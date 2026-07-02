@@ -101,9 +101,20 @@ class WarehouseAdapter(ABC):
 
     @abstractmethod
     def materialize_incremental(
-        self, table: str, df: pl.DataFrame, *, key_col: str
+        self,
+        table: str,
+        df: pl.DataFrame,
+        *,
+        key_col: str,
+        on_schema_change: str = "fail",
     ) -> int:
-        """Upsert rows in `df` into `table`, keyed on `key_col`. Returns rows written."""
+        """Upsert rows in `df` into `table`, keyed on `key_col`. Returns rows written.
+
+        Columns are matched by name, never by position. When `df`'s columns
+        differ from the existing table's, `on_schema_change` decides:
+        `fail` raises with a hint to --full-refresh; `append_new_columns`
+        adds missing columns to the table (existing rows get NULL);
+        `ignore` inserts only the columns the table already has."""
 
     @abstractmethod
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:

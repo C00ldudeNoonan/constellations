@@ -161,3 +161,111 @@ def test_outside_context_raises(tmp_path: Path) -> None:
     adapter = create_adapter(_wh(tmp_path / "t.duckdb"))
     with pytest.raises(AdapterError):
         adapter.connection  # noqa: B018
+
+
+def test_incremental_insert_matches_columns_by_name(tmp_path: Path) -> None:
+    """Same columns in a different order must land by name, not position."""
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["a"], "x": [1], "y": ["one"]}),
+            key_col="document_id",
+        )
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"y": ["two"], "x": [2], "document_id": ["b"]}),
+            key_col="document_id",
+        )
+        rows = adapter.rows(
+            f"SELECT document_id, x, y FROM {adapter.table_ref('widgets')} "
+            "ORDER BY document_id"
+        )
+        assert rows == [("a", 1, "one"), ("b", 2, "two")]
+
+
+def test_schema_change_fails_by_default(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["a"], "x": [1]}),
+            key_col="document_id",
+        )
+        with pytest.raises(AdapterError, match="full-refresh"):
+            adapter.materialize_incremental(
+                "widgets",
+                pl.DataFrame({"document_id": ["b"], "x": [2], "extra": ["?"]}),
+                key_col="document_id",
+            )
+        with pytest.raises(AdapterError, match="removed columns"):
+            adapter.materialize_incremental(
+                "widgets",
+                pl.DataFrame({"document_id": ["b"]}),
+                key_col="document_id",
+            )
+        # failed attempts wrote nothing
+        rows = adapter.rows(f"SELECT * FROM {adapter.table_ref('widgets')}")
+        assert rows == [("a", 1)]
+
+
+def test_schema_change_append_new_columns(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["a"], "x": [1]}),
+            key_col="document_id",
+        )
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["b"], "x": [2], "extra": ["new"]}),
+            key_col="document_id",
+            on_schema_change="append_new_columns",
+        )
+        rows = adapter.rows(
+            f"SELECT document_id, x, extra FROM {adapter.table_ref('widgets')} "
+            "ORDER BY document_id"
+        )
+        assert rows == [("a", 1, None), ("b", 2, "new")]
+
+
+def test_schema_change_ignore_drops_new_columns(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["a"], "x": [1]}),
+            key_col="document_id",
+        )
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["b"], "x": [2], "extra": ["dropped"]}),
+            key_col="document_id",
+            on_schema_change="ignore",
+        )
+        rows = adapter.rows(
+            f"SELECT document_id, x FROM {adapter.table_ref('widgets')} "
+            "ORDER BY document_id"
+        )
+        assert rows == [("a", 1), ("b", 2)]
+        cols = [
+            r[0]
+            for r in adapter.rows(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'testns' AND table_name = 'widgets'"
+            )
+        ]
+        assert "extra" not in cols
+
+
+def test_schema_change_unknown_policy_rejected(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["a"], "x": [1]}),
+            key_col="document_id",
+        )
+        with pytest.raises(AdapterError, match="Unknown on_schema_change"):
+            adapter.materialize_incremental(
+                "widgets",
+                pl.DataFrame({"document_id": ["b"], "x": [2], "extra": ["?"]}),
+                key_col="document_id",
+                on_schema_change="sync_all",
+            )

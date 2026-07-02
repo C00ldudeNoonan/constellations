@@ -734,3 +734,64 @@ def test_discover_source_uses_posix_relative_paths(tmp_path: Path) -> None:
     )
     assert [r.relative_path for r in refs] == ["batch_a/doc.json"]
     assert refs[0].document_id == compute_document_id("docs", "batch_a/doc.json")
+
+
+def _drop_currency_field(project: Path, *, on_schema_change: str | None = None) -> None:
+    """Remove `currency` from raw_invoices' extraction so the next run's
+    staging frame is missing a column the table already has."""
+    raw_yml = project / "models" / "raw_invoices.yml"
+    text = raw_yml.read_text().replace(
+        "fields: [invoice_id, vendor, issue_date, line_items, total, currency]",
+        "fields: [invoice_id, vendor, issue_date, line_items, total]",
+    )
+    if on_schema_change is not None:
+        text = text.replace(
+            "materialization: incremental",
+            f"materialization: incremental\n    on_schema_change: {on_schema_change}",
+        )
+    raw_yml.write_text(text)
+
+
+def test_incremental_schema_change_fails_actionably(fresh_project: Path) -> None:
+    generate_invoices(5, fresh_project / "data" / "invoices", seed=1)
+    run_project(fresh_project)
+
+    _drop_currency_field(fresh_project)
+    with pytest.raises(RunError, match="full-refresh"):
+        run_project(fresh_project, select="raw_invoices")
+
+
+def test_incremental_schema_change_append_policy(fresh_project: Path) -> None:
+    generate_invoices(5, fresh_project / "data" / "invoices", seed=1)
+    run_project(fresh_project)
+
+    _drop_currency_field(fresh_project, on_schema_change="append_new_columns")
+    results = run_project(fresh_project, select="raw_invoices")
+    raw = next(r for r in results if r.model_name == "raw_invoices")
+    # config change bumps code_version, so every doc reprocesses
+    assert raw.documents_processed == 5
+
+    db = fresh_project / "target" / "dbt_ml.duckdb"
+    rows = _query(
+        db,
+        'SELECT COUNT(*), COUNT(currency) FROM "dbt_ml".dbt_ml.raw_invoices',
+    )
+    assert rows[0] == (5, 0)
+
+
+def test_full_refresh_clears_schema_drift(fresh_project: Path) -> None:
+    generate_invoices(5, fresh_project / "data" / "invoices", seed=1)
+    run_project(fresh_project)
+
+    _drop_currency_field(fresh_project)
+    results = run_project(fresh_project, select="raw_invoices", full_refresh=True)
+    raw = next(r for r in results if r.model_name == "raw_invoices")
+    assert raw.documents_processed == 5
+
+    db = fresh_project / "target" / "dbt_ml.duckdb"
+    cols = _query(
+        db,
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'dbt_ml' AND table_name = 'raw_invoices'",
+    )
+    assert ("currency",) not in cols

@@ -97,7 +97,12 @@ class DuckDBAdapter(WarehouseAdapter):
         return df.height
 
     def materialize_incremental(
-        self, table: str, df: pl.DataFrame, *, key_col: str
+        self,
+        table: str,
+        df: pl.DataFrame,
+        *,
+        key_col: str,
+        on_schema_change: str = "fail",
     ) -> int:
         if df.height == 0:
             return 0
@@ -108,6 +113,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 f"CREATE TABLE IF NOT EXISTS {full} AS "
                 f"SELECT * FROM dbt_ml_staging LIMIT 0"
             )
+            insert_cols = self._reconcile_schema(table, df, on_schema_change)
             if key_col in df.columns:
                 key = self.quote_ident(key_col)
                 self.connection.execute(
@@ -117,10 +123,67 @@ class DuckDBAdapter(WarehouseAdapter):
                     WHERE target.{key} = source.{key}
                     """
                 )
-            self.connection.execute(f"INSERT INTO {full} SELECT * FROM dbt_ml_staging")
+            col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
+            self.connection.execute(
+                f"INSERT INTO {full} BY NAME SELECT {col_list} FROM dbt_ml_staging"
+            )
         finally:
             self.connection.unregister("dbt_ml_staging")
         return df.height
+
+    def _reconcile_schema(
+        self, table: str, df: pl.DataFrame, on_schema_change: str
+    ) -> list[str]:
+        """Compare staging columns against the existing table and apply the
+        on_schema_change policy. Returns the staging columns to insert."""
+        target_cols = [
+            r[0]
+            for r in self.connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
+                "ORDER BY ordinal_position",
+                [self.catalog, self.schema, table],
+            ).fetchall()
+        ]
+        new = [c for c in df.columns if c not in target_cols]
+        removed = [c for c in target_cols if c not in df.columns]
+        if not new and not removed:
+            return list(df.columns)
+
+        if on_schema_change == "fail":
+            drift = "; ".join(
+                part
+                for part in (
+                    f"new columns {new}" if new else "",
+                    f"removed columns {removed}" if removed else "",
+                )
+                if part
+            )
+            raise AdapterError(
+                f"Schema change on incremental table '{table}': {drift}. "
+                "Run with --full-refresh to rebuild it, or set "
+                "`on_schema_change: append_new_columns` (or `ignore`) on the model."
+            )
+        if on_schema_change == "append_new_columns":
+            if new:
+                staging_types = dict(
+                    self.connection.execute(
+                        "SELECT column_name, column_type FROM "
+                        "(DESCRIBE SELECT * FROM dbt_ml_staging)"
+                    ).fetchall()
+                )
+                for col in new:
+                    self.connection.execute(
+                        f"ALTER TABLE {self.table_ref(table)} "
+                        f"ADD COLUMN {self.quote_ident(col)} {staging_types[col]}"
+                    )
+            return list(df.columns)
+        if on_schema_change == "ignore":
+            return [c for c in df.columns if c in target_cols]
+        raise AdapterError(
+            f"Unknown on_schema_change policy '{on_schema_change}'. "
+            "Allowed: fail, ignore, append_new_columns."
+        )
 
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:
         if not keys or table not in self.list_tables():

@@ -10,7 +10,7 @@ from typing import Any, cast
 
 import polars as pl
 
-from .adapters import WarehouseAdapter, create_adapter
+from .adapters import AdapterError, WarehouseAdapter, create_adapter
 from .backends import ExtractionResult, get_backend
 from .checks import TestResult, run_model_tests
 from .classic_ml import run_classic_ml_model
@@ -380,9 +380,17 @@ def _run_extraction_model(
         if model.materialization == "full" or full_refresh:
             rows_written = adapter.materialize_full(model.name, df)
         else:
-            rows_written = adapter.materialize_incremental(
-                model.name, df, key_col="document_id"
-            )
+            try:
+                rows_written = adapter.materialize_incremental(
+                    model.name,
+                    df,
+                    key_col="document_id",
+                    on_schema_change=model.on_schema_change,
+                )
+            except AdapterError as e:
+                # RunError so `build` fails this model and blocks descendants
+                # instead of aborting the whole invocation.
+                raise RunError(str(e)) from e
 
     if full_refresh:
         adapter.clear_model_state(model.name)

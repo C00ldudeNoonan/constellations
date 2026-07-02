@@ -70,6 +70,7 @@ class ModelConfig(BaseModel):
     ml: MLConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
+    on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
     tests: list[Any] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 

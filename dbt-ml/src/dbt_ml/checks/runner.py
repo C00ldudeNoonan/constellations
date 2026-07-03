@@ -18,13 +18,22 @@ def run_project_tests(
     target: str | None = None,
     profiles_dir: Path | None = None,
     store_failures: bool = False,
+    state: Path | None = None,
 ) -> list[TestResult]:
     project, sources, models = load_project(project_dir)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     dag = ProjectDAG(sources, models)
-    selected_names = set(dag.select_models(select=select, exclude=exclude))
+    modified: set[str] | None = None
+    if state is not None:
+        # Local import: manifest.py imports from runner.py at module level.
+        from ..manifest import compute_modified_models
+
+        modified = compute_modified_models(models, project_dir, state)
+    selected_names = set(
+        dag.select_models(select=select, exclude=exclude, modified=modified)
+    )
 
     results: list[TestResult] = []
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:

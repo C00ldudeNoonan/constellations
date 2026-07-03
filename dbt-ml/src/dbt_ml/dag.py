@@ -120,24 +120,34 @@ class ProjectDAG:
         return batches
 
     def select_models(
-        self, *, select: str | None = None, exclude: str | None = None
+        self,
+        *,
+        select: str | None = None,
+        exclude: str | None = None,
+        modified: set[str] | None = None,
     ) -> list[str]:
         """Resolve selector expressions to model names, in topological order.
 
         Selector syntax (whitespace-separated tokens):
-          - `name`        — just that node
-          - `+name`       — name plus all transitive ancestors
-          - `name+`       — name plus all transitive descendants
-          - `+name+`      — name plus ancestors and descendants
+          - `name`           — just that node
+          - `+name`          — name plus all transitive ancestors
+          - `name+`          — name plus all transitive descendants
+          - `+name+`         — name plus ancestors and descendants
+          - `tag:x`          — nodes tagged x
+          - `state:modified` — models in `modified` (requires --state)
         Source nodes can match but are never returned (sources don't run).
+
+        `modified` is the set of model names whose code_version differs from
+        (or is absent in) a previous manifest; None means no state manifest
+        was provided, and `state:modified` is an error.
         """
         if select:
-            selected = self._apply(select)
+            selected = self._apply(select, modified)
         else:
             selected = set(self.nodes)
 
         if exclude:
-            selected -= self._apply(exclude)
+            selected -= self._apply(exclude, modified)
 
         return [
             n
@@ -145,20 +155,32 @@ class ProjectDAG:
             if n in selected and self.nodes[n].kind == NodeKind.MODEL
         ]
 
-    def _apply(self, expression: str) -> set[str]:
+    def _apply(self, expression: str, modified: set[str] | None = None) -> set[str]:
         out: set[str] = set()
         for token in expression.split():
-            out |= self._expand_token(token)
+            out |= self._expand_token(token, modified)
         return out
 
-    def _expand_token(self, token: str) -> set[str]:
+    def _expand_token(self, token: str, modified: set[str] | None = None) -> set[str]:
         up = token.startswith("+")
         down = token.endswith("+")
         body = token.strip("+")
         if not body:
             raise SelectionError(f"Empty selector token in '{token}'")
 
-        if body.startswith("tag:"):
+        if body == "state:modified":
+            if modified is None:
+                raise SelectionError(
+                    "Selector 'state:modified' requires a previous manifest; "
+                    "pass --state <path-to-manifest-or-its-directory>."
+                )
+            # An empty modified set is a valid outcome (nothing changed).
+            seeds = {n for n in modified if n in self.nodes}
+        elif body.startswith("state:"):
+            raise SelectionError(
+                f"Unknown state selector '{body}'. Supported: state:modified"
+            )
+        elif body.startswith("tag:"):
             tag = body[4:]
             if not tag:
                 raise SelectionError(f"Empty tag in selector '{token}'")

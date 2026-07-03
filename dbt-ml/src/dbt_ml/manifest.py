@@ -132,5 +132,54 @@ def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
     }
 
 
+class StateError(Exception):
+    pass
+
+
+def read_state_code_versions(state_path: Path) -> dict[str, str]:
+    """Read {model_name: code_version} from a previous manifest.
+
+    `state_path` may be the manifest.json itself or a directory containing
+    one (dbt's --state convention).
+    """
+    path = state_path / MANIFEST_FILENAME if state_path.is_dir() else state_path
+    if not path.exists():
+        raise StateError(
+            f"No manifest found at {path}. Point --state at a manifest.json "
+            "(or its directory) written by a previous `compile` or `run`."
+        )
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise StateError(f"{path} is not valid JSON: {e}") from e
+    models = data.get("models")
+    if not isinstance(models, list):
+        raise StateError(f"{path} has no `models` list; is it a dbt-ml manifest?")
+    return {
+        m["name"]: m.get("code_version", "")
+        for m in models
+        if isinstance(m, dict) and "name" in m
+    }
+
+
+def compute_modified_models(
+    models: list[ModelConfig], project_dir: Path, state_path: Path
+) -> set[str]:
+    """Models whose code_version differs from the state manifest, or that
+    the state manifest has never seen."""
+    previous = read_state_code_versions(state_path)
+    modified: set[str] = set()
+    for model in models:
+        current = compute_code_version(
+            extraction=model.extraction,
+            transform=model.transform,
+            ml=model.ml,
+            project_dir=project_dir,
+        )
+        if previous.get(model.name) != current:
+            modified.add(model.name)
+    return modified
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()

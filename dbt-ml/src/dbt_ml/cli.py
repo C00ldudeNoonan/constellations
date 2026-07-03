@@ -18,7 +18,7 @@ from .dag import DAGError, ProjectDAG, SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
-from .manifest import write_manifest, write_run_results
+from .manifest import StateError, write_manifest, write_run_results
 from .profile import ProfileError, resolve_profile
 from .runner import BuildResult, RunError, build_project, clean_project, run_project
 from .synth import (
@@ -398,6 +398,12 @@ def _model_kind(model: ModelConfig) -> str:
     show_default=True,
     help="Parallel worker threads per extraction model.",
 )
+@click.option(
+    "--state",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Previous manifest.json (or its directory) for state:modified selection.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -406,6 +412,7 @@ def run(
     exclude: str | None,
     watch: bool,
     threads: int,
+    state: Path | None,
 ) -> None:
     """Extract and materialize selected models into DuckDB."""
     project_dir: Path = ctx.obj["project_dir"]
@@ -433,8 +440,9 @@ def run(
             target=target,
             profiles_dir=profiles_dir,
             threads=threads,
+            state=state,
         )
-    except (ConfigError, DAGError, SelectionError, RunError, ProfileError) as e:
+    except (ConfigError, DAGError, SelectionError, RunError, ProfileError, StateError) as e:
         raise click.ClickException(str(e)) from e
 
     write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
@@ -481,6 +489,12 @@ def run(
     is_flag=True,
     help="Persist failing test rows to dbt_ml_test_failures__* tables.",
 )
+@click.option(
+    "--state",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Previous manifest.json (or its directory) for state:modified selection.",
+)
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -489,6 +503,7 @@ def build(
     exclude: str | None,
     threads: int,
     store_failures: bool,
+    state: Path | None,
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
     when an upstream model errors or fails a test."""
@@ -505,8 +520,9 @@ def build(
             profiles_dir=profiles_dir,
             threads=threads,
             store_failures=store_failures,
+            state=state,
         )
-    except (ConfigError, DAGError, SelectionError, RunError, ProfileError) as e:
+    except (ConfigError, DAGError, SelectionError, RunError, ProfileError, StateError) as e:
         raise click.ClickException(str(e)) from e
 
     write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
@@ -565,12 +581,19 @@ def _test_message(t: TestResult) -> str:
     is_flag=True,
     help="Persist failing test rows to dbt_ml_test_failures__* tables.",
 )
+@click.option(
+    "--state",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Previous manifest.json (or its directory) for state:modified selection.",
+)
 @click.pass_context
 def test(
     ctx: click.Context,
     select: str | None,
     exclude: str | None,
     store_failures: bool,
+    state: Path | None,
 ) -> None:
     """Run schema tests against materialized tables."""
     project_dir: Path = ctx.obj["project_dir"]
@@ -584,8 +607,9 @@ def test(
             target=target,
             profiles_dir=profiles_dir,
             store_failures=store_failures,
+            state=state,
         )
-    except (ConfigError, DAGError, SelectionError, ProfileError) as e:
+    except (ConfigError, DAGError, SelectionError, ProfileError, StateError) as e:
         raise click.ClickException(str(e)) from e
 
     if not results:

@@ -32,6 +32,19 @@ class RunError(Exception):
     pass
 
 
+def _modified_set(
+    models: list[ModelConfig], project_dir: Path, state: Path | None
+) -> set[str] | None:
+    """None when no state manifest was given (state:modified then errors in
+    selection); otherwise the models whose code_version diverged from it."""
+    if state is None:
+        return None
+    # Local import: manifest.py imports ModelRunResult from this module.
+    from .manifest import compute_modified_models
+
+    return compute_modified_models(models, project_dir, state)
+
+
 class _SerializedAdapter:
     """Serializes every adapter method call behind a lock so independent models
     can run on separate threads while sharing one warehouse connection. Property
@@ -98,13 +111,16 @@ def run_project(
     target: str | None = None,
     profiles_dir: Path | None = None,
     threads: int = 1,
+    state: Path | None = None,
 ) -> list[ModelRunResult]:
     project, sources, models = load_project(project_dir)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     dag = ProjectDAG(sources, models)
-    selected = dag.select_models(select=select, exclude=exclude)
+    selected = dag.select_models(
+        select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
+    )
 
     source_docs: dict[str, list[DocumentRef]] = {
         s.name: _discover_source(s, project_dir) for s in sources
@@ -143,6 +159,7 @@ def build_project(
     profiles_dir: Path | None = None,
     threads: int = 1,
     store_failures: bool = False,
+    state: Path | None = None,
 ) -> BuildResult:
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
@@ -152,7 +169,9 @@ def build_project(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     dag = ProjectDAG(sources, models)
-    selected = dag.select_models(select=select, exclude=exclude)
+    selected = dag.select_models(
+        select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
+    )
 
     source_docs: dict[str, list[DocumentRef]] = {
         s.name: _discover_source(s, project_dir) for s in sources

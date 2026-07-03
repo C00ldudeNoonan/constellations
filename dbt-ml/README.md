@@ -102,9 +102,9 @@ dbt-ml init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh pr
 dbt-ml seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 dbt-ml compile                                             # parse YAML, validate DAG, write manifest.json
 dbt-ml graph                                               # Mermaid DAG to stdout
-dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch]
-dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures]
-dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures]
+dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR]
+dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
+dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR]
 dbt-ml ls [--select EXPR] [--resource-type {model,source,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table
 dbt-ml source freshness                                    # mtime vs warn_after/error_after
@@ -135,7 +135,17 @@ dbt-ml run --select 'raw_pdf_text+'    # plus all downstream
 dbt-ml run --select '+invoice_summary' # plus all upstream
 dbt-ml run --select 'tag:raw+'         # all models tagged "raw" + their downstream
 dbt-ml run --exclude tag:expensive
+dbt-ml run --select 'state:modified+' --state ./main-manifest/
+                                       # only models whose config or transform
+                                       # code changed vs a previous manifest,
+                                       # plus their downstream
 ```
+
+`state:modified` compares each model's `code_version` (a hash of its
+extraction/transform/ml config and transform module source) against a
+manifest written by a previous `compile` or `run`. The CI recipe: store
+`target/manifest.json` from main, then on PRs run
+`dbt-ml build --select 'state:modified+' --state path/to/main-manifest/`.
 
 ## Profiles
 

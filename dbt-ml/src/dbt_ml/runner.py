@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from .versioning import (
     compute_content_hash,
     compute_document_id,
 )
+
+log = logging.getLogger(__name__)
 
 
 class RunError(Exception):
@@ -359,7 +362,8 @@ def _run_extraction_model(
         try:
             return doc, backend.extract(doc.path, options), None
         except Exception as e:
-            return doc, None, str(e)
+            log.debug("extraction failed for %s", doc.path, exc_info=True)
+            return doc, None, f"{type(e).__name__}: {e}"
 
     if threads > 1 and len(docs_to_process) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:

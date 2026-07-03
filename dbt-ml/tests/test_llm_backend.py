@@ -20,6 +20,7 @@ class _CallCounter:
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
         self.calls = 0
+        self.kwargs: dict[str, Any] = {}
 
     def __call__(
         self,
@@ -27,8 +28,10 @@ class _CallCounter:
         model: str,
         system: str,
         fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> dict[str, Any]:
         self.calls += 1
+        self.kwargs = kwargs
         return dict(self.response)
 
 
@@ -153,7 +156,10 @@ def test_llm_pipeline_end_to_end(
         "total": 123.45,
     }
 
-    def fake(self: LLMBackend, content: str, model: str, system: str, fields_spec: list) -> dict:
+    def fake(
+        self: LLMBackend, content: str, model: str, system: str, fields_spec: list,
+        **kwargs: Any,
+    ) -> dict:
         return dict(canned)
 
     monkeypatch.setattr(LLMBackend, "_call_api", fake)
@@ -185,3 +191,107 @@ def test_llm_backend_no_api_key_raises(
         backend.extract(
             doc, {"cache_path": str(tmp_path / "c.duckdb"), "fields": schema}
         )
+
+
+def test_generation_params_default_and_override(
+    monkeypatch: pytest.MonkeyPatch, doc: Path, schema: list[dict[str, Any]]
+) -> None:
+    counter = _CallCounter({"vendor": "v", "invoice_id": "i", "total": 0.0})
+    monkeypatch.setattr(LLMBackend, "_call_api", counter)
+    backend = get_backend("llm")
+
+    backend.extract(doc, {"fields": schema})
+    assert counter.kwargs == {"temperature": 0.0, "max_tokens": 2048, "max_retries": 4}
+
+    backend.extract(
+        doc,
+        {"fields": schema, "temperature": 0.3, "max_tokens": 8192, "max_retries": 1},
+    )
+    assert counter.kwargs == {"temperature": 0.3, "max_tokens": 8192, "max_retries": 1}
+
+
+def test_temperature_is_part_of_cache_key(
+    monkeypatch: pytest.MonkeyPatch, doc: Path, schema: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    counter = _CallCounter({"vendor": "v", "invoice_id": "i", "total": 0.0})
+    monkeypatch.setattr(LLMBackend, "_call_api", counter)
+    backend = get_backend("llm")
+
+    opts = {"cache_path": str(tmp_path / "cache.duckdb"), "fields": schema}
+    backend.extract(doc, opts)
+    backend.extract(doc, {**opts, "temperature": 0.7})
+    assert counter.calls == 2, "different temperature must not reuse cached output"
+    backend.extract(doc, {**opts, "temperature": 0.7})
+    assert counter.calls == 2
+
+
+def test_truncated_response_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, doc: Path, schema: list[dict[str, Any]]
+) -> None:
+    """A max_tokens-truncated response raises instead of yielding partial data;
+    the client is constructed with the retry budget and called with temperature 0
+    and a plain-string system prompt."""
+    init_kwargs: dict[str, Any] = {}
+    create_kwargs: dict[str, Any] = {}
+
+    class _FakeResp:
+        def __init__(self) -> None:
+            self.stop_reason = "max_tokens"
+            self.content: list[Any] = []
+
+    class _FakeMessages:
+        def create(self, **kwargs: Any) -> _FakeResp:
+            create_kwargs.update(kwargs)
+            return _FakeResp()
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs: Any) -> None:
+            init_kwargs.update(kwargs)
+            self.messages = _FakeMessages()
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
+
+    backend = get_backend("llm")
+    with pytest.raises(RuntimeError, match="max_tokens"):
+        backend.extract(doc, {"fields": schema})
+
+    assert init_kwargs == {"max_retries": 4}
+    assert create_kwargs["temperature"] == 0.0
+    assert create_kwargs["max_tokens"] == 2048
+    assert isinstance(create_kwargs["system"], str)
+
+
+def test_max_concurrent_gates_api_calls() -> None:
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dbt_ml.backends.llm_backend import extract_fields_from_text
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+    ) -> dict[str, Any]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return {"x": 1}
+
+    def one(text: str) -> dict[str, Any]:
+        return extract_fields_from_text(
+            text, fields_spec=[{"name": "x"}], call_api=fake, max_concurrent=1
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(one, [f"doc {i}" for i in range(8)]))
+
+    assert all(r == {"x": 1} for r in results)
+    assert peak == 1, "max_concurrent=1 must serialize API calls"

@@ -36,7 +36,9 @@ def test_pdf_pipeline_end_to_end(
 
     call_count = {"n": 0}
 
-    def fake_api(content: str, model: str, system: str, fields_spec: list) -> dict:
+    def fake_api(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: object
+    ) -> dict:
         call_count["n"] += 1
         return {
             "invoice_id": f"INV-FROMTEXT-{call_count['n']}",
@@ -75,7 +77,9 @@ def test_pdf_pipeline_caches_llm_calls(
 
     api_calls = {"n": 0}
 
-    def fake_api(content: str, model: str, system: str, fields_spec: list) -> dict:
+    def fake_api(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: object
+    ) -> dict:
         api_calls["n"] += 1
         return {
             "invoice_id": "INV-X",

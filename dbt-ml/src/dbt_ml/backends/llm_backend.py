@@ -18,9 +18,28 @@ _DEFAULT_SYSTEM = (
     "Call the `extract` tool with the requested fields. "
     "If a field is genuinely missing from the document, use null."
 )
+# Extraction wants reproducibility, not creativity.
+_DEFAULT_TEMPERATURE = 0.0
+_DEFAULT_MAX_TOKENS = 2048
+_DEFAULT_MAX_RETRIES = 4
+_DEFAULT_MAX_CONCURRENT = 4
 
 # DuckDB cache writes can race when extraction is parallelized; serialize them.
 _CACHE_WRITE_LOCK = threading.Lock()
+
+# API-level concurrency caps are account-wide, so gates live at module scope
+# and are shared across every model in the process. One gate per configured
+# size: models that agree on max_concurrent share a limit; models that
+# disagree get independent gates (combined ceiling = sum of distinct sizes).
+_GATES: dict[int, threading.BoundedSemaphore] = {}
+_GATES_LOCK = threading.Lock()
+
+
+def _gate(size: int) -> threading.BoundedSemaphore:
+    with _GATES_LOCK:
+        if size not in _GATES:
+            _GATES[size] = threading.BoundedSemaphore(size)
+        return _GATES[size]
 
 
 @register
@@ -32,10 +51,17 @@ class LLMBackend(BaseBackend):
     schema_hash) so re-runs are free.
 
     Options:
-        model:        Claude model id (default: claude-haiku-4-5)
-        system_prompt: Override system prompt
-        cache_path:   Path to cache file (recommended: ./target/llm_cache.duckdb)
-        fields:       [{name, type, description?}] — schema for tool input_schema
+        model:          Claude model id (default: claude-haiku-4-5)
+        system_prompt:  Override system prompt
+        cache_path:     Path to cache file (recommended: ./target/llm_cache.duckdb)
+        fields:         [{name, type, description?}] — schema for tool input_schema
+        temperature:    Sampling temperature (default 0 — deterministic extraction;
+                        part of the cache key)
+        max_tokens:     Response budget (default 2048); a truncated response is
+                        an error, never partial data
+        max_retries:    SDK retry budget for rate limits / transient errors
+                        (default 4, exponential backoff)
+        max_concurrent: Max in-flight API calls process-wide (default 4)
     """
 
     def name(self) -> str:
@@ -58,6 +84,10 @@ class LLMBackend(BaseBackend):
             system=options.get("system_prompt", _DEFAULT_SYSTEM),
             cache_path=options.get("cache_path"),
             call_api=self._call_api,
+            temperature=float(options.get("temperature", _DEFAULT_TEMPERATURE)),
+            max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
+            max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
+            max_concurrent=int(options.get("max_concurrent", _DEFAULT_MAX_CONCURRENT)),
         )
         return ExtractionResult(fields=fields)
 
@@ -67,8 +97,9 @@ class LLMBackend(BaseBackend):
         model: str,
         system: str,
         fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        return _default_call_api(content, model, system, fields_spec)
+        return _default_call_api(content, model, system, fields_spec, **kwargs)
 
 
 def extract_fields_from_text(
@@ -79,6 +110,10 @@ def extract_fields_from_text(
     system: str = _DEFAULT_SYSTEM,
     cache_path: str | Path | None = None,
     call_api: Any = None,
+    temperature: float = _DEFAULT_TEMPERATURE,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
     """Extract structured fields from a string of text by calling Claude.
 
@@ -88,7 +123,7 @@ def extract_fields_from_text(
     `call_api` is injectable for testing; defaults to the real Anthropic call.
     """
     content_hash = hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
-    schema_hash = _hash_schema(system, fields_spec)
+    schema_hash = _hash_schema(system, fields_spec, temperature)
     cache_key = f"{model}|{content_hash}|{schema_hash}"
 
     cache_path_obj = Path(cache_path) if cache_path is not None else None
@@ -98,7 +133,16 @@ def extract_fields_from_text(
             return cached
 
     fn = call_api or _default_call_api
-    result_fields: dict[str, Any] = fn(text, model, system, fields_spec)
+    with _gate(max_concurrent):
+        result_fields: dict[str, Any] = fn(
+            text,
+            model,
+            system,
+            fields_spec,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+        )
 
     if cache_path_obj is not None:
         _cache_put(
@@ -117,6 +161,10 @@ def _default_call_api(
     model: str,
     system: str,
     fields_spec: list[dict[str, Any]],
+    *,
+    temperature: float = _DEFAULT_TEMPERATURE,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError(
@@ -125,7 +173,8 @@ def _default_call_api(
         )
     from anthropic import Anthropic
 
-    client = Anthropic()
+    # The SDK retries 429s / 5xx / timeouts with exponential backoff.
+    client = Anthropic(max_retries=max_retries)
     tool = {
         "name": "extract",
         "description": "Return the extracted structured fields from the document.",
@@ -133,18 +182,19 @@ def _default_call_api(
     }
     resp = client.messages.create(  # type: ignore[call-overload]
         model=model,
-        max_tokens=2048,
-        system=[
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
+        max_tokens=max_tokens,
+        temperature=temperature,
+        system=system,
         tools=[tool],
         tool_choice={"type": "tool", "name": "extract"},
         messages=[{"role": "user", "content": content}],
     )
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"LLM response truncated at max_tokens={max_tokens}; partial "
+            "extractions are never used. Raise `max_tokens` in the model's "
+            "extraction options."
+        )
     for block in resp.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "extract":
             return dict(block.input)
@@ -165,9 +215,13 @@ def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:
     return {"type": "object", "properties": properties}
 
 
-def _hash_schema(system: str, fields_spec: list[dict[str, Any]]) -> str:
+def _hash_schema(
+    system: str, fields_spec: list[dict[str, Any]], temperature: float
+) -> str:
     canonical = json.dumps(
-        {"system": system, "fields": fields_spec}, sort_keys=True, separators=(",", ":")
+        {"system": system, "fields": fields_spec, "temperature": temperature},
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.blake2b(canonical.encode(), digest_size=8).hexdigest()
 

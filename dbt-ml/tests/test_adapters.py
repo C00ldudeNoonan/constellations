@@ -10,12 +10,13 @@ from dbt_ml.adapters import (
     UnknownAdapterError,
     create_adapter,
     list_adapter_types,
+    parse_warehouse_config,
 )
 from dbt_ml.config.profile import WarehouseConfig
 
 
 def _wh(path: Path, schema: str = "testns") -> WarehouseConfig:
-    return WarehouseConfig.model_validate(
+    return parse_warehouse_config(
         {"type": "duckdb", "path": str(path), "schema": schema}
     )
 
@@ -25,11 +26,10 @@ def test_registered_types() -> None:
 
 
 def test_unknown_type_raises(tmp_path: Path) -> None:
-    cfg = WarehouseConfig.model_validate(
-        {"type": "no_such_warehouse", "path": str(tmp_path / "x"), "schema": "s"}
-    )
-    with pytest.raises(UnknownAdapterError):
-        create_adapter(cfg)
+    with pytest.raises(UnknownAdapterError, match="no_such_warehouse"):
+        parse_warehouse_config(
+            {"type": "no_such_warehouse", "path": str(tmp_path / "x"), "schema": "s"}
+        )
 
 
 def test_duckdb_creates_schema_and_state(tmp_path: Path) -> None:

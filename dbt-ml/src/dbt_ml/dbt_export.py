@@ -89,7 +89,7 @@ def write_dbt_sources(
 
 def _derive_catalog(warehouse: WarehouseConfig) -> str:
     """DuckDB catalog name == basename of the database file without extension."""
-    return Path(warehouse.path).stem
+    return Path(warehouse.location()).stem
 
 
 def _table_for_model(model: ModelConfig) -> dict[str, Any]:

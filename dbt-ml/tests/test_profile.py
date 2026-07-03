@@ -233,3 +233,130 @@ def test_resolved_profile_is_frozen_dataclass(tmp_path: Path) -> None:
     assert isinstance(resolved, ResolvedProfile)
     with pytest.raises(dataclasses.FrozenInstanceError):
         resolved.target_name = "other"  # type: ignore[misc]
+
+
+# ─── env_var interpolation (issue #73) ──────────────────────────────────────
+
+
+def _write_profiles_raw(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "profiles.yml"
+    path.write_text(body)
+    return path
+
+
+def test_env_var_interpolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: \"./target/{{ env_var('DBT_ML_DB_NAME') }}.duckdb\"",
+                "        schema: \"{{ env_var('DBT_ML_SCHEMA', 'fallback_schema') }}\"",
+            ]
+        )
+        + "\n",
+    )
+    monkeypatch.setenv("DBT_ML_DB_NAME", "from_env")
+    monkeypatch.delenv("DBT_ML_SCHEMA", raising=False)
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.warehouse.location().endswith("from_env.duckdb")
+    assert resolved.warehouse.schema_name == "fallback_schema"
+
+
+def test_env_var_missing_without_default_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: \"{{ env_var('DBT_ML_NOT_SET_ANYWHERE') }}\"",
+            ]
+        )
+        + "\n",
+    )
+    monkeypatch.delenv("DBT_ML_NOT_SET_ANYWHERE", raising=False)
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match="DBT_ML_NOT_SET_ANYWHERE"):
+        resolve_profile(project, tmp_path)
+
+
+# ─── per-adapter warehouse config validation (issue #73) ────────────────────
+
+
+def test_unknown_warehouse_type_raises(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {"type": "snowflake", "path": "./x", "schema": "s"}
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match="snowflake"):
+        resolve_profile(project, tmp_path)
+
+
+def test_invalid_duckdb_config_names_adapter(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        schema: ok_but_no_path",
+            ]
+        )
+        + "\n",
+    )
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match="duckdb"):
+        resolve_profile(project, tmp_path)
+
+
+def test_unknown_warehouse_field_rejected(tmp_path: Path) -> None:
+    """Typo'd keys fail loudly instead of being silently ignored."""
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/db.duckdb",
+                "        pth_typo: ./oops",
+            ]
+        )
+        + "\n",
+    )
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match="pth_typo"):
+        resolve_profile(project, tmp_path)

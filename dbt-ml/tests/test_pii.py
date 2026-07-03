@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import polars as pl
 import pytest
 
-from dbt_ml.config.profile import WarehouseConfig
+from dbt_ml.adapters import parse_warehouse_config
 from dbt_ml.text import PIIEntity, detect_pii, redact_pii
 from dbt_ml.text import pii as pii_module
 from dbt_ml.text.transforms import redact_pii as t_redact_pii
@@ -19,7 +19,7 @@ def _ctx(options: dict | None = None) -> TransformContext:
         project_dir=Path("."),
         profile_name="test",
         target_name="dev",
-        warehouse=WarehouseConfig.model_validate(
+        warehouse=parse_warehouse_config(
             {"type": "duckdb", "path": "./t.duckdb", "schema": "main"}
         ),
         llm=None,

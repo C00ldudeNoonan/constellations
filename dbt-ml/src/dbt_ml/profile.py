@@ -12,6 +12,7 @@ First hit wins.
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
+from .adapters import AdapterError, parse_warehouse_config
 from .config.profile import LLMConfig, ProfileConfig, WarehouseConfig
 from .config.project import ProjectConfig
 
@@ -83,35 +85,26 @@ def resolve_profile(
         )
 
     selected = profile.outputs[target_name]
+    try:
+        warehouse = parse_warehouse_config(selected.warehouse)
+    except AdapterError as e:
+        raise ProfileError(
+            f"{profiles_path}: profile '{project.profile}' target '{target_name}': {e}"
+        ) from e
     return ResolvedProfile(
         profile_name=project.profile,
         target_name=target_name,
-        warehouse=_absolutize_warehouse(selected.warehouse, project_dir),
+        warehouse=warehouse.absolutize(project_dir),
         llm=_absolutize_llm(selected.llm, project_dir),
         profiles_path=profiles_path,
     )
 
 
-def _absolutize_warehouse(wh: WarehouseConfig, project_dir: Path) -> WarehouseConfig:
-    return WarehouseConfig(
-        type=wh.type,
-        path=(project_dir / wh.path).resolve(),
-        schema=wh.schema_name,
-    )
-
-
 def _absolutize_llm(llm: LLMConfig | None, project_dir: Path) -> LLMConfig | None:
-    if llm is None:
-        return None
-    cache_path: Path | None = None
-    if llm.cache_path is not None:
-        cache_path = (project_dir / llm.cache_path).resolve()
-    return LLMConfig(
-        provider=llm.provider,
-        model=llm.model,
-        api_key_env=llm.api_key_env,
-        cache_path=cache_path,
-        system_prompt=llm.system_prompt,
+    if llm is None or llm.cache_path is None:
+        return llm
+    return llm.model_copy(
+        update={"cache_path": (project_dir / llm.cache_path).resolve()}
     )
 
 
@@ -123,10 +116,12 @@ def _legacy_resolved(project: ProjectConfig) -> ResolvedProfile:
         DeprecationWarning,
         stacklevel=2,
     )
-    warehouse = WarehouseConfig(
-        type="duckdb",
-        path=project.duckdb.path,
-        schema=project.duckdb.schema_name,
+    warehouse = parse_warehouse_config(
+        {
+            "type": "duckdb",
+            "path": project.duckdb.path,
+            "schema": project.duckdb.schema_name,
+        }
     )
     return ResolvedProfile(
         profile_name="<inline>",
@@ -166,11 +161,43 @@ def _discover_profiles_file(
     return None
 
 
+# `{{ env_var('NAME') }}` or `{{ env_var('NAME', 'default') }}` — the one piece
+# of dbt's Jinja grammar profiles need, so secrets stay out of the file.
+_ENV_VAR_RE = re.compile(
+    r"\{\{\s*env_var\(\s*(['\"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)\1"
+    r"(?:\s*,\s*(['\"])(?P<default>.*?)\3)?\s*\)\s*\}\}"
+)
+
+
+def _interpolate_env_vars(value: Any, path: Path) -> Any:
+    if isinstance(value, str):
+
+        def _sub(match: re.Match[str]) -> str:
+            name = match.group("name")
+            env_value = os.environ.get(name)
+            if env_value is not None:
+                return env_value
+            default = match.group("default")
+            if default is not None:
+                return default
+            raise ProfileError(
+                f"{path}: env_var('{name}') is not set and has no default"
+            )
+
+        return _ENV_VAR_RE.sub(_sub, value)
+    if isinstance(value, dict):
+        return {k: _interpolate_env_vars(v, path) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_env_vars(v, path) for v in value]
+    return value
+
+
 def _load_profiles_file(path: Path) -> dict[str, ProfileConfig]:
     with path.open() as f:
         data: Any = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ProfileError(f"{path}: top-level must be a mapping of profile names")
+    data = _interpolate_env_vars(data, path)
 
     out: dict[str, ProfileConfig] = {}
     for name, body in data.items():

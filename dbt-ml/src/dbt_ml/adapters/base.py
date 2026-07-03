@@ -39,6 +39,12 @@ class WarehouseAdapter(ABC):
     def adapter_type(cls) -> str:
         """Short name used in profiles.yml `warehouse.type`."""
 
+    @classmethod
+    @abstractmethod
+    def config_model(cls) -> type[WarehouseConfig]:
+        """The WarehouseConfig subclass this adapter's profile block
+        validates against."""
+
     # ─── lifecycle ────────────────────────────────────────────────────────
 
     def __enter__(self) -> Self:

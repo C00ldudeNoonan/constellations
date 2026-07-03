@@ -10,7 +10,7 @@ from pathlib import Path
 
 import polars as pl
 
-from dbt_ml.config.profile import WarehouseConfig
+from dbt_ml.adapters import parse_warehouse_config
 from dbt_ml.text.transforms import (
     clean_encoding as t_clean_encoding,
 )
@@ -34,7 +34,7 @@ def _ctx(options: dict | None = None) -> TransformContext:
         project_dir=Path("."),
         profile_name="test",
         target_name="dev",
-        warehouse=WarehouseConfig.model_validate(
+        warehouse=parse_warehouse_config(
             {"type": "duckdb", "path": "./t.duckdb", "schema": "main"}
         ),
         llm=None,

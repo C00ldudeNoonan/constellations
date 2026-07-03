@@ -12,7 +12,7 @@ import polars as pl
 import pytest
 from pydantic import ValidationError
 
-from dbt_ml.adapters import create_adapter
+from dbt_ml.adapters import create_adapter, parse_warehouse_config
 from dbt_ml.checks.schema import evaluate_test_spec
 from dbt_ml.config.model import ModelConfig
 from dbt_ml.config.profile import WarehouseConfig
@@ -20,7 +20,7 @@ from dbt_ml.config.source import SourceConfig
 
 
 def _wh(path: Path) -> WarehouseConfig:
-    return WarehouseConfig.model_validate(
+    return parse_warehouse_config(
         {"type": "duckdb", "path": str(path), "schema": "testns"}
     )
 

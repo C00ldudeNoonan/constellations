@@ -6,16 +6,15 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from dbt_ml.adapters import WarehouseAdapter, create_adapter
+from dbt_ml.adapters import WarehouseAdapter, create_adapter, parse_warehouse_config
 from dbt_ml.checks.schema import evaluate_test_spec
-from dbt_ml.config.profile import WarehouseConfig
 
 
 @pytest.fixture
 def db(tmp_path: Path) -> Iterator[WarehouseAdapter]:
     """Adapter with an `items` table — passed to custom Python tests as `con`
     via the adapter's `raw_connection`."""
-    cfg = WarehouseConfig.model_validate(
+    cfg = parse_warehouse_config(
         {"type": "duckdb", "path": str(tmp_path / "t.duckdb"), "schema": "main"}
     )
     with create_adapter(cfg) as adapter:

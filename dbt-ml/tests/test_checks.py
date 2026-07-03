@@ -7,10 +7,9 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from dbt_ml.adapters import WarehouseAdapter, create_adapter
+from dbt_ml.adapters import WarehouseAdapter, create_adapter, parse_warehouse_config
 from dbt_ml.checks import run_project_tests
 from dbt_ml.checks.schema import TestResult, UnknownTestError, evaluate_test_spec
-from dbt_ml.config.profile import WarehouseConfig
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoices
 
@@ -29,7 +28,7 @@ def fresh_project(tmp_path: Path, example_project_dir: Path) -> Path:
 @pytest.fixture
 def populated_db(tmp_path: Path) -> Iterator[WarehouseAdapter]:
     """Adapter with a small `items` table — used to exercise schema tests."""
-    cfg = WarehouseConfig.model_validate(
+    cfg = parse_warehouse_config(
         {"type": "duckdb", "path": str(tmp_path / "t.duckdb"), "schema": "main"}
     )
     with create_adapter(cfg) as adapter:

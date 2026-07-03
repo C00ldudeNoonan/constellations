@@ -171,7 +171,7 @@ my_project:
     prod:
       warehouse:
         type: duckdb
-        path: /data/prod/dbt_ml.duckdb
+        path: "{{ env_var('DBT_ML_PROD_DB', '/data/prod/dbt_ml.duckdb') }}"
         schema: my_project_prod
       llm:
         model: claude-sonnet-4-6
@@ -180,6 +180,13 @@ my_project:
 
 Lookup order: `--profiles-dir` flag → `$DBT_ML_PROFILES_DIR` →
 `<project>/profiles.yml` → `~/.dbt_ml/profiles.yml`.
+
+String values support `{{ env_var('NAME') }}` and
+`{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
+profiles need, so credentials and per-environment paths stay out of the file.
+An unset variable with no default is a load-time error. Each `warehouse:`
+block is validated against the config schema of the adapter named by `type:`;
+unknown types and typo'd fields fail at resolve time with the adapter named.
 
 ## Built-in text preprocessing
 

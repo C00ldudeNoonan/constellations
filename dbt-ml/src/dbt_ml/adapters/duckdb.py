@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import duckdb
 import polars as pl
@@ -9,6 +9,17 @@ import polars as pl
 from ..config.profile import WarehouseConfig
 from .base import AdapterError, WarehouseAdapter
 from .registry import register
+
+
+class DuckDBWarehouseConfig(WarehouseConfig):
+    type: Literal["duckdb"] = "duckdb"
+    path: Path
+
+    def absolutize(self, project_dir: Path) -> DuckDBWarehouseConfig:
+        return self.model_copy(update={"path": (project_dir / self.path).resolve()})
+
+    def location(self) -> str:
+        return str(self.path)
 
 
 @register
@@ -28,6 +39,10 @@ class DuckDBAdapter(WarehouseAdapter):
     @classmethod
     def adapter_type(cls) -> str:
         return "duckdb"
+
+    @classmethod
+    def config_model(cls) -> type[WarehouseConfig]:
+        return DuckDBWarehouseConfig
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
@@ -287,7 +302,9 @@ class DuckDBAdapter(WarehouseAdapter):
     # ─── internals ───────────────────────────────────────────────────────
 
     def _resolved_path(self) -> Path:
-        path = self.config.path
+        config = self.config
+        assert isinstance(config, DuckDBWarehouseConfig)
+        path = config.path
         if path.is_absolute() or self.project_dir is None:
             return path.resolve()
         return (self.project_dir / path).resolve()

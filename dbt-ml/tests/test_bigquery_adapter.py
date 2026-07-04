@@ -75,9 +75,9 @@ def test_keyfile_absolutized_relative_to_project(tmp_path: Path) -> None:
 # ─── SQL dialect ────────────────────────────────────────────────────────────
 
 
-def _adapter(client: Any = None) -> BigQueryAdapter:
+def _adapter(client: Any = None, **cfg_extra: Any) -> BigQueryAdapter:
     cfg = parse_warehouse_config(
-        {"type": "bigquery", "project": "proj", "dataset": "ds"}
+        {"type": "bigquery", "project": "proj", "dataset": "ds", **cfg_extra}
     )
     adapter = create_adapter(cfg)
     assert isinstance(adapter, BigQueryAdapter)
@@ -151,22 +151,26 @@ class _FakeJob:
     def __init__(self, rows: list[tuple] | None = None, affected: int | None = None):
         self._rows = [_FakeRow(r) for r in (rows or [])]
         self.num_dml_affected_rows = affected
+        self.result_timeout: Any = "unset"
 
-    def result(self) -> list[_FakeRow]:
+    def result(self, timeout: Any = None) -> list[_FakeRow]:
+        self.result_timeout = timeout
         return list(self._rows)
 
 
 class _FakeClient:
     def __init__(self) -> None:
         self.queries: list[tuple[str, Any]] = []
+        self.query_kwargs: list[dict[str, Any]] = []
         self.loads: list[tuple[bytes, str, Any]] = []
         self.tables: dict[str, list[str]] = {}
         self.listing: list[str] = []
         self.dropped: list[str] = []
         self.query_results: list[_FakeJob] = []
 
-    def query(self, sql: str, job_config: Any = None) -> _FakeJob:
+    def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
         self.queries.append((sql, job_config))
+        self.query_kwargs.append(kwargs)
         return self.query_results.pop(0) if self.query_results else _FakeJob()
 
     def load_table_from_file(
@@ -378,3 +382,204 @@ def test_integration_full_round_trip() -> None:
             assert adapter.list_tables() == ["docs"]
     finally:
         adapter.clean()
+
+
+# ─── auth parity with dbt-bigquery ──────────────────────────────────────────
+
+
+def test_auth_method_inference() -> None:
+    assert _bq_cfg().method == "oauth"
+    assert _bq_cfg(keyfile="./sa.json").method == "service-account"
+    assert _bq_cfg(keyfile_json={"type": "service_account"}).method == (
+        "service-account-json"
+    )
+    assert _bq_cfg(token="tok").method == "oauth-secrets"
+
+
+def _bq_cfg(**extra: Any) -> BigQueryWarehouseConfig:
+    cfg = parse_warehouse_config({"type": "bigquery", "project": "p", **extra})
+    assert isinstance(cfg, BigQueryWarehouseConfig)
+    return cfg
+
+
+def test_auth_method_mismatch_rejected() -> None:
+    with pytest.raises(AdapterError, match="conflicts"):
+        _bq_cfg(method="oauth", keyfile="./sa.json")
+
+
+def test_service_account_requires_keyfile() -> None:
+    with pytest.raises(AdapterError, match="keyfile"):
+        _bq_cfg(method="service-account")
+
+
+def test_keyfile_and_keyfile_json_conflict() -> None:
+    with pytest.raises(AdapterError, match="not both"):
+        _bq_cfg(keyfile="./sa.json", keyfile_json={"a": 1})
+
+
+def test_oauth_secrets_requires_token_or_full_refresh_set() -> None:
+    with pytest.raises(AdapterError, match="oauth-secrets"):
+        _bq_cfg(method="oauth-secrets", refresh_token="r", client_id="c")
+    cfg = _bq_cfg(
+        refresh_token="r", client_id="c", client_secret="s",
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    assert cfg.method == "oauth-secrets"
+
+
+def test_default_scopes_match_dbt_bigquery() -> None:
+    from dbt_ml.adapters.bigquery import DEFAULT_SCOPES
+
+    assert _bq_cfg().scopes == list(DEFAULT_SCOPES)
+    assert len(DEFAULT_SCOPES) == 3
+
+
+def test_parse_keyfile_json_forms() -> None:
+    import base64
+    import json
+
+    from dbt_ml.adapters.bigquery import parse_keyfile_json
+
+    info = {"type": "service_account", "project_id": "p"}
+    assert parse_keyfile_json(info) == info
+    assert parse_keyfile_json(json.dumps(info)) == info
+    encoded = base64.b64encode(json.dumps(info).encode()).decode()
+    assert parse_keyfile_json(encoded) == info
+    with pytest.raises(AdapterError, match="keyfile_json"):
+        parse_keyfile_json("not json at all !!")
+    with pytest.raises(AdapterError, match="JSON object"):
+        parse_keyfile_json('["a", "list"]')
+
+
+def test_credentials_service_account_json_scopes_and_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.oauth2 import service_account
+
+    captured: dict[str, Any] = {}
+
+    class _FakeCreds:
+        def with_quota_project(self, qp: str) -> _FakeCreds:
+            captured["quota_project"] = qp
+            return self
+
+    def fake_from_info(info: dict, scopes: Any = None) -> _FakeCreds:
+        captured["info"] = info
+        captured["scopes"] = scopes
+        return _FakeCreds()
+
+    monkeypatch.setattr(
+        service_account.Credentials,
+        "from_service_account_info",
+        staticmethod(fake_from_info),
+    )
+    adapter = _adapter(
+        keyfile_json={"type": "service_account"}, quota_project="bill-here"
+    )
+    creds = adapter._credentials()
+    assert isinstance(creds, _FakeCreds)
+    assert captured["info"] == {"type": "service_account"}
+    assert list(captured["scopes"]) == _bq_cfg().scopes
+    assert captured["quota_project"] == "bill-here"
+
+
+def test_credentials_impersonation_wraps_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.auth import impersonated_credentials
+    from google.oauth2 import service_account
+
+    captured: dict[str, Any] = {}
+
+    class _FakeSource:
+        pass
+
+    class _FakeImpersonated:
+        def __init__(
+            self, source_credentials: Any, target_principal: str, target_scopes: list
+        ) -> None:
+            captured["source"] = source_credentials
+            captured["principal"] = target_principal
+
+    monkeypatch.setattr(
+        service_account.Credentials,
+        "from_service_account_file",
+        staticmethod(lambda path, scopes=None: _FakeSource()),
+    )
+    monkeypatch.setattr(impersonated_credentials, "Credentials", _FakeImpersonated)
+
+    adapter = _adapter(
+        keyfile="./sa.json",
+        impersonate_service_account="runner@proj.iam.gserviceaccount.com",
+    )
+    creds = adapter._credentials()
+    assert isinstance(creds, _FakeImpersonated)
+    assert isinstance(captured["source"], _FakeSource)
+    assert captured["principal"] == "runner@proj.iam.gserviceaccount.com"
+
+
+# ─── execution / billing options ────────────────────────────────────────────
+
+
+def test_default_job_config_priority_and_cost_cap() -> None:
+    adapter = _adapter(priority="batch", maximum_bytes_billed=10**9)
+    job_config = adapter._default_job_config()
+    assert job_config.priority == "BATCH"
+    assert job_config.maximum_bytes_billed == 10**9
+
+    assert _adapter()._default_job_config() is None
+
+
+def test_execution_project_bills_elsewhere_data_stays_qualified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+
+    captured: dict[str, Any] = {}
+
+    class _FakeCreds:
+        pass
+
+    monkeypatch.setattr(
+        service_account.Credentials,
+        "from_service_account_info",
+        staticmethod(lambda info, scopes=None: _FakeCreds()),
+    )
+
+    def fake_client(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "client"
+
+    monkeypatch.setattr(bigquery, "Client", fake_client)
+
+    adapter = _adapter(
+        keyfile_json={"type": "service_account"}, execution_project="billing-proj"
+    )
+    assert adapter._make_client() == "client"
+    assert captured["project"] == "billing-proj"
+    # table refs still point at the data project
+    assert adapter.table_ref("docs") == "`proj`.`ds`.`docs`"
+
+
+def test_job_retry_and_timeout_wiring() -> None:
+    client = _FakeClient()
+    adapter = _adapter(
+        client,
+        job_retries=0,
+        job_creation_timeout_seconds=7.0,
+        job_execution_timeout_seconds=99.0,
+    )
+    job = adapter._run_query("SELECT 1")
+    assert client.query_kwargs[0]["timeout"] == 7.0
+    assert client.query_kwargs[0]["job_retry"] is None
+    assert job.result_timeout == 99.0
+
+
+def test_job_retry_deadline_applied() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client, job_retry_deadline_seconds=120.0)
+    adapter._run_query("SELECT 1")
+    job_retry = client.query_kwargs[0]["job_retry"]
+    assert job_retry is not None
+    assert job_retry._deadline == 120.0

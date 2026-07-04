@@ -183,8 +183,18 @@ Lookup order: `--profiles-dir` flag → `$DBT_ML_PROFILES_DIR` →
 
 ### BigQuery
 
-Install the extra, then point a target at a GCP project. Credentials come
-from Application Default Credentials, or a service-account `keyfile:`.
+Install the extra, then point a target at a GCP project. Profile fields
+mirror dbt-bigquery, so an existing dbt profile ports over: auth via ADC
+(`method: oauth`, the default), `keyfile:` (service-account),
+`keyfile_json:` (inline/base64 JSON — CI-friendly with `env_var()`), or
+`token`/`refresh_token` + client secrets (`oauth-secrets`), plus
+`impersonate_service_account`, `scopes`, `execution_project`,
+`quota_project`, `priority`, `maximum_bytes_billed`, and the
+`job_retries` / `job_retry_deadline_seconds` /
+`job_creation_timeout_seconds` / `job_execution_timeout_seconds` knobs.
+`method:` may be omitted — it's inferred from which credential fields are
+set. (dbt's `dataproc_*` fields don't apply: dbt-ml transforms run
+in-process, not on Dataproc.)
 
 ```
 pip install 'dbt-ml[bigquery]'

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import polars as pl
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 
 from ..config.profile import WarehouseConfig
 from .base import AdapterError, WarehouseAdapter
@@ -51,15 +51,30 @@ def _not_found_error() -> type[Exception]:
     return NotFound
 
 
+# dbt-bigquery's default scopes, kept identical so profiles port over unchanged.
+DEFAULT_SCOPES = (
+    "https://www.googleapis.com/auth/bigquery",
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/drive",
+)
+
+AuthMethod = Literal["oauth", "service-account", "service-account-json", "oauth-secrets"]
+
+
 class BigQueryWarehouseConfig(WarehouseConfig):
-    """profiles.yml:
+    """Field names mirror dbt-bigquery's profile so existing dbt profiles
+    port over. `method:` may be omitted — it is inferred from which
+    credential fields are present (keyfile → service-account, keyfile_json →
+    service-account-json, token/refresh_token → oauth-secrets, else oauth/ADC).
+
+    profiles.yml:
 
     warehouse:
       type: bigquery
       project: my-gcp-project
       dataset: dbt_ml            # `schema:` works too
       location: US               # optional BigQuery region
-      keyfile: ./sa.json         # optional service-account JSON; omit for ADC
+      keyfile: ./sa.json         # service-account file auth; omit for ADC
     """
 
     type: Literal["bigquery"] = "bigquery"
@@ -70,7 +85,64 @@ class BigQueryWarehouseConfig(WarehouseConfig):
         serialization_alias="schema",
     )
     location: str | None = None
+
+    # ─── auth (dbt-bigquery parity) ───────────────────────────────────────
+    method: AuthMethod | None = None
     keyfile: Path | None = None
+    keyfile_json: dict[str, Any] | str | None = None  # dict, JSON, or base64 JSON
+    token: str | None = None
+    refresh_token: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    token_uri: str | None = None
+    impersonate_service_account: str | None = None
+    scopes: list[str] = Field(default_factory=lambda: list(DEFAULT_SCOPES))
+
+    # ─── execution / billing (dbt-bigquery parity) ────────────────────────
+    execution_project: str | None = None
+    quota_project: str | None = None
+    priority: Literal["interactive", "batch"] | None = None
+    maximum_bytes_billed: int | None = None
+    job_retries: int = 1
+    job_retry_deadline_seconds: float | None = None
+    job_creation_timeout_seconds: float | None = None
+    job_execution_timeout_seconds: float | None = None
+
+    @model_validator(mode="after")
+    def _resolve_auth_method(self) -> BigQueryWarehouseConfig:
+        if self.keyfile is not None and self.keyfile_json is not None:
+            raise ValueError("set either `keyfile` or `keyfile_json`, not both")
+        inferred: AuthMethod
+        if self.keyfile is not None:
+            inferred = "service-account"
+        elif self.keyfile_json is not None:
+            inferred = "service-account-json"
+        elif self.token or self.refresh_token:
+            inferred = "oauth-secrets"
+        else:
+            inferred = "oauth"
+        if self.method is None:
+            self.method = inferred
+        elif self.method != inferred and inferred != "oauth":
+            raise ValueError(
+                f"method '{self.method}' conflicts with the credential fields "
+                f"provided (which imply '{inferred}')"
+            )
+
+        if self.method == "service-account" and self.keyfile is None:
+            raise ValueError("method 'service-account' requires `keyfile`")
+        if self.method == "service-account-json" and self.keyfile_json is None:
+            raise ValueError("method 'service-account-json' requires `keyfile_json`")
+        if self.method == "oauth-secrets":
+            has_refresh_set = all(
+                (self.refresh_token, self.client_id, self.client_secret, self.token_uri)
+            )
+            if not self.token and not has_refresh_set:
+                raise ValueError(
+                    "method 'oauth-secrets' requires `token`, or all of "
+                    "`refresh_token`, `client_id`, `client_secret`, `token_uri`"
+                )
+        return self
 
     def absolutize(self, project_dir: Path) -> BigQueryWarehouseConfig:
         if self.keyfile is None:
@@ -84,6 +156,28 @@ class BigQueryWarehouseConfig(WarehouseConfig):
 
     def catalog_name(self) -> str:
         return self.project
+
+
+def parse_keyfile_json(value: dict[str, Any] | str) -> dict[str, Any]:
+    """`keyfile_json` accepts a YAML mapping, a JSON string, or base64-encoded
+    JSON (matching dbt-bigquery, where CI pipelines inject it via env vars)."""
+    import base64
+    import json
+
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        try:
+            parsed = json.loads(base64.b64decode(value, validate=True))
+        except Exception as e:
+            raise AdapterError(
+                "keyfile_json must be a mapping, a JSON string, or base64-encoded JSON"
+            ) from e
+    if not isinstance(parsed, dict):
+        raise AdapterError("keyfile_json must decode to a JSON object")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -187,18 +281,79 @@ class BigQueryAdapter(WarehouseAdapter):
             raise AdapterError("Adapter must be used as a context manager")
         return self._client
 
+    def _credentials(self) -> Any:
+        """Build google credentials per the configured auth method, then apply
+        impersonation and quota-project wrapping — mirroring dbt-bigquery."""
+        cfg = self._cfg
+        scopes = tuple(cfg.scopes)
+        try:
+            if cfg.method == "service-account":
+                from google.oauth2 import service_account
+
+                creds = service_account.Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
+                    str(cfg.keyfile), scopes=scopes
+                )
+            elif cfg.method == "service-account-json":
+                from google.oauth2 import service_account
+
+                assert cfg.keyfile_json is not None
+                creds = service_account.Credentials.from_service_account_info(  # type: ignore[no-untyped-call]
+                    parse_keyfile_json(cfg.keyfile_json), scopes=scopes
+                )
+            elif cfg.method == "oauth-secrets":
+                from google.oauth2.credentials import Credentials as UserCredentials
+
+                creds = UserCredentials(  # type: ignore[no-untyped-call]
+                    token=cfg.token,
+                    refresh_token=cfg.refresh_token,
+                    client_id=cfg.client_id,
+                    client_secret=cfg.client_secret,
+                    token_uri=cfg.token_uri,
+                    scopes=scopes,
+                )
+            else:  # oauth: gcloud Application Default Credentials
+                import google.auth
+
+                creds, _ = google.auth.default(scopes=scopes)
+
+            if cfg.impersonate_service_account:
+                from google.auth import impersonated_credentials
+
+                creds = impersonated_credentials.Credentials(  # type: ignore[no-untyped-call]
+                    source_credentials=creds,
+                    target_principal=cfg.impersonate_service_account,
+                    target_scopes=list(scopes),
+                )
+            if cfg.quota_project:
+                creds = creds.with_quota_project(cfg.quota_project)
+        except ImportError as e:
+            raise AdapterError(_INSTALL_HINT) from e
+        return creds
+
+    def _default_job_config(self) -> Any | None:
+        """Client-level QueryJobConfig defaults (priority, cost cap); BigQuery
+        merges these into every query job unless overridden per call."""
+        cfg = self._cfg
+        if cfg.priority is None and cfg.maximum_bytes_billed is None:
+            return None
+        bigquery = _bigquery()
+        job_config = bigquery.QueryJobConfig()
+        if cfg.priority is not None:
+            job_config.priority = cfg.priority.upper()
+        if cfg.maximum_bytes_billed is not None:
+            job_config.maximum_bytes_billed = cfg.maximum_bytes_billed
+        return job_config
+
     def _make_client(self) -> Any:
         bigquery = _bigquery()
         cfg = self._cfg
-        credentials = None
-        if cfg.keyfile is not None:
-            from google.oauth2 import service_account
-
-            credentials = service_account.Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
-                str(cfg.keyfile)
-            )
+        # execution_project bills the queries; data still lives in `project`
+        # (all table refs are fully qualified with the data project).
         return bigquery.Client(
-            project=cfg.project, credentials=credentials, location=cfg.location
+            project=cfg.execution_project or cfg.project,
+            credentials=self._credentials(),
+            location=cfg.location,
+            default_query_job_config=self._default_job_config(),
         )
 
     def _connect(self) -> None:
@@ -256,13 +411,24 @@ class BigQueryAdapter(WarehouseAdapter):
 
     def _run_query(self, sql: str, params: list[Any] | None = None) -> Any:
         bigquery = _bigquery()
-        job_config = None
+        cfg = self._cfg
+        kwargs: dict[str, Any] = {}
         if params:
-            job_config = bigquery.QueryJobConfig(
+            kwargs["job_config"] = bigquery.QueryJobConfig(
                 query_parameters=to_query_parameters(params)
             )
-        job = self.client.query(sql, job_config=job_config)
-        job.result()
+        if cfg.job_creation_timeout_seconds is not None:
+            kwargs["timeout"] = cfg.job_creation_timeout_seconds
+        if cfg.job_retries == 0:
+            kwargs["job_retry"] = None
+        elif cfg.job_retry_deadline_seconds is not None:
+            from google.cloud.bigquery.retry import DEFAULT_JOB_RETRY
+
+            kwargs["job_retry"] = DEFAULT_JOB_RETRY.with_deadline(
+                cfg.job_retry_deadline_seconds
+            )
+        job = self.client.query(sql, **kwargs)
+        job.result(timeout=cfg.job_execution_timeout_seconds)
         return job
 
     def execute(self, sql: str, params: list[Any] | None = None) -> Any:

@@ -1,4 +1,7 @@
-from . import duckdb  # noqa: F401  # side-effect: registers DuckDBAdapter
+from . import (
+    bigquery,  # noqa: F401  # side-effect: registers BigQueryAdapter
+    duckdb,  # noqa: F401  # side-effect: registers DuckDBAdapter
+)
 from .base import AdapterError, WarehouseAdapter
 from .registry import (
     UnknownAdapterError,

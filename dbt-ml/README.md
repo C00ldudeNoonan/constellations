@@ -181,6 +181,34 @@ my_project:
 Lookup order: `--profiles-dir` flag → `$DBT_ML_PROFILES_DIR` →
 `<project>/profiles.yml` → `~/.dbt_ml/profiles.yml`.
 
+### BigQuery
+
+Install the extra, then point a target at a GCP project. Credentials come
+from Application Default Credentials, or a service-account `keyfile:`.
+
+```
+pip install 'dbt-ml[bigquery]'
+```
+
+```yaml
+my_project:
+  target: prod
+  outputs:
+    prod:
+      warehouse:
+        type: bigquery
+        project: my-gcp-project
+        dataset: dbt_ml                # `schema:` works too
+        location: US                   # optional
+        # keyfile: "{{ env_var('DBT_ML_BQ_KEYFILE') }}"   # optional; omit for ADC
+```
+
+Materialized tables, `--store-failures` tables, and incremental state all
+live in the configured dataset — no DuckDB involved. `dbt-ml clean` drops
+the whole dataset. `emit-dbt-sources` emits `database: <project>` /
+`schema: <dataset>` so a dbt-bigquery project can consume the tables
+directly.
+
 String values support `{{ env_var('NAME') }}` and
 `{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
 profiles need, so credentials and per-environment paths stay out of the file.

@@ -18,8 +18,11 @@ class DuckDBWarehouseConfig(WarehouseConfig):
     def absolutize(self, project_dir: Path) -> DuckDBWarehouseConfig:
         return self.model_copy(update={"path": (project_dir / self.path).resolve()})
 
-    def location(self) -> str:
+    def storage_location(self) -> str:
         return str(self.path)
+
+    def catalog_name(self) -> str:
+        return self.path.stem
 
 
 @register

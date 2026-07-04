@@ -25,8 +25,13 @@ class WarehouseConfig(BaseModel):
         """Resolve project-relative paths. Default: nothing to resolve."""
         return self
 
-    def location(self) -> str:
+    def storage_location(self) -> str:
         """Human-readable storage location (file path, DSN, dataset, ...)."""
+        return ""
+
+    def catalog_name(self) -> str:
+        """Catalog/database name for SQL references and emitted dbt sources
+        (DuckDB: database file stem; BigQuery: GCP project)."""
         return ""
 
 

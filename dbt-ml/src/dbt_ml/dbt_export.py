@@ -88,8 +88,8 @@ def write_dbt_sources(
 
 
 def _derive_catalog(warehouse: WarehouseConfig) -> str:
-    """DuckDB catalog name == basename of the database file without extension."""
-    return Path(warehouse.location()).stem
+    """Adapter-specific catalog: DuckDB file stem, BigQuery project, ..."""
+    return warehouse.catalog_name()
 
 
 def _table_for_model(model: ModelConfig) -> dict[str, Any]:

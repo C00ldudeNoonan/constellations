@@ -38,7 +38,7 @@ def build_manifest(
             "version": project.version,
             "profile": resolved.profile_name,
             "target": resolved.target_name,
-            "duckdb_path": resolved.warehouse.location(),
+            "duckdb_path": resolved.warehouse.storage_location(),
             "duckdb_schema": resolved.warehouse.schema_name,
         },
         "sources": [

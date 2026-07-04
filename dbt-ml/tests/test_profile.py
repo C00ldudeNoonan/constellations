@@ -269,7 +269,7 @@ def test_env_var_interpolation(
 
     project, _, _ = load_project(tmp_path)
     resolved = resolve_profile(project, tmp_path)
-    assert resolved.warehouse.location().endswith("from_env.duckdb")
+    assert resolved.warehouse.storage_location().endswith("from_env.duckdb")
     assert resolved.warehouse.schema_name == "fallback_schema"
 
 

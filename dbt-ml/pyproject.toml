@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 bigquery = ["google-cloud-bigquery>=3.25"]
+gcs = ["google-cloud-storage>=2.16"]
 
 [project.scripts]
 dbt-ml = "dbt_ml.cli:main"
@@ -48,8 +49,9 @@ dev = [
     "mypy>=1.10",
     "pip-audit>=2.7",
     "types-pyyaml",
-    # the bigquery extra, so adapter unit tests run against real client types
+    # the bigquery/gcs extras, so adapter unit tests run against real client types
     "google-cloud-bigquery>=3.25",
+    "google-cloud-storage>=2.16",
 ]
 
 [tool.ruff]

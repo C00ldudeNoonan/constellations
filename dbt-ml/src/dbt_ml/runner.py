@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,12 +22,9 @@ from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
 from .profile import ResolvedProfile, resolve_llm_options, resolve_profile
+from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import load_transform
-from .versioning import (
-    compute_code_version,
-    compute_content_hash,
-    compute_document_id,
-)
+from .versioning import compute_code_version
 
 log = logging.getLogger(__name__)
 
@@ -71,12 +69,11 @@ class _SerializedAdapter:
 
 
 @dataclass
-class DocumentRef:
-    source_name: str
-    path: Path
-    relative_path: str
-    document_id: str
-    content_hash: str
+class DiscoveredSource:
+    """A source's backend plus its discovered documents for this run."""
+
+    backend: DocumentSource
+    refs: list[DocumentRef]
 
 
 @dataclass
@@ -125,9 +122,7 @@ def run_project(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
     )
 
-    source_docs: dict[str, list[DocumentRef]] = {
-        s.name: _discover_source(s, project_dir) for s in sources
-    }
+    source_docs = _discover_sources(sources, project_dir)
 
     models_by_name = {m.name: m for m in models}
 
@@ -176,9 +171,7 @@ def build_project(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
     )
 
-    source_docs: dict[str, list[DocumentRef]] = {
-        s.name: _discover_source(s, project_dir) for s in sources
-    }
+    source_docs = _discover_sources(sources, project_dir)
     models_by_name = {m.name: m for m in models}
 
     out = BuildResult()
@@ -252,26 +245,18 @@ def _run_in_batches(
     return results_by_name
 
 
-def _discover_source(source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
-    source_dir = (project_dir / source.path).resolve()
-    if not source_dir.exists():
-        return []
-    pattern = f"**/{source.file_pattern}" if source.recursive else source.file_pattern
-    files = sorted(p for p in source_dir.glob(pattern) if p.is_file())
-    refs: list[DocumentRef] = []
-    for p in files:
-        # POSIX separators so document_id is stable across OSes (issue #67)
-        relative_path = p.relative_to(source_dir).as_posix()
-        refs.append(
-            DocumentRef(
-                source_name=source.name,
-                path=p,
-                relative_path=relative_path,
-                document_id=compute_document_id(source.name, relative_path),
-                content_hash=compute_content_hash(p),
-            )
-        )
-    return refs
+def _discover_sources(
+    sources: list[SourceConfig], project_dir: Path
+) -> dict[str, DiscoveredSource]:
+    out: dict[str, DiscoveredSource] = {}
+    for source in sources:
+        backend = get_document_source(source.path)
+        try:
+            refs = backend.discover(source, project_dir)
+        except SourceError as e:
+            raise RunError(str(e)) from e
+        out[source.name] = DiscoveredSource(backend=backend, refs=refs)
+    return out
 
 
 def _run_model(
@@ -279,7 +264,7 @@ def _run_model(
     model: ModelConfig,
     project: ProjectConfig,
     project_dir: Path,
-    source_docs: dict[str, list[DocumentRef]],
+    source_docs: dict[str, DiscoveredSource],
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
@@ -324,7 +309,7 @@ def _run_extraction_model(
     model: ModelConfig,
     project: ProjectConfig,
     project_dir: Path,
-    source_docs: dict[str, list[DocumentRef]],
+    source_docs: dict[str, DiscoveredSource],
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
@@ -340,11 +325,13 @@ def _run_extraction_model(
     if not model.source:
         raise RunError(f"Extraction model '{model.name}' must declare a `source:`")
     source_name = parse_ref(model.source)
-    docs = source_docs.get(source_name)
-    if docs is None:
+    discovered = source_docs.get(source_name)
+    if discovered is None:
         raise RunError(
             f"Model '{model.name}' references unknown source '{source_name}'"
         )
+    docs = discovered.refs
+    source_backend = discovered.backend
 
     code_version = compute_code_version(
         extraction=model.extraction,
@@ -377,18 +364,27 @@ def _run_extraction_model(
     rows: list[dict[str, Any]] = []
     state_records: list[tuple[str, str, str]] = []
 
-    def _one(doc: DocumentRef) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
-        try:
-            return doc, backend.extract(doc.path, options), None
-        except Exception as e:
-            log.debug("extraction failed for %s", doc.path, exc_info=True)
-            return doc, None, f"{type(e).__name__}: {e}"
+    # Remote sources download into a per-model scratch dir, lazily and only
+    # for documents that actually need processing; local sources pass their
+    # real path through untouched.
+    with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
+        work_dir = Path(scratch)
 
-    if threads > 1 and len(docs_to_process) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
-            extracted = list(ex.map(_one, docs_to_process))
-    else:
-        extracted = [_one(d) for d in docs_to_process]
+        def _one(
+            doc: DocumentRef,
+        ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
+            try:
+                local_path = source_backend.fetch(doc, work_dir)
+                return doc, backend.extract(local_path, options), None
+            except Exception as e:
+                log.debug("extraction failed for %s", doc.relative_path, exc_info=True)
+                return doc, None, f"{type(e).__name__}: {e}"
+
+        if threads > 1 and len(docs_to_process) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                extracted = list(ex.map(_one, docs_to_process))
+        else:
+            extracted = [_one(d) for d in docs_to_process]
 
     for doc, result, err in extracted:
         if err is not None or result is None:
@@ -441,6 +437,12 @@ def _row_for_extraction(
         "content_hash": doc.content_hash,
         "code_version": code_version,
     }
+    # Remote sources carry lineage back to the exact object version. Local
+    # rows keep their existing shape (adding columns would force incremental
+    # users through a schema change).
+    if doc.source_uri is not None:
+        row["source_uri"] = doc.source_uri
+        row["source_metadata"] = json.dumps(doc.source_metadata or {}, default=str)
     for key, value in result.fields.items():
         row[key] = _scalarize(value)
     return row

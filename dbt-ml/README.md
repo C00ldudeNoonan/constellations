@@ -226,6 +226,43 @@ An unset variable with no default is a load-time error. Each `warehouse:`
 block is validated against the config schema of the adapter named by `type:`;
 unknown types and typo'd fields fail at resolve time with the adapter named.
 
+## GCS sources
+
+Sources can point at Google Cloud Storage instead of local directories —
+raw documents stay in the bucket, dbt-ml materializes into the warehouse:
+
+```
+pip install 'dbt-ml[gcs]'
+```
+
+```yaml
+# sources/filings.yml
+version: 2
+sources:
+  - name: sec_filings
+    path: gs://econ-raw/sec/10k        # bucket + prefix
+    file_pattern: "*.html"             # basename match; "2026/*.html" matches paths
+    max_objects: 20000                 # listing bound (default 5000)
+
+  - name: fomc_transcripts
+    path: gs://econ-raw/fomc
+    file_pattern: "*.pdf"
+    freshness:
+      warn_after: { count: 45, period: day }
+```
+
+Incremental identity comes from the object listing (md5 → crc32c →
+generation), so unchanged objects are skipped **without downloading
+anything**; changed objects are fetched generation-pinned into a per-run
+scratch directory. Extraction rows gain `source_uri`
+(`gs://bucket/name#generation` — exact lineage to the raw object version)
+and a `source_metadata` JSON column (size, updated, content type, hashes).
+`source freshness` uses object `updated` timestamps.
+
+Auth is Application Default Credentials: `gcloud auth application-default
+login` locally, or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
+service-account JSON in CI.
+
 ## Built-in text preprocessing
 
 Reference any of these as a Python transform module — no project-local code

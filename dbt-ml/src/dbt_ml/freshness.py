@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import load_project
 from .config.source import SourceConfig
-from .sources import SourceError, get_document_source
+from .sources import get_document_source
 
 
 @dataclass
@@ -34,17 +34,9 @@ def check_freshness(project_dir: Path) -> list[FreshnessResult]:
 
 def _check_one(source: SourceConfig, project_dir: Path) -> FreshnessResult:
     backend = get_document_source(source.path)
-    try:
-        scan = backend.scan(source, project_dir)
-    except SourceError as e:
-        return FreshnessResult(
-            source_name=source.name,
-            status="no_data",
-            newest_age_seconds=None,
-            newest_file=None,
-            file_count=0,
-            message=str(e),
-        )
+    # SourceError (bad path, auth, max_objects cap) propagates: a broken
+    # source must fail the command, not report a passing no_data.
+    scan = backend.scan(source, project_dir)
     if not scan.exists or scan.file_count == 0 or scan.newest_epoch is None:
         return FreshnessResult(
             source_name=source.name,

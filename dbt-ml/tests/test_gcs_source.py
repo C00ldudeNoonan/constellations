@@ -183,7 +183,27 @@ def test_bounded_listing_raises(tmp_path: Path) -> None:
         src.discover(_cfg(max_objects=3), tmp_path)
     # and the listing itself was capped, not just post-filtered
     client = src._client
-    assert client.list_calls[-1] == ("bkt", "raw/sec", 4)
+    assert client.list_calls[-1] == ("bkt", "raw/sec/", 4)
+
+
+def test_sibling_prefix_is_not_ingested(tmp_path: Path) -> None:
+    """`gs://bkt/raw/sec` must not match `raw/secret/…` — GCS prefixes are
+    raw string matches, so the source normalizes to a directory boundary
+    (PR #92 review finding)."""
+    blobs = [
+        _FakeBlob("raw/sec/a.html"),
+        _FakeBlob("raw/secret/b.html"),
+        _FakeBlob("raw/sec"),  # object literally named like the prefix
+    ]
+    src = _gcs_source(_FakeStorageClient(blobs))
+    refs = src.discover(_cfg(), tmp_path)
+    assert [r.relative_path for r in refs] == ["a.html"]
+    # the boundary is enforced at the listing API, not just post-filtered
+    assert src._client.list_calls[-1][1] == "raw/sec/"
+
+    # a trailing slash in the configured path behaves identically
+    refs = src.discover(_cfg(path="gs://bkt/raw/sec/"), tmp_path)
+    assert [r.relative_path for r in refs] == ["a.html"]
 
 
 # ─── fetch ──────────────────────────────────────────────────────────────────
@@ -316,6 +336,26 @@ def test_freshness_for_gcs_source(
     assert results[0].status == "pass"
     assert results[0].newest_file == "aapl.json"
     assert results[0].file_count == 1
+
+
+def test_freshness_propagates_source_errors(
+    gcs_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken source (here: the max_objects cap) must fail `source
+    freshness`, not report a passing no_data (PR #92 review finding)."""
+    client = _FakeStorageClient(
+        [_json_blob("raw/a.json", 1), _json_blob("raw/b.json", 1)]
+    )
+    monkeypatch.setattr(GCSDocumentSource, "_make_client", lambda self: client)
+    filings = gcs_project / "sources" / "filings.yml"
+    filings.write_text(
+        filings.read_text().replace(
+            "    file_pattern: '*.json'\n",
+            "    file_pattern: '*.json'\n    max_objects: 1\n",
+        )
+    )
+    with pytest.raises(SourceError, match="max_objects"):
+        check_freshness(gcs_project)
 
 
 # ─── optional integration (needs real GCS credentials) ─────────────────────

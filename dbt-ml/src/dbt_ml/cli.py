@@ -21,6 +21,7 @@ from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
 from .profile import ProfileError, resolve_profile
 from .runner import BuildResult, RunError, build_project, clean_project, run_project
+from .sources import SourceError
 from .synth import (
     generate_arxiv_papers,
     generate_invoice_pdfs,
@@ -736,7 +737,7 @@ def source_freshness(ctx: click.Context) -> None:
     project_dir: Path = ctx.obj["project_dir"]
     try:
         results = check_freshness(project_dir)
-    except ConfigError as e:
+    except (ConfigError, SourceError) as e:
         raise click.ClickException(str(e)) from e
 
     if not results:

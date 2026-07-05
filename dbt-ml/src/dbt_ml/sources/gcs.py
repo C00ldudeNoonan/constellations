@@ -79,25 +79,31 @@ class GCSDocumentSource(DocumentSource):
 
     def discover(self, source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
         bucket_name, prefix = parse_gcs_path(source.path)
+        # Directory-boundary semantics: GCS prefixes are raw string matches,
+        # so listing `raw/sec` would also return `raw/secret/…`. Normalizing
+        # to a trailing slash keeps sibling prefixes out.
+        list_prefix = f"{prefix.rstrip('/')}/" if prefix else ""
         listed = list(
             self._get_client().list_blobs(
                 bucket_name,
-                prefix=prefix or None,
+                prefix=list_prefix or None,
                 max_results=source.max_objects + 1,
             )
         )
         if len(listed) > source.max_objects:
             raise SourceError(
                 f"Source '{source.name}': more than {source.max_objects} objects "
-                f"under gs://{bucket_name}/{prefix}. Narrow the prefix or raise "
-                "`max_objects` on the source."
+                f"under gs://{bucket_name}/{list_prefix}. Narrow the prefix or "
+                "raise `max_objects` on the source."
             )
 
         refs: list[DocumentRef] = []
         for blob in sorted(listed, key=lambda b: b.name):
             if blob.name.endswith("/"):  # directory placeholder objects
                 continue
-            relative = blob.name.removeprefix(prefix).lstrip("/")
+            if list_prefix and not blob.name.startswith(list_prefix):
+                continue
+            relative = blob.name.removeprefix(list_prefix)
             if not relative or not _matches(
                 relative, source.file_pattern, source.recursive
             ):

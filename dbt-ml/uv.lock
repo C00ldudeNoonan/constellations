@@ -515,10 +515,14 @@ dependencies = [
 bigquery = [
     { name = "google-cloud-bigquery" },
 ]
+gcs = [
+    { name = "google-cloud-storage" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "google-cloud-bigquery" },
+    { name = "google-cloud-storage" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "pytest" },
@@ -538,6 +542,7 @@ requires-dist = [
     { name = "fpdf2", specifier = ">=2.7" },
     { name = "ftfy", specifier = ">=6.2" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3.25" },
+    { name = "google-cloud-storage", marker = "extra == 'gcs'", specifier = ">=2.16" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "langdetect", specifier = ">=1.0" },
     { name = "polars", specifier = ">=1.0" },
@@ -550,11 +555,12 @@ requires-dist = [
     { name = "tiktoken", specifier = ">=0.7" },
     { name = "watchfiles", specifier = ">=0.21" },
 ]
-provides-extras = ["bigquery"]
+provides-extras = ["bigquery", "gcs"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "google-cloud-bigquery", specifier = ">=3.25" },
+    { name = "google-cloud-storage", specifier = ">=2.16" },
     { name = "mypy", specifier = ">=1.10" },
     { name = "pip-audit", specifier = ">=2.7" },
     { name = "pytest", specifier = ">=8" },
@@ -775,6 +781,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a8/dd/1eef226e470369b26824a505c34482c0b493bc35fe8e0c6b003b5feca21a/google_cloud_core-2.6.0.tar.gz", hash = "sha256:e76149739f90fac1fc6757c09f47eaccb3145b54adbd7759b0f7c4b235f46c83", size = 36001, upload-time = "2026-05-07T08:04:04.124Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/4a/98da8930ab109c73d9a5d13782a9ebb81ea8c111f6d534a567b71d23e52b/google_cloud_core-2.6.0-py3-none-any.whl", hash = "sha256:6d63ac8e5eca6d9e4319d0a1e2265fadcd7f1049904378caecfa01cf52dd869e", size = 29390, upload-time = "2026-05-07T08:02:34.672Z" },
+]
+
+[[package]]
+name = "google-cloud-storage"
+version = "3.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core" },
+    { name = "google-auth" },
+    { name = "google-cloud-core" },
+    { name = "google-crc32c" },
+    { name = "google-resumable-media" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/58/72/86f94e1639a8bcd9d33e8e01b49afcaa1c3a13bda7683c681717e0901e15/google_cloud_storage-3.12.0.tar.gz", hash = "sha256:03ae9847c6babb368f35f054126b8a08cbc0e3266efb990eb17b9926a45cf3be", size = 17338620, upload-time = "2026-06-12T18:03:29.215Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1b/bd/a89eaebd2f9db5f92ddcc8e4f23c266be1dbd11058bb83451d8dd029f34c/google_cloud_storage-3.12.0-py3-none-any.whl", hash = "sha256:3880773754ddf7c27567b04e2a4d193950b6b99429f37b9097d873686e95b09c", size = 340605, upload-time = "2026-06-12T18:03:12.677Z" },
 ]
 
 [[package]]

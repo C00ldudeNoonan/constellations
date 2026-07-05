@@ -24,9 +24,11 @@ class FreshnessConfig(BaseModel):
 class SourceConfig(BaseModel):
     name: str
     description: str | None = None
-    path: str
+    path: str  # project-relative directory, or gs://bucket/prefix
     file_pattern: str = "*.json"
     recursive: bool = True
+    # Bound on remote listings so a typo'd prefix can't crawl a whole bucket.
+    max_objects: int = 5000
     tags: list[str] = Field(default_factory=list)
     freshness: FreshnessConfig | None = None
 

@@ -1,4 +1,8 @@
-"""Source freshness: warn / error when source files are too old."""
+"""Source freshness: warn / error when source documents are too old.
+
+Works for any document source (local mtimes, GCS `updated` timestamps) via
+the DocumentSource.scan() seam.
+"""
 from __future__ import annotations
 
 import time
@@ -7,6 +11,7 @@ from pathlib import Path
 
 from .config import load_project
 from .config.source import SourceConfig
+from .sources import get_document_source
 
 
 @dataclass
@@ -28,33 +33,22 @@ def check_freshness(project_dir: Path) -> list[FreshnessResult]:
 
 
 def _check_one(source: SourceConfig, project_dir: Path) -> FreshnessResult:
-    source_dir = (project_dir / source.path).resolve()
-    if not source_dir.exists():
+    backend = get_document_source(source.path)
+    # SourceError (bad path, auth, max_objects cap) propagates: a broken
+    # source must fail the command, not report a passing no_data.
+    scan = backend.scan(source, project_dir)
+    if not scan.exists or scan.file_count == 0 or scan.newest_epoch is None:
         return FreshnessResult(
             source_name=source.name,
             status="no_data",
             newest_age_seconds=None,
             newest_file=None,
-            file_count=0,
-            message=f"source path does not exist: {source_dir}",
+            file_count=scan.file_count,
+            message=scan.message or "no matching files",
         )
 
-    pattern = f"**/{source.file_pattern}" if source.recursive else source.file_pattern
-    files = [p for p in source_dir.glob(pattern) if p.is_file()]
-    if not files:
-        return FreshnessResult(
-            source_name=source.name,
-            status="no_data",
-            newest_age_seconds=None,
-            newest_file=None,
-            file_count=0,
-            message="no matching files",
-        )
-
-    now = time.time()
-    newest = max(files, key=lambda p: p.stat().st_mtime)
-    age = now - newest.stat().st_mtime
-    relative = newest.relative_to(source_dir).as_posix()
+    age = time.time() - scan.newest_epoch
+    relative = scan.newest_name
 
     if source.freshness is None:
         return FreshnessResult(
@@ -62,7 +56,7 @@ def _check_one(source: SourceConfig, project_dir: Path) -> FreshnessResult:
             status="pass",
             newest_age_seconds=age,
             newest_file=relative,
-            file_count=len(files),
+            file_count=scan.file_count,
             message="no freshness thresholds configured",
         )
 
@@ -88,7 +82,7 @@ def _check_one(source: SourceConfig, project_dir: Path) -> FreshnessResult:
         status=status,
         newest_age_seconds=age,
         newest_file=relative,
-        file_count=len(files),
+        file_count=scan.file_count,
         message=msg,
     )
 

@@ -35,9 +35,9 @@ class HtmlBackend(BaseBackend):
         include_structure: Emit `sections` (heading hierarchy with char offsets
                            into the text field, plus anchor ids) and `tables`
                            (cell matrices with char offsets) as JSON — enough
-                           for a downstream section parser (e.g. SEC Item
-                           splitting) to slice the document without touching
-                           HTML again (default False).
+                           for a downstream section parser to slice the
+                           document without touching HTML again
+                           (default False).
         selectors:         dict of {field_name: css_selector}. First match's text
                            per selector is emitted; missing selectors yield None
                            with a warning.

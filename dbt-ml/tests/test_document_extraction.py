@@ -1,9 +1,9 @@
 """Structure-preserving extraction + the common output contract (issue #85).
 
-SEC-shaped HTML must yield sections/tables a downstream Item parser can
-slice by char offset; FOMC-shaped PDFs must yield page offsets a speaker
-parser can attribute matches to; every extraction row must carry lineage
-and parser identity.
+Sectioned HTML documents must yield sections/tables a downstream section
+parser can slice by char offset; multi-page PDFs must yield page offsets a
+transcript-style parser can attribute matches to; every extraction row must
+carry lineage and parser identity.
 """
 from __future__ import annotations
 
@@ -20,48 +20,48 @@ from dbt_ml.backends import get_backend
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-# ─── SEC HTML: structure ────────────────────────────────────────────────────
+# ─── HTML: structure ────────────────────────────────────────────────────────
 
 
-def _extract_sec(**options: Any) -> dict[str, Any]:
+def _extract_report(**options: Any) -> dict[str, Any]:
     backend = get_backend("html")
     result = backend.extract(
-        FIXTURES / "sec_10k_snippet.html", {"include_structure": True, **options}
+        FIXTURES / "annual_report_snippet.html", {"include_structure": True, **options}
     )
     return result.fields
 
 
 def test_sections_carry_levels_offsets_and_anchors() -> None:
-    fields = _extract_sec()
+    fields = _extract_report()
     headings = [(s["level"], s["heading"]) for s in fields["sections"]]
     assert headings == [
         (1, "ACME CORP"),
-        (2, "Item 1. Business"),
-        (2, "Item 1A. Risk Factors"),
-        (2, "Item 7. Management’s Discussion and Analysis"),
+        (2, "1. Business Overview"),
+        (2, "2. Risk Factors"),
+        (2, "3. Management’s Financial Review"),
     ]
     by_heading = {s["heading"]: s for s in fields["sections"]}
-    assert by_heading["Item 1. Business"]["anchor"] == "item1"
-    assert by_heading["Item 1A. Risk Factors"]["anchor"] == "item1a"
+    assert by_heading["1. Business Overview"]["anchor"] == "overview"
+    assert by_heading["2. Risk Factors"]["anchor"] == "risks"
 
 
 def test_section_offsets_slice_the_text() -> None:
-    fields = _extract_sec()
+    fields = _extract_report()
     text, sections = fields["text"], fields["sections"]
-    item1a = next(s for s in sections if s["heading"] == "Item 1A. Risk Factors")
-    item7 = next(s for s in sections if s["heading"].startswith("Item 7"))
+    risks = next(s for s in sections if s["heading"] == "2. Risk Factors")
+    financials = next(s for s in sections if s["heading"].startswith("3."))
 
-    body = text[item1a["char_start"] : item7["char_start"]]
-    assert body.startswith("Item 1A. Risk Factors")
+    body = text[risks["char_start"] : financials["char_start"]]
+    assert body.startswith("2. Risk Factors")
     assert "single customer" in body
-    assert "rocket-powered" not in body  # Item 1 content stays out
+    assert "rocket-powered" not in body  # section 1 content stays out
     # every section starts exactly at its recorded offset
     for s in sections:
         assert text[s["char_start"] :].startswith(s["heading"])
 
 
 def test_tables_extracted_as_cells_with_offsets() -> None:
-    fields = _extract_sec()
+    fields = _extract_report()
     tables = fields["tables"]
     assert len(tables) == 1
     t = tables[0]
@@ -74,21 +74,21 @@ def test_tables_extracted_as_cells_with_offsets() -> None:
 
 
 def test_script_and_style_excluded() -> None:
-    fields = _extract_sec()
+    fields = _extract_report()
     assert "should never appear" not in fields["text"]
     assert ".hidden" not in fields["text"]
 
 
 def test_structured_extraction_is_deterministic() -> None:
-    assert _extract_sec() == _extract_sec()
+    assert _extract_report() == _extract_report()
 
 
 def test_malformed_html_does_not_crash(tmp_path: Path) -> None:
     p = tmp_path / "bad.html"
-    p.write_text("<html><body><h2>Item 1. <b>Business</h2><p>text<table><tr><td>x")
+    p.write_text("<html><body><h2>1. <b>Overview</h2><p>text<table><tr><td>x")
     backend = get_backend("html")
     fields = backend.extract(p, {"include_structure": True}).fields
-    assert fields["sections"][0]["heading"].startswith("Item 1.")
+    assert fields["sections"][0]["heading"].startswith("1.")
     assert fields["tables"][0]["cells"] == [["x"]]
 
 
@@ -104,7 +104,7 @@ def test_empty_html_file(tmp_path: Path) -> None:
 def test_large_html_is_deterministic_and_ordered(tmp_path: Path) -> None:
     parts = ["<html><body>"]
     for i in range(500):
-        parts.append(f"<h2>Item {i}</h2><p>Paragraph body {i}</p>")
+        parts.append(f"<h2>Section {i}</h2><p>Paragraph body {i}</p>")
     parts.append("</body></html>")
     p = tmp_path / "large.html"
     p.write_text("".join(parts))
@@ -118,48 +118,46 @@ def test_large_html_is_deterministic_and_ordered(tmp_path: Path) -> None:
     assert len(starts) == 500
 
 
-# ─── FOMC PDF: pages ────────────────────────────────────────────────────────
+# ─── PDF: pages ─────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
-def fomc_pdf(tmp_path: Path) -> Path:
+def transcript_pdf(tmp_path: Path) -> Path:
     from fpdf import FPDF
 
     pdf = FPDF()
     pdf.set_font("Helvetica", size=11)
     pdf.add_page()
-    pdf.multi_cell(
-        0, 8, "Meeting of the Federal Open Market Committee\nJanuary 28-29, 2026"
-    )
+    pdf.multi_cell(0, 8, "Quarterly Planning Meeting\nJanuary 28-29, 2026")
     pdf.add_page()
     pdf.multi_cell(
         0, 8,
-        "CHAIR POWELL. Good morning, everybody.\n"
-        "MR. WILLIAMS. Thank you, Mr. Chairman.",
+        "CHAIR THOMPSON. Good morning, everybody.\n"
+        "MR. GARCIA. Thank you, Madam Chair.",
     )
     pdf.add_page()
-    pdf.multi_cell(0, 8, "CHAIR POWELL. We are adjourned.")
-    out = tmp_path / "fomc.pdf"
+    pdf.multi_cell(0, 8, "CHAIR THOMPSON. We are adjourned.")
+    out = tmp_path / "transcript.pdf"
     pdf.output(str(out))
     return out
 
 
-def test_pdf_pages_offsets_slice_the_text(fomc_pdf: Path) -> None:
-    fields = get_backend("pdf").extract(fomc_pdf, {"include_pages": True}).fields
+def test_pdf_pages_offsets_slice_the_text(transcript_pdf: Path) -> None:
+    fields = get_backend("pdf").extract(transcript_pdf, {"include_pages": True}).fields
     text, pages = fields["text"], fields["pages"]
     assert [p["page"] for p in pages] == [1, 2, 3]
     assert fields["page_count"] == 3
     for span in pages:
         assert 0 <= span["char_start"] <= span["char_end"] <= len(text)
     page2 = text[pages[1]["char_start"] : pages[1]["char_end"]]
-    assert "MR. WILLIAMS" in page2
+    assert "MR. GARCIA" in page2
     assert "adjourned" not in page2
 
 
-def test_pdf_speaker_turns_attributable_to_pages(fomc_pdf: Path) -> None:
-    """The downstream FOMC pattern: regex over the full text, then page
+def test_pdf_speaker_turns_attributable_to_pages(transcript_pdf: Path) -> None:
+    """The downstream transcript pattern: regex over the full text, then page
     attribution via the offset spans."""
-    fields = get_backend("pdf").extract(fomc_pdf, {"include_pages": True}).fields
+    fields = get_backend("pdf").extract(transcript_pdf, {"include_pages": True}).fields
     text, pages = fields["text"], fields["pages"]
 
     def page_of(pos: int) -> int:
@@ -168,16 +166,19 @@ def test_pdf_speaker_turns_attributable_to_pages(fomc_pdf: Path) -> None:
         )
 
     turns = [(m.group(1), page_of(m.start())) for m in
-             re.finditer(r"(CHAIR POWELL|MR\. WILLIAMS)\.", text)]
-    assert ("CHAIR POWELL", 2) in turns
-    assert ("MR. WILLIAMS", 2) in turns
-    assert ("CHAIR POWELL", 3) in turns
+             re.finditer(r"(CHAIR THOMPSON|MR\. GARCIA)\.", text)]
+    assert ("CHAIR THOMPSON", 2) in turns
+    assert ("MR. GARCIA", 2) in turns
+    assert ("CHAIR THOMPSON", 3) in turns
 
 
-def test_pdf_extraction_is_deterministic(fomc_pdf: Path) -> None:
+def test_pdf_extraction_is_deterministic(transcript_pdf: Path) -> None:
     backend = get_backend("pdf")
     opts = {"include_pages": True, "include_metadata": False}
-    assert backend.extract(fomc_pdf, opts).fields == backend.extract(fomc_pdf, opts).fields
+    assert (
+        backend.extract(transcript_pdf, opts).fields
+        == backend.extract(transcript_pdf, opts).fields
+    )
 
 
 def test_corrupt_pdf_raises_cleanly(tmp_path: Path) -> None:

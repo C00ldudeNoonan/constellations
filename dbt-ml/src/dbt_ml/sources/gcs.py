@@ -80,7 +80,7 @@ class GCSDocumentSource(DocumentSource):
     def discover(self, source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
         bucket_name, prefix = parse_gcs_path(source.path)
         # Directory-boundary semantics: GCS prefixes are raw string matches,
-        # so listing `raw/sec` would also return `raw/secret/…`. Normalizing
+        # so listing `raw/doc` would also return `raw/docs/…`. Normalizing
         # to a trailing slash keeps sibling prefixes out.
         list_prefix = f"{prefix.rstrip('/')}/" if prefix else ""
         listed = list(

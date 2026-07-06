@@ -236,16 +236,16 @@ pip install 'dbt-ml[gcs]'
 ```
 
 ```yaml
-# sources/filings.yml
+# sources/documents.yml
 version: 2
 sources:
-  - name: sec_filings
-    path: gs://econ-raw/sec/10k        # bucket + prefix
+  - name: report_html
+    path: gs://my-raw-bucket/reports   # bucket + prefix
     file_pattern: "*.html"             # basename match; "2026/*.html" matches paths
     max_objects: 20000                 # listing bound (default 5000)
 
-  - name: fomc_transcripts
-    path: gs://econ-raw/fomc
+  - name: meeting_transcripts
+    path: gs://my-raw-bucket/transcripts
     file_pattern: "*.pdf"
     freshness:
       warn_after: { count: 45, period: day }
@@ -280,20 +280,21 @@ sources add `source_metadata` JSON.
 Structure-preserving options for document parsing:
 
 ```yaml
-# SEC-style HTML: headings/tables as JSON with char offsets into `text`,
-# so a downstream Item parser slices sections without touching HTML.
-- name: raw_filings
-  source: ref('sec_filings')
+# Sectioned HTML (reports, filings): headings/tables as JSON with char
+# offsets into `text`, so a downstream parser slices sections without
+# touching HTML.
+- name: raw_reports
+  source: ref('report_html')
   extraction:
     backend: html
     options:
       include_structure: true   # emits `sections` and `tables`
   materialization: incremental
 
-# FOMC-style PDF: per-page char offsets into `text`, so speaker-turn
-# parsing can attribute any regex match to a page.
+# Multi-page PDF (transcripts, reports): per-page char offsets into
+# `text`, so e.g. speaker-turn parsing can attribute any match to a page.
 - name: raw_transcripts
-  source: ref('fomc_transcripts')
+  source: ref('meeting_transcripts')
   extraction:
     backend: pdf
     options:
@@ -302,8 +303,8 @@ Structure-preserving options for document parsing:
 ```
 
 `sections` entries are `{level, heading, char_start, anchor?}`; `tables`
-are `{index, char_start, n_rows, n_cols, cells}`. SEC-specific logic
-(Item splitting, speaker parsing) belongs in a transform layered after
+are `{index, char_start, n_rows, n_cols, cells}`. Domain-specific logic
+(section taxonomy, speaker parsing) belongs in a transform layered after
 extraction — the backends stay generic.
 
 ## Built-in text preprocessing

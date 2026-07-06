@@ -61,8 +61,9 @@ class PdfBackend(BaseBackend):
                     "or image-only. Consider OCR (e.g. ocrmypdf) before dbt-ml run."
                 )
         if include_pages:
-            # Char offsets into the joined text, so downstream parsing (e.g.
-            # FOMC speaker turns) can attribute any match to a page (#85).
+            # Char offsets into the joined text, so downstream parsing
+            # (e.g. transcript speaker turns) can attribute any match to a
+            # page (#85).
             page_spans: list[dict[str, int]] = []
             offset = 0
             for i, text in enumerate(pages):

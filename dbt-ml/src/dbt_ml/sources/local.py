@@ -29,6 +29,7 @@ class LocalDocumentSource(DocumentSource):
                     document_id=compute_document_id(source.name, relative_path),
                     content_hash=compute_content_hash(p),
                     path=p,
+                    source_uri=p.as_uri(),
                 )
             )
         return refs

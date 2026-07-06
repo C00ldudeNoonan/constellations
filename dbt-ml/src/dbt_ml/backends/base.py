@@ -30,6 +30,17 @@ class BaseBackend(ABC):
     @abstractmethod
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult: ...
 
+    def version(self) -> str:
+        """Parser identity recorded on every extracted row (issue #85), so a
+        row can always be traced to the code that produced it. Backends built
+        on a parsing library report that library's version."""
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return f"dbt-ml/{version('dbt-ml')}"
+        except PackageNotFoundError:
+            return "dbt-ml/unknown"
+
     def validate(self) -> None:
         """Raise if the backend's runtime deps are missing. Default: no-op."""
         return None

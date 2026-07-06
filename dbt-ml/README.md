@@ -263,6 +263,49 @@ Auth is Application Default Credentials: `gcloud auth application-default
 login` locally, or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
 service-account JSON in CI.
 
+## Document extraction contract
+
+Every extraction row carries identity, lineage, and parser provenance:
+`document_id`, `source_path`, `source_uri` (local `file://` URI, or
+`gs://bucket/name#generation` for GCS), `content_hash`, `code_version`,
+`backend_name`, `backend_version` (the parsing library's version, e.g.
+`pypdf/6.1`), and `extracted_at` (one UTC timestamp per run). Remote
+sources add `source_metadata` JSON.
+
+> Upgrading note: these columns are new — existing *incremental*
+> extraction models will report a schema change on their next reprocess;
+> run once with `--full-refresh` (or set
+> `on_schema_change: append_new_columns`).
+
+Structure-preserving options for document parsing:
+
+```yaml
+# SEC-style HTML: headings/tables as JSON with char offsets into `text`,
+# so a downstream Item parser slices sections without touching HTML.
+- name: raw_filings
+  source: ref('sec_filings')
+  extraction:
+    backend: html
+    options:
+      include_structure: true   # emits `sections` and `tables`
+  materialization: incremental
+
+# FOMC-style PDF: per-page char offsets into `text`, so speaker-turn
+# parsing can attribute any regex match to a page.
+- name: raw_transcripts
+  source: ref('fomc_transcripts')
+  extraction:
+    backend: pdf
+    options:
+      include_pages: true       # emits `pages` [{page, char_start, char_end}]
+  materialization: incremental
+```
+
+`sections` entries are `{level, heading, char_start, anchor?}`; `tables`
+are `{index, char_start, n_rows, n_cols, cells}`. SEC-specific logic
+(Item splitting, speaker parsing) belongs in a transform layered after
+extraction — the backends stay generic.
+
 ## Built-in text preprocessing
 
 Reference any of these as a Python transform module — no project-local code

@@ -16,6 +16,7 @@ import polars as pl
 from .adapters import AdapterError, WarehouseAdapter, create_adapter
 from .backends import ExtractionResult, get_backend
 from .checks import TestResult, run_model_tests
+from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
 from .config import load_project
 from .config.model import ModelConfig
@@ -297,9 +298,17 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
         )
+    elif model.chunk is not None:
+        result = _run_chunk_model(
+            model=model,
+            project_dir=project_dir,
+            adapter=adapter,
+            full_refresh=full_refresh,
+        )
     else:
         raise RunError(
-            f"Model '{model.name}' has no extraction, transform, or ml block configured"
+            f"Model '{model.name}' has no extraction, transform, ml, or chunk "
+            "block configured"
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     return result
@@ -540,6 +549,152 @@ def _run_transform_model(
         kind="transform",
         rows_written=output.height,
     )
+
+
+def _run_chunk_model(
+    *,
+    model: ModelConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    full_refresh: bool,
+) -> ModelRunResult:
+    assert model.chunk is not None
+    chunk_cfg = model.chunk
+    if not model.depends_on or len(model.depends_on) != 1:
+        raise RunError(
+            f"Chunk model '{model.name}' must declare exactly one upstream in "
+            "`depends_on:` (the extraction model to chunk)"
+        )
+    upstream = parse_ref(model.depends_on[0])
+    df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(upstream)}")
+    if chunk_cfg.text_field not in df.columns:
+        raise RunError(
+            f"Chunk model '{model.name}': upstream '{upstream}' has no column "
+            f"'{chunk_cfg.text_field}'. Available: {sorted(df.columns)}"
+        )
+    if "document_id" not in df.columns:
+        raise RunError(
+            f"Chunk model '{model.name}': upstream '{upstream}' has no "
+            "`document_id`; chunk models read extraction outputs."
+        )
+
+    code_version = compute_code_version(
+        extraction=None, transform=None, chunk=chunk_cfg, project_dir=project_dir
+    )
+    has_hash = "content_hash" in df.columns
+    is_incremental = model.materialization == "incremental" and not full_refresh
+    processed_state = adapter.fetch_state(model.name) if is_incremental else {}
+
+    # Carry every upstream column except the split text field (replaced by the
+    # per-chunk text), so lineage (document_id, source_uri, content_hash, …)
+    # flows onto every chunk row for free.
+    carry_cols = [c for c in df.columns if c != chunk_cfg.text_field]
+    chunked_at = datetime.now(UTC).isoformat()
+
+    rows: list[dict[str, Any]] = []
+    state_records: list[tuple[str, str, str]] = []
+    processed = 0
+    skipped = 0
+    current_ids: set[str] = set()
+    changed_ids: list[str] = []
+
+    for record in df.iter_rows(named=True):
+        document_id = str(record["document_id"])
+        current_ids.add(document_id)
+        doc_hash = str(record["content_hash"]) if has_hash else code_version
+        if is_incremental:
+            prior = processed_state.get(document_id)
+            if prior == (doc_hash, code_version):
+                skipped += 1
+                continue
+            if prior is not None:
+                changed_ids.append(document_id)
+        processed += 1
+        pieces = split_text(str(record[chunk_cfg.text_field] or ""), chunk_cfg)
+        carried = {c: record[c] for c in carry_cols}
+        for piece in pieces:
+            rows.append(
+                _chunk_row(
+                    carried=carried,
+                    document_id=document_id,
+                    piece_index=piece.index,
+                    chunk_count=len(pieces),
+                    text=piece.text,
+                    strategy=chunk_cfg.strategy,
+                    code_version=code_version,
+                    chunked_at=chunked_at,
+                )
+            )
+        state_records.append((document_id, doc_hash, code_version))
+
+    deleted = 0
+    if is_incremental:
+        removed = [d for d in processed_state if d not in current_ids]
+        # Re-chunked docs: clear their old chunks so shrinking a document
+        # doesn't leave orphan chunk rows (materialize_incremental keys on
+        # chunk_id, which differs for the new chunks).
+        stale = removed + changed_ids
+        if stale:
+            adapter.delete_rows(model.name, key_col="document_id", keys=stale)
+            adapter.delete_state(model.name, removed)
+            deleted = len(removed)
+
+    rows_written = 0
+    if rows or full_refresh or model.materialization == "full":
+        chunk_df = pl.DataFrame(rows) if rows else pl.DataFrame()
+        if model.materialization == "full" or full_refresh:
+            rows_written = adapter.materialize_full(model.name, chunk_df)
+        else:
+            try:
+                rows_written = adapter.materialize_incremental(
+                    model.name,
+                    chunk_df,
+                    key_col="chunk_id",
+                    on_schema_change=model.on_schema_change,
+                )
+            except AdapterError as e:
+                raise RunError(str(e)) from e
+
+    if full_refresh:
+        adapter.clear_model_state(model.name)
+    adapter.upsert_state(model.name, state_records)
+
+    return ModelRunResult(
+        model_name=model.name,
+        materialization=model.materialization,
+        kind="chunk",
+        documents_processed=processed,
+        documents_skipped=skipped,
+        documents_deleted=deleted,
+        rows_written=rows_written,
+    )
+
+
+def _chunk_row(
+    *,
+    carried: dict[str, Any],
+    document_id: str,
+    piece_index: int,
+    chunk_count: int,
+    text: str,
+    strategy: str,
+    code_version: str,
+    chunked_at: str,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {c: _scalarize(v) for c, v in carried.items()}
+    row.update(
+        {
+            "chunk_id": chunk_id(document_id, piece_index, text),
+            "document_id": document_id,
+            "chunk_index": piece_index,
+            "chunk_count": chunk_count,
+            "text": text,
+            "chunk_strategy": strategy,
+            "code_version": code_version,
+            "chunked_at": chunked_at,
+        }
+    )
+    return row
 
 
 def _run_ml_model(

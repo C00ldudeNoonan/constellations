@@ -1,0 +1,8 @@
+rag_chunks_pipeline:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/dbt_ml.duckdb
+        schema: rag

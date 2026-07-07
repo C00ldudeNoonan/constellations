@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: raw_documents
+    description: "Source HTML documents (local dir here; swap for gs://… in prod)"
+    path: "./documents/"
+    file_pattern: "*.html"
+    recursive: true

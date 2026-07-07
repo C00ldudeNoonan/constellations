@@ -307,6 +307,43 @@ are `{index, char_start, n_rows, n_cols, cells}`. Domain-specific logic
 (section taxonomy, speaker parsing) belongs in a transform layered after
 extraction — the backends stay generic.
 
+## Chunking (RAG)
+
+A `chunk:` model splits an upstream document's text into one row per chunk —
+the grain RAG and agent retrieval need. Chunk IDs are deterministic and
+content-addressed, so an unchanged document re-runs to identical IDs (safe
+for incremental MERGE into a warehouse/vector store).
+
+```yaml
+- name: document_chunks
+  depends_on: [ref('document_registry')]   # an extraction model
+  chunk:
+    strategy: recursive        # recursive (char splitter) | tokens (tiktoken)
+    text_field: text           # upstream column to split
+    chunk_size: 800            # chars (recursive) or tokens (tokens)
+    chunk_overlap: 100
+  materialization: incremental
+```
+
+Each chunk row carries `chunk_id`, `document_id`, `chunk_index`,
+`chunk_count`, `text`, `chunk_strategy`, `chunked_at`, plus every upstream
+column except the split text field — so document lineage (`source_uri`,
+`content_hash`, parser provenance) flows onto every chunk for free.
+Incremental chunk models skip unchanged documents, re-chunk changed ones
+without leaving orphan chunks, and prune chunks of deleted documents.
+
+The recommended document-layer shape (GCS raw files → BigQuery tables):
+
+| model | grain | kind |
+|-------|-------|------|
+| `document_registry` | one row per document/version | `extraction` (`include_structure`) |
+| `document_chunks`   | one row per chunk            | `chunk` |
+| `document_extractions` | one row per structured field set | `extraction` (llm) or `transform` |
+
+See `examples/rag_chunks_pipeline/` for a runnable registry → chunks project.
+Domain keys (symbol, filing date, …) and embeddings belong in transforms /
+downstream dbt models layered on top — the chunk grain stays generic.
+
 ## Built-in text preprocessing
 
 Reference any of these as a Python transform module — no project-local code

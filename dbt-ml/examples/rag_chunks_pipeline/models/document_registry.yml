@@ -1,0 +1,21 @@
+version: 2
+
+# One row per source document/version: the registry grain. Structure-
+# preserving extraction keeps headings/tables as JSON (issue #85), and the
+# common contract columns (source_uri, content_hash, backend_version,
+# extracted_at) come for free.
+models:
+  - name: document_registry
+    description: "One row per document, with normalized text + structure"
+    source: ref('raw_documents')
+
+    extraction:
+      backend: html
+      options:
+        include_structure: true
+
+    materialization: incremental
+
+    tests:
+      - not_null: [document_id, text]
+      - unique: document_id

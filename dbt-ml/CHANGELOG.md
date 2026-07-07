@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Orchestration (issue #87)
+- `run`/`build` exit codes now distinguish success (`0`), run failure (`1`), and
+  configuration/usage error (`2`) so an orchestrator can branch on the cause.
+  Malformed YAML is now reported as a config error instead of an uncaught trace.
+- `run`/`build` gain `--json`, printing the `run_results.json` payload to stdout
+  (identical to the on-disk artifact) for machine consumption.
+- `run_results.json` carries run-level metadata (warehouse target, counts,
+  status, elapsed) and per-model `status` + fully-qualified output `relation`;
+  `build` records skipped downstream models as `status: "skipped"`.
+- New `docs/orchestration-dagster.md`: a Dagster `@asset` wrapper pattern and the
+  `emit-dbt-sources` handoff to downstream dbt.
+
 ## v0.1.0 (unreleased)
 
 Initial public preview.

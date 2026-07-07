@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,6 +33,19 @@ from .synth import (
     generate_support_emails,
     generate_support_tickets,
 )
+
+
+class ConfigClickError(click.ClickException):
+    """A configuration/usage error the run never got past. Exits 2 so an
+    orchestrator (issue #87) can tell a broken project apart from a run that
+    started but had a model fail (exit 1)."""
+
+    exit_code = 2
+
+
+# Errors that mean the project couldn't be coherently set up → exit 2. RunError
+# (a run that started but a model failed hard) stays a plain ClickException → 1.
+_CONFIG_ERRORS = (ConfigError, DAGError, SelectionError, ProfileError, StateError)
 
 
 @click.group()
@@ -75,7 +89,7 @@ def compile(ctx: click.Context) -> None:
             project_dir, target=target, profiles_dir=profiles_dir
         )
     except ProfileError as e:
-        raise click.ClickException(str(e)) from e
+        raise ConfigClickError(str(e)) from e
 
     click.echo(f"Project: {project.name} v{project.version}")
     click.echo(f"  Sources: {len(sources)}")
@@ -212,7 +226,7 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
             project, project_dir, target=target, profiles_dir=profiles_dir
         )
     except ProfileError as e:
-        raise click.ClickException(str(e)) from e
+        raise ConfigClickError(str(e)) from e
 
     try:
         with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
@@ -407,6 +421,12 @@ def _model_kind(model: ModelConfig) -> str:
     default=None,
     help="Previous manifest.json (or its directory) for state:modified selection.",
 )
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print the run_results.json payload to stdout instead of the table.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -416,6 +436,7 @@ def run(
     watch: bool,
     threads: int,
     state: Path | None,
+    json_output: bool,
 ) -> None:
     """Extract and materialize selected models into DuckDB."""
     project_dir: Path = ctx.obj["project_dir"]
@@ -434,6 +455,7 @@ def run(
         )
         return
 
+    start = time.monotonic()
     try:
         results = run_project(
             project_dir,
@@ -445,11 +467,27 @@ def run(
             threads=threads,
             state=state,
         )
-    except (ConfigError, DAGError, SelectionError, RunError, ProfileError, StateError) as e:
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except RunError as e:
         raise click.ClickException(str(e)) from e
+    elapsed = round(time.monotonic() - start, 3)
 
     write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
-    write_run_results(project_dir, results)
+    results_path = write_run_results(
+        project_dir,
+        results,
+        target=target,
+        profiles_dir=profiles_dir,
+        invocation="run",
+        elapsed_seconds=elapsed,
+    )
+
+    if json_output:
+        click.echo(results_path.read_text())
+        if any(r.errors for r in results):
+            ctx.exit(1)
+        return
 
     if not results:
         click.echo("No models selected.")
@@ -498,6 +536,12 @@ def run(
     default=None,
     help="Previous manifest.json (or its directory) for state:modified selection.",
 )
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print the run_results.json payload to stdout instead of the table.",
+)
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -507,12 +551,14 @@ def build(
     threads: int,
     store_failures: bool,
     state: Path | None,
+    json_output: bool,
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
     when an upstream model errors or fails a test."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    start = time.monotonic()
     try:
         result = build_project(
             project_dir,
@@ -525,16 +571,31 @@ def build(
             store_failures=store_failures,
             state=state,
         )
-    except (ConfigError, DAGError, SelectionError, RunError, ProfileError, StateError) as e:
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except RunError as e:
         raise click.ClickException(str(e)) from e
+    elapsed = round(time.monotonic() - start, 3)
 
     write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
-    write_run_results(project_dir, result.run_results)
-
-    _echo_build(result)
+    results_path = write_run_results(
+        project_dir,
+        result.run_results,
+        target=target,
+        profiles_dir=profiles_dir,
+        invocation="build",
+        skipped=result.skipped,
+        elapsed_seconds=elapsed,
+    )
 
     failed_tests = sum(1 for t in result.test_results if t.status == "fail")
     errored_models = sum(1 for r in result.run_results if r.errors)
+
+    if json_output:
+        click.echo(results_path.read_text())
+    else:
+        _echo_build(result)
+
     if failed_tests or errored_models or result.skipped:
         ctx.exit(1)
 
@@ -612,8 +673,8 @@ def test(
             store_failures=store_failures,
             state=state,
         )
-    except (ConfigError, DAGError, SelectionError, ProfileError, StateError) as e:
-        raise click.ClickException(str(e)) from e
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
 
     if not results:
         click.echo("No tests defined.")
@@ -680,8 +741,8 @@ def emit_dbt_sources(
             target=target,
             profiles_dir=profiles_dir,
         )
-    except (ConfigError, DAGError, SelectionError, ProfileError) as e:
-        raise click.ClickException(str(e)) from e
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
     click.echo(f"Wrote {path}")
 
 
@@ -710,7 +771,9 @@ def docs_generate(ctx: click.Context, output: Path | None) -> None:
             profiles_dir=profiles_dir,
             output_dir=output,
         )
-    except (ConfigError, ProfileError, DocsError) as e:
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except DocsError as e:
         raise click.ClickException(str(e)) from e
     click.echo(f"Wrote {result.pages_written} page(s) to {result.output_dir}")
 
@@ -723,7 +786,9 @@ def docs_serve(ctx: click.Context, port: int) -> None:
     project_dir: Path = ctx.obj["project_dir"]
     try:
         serve_docs(project_dir, port=port)
-    except (ConfigError, DocsError) as e:
+    except ConfigError as e:
+        raise ConfigClickError(str(e)) from e
+    except DocsError as e:
         raise click.ClickException(str(e)) from e
 
 
@@ -739,7 +804,9 @@ def source_freshness(ctx: click.Context) -> None:
     project_dir: Path = ctx.obj["project_dir"]
     try:
         results = check_freshness(project_dir)
-    except (ConfigError, SourceError) as e:
+    except ConfigError as e:
+        raise ConfigClickError(str(e)) from e
+    except SourceError as e:
         raise click.ClickException(str(e)) from e
 
     if not results:
@@ -781,7 +848,7 @@ def clean(ctx: click.Context) -> None:
     try:
         path = clean_project(project_dir, target=target, profiles_dir=profiles_dir)
     except (ConfigError, ProfileError) as e:
-        raise click.ClickException(str(e)) from e
+        raise ConfigClickError(str(e)) from e
     click.echo(f"Removed {path}")
 
 
@@ -789,14 +856,14 @@ def _load(project_dir: Path) -> tuple[ProjectConfig, list[SourceConfig], list[Mo
     try:
         return load_project(project_dir)
     except ConfigError as e:
-        raise click.ClickException(str(e)) from e
+        raise ConfigClickError(str(e)) from e
 
 
 def _build_dag(sources: list[SourceConfig], models: list[ModelConfig]) -> ProjectDAG:
     try:
         return ProjectDAG(sources, models)
     except DAGError as e:
-        raise click.ClickException(str(e)) from e
+        raise ConfigClickError(str(e)) from e
 
 
 def _run_watch(
@@ -841,7 +908,9 @@ def _run_watch(
             click.echo(f"error: {e}", err=True)
             return
         write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
-        write_run_results(project_dir, results)
+        write_run_results(
+            project_dir, results, target=target, profiles_dir=profiles_dir
+        )
         for r in results:
             click.echo(
                 f"  {r.model_name:<22} {r.kind:<12} "

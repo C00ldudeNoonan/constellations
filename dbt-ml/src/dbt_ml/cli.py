@@ -228,7 +228,18 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
     except AdapterError as e:
         raise click.ClickException(str(e)) from e
 
-    click.echo(df)
+    click.echo(_safe_console_text(str(df)))
+
+
+def _safe_console_text(text: str, stream: object | None = None) -> str:
+    target = stream or click.get_text_stream("stdout")
+    encoding = getattr(target, "encoding", None) or "utf-8"
+    errors = getattr(target, "errors", None) or "strict"
+    if errors != "strict":
+        return text
+    return text.encode(encoding, errors="replace").decode(
+        encoding, errors="replace"
+    )
 
 
 @cli.command()

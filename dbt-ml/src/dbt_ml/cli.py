@@ -577,6 +577,13 @@ def build(
         raise click.ClickException(str(e)) from e
     elapsed = round(time.monotonic() - start, 3)
 
+    # Hard test failures don't populate ModelRunResult.errors, so feed them in
+    # explicitly or a failing test on a leaf model would report success.
+    test_failures: dict[str, list[str]] = {}
+    for t in result.test_results:
+        if t.is_hard_failure:
+            test_failures.setdefault(t.model_name, []).append(_test_failure_label(t))
+
     write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
     results_path = write_run_results(
         project_dir,
@@ -586,6 +593,7 @@ def build(
         invocation="build",
         skipped=result.skipped,
         elapsed_seconds=elapsed,
+        test_failures=test_failures,
     )
 
     failed_tests = sum(1 for t in result.test_results if t.status == "fail")
@@ -635,6 +643,12 @@ def _test_message(t: TestResult) -> str:
     if t.failures_table:
         return f"{t.message} [stored {t.failure_count} rows in {t.failures_table}]"
     return t.message
+
+
+def _test_failure_label(t: TestResult) -> str:
+    """Compact identifier for a failed test, for the run_results payload."""
+    name = f"{t.test_name}({t.column})" if t.column else t.test_name
+    return f"{name}: {t.message}" if t.message else name
 
 
 @cli.command()

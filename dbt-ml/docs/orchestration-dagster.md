@@ -116,6 +116,7 @@ def dbt_ml_documents(context: AssetExecutionContext):
                 "documents_processed": r.get("documents_processed", 0),
                 "documents_skipped": r.get("documents_skipped", 0),
                 "failed_documents": len(r.get("errors", [])),
+                "failed_tests": len(r.get("test_failures", [])),
                 "warehouse": target["adapter_type"],
             },
         )

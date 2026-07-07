@@ -111,3 +111,33 @@ def test_build_json_marks_skipped_downstream(
     statuses = {r["model_name"]: r["status"] for r in payload["results"]}
     assert statuses["invoice_summary"] == "skipped"
     assert payload["metadata"]["counts"]["skipped"] >= 1
+
+
+def test_build_json_leaf_test_failure_marks_error(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    dst = _copy_example(tmp_path, example_project_dir)
+    generate_invoices(5, dst / "data" / "invoices", seed=1)
+
+    # A test that fails on a leaf model (invoice_summary has no descendants), so
+    # nothing is skipped and the model's run has no errors — the payload status
+    # must still be error, matching the exit code.
+    summary = dst / "models" / "invoice_summary.yml"
+    summary.write_text(
+        summary.read_text().replace("- min_rows: 1", "- min_rows: 100000")
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--project-dir", str(dst), "build", "--json"])
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+
+    assert payload["metadata"]["status"] == "error"
+    assert payload["metadata"]["counts"]["error"] >= 1
+    assert payload["metadata"]["counts"]["skipped"] == 0
+
+    summary_row = next(
+        r for r in payload["results"] if r["model_name"] == "invoice_summary"
+    )
+    assert summary_row["status"] == "error"
+    assert any("min_rows" in f for f in summary_row["test_failures"])

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from dbt_ml.cli import cli
+from dbt_ml.cli import _safe_console_text, cli
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoices
 
@@ -174,6 +174,19 @@ def test_show_prints_rows(tmp_path: Path, example_project_dir: Path) -> None:
     result = runner.invoke(cli, ["--project-dir", str(dst), "show", "raw_invoices", "--limit", "3"])
     assert result.exit_code == 0, result.output
     assert "shape: (3," in result.output  # polars repr always starts with shape
+
+
+def test_show_output_is_safe_for_strict_cp1252_console() -> None:
+    class StrictCp1252Stream:
+        encoding = "cp1252"
+        errors = "strict"
+
+    text = "shape: (1, 1)\n\u250c\u2500\u2500\u2510\n\u6771\u4eac"
+    safe = _safe_console_text(text, StrictCp1252Stream())
+
+    safe.encode("cp1252", errors="strict")
+    assert safe != text
+    assert "shape: (1, 1)" in safe
 
 
 def test_show_missing_db(tmp_path: Path, example_project_dir: Path) -> None:

@@ -1,144 +1,165 @@
-# Orchestrating dbt-ml with Dagster
+# Orchestrating dbt-ml with Dagster (dagster-dbt)
 
-dbt-ml doesn't need a deep Dagster integration to be operable inside a Dagster
-project. It exposes a stable **CLI + artifact contract** so a Dagster asset can
-launch a run as a subprocess, fail loudly on error, read run metadata, and hand
-its output tables to downstream dbt models. This page sketches that pattern; it
-is intentionally a code sketch, not a runnable example, and adds no Dagster
-dependency to dbt-ml itself.
+dbt-ml is a dbt-shaped package: its materialized tables are declared as dbt
+**sources** (`dbt-ml emit-dbt-sources`). That means it slots straight into the
+[`dagster-dbt`](https://docs.dagster.io/integrations/libraries/dbt) integration —
+when your dbt project is loaded with `@dbt_assets`, any model that does
+`{{ source('dbt_ml_<project>', '<table>') }}` gets an upstream asset dependency,
+and dbt-ml is the asset that produces it. No custom lineage glue.
 
-## The contract
+This page shows that native wiring. dbt-ml itself stays pure Python and gains no
+Dagster dependency; the code below lives in your Dagster project (e.g.
+`economic-data-project`).
 
-### Exit codes
+## How the keys line up
 
-`dbt-ml run` (and `build`) return a status code an orchestrator can branch on:
+`dagster-dbt`'s default asset key for a dbt source table is
+`[source_name, table_name]`. So for the source dbt-ml emits — `dbt_ml_<project>` —
+table `raw_invoices` becomes the asset key `dbt_ml_<project>/raw_invoices`.
 
-| Code | Meaning |
-| ---- | ------- |
-| `0`  | Success — every selected model ran clean (and, for `build`, tests passed). |
-| `1`  | Run failure — the run started but a model errored, a document failed to extract, or a test hard-failed. |
-| `2`  | Configuration/usage error — the project couldn't be set up: malformed YAML, DAG cycle, bad selector, unresolved profile, or bad `--state`. |
+`dbt-ml emit-dbt-sources --dagster-meta` pins that exact key onto each table via
+`meta.dagster.asset_key`, so the producer (dbt-ml) and the consumers (your dbt
+models) agree on one key without you hand-copying anything. Pure dbt ignores the
+`meta`, so the same file still works in a plain dbt project.
 
-Distinguishing `2` from `1` lets you alert differently: a `2` is "someone broke
-the project definition," a `1` is "a run had bad data."
-
-### Artifacts
-
-Every `run`/`build` writes two files under `target/`:
-
-- `manifest.json` — project structure: sources, models, kinds, DAG, per-model
-  `code_version`.
-- `run_results.json` — what the run did. With `--json`, the identical payload is
-  printed to stdout so you can capture it without reading the file.
-
-`run_results.json` shape (abridged):
-
-```json
-{
-  "metadata": {
-    "dbt_ml_version": "0.2.7",
-    "invocation": "run",
-    "status": "success",
-    "elapsed_seconds": 0.94,
-    "target": {
-      "profile": "invoice_pipeline", "name": "dev",
-      "adapter_type": "duckdb", "schema": "dbt_ml",
-      "catalog": "dbt_ml", "location": "/abs/path/dbt_ml.duckdb"
-    },
-    "counts": {"total": 3, "success": 3, "error": 0, "skipped": 0}
-  },
-  "results": [
-    {
-      "model_name": "raw_invoices", "kind": "extraction",
-      "status": "success",
-      "documents_processed": 8, "documents_skipped": 0,
-      "documents_deleted": 0, "rows_written": 8, "errors": [],
-      "relation": {
-        "catalog": "dbt_ml", "schema": "dbt_ml", "name": "raw_invoices",
-        "fully_qualified": "dbt_ml.dbt_ml.raw_invoices"
-      }
-    }
-  ]
-}
+```yaml
+# _dbt_ml_sources.yml (emitted)
+sources:
+  - name: dbt_ml_invoice_pipeline
+    tables:
+      - name: raw_invoices
+        meta:
+          dagster:
+            asset_key: [dbt_ml_invoice_pipeline, raw_invoices]
 ```
 
-`skipped` downstream models (a `build` where an upstream failed) appear in
-`results` with `"status": "skipped"`.
+## Step 1 — emit sources into the dbt project
 
-## A Dagster asset wrapper
+Run this **before** Dagster loads the dbt manifest (the `@dbt_assets` decorator
+reads the manifest at definition time, so the source must exist when `dbt parse`
+runs). A natural home is the `DbtProject` prepare step, a Makefile, or CI:
 
-Invoke dbt-ml as a subprocess with `--json`, branch on the exit code, and attach
-the run metadata to the materialization.
+```bash
+uv run dbt-ml --project-dir /opt/pipelines/document_extraction \
+  emit-dbt-sources --dagster-meta \
+  --output /opt/pipelines/dbt/models/sources/_dbt_ml_sources.yml
+```
+
+## Step 2 — load the dbt project
+
+Standard `dagster-dbt` setup:
+
+```python
+from pathlib import Path
+
+from dagster import AssetExecutionContext
+from dagster_dbt import DbtCliResource, DbtProject, dbt_assets
+
+dbt_project = DbtProject(project_dir=Path("/opt/pipelines/dbt"))
+dbt_project.prepare_if_dev()
+
+
+@dbt_assets(manifest=dbt_project.manifest_path)
+def dbt_models(context: AssetExecutionContext, dbt: DbtCliResource):
+    yield from dbt.cli(["build"], context=context).stream()
+```
+
+## Step 3 — make dbt-ml the producer of the source assets
+
+Model the dbt-ml run as one `@multi_asset` whose outputs are exactly the source
+asset keys dbt-ml feeds. `get_asset_keys_by_output_name_for_source` reads those
+keys back out of the dbt manifest, so the two sides can never drift. The op runs
+`dbt-ml run --json` once and attaches per-table metadata from `run_results.json`.
 
 ```python
 import json
 import subprocess
-from pathlib import Path
 
-from dagster import AssetExecutionContext, MaterializeResult, asset
+from dagster import AssetOut, MaterializeResult, multi_asset
+from dagster_dbt import get_asset_keys_by_output_name_for_source
 
-DBT_ML_PROJECT = Path("/opt/pipelines/document_extraction")
+DBT_ML_PROJECT = "/opt/pipelines/document_extraction"
+SOURCE_NAME = "dbt_ml_invoice_pipeline"
+
+_keys_by_output = get_asset_keys_by_output_name_for_source([dbt_models], SOURCE_NAME)
 
 
-@asset
-def dbt_ml_documents(context: AssetExecutionContext) -> MaterializeResult:
+@multi_asset(
+    outs={name: AssetOut(key=key) for name, key in _keys_by_output.items()},
+    can_subset=True,
+)
+def dbt_ml_documents(context: AssetExecutionContext):
     proc = subprocess.run(
-        ["uv", "run", "dbt-ml", "--project-dir", str(DBT_ML_PROJECT), "run", "--json"],
+        ["uv", "run", "dbt-ml", "--project-dir", DBT_ML_PROJECT, "run", "--json"],
         capture_output=True,
         text=True,
     )
-
+    # 2 = misconfigured project, 1 = a model/document/test failed, 0 = ok.
     if proc.returncode == 2:
         raise RuntimeError(f"dbt-ml project is misconfigured:\n{proc.stderr}")
     if proc.returncode == 1:
-        # Surface the run so the failure is visible, then fail the asset.
         context.log.error(proc.stdout or proc.stderr)
-        raise RuntimeError("dbt-ml run failed (a model errored or a test failed)")
+        raise RuntimeError("dbt-ml run failed")
 
     payload = json.loads(proc.stdout)
-    meta = payload["metadata"]
-    rows = sum(r["rows_written"] for r in payload["results"])
-    errored = sum(len(r["errors"]) for r in payload["results"])
+    by_model = {r["model_name"]: r for r in payload["results"]}
+    target = payload["metadata"]["target"]
 
-    return MaterializeResult(
-        metadata={
-            "target": meta["target"]["location"],
-            "adapter": meta["target"]["adapter_type"],
-            "models": meta["counts"]["total"],
-            "rows_written": rows,
-            "documents_skipped": sum(r["documents_skipped"] for r in payload["results"]),
-            "failed_documents": errored,
-            "relations": [r["relation"]["fully_qualified"] for r in payload["results"]],
-            "elapsed_seconds": meta["elapsed_seconds"],
-        }
-    )
+    for output_name, key in _keys_by_output.items():
+        # output_name mirrors the source table name, which is the dbt-ml model.
+        r = by_model.get(key.path[-1], {})
+        yield MaterializeResult(
+            asset_key=key,
+            metadata={
+                "relation": r.get("relation", {}).get("fully_qualified"),
+                "rows_written": r.get("rows_written", 0),
+                "documents_processed": r.get("documents_processed", 0),
+                "documents_skipped": r.get("documents_skipped", 0),
+                "failed_documents": len(r.get("errors", [])),
+                "warehouse": target["adapter_type"],
+            },
+        )
 ```
 
-For finer-grained lineage, emit one asset per dbt-ml model by iterating
-`manifest.json`'s `models` and keying each `MaterializeResult` off the matching
-entry in `run_results.json`.
+Wire it all together:
 
-## Handing off to downstream dbt
+```python
+from dagster import Definitions
 
-`emit-dbt-sources` writes a dbt-parseable `sources.yml` declaring the dbt-ml
-tables. Point it at a dbt project's sources directory and downstream dbt models
-`{{ source(...) }}` straight into dbt-ml output — no glue:
-
-```bash
-uv run dbt-ml --project-dir /opt/pipelines/document_extraction \
-  emit-dbt-sources \
-  --output /opt/pipelines/dbt/models/sources/_dbt_ml_sources.yml
+defs = Definitions(
+    assets=[dbt_ml_documents, dbt_models],
+    resources={"dbt": DbtCliResource(project_dir=dbt_project)},
+)
 ```
 
-Run this as its own asset (or the tail of the run asset) so it lands before the
-dbt build. A Dagster `@dbt_assets` graph then depends on the generated source,
-giving you dbt-ml → dbt lineage in one asset graph. See
-`examples/dbt_consumer/` for the round-trip proof that the emitted `sources.yml`
-is dbt-parseable and that dbt models read dbt-ml tables directly.
+Dagster now shows one asset graph: `dbt_ml_documents` (per table) → the dbt models
+that `{{ source(...) }}` them → downstream marts.
 
-## Sketch of the asset graph
+### Single-table sources
 
+If the dbt-ml source has one table, skip the multi-asset and use the single-key
+helper:
+
+```python
+from dagster import asset
+from dagster_dbt import get_asset_key_for_source
+
+@asset(key=get_asset_key_for_source([dbt_models], "dbt_ml_invoice_pipeline"))
+def dbt_ml_documents(context): ...
 ```
-dbt_ml_documents ──> emit_dbt_ml_sources ──> @dbt_assets (staging → marts)
-     (run --json)        (sources.yml)              ({{ source('dbt_ml_*', ...) }})
-```
+
+## Why the exit codes matter here
+
+The subprocess branches on dbt-ml's status codes:
+
+| Code | Meaning | Dagster reaction |
+| ---- | ------- | ---------------- |
+| `0`  | Success | materialize with metadata |
+| `1`  | A model/document/test failed | fail the asset loudly |
+| `2`  | Misconfigured project (bad YAML, DAG cycle, bad selector, profile) | fail with a distinct message |
+
+## Related
+
+- `examples/dbt_consumer/` — the round-trip proof that dbt-ml's emitted
+  `sources.yml` is dbt-parseable and that dbt models read dbt-ml tables directly.
+- `emit-dbt-sources` reference in the main `README.md`.

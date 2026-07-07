@@ -715,6 +715,12 @@ def test(
     default=None,
     help="Output file (default: <target-path>/sources.yml).",
 )
+@click.option(
+    "--dagster-meta",
+    is_flag=True,
+    help="Stamp meta.dagster.asset_key on each table so the emitted sources map "
+    "cleanly onto dagster-dbt assets. Ignored by pure dbt.",
+)
 @click.pass_context
 def emit_dbt_sources(
     ctx: click.Context,
@@ -722,11 +728,13 @@ def emit_dbt_sources(
     select: str | None,
     exclude: str | None,
     output: Path | None,
+    dagster_meta: bool,
 ) -> None:
     """Write a dbt-compatible sources.yml declaring dbt_ml's materialized tables.
 
     Drop the output into a dbt-duckdb project so dbt models can refer to the
-    dbt-ml tables via `{{ source(...) }}`.
+    dbt-ml tables via `{{ source(...) }}`. With --dagster-meta, each table also
+    carries a Dagster asset key for the dagster-dbt integration.
     """
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
@@ -740,6 +748,7 @@ def emit_dbt_sources(
             output=output,
             target=target,
             profiles_dir=profiles_dir,
+            dagster_meta=dagster_meta,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e

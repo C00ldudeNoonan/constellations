@@ -11,8 +11,12 @@
 - `run_results.json` carries run-level metadata (warehouse target, counts,
   status, elapsed) and per-model `status` + fully-qualified output `relation`;
   `build` records skipped downstream models as `status: "skipped"`.
-- New `docs/orchestration-dagster.md`: a Dagster `@asset` wrapper pattern and the
-  `emit-dbt-sources` handoff to downstream dbt.
+- `emit-dbt-sources --dagster-meta` stamps `meta.dagster.asset_key` on each
+  emitted source table so dbt-ml tables map cleanly onto `dagster-dbt` assets
+  (pure dbt ignores the meta).
+- New `docs/orchestration-dagster.md`: native `dagster-dbt` wiring — dbt-ml
+  materializes the dbt source assets a `@dbt_assets` graph depends on, via
+  `get_asset_keys_by_output_name_for_source` and `dbt-ml run --json`.
 
 ## v0.1.0 (unreleased)
 

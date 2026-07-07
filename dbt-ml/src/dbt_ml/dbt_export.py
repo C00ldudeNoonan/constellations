@@ -28,6 +28,7 @@ def build_dbt_sources(
     exclude: str | None = None,
     target: str | None = None,
     profiles_dir: Path | None = None,
+    dagster_meta: bool = False,
 ) -> dict[str, Any]:
     project, sources_cfg, models = load_project(project_dir)
     resolved = resolve_profile(
@@ -50,7 +51,10 @@ def build_dbt_sources(
                 ),
                 "database": catalog,
                 "schema": resolved.warehouse.schema_name,
-                "tables": [_table_for_model(m) for m in selected_models],
+                "tables": [
+                    _table_for_model(m, source_name=name, dagster_meta=dagster_meta)
+                    for m in selected_models
+                ],
             }
         ],
     }
@@ -65,6 +69,7 @@ def write_dbt_sources(
     output: Path | None = None,
     target: str | None = None,
     profiles_dir: Path | None = None,
+    dagster_meta: bool = False,
 ) -> Path:
     project, _, _ = load_project(project_dir)
     payload = build_dbt_sources(
@@ -74,6 +79,7 @@ def write_dbt_sources(
         exclude=exclude,
         target=target,
         profiles_dir=profiles_dir,
+        dagster_meta=dagster_meta,
     )
 
     if output is None:
@@ -92,7 +98,9 @@ def _derive_catalog(warehouse: WarehouseConfig) -> str:
     return warehouse.catalog_name()
 
 
-def _table_for_model(model: ModelConfig) -> dict[str, Any]:
+def _table_for_model(
+    model: ModelConfig, *, source_name: str, dagster_meta: bool = False
+) -> dict[str, Any]:
     columns_by_name: dict[str, dict[str, Any]] = {}
 
     for field in model.fields:
@@ -109,6 +117,13 @@ def _table_for_model(model: ModelConfig) -> dict[str, Any]:
         table["description"] = model.description
     if model.tags:
         table["tags"] = model.tags
+
+    if dagster_meta:
+        # Pin the Dagster asset key to dagster-dbt's default source key
+        # ([source, table]) so a dbt-ml producer asset and the dbt models that
+        # {{ source(...) }} it agree on one key without hand-copying. dbt itself
+        # ignores unknown `meta`, so pure-dbt consumers are unaffected.
+        table["meta"] = {"dagster": {"asset_key": [source_name, model.name]}}
 
     if columns_by_name:
         table["columns"] = list(columns_by_name.values())

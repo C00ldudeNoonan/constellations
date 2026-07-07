@@ -512,9 +512,11 @@ Every `dbt-ml compile` / `dbt-ml run` writes to `target/`:
 
 External tools (lineage viewers, CI dashboards, the dbt-consumer above)
 consume these. `run`/`build` exit `0` on success, `1` on run failure, and `2` on
-a configuration error, so an orchestrator can branch on the cause. See
-[`docs/orchestration-dagster.md`](docs/orchestration-dagster.md) for a Dagster
-asset wrapper pattern.
+a configuration error, so an orchestrator can branch on the cause. Because
+dbt-ml tables are dbt sources, they wire natively into the `dagster-dbt`
+integration — see
+[`docs/orchestration-dagster.md`](docs/orchestration-dagster.md) (use
+`emit-dbt-sources --dagster-meta` to pin the Dagster asset keys).
 
 ## Benchmarks
 

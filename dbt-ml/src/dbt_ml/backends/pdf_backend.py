@@ -27,11 +27,17 @@ class PdfBackend(BaseBackend):
     def supported_formats(self) -> list[str]:
         return [".pdf"]
 
+    def version(self) -> str:
+        import pypdf
+
+        return f"pypdf/{pypdf.__version__}"
+
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         text_field = options.get("text_field", "text")
         include_text = options.get("include_text", True)
         include_page_count = options.get("include_page_count", True)
         include_metadata = options.get("include_metadata", False)
+        include_pages = options.get("include_pages", False)
         page_separator = options.get("page_separator", "\n\n")
 
         warnings: list[str] = []
@@ -54,6 +60,18 @@ class PdfBackend(BaseBackend):
                     f"{path.name}: no text extracted — the PDF may be scanned "
                     "or image-only. Consider OCR (e.g. ocrmypdf) before dbt-ml run."
                 )
+        if include_pages:
+            # Char offsets into the joined text, so downstream parsing
+            # (e.g. transcript speaker turns) can attribute any match to a
+            # page (#85).
+            page_spans: list[dict[str, int]] = []
+            offset = 0
+            for i, text in enumerate(pages):
+                page_spans.append(
+                    {"page": i + 1, "char_start": offset, "char_end": offset + len(text)}
+                )
+                offset += len(text) + len(page_separator)
+            fields["pages"] = page_spans
         if include_page_count:
             fields["page_count"] = len(pages)
         if include_metadata:

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -386,11 +387,23 @@ def _run_extraction_model(
         else:
             extracted = [_one(d) for d in docs_to_process]
 
+    backend_version = backend.version()
+    # One timestamp per model run: rows from the same run are batch-identifiable.
+    extracted_at = datetime.now(UTC).isoformat()
     for doc, result, err in extracted:
         if err is not None or result is None:
             errors.append(f"{doc.relative_path}: {err}")
             continue
-        rows.append(_row_for_extraction(doc, code_version, result))
+        rows.append(
+            _row_for_extraction(
+                doc,
+                code_version,
+                result,
+                backend_name=backend_name,
+                backend_version=backend_version,
+                extracted_at=extracted_at,
+            )
+        )
         state_records.append((doc.document_id, doc.content_hash, code_version))
 
     rows_written = 0
@@ -429,20 +442,28 @@ def _run_extraction_model(
 
 
 def _row_for_extraction(
-    doc: DocumentRef, code_version: str, result: ExtractionResult
+    doc: DocumentRef,
+    code_version: str,
+    result: ExtractionResult,
+    *,
+    backend_name: str,
+    backend_version: str,
+    extracted_at: str,
 ) -> dict[str, Any]:
+    # The common output contract (issue #85): identity, lineage back to the
+    # exact source object, and the parser that produced the row.
     row: dict[str, Any] = {
         "document_id": doc.document_id,
         "source_path": doc.relative_path,
+        "source_uri": doc.source_uri,
         "content_hash": doc.content_hash,
         "code_version": code_version,
+        "backend_name": backend_name,
+        "backend_version": backend_version,
+        "extracted_at": extracted_at,
     }
-    # Remote sources carry lineage back to the exact object version. Local
-    # rows keep their existing shape (adding columns would force incremental
-    # users through a schema change).
-    if doc.source_uri is not None:
-        row["source_uri"] = doc.source_uri
-        row["source_metadata"] = json.dumps(doc.source_metadata or {}, default=str)
+    if doc.source_metadata is not None:
+        row["source_metadata"] = json.dumps(doc.source_metadata, default=str)
     for key, value in result.fields.items():
         row[key] = _scalarize(value)
     return row

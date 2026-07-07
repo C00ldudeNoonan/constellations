@@ -95,7 +95,7 @@ def _gcs_source(client: _FakeStorageClient) -> GCSDocumentSource:
 def _cfg(**kwargs: Any) -> SourceConfig:
     defaults: dict[str, Any] = {
         "name": "filings",
-        "path": "gs://bkt/raw/sec",
+        "path": "gs://bkt/raw/docs",
         "file_pattern": "*.html",
     }
     return SourceConfig(**{**defaults, **kwargs})
@@ -106,7 +106,7 @@ def _cfg(**kwargs: Any) -> SourceConfig:
 
 def test_parse_gcs_path() -> None:
     assert parse_gcs_path("gs://bkt") == ("bkt", "")
-    assert parse_gcs_path("gs://bkt/raw/sec") == ("bkt", "raw/sec")
+    assert parse_gcs_path("gs://bkt/raw/docs") == ("bkt", "raw/docs")
 
 
 @pytest.mark.parametrize("bad", ["s3://bkt/x", "gs://", "gs:///x", "data/local"])
@@ -125,17 +125,17 @@ def test_scheme_routing() -> None:
 
 def test_discover_identity_and_lineage(tmp_path: Path) -> None:
     blob = _FakeBlob(
-        "raw/sec/2026/aapl-10k.html", generation=42, md5_hash="m5==", size=1234
+        "raw/docs/2026/acme-report.html", generation=42, md5_hash="m5==", size=1234
     )
     src = _gcs_source(_FakeStorageClient([blob]))
     refs = src.discover(_cfg(), tmp_path)
 
     assert len(refs) == 1
     ref = refs[0]
-    assert ref.relative_path == "2026/aapl-10k.html"
-    assert ref.document_id == compute_document_id("filings", "2026/aapl-10k.html")
+    assert ref.relative_path == "2026/acme-report.html"
+    assert ref.document_id == compute_document_id("filings", "2026/acme-report.html")
     assert ref.content_hash == "md5:m5=="
-    assert ref.source_uri == "gs://bkt/raw/sec/2026/aapl-10k.html#42"
+    assert ref.source_uri == "gs://bkt/raw/docs/2026/acme-report.html#42"
     assert ref.source_metadata is not None
     assert ref.source_metadata["generation"] == 42
     assert ref.source_metadata["size"] == 1234
@@ -156,10 +156,10 @@ def test_changed_generation_changes_hash() -> None:
 
 def test_discover_filters_pattern_and_placeholders(tmp_path: Path) -> None:
     blobs = [
-        _FakeBlob("raw/sec/"),  # directory placeholder
-        _FakeBlob("raw/sec/a.html"),
-        _FakeBlob("raw/sec/notes.txt"),
-        _FakeBlob("raw/sec/deep/b.html"),
+        _FakeBlob("raw/docs/"),  # directory placeholder
+        _FakeBlob("raw/docs/a.html"),
+        _FakeBlob("raw/docs/notes.txt"),
+        _FakeBlob("raw/docs/deep/b.html"),
     ]
     src = _gcs_source(_FakeStorageClient(blobs))
     refs = src.discover(_cfg(), tmp_path)
@@ -170,39 +170,39 @@ def test_discover_filters_pattern_and_placeholders(tmp_path: Path) -> None:
 
 
 def test_discover_slash_pattern_matches_full_relative(tmp_path: Path) -> None:
-    blobs = [_FakeBlob("raw/sec/2026/a.html"), _FakeBlob("raw/sec/2025/b.html")]
+    blobs = [_FakeBlob("raw/docs/2026/a.html"), _FakeBlob("raw/docs/2025/b.html")]
     src = _gcs_source(_FakeStorageClient(blobs))
     refs = src.discover(_cfg(file_pattern="2026/*.html"), tmp_path)
     assert [r.relative_path for r in refs] == ["2026/a.html"]
 
 
 def test_bounded_listing_raises(tmp_path: Path) -> None:
-    blobs = [_FakeBlob(f"raw/sec/{i}.html") for i in range(4)]
+    blobs = [_FakeBlob(f"raw/docs/{i}.html") for i in range(4)]
     src = _gcs_source(_FakeStorageClient(blobs))
     with pytest.raises(SourceError, match="max_objects"):
         src.discover(_cfg(max_objects=3), tmp_path)
     # and the listing itself was capped, not just post-filtered
     client = src._client
-    assert client.list_calls[-1] == ("bkt", "raw/sec/", 4)
+    assert client.list_calls[-1] == ("bkt", "raw/docs/", 4)
 
 
 def test_sibling_prefix_is_not_ingested(tmp_path: Path) -> None:
-    """`gs://bkt/raw/sec` must not match `raw/secret/…` — GCS prefixes are
+    """`gs://bkt/raw/docs` must not match `raw/docs-archive/…` — GCS prefixes are
     raw string matches, so the source normalizes to a directory boundary
     (PR #92 review finding)."""
     blobs = [
-        _FakeBlob("raw/sec/a.html"),
-        _FakeBlob("raw/secret/b.html"),
-        _FakeBlob("raw/sec"),  # object literally named like the prefix
+        _FakeBlob("raw/docs/a.html"),
+        _FakeBlob("raw/docs-archive/b.html"),
+        _FakeBlob("raw/docs"),  # object literally named like the prefix
     ]
     src = _gcs_source(_FakeStorageClient(blobs))
     refs = src.discover(_cfg(), tmp_path)
     assert [r.relative_path for r in refs] == ["a.html"]
     # the boundary is enforced at the listing API, not just post-filtered
-    assert src._client.list_calls[-1][1] == "raw/sec/"
+    assert src._client.list_calls[-1][1] == "raw/docs/"
 
     # a trailing slash in the configured path behaves identically
-    refs = src.discover(_cfg(path="gs://bkt/raw/sec/"), tmp_path)
+    refs = src.discover(_cfg(path="gs://bkt/raw/docs/"), tmp_path)
     assert [r.relative_path for r in refs] == ["a.html"]
 
 
@@ -210,7 +210,7 @@ def test_sibling_prefix_is_not_ingested(tmp_path: Path) -> None:
 
 
 def test_fetch_downloads_pinned_generation(tmp_path: Path) -> None:
-    blob = _FakeBlob("raw/sec/a.html", generation=9, payload=b"<html>hi</html>")
+    blob = _FakeBlob("raw/docs/a.html", generation=9, payload=b"<html>hi</html>")
     client = _FakeStorageClient([blob])
     src = _gcs_source(client)
     ref = src.discover(_cfg(), tmp_path)[0]
@@ -227,8 +227,8 @@ def test_fetch_downloads_pinned_generation(tmp_path: Path) -> None:
 
 def test_scan_reports_newest_object(tmp_path: Path) -> None:
     blobs = [
-        _FakeBlob("raw/sec/old.html", updated=datetime(2026, 1, 1, tzinfo=UTC)),
-        _FakeBlob("raw/sec/new.html", updated=datetime(2026, 6, 1, tzinfo=UTC)),
+        _FakeBlob("raw/docs/old.html", updated=datetime(2026, 1, 1, tzinfo=UTC)),
+        _FakeBlob("raw/docs/new.html", updated=datetime(2026, 6, 1, tzinfo=UTC)),
     ]
     src = _gcs_source(_FakeStorageClient(blobs))
     scan = src.scan(_cfg(), tmp_path)
@@ -277,7 +277,7 @@ def test_incremental_run_against_fake_gcs(
     gcs_project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     blobs = [
-        _json_blob("raw/aapl.json", 1, ticker="AAPL", revenue=100),
+        _json_blob("raw/acme.json", 1, ticker="ACME", revenue=100),
         _json_blob("raw/msft.json", 1, ticker="MSFT", revenue=200),
     ]
     client = _FakeStorageClient(blobs)
@@ -297,7 +297,7 @@ def test_incremental_run_against_fake_gcs(
         ).fetchall()
     finally:
         con.close()
-    assert rows[0] == ("aapl.json", "AAPL", "gs://bkt/raw/aapl.json#1")
+    assert rows[0] == ("acme.json", "ACME", "gs://bkt/raw/acme.json#1")
     assert rows[1][2] == "gs://bkt/raw/msft.json#1"
 
     # unchanged generations → nothing re-downloaded or reprocessed
@@ -308,7 +308,7 @@ def test_incremental_run_against_fake_gcs(
 
     # one object rewritten (new generation), one removed
     client.blobs = [
-        _json_blob("raw/aapl.json", 2, ticker="AAPL", revenue=999),
+        _json_blob("raw/acme.json", 2, ticker="ACME", revenue=999),
     ]
     results = run_project(gcs_project)
     raw = results[0]
@@ -323,18 +323,18 @@ def test_incremental_run_against_fake_gcs(
         ).fetchall()
     finally:
         con.close()
-    assert rows == [("aapl.json", 999, "gs://bkt/raw/aapl.json#2")]
+    assert rows == [("acme.json", 999, "gs://bkt/raw/acme.json#2")]
 
 
 def test_freshness_for_gcs_source(
     gcs_project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client = _FakeStorageClient([_json_blob("raw/aapl.json", 1, ticker="AAPL")])
+    client = _FakeStorageClient([_json_blob("raw/acme.json", 1, ticker="ACME")])
     monkeypatch.setattr(GCSDocumentSource, "_make_client", lambda self: client)
 
     results = check_freshness(gcs_project)
     assert results[0].status == "pass"
-    assert results[0].newest_file == "aapl.json"
+    assert results[0].newest_file == "acme.json"
     assert results[0].file_count == 1
 
 

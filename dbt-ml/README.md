@@ -236,16 +236,16 @@ pip install 'dbt-ml[gcs]'
 ```
 
 ```yaml
-# sources/filings.yml
+# sources/documents.yml
 version: 2
 sources:
-  - name: sec_filings
-    path: gs://econ-raw/sec/10k        # bucket + prefix
+  - name: report_html
+    path: gs://my-raw-bucket/reports   # bucket + prefix
     file_pattern: "*.html"             # basename match; "2026/*.html" matches paths
     max_objects: 20000                 # listing bound (default 5000)
 
-  - name: fomc_transcripts
-    path: gs://econ-raw/fomc
+  - name: meeting_transcripts
+    path: gs://my-raw-bucket/transcripts
     file_pattern: "*.pdf"
     freshness:
       warn_after: { count: 45, period: day }
@@ -262,6 +262,50 @@ and a `source_metadata` JSON column (size, updated, content type, hashes).
 Auth is Application Default Credentials: `gcloud auth application-default
 login` locally, or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
 service-account JSON in CI.
+
+## Document extraction contract
+
+Every extraction row carries identity, lineage, and parser provenance:
+`document_id`, `source_path`, `source_uri` (local `file://` URI, or
+`gs://bucket/name#generation` for GCS), `content_hash`, `code_version`,
+`backend_name`, `backend_version` (the parsing library's version, e.g.
+`pypdf/6.1`), and `extracted_at` (one UTC timestamp per run). Remote
+sources add `source_metadata` JSON.
+
+> Upgrading note: these columns are new — existing *incremental*
+> extraction models will report a schema change on their next reprocess;
+> run once with `--full-refresh` (or set
+> `on_schema_change: append_new_columns`).
+
+Structure-preserving options for document parsing:
+
+```yaml
+# Sectioned HTML (reports, filings): headings/tables as JSON with char
+# offsets into `text`, so a downstream parser slices sections without
+# touching HTML.
+- name: raw_reports
+  source: ref('report_html')
+  extraction:
+    backend: html
+    options:
+      include_structure: true   # emits `sections` and `tables`
+  materialization: incremental
+
+# Multi-page PDF (transcripts, reports): per-page char offsets into
+# `text`, so e.g. speaker-turn parsing can attribute any match to a page.
+- name: raw_transcripts
+  source: ref('meeting_transcripts')
+  extraction:
+    backend: pdf
+    options:
+      include_pages: true       # emits `pages` [{page, char_start, char_end}]
+  materialization: incremental
+```
+
+`sections` entries are `{level, heading, char_start, anchor?}`; `tables`
+are `{index, char_start, n_rows, n_cols, cells}`. Domain-specific logic
+(section taxonomy, speaker parsing) belongs in a transform layered after
+extraction — the backends stay generic.
 
 ## Built-in text preprocessing
 

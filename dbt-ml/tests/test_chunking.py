@@ -68,6 +68,28 @@ def test_splitting_is_deterministic() -> None:
     assert split_text(text, cfg) == split_text(text, cfg)
 
 
+def test_splitter_does_not_inject_trailing_separator() -> None:
+    """The source ends in `sentence 19` (no trailing `. `); the final chunk
+    must not gain an injected period — chunk text is what gets embedded."""
+    text = ". ".join(f"sentence {i}" for i in range(20))
+    assert text.endswith("sentence 19")
+    chunks = split_text(text, ChunkConfig(chunk_size=80, chunk_overlap=10))
+    assert chunks[-1].text.endswith("sentence 19")
+    assert not chunks[-1].text.endswith(".")
+
+
+def test_chunks_contain_only_source_characters() -> None:
+    """Concatenating chunk text (minus overlap) introduces no characters that
+    weren't in the source."""
+    text = "\n\n".join(
+        f"Paragraph {i} has several words in it." for i in range(15)
+    )
+    chunks = split_text(text, ChunkConfig(chunk_size=100, chunk_overlap=0))
+    source_chars = set(text)
+    for chunk in chunks:
+        assert set(chunk.text) <= source_chars
+
+
 # ─── chunk ids ──────────────────────────────────────────────────────────────
 
 
@@ -261,3 +283,16 @@ def test_chunk_dag_orders_after_extraction(tmp_path: Path) -> None:
     dag = ProjectDAG(sources, models)
     order = dag.execution_order()
     assert order.index("document_registry") < order.index("document_chunks")
+
+
+def test_ls_reports_chunk_kind() -> None:
+    """`dbt-ml ls` must show chunk models as `chunk`, not `unknown`."""
+    from dbt_ml.cli import _model_kind
+    from dbt_ml.config.model import ChunkConfig, ModelConfig
+
+    model = ModelConfig(
+        name="document_chunks",
+        depends_on=["ref('document_registry')"],
+        chunk=ChunkConfig(),
+    )
+    assert _model_kind(model) == "chunk"

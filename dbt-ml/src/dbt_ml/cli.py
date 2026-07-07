@@ -371,6 +371,8 @@ def _model_kind(model: ModelConfig) -> str:
         return "ml"
     if model.transform is not None:
         return "transform"
+    if model.chunk is not None:
+        return "chunk"
     return "unknown"
 
 

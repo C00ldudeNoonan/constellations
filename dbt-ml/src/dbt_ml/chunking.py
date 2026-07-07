@@ -70,10 +70,16 @@ def _recurse(text: str, chunk_size: int, separators: list[str]) -> list[str]:
         return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
     pieces: list[str] = []
-    for part in text.split(separator):
-        if not part:
+    parts = text.split(separator)
+    for i, part in enumerate(parts):
+        # Re-attach the separator that split() consumed, but only *between*
+        # parts — the final part had no trailing separator in the source, so
+        # appending one would inject characters that were never there.
+        # Chunk text is what gets embedded/retrieved, so it must match the
+        # source exactly apart from window-boundary whitespace.
+        segment = part + separator if i < len(parts) - 1 else part
+        if not segment:
             continue
-        segment = part + separator
         if len(segment) <= chunk_size:
             pieces.append(segment)
         else:

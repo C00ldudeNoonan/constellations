@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config.model import ExtractionConfig, MLConfig, TransformConfig
+from .config.model import ChunkConfig, ExtractionConfig, MLConfig, TransformConfig
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -23,12 +23,14 @@ def compute_code_version(
     extraction: ExtractionConfig | None,
     transform: TransformConfig | None,
     ml: MLConfig | None = None,
+    chunk: ChunkConfig | None = None,
     project_dir: Path,
 ) -> str:
     payload: dict[str, Any] = {
         "extraction": extraction.model_dump() if extraction else None,
         "transform": transform.model_dump() if transform else None,
         "ml": ml.model_dump(mode="json") if ml else None,
+        "chunk": chunk.model_dump() if chunk else None,
     }
     if transform and transform.module:
         module_file = resolve_module_file(transform.module, project_dir)

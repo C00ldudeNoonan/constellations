@@ -26,6 +26,36 @@ class TransformConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChunkConfig(BaseModel):
+    """Split an upstream document's text into one row per chunk (issue #86).
+
+    strategy:      "recursive" (character splitter on a separator hierarchy,
+                   pure-python) or "tokens" (tiktoken-based).
+    text_field:    upstream column holding the text to split (default "text").
+    chunk_size:    target chunk size — characters for recursive, tokens for
+                   tokens.
+    chunk_overlap: overlap carried between adjacent chunks, same unit.
+    encoding:      tiktoken encoding name for the tokens strategy.
+    """
+
+    strategy: Literal["recursive", "tokens"] = "recursive"
+    text_field: str = "text"
+    chunk_size: int = 1000
+    chunk_overlap: int = 100
+    encoding: str = "cl100k_base"
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_sizes(self) -> ChunkConfig:
+        if self.chunk_size <= 0:
+            raise ValueError("chunk.chunk_size must be positive")
+        if self.chunk_overlap < 0:
+            raise ValueError("chunk.chunk_overlap must be non-negative")
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk.chunk_overlap must be smaller than chunk_size")
+        return self
+
+
 class MLArtifactConfig(BaseModel):
     path: Path | None = None
     include_metrics: bool = True
@@ -68,6 +98,7 @@ class ModelConfig(BaseModel):
     extraction: ExtractionConfig | None = None
     transform: TransformConfig | None = None
     ml: MLConfig | None = None
+    chunk: ChunkConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
     on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
@@ -87,20 +118,24 @@ class ModelConfig(BaseModel):
                 ("extraction", self.extraction),
                 ("transform", self.transform),
                 ("ml", self.ml),
+                ("chunk", self.chunk),
             )
             if block is not None
         ]
         if len(kinds) > 1:
             raise ValueError(
                 f"Model '{self.name}' declares multiple kind blocks "
-                f"({', '.join(kinds)}); exactly one of extraction/transform/ml "
-                "is allowed"
+                f"({', '.join(kinds)}); exactly one of "
+                "extraction/transform/ml/chunk is allowed"
             )
         return self
 
     @property
     def kind_block_count(self) -> int:
-        return sum(b is not None for b in (self.extraction, self.transform, self.ml))
+        return sum(
+            b is not None
+            for b in (self.extraction, self.transform, self.ml, self.chunk)
+        )
 
 
 class ModelFile(BaseModel):
@@ -115,7 +150,7 @@ class ModelFile(BaseModel):
         missing = [m.name for m in self.models if m.kind_block_count == 0]
         if missing:
             raise ValueError(
-                f"Models missing an extraction/transform/ml block: "
+                f"Models missing an extraction/transform/ml/chunk block: "
                 f"{', '.join(sorted(missing))}"
             )
         return self

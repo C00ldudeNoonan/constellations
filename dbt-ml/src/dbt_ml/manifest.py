@@ -107,6 +107,8 @@ def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
         kind = "ml"
     elif model.transform is not None:
         kind = "transform"
+    elif model.chunk is not None:
+        kind = "chunk"
     else:
         kind = "unknown"
 
@@ -121,12 +123,14 @@ def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
         "extraction": model.extraction.model_dump() if model.extraction else None,
         "transform": model.transform.model_dump() if model.transform else None,
         "ml": model.ml.model_dump(mode="json") if model.ml else None,
+        "chunk": model.chunk.model_dump() if model.chunk else None,
         "fields": [f.model_dump() for f in model.fields],
         "tests": model.tests,
         "code_version": compute_code_version(
             extraction=model.extraction,
             transform=model.transform,
             ml=model.ml,
+            chunk=model.chunk,
             project_dir=project_dir,
         ),
     }
@@ -174,6 +178,7 @@ def compute_modified_models(
             extraction=model.extraction,
             transform=model.transform,
             ml=model.ml,
+            chunk=model.chunk,
             project_dir=project_dir,
         )
         if previous.get(model.name) != current:

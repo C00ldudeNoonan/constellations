@@ -1,0 +1,21 @@
+version: 2
+
+# One row per chunk with a deterministic chunk_id (stable across reruns when
+# the document is unchanged — safe for incremental MERGE downstream). Lineage
+# (document_id, source_uri, content_hash) is carried onto every chunk.
+models:
+  - name: document_chunks
+    description: "Recursive character chunks of each document, for RAG"
+    depends_on: [ref('document_registry')]
+
+    chunk:
+      strategy: recursive
+      text_field: text
+      chunk_size: 800
+      chunk_overlap: 100
+
+    materialization: incremental
+
+    tests:
+      - not_null: [chunk_id, document_id, text]
+      - unique: chunk_id

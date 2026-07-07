@@ -1,9 +1,17 @@
 from .loader import ConfigError, load_project
-from .model import ExtractionConfig, FieldConfig, ModelConfig, ModelFile, TransformConfig
+from .model import (
+    ChunkConfig,
+    ExtractionConfig,
+    FieldConfig,
+    ModelConfig,
+    ModelFile,
+    TransformConfig,
+)
 from .project import DuckDBConfig, ExtractionDefaults, ProjectConfig
 from .source import SourceConfig, SourceFile
 
 __all__ = [
+    "ChunkConfig",
     "ConfigError",
     "DuckDBConfig",
     "ExtractionConfig",

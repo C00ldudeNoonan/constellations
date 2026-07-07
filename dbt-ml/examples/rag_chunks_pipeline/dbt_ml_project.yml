@@ -1,0 +1,10 @@
+name: rag_chunks_pipeline
+version: "0.1.0"
+profile: rag_chunks_pipeline
+
+extraction:
+  default_backend: html
+
+source-paths: ["sources"]
+model-paths: ["models"]
+target-path: "target"

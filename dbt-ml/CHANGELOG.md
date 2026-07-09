@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Observability (issue #75, part 2)
+- Opt-in `batch: true` on `llm` extraction options routes uncached documents
+  through the Anthropic Message Batches API (50% token cost, minutes-latency;
+  sync stays the default). Per-document errors stay isolated, responses land
+  in the LLM cache, and `estimated_cost_usd` applies the batch discount.
+- New `BaseBackend.extract_batch` hook (default: sequential loop with
+  per-document error capture).
+
 ### Observability (issue #75, part 1)
 - LLM extraction records token usage per model: API calls, response-cache hits,
   input/output tokens, and prompt-cache read/write tokens. Totals land on

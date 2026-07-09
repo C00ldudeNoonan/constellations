@@ -14,7 +14,7 @@ from typing import Any, cast
 import polars as pl
 
 from .adapters import AdapterError, WarehouseAdapter, create_adapter
-from .backends import ExtractionResult, get_backend
+from .backends import BaseBackend, ExtractionResult, get_backend
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
@@ -391,7 +391,11 @@ def _run_extraction_model(
                 log.debug("extraction failed for %s", doc.relative_path, exc_info=True)
                 return doc, None, f"{type(e).__name__}: {e}"
 
-        if threads > 1 and len(docs_to_process) > 1:
+        if options.get("batch") and docs_to_process:
+            extracted = _extract_batched(
+                docs_to_process, source_backend, backend, options, work_dir, model.name
+            )
+        elif threads > 1 and len(docs_to_process) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
                 extracted = list(ex.map(_one, docs_to_process))
         else:
@@ -420,10 +424,15 @@ def _run_extraction_model(
         )
         state_records.append((doc.document_id, doc.content_hash, code_version))
 
+    if usage_totals and options.get("batch"):
+        usage_totals["batch"] = True
     if usage_totals and resolved.llm is not None and resolved.llm.pricing is not None:
-        usage_totals["estimated_cost_usd"] = _estimate_cost(
-            usage_totals, resolved.llm.pricing
-        )
+        cost = _estimate_cost(usage_totals, resolved.llm.pricing)
+        if options.get("batch"):
+            # The Batch API bills 50%, and every non-cache token in these
+            # totals went through it (cache hits contribute zero tokens).
+            cost = round(cost * 0.5, 6)
+        usage_totals["estimated_cost_usd"] = cost
 
     rows_written = 0
     if rows or full_refresh or model.materialization == "full":
@@ -474,6 +483,53 @@ def _estimate_cost(totals: dict[str, Any], pricing: PricingConfig) -> float:
         float(totals.get(key, 0)) * rate for key, rate in rates if rate is not None
     )
     return round(cost / 1_000_000, 6)
+
+
+def _extract_batched(
+    docs: list[DocumentRef],
+    source_backend: DocumentSource,
+    backend: BaseBackend,
+    options: dict[str, Any],
+    work_dir: Path,
+    model_name: str,
+) -> list[tuple[DocumentRef, ExtractionResult | None, str | None]]:
+    """Batch-mode extraction: fetch everything up front, hand the backend one
+    extract_batch() call, and map its aligned results back per document. Fetch
+    and per-item failures stay per-document; only batch submission itself
+    fails the model."""
+    entries: list[tuple[DocumentRef, Path | None, str | None]] = []
+    for doc in docs:
+        try:
+            entries.append((doc, source_backend.fetch(doc, work_dir), None))
+        except Exception as e:
+            log.debug("fetch failed for %s", doc.relative_path, exc_info=True)
+            entries.append((doc, None, f"{type(e).__name__}: {e}"))
+
+    fetched = [(doc, path) for doc, path, err in entries if path is not None]
+    try:
+        batch_out = (
+            backend.extract_batch([p for _, p in fetched], options) if fetched else []
+        )
+    except Exception as e:
+        raise RunError(
+            f"Batch extraction failed for model '{model_name}': {e}"
+        ) from e
+    by_doc_id = {
+        doc.document_id: res
+        for (doc, _), res in zip(fetched, batch_out, strict=True)
+    }
+
+    out: list[tuple[DocumentRef, ExtractionResult | None, str | None]] = []
+    for doc, _path, err in entries:
+        if err is not None:
+            out.append((doc, None, err))
+            continue
+        res = by_doc_id[doc.document_id]
+        if isinstance(res, Exception):
+            out.append((doc, None, f"{type(res).__name__}: {res}"))
+        else:
+            out.append((doc, res, None))
+    return out
 
 
 def _row_for_extraction(

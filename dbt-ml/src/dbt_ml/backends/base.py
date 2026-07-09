@@ -33,6 +33,22 @@ class BaseBackend(ABC):
     @abstractmethod
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult: ...
 
+    def extract_batch(
+        self, paths: list[Path], options: dict[str, Any]
+    ) -> list[ExtractionResult | Exception]:
+        """Extract many documents in one call, returning one entry per input
+        path (aligned): an ExtractionResult, or the Exception that document
+        raised — per-document failures never abort the batch. Default is a
+        sequential extract() loop; backends with a native batch path (llm →
+        Anthropic Message Batches, issue #75) override."""
+        out: list[ExtractionResult | Exception] = []
+        for path in paths:
+            try:
+                out.append(self.extract(path, options))
+            except Exception as e:
+                out.append(e)
+        return out
+
     def version(self) -> str:
         """Parser identity recorded on every extracted row (issue #85), so a
         row can always be traced to the code that produced it. Backends built

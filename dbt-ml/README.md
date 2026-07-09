@@ -95,6 +95,20 @@ The `llm` backend sends document text to the configured model provider and store
 cached structured responses in the configured cache database. Use deterministic
 local backends for sensitive documents unless remote processing is intended.
 
+For scheduled/orchestrated runs, the `llm` backend can route uncached documents
+through the Anthropic Message Batches API — 50% token cost, at the price of
+minutes-scale latency (the run blocks until the batch completes). Cache hits
+still resolve locally, and the cost estimate in run results applies the batch
+discount automatically. Keep it off for dev loops:
+
+```yaml
+extraction:
+  backend: llm
+  options:
+    batch: true            # Message Batches API: 50% token cost, minutes-latency
+    batch_poll_seconds: 30 # optional poll interval
+```
+
 ## The CLI
 
 ```

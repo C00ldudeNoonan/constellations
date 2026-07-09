@@ -262,6 +262,72 @@ def test_truncated_response_is_an_error(
     assert isinstance(create_kwargs["system"], str)
 
 
+def test_extract_with_usage_carries_tokens(tmp_path: Path) -> None:
+    from dbt_ml.backends.llm_backend import extract_fields_with_usage
+
+    def fake(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return {"x": 1}, {"input_tokens": 500, "output_tokens": 42}
+
+    fields, usage = extract_fields_with_usage(
+        "some text",
+        fields_spec=[{"name": "x"}],
+        call_api=fake,
+        cache_path=tmp_path / "cache.duckdb",
+    )
+    assert fields == {"x": 1}
+    assert usage["api_calls"] == 1
+    assert usage["cache_hits"] == 0
+    assert usage["input_tokens"] == 500
+    assert usage["output_tokens"] == 42
+    assert usage["cache_read_input_tokens"] == 0
+
+
+def test_extract_with_usage_cache_hit_is_zero_tokens(tmp_path: Path) -> None:
+    from dbt_ml.backends.llm_backend import extract_fields_with_usage
+
+    def fake(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return {"x": 1}, {"input_tokens": 500, "output_tokens": 42}
+
+    kwargs: dict[str, Any] = {
+        "fields_spec": [{"name": "x"}],
+        "call_api": fake,
+        "cache_path": tmp_path / "cache.duckdb",
+    }
+    extract_fields_with_usage("same text", **kwargs)
+    fields, usage = extract_fields_with_usage("same text", **kwargs)
+
+    assert fields == {"x": 1}
+    assert usage == {
+        "api_calls": 0,
+        "cache_hits": 1,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def test_extract_with_usage_accepts_bare_dict_fake() -> None:
+    """Injected call_api fns predating #75 return fields only — still valid."""
+    from dbt_ml.backends.llm_backend import extract_fields_with_usage
+
+    def fake(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+    ) -> dict[str, Any]:
+        return {"x": 1}
+
+    fields, usage = extract_fields_with_usage(
+        "text", fields_spec=[{"name": "x"}], call_api=fake
+    )
+    assert fields == {"x": 1}
+    assert usage["api_calls"] == 1
+    assert usage["input_tokens"] == 0
+
+
 def test_max_concurrent_gates_api_calls() -> None:
     import threading
     import time

@@ -20,6 +20,7 @@ from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
 from .config import load_project
 from .config.model import ModelConfig
+from .config.profile import PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
@@ -399,10 +400,14 @@ def _run_extraction_model(
     backend_version = backend.version()
     # One timestamp per model run: rows from the same run are batch-identifiable.
     extracted_at = datetime.now(UTC).isoformat()
+    usage_totals: dict[str, Any] = {}
     for doc, result, err in extracted:
         if err is not None or result is None:
             errors.append(f"{doc.relative_path}: {err}")
             continue
+        for key, value in result.metrics.items():
+            if isinstance(value, int | float):
+                usage_totals[key] = usage_totals.get(key, 0) + value
         rows.append(
             _row_for_extraction(
                 doc,
@@ -414,6 +419,11 @@ def _run_extraction_model(
             )
         )
         state_records.append((doc.document_id, doc.content_hash, code_version))
+
+    if usage_totals and resolved.llm is not None and resolved.llm.pricing is not None:
+        usage_totals["estimated_cost_usd"] = _estimate_cost(
+            usage_totals, resolved.llm.pricing
+        )
 
     rows_written = 0
     if rows or full_refresh or model.materialization == "full":
@@ -447,7 +457,23 @@ def _run_extraction_model(
         documents_deleted=deleted,
         rows_written=rows_written,
         errors=errors,
+        metrics=usage_totals,
     )
+
+
+def _estimate_cost(totals: dict[str, Any], pricing: PricingConfig) -> float:
+    """Token totals × user-supplied USD-per-Mtok rates. Cache rates are
+    optional; tokens with no configured rate contribute nothing."""
+    rates = [
+        ("input_tokens", pricing.input_usd_per_mtok),
+        ("output_tokens", pricing.output_usd_per_mtok),
+        ("cache_read_input_tokens", pricing.cache_read_usd_per_mtok),
+        ("cache_creation_input_tokens", pricing.cache_write_usd_per_mtok),
+    ]
+    cost = sum(
+        float(totals.get(key, 0)) * rate for key, rate in rates if rate is not None
+    )
+    return round(cost / 1_000_000, 6)
 
 
 def _row_for_extraction(

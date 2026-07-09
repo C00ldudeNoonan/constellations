@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Scale (issue #77)
+- Extraction models stream rows to the warehouse every `flush_every` documents
+  (default 5000) instead of accumulating the whole corpus in memory.
+  Incremental models upsert rows and state per flush, so a killed run keeps
+  completed chunks and the re-run processes only the remainder; full models
+  stream through a `dbt_ml_staging__*` table swapped in atomically at the end.
+- New `WarehouseAdapter.materialize_full_chunks` (DuckDB + BigQuery
+  implementations); staging tables are hidden from `list_tables`.
+- `flush_every` is excluded from `code_version`, so tuning it never
+  invalidates incremental state. Empty-corpus full models now drop the target
+  table on both adapters (previously DuckDB errored).
+
 ### Observability (issue #75, part 2)
 - Opt-in `batch: true` on `llm` extraction options routes uncached documents
   through the Anthropic Message Batches API (50% token cost, minutes-latency;

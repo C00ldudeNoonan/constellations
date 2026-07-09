@@ -6,6 +6,7 @@ import logging
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -371,13 +372,50 @@ def _run_extraction_model(
             deleted = len(removed)
 
     skipped = len(docs) - len(docs_to_process)
+    total_docs = len(docs_to_process)
+    flush_every = model.extraction.flush_every
+    use_full = model.materialization == "full" or full_refresh
+
     errors: list[str] = []
-    rows: list[dict[str, Any]] = []
-    state_records: list[tuple[str, str, str]] = []
+    usage_totals: dict[str, Any] = {}
+    full_state_records: list[tuple[str, str, str]] = []
+    rows_written = 0
+    docs_flushed = 0
+
+    backend_version = backend.version()
+    # One timestamp per model run: rows from the same run are batch-identifiable.
+    extracted_at = datetime.now(UTC).isoformat()
+
+    def _rows_for_chunk(
+        extracted: list[tuple[DocumentRef, ExtractionResult | None, str | None]],
+    ) -> tuple[list[dict[str, Any]], list[tuple[str, str, str]]]:
+        chunk_rows: list[dict[str, Any]] = []
+        chunk_records: list[tuple[str, str, str]] = []
+        for doc, result, err in extracted:
+            if err is not None or result is None:
+                errors.append(f"{doc.relative_path}: {err}")
+                continue
+            for key, value in result.metrics.items():
+                if isinstance(value, int | float):
+                    usage_totals[key] = usage_totals.get(key, 0) + value
+            chunk_rows.append(
+                _row_for_extraction(
+                    doc,
+                    code_version,
+                    result,
+                    backend_name=backend_name,
+                    backend_version=backend_version,
+                    extracted_at=extracted_at,
+                )
+            )
+            chunk_records.append((doc.document_id, doc.content_hash, code_version))
+        return chunk_rows, chunk_records
 
     # Remote sources download into a per-model scratch dir, lazily and only
     # for documents that actually need processing; local sources pass their
-    # real path through untouched.
+    # real path through untouched. Extraction streams through in
+    # `flush_every`-sized chunks (issue #77): rows never accumulate beyond
+    # one chunk, so corpus size is bounded by the flush size, not memory.
     with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
         work_dir = Path(scratch)
 
@@ -391,38 +429,90 @@ def _run_extraction_model(
                 log.debug("extraction failed for %s", doc.relative_path, exc_info=True)
                 return doc, None, f"{type(e).__name__}: {e}"
 
-        if options.get("batch") and docs_to_process:
-            extracted = _extract_batched(
-                docs_to_process, source_backend, backend, options, work_dir, model.name
-            )
-        elif threads > 1 and len(docs_to_process) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
-                extracted = list(ex.map(_one, docs_to_process))
-        else:
-            extracted = [_one(d) for d in docs_to_process]
+        def _iter_extracted() -> (
+            Iterator[list[tuple[DocumentRef, ExtractionResult | None, str | None]]]
+        ):
+            if options.get("batch") and docs_to_process:
+                # One Batches API submission for the whole model (#75); only
+                # the materialization of its results is chunked.
+                all_extracted = _extract_batched(
+                    docs_to_process,
+                    source_backend,
+                    backend,
+                    options,
+                    work_dir,
+                    model.name,
+                )
+                for i in range(0, len(all_extracted), flush_every):
+                    yield all_extracted[i : i + flush_every]
+                return
+            for i in range(0, total_docs, flush_every):
+                chunk = docs_to_process[i : i + flush_every]
+                if threads > 1 and len(chunk) > 1:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=threads
+                    ) as ex:
+                        yield list(ex.map(_one, chunk))
+                else:
+                    yield [_one(d) for d in chunk]
 
-    backend_version = backend.version()
-    # One timestamp per model run: rows from the same run are batch-identifiable.
-    extracted_at = datetime.now(UTC).isoformat()
-    usage_totals: dict[str, Any] = {}
-    for doc, result, err in extracted:
-        if err is not None or result is None:
-            errors.append(f"{doc.relative_path}: {err}")
-            continue
-        for key, value in result.metrics.items():
-            if isinstance(value, int | float):
-                usage_totals[key] = usage_totals.get(key, 0) + value
-        rows.append(
-            _row_for_extraction(
-                doc,
-                code_version,
-                result,
-                backend_name=backend_name,
-                backend_version=backend_version,
-                extracted_at=extracted_at,
-            )
-        )
-        state_records.append((doc.document_id, doc.content_hash, code_version))
+        if use_full:
+            # Chunks stream into a staging table that atomically replaces the
+            # target at the end; state upserts once, after the swap.
+            def _frames() -> Iterator[pl.DataFrame]:
+                nonlocal docs_flushed
+                for extracted in _iter_extracted():
+                    chunk_rows, chunk_records = _rows_for_chunk(extracted)
+                    full_state_records.extend(chunk_records)
+                    docs_flushed += len(extracted)
+                    if chunk_rows:
+                        log.info(
+                            "staged %d rows (%d/%d docs) for %s",
+                            len(chunk_rows),
+                            docs_flushed,
+                            total_docs,
+                            model.name,
+                        )
+                        yield pl.DataFrame(chunk_rows)
+
+            try:
+                rows_written = adapter.materialize_full_chunks(model.name, _frames())
+            except AdapterError as e:
+                raise RunError(str(e)) from e
+        else:
+            # Incremental: each flush upserts rows and its state immediately —
+            # a killed run keeps completed chunks, and the re-run skips them.
+            first_flush = True
+            for extracted in _iter_extracted():
+                chunk_rows, chunk_records = _rows_for_chunk(extracted)
+                docs_flushed += len(extracted)
+                if not chunk_rows:
+                    continue
+                try:
+                    rows_written += adapter.materialize_incremental(
+                        model.name,
+                        pl.DataFrame(chunk_rows),
+                        key_col="document_id",
+                        # The model's policy governs run-over-run drift on the
+                        # first flush; later flushes union within-run drift,
+                        # matching what one whole-run DataFrame did.
+                        on_schema_change=model.on_schema_change
+                        if first_flush
+                        else "append_new_columns",
+                    )
+                except AdapterError as e:
+                    # RunError so `build` fails this model and blocks
+                    # descendants instead of aborting the whole invocation.
+                    raise RunError(str(e)) from e
+                first_flush = False
+                adapter.upsert_state(model.name, chunk_records)
+                log.info(
+                    "flushed %d rows (%d/%d docs) for %s",
+                    len(chunk_rows),
+                    docs_flushed,
+                    total_docs,
+                    model.name,
+                )
 
     if usage_totals and options.get("batch"):
         usage_totals["batch"] = True
@@ -434,27 +524,10 @@ def _run_extraction_model(
             cost = round(cost * 0.5, 6)
         usage_totals["estimated_cost_usd"] = cost
 
-    rows_written = 0
-    if rows or full_refresh or model.materialization == "full":
-        df = pl.DataFrame(rows) if rows else pl.DataFrame()
-        if model.materialization == "full" or full_refresh:
-            rows_written = adapter.materialize_full(model.name, df)
-        else:
-            try:
-                rows_written = adapter.materialize_incremental(
-                    model.name,
-                    df,
-                    key_col="document_id",
-                    on_schema_change=model.on_schema_change,
-                )
-            except AdapterError as e:
-                # RunError so `build` fails this model and blocks descendants
-                # instead of aborting the whole invocation.
-                raise RunError(str(e)) from e
-
     if full_refresh:
         adapter.clear_model_state(model.name)
-    adapter.upsert_state(model.name, state_records)
+    if use_full:
+        adapter.upsert_state(model.name, full_state_records)
 
     return ModelRunResult(
         model_name=model.name,

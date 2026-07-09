@@ -269,3 +269,84 @@ def test_schema_change_unknown_policy_rejected(tmp_path: Path) -> None:
                 key_col="document_id",
                 on_schema_change="sync_all",
             )
+
+
+# ─── materialize_full_chunks (issue #77) ────────────────────────────────────
+
+
+def test_full_chunks_concatenates_and_replaces(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("widgets", pl.DataFrame({"old": ["stale"]}))
+        total = adapter.materialize_full_chunks(
+            "widgets",
+            iter(
+                [
+                    pl.DataFrame({"document_id": ["a", "b"], "x": [1, 2]}),
+                    pl.DataFrame({"document_id": ["c"], "x": [3]}),
+                ]
+            ),
+        )
+        assert total == 3
+        rows = adapter.rows(
+            f"SELECT document_id, x FROM {adapter.table_ref('widgets')} "
+            "ORDER BY document_id"
+        )
+        assert rows == [("a", 1), ("b", 2), ("c", 3)]
+        assert "dbt_ml_staging__widgets" not in adapter.rows(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'testns'"
+        )
+
+
+def test_full_chunks_unions_intra_run_drift(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full_chunks(
+            "widgets",
+            iter(
+                [
+                    pl.DataFrame({"document_id": ["a"], "x": [1]}),
+                    # chunk 2 adds a column and drops one
+                    pl.DataFrame({"document_id": ["b"], "extra": ["?"]}),
+                ]
+            ),
+        )
+        rows = adapter.rows(
+            f"SELECT document_id, x, extra FROM {adapter.table_ref('widgets')} "
+            "ORDER BY document_id"
+        )
+        assert rows == [("a", 1, None), ("b", None, "?")]
+
+
+def test_full_chunks_failure_drops_staging_keeps_target(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("widgets", pl.DataFrame({"x": [1]}))
+
+        def _chunks():
+            yield pl.DataFrame({"x": [2]})
+            raise RuntimeError("extraction blew up mid-stream")
+
+        with pytest.raises(RuntimeError, match="mid-stream"):
+            adapter.materialize_full_chunks("widgets", _chunks())
+
+        # target untouched, staging cleaned up
+        assert adapter.rows(f"SELECT x FROM {adapter.table_ref('widgets')}") == [(1,)]
+        staging = adapter.rows(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'testns' AND table_name LIKE 'dbt_ml_staging%'"
+        )
+        assert staging == []
+
+
+def test_full_chunks_empty_iterator_drops_target(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("widgets", pl.DataFrame({"x": [1]}))
+        total = adapter.materialize_full_chunks("widgets", iter([]))
+        assert total == 0
+        assert "widgets" not in adapter.list_tables()
+
+
+def test_list_tables_excludes_staging_tables(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("model_a", pl.DataFrame({"x": [1]}))
+        adapter.materialize_full("dbt_ml_staging__model_a", pl.DataFrame({"x": [1]}))
+        assert adapter.list_tables() == ["model_a"]

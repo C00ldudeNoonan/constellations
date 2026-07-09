@@ -27,7 +27,12 @@ def compute_code_version(
     project_dir: Path,
 ) -> str:
     payload: dict[str, Any] = {
-        "extraction": extraction.model_dump() if extraction else None,
+        # flush_every shapes execution (memory/flush cadence), never output
+        # content — including it would invalidate every model's incremental
+        # state on upgrade.
+        "extraction": extraction.model_dump(exclude={"flush_every"})
+        if extraction
+        else None,
         "transform": transform.model_dump() if transform else None,
         "ml": ml.model_dump(mode="json") if ml else None,
         "chunk": chunk.model_dump() if chunk else None,

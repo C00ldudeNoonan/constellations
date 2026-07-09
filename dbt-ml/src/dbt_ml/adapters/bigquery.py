@@ -17,6 +17,7 @@ parameters, converted to BigQuery query parameters here.
 from __future__ import annotations
 
 import io
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -454,7 +455,8 @@ class BigQueryAdapter(WarehouseAdapter):
         return [
             n
             for n in names
-            if n != "dbt_ml_state" and not n.startswith("dbt_ml_test_failures__")
+            if n != "dbt_ml_state"
+            and not n.startswith(("dbt_ml_test_failures__", "dbt_ml_staging__"))
         ]
 
     # ─── materialization ─────────────────────────────────────────────────
@@ -519,6 +521,42 @@ class BigQueryAdapter(WarehouseAdapter):
             ]
         self._load_parquet(table, load_df, job_config)
         return df.height
+
+    def materialize_full_chunks(
+        self, table: str, chunks: Iterable[pl.DataFrame]
+    ) -> int:
+        bigquery = _bigquery()
+        staging = f"dbt_ml_staging__{table}"
+        total = 0
+        first = True
+        try:
+            for df in chunks:
+                job_config = bigquery.LoadJobConfig(
+                    source_format=bigquery.SourceFormat.PARQUET,
+                    write_disposition=(
+                        bigquery.WriteDisposition.WRITE_TRUNCATE
+                        if first
+                        else bigquery.WriteDisposition.WRITE_APPEND
+                    ),
+                )
+                if not first:
+                    # Union intra-run schema drift: new columns are added,
+                    # columns missing from a chunk load as NULL.
+                    job_config.schema_update_options = [
+                        bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+                    ]
+                self._load_parquet(staging, df, job_config)
+                first = False
+                total += df.height
+            if first:
+                return self.materialize_full(table, pl.DataFrame())
+            self._run_query(
+                f"CREATE OR REPLACE TABLE {self.table_ref(table)} "
+                f"AS SELECT * FROM {self.table_ref(staging)}"
+            )
+        finally:
+            self.drop_table(staging)
+        return total
 
     def _table_columns(self, table: str) -> list[str] | None:
         try:

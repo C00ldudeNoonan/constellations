@@ -325,6 +325,29 @@ are `{index, char_start, n_rows, n_cols, cells}`. Domain-specific logic
 (section taxonomy, speaker parsing) belongs in a transform layered after
 extraction — the backends stay generic.
 
+### Streaming large corpora
+
+Extraction streams rows to the warehouse every `flush_every` documents
+(default 5000), so corpus size is bounded by the flush size, not memory:
+
+```yaml
+- name: raw_filings
+  source: ref('filing_html')
+  extraction:
+    backend: html
+    flush_every: 1000   # smaller = lower memory, finer crash recovery
+  materialization: incremental
+```
+
+Incremental models upsert rows *and* state per flush — a killed run keeps
+its completed chunks, and the re-run picks up only the remainder. Full
+models stream into a `dbt_ml_staging__*` table that atomically replaces the
+target at the end. Changing `flush_every` never invalidates incremental
+state. One edge: with `on_schema_change: fail` and more than one flush, the
+first flush is compared against the existing table — heterogeneous corpora
+whose early documents lack a column can fail where a whole-run union
+carried it; use `append_new_columns` there.
+
 ## Chunking (RAG)
 
 A `chunk:` model splits an upstream document's text into one row per chunk —

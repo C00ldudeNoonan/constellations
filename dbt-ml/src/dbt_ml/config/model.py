@@ -18,6 +18,10 @@ from .identifiers import validate_node_name
 class ExtractionConfig(BaseModel):
     backend: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    # Rows flush to the warehouse every N documents (issue #77) — bounds
+    # memory and gives incremental runs per-flush crash recovery. Excluded
+    # from code_version: it changes execution, never output content.
+    flush_every: int = Field(default=5000, gt=0)
 
 
 class TransformConfig(BaseModel):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -149,6 +150,51 @@ class DuckDBAdapter(WarehouseAdapter):
             self.connection.unregister("dbt_ml_staging")
         return df.height
 
+    def materialize_full_chunks(
+        self, table: str, chunks: Iterable[pl.DataFrame]
+    ) -> int:
+        staging = f"dbt_ml_staging__{table}"
+        staging_ref = self.table_ref(staging)
+        total = 0
+        first = True
+        try:
+            for df in chunks:
+                self.connection.register("dbt_ml_staging", df)
+                try:
+                    if first:
+                        self.connection.execute(
+                            f"CREATE OR REPLACE TABLE {staging_ref} "
+                            "AS SELECT * FROM dbt_ml_staging"
+                        )
+                        first = False
+                    else:
+                        insert_cols = self._reconcile_schema(
+                            staging, df, "append_new_columns"
+                        )
+                        col_list = ", ".join(
+                            self.quote_ident(c) for c in insert_cols
+                        )
+                        self.connection.execute(
+                            f"INSERT INTO {staging_ref} BY NAME "
+                            f"SELECT {col_list} FROM dbt_ml_staging"
+                        )
+                finally:
+                    self.connection.unregister("dbt_ml_staging")
+                total += df.height
+            if first:
+                # Empty corpus: drop the target (BigQuery's materialize_full
+                # contract for an empty frame) rather than swap in nothing.
+                self.drop_table(table)
+                return 0
+            self.connection.execute(f"DROP TABLE IF EXISTS {self.table_ref(table)}")
+            self.connection.execute(
+                f"ALTER TABLE {staging_ref} RENAME TO {self.quote_ident(table)}"
+            )
+        except Exception:
+            self.connection.execute(f"DROP TABLE IF EXISTS {staging_ref}")
+            raise
+        return total
+
     def _reconcile_schema(
         self, table: str, df: pl.DataFrame, on_schema_change: str
     ) -> list[str]:
@@ -254,9 +300,14 @@ class DuckDBAdapter(WarehouseAdapter):
             [self.catalog, self.schema],
         ).fetchall()
         # `dbt_ml_test_failures__*` tables are --store-failures inspection
-        # artifacts, not models; keep them out of the model namespace. (Filtered
-        # in Python because `_` is a LIKE wildcard in SQL.)
-        return [r[0] for r in rows if not r[0].startswith("dbt_ml_test_failures__")]
+        # artifacts and `dbt_ml_staging__*` are in-flight full loads (#77),
+        # not models; keep both out of the model namespace. (Filtered in
+        # Python because `_` is a LIKE wildcard in SQL.)
+        return [
+            r[0]
+            for r in rows
+            if not r[0].startswith(("dbt_ml_test_failures__", "dbt_ml_staging__"))
+        ]
 
     # ─── state CRUD ──────────────────────────────────────────────────────
 

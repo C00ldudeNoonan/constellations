@@ -583,3 +583,55 @@ def test_job_retry_deadline_applied() -> None:
     job_retry = client.query_kwargs[0]["job_retry"]
     assert job_retry is not None
     assert job_retry._deadline == 120.0
+
+
+# ─── materialize_full_chunks (issue #77) ─────────────────────────────────────
+
+
+def test_full_chunks_stages_then_swaps() -> None:
+    from google.cloud import bigquery
+
+    client = _FakeClient()
+    adapter = _adapter(client)
+    total = adapter.materialize_full_chunks(
+        "docs",
+        iter(
+            [
+                pl.DataFrame({"document_id": ["a"], "x": [1]}),
+                pl.DataFrame({"document_id": ["b"], "extra": ["?"]}),
+            ]
+        ),
+    )
+    assert total == 2
+
+    # Chunk 1 truncates the staging table; chunk 2 appends with field addition.
+    _, staging_id, cfg1 = client.loads[0]
+    assert staging_id == "proj.ds.dbt_ml_staging__docs"
+    assert cfg1.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
+    _, _, cfg2 = client.loads[1]
+    assert cfg2.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+    assert cfg2.schema_update_options == [
+        bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+    ]
+
+    # Swap into the target, then drop staging.
+    swap_sql = client.queries[0][0]
+    assert "CREATE OR REPLACE TABLE `proj`.`ds`.`docs`" in swap_sql
+    assert "`proj`.`ds`.`dbt_ml_staging__docs`" in swap_sql
+    assert client.dropped == ["proj.ds.dbt_ml_staging__docs"]
+
+
+def test_full_chunks_empty_iterator_drops_target() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    assert adapter.materialize_full_chunks("docs", iter([])) == 0
+    assert client.loads == []
+    # materialize_full(empty) drops the target; staging cleanup is a no-op drop.
+    assert "proj.ds.docs" in client.dropped
+
+
+def test_list_tables_excludes_staging() -> None:
+    client = _FakeClient()
+    client.listing = ["docs", "dbt_ml_staging__docs", "dbt_ml_state"]
+    adapter = _adapter(client)
+    assert adapter.list_tables() == ["docs"]

@@ -12,6 +12,7 @@ Databricks / Redshift, matching the dbt-core set.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -121,6 +122,17 @@ class WarehouseAdapter(ABC):
         `fail` raises with a hint to --full-refresh; `append_new_columns`
         adds missing columns to the table (existing rows get NULL);
         `ignore` inserts only the columns the table already has."""
+
+    @abstractmethod
+    def materialize_full_chunks(
+        self, table: str, chunks: Iterable[pl.DataFrame]
+    ) -> int:
+        """Replace `table` with the concatenation of `chunks` without holding
+        them all in memory (issue #77): chunks land in a staging table
+        (`dbt_ml_staging__<table>`) that replaces the target once every chunk
+        is in. Intra-run schema drift between chunks is unioned — new columns
+        are added, missing columns fill with NULL — matching what one
+        whole-run DataFrame gave for free. Returns total rows written."""
 
     @abstractmethod
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:

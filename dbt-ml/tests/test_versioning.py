@@ -64,3 +64,15 @@ def test_resolve_module_file_dotted(tmp_path: Path) -> None:
     assert resolve_module_file("transforms.summary", tmp_path) == (
         tmp_path / "transforms" / "summary.py"
     )
+
+
+def test_code_version_ignores_flush_every(tmp_path: Path) -> None:
+    """flush_every shapes execution, not output — changing it must not
+    invalidate incremental state (issue #77)."""
+    base = ExtractionConfig(backend="json", options={"fields": ["a"]})
+    tuned = ExtractionConfig(
+        backend="json", options={"fields": ["a"]}, flush_every=2
+    )
+    assert compute_code_version(
+        extraction=base, transform=None, project_dir=tmp_path
+    ) == compute_code_version(extraction=tuned, transform=None, project_dir=tmp_path)

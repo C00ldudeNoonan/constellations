@@ -80,6 +80,28 @@ def test_tags_propagate(fresh_project: Path) -> None:
     assert set(raw["tags"]) == {"raw", "invoices"}
 
 
+def test_dagster_meta_off_by_default(fresh_project: Path) -> None:
+    payload = build_dbt_sources(fresh_project)
+    assert "meta" not in _table(payload, "raw_invoices")
+
+
+def test_dagster_meta_stamps_asset_key(fresh_project: Path) -> None:
+    payload = build_dbt_sources(fresh_project, dagster_meta=True)
+    raw = _table(payload, "raw_invoices")
+    assert raw["meta"]["dagster"]["asset_key"] == [
+        "dbt_ml_invoice_pipeline",
+        "raw_invoices",
+    ]
+
+
+def test_dagster_meta_uses_custom_source_name(fresh_project: Path) -> None:
+    payload = build_dbt_sources(
+        fresh_project, source_name="my_ml", dagster_meta=True
+    )
+    raw = _table(payload, "raw_invoices")
+    assert raw["meta"]["dagster"]["asset_key"] == ["my_ml", "raw_invoices"]
+
+
 def test_write_creates_yaml(fresh_project: Path) -> None:
     path = write_dbt_sources(fresh_project)
     assert path.exists()

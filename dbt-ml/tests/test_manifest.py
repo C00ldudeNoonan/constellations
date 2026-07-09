@@ -122,9 +122,53 @@ def test_write_manifest_creates_file(fresh_project: Path) -> None:
 def test_run_writes_run_results(fresh_project: Path) -> None:
     generate_invoices(3, fresh_project / "data" / "invoices", seed=1)
     results = run_project(fresh_project)
-    path = write_run_results(fresh_project, results)
+    path = write_run_results(fresh_project, results, elapsed_seconds=1.5)
     assert path.exists()
     assert path.name == RUN_RESULTS_FILENAME
     payload = json.loads(path.read_text())
     assert len(payload["results"]) == len(results)
     assert {r["model_name"] for r in payload["results"]} == {r.model_name for r in results}
+
+
+def test_run_results_metadata_and_relations(fresh_project: Path) -> None:
+    generate_invoices(3, fresh_project / "data" / "invoices", seed=1)
+    results = run_project(fresh_project)
+    payload = json.loads(
+        write_run_results(fresh_project, results, elapsed_seconds=2.0).read_text()
+    )
+
+    meta = payload["metadata"]
+    assert meta["status"] == "success"
+    assert meta["invocation"] == "run"
+    assert meta["elapsed_seconds"] == 2.0
+    assert meta["counts"] == {
+        "total": len(results),
+        "success": len(results),
+        "error": 0,
+        "skipped": 0,
+    }
+    assert meta["target"]["adapter_type"] == "duckdb"
+    assert meta["target"]["schema"] == "dbt_ml"
+
+    for row in payload["results"]:
+        assert row["status"] == "success"
+        rel = row["relation"]
+        assert rel["name"] == row["model_name"]
+        assert rel["fully_qualified"].endswith("." + row["model_name"])
+
+
+def test_run_results_reports_skipped(fresh_project: Path) -> None:
+    generate_invoices(2, fresh_project / "data" / "invoices", seed=1)
+    results = run_project(fresh_project, select="raw_invoices")
+    payload = json.loads(
+        write_run_results(
+            fresh_project,
+            results,
+            invocation="build",
+            skipped=["invoice_summary"],
+        ).read_text()
+    )
+    statuses = {r["model_name"]: r["status"] for r in payload["results"]}
+    assert statuses["invoice_summary"] == "skipped"
+    assert payload["metadata"]["status"] == "error"
+    assert payload["metadata"]["counts"]["skipped"] == 1

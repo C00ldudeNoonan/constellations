@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
 from .config import load_project
 from .config.model import ModelConfig
 from .dag import ProjectDAG
-from .profile import resolve_profile
+from .profile import ProfileError, resolve_profile
 from .runner import ModelRunResult
 from .versioning import compute_code_version
 
@@ -87,17 +89,141 @@ def write_manifest(
     return out
 
 
-def write_run_results(project_dir: Path, results: list[ModelRunResult]) -> Path:
+def build_run_results(
+    project_dir: Path,
+    results: list[ModelRunResult],
+    *,
+    target: str | None = None,
+    profiles_dir: Path | None = None,
+    invocation: str = "run",
+    skipped: list[str] | None = None,
+    elapsed_seconds: float | None = None,
+    test_failures: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """Assemble the run_results.json payload: run-level metadata (target,
+    counts, status) plus per-model status and the fully-qualified relation each
+    model materialized into. This is the contract Dagster reads to attach
+    materialization metadata (issue #87).
+
+    `test_failures` maps model_name → hard-failed test labels (from `build`). A
+    model that materialized fine but failed a test has empty `errors`, so its
+    status must be derived here too — otherwise a failing test on a leaf model
+    (no skipped descendants) would report `success` while the command exits 1."""
+    skipped = skipped or []
+    test_failures = test_failures or {}
+    target_block = _target_block(project_dir, target=target, profiles_dir=profiles_dir)
+    catalog = target_block["catalog"] if target_block else None
+    schema = target_block["schema"] if target_block else None
+
+    result_rows: list[dict[str, Any]] = []
+    n_error = 0
+    for r in results:
+        failed = test_failures.get(r.model_name, [])
+        status = "error" if (r.errors or failed) else "success"
+        n_error += status == "error"
+        row = asdict(r)
+        row["status"] = status
+        row["test_failures"] = failed
+        row["relation"] = _relation(catalog, schema, r.model_name)
+        result_rows.append(row)
+
+    for name in skipped:
+        row = asdict(ModelRunResult(model_name=name, materialization="", kind="skipped"))
+        row["status"] = "skipped"
+        row["test_failures"] = []
+        row["relation"] = _relation(catalog, schema, name)
+        result_rows.append(row)
+
+    overall = "error" if (n_error or skipped) else "success"
+    metadata: dict[str, Any] = {
+        "dbt_ml_version": _dbt_ml_version(),
+        "generated_at": _now(),
+        "invocation": invocation,
+        "status": overall,
+        "elapsed_seconds": elapsed_seconds,
+        "target": target_block,
+        "counts": {
+            "total": len(results) + len(skipped),
+            "success": len(results) - n_error,
+            "error": n_error,
+            "skipped": len(skipped),
+        },
+    }
+    return {"metadata": metadata, "results": result_rows}
+
+
+def write_run_results(
+    project_dir: Path,
+    results: list[ModelRunResult],
+    *,
+    target: str | None = None,
+    profiles_dir: Path | None = None,
+    invocation: str = "run",
+    skipped: list[str] | None = None,
+    elapsed_seconds: float | None = None,
+    test_failures: dict[str, list[str]] | None = None,
+) -> Path:
     project, _, _ = load_project(project_dir)
     target_dir = (project_dir / project.target_path).resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "generated_at": _now(),
-        "results": [asdict(r) for r in results],
-    }
+    payload = build_run_results(
+        project_dir,
+        results,
+        target=target,
+        profiles_dir=profiles_dir,
+        invocation=invocation,
+        skipped=skipped,
+        elapsed_seconds=elapsed_seconds,
+        test_failures=test_failures,
+    )
     out = target_dir / RUN_RESULTS_FILENAME
     out.write_text(json.dumps(payload, indent=2))
     return out
+
+
+def _target_block(
+    project_dir: Path,
+    *,
+    target: str | None,
+    profiles_dir: Path | None,
+) -> dict[str, Any] | None:
+    """Warehouse target descriptor for run_results. Returns None if the profile
+    can't be resolved (never fail a completed run just to describe its target)."""
+    project, _, _ = load_project(project_dir)
+    try:
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+    except ProfileError:
+        return None
+    w = resolved.warehouse
+    return {
+        "profile": resolved.profile_name,
+        "name": resolved.target_name,
+        "adapter_type": w.type,
+        "schema": w.schema_name,
+        "catalog": w.catalog_name(),
+        "location": w.storage_location(),
+    }
+
+
+def _relation(
+    catalog: str | None, schema: str | None, name: str
+) -> dict[str, Any]:
+    parts = [p for p in (catalog, schema, name) if p]
+    return {
+        "catalog": catalog,
+        "schema": schema,
+        "name": name,
+        "fully_qualified": ".".join(parts),
+    }
+
+
+def _dbt_ml_version() -> str:
+    try:
+        return _pkg_version("dbt-ml")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:

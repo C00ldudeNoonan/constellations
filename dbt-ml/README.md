@@ -502,14 +502,21 @@ Every `dbt-ml compile` / `dbt-ml run` writes to `target/`:
 
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
   model, DAG nodes+edges+execution order. Re-generated each run.
-- **`run_results.json`** — per-model documents processed/skipped, rows written,
-  duration, errors.
+- **`run_results.json`** — run-level metadata (warehouse target, status, counts,
+  elapsed) plus per-model documents processed/skipped, rows written, duration,
+  errors, `status`, and the fully-qualified output `relation`. `run`/`build`
+  also accept `--json` to print this payload to stdout.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`dbt-ml docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `dbt-ml docs serve`.
 
 External tools (lineage viewers, CI dashboards, the dbt-consumer above)
-consume these.
+consume these. `run`/`build` exit `0` on success, `1` on run failure, and `2` on
+a configuration error, so an orchestrator can branch on the cause. Because
+dbt-ml tables are dbt sources, they wire natively into the `dagster-dbt`
+integration — see
+[`docs/orchestration-dagster.md`](docs/orchestration-dagster.md) (use
+`emit-dbt-sources --dagster-meta` to pin the Dagster asset keys).
 
 ## Benchmarks
 

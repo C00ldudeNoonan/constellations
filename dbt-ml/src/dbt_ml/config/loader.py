@@ -36,8 +36,11 @@ def load_project(
 
 
 def _parse_yaml[T](path: Path, model: type[T]) -> T:
-    with path.open() as f:
-        data: Any = yaml.safe_load(f) or {}
+    try:
+        with path.open() as f:
+            data: Any = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Malformed YAML at {path}:\n{e}") from e
     try:
         return model.model_validate(data)  # type: ignore[attr-defined,no-any-return]
     except ValidationError as e:

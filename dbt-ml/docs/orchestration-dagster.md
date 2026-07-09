@@ -108,6 +108,7 @@ def dbt_ml_documents(context: AssetExecutionContext):
     for output_name, key in _keys_by_output.items():
         # output_name mirrors the source table name, which is the dbt-ml model.
         r = by_model.get(key.path[-1], {})
+        metrics = r.get("metrics", {})
         yield MaterializeResult(
             asset_key=key,
             metadata={
@@ -118,6 +119,9 @@ def dbt_ml_documents(context: AssetExecutionContext):
                 "failed_documents": len(r.get("errors", [])),
                 "failed_tests": len(r.get("test_failures", [])),
                 "warehouse": target["adapter_type"],
+                # LLM models carry token accounting (issue #75); empty otherwise.
+                "input_tokens": metrics.get("input_tokens", 0),
+                "estimated_cost_usd": metrics.get("estimated_cost_usd"),
             },
         )
 ```

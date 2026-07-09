@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Observability (issue #75, part 1)
+- LLM extraction records token usage per model: API calls, response-cache hits,
+  input/output tokens, and prompt-cache read/write tokens. Totals land on
+  `ModelRunResult.metrics`, in `run_results.json`, and as a summary line after
+  `dbt-ml run`.
+- Optional `pricing:` block in the profile `llm:` config (USD per million
+  tokens, user-supplied — no prices ship with dbt-ml) adds `estimated_cost_usd`
+  to those metrics.
+- New `extract_fields_with_usage` alongside `extract_fields_from_text` for
+  transforms that want token accounting; the original keeps its signature.
+
 ### Orchestration (issue #87)
 - `run`/`build` exit codes now distinguish success (`0`), run failure (`1`), and
   configuration/usage error (`2`) so an orchestrator can branch on the cause.

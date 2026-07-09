@@ -168,6 +168,10 @@ my_project:
         model: claude-haiku-4-5
         api_key_env: ANTHROPIC_API_KEY
         cache_path: ./target/llm_cache.duckdb
+        pricing:                       # optional — enables estimated_cost_usd
+          input_usd_per_mtok: 1.00     # in run summaries + run_results.json.
+          output_usd_per_mtok: 5.00    # USD per million tokens; you own these
+          cache_read_usd_per_mtok: 0.10   # numbers, dbt-ml ships no price table.
     prod:
       warehouse:
         type: duckdb
@@ -504,8 +508,10 @@ Every `dbt-ml compile` / `dbt-ml run` writes to `target/`:
   model, DAG nodes+edges+execution order. Re-generated each run.
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed) plus per-model documents processed/skipped, rows written, duration,
-  errors, `status`, and the fully-qualified output `relation`. `run`/`build`
-  also accept `--json` to print this payload to stdout.
+  errors, `status`, and the fully-qualified output `relation`. LLM extraction
+  models also carry token accounting in `metrics` (API calls, cache hits,
+  input/output/cache tokens, and `estimated_cost_usd` when the profile sets
+  `pricing:`). `run`/`build` also accept `--json` to print this payload to stdout.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`dbt-ml docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `dbt-ml docs serve`.

@@ -77,7 +77,7 @@ class LLMBackend(BaseBackend):
                 "llm backend requires `options.fields: [{name, type, ...}]`"
             )
 
-        fields = extract_fields_from_text(
+        fields, usage = extract_fields_with_usage(
             path.read_text(),
             fields_spec=fields_spec,
             model=options.get("model", _DEFAULT_MODEL),
@@ -89,7 +89,7 @@ class LLMBackend(BaseBackend):
             max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
             max_concurrent=int(options.get("max_concurrent", _DEFAULT_MAX_CONCURRENT)),
         )
-        return ExtractionResult(fields=fields)
+        return ExtractionResult(fields=fields, metrics=usage)
 
     def _call_api(
         self,
@@ -98,8 +98,16 @@ class LLMBackend(BaseBackend):
         system: str,
         fields_spec: list[dict[str, Any]],
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]] | dict[str, Any]:
         return _default_call_api(content, model, system, fields_spec, **kwargs)
+
+
+_ZERO_USAGE = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+}
 
 
 def extract_fields_from_text(
@@ -118,10 +126,43 @@ def extract_fields_from_text(
     """Extract structured fields from a string of text by calling Claude.
 
     Reusable from transform models that need to LLM-process rows of text
-    (e.g. text extracted from PDFs in an upstream model).
+    (e.g. text extracted from PDFs in an upstream model). Discards usage;
+    call `extract_fields_with_usage` to get token accounting too.
 
     `call_api` is injectable for testing; defaults to the real Anthropic call.
     """
+    fields, _ = extract_fields_with_usage(
+        text,
+        fields_spec=fields_spec,
+        model=model,
+        system=system,
+        cache_path=cache_path,
+        call_api=call_api,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        max_concurrent=max_concurrent,
+    )
+    return fields
+
+
+def extract_fields_with_usage(
+    text: str,
+    *,
+    fields_spec: list[dict[str, Any]],
+    model: str = _DEFAULT_MODEL,
+    system: str = _DEFAULT_SYSTEM,
+    cache_path: str | Path | None = None,
+    call_api: Any = None,
+    temperature: float = _DEFAULT_TEMPERATURE,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Like `extract_fields_from_text`, but also returns usage accounting
+    (issue #75): api_calls, cache_hits, and token counts for the call. A cache
+    hit is zero tokens and zero API calls — the cache stores only fields, and
+    cached responses cost nothing."""
     content_hash = hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
     schema_hash = _hash_schema(system, fields_spec, temperature)
     cache_key = f"{model}|{content_hash}|{schema_hash}"
@@ -130,11 +171,11 @@ def extract_fields_from_text(
     if cache_path_obj is not None:
         cached = _cache_get(cache_path_obj, cache_key)
         if cached is not None:
-            return cached
+            return cached, {"api_calls": 0, "cache_hits": 1, **_ZERO_USAGE}
 
     fn = call_api or _default_call_api
     with _gate(max_concurrent):
-        result_fields: dict[str, Any] = fn(
+        raw = fn(
             text,
             model,
             system,
@@ -143,6 +184,14 @@ def extract_fields_from_text(
             max_tokens=max_tokens,
             max_retries=max_retries,
         )
+
+    # Injected test fakes may still return bare fields (the pre-#75 contract);
+    # the real call returns (fields, usage).
+    if isinstance(raw, tuple):
+        result_fields, call_usage = raw
+    else:
+        result_fields, call_usage = raw, {}
+    usage = {"api_calls": 1, "cache_hits": 0, **_ZERO_USAGE, **call_usage}
 
     if cache_path_obj is not None:
         _cache_put(
@@ -153,7 +202,7 @@ def extract_fields_from_text(
             schema_hash=schema_hash,
             fields=result_fields,
         )
-    return result_fields
+    return result_fields, usage
 
 
 def _default_call_api(
@@ -165,7 +214,7 @@ def _default_call_api(
     temperature: float = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Either export it or seed the "
@@ -195,9 +244,13 @@ def _default_call_api(
             "extractions are never used. Raise `max_tokens` in the model's "
             "extraction options."
         )
+    usage = {
+        key: getattr(resp.usage, key, None) or 0
+        for key in _ZERO_USAGE
+    }
     for block in resp.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "extract":
-            return dict(block.input)
+            return dict(block.input), usage
     raise RuntimeError("LLM did not return an `extract` tool call")
 
 

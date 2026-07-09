@@ -35,6 +35,16 @@ class WarehouseConfig(BaseModel):
         return ""
 
 
+class PricingConfig(BaseModel):
+    """User-supplied token prices (USD per million tokens) for cost estimates
+    in run results. No prices ship with dbt-ml — they drift; you own them."""
+
+    input_usd_per_mtok: float
+    output_usd_per_mtok: float
+    cache_read_usd_per_mtok: float | None = None
+    cache_write_usd_per_mtok: float | None = None
+
+
 class LLMConfig(BaseModel):
     """Defaults for the LLM extraction backend and LLM-using transforms."""
 
@@ -43,6 +53,7 @@ class LLMConfig(BaseModel):
     api_key_env: str = "ANTHROPIC_API_KEY"
     cache_path: Path | None = None
     system_prompt: str | None = None
+    pricing: PricingConfig | None = None
 
 
 class TargetConfig(BaseModel):

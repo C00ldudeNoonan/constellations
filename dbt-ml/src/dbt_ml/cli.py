@@ -519,8 +519,31 @@ def run(
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
 
+    usage_lines = [
+        f"{r.model_name:<22}{_usage_summary(r.metrics)}"
+        for r in results
+        if "api_calls" in r.metrics
+    ]
+    if usage_lines:
+        click.echo("")
+        for line in usage_lines:
+            click.echo(line)
+
     if any(r.errors for r in results):
         ctx.exit(1)
+
+
+def _usage_summary(m: dict[str, object]) -> str:
+    """One-line LLM usage: calls, cache hits, tokens, optional cost estimate."""
+    parts = [f"llm: {m.get('api_calls', 0)} calls, {m.get('cache_hits', 0)} cache hits"]
+    tokens_in = m.get("input_tokens", 0)
+    tokens_out = m.get("output_tokens", 0)
+    if tokens_in or tokens_out:
+        parts.append(f"{tokens_in:,} in / {tokens_out:,} out tokens")
+    cost = m.get("estimated_cost_usd")
+    if cost is not None:
+        parts.append(f"~${cost:.4f}")
+    return "  ".join(parts)
 
 
 @cli.command()

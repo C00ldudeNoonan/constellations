@@ -11,11 +11,14 @@ class ExtractionResult:
     """Output of a single document extraction.
 
     `fields` holds the projected field values. `warnings` collects
-    non-fatal issues surfaced by the backend.
+    non-fatal issues surfaced by the backend. `metrics` carries numeric
+    accounting the runner sums per model (issue #75) — today the llm backend's
+    token/call/cache-hit counts; other backends leave it empty.
     """
 
     fields: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseBackend(ABC):

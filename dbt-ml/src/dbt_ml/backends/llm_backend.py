@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,8 @@ import duckdb
 
 from .base import BaseBackend, ExtractionResult
 from .registry import register
+
+log = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-haiku-4-5"
 _DEFAULT_SYSTEM = (
@@ -23,6 +27,9 @@ _DEFAULT_TEMPERATURE = 0.0
 _DEFAULT_MAX_TOKENS = 2048
 _DEFAULT_MAX_RETRIES = 4
 _DEFAULT_MAX_CONCURRENT = 4
+_DEFAULT_BATCH_POLL_SECONDS = 30.0
+# Anthropic Message Batches API ceiling; multi-batch chunking is deferred.
+_MAX_BATCH_REQUESTS = 100_000
 
 # DuckDB cache writes can race when extraction is parallelized; serialize them.
 _CACHE_WRITE_LOCK = threading.Lock()
@@ -62,6 +69,10 @@ class LLMBackend(BaseBackend):
         max_retries:    SDK retry budget for rate limits / transient errors
                         (default 4, exponential backoff)
         max_concurrent: Max in-flight API calls process-wide (default 4)
+        batch:          Submit uncached documents through the Message Batches
+                        API — 50% token cost, minutes-latency (default false;
+                        keep off for dev loops)
+        batch_poll_seconds: Poll interval while a batch runs (default 30)
     """
 
     def name(self) -> str:
@@ -100,6 +111,126 @@ class LLMBackend(BaseBackend):
         **kwargs: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]] | dict[str, Any]:
         return _default_call_api(content, model, system, fields_spec, **kwargs)
+
+    def extract_batch(
+        self, paths: list[Path], options: dict[str, Any]
+    ) -> list[ExtractionResult | Exception]:
+        """One Message Batches API submission for every uncached document
+        (issue #75 part 2): cache hits resolve locally, the rest go up as a
+        single batch, results come back keyed by custom_id, and every response
+        is cached so re-runs are free. Per-document failures come back as
+        Exception entries; only submission itself can fail the whole batch."""
+        fields_spec = options.get("fields")
+        if not fields_spec or not isinstance(fields_spec, list):
+            raise ValueError(
+                "llm backend requires `options.fields: [{name, type, ...}]`"
+            )
+        model = options.get("model", _DEFAULT_MODEL)
+        system = options.get("system_prompt", _DEFAULT_SYSTEM)
+        temperature = float(options.get("temperature", _DEFAULT_TEMPERATURE))
+        max_tokens = int(options.get("max_tokens", _DEFAULT_MAX_TOKENS))
+        poll_seconds = float(
+            options.get("batch_poll_seconds", _DEFAULT_BATCH_POLL_SECONDS)
+        )
+        cache_path = options.get("cache_path")
+        cache_path_obj = Path(cache_path) if cache_path is not None else None
+        schema_hash = _hash_schema(system, fields_spec, temperature)
+
+        by_index: dict[int, ExtractionResult | Exception] = {}
+        pending: list[tuple[int, str, str]] = []
+        for i, path in enumerate(paths):
+            try:
+                text = path.read_text()
+            except Exception as e:
+                by_index[i] = e
+                continue
+            content_hash = hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
+            cache_key = f"{model}|{content_hash}|{schema_hash}"
+            cached = (
+                _cache_get(cache_path_obj, cache_key)
+                if cache_path_obj is not None
+                else None
+            )
+            if cached is not None:
+                by_index[i] = ExtractionResult(
+                    fields=cached,
+                    metrics={"api_calls": 0, "cache_hits": 1, **_ZERO_USAGE},
+                )
+                continue
+            pending.append((i, text, content_hash))
+
+        if pending:
+            if len(pending) > _MAX_BATCH_REQUESTS:
+                raise RuntimeError(
+                    f"{len(pending)} uncached documents exceed the Message "
+                    f"Batches API limit of {_MAX_BATCH_REQUESTS} requests per "
+                    "batch. Split the run with --select, or disable `batch:`."
+                )
+            tool = _extract_tool(fields_spec)
+            requests = [
+                {
+                    "custom_id": f"req-{j}",
+                    "params": {
+                        "model": model,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "system": system,
+                        "tools": [tool],
+                        "tool_choice": {"type": "tool", "name": "extract"},
+                        "messages": [{"role": "user", "content": text}],
+                    },
+                }
+                for j, (_, text, _) in enumerate(pending)
+            ]
+            items = _run_message_batch(requests, poll_seconds=poll_seconds)
+            for j, (i, _, content_hash) in enumerate(pending):
+                by_index[i] = self._resolve_batch_item(
+                    items.get(f"req-{j}"),
+                    max_tokens=max_tokens,
+                    cache_path=cache_path_obj,
+                    model=model,
+                    content_hash=content_hash,
+                    schema_hash=schema_hash,
+                )
+
+        return [by_index[i] for i in range(len(paths))]
+
+    @staticmethod
+    def _resolve_batch_item(
+        item: Any,
+        *,
+        max_tokens: int,
+        cache_path: Path | None,
+        model: str,
+        content_hash: str,
+        schema_hash: str,
+    ) -> ExtractionResult | Exception:
+        if item is None:
+            return RuntimeError("Message Batches API returned no result for document")
+        result_type = item.result.type
+        if result_type != "succeeded":
+            detail = getattr(item.result, "error", None)
+            suffix = f": {detail}" if detail is not None else ""
+            return RuntimeError(f"batch request {result_type}{suffix}")
+        try:
+            fields, usage = _parse_extract_response(
+                item.result.message, max_tokens=max_tokens
+            )
+        except RuntimeError as e:
+            return e
+        if cache_path is not None:
+            _cache_put(
+                cache_path,
+                f"{model}|{content_hash}|{schema_hash}",
+                model=model,
+                content_hash=content_hash,
+                schema_hash=schema_hash,
+                fields=fields,
+            )
+        return ExtractionResult(
+            fields=fields,
+            metrics={"api_calls": 1, "cache_hits": 0, **_ZERO_USAGE, **usage},
+        )
 
 
 _ZERO_USAGE = {
@@ -224,20 +355,31 @@ def _default_call_api(
 
     # The SDK retries 429s / 5xx / timeouts with exponential backoff.
     client = Anthropic(max_retries=max_retries)
-    tool = {
-        "name": "extract",
-        "description": "Return the extracted structured fields from the document.",
-        "input_schema": _input_schema(fields_spec),
-    }
     resp = client.messages.create(  # type: ignore[call-overload]
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
         system=system,
-        tools=[tool],
+        tools=[_extract_tool(fields_spec)],
         tool_choice={"type": "tool", "name": "extract"},
         messages=[{"role": "user", "content": content}],
     )
+    return _parse_extract_response(resp, max_tokens=max_tokens)
+
+
+def _extract_tool(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "name": "extract",
+        "description": "Return the extracted structured fields from the document.",
+        "input_schema": _input_schema(fields_spec),
+    }
+
+
+def _parse_extract_response(
+    resp: Any, *, max_tokens: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fields + usage from a Messages API response — shared by the synchronous
+    call and per-item batch results (identical message shape)."""
     if resp.stop_reason == "max_tokens":
         raise RuntimeError(
             f"LLM response truncated at max_tokens={max_tokens}; partial "
@@ -252,6 +394,39 @@ def _default_call_api(
         if getattr(block, "type", None) == "tool_use" and block.name == "extract":
             return dict(block.input), usage
     raise RuntimeError("LLM did not return an `extract` tool call")
+
+
+def _run_message_batch(
+    requests: list[dict[str, Any]], *, poll_seconds: float
+) -> dict[str, Any]:
+    """Submit one Message Batch, poll to completion, return items keyed by
+    custom_id (results stream back unordered). Injectable for testing, like
+    `_default_call_api`."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. Either export it or seed the "
+            "llm cache so re-runs hit cached responses."
+        )
+    from anthropic import Anthropic
+
+    client = Anthropic()
+    batch = client.messages.batches.create(requests=requests)  # type: ignore[arg-type]
+    log.info("submitted message batch %s (%d requests)", batch.id, len(requests))
+    while True:
+        batch = client.messages.batches.retrieve(batch.id)
+        if batch.processing_status == "ended":
+            break
+        counts = batch.request_counts
+        log.info(
+            "batch %s: %s (processing=%d succeeded=%d errored=%d)",
+            batch.id,
+            batch.processing_status,
+            counts.processing,
+            counts.succeeded,
+            counts.errored,
+        )
+        time.sleep(poll_seconds)
+    return {r.custom_id: r for r in client.messages.batches.results(batch.id)}
 
 
 def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:

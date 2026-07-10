@@ -69,7 +69,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/project/dbt-ml/
     permissions:
       contents: write
     steps:

@@ -1,6 +1,7 @@
 # Release process
 
-dbt-ml publishes to PyPI from GitHub Actions when a version tag is pushed.
+dbt-ml publishes to [PyPI](https://pypi.org/project/dbt-ml/) from GitHub
+Actions when a version tag is pushed.
 
 ## One-time setup
 

@@ -24,6 +24,7 @@ def compute_code_version(
     transform: TransformConfig | None,
     ml: MLConfig | None = None,
     chunk: ChunkConfig | None = None,
+    depends_on: list[str] | None = None,
     project_dir: Path,
 ) -> str:
     payload: dict[str, Any] = {
@@ -40,6 +41,7 @@ def compute_code_version(
         if ml
         else None,
         "chunk": chunk.model_dump() if chunk else None,
+        "depends_on": depends_on or None,
     }
     if transform and transform.module:
         module_file = resolve_module_file(transform.module, project_dir)

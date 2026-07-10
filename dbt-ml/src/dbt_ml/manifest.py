@@ -10,7 +10,7 @@ from typing import Any
 
 from .config import load_project
 from .config.model import ModelConfig
-from .dag import ProjectDAG
+from .dag import ProjectDAG, parse_ref
 from .profile import ProfileError, resolve_profile
 from .runner import ModelRunResult
 from .versioning import compute_code_version
@@ -258,9 +258,16 @@ def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
             transform=model.transform,
             ml=model.ml,
             chunk=model.chunk,
+            depends_on=_code_version_depends_on(model),
             project_dir=project_dir,
         ),
     }
+
+
+def _code_version_depends_on(model: ModelConfig) -> list[str] | None:
+    if model.chunk is None or not model.depends_on:
+        return None
+    return [parse_ref(dep) for dep in model.depends_on]
 
 
 class StateError(Exception):

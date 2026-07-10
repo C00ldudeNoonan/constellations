@@ -206,6 +206,8 @@ my_project:
         type: duckdb
         path: ./target/dbt_ml.duckdb
         schema: my_project
+      source_paths:
+        filings: ./data/dev/filings
       llm:
         provider: anthropic
         model: claude-haiku-4-5
@@ -220,6 +222,8 @@ my_project:
         type: duckdb
         path: "{{ env_var('DBT_ML_PROD_DB', '/data/prod/dbt_ml.duckdb') }}"
         schema: my_project_prod
+      source_paths:
+        filings: "{{ env_var('DBT_ML_FILINGS_ROOT', '/data/prod/filings') }}"
       llm:
         model: claude-sonnet-4-6
         cache_path: /data/prod/llm_cache.duckdb
@@ -272,6 +276,11 @@ profiles need, so credentials and per-environment paths stay out of the file.
 An unset variable with no default is a load-time error. Each `warehouse:`
 block is validated against the config schema of the adapter named by `type:`;
 unknown types and typo'd fields fail at resolve time with the adapter named.
+Use target-level `source_paths:` when the same source should read from
+different local roots or `gs://` prefixes in dev/staging/prod. Keys are source
+names from project YAML; values replace only `source.path`, leaving
+`document_id` and incremental identity based on the source-relative object path
+and content/generation hash.
 
 ## GCS sources
 

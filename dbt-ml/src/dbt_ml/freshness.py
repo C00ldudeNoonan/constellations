@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .config import load_project
 from .config.source import SourceConfig
+from .profile import apply_source_path_overrides, resolve_profile
 from .sources import get_document_source
 
 
@@ -24,8 +25,17 @@ class FreshnessResult:
     message: str = ""
 
 
-def check_freshness(project_dir: Path) -> list[FreshnessResult]:
-    _, sources, _ = load_project(project_dir)
+def check_freshness(
+    project_dir: Path,
+    *,
+    target: str | None = None,
+    profiles_dir: Path | None = None,
+) -> list[FreshnessResult]:
+    project, sources, _ = load_project(project_dir)
+    resolved = resolve_profile(
+        project, project_dir, target=target, profiles_dir=profiles_dir
+    )
+    sources = apply_source_path_overrides(sources, resolved)
     results: list[FreshnessResult] = []
     for source in sources:
         results.append(_check_one(source, project_dir))

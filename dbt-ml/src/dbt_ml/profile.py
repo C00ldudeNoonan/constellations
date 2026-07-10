@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from .adapters import AdapterError, parse_warehouse_config
 from .config.profile import LLMConfig, ProfileConfig, WarehouseConfig
 from .config.project import ProjectConfig
+from .config.source import SourceConfig
 
 PROFILES_FILENAME = "profiles.yml"
 PROFILES_DIR_ENV = "DBT_ML_PROFILES_DIR"
@@ -42,6 +43,7 @@ class ResolvedProfile:
     target_name: str
     warehouse: WarehouseConfig
     llm: LLMConfig | None
+    source_paths: dict[str, str]
     profiles_path: Path | None  # None when using inline-legacy fallback
 
 
@@ -96,6 +98,7 @@ def resolve_profile(
         target_name=target_name,
         warehouse=warehouse.absolutize(project_dir),
         llm=_absolutize_llm(selected.llm, project_dir),
+        source_paths=selected.source_paths,
         profiles_path=profiles_path,
     )
 
@@ -128,8 +131,48 @@ def _legacy_resolved(project: ProjectConfig) -> ResolvedProfile:
         target_name="<inline>",
         warehouse=warehouse,
         llm=None,
+        source_paths={},
         profiles_path=None,
     )
+
+
+def apply_source_path_overrides(
+    sources: list[SourceConfig], resolved: ResolvedProfile
+) -> list[SourceConfig]:
+    """Apply target-specific source roots from profiles.yml.
+
+    Project YAML remains the reviewed declaration of sources; profiles.yml can
+    override only their roots per target so dev/staging/prod can point at
+    different buckets or local directories without editing the project.
+    """
+    if not resolved.source_paths:
+        return sources
+
+    source_names = {source.name for source in sources}
+    unknown = sorted(set(resolved.source_paths) - source_names)
+    if unknown:
+        raise ProfileError(
+            f"Profile target '{resolved.target_name}' defines source_paths for "
+            f"unknown source(s): {', '.join(unknown)}. Available sources: "
+            f"{', '.join(sorted(source_names)) or '<none>'}."
+        )
+
+    out: list[SourceConfig] = []
+    for source in sources:
+        override = resolved.source_paths.get(source.name)
+        if override is None:
+            out.append(source)
+            continue
+        out.append(
+            source.model_copy(
+                update={"path": override, "external": source.external or _is_local_path(override)}
+            )
+        )
+    return out
+
+
+def _is_local_path(path: str) -> bool:
+    return "://" not in path
 
 
 def _legacy_env_dir() -> str | None:

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.7 - 2026-07-10
 
 ### Security (issue #65)
 - Project-YAML paths are now confined to the project directory: source

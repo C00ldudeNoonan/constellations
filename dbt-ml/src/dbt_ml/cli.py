@@ -20,6 +20,7 @@ from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
+from .paths import is_within_project, resolve_within_project
 from .profile import ProfileError, resolve_profile
 from .runner import BuildResult, RunError, build_project, clean_project, run_project
 from .sources import SourceError
@@ -304,7 +305,16 @@ def seed(
         seeder = backend_seeder
         label = backend_name
 
-    output_dir = (project_dir / source.path).resolve()
+    try:
+        output_dir = resolve_within_project(
+            source.path,
+            project_dir,
+            surface=f"Source '{source.name}' path",
+            external=source.external,
+            hint="Set `external: true` on the source to allow it.",
+        )
+    except ConfigError as e:
+        raise ConfigClickError(str(e)) from e
     paths = seeder(count, output_dir, seed)
     click.echo(f"Wrote {len(paths)} {label} documents to {output_dir}")
 
@@ -896,12 +906,36 @@ def source_freshness(ctx: click.Context) -> None:
 
 
 @cli.command()
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Allow deleting a warehouse file outside the project directory.",
+)
 @click.pass_context
-def clean(ctx: click.Context) -> None:
+def clean(ctx: click.Context, force: bool) -> None:
     """Delete the project's DuckDB output file."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    try:
+        project, _, _ = load_project(project_dir)
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+
+    local = resolved.warehouse.local_path()
+    if local is not None and not force:
+        # Profile paths are trusted for read/write, but a delete pointed
+        # outside the project must be explicit (issue #65).
+        resolved_local = (project_dir / local).resolve()
+        if not is_within_project(resolved_local, project_dir):
+            raise ConfigClickError(
+                f"The configured warehouse file {resolved_local} is outside "
+                "the project directory. Pass --force to delete it."
+            )
+
     try:
         path = clean_project(project_dir, target=target, profiles_dir=profiles_dir)
     except (ConfigError, ProfileError) as e:
@@ -939,7 +973,16 @@ def _run_watch(
     _, sources, _ = _load(project_dir)
     watch_paths = []
     for s in sources:
-        candidate = (project_dir / s.path).resolve()
+        try:
+            candidate = resolve_within_project(
+                s.path,
+                project_dir,
+                surface=f"Source '{s.name}' path",
+                external=s.external,
+                hint="Set `external: true` on the source to allow it.",
+            )
+        except ConfigError as e:
+            raise ConfigClickError(str(e)) from e
         if candidate.exists():
             watch_paths.append(candidate)
     if not watch_paths:

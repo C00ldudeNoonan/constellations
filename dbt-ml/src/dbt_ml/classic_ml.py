@@ -17,6 +17,7 @@ from .adapters import WarehouseAdapter
 from .config.model import MLConfig, ModelConfig
 from .config.project import ProjectConfig
 from .dag import parse_ref
+from .paths import resolve_within_project
 from .versioning import compute_code_version
 
 ARTIFACT_SCHEMA_VERSION = 1
@@ -345,8 +346,13 @@ def _artifact_path(
     project_dir: Path,
 ) -> Path:
     if ml.artifact.path is not None:
-        path = ml.artifact.path
-        return path if path.is_absolute() else project_dir / path
+        return resolve_within_project(
+            ml.artifact.path,
+            project_dir,
+            surface=f"Model '{model.name}' ml.artifact.path",
+            external=ml.artifact.external,
+            hint="Set `external: true` on the artifact block to allow it.",
+        )
     return project_dir / project.target_path / "artifacts" / model.name
 
 

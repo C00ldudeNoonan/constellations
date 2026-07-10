@@ -63,6 +63,9 @@ class ChunkConfig(BaseModel):
 class MLArtifactConfig(BaseModel):
     path: Path | None = None
     include_metrics: bool = True
+    # Opt-in for an artifact location outside the project directory
+    # (issue #65). Excluded from code_version.
+    external: bool = False
 
     @field_serializer("path")
     def _serialize_path(self, path: Path | None) -> str | None:

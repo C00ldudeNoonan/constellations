@@ -34,7 +34,11 @@ def compute_code_version(
         if extraction
         else None,
         "transform": transform.model_dump() if transform else None,
-        "ml": ml.model_dump(mode="json") if ml else None,
+        # artifact.external is boundary policy, not code identity (see
+        # flush_every above).
+        "ml": ml.model_dump(mode="json", exclude={"artifact": {"external"}})
+        if ml
+        else None,
         "chunk": chunk.model_dump() if chunk else None,
     }
     if transform and transform.module:

@@ -25,6 +25,9 @@ class DuckDBWarehouseConfig(WarehouseConfig):
     def catalog_name(self) -> str:
         return self.path.stem
 
+    def local_path(self) -> Path | None:
+        return self.path
+
 
 @register
 class DuckDBAdapter(WarehouseAdapter):

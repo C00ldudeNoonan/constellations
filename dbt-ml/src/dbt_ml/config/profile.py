@@ -34,6 +34,12 @@ class WarehouseConfig(BaseModel):
         (DuckDB: database file stem; BigQuery: GCP project)."""
         return ""
 
+    def local_path(self) -> Path | None:
+        """Filesystem location backing this warehouse, if file-backed
+        (DuckDB); None for remote warehouses. Drives `clean`'s --force guard
+        for files outside the project directory (issue #65)."""
+        return None
+
 
 class PricingConfig(BaseModel):
     """User-supplied token prices (USD per million tokens) for cost estimates

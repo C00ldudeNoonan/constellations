@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Security (issue #65)
+- Project-YAML paths are now confined to the project directory: source
+  `path:`, `ml.artifact.path`, the layout paths (`source-paths`,
+  `model-paths`, `transform-paths`, `target-path`), and model-level llm
+  `cache_path` error (exit 2) when they resolve outside it — including via
+  `..` and symlinks. Sources and artifact blocks opt out explicitly with
+  `external: true`; external llm caches belong in profiles.yml.
+- profiles.yml paths stay trusted (operator-local config), but `dbt-ml clean`
+  now requires `--force` to delete a warehouse file outside the project
+  directory.
+- New Trust model & filesystem boundaries section in the README.
+- **Upgrade note:** projects whose sources point outside the repo must add
+  `external: true` to those sources. `artifact.external` and the boundary
+  checks never change `code_version` — incremental state is unaffected.
+
 ### Scale (issue #77)
 - Extraction models stream rows to the warehouse every `flush_every` documents
   (default 5000) instead of accumulating the whole corpus in memory.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import tempfile
@@ -750,9 +751,12 @@ def _run_chunk_model(
         )
 
     code_version = compute_code_version(
-        extraction=None, transform=None, chunk=chunk_cfg, project_dir=project_dir
+        extraction=None,
+        transform=None,
+        chunk=chunk_cfg,
+        depends_on=[upstream],
+        project_dir=project_dir,
     )
-    has_hash = "content_hash" in df.columns
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(model.name) if is_incremental else {}
 
@@ -772,7 +776,8 @@ def _run_chunk_model(
     for record in df.iter_rows(named=True):
         document_id = str(record["document_id"])
         current_ids.add(document_id)
-        doc_hash = str(record["content_hash"]) if has_hash else code_version
+        text = str(record[chunk_cfg.text_field] or "")
+        doc_hash = _chunk_input_hash(text)
         if is_incremental:
             prior = processed_state.get(document_id)
             if prior == (doc_hash, code_version):
@@ -781,7 +786,7 @@ def _run_chunk_model(
             if prior is not None:
                 changed_ids.append(document_id)
         processed += 1
-        pieces = split_text(str(record[chunk_cfg.text_field] or ""), chunk_cfg)
+        pieces = split_text(text, chunk_cfg)
         carried = {c: record[c] for c in carry_cols}
         for piece in pieces:
             rows.append(
@@ -839,6 +844,10 @@ def _run_chunk_model(
         documents_deleted=deleted,
         rows_written=rows_written,
     )
+
+
+def _chunk_input_hash(text: str) -> str:
+    return "text:" + hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
 
 
 def _chunk_row(

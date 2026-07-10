@@ -229,6 +229,68 @@ def test_changed_document_rechunks_without_orphans(tmp_path: Path) -> None:
     assert not ({r[0] for r in after} & {r[0] for r in before})
 
 
+def test_changed_chunk_upstream_rechunks_same_source_hash(tmp_path: Path) -> None:
+    from dbt_ml.runner import run_project
+
+    project = _chunk_project(tmp_path, chunk_size=500)
+    _write_doc(project, "a.json", "Doc A", "base text for the filing")
+    (project / "transforms").mkdir()
+    (project / "transforms" / "noisy_docs.py").write_text(
+        "import polars as pl\n\n"
+        "def run(deps):\n"
+        "    df = deps['document_registry']\n"
+        "    return df.with_columns(\n"
+        "        (pl.lit('NOISY ') + pl.col('body')).alias('body')\n"
+        "    )\n"
+    )
+    (project / "transforms" / "clean_docs.py").write_text(
+        "import polars as pl\n\n"
+        "def run(deps):\n"
+        "    df = deps['document_registry']\n"
+        "    return df.with_columns(\n"
+        "        (pl.lit('CLEAN ') + pl.col('body')).alias('body')\n"
+        "    )\n"
+    )
+    (project / "models" / "variants.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: noisy_docs\n"
+        "    depends_on: [ref('document_registry')]\n"
+        "    transform:\n"
+        "      type: python\n"
+        "      module: transforms.noisy_docs\n"
+        "  - name: clean_docs\n"
+        "    depends_on: [ref('document_registry')]\n"
+        "    transform:\n"
+        "      type: python\n"
+        "      module: transforms.clean_docs\n"
+    )
+    chunks_yml = project / "models" / "chunks.yml"
+    chunks_yml.write_text(
+        chunks_yml.read_text().replace(
+            "depends_on: [ref('document_registry')]",
+            "depends_on: [ref('noisy_docs')]",
+        )
+    )
+
+    run_project(project)
+    assert _chunks(project)[0][4] == "NOISY base text for the filing"
+
+    chunks_yml.write_text(
+        chunks_yml.read_text().replace(
+            "depends_on: [ref('noisy_docs')]",
+            "depends_on: [ref('clean_docs')]",
+        )
+    )
+    results = run_project(project)
+    chunk_res = next(r for r in results if r.model_name == "document_chunks")
+
+    assert chunk_res.documents_processed == 1
+    assert chunk_res.documents_skipped == 0
+    rows = _chunks(project)
+    assert len(rows) == 1
+    assert rows[0][4] == "CLEAN base text for the filing"
+
+
 def test_deleted_document_prunes_its_chunks(tmp_path: Path) -> None:
     from dbt_ml.runner import run_project
 

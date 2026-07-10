@@ -25,6 +25,7 @@ from .config.profile import PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
+from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options, resolve_profile
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import load_transform
@@ -332,6 +333,21 @@ def _run_extraction_model(
     backend = get_backend(backend_name)
     options = model.extraction.options
     if backend_name == "llm":
+        if "cache_path" in options:
+            # A model-level cache_path is project YAML: confine it. External
+            # cache locations belong in the (trusted) profiles.yml llm block.
+            options = {
+                **options,
+                "cache_path": str(
+                    resolve_within_project(
+                        options["cache_path"],
+                        project_dir,
+                        surface=f"Model '{model.name}' llm cache_path",
+                        hint="Set llm.cache_path in profiles.yml for "
+                        "locations outside the project.",
+                    )
+                ),
+            }
         options = resolve_llm_options(options, resolved)
 
     if not model.source:

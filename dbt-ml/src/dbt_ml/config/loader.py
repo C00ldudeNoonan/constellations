@@ -24,6 +24,20 @@ def load_project(
 
     project = _parse_yaml(project_path, ProjectConfig)
 
+    # Local import: paths.py imports ConfigError from this module.
+    from ..paths import resolve_within_project
+
+    # Layout paths always stay inside the project — there is no sane reason
+    # for models/ or target/ to live outside the repo, and no opt-in (#65).
+    layout: list[tuple[str, Path]] = [
+        *(("source-paths", p) for p in project.source_paths),
+        *(("model-paths", p) for p in project.model_paths),
+        *(("transform-paths", p) for p in project.transform_paths),
+        ("target-path", project.target_path),
+    ]
+    for label, layout_path in layout:
+        resolve_within_project(layout_path, project_dir, surface=f"`{label}`")
+
     sources: list[SourceConfig] = []
     for source_dir in project.source_paths:
         sources.extend(_load_yaml_dir(project_dir / source_dir, SourceFile, lambda f: f.sources))

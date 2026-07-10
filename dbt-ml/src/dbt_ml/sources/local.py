@@ -3,15 +3,26 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..config.source import SourceConfig
+from ..paths import resolve_within_project
 from ..versioning import compute_content_hash, compute_document_id
 from .base import DocumentRef, DocumentSource, SourceScan
+
+
+def _source_dir(source: SourceConfig, project_dir: Path) -> Path:
+    return resolve_within_project(
+        source.path,
+        project_dir,
+        surface=f"Source '{source.name}' path",
+        external=source.external,
+        hint="Set `external: true` on the source to allow it.",
+    )
 
 
 class LocalDocumentSource(DocumentSource):
     """Files on disk under `<project_dir>/<source.path>`."""
 
     def discover(self, source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
-        source_dir = (project_dir / source.path).resolve()
+        source_dir = _source_dir(source, project_dir)
         if not source_dir.exists():
             return []
         pattern = (
@@ -39,7 +50,7 @@ class LocalDocumentSource(DocumentSource):
         return ref.path
 
     def scan(self, source: SourceConfig, project_dir: Path) -> SourceScan:
-        source_dir = (project_dir / source.path).resolve()
+        source_dir = _source_dir(source, project_dir)
         if not source_dir.exists():
             return SourceScan(
                 exists=False,

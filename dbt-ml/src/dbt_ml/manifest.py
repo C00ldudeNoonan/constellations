@@ -50,6 +50,7 @@ def build_manifest(
                 "path": s.path,
                 "file_pattern": s.file_pattern,
                 "recursive": s.recursive,
+                "external": s.external,
                 "tags": s.tags,
             }
             for s in sources

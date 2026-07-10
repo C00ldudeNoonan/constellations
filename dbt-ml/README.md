@@ -95,6 +95,35 @@ The `llm` backend sends document text to the configured model provider and store
 cached structured responses in the configured cache database. Use deterministic
 local backends for sensitive documents unless remote processing is intended.
 
+### Trust model & filesystem boundaries
+
+Paths declared in **project YAML** ship with a repo, so they are confined to
+the project directory — a path that resolves outside it (via `..`, an absolute
+path, or a symlink) is a configuration error (exit 2):
+
+| Path | Confined | Opt-out |
+|---|---|---|
+| `source.path` | yes | `external: true` on the source |
+| `ml.artifact.path` | yes | `external: true` on the artifact block |
+| `source-paths` / `model-paths` / `transform-paths` / `target-path` | always | none |
+| model-level llm `cache_path` | always | put it in profiles.yml instead |
+
+```yaml
+sources:
+  - name: filings
+    path: "D:/corpora/filings/"   # outside the repo — reviewable opt-in:
+    external: true
+```
+
+**profiles.yml paths** (warehouse `path:`, llm `cache_path:`) are your
+machine's config, like dbt's — they are trusted as-is. The one exception is
+deletion: `dbt-ml clean` refuses to remove a warehouse file outside the
+project directory unless you pass `--force`.
+
+Running a third-party project still executes its Python transforms and custom
+tests, and remote sources (`gs://…`) reach whatever your ambient credentials
+allow — review projects you didn't write before running them.
+
 For scheduled/orchestrated runs, the `llm` backend can route uncached documents
 through the Anthropic Message Batches API — 50% token cost, at the price of
 minutes-scale latency (the run blocks until the batch completes). Cache hits

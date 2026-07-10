@@ -27,6 +27,9 @@ class SourceConfig(BaseModel):
     path: str  # project-relative directory, or gs://bucket/prefix
     file_pattern: str = "*.json"
     recursive: bool = True
+    # Opt-in for a local path outside the project directory (issue #65).
+    # Explicit and per-source so out-of-project reads survive code review.
+    external: bool = False
     # Bound on remote listings so a typo'd prefix can't crawl a whole bucket.
     max_objects: int = 5000
     tags: list[str] = Field(default_factory=list)

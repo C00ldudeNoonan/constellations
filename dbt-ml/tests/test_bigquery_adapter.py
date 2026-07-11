@@ -895,6 +895,70 @@ def test_integration_full_round_trip() -> None:
         adapter._reset_storage_for_test()
 
 
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set DBT_ML_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_warehouse_options_round_trip() -> None:
+    from datetime import date as date_type
+
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "dbt_ml_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, BigQueryAdapter)
+    opts = adapter.parse_warehouse_options(
+        {
+            "partition_by": {"field": "filing_date"},
+            "cluster_by": ["vendor"],
+            "labels": {"managed-by": "dbt-ml-tests"},
+            "incremental_strategy": "insert_overwrite",
+        },
+        model_name="docs",
+    )
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "docs",
+                pl.DataFrame(
+                    {
+                        "document_id": ["a", "b"],
+                        "vendor": ["acme", "zenith"],
+                        "filing_date": [date_type(2026, 1, 1), date_type(2026, 1, 2)],
+                    }
+                ),
+                options=opts,
+            )
+            table = adapter.client.get_table(adapter._table_id("docs"))
+            assert table.time_partitioning.field == "filing_date"
+            assert table.clustering_fields == ["vendor"]
+            assert table.labels == {"managed-by": "dbt-ml-tests"}
+
+            # insert_overwrite replaces the 2026-01-01 partition only
+            adapter.materialize_incremental(
+                "docs",
+                pl.DataFrame(
+                    {
+                        "document_id": ["a2"],
+                        "vendor": ["acme"],
+                        "filing_date": [date_type(2026, 1, 1)],
+                    }
+                ),
+                key_col="document_id",
+                options=opts,
+            )
+            rows = adapter.rows(
+                f"SELECT document_id FROM {adapter.table_ref('docs')} "
+                "ORDER BY document_id"
+            )
+            assert rows == [("a2",), ("b",)]
+    finally:
+        adapter._reset_storage_for_test()
+
+
 # ─── auth parity with dbt-bigquery ──────────────────────────────────────────
 
 

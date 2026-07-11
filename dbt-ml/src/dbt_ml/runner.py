@@ -7,6 +7,7 @@ import logging
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -99,6 +100,9 @@ class ModelRunResult:
     rows_written: int = 0
     duration_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
+    # Non-fatal backend warnings, aggregated: distinct message -> number of
+    # documents that raised it. Never affects status or exit code.
+    warnings: dict[str, int] = field(default_factory=dict)
     artifact_path: str | None = None
     artifact_version: str | None = None
     training_input: dict[str, Any] | None = None
@@ -401,6 +405,7 @@ def _run_extraction_model(
     use_full = model.materialization == "full" or full_refresh
 
     errors: list[str] = []
+    warning_counts: Counter[str] = Counter()
     usage_totals: dict[str, Any] = {}
     full_state_records: list[tuple[str, str, str]] = []
     rows_written = 0
@@ -419,6 +424,7 @@ def _run_extraction_model(
             if err is not None or result is None:
                 errors.append(f"{doc.relative_path}: {err}")
                 continue
+            warning_counts.update(set(result.warnings))
             for key, value in result.metrics.items():
                 if isinstance(value, int | float):
                     usage_totals[key] = usage_totals.get(key, 0) + value
@@ -563,6 +569,7 @@ def _run_extraction_model(
         documents_deleted=deleted,
         rows_written=rows_written,
         errors=errors,
+        warnings=dict(warning_counts),
         metrics=usage_totals,
     )
 

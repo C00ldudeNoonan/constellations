@@ -146,6 +146,7 @@ def test_run_results_metadata_and_relations(fresh_project: Path) -> None:
         "success": len(results),
         "error": 0,
         "skipped": 0,
+        "warnings": 0,
     }
     assert meta["target"]["adapter_type"] == "duckdb"
     assert meta["target"]["schema"] == "dbt_ml"

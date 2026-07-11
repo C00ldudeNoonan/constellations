@@ -149,6 +149,7 @@ def build_run_results(
             "success": len(results) - n_error,
             "error": n_error,
             "skipped": len(skipped),
+            "warnings": sum(sum(r.warnings.values()) for r in results),
         },
     }
     return {"metadata": metadata, "results": result_rows}

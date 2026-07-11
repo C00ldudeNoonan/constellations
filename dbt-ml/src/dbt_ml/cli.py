@@ -22,7 +22,14 @@ from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
 from .paths import is_within_project, resolve_within_project
 from .profile import ProfileError, apply_source_path_overrides, resolve_profile
-from .runner import BuildResult, RunError, build_project, clean_project, run_project
+from .runner import (
+    BuildResult,
+    ModelRunResult,
+    RunError,
+    build_project,
+    clean_project,
+    run_project,
+)
 from .sources import SourceError
 from .synth import (
     generate_arxiv_papers,
@@ -544,6 +551,7 @@ def run(
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
+        _echo_warnings(r)
 
     usage_lines = [
         f"{r.model_name:<22}{_usage_summary(r.metrics)}"
@@ -557,6 +565,24 @@ def run(
 
     if any(r.errors for r in results):
         ctx.exit(1)
+
+
+_MAX_WARNING_LINES = 5
+
+
+def _echo_warnings(r: ModelRunResult) -> None:
+    """Backend warnings under the model's summary row, capped so a corpus-wide
+    papercut (one warning per document) can't flood the terminal. The full set
+    is always in run_results.json. Warnings never change the exit code."""
+    shown = list(r.warnings.items())[:_MAX_WARNING_LINES]
+    for message, count in shown:
+        suffix = f" ({count} documents)" if count > 1 else ""
+        click.echo(f"  WARNING: {message}{suffix}", err=True)
+    hidden = len(r.warnings) - len(shown)
+    if hidden > 0:
+        click.echo(
+            f"  ... {hidden} more distinct warnings (see run_results.json)", err=True
+        )
 
 
 def _usage_summary(m: dict[str, object]) -> str:
@@ -684,6 +710,7 @@ def _echo_build(result: BuildResult) -> None:
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
+        _echo_warnings(r)
     for name in result.skipped:
         click.echo(f"{name:<22}{'-':<12}{'-':>8}{'-':>10}  SKIPPED (upstream failed)")
 

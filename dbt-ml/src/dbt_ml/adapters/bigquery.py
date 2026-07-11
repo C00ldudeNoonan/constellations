@@ -25,7 +25,14 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 import polars as pl
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from ..config.profile import WarehouseConfig
 from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
@@ -160,6 +167,58 @@ class BigQueryWarehouseConfig(WarehouseConfig):
         return self.project
 
 
+class BigQueryPartitionRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: int
+    end: int
+    interval: int = Field(gt=0)
+
+
+class BigQueryPartitionBy(BaseModel):
+    """Mirrors dbt-bigquery's `partition_by` resource config: a time column
+    (timestamp/date/datetime + granularity), an integer-range column
+    (int64 + range), or ingestion time when `field` is omitted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str | None = None
+    data_type: Literal["timestamp", "date", "datetime", "int64"] = "date"
+    granularity: Literal["hour", "day", "month", "year"] = "day"
+    range: BigQueryPartitionRange | None = None
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> BigQueryPartitionBy:
+        if self.data_type == "int64":
+            if self.field is None:
+                raise ValueError("int64 partitioning requires `field`")
+            if self.range is None:
+                raise ValueError(
+                    "int64 partitioning requires `range` (start/end/interval)"
+                )
+        elif self.range is not None:
+            raise ValueError("`range` applies only to `data_type: int64`")
+        if self.data_type == "date" and self.granularity == "hour":
+            raise ValueError("date columns cannot partition by hour granularity")
+        return self
+
+
+class BigQueryWarehouseOptions(BaseModel):
+    """Model-level `warehouse_options` for BigQuery (issue #91). Applied when
+    a target table is (re)created; an existing incremental table keeps its
+    layout until --full-refresh rebuilds it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    partition_by: BigQueryPartitionBy | None = None
+    cluster_by: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("cluster_by", mode="before")
+    @classmethod
+    def _single_column_ok(cls, value: Any) -> Any:
+        return [value] if isinstance(value, str) else value
+
+
 def parse_keyfile_json(value: dict[str, Any] | str) -> dict[str, Any]:
     """`keyfile_json` accepts a YAML mapping, a JSON string, or base64-encoded
     JSON (matching dbt-bigquery, where CI pipelines inject it via env vars)."""
@@ -268,6 +327,10 @@ class BigQueryAdapter(WarehouseAdapter):
     @classmethod
     def config_model(cls) -> type[WarehouseConfig]:
         return BigQueryWarehouseConfig
+
+    @classmethod
+    def warehouse_options_model(cls) -> type[BaseModel] | None:
+        return BigQueryWarehouseOptions
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
@@ -462,6 +525,75 @@ class BigQueryAdapter(WarehouseAdapter):
 
     # ─── materialization ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _layout(options: BaseModel | None) -> BigQueryWarehouseOptions | None:
+        if options is None:
+            return None
+        assert isinstance(options, BigQueryWarehouseOptions)
+        return options
+
+    def _apply_layout_to_load(
+        self, job_config: Any, options: BaseModel | None
+    ) -> None:
+        """Partitioning/clustering on a load job creating the target table."""
+        layout = self._layout(options)
+        if layout is None:
+            return
+        bigquery = _bigquery()
+        if layout.cluster_by:
+            job_config.clustering_fields = list(layout.cluster_by)
+        pb = layout.partition_by
+        if pb is None:
+            return
+        if pb.data_type == "int64":
+            assert pb.range is not None
+            job_config.range_partitioning = bigquery.RangePartitioning(
+                field=pb.field,
+                range_=bigquery.PartitionRange(
+                    start=pb.range.start, end=pb.range.end, interval=pb.range.interval
+                ),
+            )
+        else:
+            job_config.time_partitioning = bigquery.TimePartitioning(
+                type_=pb.granularity.upper(), field=pb.field
+            )
+
+    def _partition_expression(self, pb: BigQueryPartitionBy) -> str:
+        if pb.data_type == "int64":
+            assert pb.field is not None and pb.range is not None
+            return (
+                f"RANGE_BUCKET({self.quote_ident(pb.field)}, "
+                f"GENERATE_ARRAY({pb.range.start}, {pb.range.end}, "
+                f"{pb.range.interval}))"
+            )
+        granularity = pb.granularity.upper()
+        if pb.field is None:
+            if granularity == "DAY":
+                return "_PARTITIONDATE"
+            return f"TIMESTAMP_TRUNC(_PARTITIONTIME, {granularity})"
+        column = self.quote_ident(pb.field)
+        if pb.data_type == "date":
+            return column if granularity == "DAY" else f"DATE_TRUNC({column}, {granularity})"
+        trunc = "TIMESTAMP_TRUNC" if pb.data_type == "timestamp" else "DATETIME_TRUNC"
+        return f"{trunc}({column}, {granularity})"
+
+    def _ddl_layout_clauses(self, options: BaseModel | None) -> str:
+        """` PARTITION BY … CLUSTER BY …` for CREATE TABLE DDL, or ''."""
+        layout = self._layout(options)
+        if layout is None:
+            return ""
+        clauses: list[str] = []
+        if layout.partition_by is not None:
+            clauses.append(
+                f"PARTITION BY {self._partition_expression(layout.partition_by)}"
+            )
+        if layout.cluster_by:
+            clauses.append(
+                "CLUSTER BY "
+                + ", ".join(self.quote_ident(c) for c in layout.cluster_by)
+            )
+        return (" " + " ".join(clauses)) if clauses else ""
+
     def _load_parquet(self, table: str, df: pl.DataFrame, job_config: Any) -> None:
         buffer = io.BytesIO()
         df.write_parquet(buffer)
@@ -471,7 +603,9 @@ class BigQueryAdapter(WarehouseAdapter):
         )
         job.result()
 
-    def materialize_full(self, table: str, df: pl.DataFrame) -> int:
+    def materialize_full(
+        self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None
+    ) -> int:
         if df.width == 0:
             self.drop_table(table)
             return 0
@@ -480,6 +614,11 @@ class BigQueryAdapter(WarehouseAdapter):
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
+        if self._layout(options) is not None:
+            # A load job cannot change an existing table's partitioning or
+            # clustering spec — recreate so the declared layout always holds.
+            self.drop_table(table)
+            self._apply_layout_to_load(job_config, options)
         self._load_parquet(table, df, job_config)
         return df.height
 
@@ -490,6 +629,7 @@ class BigQueryAdapter(WarehouseAdapter):
         *,
         key_col: str,
         on_schema_change: str = "fail",
+        options: BaseModel | None = None,
     ) -> int:
         if df.height == 0:
             return 0
@@ -504,6 +644,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 source_format=bigquery.SourceFormat.PARQUET,
                 write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
             )
+            self._apply_layout_to_load(job_config, options)
             self._load_parquet(table, load_df, job_config)
             return df.height
 
@@ -566,7 +707,11 @@ class BigQueryAdapter(WarehouseAdapter):
         return df.height
 
     def materialize_full_chunks(
-        self, table: str, chunks: Iterable[pl.DataFrame]
+        self,
+        table: str,
+        chunks: Iterable[pl.DataFrame],
+        *,
+        options: BaseModel | None = None,
     ) -> int:
         bigquery = _bigquery()
         staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
@@ -593,8 +738,13 @@ class BigQueryAdapter(WarehouseAdapter):
                 total += df.height
             if first:
                 return self.materialize_full(table, pl.DataFrame())
+            layout_clauses = self._ddl_layout_clauses(options)
+            if layout_clauses:
+                # CREATE OR REPLACE cannot change an existing table's
+                # partitioning spec; drop first so the declared layout holds.
+                self.drop_table(table)
             self._run_query(
-                f"CREATE OR REPLACE TABLE {self.table_ref(table)} "
+                f"CREATE OR REPLACE TABLE {self.table_ref(table)}{layout_clauses} "
                 f"AS SELECT * FROM {self.table_ref(staging)}"
             )
         except BaseException as error:

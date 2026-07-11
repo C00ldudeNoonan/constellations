@@ -379,6 +379,203 @@ def test_list_tables_filters_internal() -> None:
     assert adapter.list_tables() == ["docs"]
 
 
+# ─── model-level warehouse_options (issue #91) ──────────────────────────────
+
+
+def _parse_options(payload: dict[str, Any]) -> Any:
+    return _adapter().parse_warehouse_options(payload, model_name="filings")
+
+
+def test_warehouse_options_partition_and_cluster_parse() -> None:
+    opts = _parse_options(
+        {
+            "partition_by": {"field": "filing_date", "granularity": "day"},
+            "cluster_by": ["cik", "form_type"],
+        }
+    )
+    assert opts.partition_by.field == "filing_date"
+    assert opts.partition_by.data_type == "date"
+    assert opts.cluster_by == ["cik", "form_type"]
+
+
+def test_warehouse_options_single_cluster_column_string() -> None:
+    assert _parse_options({"cluster_by": "cik"}).cluster_by == ["cik"]
+
+
+def test_warehouse_options_reject_unknown_key() -> None:
+    with pytest.raises(AdapterError, match="partiton_by"):
+        _parse_options({"partiton_by": {"field": "d"}})
+
+
+def test_warehouse_options_int64_requires_range() -> None:
+    with pytest.raises(AdapterError, match="range"):
+        _parse_options({"partition_by": {"field": "bucket", "data_type": "int64"}})
+
+
+def test_warehouse_options_range_only_for_int64() -> None:
+    with pytest.raises(AdapterError, match="int64"):
+        _parse_options(
+            {
+                "partition_by": {
+                    "field": "filing_date",
+                    "range": {"start": 0, "end": 10, "interval": 1},
+                }
+            }
+        )
+
+
+def test_warehouse_options_date_hour_rejected() -> None:
+    with pytest.raises(AdapterError, match="hour"):
+        _parse_options({"partition_by": {"field": "d", "granularity": "hour"}})
+
+
+def test_warehouse_options_cluster_limit_four() -> None:
+    with pytest.raises(AdapterError, match="cluster_by"):
+        _parse_options({"cluster_by": ["a", "b", "c", "d", "e"]})
+
+
+def test_partition_expression_ddl_forms() -> None:
+    adapter = _adapter()
+
+    def expr(**payload: Any) -> str:
+        from dbt_ml.adapters.bigquery import BigQueryPartitionBy
+
+        return adapter._partition_expression(BigQueryPartitionBy(**payload))
+
+    assert expr(field="d") == "`d`"
+    assert expr(field="d", granularity="month") == "DATE_TRUNC(`d`, MONTH)"
+    assert (
+        expr(field="ts", data_type="timestamp", granularity="hour")
+        == "TIMESTAMP_TRUNC(`ts`, HOUR)"
+    )
+    assert (
+        expr(field="dt", data_type="datetime", granularity="year")
+        == "DATETIME_TRUNC(`dt`, YEAR)"
+    )
+    assert (
+        expr(field="n", data_type="int64", range={"start": 0, "end": 100, "interval": 10})
+        == "RANGE_BUCKET(`n`, GENERATE_ARRAY(0, 100, 10))"
+    )
+    assert expr() == "_PARTITIONDATE"
+    assert expr(granularity="month", data_type="timestamp") == (
+        "TIMESTAMP_TRUNC(_PARTITIONTIME, MONTH)"
+    )
+
+
+def test_materialize_full_applies_layout_and_recreates() -> None:
+    from google.cloud import bigquery
+
+    client = _FakeClient()
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "partition_by": {"field": "filing_date"},
+            "cluster_by": ["cik"],
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_full("docs", df, options=opts)
+
+    # dropped first: a load job cannot change an existing table's layout
+    assert client.dropped == ["proj.ds.docs"]
+    _, _, job_config = client.loads[0]
+    assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
+    assert job_config.time_partitioning.type_ == "DAY"
+    assert job_config.time_partitioning.field == "filing_date"
+    assert job_config.clustering_fields == ["cik"]
+
+
+def test_materialize_full_without_options_keeps_plain_truncate() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    adapter.materialize_full("docs", pl.DataFrame({"document_id": ["a"]}))
+    assert client.dropped == []
+    _, _, job_config = client.loads[0]
+    assert job_config.time_partitioning is None
+    assert job_config.clustering_fields is None
+
+
+def test_incremental_first_load_creates_partitioned_table() -> None:
+    client = _FakeClient()  # get_table -> NotFound
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "partition_by": {
+                "field": "bucket",
+                "data_type": "int64",
+                "range": {"start": 0, "end": 100, "interval": 10},
+            }
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "bucket": [7]})
+    adapter.materialize_incremental(
+        "docs", df, key_col="document_id", options=opts
+    )
+    _, _, job_config = client.loads[0]
+    assert job_config.range_partitioning.field == "bucket"
+    assert job_config.range_partitioning.range_.start == 0
+    assert job_config.range_partitioning.range_.end == 100
+    assert job_config.range_partitioning.range_.interval == 10
+
+
+def test_incremental_existing_table_keeps_layout() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    adapter = _adapter(client)
+    opts = _parse_options({"partition_by": {"field": "filing_date"}})
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_incremental("docs", df, key_col="document_id", options=opts)
+
+    # the staging load and MERGE never carry a partitioning spec
+    for _, _, job_config in client.loads:
+        assert job_config.time_partitioning is None
+
+
+def test_full_chunks_ctas_carries_partition_and_cluster_clauses() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "partition_by": {"field": "filing_date", "granularity": "month"},
+            "cluster_by": ["cik", "form_type"],
+        }
+    )
+    total = adapter.materialize_full_chunks(
+        "docs",
+        iter([pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})]),
+        options=opts,
+    )
+    assert total == 1
+    swap_sql = client.queries[0][0]
+    assert (
+        "CREATE OR REPLACE TABLE `proj`.`ds`.`docs` "
+        "PARTITION BY DATE_TRUNC(`filing_date`, MONTH) "
+        "CLUSTER BY `cik`, `form_type` AS SELECT" in swap_sql
+    )
+    # target dropped before the swap so the new layout can apply
+    assert client.dropped[0] == "proj.ds.docs"
+
+
+def test_duckdb_ignores_warehouse_options(tmp_path: Path) -> None:
+    from dbt_ml.adapters.duckdb import DuckDBAdapter
+
+    cfg = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "wh.duckdb")}
+    )
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, DuckDBAdapter)
+    assert adapter.warehouse_options_model() is None
+    parsed = adapter.parse_warehouse_options(
+        {"partition_by": {"field": "filing_date"}}, model_name="filings"
+    )
+    assert parsed is None
+    with adapter:
+        rows = adapter.materialize_full(
+            "docs", pl.DataFrame({"document_id": ["a"]}), options=parsed
+        )
+    assert rows == 1
+
+
 # ─── dbt sources export ─────────────────────────────────────────────────────
 
 

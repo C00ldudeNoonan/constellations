@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### BigQuery model-level parity (issue #91)
+
+- New model-level `warehouse_options:` block, opaque to core and validated by
+  the active adapter — BigQuery rejects unknown/malformed keys at run time;
+  adapters with no layout knobs (DuckDB) ignore the block, so one project can
+  target DuckDB in dev and BigQuery in prod.
+- BigQuery honors `partition_by` (time, ingestion-time, and integer-range,
+  mirroring dbt-bigquery's config shape) and `cluster_by` (up to 4 columns).
+  Layout applies when a table is created or fully rebuilt; changing layout on
+  an existing incremental table requires `--full-refresh`.
+- `warehouse_options` is excluded from `code_version`: declaring or tuning
+  layout never reprocesses documents.
+
 ### Security
 
 - Local `source.file_pattern` values must be relative and cannot contain `..`.

@@ -320,6 +320,33 @@ drop or mutate the BigQuery dataset; it only removes known local target
 artifacts. `emit-dbt-sources` emits `database: <project>` / `schema: <dataset>`
 so a dbt-bigquery project can consume the tables directly.
 
+#### Partitioning & clustering (`warehouse_options`)
+
+Models may declare adapter-specific physical layout under
+`warehouse_options:` (issue #91), mirroring dbt-bigquery's `partition_by` /
+`cluster_by` resource configs:
+
+```yaml
+- name: filings_chunks
+  materialization: incremental
+  warehouse_options:
+    partition_by:
+      field: filing_date        # omit for ingestion-time partitioning
+      data_type: date           # timestamp | date (default) | datetime | int64
+      granularity: day          # hour | day (default) | month | year
+      # int64 instead takes: range: {start: 0, end: 100, interval: 10}
+    cluster_by: [cik, form_type] # up to 4 columns; a single string works too
+```
+
+The block is validated by the *active* adapter: BigQuery rejects unknown or
+malformed keys at run time, while adapters with no layout knobs (DuckDB
+today) ignore it entirely — so one project can run DuckDB in dev and
+BigQuery in prod. Layout applies when the table is created or fully
+rebuilt (`full` models rebuild every run); an existing incremental table
+keeps its layout, so adding or changing `partition_by` on an incremental
+model needs one `--full-refresh`. `warehouse_options` never changes
+`code_version` — declaring it does not reprocess documents.
+
 String values support `{{ env_var('NAME') }}` and
 `{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
 profiles need, so credentials and per-environment paths stay out of the file.

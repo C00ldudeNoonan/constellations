@@ -731,6 +731,70 @@ def test_discover_source_uses_posix_relative_paths(tmp_path: Path) -> None:
     assert refs[0].document_id == compute_document_id("docs", "batch_a/doc.json")
 
 
+def test_target_source_path_override_drives_discovery(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    dev_root = tmp_path / "dev_docs"
+    prod_root = tmp_path / "prod_docs"
+    (project / "dbt_ml_project.yml").write_text(
+        "name: docs\nversion: '0.1.0'\nprofile: docs\n"
+    )
+    (project / "profiles.yml").write_text(
+        f"docs:\n"
+        f"  target: dev\n"
+        f"  outputs:\n"
+        f"    dev:\n"
+        f"      warehouse:\n"
+        f"        type: duckdb\n"
+        f"        path: ./target/dev/db.duckdb\n"
+        f"        schema: docs\n"
+        f"      source_paths:\n"
+        f"        docs_src: {dev_root.as_posix()}\n"
+        f"    prod:\n"
+        f"      warehouse:\n"
+        f"        type: duckdb\n"
+        f"        path: ./target/prod/db.duckdb\n"
+        f"        schema: docs\n"
+        f"      source_paths:\n"
+        f"        docs_src: {prod_root.as_posix()}\n"
+    )
+    (project / "sources").mkdir()
+    (project / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n"
+        "  - name: docs_src\n"
+        "    path: data/prod\n"
+        "    file_pattern: '*.json'\n"
+    )
+    (project / "models").mkdir()
+    (project / "models" / "raw_docs.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: raw_docs\n"
+        "    source: ref('docs_src')\n"
+        "    extraction:\n"
+        "      backend: json\n"
+        "      options:\n"
+        "        fields: [title]\n"
+    )
+    for target_name, root in (("dev", dev_root), ("prod", prod_root)):
+        root.mkdir(parents=True)
+        (root / "doc.json").write_text(json.dumps({"title": target_name}))
+
+    run_project(project, target="dev")
+    run_project(project, target="prod")
+
+    dev_rows = _query(
+        project / "target" / "dev" / "db.duckdb",
+        'SELECT document_id, source_path, title FROM "db".docs.raw_docs',
+    )
+    prod_rows = _query(
+        project / "target" / "prod" / "db.duckdb",
+        'SELECT document_id, source_path, title FROM "db".docs.raw_docs',
+    )
+
+    assert dev_rows == [(prod_rows[0][0], "doc.json", "dev")]
+    assert prod_rows == [(dev_rows[0][0], "doc.json", "prod")]
+
+
 def _drop_currency_field(project: Path, *, on_schema_change: str | None = None) -> None:
     """Remove `currency` from raw_invoices' extraction so the next run's
     staging frame is missing a column the table already has."""

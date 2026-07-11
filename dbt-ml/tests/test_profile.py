@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 
 from dbt_ml.config import load_project
+from dbt_ml.config.source import SourceConfig
 from dbt_ml.profile import (
     ProfileError,
     ResolvedProfile,
+    apply_source_path_overrides,
     resolve_llm_options,
     resolve_profile,
 )
@@ -64,6 +66,10 @@ def _write_profiles(
             lines.append("      llm:")
             for k, v in llm.items():
                 lines.append(f"        {k}: {v}")
+        if "source_paths" in tcfg:
+            lines.append("      source_paths:")
+            for source_name, source_path in tcfg["source_paths"].items():
+                lines.append(f"        {source_name}: {source_path}")
     path = tmp_path / "profiles.yml"
     path.write_text("\n".join(lines) + "\n")
     return path
@@ -235,6 +241,77 @@ def test_resolved_profile_is_frozen_dataclass(tmp_path: Path) -> None:
         resolved.target_name = "other"  # type: ignore[misc]
 
 
+def test_target_source_path_overrides(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {"type": "duckdb", "path": "./d.duckdb", "schema": "d"},
+                "source_paths": {"filings": "gs://bucket-dev/sec_filings"},
+            },
+            "prod": {
+                "warehouse": {"type": "duckdb", "path": "./p.duckdb", "schema": "p"},
+                "source_paths": {"filings": "gs://bucket-prod/sec_filings"},
+            },
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    source = SourceConfig(name="filings", path="gs://bucket-prod/sec_filings")
+
+    dev = resolve_profile(project, tmp_path, target="dev")
+    prod = resolve_profile(project, tmp_path, target="prod")
+
+    assert apply_source_path_overrides([source], dev)[0].path == (
+        "gs://bucket-dev/sec_filings"
+    )
+    assert apply_source_path_overrides([source], prod)[0].path == (
+        "gs://bucket-prod/sec_filings"
+    )
+
+
+def test_target_local_source_path_override_is_profile_trusted(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    outside = tmp_path.parent / "operator_docs"
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {"type": "duckdb", "path": "./d.duckdb", "schema": "d"},
+                "source_paths": {"filings": outside.as_posix()},
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    source = SourceConfig(name="filings", path="data/prod", external=False)
+
+    resolved = resolve_profile(project, tmp_path)
+    overridden = apply_source_path_overrides([source], resolved)[0]
+
+    assert overridden.path == outside.as_posix()
+    assert overridden.external is True
+
+
+def test_unknown_target_source_path_override_raises(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {"type": "duckdb", "path": "./d.duckdb", "schema": "d"},
+                "source_paths": {"typo": "data/dev"},
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    with pytest.raises(ProfileError, match="unknown source"):
+        apply_source_path_overrides(
+            [SourceConfig(name="filings", path="data/prod")], resolved
+        )
+
+
 # ─── env_var interpolation (issue #73) ──────────────────────────────────────
 
 
@@ -359,4 +436,30 @@ def test_unknown_warehouse_field_rejected(tmp_path: Path) -> None:
     )
     project, _, _ = load_project(tmp_path)
     with pytest.raises(ProfileError, match="pth_typo"):
+        resolve_profile(project, tmp_path)
+
+
+@pytest.mark.parametrize("bad_key", ["source_path", "source-path"])
+def test_unknown_target_field_rejected(tmp_path: Path, bad_key: str) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/db.duckdb",
+                f"      {bad_key}:",
+                "        filings: data/dev",
+            ]
+        )
+        + "\n",
+    )
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(ProfileError, match=bad_key):
         resolve_profile(project, tmp_path)

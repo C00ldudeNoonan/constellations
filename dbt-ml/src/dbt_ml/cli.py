@@ -21,7 +21,7 @@ from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
 from .paths import is_within_project, resolve_within_project
-from .profile import ProfileError, resolve_profile
+from .profile import ProfileError, apply_source_path_overrides, resolve_profile
 from .runner import BuildResult, RunError, build_project, clean_project, run_project
 from .sources import SourceError
 from .synth import (
@@ -288,8 +288,24 @@ def seed(
     html → product_pages, llm → invoice_texts.
     """
     project_dir: Path = ctx.obj["project_dir"]
-    _, sources, models = _load(project_dir)
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    project, sources, models = _load(project_dir)
+    try:
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+        sources = apply_source_path_overrides(sources, resolved)
+    except ProfileError as e:
+        raise ConfigClickError(str(e)) from e
     source = _pick_source(sources, source_name)
+    if _is_remote_source_path(source.path):
+        raise ConfigClickError(
+            f"`dbt-ml seed` only supports local source paths; source "
+            f"'{source.name}' points to remote path '{source.path}'. "
+            "Use a local target source_paths override, or seed remote storage "
+            "outside dbt-ml."
+        )
 
     if data_type:
         seeder = _SEEDERS_BY_TYPE[data_type]
@@ -869,9 +885,13 @@ def source() -> None:
 def source_freshness(ctx: click.Context) -> None:
     """Check source freshness against configured warn/error thresholds."""
     project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
     try:
-        results = check_freshness(project_dir)
-    except ConfigError as e:
+        results = check_freshness(
+            project_dir, target=target, profiles_dir=profiles_dir
+        )
+    except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
     except SourceError as e:
         raise click.ClickException(str(e)) from e
@@ -970,7 +990,14 @@ def _run_watch(
     """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
     from watchfiles import watch
 
-    _, sources, _ = _load(project_dir)
+    project, sources, _ = _load(project_dir)
+    try:
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+        sources = apply_source_path_overrides(sources, resolved)
+    except ProfileError as e:
+        raise ConfigClickError(str(e)) from e
     watch_paths = []
     for s in sources:
         try:
@@ -1037,6 +1064,10 @@ def _backend_for_source(source: SourceConfig, models: list[ModelConfig]) -> str:
         ):
             return model.extraction.backend or "json"
     return "json"
+
+
+def _is_remote_source_path(path: str) -> bool:
+    return path.startswith("gs://")
 
 
 def _pick_source(sources: list[SourceConfig], name: str | None) -> SourceConfig:

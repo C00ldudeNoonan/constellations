@@ -27,7 +27,12 @@ from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
 from .paths import resolve_within_project
-from .profile import ResolvedProfile, resolve_llm_options, resolve_profile
+from .profile import (
+    ResolvedProfile,
+    apply_source_path_overrides,
+    resolve_llm_options,
+    resolve_profile,
+)
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import load_transform
 from .versioning import compute_code_version
@@ -123,6 +128,7 @@ def run_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    sources = apply_source_path_overrides(sources, resolved)
     dag = ProjectDAG(sources, models)
     selected = dag.select_models(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
@@ -172,6 +178,7 @@ def build_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    sources = apply_source_path_overrides(sources, resolved)
     dag = ProjectDAG(sources, models)
     selected = dag.select_models(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)

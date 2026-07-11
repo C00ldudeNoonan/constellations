@@ -118,6 +118,119 @@ def test_large_html_is_deterministic_and_ordered(tmp_path: Path) -> None:
     assert len(starts) == 500
 
 
+# ─── HTML: styled headings (issue #108) ─────────────────────────────────────
+#
+# Modern SEC inline-XBRL filings express headings as bold styled divs/spans,
+# not <h1>-<h6>. `styled_headings` detects them heuristically; a project can
+# also name headings explicitly with `heading_selectors`.
+
+
+def _extract_sec(**options: Any) -> dict[str, Any]:
+    backend = get_backend("html")
+    return backend.extract(
+        FIXTURES / "sec_10k_snippet.html", {"include_structure": True, **options}
+    ).fields
+
+
+def test_styled_docs_yield_no_sections_by_default() -> None:
+    assert _extract_sec()["sections"] == []
+
+
+def test_styled_headings_detected_with_font_size_levels() -> None:
+    sections = _extract_sec(styled_headings=True)["sections"]
+    assert [(s["level"], s["heading"]) for s in sections] == [
+        (1, "ACME CORP"),
+        (2, "PART I"),
+        (3, "Item 1. Business"),
+        (3, "Item 1A. Risk Factors"),
+        (
+            3,
+            "Item 7. Management’s Discussion and Analysis of "
+            "Financial Condition and Results of Operations",
+        ),
+    ]
+    assert all(s["source"] == "style" for s in sections)
+    risk = next(s for s in sections if s["heading"] == "Item 1A. Risk Factors")
+    assert risk["anchor"] == "ria"
+
+
+def test_styled_heading_offsets_slice_the_text() -> None:
+    fields = _extract_sec(styled_headings=True)
+    text, sections = fields["text"], fields["sections"]
+    for s in sections:
+        assert text[s["char_start"] :].startswith(s["heading"])
+    risk = next(s for s in sections if s["heading"] == "Item 1A. Risk Factors")
+    mdna = next(s for s in sections if s["heading"].startswith("Item 7."))
+    body = text[risk["char_start"] : mdna["char_start"]]
+    assert "single customer" in body
+    assert "rocket-powered" not in body
+
+
+def test_styled_heuristic_rejects_non_headings() -> None:
+    headings = [s["heading"] for s in _extract_sec(styled_headings=True)["sections"]]
+    # partial-bold body text, long bold paragraphs, non-bold blocks,
+    # letterless blocks, table cells, and hidden iXBRL noise are not headings
+    assert not any("single customer" == h for h in headings)
+    assert not any(h.startswith("We may never sell") for h in headings)
+    assert "Certain statements are forward-looking." not in headings
+    assert "$1,400" not in headings
+    assert "Year" not in headings
+    assert not any("iXBRL" in h for h in headings)
+
+
+def test_heading_selectors_name_headings_explicitly() -> None:
+    sections = _extract_sec(heading_selectors=["div[id]"])["sections"]
+    assert len(sections) == 1
+    (risk,) = sections
+    assert risk["heading"] == "Item 1A. Risk Factors"
+    assert risk["level"] == 1
+    assert risk["source"] == "selector"
+    assert risk["anchor"] == "ria"
+
+
+def test_heading_selector_order_sets_level() -> None:
+    sections = _extract_sec(
+        heading_selectors=["span[style*='14pt']", "span[style*='font-weight:700']"]
+    )["sections"]
+    by_heading = {s["heading"]: s for s in sections}
+    assert by_heading["ACME CORP"]["level"] == 1
+    assert by_heading["Item 1. Business"]["level"] == 2
+
+
+def test_heading_selectors_must_be_a_list() -> None:
+    backend = get_backend("html")
+    with pytest.raises(ValueError, match="heading_selectors"):
+        backend.extract(
+            FIXTURES / "sec_10k_snippet.html",
+            {"include_structure": True, "heading_selectors": "div[id]"},
+        )
+
+
+def test_heading_selector_matching_nothing_warns() -> None:
+    backend = get_backend("html")
+    result = backend.extract(
+        FIXTURES / "sec_10k_snippet.html",
+        {"include_structure": True, "heading_selectors": ["h1.no-such-heading"]},
+    )
+    assert any("h1.no-such-heading" in w for w in result.warnings)
+    assert result.fields["sections"] == []
+
+
+def test_heading_selectors_take_precedence_over_style_heuristic() -> None:
+    sections = _extract_sec(styled_headings=True, heading_selectors=["div[id]"])[
+        "sections"
+    ]
+    by_heading = {s["heading"]: s for s in sections}
+    risk = by_heading["Item 1A. Risk Factors"]
+    assert (risk["level"], risk["source"]) == (1, "selector")
+    assert by_heading["PART I"]["source"] == "style"
+
+
+def test_semantic_heading_sections_carry_source_tag() -> None:
+    sections = _extract_report()["sections"]
+    assert sections and all(s["source"] == "tag" for s in sections)
+
+
 # ─── PDF: pages ─────────────────────────────────────────────────────────────
 
 

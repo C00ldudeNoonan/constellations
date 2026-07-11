@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Extraction (issue #108)
+- html backend: two opt-in heading detectors for corpora that style headings
+  instead of using `<h1>`–`<h6>` (SEC inline-XBRL filings):
+  `styled_headings: true` heuristically treats short, fully-bold leaf blocks
+  as headings with levels ranked by font size, and `heading_selectors:`
+  accepts explicit CSS selectors with selector order setting the level.
+- `sections` entries now carry a `source` field: `"tag"`, `"selector"`, or
+  `"style"`. Both detectors are off by default; existing extractions are
+  unaffected.
+
 ## v0.2.7 - 2026-07-10
 
 ### Security (issue #65)

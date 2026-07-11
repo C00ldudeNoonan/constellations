@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 import polars as pl
 import pytest
 
@@ -126,6 +127,68 @@ def test_materialize_incremental_upserts(tmp_path: Path) -> None:
         assert rows == [("a", 99), ("b", 2)]
 
 
+@pytest.mark.parametrize(
+    ("df", "message"),
+    [
+        (pl.DataFrame({"x": [1]}), "missing required key"),
+        (pl.DataFrame({"document_id": [None], "x": [1]}), "contains 1 NULL"),
+        (
+            pl.DataFrame({"document_id": ["a", "a"], "x": [1, 2]}),
+            "contains 1 duplicate",
+        ),
+    ],
+)
+def test_incremental_rejects_invalid_keys(
+    tmp_path: Path, df: pl.DataFrame, message: str
+) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        with pytest.raises(AdapterError, match=message):
+            adapter.materialize_incremental("widgets", df, key_col="document_id")
+        assert "widgets" not in adapter.list_tables()
+
+
+@pytest.mark.parametrize("policy", ["fail", "ignore", "append_new_columns"])
+def test_incremental_rejects_existing_target_without_key(
+    tmp_path: Path, policy: str
+) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("widgets", pl.DataFrame({"x": [1]}))
+
+        with pytest.raises(AdapterError, match=r"target.*missing key"):
+            adapter.materialize_incremental(
+                "widgets",
+                pl.DataFrame({"document_id": ["a"], "x": [2]}),
+                key_col="document_id",
+                on_schema_change=policy,
+            )
+
+        assert adapter.rows(f"SELECT * FROM {adapter.table_ref('widgets')}") == [
+            (1,)
+        ]
+
+
+def test_incremental_failure_rolls_back_delete(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "widgets",
+            pl.DataFrame({"document_id": ["a", "b"], "x": [1, 2]}),
+            key_col="document_id",
+        )
+
+        with pytest.raises(duckdb.ConversionException):
+            adapter.materialize_incremental(
+                "widgets",
+                pl.DataFrame({"document_id": ["a"], "x": ["not-an-int"]}),
+                key_col="document_id",
+            )
+
+        rows = adapter.rows(
+            f"SELECT document_id, x FROM {adapter.table_ref('widgets')} "
+            "ORDER BY document_id"
+        )
+        assert rows == [("a", 1), ("b", 2)]
+
+
 def test_list_tables_excludes_state(tmp_path: Path) -> None:
     with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
         adapter.materialize_full(
@@ -147,12 +210,13 @@ def test_drop_table(tmp_path: Path) -> None:
         assert "x" not in adapter.list_tables()
 
 
-def test_clean_deletes_duckdb_file(tmp_path: Path) -> None:
+def test_adapter_test_reset_deletes_duckdb_file(tmp_path: Path) -> None:
     cfg = _wh(tmp_path / "t.duckdb")
     with create_adapter(cfg) as adapter:
         adapter.materialize_full("x", pl.DataFrame({"a": [1]}))
     adapter2 = create_adapter(cfg)
-    out = adapter2.clean()
+    assert hasattr(adapter2, "_reset_storage_for_test")
+    out = adapter2._reset_storage_for_test()  # type: ignore[attr-defined]
     assert "t.duckdb" in out
     assert not (tmp_path / "t.duckdb").exists()
 
@@ -337,12 +401,59 @@ def test_full_chunks_failure_drops_staging_keeps_target(tmp_path: Path) -> None:
         assert staging == []
 
 
+def test_full_chunks_swap_failure_rolls_back_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("widgets", pl.DataFrame({"x": [1]}))
+
+        def fail_rename(staging_ref: str, table: str) -> None:
+            raise RuntimeError(f"cannot rename {staging_ref} to {table}")
+
+        monkeypatch.setattr(adapter, "_rename_staging", fail_rename)
+        with pytest.raises(RuntimeError, match="cannot rename"):
+            adapter.materialize_full_chunks(
+                "widgets", iter([pl.DataFrame({"x": [2]})])
+            )
+
+        assert adapter.rows(f"SELECT x FROM {adapter.table_ref('widgets')}") == [(1,)]
+        staging = adapter.rows(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'testns' AND table_name LIKE 'dbt_ml_staging%'"
+        )
+        assert staging == []
+
+
 def test_full_chunks_empty_iterator_drops_target(tmp_path: Path) -> None:
     with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
         adapter.materialize_full("widgets", pl.DataFrame({"x": [1]}))
         total = adapter.materialize_full_chunks("widgets", iter([]))
         assert total == 0
         assert "widgets" not in adapter.list_tables()
+
+
+def test_full_chunks_typed_empty_frame_creates_relation(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        frame = pl.DataFrame(
+            schema={
+                "document_id": pl.String,
+                "count": pl.Int64,
+                "score": pl.Float64,
+                "active": pl.Boolean,
+            }
+        )
+        assert adapter.materialize_full_chunks("widgets", iter([frame])) == 0
+        assert adapter.scalar(
+            f"SELECT COUNT(*) FROM {adapter.table_ref('widgets')}"
+        ) == 0
+        assert adapter.rows(
+            f"DESCRIBE {adapter.table_ref('widgets')}"
+        )[:4] == [
+            ("document_id", "VARCHAR", "YES", None, None, None),
+            ("count", "BIGINT", "YES", None, None, None),
+            ("score", "DOUBLE", "YES", None, None, None),
+            ("active", "BOOLEAN", "YES", None, None, None),
+        ]
 
 
 def test_list_tables_excludes_staging_tables(tmp_path: Path) -> None:

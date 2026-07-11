@@ -21,6 +21,11 @@ from dbt_ml.synth import generate_invoice_texts
 _SCHEMA = [{"name": "vendor", "type": "string"}, {"name": "total", "type": "number"}]
 
 
+@pytest.fixture(autouse=True)
+def _default_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
+
+
 def _succeeded_item(
     fields: dict[str, Any],
     *,
@@ -58,7 +63,11 @@ class _FakeBatchAPI:
         self.overrides = overrides or {}
 
     def __call__(
-        self, requests: list[dict[str, Any]], *, poll_seconds: float
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        poll_seconds: float,
+        api_key_env: str,
     ) -> dict[str, Any]:
         self.calls += 1
         self.submitted.append(requests)
@@ -173,6 +182,73 @@ def test_llm_batch_max_tokens_item_is_error(
     assert "max_tokens" in str(out[0])
 
 
+def test_message_batch_uses_custom_api_key_env(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    init_kwargs: dict[str, Any] = {}
+    submitted: list[list[dict[str, Any]]] = []
+
+    class _FakeBatches:
+        def create(self, *, requests: list[dict[str, Any]]) -> SimpleNamespace:
+            submitted.append(requests)
+            return SimpleNamespace(id="batch-1")
+
+        def retrieve(self, batch_id: str) -> SimpleNamespace:
+            assert batch_id == "batch-1"
+            return SimpleNamespace(id=batch_id, processing_status="ended")
+
+        def results(self, batch_id: str) -> list[Any]:
+            assert batch_id == "batch-1"
+            return []
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs: Any) -> None:
+            init_kwargs.update(kwargs)
+            self.messages = SimpleNamespace(batches=_FakeBatches())
+
+    secret = "batch-secret-that-must-not-leak"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-default-secret")
+    monkeypatch.setenv("DBT_ML_BATCH_KEY", secret)
+    monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
+
+    result = llm_backend._run_message_batch(
+        [{"custom_id": "req-0", "params": {}}],
+        poll_seconds=0,
+        api_key_env="DBT_ML_BATCH_KEY",
+    )
+
+    assert result == {}
+    assert init_kwargs == {"api_key": secret}
+    assert len(submitted) == 1
+    assert secret not in caplog.text
+
+
+def test_message_batch_missing_custom_key_fails_before_client_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed = False
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs: Any) -> None:
+            nonlocal constructed
+            constructed = True
+
+    fallback_secret = "wrong-default-secret"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", fallback_secret)
+    monkeypatch.delenv("DBT_ML_BATCH_KEY", raising=False)
+    monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
+
+    with pytest.raises(RuntimeError, match="DBT_ML_BATCH_KEY") as exc_info:
+        llm_backend._run_message_batch(
+            [{"custom_id": "req-0", "params": {}}],
+            poll_seconds=0,
+            api_key_env="DBT_ML_BATCH_KEY",
+        )
+
+    assert not constructed
+    assert fallback_secret not in str(exc_info.value)
+
+
 # ─── runner end-to-end ─────────────────────────────────────────────────────
 
 
@@ -212,7 +288,12 @@ def test_runner_batch_mode_end_to_end(
 ) -> None:
     calls = {"n": 0}
 
-    def fake(requests: list[dict[str, Any]], *, poll_seconds: float) -> dict[str, Any]:
+    def fake(
+        requests: list[dict[str, Any]],
+        *,
+        poll_seconds: float,
+        api_key_env: str,
+    ) -> dict[str, Any]:
         calls["n"] += 1
         return {
             req["custom_id"]: _invoice_item(i) for i, req in enumerate(requests)
@@ -251,7 +332,12 @@ def test_runner_batch_cost_estimate_halved(
         )
     )
 
-    def fake(requests: list[dict[str, Any]], *, poll_seconds: float) -> dict[str, Any]:
+    def fake(
+        requests: list[dict[str, Any]],
+        *,
+        poll_seconds: float,
+        api_key_env: str,
+    ) -> dict[str, Any]:
         return {req["custom_id"]: _invoice_item(i) for i, req in enumerate(requests)}
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
@@ -265,7 +351,12 @@ def test_runner_batch_cost_estimate_halved(
 def test_runner_batch_isolates_per_document_errors(
     monkeypatch: pytest.MonkeyPatch, batch_project: Path
 ) -> None:
-    def fake(requests: list[dict[str, Any]], *, poll_seconds: float) -> dict[str, Any]:
+    def fake(
+        requests: list[dict[str, Any]],
+        *,
+        poll_seconds: float,
+        api_key_env: str,
+    ) -> dict[str, Any]:
         out = {req["custom_id"]: _invoice_item(i) for i, req in enumerate(requests)}
         out["req-1"] = _errored_item()
         return out

@@ -7,6 +7,7 @@ from graphlib import CycleError, TopologicalSorter
 
 from .config.model import ModelConfig
 from .config.source import SourceConfig
+from .test_specs import TestSpecError, relationship_test_targets
 
 _REF_PATTERN = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
 
@@ -67,6 +68,10 @@ class ProjectDAG:
                 preds.add(parse_ref(model.source))
             if model.depends_on:
                 preds.update(parse_ref(dep) for dep in model.depends_on)
+            try:
+                preds.update(relationship_test_targets(model.tests))
+            except TestSpecError as e:
+                raise DAGError(f"Model '{model.name}' has invalid tests: {e}") from e
             self.predecessors[model.name] = preds
 
         for model_name, preds in self.predecessors.items():
@@ -98,6 +103,23 @@ class ProjectDAG:
     def descendants(self, name: str) -> set[str]:
         """All nodes transitively downstream of `name` (excluding `name`)."""
         return _bfs(name, self.successors)
+
+    def required_sources(self, model_names: list[str]) -> list[str]:
+        """Source ancestors required by `model_names`, in graph order."""
+        required: set[str] = set()
+        for name in model_names:
+            if name not in self.nodes:
+                raise SelectionError(
+                    f"Unknown selected model '{name}'. Known nodes: "
+                    f"{sorted(self.nodes)}"
+                )
+            ancestors = _bfs(name, self.predecessors)
+            required.update(
+                ancestor
+                for ancestor in ancestors
+                if self.nodes[ancestor].kind == NodeKind.SOURCE
+            )
+        return [name for name in self._sorted if name in required]
 
     def parallel_batches(self, names: list[str]) -> list[list[str]]:
         """Group `names` into topological generations: each batch may run

@@ -26,6 +26,24 @@ class AdapterError(Exception):
     pass
 
 
+def validate_incremental_keys(df: pl.DataFrame, key_col: str) -> None:
+    if key_col not in df.columns:
+        raise AdapterError(
+            f"Incremental input is missing required key column '{key_col}'"
+        )
+    null_count = df[key_col].null_count()
+    if null_count:
+        raise AdapterError(
+            f"Incremental key column '{key_col}' contains {null_count} NULL value(s)"
+        )
+    duplicate_count = df.height - df[key_col].n_unique()
+    if duplicate_count:
+        raise AdapterError(
+            f"Incremental key column '{key_col}' contains "
+            f"{duplicate_count} duplicate value(s)"
+        )
+
+
 class WarehouseAdapter(ABC):
     """Lifecycle-managed warehouse driver."""
 
@@ -159,14 +177,6 @@ class WarehouseAdapter(ABC):
 
     @abstractmethod
     def list_tables(self) -> list[str]: ...
-
-    # ─── lifecycle-bypass operations ──────────────────────────────────────
-
-    @abstractmethod
-    def clean(self) -> str:
-        """Remove everything this adapter has materialized. Returns a human-readable
-        description of what was removed. Implementations handle their own short-lived
-        connection if needed — does not require __enter__ to be called first."""
 
     # ─── incremental state CRUD ───────────────────────────────────────────
 

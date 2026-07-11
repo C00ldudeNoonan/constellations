@@ -55,6 +55,13 @@ def test_not_null_translated_to_column_tests(fresh_project: Path) -> None:
     assert "not_null" in total_col["tests"]
 
 
+def test_declared_data_type_propagates_to_dbt_columns(fresh_project: Path) -> None:
+    raw = _table(build_dbt_sources(fresh_project), "raw_invoices")
+    assert _col(raw, "invoice_id")["data_type"] == "string"
+    assert _col(raw, "total")["data_type"] == "float"
+    assert _col(raw, "line_items")["data_type"] == "string"
+
+
 def test_single_column_unique_on_column(fresh_project: Path) -> None:
     payload = build_dbt_sources(fresh_project)
     raw = _table(payload, "raw_invoices")

@@ -15,7 +15,7 @@ from click.testing import CliRunner
 
 from dbt_ml.backends import llm_backend
 from dbt_ml.cli import cli
-from dbt_ml.manifest import write_run_results
+from dbt_ml.manifest import write_manifest, write_run_results
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoice_texts
 
@@ -33,6 +33,11 @@ _CALL_USAGE = {
     "cache_read_input_tokens": 0,
     "cache_creation_input_tokens": 0,
 }
+
+
+@pytest.fixture(autouse=True)
+def _default_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
 
 
 @pytest.fixture
@@ -125,6 +130,61 @@ def test_run_summary_prints_usage_line(llm_project: Path, fake_api: dict) -> Non
     assert result.exit_code == 0, result.output
     assert "llm: 3 calls, 0 cache hits" in result.output
     assert "3,000 in / 300 out tokens" in result.output
+
+
+def test_compile_warning_uses_configured_api_key_env(
+    monkeypatch: pytest.MonkeyPatch, llm_project: Path
+) -> None:
+    profiles = llm_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "api_key_env: ANTHROPIC_API_KEY",
+            "api_key_env: DBT_ML_ANTHROPIC_KEY",
+        )
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-default-secret")
+    monkeypatch.delenv("DBT_ML_ANTHROPIC_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(llm_project), "compile"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "warning: DBT_ML_ANTHROPIC_KEY is not set" in result.output
+    assert "warning: ANTHROPIC_API_KEY is not set" not in result.output
+    assert "wrong-default-secret" not in result.output
+
+
+def test_api_key_secret_is_not_persisted_or_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    llm_project: Path,
+    fake_api: dict,
+) -> None:
+    profiles = llm_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "api_key_env: ANTHROPIC_API_KEY",
+            "api_key_env: DBT_ML_ANTHROPIC_KEY",
+        )
+    )
+    secret = "custom-secret-that-must-never-be-persisted"
+    fallback_secret = "wrong-default-secret-that-must-never-be-used"
+    monkeypatch.setenv("DBT_ML_ANTHROPIC_KEY", secret)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", fallback_secret)
+
+    results = run_project(llm_project)
+    write_manifest(llm_project)
+    write_run_results(llm_project, results)
+
+    target_files = [p for p in (llm_project / "target").rglob("*") if p.is_file()]
+    assert target_files
+    for path in target_files:
+        payload = path.read_bytes()
+        assert secret.encode() not in payload
+        assert fallback_secret.encode() not in payload
+    assert secret not in caplog.text
+    assert fallback_secret not in caplog.text
 
 
 def test_non_llm_backend_has_empty_metrics(

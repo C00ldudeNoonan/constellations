@@ -22,12 +22,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 import polars as pl
 from pydantic import AliasChoices, Field, model_validator
 
 from ..config.profile import WarehouseConfig
-from .base import AdapterError, WarehouseAdapter
+from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
 from .registry import register
 
 _INSTALL_HINT = (
@@ -492,41 +493,83 @@ class BigQueryAdapter(WarehouseAdapter):
     ) -> int:
         if df.height == 0:
             return 0
+        validate_incremental_keys(df, key_col)
         bigquery = _bigquery()
         load_df = df
         allow_field_addition = False
 
         existing = self._table_columns(table)
-        if existing is not None:
-            plan = plan_schema_change(
-                existing, list(df.columns), on_schema_change, table
+        if existing is None:
+            job_config = bigquery.LoadJobConfig(
+                source_format=bigquery.SourceFormat.PARQUET,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
             )
-            allow_field_addition = plan.allow_field_addition
-            if plan.columns_to_load != list(df.columns):
-                load_df = df.select(plan.columns_to_load)
-            if key_col in load_df.columns:
-                self._run_query(
-                    f"DELETE FROM {self.table_ref(table)} "
-                    f"WHERE {self.quote_ident(key_col)} IN UNNEST(?)",
-                    [df[key_col].to_list()],
-                )
+            self._load_parquet(table, load_df, job_config)
+            return df.height
 
-        job_config = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.PARQUET,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        )
+        if key_col not in existing:
+            raise AdapterError(
+                f"Incremental target '{table}' is missing key column '{key_col}'"
+            )
+        plan = plan_schema_change(existing, list(df.columns), on_schema_change, table)
+        allow_field_addition = plan.allow_field_addition
+        if plan.columns_to_load != list(df.columns):
+            load_df = df.select(plan.columns_to_load)
+
         if allow_field_addition:
-            job_config.schema_update_options = [
-                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
-            ]
-        self._load_parquet(table, load_df, job_config)
+            schema_config = bigquery.LoadJobConfig(
+                source_format=bigquery.SourceFormat.PARQUET,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+            )
+            self._load_parquet(table, load_df.head(0), schema_config)
+
+        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+        staging_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        try:
+            self._load_parquet(staging, load_df, staging_config)
+            final_columns = [*existing]
+            final_columns.extend(c for c in load_df.columns if c not in final_columns)
+            assignments = ", ".join(
+                f"target.{self.quote_ident(column)} = "
+                f"source.{self.quote_ident(column)}"
+                if column in load_df.columns
+                else f"target.{self.quote_ident(column)} = NULL"
+                for column in final_columns
+            )
+            insert_columns = ", ".join(
+                self.quote_ident(column) for column in load_df.columns
+            )
+            insert_values = ", ".join(
+                f"source.{self.quote_ident(column)}" for column in load_df.columns
+            )
+            self._run_query(
+                f"MERGE {self.table_ref(table)} AS target "
+                f"USING {self.table_ref(staging)} AS source "
+                f"ON target.{self.quote_ident(key_col)} = "
+                f"source.{self.quote_ident(key_col)} "
+                f"WHEN MATCHED THEN UPDATE SET {assignments} "
+                f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
+                f"VALUES ({insert_values})"
+            )
+        except BaseException as error:
+            try:
+                self.drop_table(staging)
+            except Exception as cleanup_error:
+                error.add_note(f"Failed to clean staging table: {cleanup_error}")
+            raise
+        else:
+            self.drop_table(staging)
         return df.height
 
     def materialize_full_chunks(
         self, table: str, chunks: Iterable[pl.DataFrame]
     ) -> int:
         bigquery = _bigquery()
-        staging = f"dbt_ml_staging__{table}"
+        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
         total = 0
         first = True
         try:
@@ -554,7 +597,13 @@ class BigQueryAdapter(WarehouseAdapter):
                 f"CREATE OR REPLACE TABLE {self.table_ref(table)} "
                 f"AS SELECT * FROM {self.table_ref(staging)}"
             )
-        finally:
+        except BaseException as error:
+            try:
+                self.drop_table(staging)
+            except Exception as cleanup_error:
+                error.add_note(f"Failed to clean staging table: {cleanup_error}")
+            raise
+        else:
             self.drop_table(staging)
         return total
 
@@ -578,9 +627,8 @@ class BigQueryAdapter(WarehouseAdapter):
     def drop_table(self, table: str) -> None:
         self.client.delete_table(self._table_id(table), not_found_ok=True)
 
-    def clean(self) -> str:
-        """Drop the whole dataset (everything dbt-ml materialized, including
-        state). Uses its own client when called outside the context manager."""
+    def _reset_storage_for_test(self) -> str:
+        """Drop the isolated test dataset used by live adapter integration tests."""
         cfg = self._cfg
         dataset_id = f"{cfg.project}.{cfg.schema_name}"
         client = self._client or self._make_client()

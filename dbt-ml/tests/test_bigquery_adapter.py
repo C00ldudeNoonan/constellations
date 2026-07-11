@@ -158,6 +158,11 @@ class _FakeJob:
         return list(self._rows)
 
 
+class _FailingJob(_FakeJob):
+    def result(self, timeout: Any = None) -> list[_FakeRow]:
+        raise RuntimeError("simulated merge failure")
+
+
 class _FakeClient:
     def __init__(self) -> None:
         self.queries: list[tuple[str, Any]] = []
@@ -223,18 +228,26 @@ def test_incremental_first_load_creates_table() -> None:
     assert job_config.write_disposition == "WRITE_APPEND"
 
 
-def test_incremental_upsert_deletes_then_appends() -> None:
+def test_incremental_upsert_uses_staging_merge() -> None:
     client = _FakeClient()
     client.tables["proj.ds.docs"] = ["document_id", "x"]
     adapter = _adapter(client)
     df = pl.DataFrame({"document_id": ["a", "b"], "x": [1, 2]})
     adapter.materialize_incremental("docs", df, key_col="document_id")
 
-    sql, job_config = client.queries[0]
-    assert "DELETE FROM `proj`.`ds`.`docs`" in sql
-    assert "IN UNNEST(?)" in sql
-    assert job_config.query_parameters[0].values == ["a", "b"]
+    payload, staging_id, job_config = client.loads[0]
+    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
+    assert job_config.write_disposition == "WRITE_TRUNCATE"
+    assert pl.read_parquet(io.BytesIO(payload)).rows() == [("a", 1), ("b", 2)]
+
+    sql, query_config = client.queries[0]
+    assert sql.startswith("MERGE `proj`.`ds`.`docs` AS target")
+    assert "WHEN MATCHED THEN UPDATE SET" in sql
+    assert "WHEN NOT MATCHED THEN INSERT" in sql
+    assert "DELETE FROM" not in sql
+    assert query_config is None
     assert len(client.loads) == 1
+    assert client.dropped == [staging_id]
 
 
 def test_incremental_append_new_columns_sets_schema_update() -> None:
@@ -247,10 +260,70 @@ def test_incremental_append_new_columns_sets_schema_update() -> None:
     adapter.materialize_incremental(
         "docs", df, key_col="document_id", on_schema_change="append_new_columns"
     )
-    _, _, job_config = client.loads[0]
-    assert job_config.schema_update_options == [
+    schema_payload, table_id, schema_config = client.loads[0]
+    assert table_id == "proj.ds.docs"
+    assert pl.read_parquet(io.BytesIO(schema_payload)).height == 0
+    assert schema_config.schema_update_options == [
         bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
     ]
+    data_payload, staging_id, staging_config = client.loads[1]
+    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
+    assert staging_config.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
+    assert pl.read_parquet(io.BytesIO(data_payload)).rows() == [("a", "new")]
+
+
+@pytest.mark.parametrize(
+    ("df", "message"),
+    [
+        (pl.DataFrame({"x": [1]}), "missing required key"),
+        (pl.DataFrame({"document_id": [None], "x": [1]}), "contains 1 NULL"),
+        (
+            pl.DataFrame({"document_id": ["a", "a"], "x": [1, 2]}),
+            "contains 1 duplicate",
+        ),
+    ],
+)
+def test_incremental_rejects_invalid_keys(df: pl.DataFrame, message: str) -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match=message):
+        adapter.materialize_incremental("docs", df, key_col="document_id")
+    assert client.loads == []
+    assert client.queries == []
+
+
+def test_incremental_rejects_target_without_key() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["x"]
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match=r"target.*missing key"):
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "x": [1]}),
+            key_col="document_id",
+        )
+    assert client.loads == []
+    assert client.queries == []
+
+
+def test_incremental_merge_failure_keeps_target_and_cleans_staging() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    client.query_results = [_FailingJob()]
+    adapter = _adapter(client)
+
+    with pytest.raises(RuntimeError, match="simulated merge failure"):
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "x": [99]}),
+            key_col="document_id",
+        )
+
+    sql, _ = client.queries[0]
+    assert sql.startswith("MERGE")
+    assert "DELETE FROM" not in sql
+    assert len(client.dropped) == 1
+    assert client.dropped[0].startswith("proj.ds.dbt_ml_staging__docs__")
 
 
 def test_incremental_fail_policy_raises_before_writing() -> None:
@@ -381,7 +454,8 @@ def test_integration_full_round_trip() -> None:
             assert adapter.fetch_state("m") == {"a": ("h2", "v2")}
             assert adapter.list_tables() == ["docs"]
     finally:
-        adapter.clean()
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
 
 
 # ─── auth parity with dbt-bigquery ──────────────────────────────────────────
@@ -606,7 +680,7 @@ def test_full_chunks_stages_then_swaps() -> None:
 
     # Chunk 1 truncates the staging table; chunk 2 appends with field addition.
     _, staging_id, cfg1 = client.loads[0]
-    assert staging_id == "proj.ds.dbt_ml_staging__docs"
+    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
     assert cfg1.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
     _, _, cfg2 = client.loads[1]
     assert cfg2.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
@@ -617,8 +691,9 @@ def test_full_chunks_stages_then_swaps() -> None:
     # Swap into the target, then drop staging.
     swap_sql = client.queries[0][0]
     assert "CREATE OR REPLACE TABLE `proj`.`ds`.`docs`" in swap_sql
-    assert "`proj`.`ds`.`dbt_ml_staging__docs`" in swap_sql
-    assert client.dropped == ["proj.ds.dbt_ml_staging__docs"]
+    staging_table = staging_id.removeprefix("proj.ds.")
+    assert f"`proj`.`ds`.`{staging_table}`" in swap_sql
+    assert client.dropped == [staging_id]
 
 
 def test_full_chunks_empty_iterator_drops_target() -> None:
@@ -628,6 +703,28 @@ def test_full_chunks_empty_iterator_drops_target() -> None:
     assert client.loads == []
     # materialize_full(empty) drops the target; staging cleanup is a no-op drop.
     assert "proj.ds.docs" in client.dropped
+
+
+def test_full_chunks_typed_empty_frame_loads_and_swaps() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    frame = pl.DataFrame(
+        schema={
+            "document_id": pl.String,
+            "count": pl.Int64,
+            "score": pl.Float64,
+            "active": pl.Boolean,
+        }
+    )
+
+    assert adapter.materialize_full_chunks("docs", iter([frame])) == 0
+
+    payload, staging_id, _ = client.loads[0]
+    loaded = pl.read_parquet(io.BytesIO(payload))
+    assert loaded.schema == frame.schema
+    assert loaded.height == 0
+    assert "CREATE OR REPLACE TABLE `proj`.`ds`.`docs`" in client.queries[0][0]
+    assert client.dropped == [staging_id]
 
 
 def test_list_tables_excludes_staging() -> None:

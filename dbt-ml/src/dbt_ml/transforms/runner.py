@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,22 @@ class TransformContext:
 
 class TransformFn(Protocol):
     def __call__(self, deps: dict[str, pl.DataFrame], *args: Any) -> pl.DataFrame: ...
+
+
+def transform_call_arity(transform_fn: TransformFn) -> int:
+    if inspect.iscoroutinefunction(transform_fn):
+        raise TypeError("async transform functions are not supported")
+    signature = inspect.signature(transform_fn)
+    marker = object()
+    for arity in (2, 1):
+        try:
+            signature.bind(*([marker] * arity))
+        except TypeError:
+            continue
+        return arity
+    raise TypeError(
+        f"run{signature} must accept either (deps) or (deps, ctx) positional arguments"
+    )
 
 
 def load_transform(module_path: str, project_dir: Path) -> TransformFn:

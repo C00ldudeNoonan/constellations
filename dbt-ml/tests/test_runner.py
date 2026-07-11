@@ -7,6 +7,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from dbt_ml.config import ConfigError
 from dbt_ml.config.source import SourceConfig
 from dbt_ml.manifest import write_run_results
 from dbt_ml.runner import RunError, build_project, clean_project, run_project
@@ -183,7 +184,7 @@ def test_incremental_transform_is_rejected(fresh_project: Path) -> None:
     text = summary_yml.read_text()
     summary_yml.write_text(text.replace("materialization: full", "materialization: incremental"))
 
-    with pytest.raises(RunError, match="only support `full`"):
+    with pytest.raises(ConfigError, match="only supports `materialization: full`"):
         run_project(fresh_project, select="invoice_summary")
 
 
@@ -235,11 +236,7 @@ def test_run_with_threads_produces_same_results(fresh_project: Path) -> None:
     raw_serial = next(r for r in results_serial if r.model_name == "raw_invoices")
     assert raw_serial.rows_written == 20
 
-    # Clean and re-run with 4 threads
-    from dbt_ml.runner import clean_project
-
-    clean_project(fresh_project)
-    results_parallel = run_project(fresh_project, threads=4)
+    results_parallel = run_project(fresh_project, threads=4, full_refresh=True)
     raw_parallel = next(r for r in results_parallel if r.model_name == "raw_invoices")
     assert raw_parallel.rows_written == 20
 
@@ -256,8 +253,7 @@ def test_threaded_run_parallelizes_independent_branches(fresh_project: Path) -> 
     serial = run_project(fresh_project)
     serial_rows = {r.model_name: r.rows_written for r in serial}
 
-    clean_project(fresh_project)
-    parallel = run_project(fresh_project, threads=4)
+    parallel = run_project(fresh_project, threads=4, full_refresh=True)
     parallel_rows = {r.model_name: r.rows_written for r in parallel}
 
     assert parallel_rows == serial_rows
@@ -270,7 +266,7 @@ def test_threaded_run_parallelizes_independent_branches(fresh_project: Path) -> 
     assert monthly[0][0] > 0
 
 
-def test_clean_removes_duckdb(fresh_project: Path) -> None:
+def test_clean_preserves_duckdb(fresh_project: Path) -> None:
     invoices_dir = fresh_project / "data" / "invoices"
     generate_invoices(2, invoices_dir, seed=1)
     run_project(fresh_project)
@@ -278,7 +274,7 @@ def test_clean_removes_duckdb(fresh_project: Path) -> None:
     assert db.exists()
 
     clean_project(fresh_project)
-    assert not db.exists()
+    assert db.exists()
 
 
 def test_classic_ml_tfidf_end_to_end(tmp_path: Path) -> None:
@@ -803,6 +799,10 @@ def _drop_currency_field(project: Path, *, on_schema_change: str | None = None) 
         "fields: [invoice_id, vendor, issue_date, line_items, total, currency]",
         "fields: [invoice_id, vendor, issue_date, line_items, total]",
     )
+    text = text.replace(
+        "      - name: currency\n        data_type: string\n",
+        "",
+    ).replace("      - name: currency\n", "")
     if on_schema_change is not None:
         text = text.replace(
             "materialization: incremental",

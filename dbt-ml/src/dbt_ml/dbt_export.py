@@ -1,8 +1,8 @@
 """Translate a dbt-ml project into a dbt-compatible sources.yml.
 
-The idea: a dbt-duckdb project pointed at the same DuckDB file can consume
-dbt_ml-materialized tables via `{{ source('dbt_ml_<project>', '<model>') }}`.
-This module emits the sources.yml declaration that makes that work.
+A dbt project using the matching warehouse adapter can consume dbt-ml tables
+via `{{ source('dbt_ml_<project>', '<model>') }}`. This module emits the
+sources.yml declaration that makes that work.
 """
 from __future__ import annotations
 
@@ -107,6 +107,11 @@ def _table_for_model(
         columns_by_name[field.name] = {"name": field.name}
         if field.description:
             columns_by_name[field.name]["description"] = field.description
+        if field.data_type:
+            # Adapters receive nested values after they are flattened to JSON text.
+            columns_by_name[field.name]["data_type"] = (
+                "string" if field.data_type == "json" else field.data_type
+            )
 
     table_tests: list[Any] = []
     for spec in model.tests:

@@ -31,10 +31,15 @@ models:
 
     fields:
       - name: vendor
+        data_type: string
       - name: invoice_id
+        data_type: string
       - name: issue_date
+        data_type: string
       - name: currency
+        data_type: string
       - name: total
+        data_type: float
 
     tests:
       - not_null: [vendor, invoice_id, total]

@@ -18,6 +18,25 @@ models:
           - customer_email
           - created_at
     materialization: incremental
+    fields:
+      - name: ticket_id
+        data_type: string
+      - name: product
+        data_type: string
+      - name: priority
+        data_type: string
+      - name: status
+        data_type: string
+      - name: assigned_team
+        data_type: string
+      - name: summary
+        data_type: string
+      - name: customer_name
+        data_type: string
+      - name: customer_email
+        data_type: string
+      - name: created_at
+        data_type: string
     tags: [raw, tickets, classic_ml]
     tests:
       - not_null: [ticket_id, summary, priority]

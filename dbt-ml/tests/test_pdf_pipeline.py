@@ -17,6 +17,11 @@ from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoice_pdfs
 
 
+@pytest.fixture(autouse=True)
+def _default_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
+
+
 @pytest.fixture
 def pdf_project(tmp_path: Path) -> Path:
     repo = Path(__file__).resolve().parents[1]
@@ -95,3 +100,38 @@ def test_pdf_pipeline_caches_llm_calls(
     assert api_calls["n"] == 3
     run_project(pdf_project)
     assert api_calls["n"] == 3, "second run should not invoke the API"
+
+
+def test_pdf_transform_propagates_custom_api_key_env(
+    monkeypatch: pytest.MonkeyPatch, pdf_project: Path
+) -> None:
+    generate_invoice_pdfs(1, pdf_project / "data" / "invoices_pdf", seed=1)
+    profiles = pdf_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "api_key_env: ANTHROPIC_API_KEY",
+            "api_key_env: DBT_ML_ANTHROPIC_KEY",
+        )
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("DBT_ML_ANTHROPIC_KEY", "custom-test-key")
+    seen_envs: list[str] = []
+
+    def fake_api(
+        content: str, model: str, system: str, fields_spec: list, **kwargs: object
+    ) -> dict:
+        seen_envs.append(str(kwargs["api_key_env"]))
+        return {
+            "invoice_id": "INV-CUSTOM-KEY",
+            "vendor": "Mocked Vendor",
+            "issue_date": "2026-01-01",
+            "currency": "USD",
+            "total": 1.0,
+        }
+
+    monkeypatch.setattr(llm_backend, "_default_call_api", fake_api)
+
+    results = run_project(pdf_project)
+
+    assert seen_envs == ["DBT_ML_ANTHROPIC_KEY"]
+    assert not next(r for r in results if r.model_name == "extracted_invoices").errors

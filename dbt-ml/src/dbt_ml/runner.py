@@ -4,6 +4,8 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import os
+import shutil
 import tempfile
 import threading
 import time
@@ -21,8 +23,9 @@ from .backends import BaseBackend, ExtractionResult, get_backend
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
+from .compiler import validate_project_contract
 from .config import load_project
-from .config.model import ModelConfig
+from .config.model import INTERNAL_LINEAGE_FIELDS, ModelConfig
 from .config.profile import PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
@@ -35,14 +38,109 @@ from .profile import (
     resolve_profile,
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
-from .transforms import load_transform
+from .transforms import TransformContext, load_transform, transform_call_arity
 from .versioning import compute_code_version
 
 log = logging.getLogger(__name__)
 
+_EXTRACTION_LINEAGE_SCHEMA: dict[str, Any] = {
+    "document_id": pl.String,
+    "source_path": pl.String,
+    "source_uri": pl.String,
+    # Remote sources populate this JSON string; local rows retain it as NULL.
+    "source_metadata": pl.String,
+    "content_hash": pl.String,
+    "code_version": pl.String,
+    "backend_name": pl.String,
+    "backend_version": pl.String,
+    "extracted_at": pl.String,
+}
+_EXTRACTION_FIELD_DTYPES: dict[str, Any] = {
+    "string": pl.String,
+    "integer": pl.Int64,
+    "float": pl.Float64,
+    "boolean": pl.Boolean,
+    "date": pl.Date,
+    "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "json": pl.String,
+}
+
 
 class RunError(Exception):
     pass
+
+
+class _FullExtractionFailed(Exception):
+    pass
+
+
+def _extraction_schema(model: ModelConfig) -> dict[str, Any]:
+    schema = dict(_EXTRACTION_LINEAGE_SCHEMA)
+    names = {name.casefold(): name for name in schema}
+    for field_config in model.fields:
+        folded = field_config.name.casefold()
+        existing = names.get(folded)
+        if existing is not None:
+            if existing in _EXTRACTION_LINEAGE_SCHEMA:
+                if field_config.data_type not in {None, "string", "json"}:
+                    raise RunError(
+                        f"Extraction model '{model.name}' declares lineage field "
+                        f"'{field_config.name}' as {field_config.data_type}; lineage "
+                        "fields use string storage"
+                    )
+                continue
+            raise RunError(
+                f"Extraction model '{model.name}' declares duplicate field "
+                f"'{field_config.name}'"
+            )
+        names[folded] = field_config.name
+        schema[field_config.name] = (
+            _EXTRACTION_FIELD_DTYPES[field_config.data_type]
+            if field_config.data_type is not None
+            else pl.String
+        )
+    return schema
+
+
+def _empty_extraction_frame(model: ModelConfig) -> pl.DataFrame:
+    return pl.DataFrame(schema=_extraction_schema(model))
+
+
+def _apply_extraction_contract(
+    frame: pl.DataFrame, model: ModelConfig
+) -> pl.DataFrame:
+    schema = _extraction_schema(model)
+    typed_names = {
+        field_config.name: field_config.data_type
+        for field_config in model.fields
+        if field_config.data_type is not None
+        and field_config.name.casefold() not in INTERNAL_LINEAGE_FIELDS
+    }
+    expressions: list[pl.Expr] = []
+    for name, dtype in schema.items():
+        if name in frame.columns:
+            if name in typed_names:
+                data_type = typed_names[name]
+                if data_type == "date" and frame.schema[name] == pl.String:
+                    expressions.append(pl.col(name).str.to_date(strict=True))
+                elif data_type == "timestamp" and frame.schema[name] == pl.String:
+                    expressions.append(
+                        pl.col(name).str.to_datetime(time_zone="UTC", strict=True)
+                    )
+                else:
+                    expressions.append(pl.col(name).cast(dtype, strict=True))
+            continue
+        expressions.append(pl.lit(None, dtype=dtype).alias(name))
+    try:
+        contracted = frame.with_columns(expressions) if expressions else frame
+    except Exception as e:
+        raise RunError(
+            f"Extraction model '{model.name}' produced a value that does not "
+            f"match its declared field data_type: {e}"
+        ) from e
+    if model.fields:
+        return contracted.select(list(schema))
+    return contracted
 
 
 def _modified_set(
@@ -129,16 +227,20 @@ def run_project(
     state: Path | None = None,
 ) -> list[ModelRunResult]:
     project, sources, models = load_project(project_dir)
+    dag = validate_project_contract(project, sources, models, project_dir)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     sources = apply_source_path_overrides(sources, resolved)
-    dag = ProjectDAG(sources, models)
     selected = dag.select_models(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
     )
 
-    source_docs = _discover_sources(sources, project_dir)
+    required_sources = set(dag.required_sources(selected))
+    source_docs = _discover_sources(
+        [source for source in sources if source.name in required_sources],
+        project_dir,
+    )
 
     models_by_name = {m.name: m for m in models}
 
@@ -179,16 +281,20 @@ def build_project(
     whose tests hard-fail blocks all its descendants, which are reported as
     skipped (dbt `build` semantics)."""
     project, sources, models = load_project(project_dir)
+    dag = validate_project_contract(project, sources, models, project_dir)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     sources = apply_source_path_overrides(sources, resolved)
-    dag = ProjectDAG(sources, models)
     selected = dag.select_models(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
     )
 
-    source_docs = _discover_sources(sources, project_dir)
+    required_sources = set(dag.required_sources(selected))
+    source_docs = _discover_sources(
+        [source for source in sources if source.name in required_sources],
+        project_dir,
+    )
     models_by_name = {m.name: m for m in models}
 
     out = BuildResult()
@@ -376,11 +482,19 @@ def _run_extraction_model(
     code_version = compute_code_version(
         extraction=model.extraction,
         transform=None,
+        fields=model.fields,
         project_dir=project_dir,
     )
 
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(model.name) if is_incremental else {}
+    existing_tables = set(adapter.list_tables()) if is_incremental else set()
+    empty_incremental_target = (
+        is_incremental
+        and not processed_state
+        and model.name in existing_tables
+        and adapter.scalar(f"SELECT COUNT(*) FROM {adapter.table_ref(model.name)}") == 0
+    )
 
     docs_to_process: list[DocumentRef] = []
     for doc in docs:
@@ -406,8 +520,14 @@ def _run_extraction_model(
 
     errors: list[str] = []
     warning_counts: Counter[str] = Counter()
+    if not docs:
+        warning_counts[
+            f"Source '{source_name}' matched zero documents; verify its path and "
+            "file_pattern."
+        ] += 1
     usage_totals: dict[str, Any] = {}
     full_state_records: list[tuple[str, str, str]] = []
+    full_committed = False
     rows_written = 0
     docs_flushed = 0
 
@@ -441,9 +561,8 @@ def _run_extraction_model(
             chunk_records.append((doc.document_id, doc.content_hash, code_version))
         return chunk_rows, chunk_records
 
-    # Remote sources download into a per-model scratch dir, lazily and only
-    # for documents that actually need processing; local sources pass their
-    # real path through untouched. Extraction streams through in
+    # Sources snapshot into a per-model scratch dir, lazily and only for
+    # documents that actually need processing. Extraction streams through in
     # `flush_every`-sized chunks (issue #77): rows never accumulate beyond
     # one chunk, so corpus size is bounded by the flush size, not memory.
     with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
@@ -491,6 +610,7 @@ def _run_extraction_model(
             # target at the end; state upserts once, after the swap.
             def _frames() -> Iterator[pl.DataFrame]:
                 nonlocal docs_flushed
+                yielded = False
                 for extracted in _iter_extracted():
                     chunk_rows, chunk_records = _rows_for_chunk(extracted)
                     full_state_records.extend(chunk_records)
@@ -503,10 +623,20 @@ def _run_extraction_model(
                             total_docs,
                             model.name,
                         )
-                        yield pl.DataFrame(chunk_rows)
+                        yielded = True
+                        yield _apply_extraction_contract(
+                            pl.DataFrame(chunk_rows), model
+                        )
+                if errors:
+                    raise _FullExtractionFailed
+                if not yielded:
+                    yield _empty_extraction_frame(model)
 
             try:
                 rows_written = adapter.materialize_full_chunks(model.name, _frames())
+                full_committed = True
+            except _FullExtractionFailed:
+                rows_written = 0
             except AdapterError as e:
                 raise RunError(str(e)) from e
         else:
@@ -521,14 +651,18 @@ def _run_extraction_model(
                 try:
                     rows_written += adapter.materialize_incremental(
                         model.name,
-                        pl.DataFrame(chunk_rows),
+                        _apply_extraction_contract(pl.DataFrame(chunk_rows), model),
                         key_col="document_id",
                         # The model's policy governs run-over-run drift on the
                         # first flush; later flushes union within-run drift,
                         # matching what one whole-run DataFrame did.
-                        on_schema_change=model.on_schema_change
-                        if first_flush
-                        else "append_new_columns",
+                        on_schema_change=(
+                            "append_new_columns"
+                            if first_flush and empty_incremental_target
+                            else model.on_schema_change
+                            if first_flush
+                            else "append_new_columns"
+                        ),
                     )
                 except AdapterError as e:
                     # RunError so `build` fails this model and blocks
@@ -544,6 +678,12 @@ def _run_extraction_model(
                     model.name,
                 )
 
+            if not docs and model.name not in existing_tables:
+                try:
+                    adapter.materialize_full(model.name, _empty_extraction_frame(model))
+                except AdapterError as e:
+                    raise RunError(str(e)) from e
+
     if usage_totals and options.get("batch"):
         usage_totals["batch"] = True
     if usage_totals and resolved.llm is not None and resolved.llm.pricing is not None:
@@ -554,9 +694,8 @@ def _run_extraction_model(
             cost = round(cost * 0.5, 6)
         usage_totals["estimated_cost_usd"] = cost
 
-    if full_refresh:
+    if use_full and full_committed:
         adapter.clear_model_state(model.name)
-    if use_full:
         adapter.upsert_state(model.name, full_state_records)
 
     return ModelRunResult(
@@ -645,6 +784,16 @@ def _row_for_extraction(
     backend_version: str,
     extracted_at: str,
 ) -> dict[str, Any]:
+    conflicts = sorted(
+        key
+        for key in result.fields
+        if key.casefold() in INTERNAL_LINEAGE_FIELDS
+    )
+    if conflicts:
+        raise RunError(
+            "Extracted fields collide with reserved dbt-ml lineage columns: "
+            f"{', '.join(conflicts)}"
+        )
     # The common output contract (issue #85): identity, lineage back to the
     # exact source object, and the parser that produced the row.
     row: dict[str, Any] = {
@@ -696,10 +845,6 @@ def _run_transform_model(
             f"Transform model '{model.name}' must declare `depends_on:` for v1"
         )
 
-    import inspect
-
-    from .transforms import TransformContext
-
     transform_fn = load_transform(model.transform.module, project_dir)
     deps: dict[str, pl.DataFrame] = {}
     for dep_ref in model.depends_on:
@@ -708,8 +853,7 @@ def _run_transform_model(
             f"SELECT * FROM {adapter.table_ref(dep_name)}"
         )
 
-    sig = inspect.signature(transform_fn)
-    if len(sig.parameters) >= 2:
+    if transform_call_arity(transform_fn) == 2:
         ctx = TransformContext(
             project_dir=project_dir,
             profile_name=resolved.profile_name,
@@ -931,14 +1075,90 @@ def _run_ml_model(
 
 def clean_project(
     project_dir: Path,
-    *,
-    target: str | None = None,
-    profiles_dir: Path | None = None,
 ) -> str:
-    """Delegate to the adapter's clean(). Returns a description of what was removed."""
+    """Remove known dbt-ml artifacts without invoking warehouse cleanup."""
     project, _, _ = load_project(project_dir)
-    resolved = resolve_profile(
-        project, project_dir, target=target, profiles_dir=profiles_dir
+    project_root = project_dir.resolve()
+    target_dir = resolve_within_project(
+        project.target_path, project_dir, surface="`target-path`"
     )
-    adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
-    return adapter.clean()
+
+    if target_dir == project_root:
+        raise RunError(
+            "Refusing to clean because `target-path` resolves to the project root."
+        )
+    relative_target = target_dir.relative_to(project_root)
+    if relative_target.parts[0] in {".git", ".hg", ".svn"}:
+        raise RunError(
+            f"Refusing to clean reserved project metadata path {target_dir}."
+        )
+
+    for label, paths in (
+        ("source-paths", project.source_paths),
+        ("model-paths", project.model_paths),
+        ("transform-paths", project.transform_paths),
+    ):
+        for configured_path in paths:
+            protected = resolve_within_project(
+                configured_path, project_dir, surface=f"`{label}`"
+            )
+            if target_dir.is_relative_to(protected) or protected.is_relative_to(
+                target_dir
+            ):
+                raise RunError(
+                    f"Refusing to clean {target_dir} because it overlaps "
+                    f"configured `{label}` path {protected}."
+                )
+
+    lexical_target = Path(
+        os.path.abspath(
+            project.target_path
+            if project.target_path.is_absolute()
+            else project_root / project.target_path
+        )
+    )
+    try:
+        lexical_parts = lexical_target.relative_to(project_root).parts
+    except ValueError as e:
+        raise RunError(
+            "Refusing to clean a target path that enters the project through "
+            f"a symlink: {lexical_target}."
+        ) from e
+    current = project_root
+    for part in lexical_parts:
+        current /= part
+        if current.is_symlink():
+            raise RunError(
+                f"Refusing to clean target path with symlink component {current}."
+            )
+
+    if not target_dir.exists():
+        return str(target_dir)
+    if not target_dir.is_dir():
+        raise RunError(f"Configured target path is not a directory: {target_dir}")
+
+    for filename in ("manifest.json", "run_results.json", "sources.yml"):
+        artifact = target_dir / filename
+        if artifact.is_symlink():
+            raise RunError(f"Refusing to clean symlinked artifact {artifact}.")
+        if artifact.exists():
+            if not artifact.is_file():
+                raise RunError(f"Expected generated artifact to be a file: {artifact}")
+            artifact.unlink()
+
+    for dirname in ("docs", "artifacts"):
+        artifact_dir = target_dir / dirname
+        if artifact_dir.is_symlink():
+            raise RunError(f"Refusing to clean symlinked artifact {artifact_dir}.")
+        if artifact_dir.exists():
+            if not artifact_dir.is_dir():
+                raise RunError(
+                    f"Expected generated artifact to be a directory: {artifact_dir}"
+                )
+            shutil.rmtree(artifact_dir)
+
+    try:
+        target_dir.rmdir()
+    except OSError:
+        pass
+    return str(target_dir)

@@ -14,11 +14,17 @@ models:
 
     fields:
       - name: invoice_id
+        data_type: string
       - name: vendor
+        data_type: string
       - name: issue_date
-      - name: total
+        data_type: string
       - name: line_items
+        data_type: json
+      - name: total
+        data_type: float
       - name: currency
+        data_type: string
 
     tests:
       - not_null: [vendor, total]

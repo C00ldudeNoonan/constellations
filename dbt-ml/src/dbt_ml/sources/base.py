@@ -57,9 +57,11 @@ class DocumentSource(ABC):
 
     @abstractmethod
     def fetch(self, ref: DocumentRef, work_dir: Path) -> Path:
-        """Make the document's bytes available as a local file. Local sources
-        return the original path; remote sources download into `work_dir`
-        (a per-run scratch directory the runner cleans up)."""
+        """Make verified document bytes available under the per-run `work_dir`.
+
+        Implementations snapshot or download the discovered object so extraction
+        cannot follow a path/object change after discovery.
+        """
 
     @abstractmethod
     def scan(self, source: SourceConfig, project_dir: Path) -> SourceScan:

@@ -2,7 +2,81 @@
 
 ## Unreleased
 
+### Security
+
+- Local `source.file_pattern` values must be relative and cannot contain `..`.
+  Discovery never follows matched file or directory symlinks, hashes through
+  verified file descriptors where supported, and gives parsers a hash-checked
+  scratch snapshot to close discovery/fetch races. Project, source, and model
+  YAML and project Python modules are likewise confined and cannot escape via
+  symlinks.
+- `llm.api_key_env` is now honored by synchronous extraction, Message Batches,
+  and reusable helpers. The profile-owned variable wins deterministically,
+  secrets never enter options/artifacts/errors, model YAML cannot select an
+  arbitrary environment variable, and secret-value interpolation in
+  `api_key_env` is rejected.
+- `redact_pii` omits matched substrings from entity evidence by default,
+  automatically drops a separately named input text column, and adds explicit
+  `keep_fields` / `drop_fields`, `include_raw_text`, and `retain_input_text`
+  controls. The customer-facing support-ticket example now uses an allow-list
+  projection.
+- `clean` no longer invokes adapter database/schema/dataset deletion. It
+  removes only named local artifacts, preserves warehouses/caches/unknown
+  files, rejects project-root or config-root overlap, and refuses every
+  symlink component. The old `--force` option was removed.
+
+### Reliability and correctness
+
+- Incremental inputs now reject missing, NULL, or duplicate keys before
+  mutation. DuckDB performs delete+insert and full-table publication in
+  transactions; BigQuery stages each write under a unique name and uses one
+  atomic `MERGE`. Cleanup errors no longer mask the primary warehouse error.
+- Full extraction models publish only after every document succeeds; any
+  parser/backend error preserves the prior target and state. Backend and
+  zero-match warnings are retained in CLI output and `run_results.json`.
+- Extraction `fields[].data_type` defines a typed output contract and enables
+  successful zero-document runs to create real zero-row relations on DuckDB
+  and BigQuery. Supported logical types are string, integer, float, boolean,
+  date, timestamp, and JSON; contract changes invalidate incremental state.
+- Selection now limits source discovery and watch paths to the selected graph,
+  so unrelated GCS branches do not construct clients or consume credentials.
+  Run artifacts record `sources_considered`.
+
+### Compiler and blocker fixes
+
+- All public configuration models reject unknown keys, source/model YAML is
+  fixed at schema version 2, configured and dynamic extraction fields cannot
+  overwrite lineage columns, and LLM numeric settings are bounded before any
+  file, cloud, or API access.
+- A shared preflight for compile/run/build/test/watch validates backend names,
+  edge kinds, dependency counts, materializations, transform/custom-test
+  modules and call signatures, built-in test specifications, and relationship
+  targets. Relationship targets are DAG predecessors, so `build` orders them
+  before the referencing test.
+- GCS sources accept an explicit `project:` and missing ADC/project inference
+  now exits 2 with actionable guidance instead of a raw traceback (#105).
+- Tests against a genuinely missing model relation return a structured
+  `relation_exists` failure rather than leaking an adapter-specific 404 (#106).
+- `show` safely replaces unsupported characters on narrow Windows console
+  encodings such as cp1252 (#107).
+- Custom `llm.api_key_env` resolution is consistent at compile and runtime
+  (#116), and redacted outputs no longer silently persist raw evidence (#115).
+
+### Upgrade notes
+
+- Unknown configuration keys that were previously ignored now fail. Correct
+  misspellings and keep source/model file `version: 2`.
+- LLM extraction models require the configured credential variable even when
+  their response cache is warm. Put `api_key_env` under profile `llm:`, not
+  model options.
+- Use `include_raw_text: true` or `retain_input_text: true` only when the
+  resulting relation is intentionally sensitive. Use `keep_fields` for
+  customer-facing redacted tables.
+- `dbt-ml clean` preserves the local DuckDB warehouse; use an explicitly
+  scoped administrative workflow when warehouse relations must be dropped.
+
 ### Extraction (issue #108)
+
 - html backend: two opt-in heading detectors for corpora that style headings
   instead of using `<h1>`–`<h6>` (SEC inline-XBRL filings):
   `styled_headings: true` heuristically treats short, fully-bold leaf blocks
@@ -13,6 +87,7 @@
   unaffected.
 
 ### Observability
+
 - Backend extraction warnings (missing json fields, empty pdf pages, html
   selectors matching nothing) are no longer dropped: the runner aggregates
   them per model as distinct message → document count, `dbt-ml run`/`build`

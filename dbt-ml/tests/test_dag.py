@@ -58,6 +58,22 @@ def test_parallel_batches_ignores_unselected_predecessors(
     assert set(batches[0]) == {"invoice_summary", "monthly_totals"}
 
 
+def test_required_sources_includes_ancestors_of_downstream_selection(
+    example_project_dir: Path,
+) -> None:
+    _, sources, models = load_project(example_project_dir)
+    dag = ProjectDAG(sources, models)
+
+    assert dag.required_sources(["invoice_summary"]) == ["vendor_invoices"]
+
+
+def test_required_sources_empty_for_empty_selection(
+    example_project_dir: Path,
+) -> None:
+    _, sources, models = load_project(example_project_dir)
+    assert ProjectDAG(sources, models).required_sources([]) == []
+
+
 def test_unknown_ref_raises() -> None:
     models = [
         ModelConfig(name="a", depends_on=["ref('does_not_exist')"]),

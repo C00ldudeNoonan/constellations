@@ -13,6 +13,19 @@ models:
         text_field: summary
         output_field: summary_redacted
         entities_field: pii_entities
+        keep_fields:
+          - ticket_id
+          - product
+          - priority
+          - status
+          - customer_tier
+          - assigned_team
+          - summary_redacted
+          - created_at
+          - first_response_at
+          - resolved_at
+          - sla_target_hours
+          - pii_entities
         entities: [PERSON, EMAIL_ADDRESS, PHONE_NUMBER, URL]
         score_threshold: 0.4
 

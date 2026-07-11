@@ -15,7 +15,9 @@ models:
 
     fields:
       - name: body
+        data_type: string
       - name: word_count
+        data_type: integer
 
     tags: [raw, markdown]
 

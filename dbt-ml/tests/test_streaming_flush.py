@@ -40,6 +40,38 @@ def flushing_project(tmp_path: Path, example_project_dir: Path) -> Path:
     return dst
 
 
+@pytest.fixture
+def typed_empty_project(tmp_path: Path, example_project_dir: Path) -> Path:
+    dst = tmp_path / "typed_project"
+    shutil.copytree(
+        example_project_dir,
+        dst,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    (dst / "models" / "raw_invoices.yml").write_text(
+        """version: 2
+models:
+  - name: raw_invoices
+    source: ref('vendor_invoices')
+    extraction:
+      backend: json
+      options:
+        fields: [invoice_id, total, quantity, paid, note, payload, event_date, event_at]
+    materialization: incremental
+    fields:
+      - {name: invoice_id, data_type: string}
+      - {name: total, data_type: float}
+      - {name: quantity, data_type: integer}
+      - {name: paid, data_type: boolean}
+      - {name: note, data_type: string}
+      - {name: payload, data_type: json}
+      - {name: event_date, data_type: date}
+      - {name: event_at, data_type: timestamp}
+"""
+    )
+    return dst
+
+
 def _table_count(project: Path, table: str) -> int:
     con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
     try:
@@ -62,6 +94,115 @@ def _state_count(project: Path, model: str) -> int:
         return int(row[0]) if row else 0
     finally:
         con.close()
+
+
+def _table_snapshot(project: Path, table: str) -> list[tuple[Any, ...]]:
+    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    try:
+        return con.execute(
+            f'SELECT * FROM "dbt_ml"."dbt_ml"."{table}" ORDER BY document_id'
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _table_types(project: Path, table: str) -> dict[str, str]:
+    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    try:
+        return dict(
+            con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = 'dbt_ml' AND table_name = ?",
+                [table],
+            ).fetchall()
+        )
+    finally:
+        con.close()
+
+
+def test_full_zero_match_streams_typed_empty_relation(
+    typed_empty_project: Path,
+) -> None:
+    model = typed_empty_project / "models" / "raw_invoices.yml"
+    model.write_text(
+        model.read_text().replace("materialization: incremental", "materialization: full")
+    )
+
+    result = run_project(typed_empty_project, select="raw_invoices")[0]
+
+    assert result.rows_written == 0
+    assert _table_count(typed_empty_project, "raw_invoices") == 0
+    types = _table_types(typed_empty_project, "raw_invoices")
+    assert types["invoice_id"] == "VARCHAR"
+    assert types["total"] == "DOUBLE"
+    assert types["quantity"] == "BIGINT"
+    assert types["paid"] == "BOOLEAN"
+    assert types["event_date"] == "DATE"
+    assert types["event_at"] == "TIMESTAMP WITH TIME ZONE"
+
+
+def test_incremental_typed_empty_then_nonempty_preserves_types(
+    typed_empty_project: Path,
+) -> None:
+    first = run_project(typed_empty_project, select="raw_invoices")[0]
+    assert first.rows_written == 0
+    assert first.warnings
+    assert _table_count(typed_empty_project, "raw_invoices") == 0
+
+    data_dir = typed_empty_project / "data" / "invoices"
+    data_dir.mkdir(parents=True)
+    (data_dir / "one.json").write_text(
+        '{"invoice_id":"INV-1","total":19.5,"quantity":2,"paid":true,'
+        '"note":"ready","payload":{"kind":"sample"},'
+        '"event_date":"2026-07-11","event_at":"2026-07-11T12:30:00Z"}'
+    )
+
+    second = run_project(typed_empty_project, select="raw_invoices")[0]
+
+    assert second.rows_written == 1
+    types = _table_types(typed_empty_project, "raw_invoices")
+    assert types["invoice_id"] == "VARCHAR"
+    assert types["total"] == "DOUBLE"
+    assert types["quantity"] == "BIGINT"
+    assert types["paid"] == "BOOLEAN"
+    assert types["event_date"] == "DATE"
+    assert types["event_at"] == "TIMESTAMP WITH TIME ZONE"
+    con = duckdb.connect(
+        str(typed_empty_project / "target" / "dbt_ml.duckdb"), read_only=True
+    )
+    try:
+        row = con.execute(
+            'SELECT invoice_id, total, quantity, paid, note, payload '
+            'FROM "dbt_ml"."dbt_ml"."raw_invoices"'
+        ).fetchone()
+    finally:
+        con.close()
+    assert row == ("INV-1", 19.5, 2, True, "ready", '{"kind": "sample"}')
+
+
+def test_declared_extraction_fields_are_an_exact_projection(
+    typed_empty_project: Path,
+) -> None:
+    model = typed_empty_project / "models" / "raw_invoices.yml"
+    model.write_text(
+        model.read_text().replace(
+            "      options:\n"
+            "        fields: [invoice_id, total, quantity, paid, note, payload, "
+            "event_date, event_at]\n",
+            "      options: {}\n",
+        )
+    )
+    data_dir = typed_empty_project / "data" / "invoices"
+    data_dir.mkdir(parents=True)
+    (data_dir / "one.json").write_text(
+        '{"invoice_id":"INV-1","total":19.5,"quantity":2,"paid":true,'
+        '"note":"ready","payload":{},"event_date":"2026-07-11",'
+        '"event_at":"2026-07-11T12:30:00Z","undeclared":"drop me"}'
+    )
+
+    run_project(typed_empty_project, select="raw_invoices")
+
+    assert "undeclared" not in _table_types(typed_empty_project, "raw_invoices")
 
 
 def test_incremental_flushes_in_chunks(
@@ -159,9 +300,71 @@ def test_full_refresh_uses_staged_path(flushing_project: Path) -> None:
     assert _state_count(flushing_project, "raw_invoices") == 5
 
 
+def test_full_document_failure_preserves_target_and_state(
+    flushing_project: Path,
+) -> None:
+    raw = flushing_project / "models" / "raw_invoices.yml"
+    raw.write_text(
+        raw.read_text().replace("materialization: incremental", "materialization: full")
+    )
+    run_project(flushing_project, select="raw_invoices")
+    before = _table_snapshot(flushing_project, "raw_invoices")
+    assert _state_count(flushing_project, "raw_invoices") == 5
+
+    (flushing_project / "data" / "invoices" / "corrupt.json").write_text("{broken")
+    result = run_project(flushing_project, select="raw_invoices")[0]
+
+    assert result.rows_written == 0
+    assert any("corrupt.json" in error for error in result.errors)
+    assert _table_snapshot(flushing_project, "raw_invoices") == before
+    assert _state_count(flushing_project, "raw_invoices") == 5
+
+
+def test_full_materialization_replaces_state_snapshot(flushing_project: Path) -> None:
+    raw = flushing_project / "models" / "raw_invoices.yml"
+    raw.write_text(
+        raw.read_text().replace("materialization: incremental", "materialization: full")
+    )
+    run_project(flushing_project, select="raw_invoices")
+    removed = next((flushing_project / "data" / "invoices").glob("*.json"))
+    removed.unlink()
+
+    result = run_project(flushing_project, select="raw_invoices")[0]
+
+    assert result.rows_written == 4
+    assert _table_count(flushing_project, "raw_invoices") == 4
+    assert _state_count(flushing_project, "raw_invoices") == 4
+
+
+def test_dynamic_backend_fields_cannot_overwrite_lineage(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    project = tmp_path / "project"
+    shutil.copytree(
+        example_project_dir,
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    model = project / "models" / "raw_invoices.yml"
+    model.write_text(
+        model.read_text().replace(
+            "      options:\n"
+            "        fields: [invoice_id, vendor, issue_date, line_items, total, currency]\n",
+            "      options: {}\n",
+        )
+    )
+    data = project / "data" / "invoices"
+    data.mkdir(parents=True)
+    (data / "hostile.json").write_text('{"document_id": "attacker-controlled"}')
+
+    with pytest.raises(RunError, match="reserved dbt-ml lineage columns"):
+        run_project(project, select="raw_invoices")
+
+
 def test_batch_mode_single_submission_chunked_flushes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     repo = Path(__file__).resolve().parents[1]
     dst = tmp_path / "llm_proj"
     shutil.copytree(
@@ -179,7 +382,10 @@ def test_batch_mode_single_submission_chunked_flushes(
     batch_calls = {"n": 0}
 
     def fake_batch(
-        requests: list[dict[str, Any]], *, poll_seconds: float
+        requests: list[dict[str, Any]],
+        *,
+        poll_seconds: float,
+        api_key_env: str,
     ) -> dict[str, Any]:
         batch_calls["n"] += 1
         out = {}

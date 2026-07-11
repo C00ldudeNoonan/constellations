@@ -89,12 +89,15 @@ class LLMConfig(BaseModel):
 
 
 class TargetConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     # Raw mapping: validated against the adapter's config model at resolve
     # time, once `type:` is known (the adapter registry owns that lookup).
     warehouse: dict[str, Any]
     llm: LLMConfig | None = None
+    # Operator-owned source roots for this target. Keys are source names from
+    # project YAML; values replace SourceConfig.path after target resolution.
+    source_paths: dict[str, str] = Field(default_factory=dict, alias="source-paths")
 
 
 class ProfileConfig(BaseModel):

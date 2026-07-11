@@ -11,7 +11,7 @@ from typing import Any
 from .config import load_project
 from .config.model import ModelConfig
 from .dag import ProjectDAG, parse_ref
-from .profile import ProfileError, resolve_profile
+from .profile import ProfileError, apply_source_path_overrides, resolve_profile
 from .runner import ModelRunResult
 from .versioning import compute_code_version
 
@@ -30,6 +30,7 @@ def build_manifest(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    sources = apply_source_path_overrides(sources, resolved)
     dag = ProjectDAG(sources, models)
 
     return {
@@ -158,6 +159,7 @@ def build_run_results(
             "success": len(results) - n_error,
             "error": n_error,
             "skipped": len(skipped),
+            "warnings": sum(sum(r.warnings.values()) for r in results),
         },
     }
     return {"metadata": metadata, "results": result_rows}

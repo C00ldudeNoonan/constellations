@@ -251,6 +251,8 @@ my_project:
         type: duckdb
         path: ./target/dbt_ml.duckdb
         schema: my_project
+      source_paths:
+        filings: ./data/dev/filings
       llm:
         provider: anthropic
         model: claude-haiku-4-5
@@ -265,6 +267,8 @@ my_project:
         type: duckdb
         path: "{{ env_var('DBT_ML_PROD_DB', '/data/prod/dbt_ml.duckdb') }}"
         schema: my_project_prod
+      source_paths:
+        filings: "{{ env_var('DBT_ML_FILINGS_ROOT', '/data/prod/filings') }}"
       llm:
         model: claude-sonnet-4-6
         cache_path: /data/prod/llm_cache.duckdb
@@ -324,6 +328,11 @@ An unset interpolated variable with no default is a load-time error. Each
 `warehouse:` block is validated against the config schema of the adapter named
 by `type:`; unknown types and typo'd fields fail at resolve time with the
 adapter named.
+Use target-level `source_paths:` when the same source should read from
+different local roots or `gs://` prefixes in dev/staging/prod. Keys are source
+names from project YAML; values replace only `source.path`, leaving
+`document_id` and incremental identity based on the source-relative object path
+and content/generation hash.
 
 ## GCS sources
 
@@ -429,10 +438,36 @@ Structure-preserving options for document parsing:
   materialization: incremental
 ```
 
-`sections` entries are `{level, heading, char_start, anchor?}`; `tables`
-are `{index, char_start, n_rows, n_cols, cells}`. Domain-specific logic
-(section taxonomy, speaker parsing) belongs in a transform layered after
-extraction — the backends stay generic.
+`sections` entries are `{level, heading, char_start, source, anchor?}`;
+`tables` are `{index, char_start, n_rows, n_cols, cells}`. Domain-specific
+logic (section taxonomy, speaker parsing) belongs in a transform layered
+after extraction — the backends stay generic.
+
+By default `sections` only sees semantic `<h1>`–`<h6>` tags
+(`source: "tag"`). Corpora that style their headings instead — SEC
+inline-XBRL filings render headings as bold `<div>`/`<span>` blocks — need
+one of the opt-in detectors:
+
+```yaml
+- name: raw_filings
+  source: ref('filing_html')
+  extraction:
+    backend: html
+    options:
+      include_structure: true
+      styled_headings: true      # heuristic: short, fully-bold leaf blocks
+      heading_selectors:         # and/or explicit CSS selectors
+        - "div.doc-title"        # matches become level 1
+        - "div[id^='item']"      # matches become level 2, and so on
+  materialization: incremental
+```
+
+`styled_headings` treats a leaf block element whose text is short and
+entirely bold as a heading, ranking levels by font size (largest = level 1);
+entries carry `source: "style"`. `heading_selectors` names headings
+explicitly (`source: "selector"`), with selector order setting the level;
+its matches win over the heuristic, and semantic heading tags always work.
+A selector that matches nothing logs a warning on the run.
 
 ### Streaming large corpora
 

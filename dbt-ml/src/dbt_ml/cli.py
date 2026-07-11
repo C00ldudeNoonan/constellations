@@ -22,8 +22,20 @@ from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
 from .paths import resolve_within_project
-from .profile import ProfileError, resolve_llm_options, resolve_profile
-from .runner import BuildResult, RunError, build_project, clean_project, run_project
+from .profile import (
+    ProfileError,
+    apply_source_path_overrides,
+    resolve_llm_options,
+    resolve_profile,
+)
+from .runner import (
+    BuildResult,
+    ModelRunResult,
+    RunError,
+    build_project,
+    clean_project,
+    run_project,
+)
 from .sources import SourceError
 from .synth import (
     generate_arxiv_papers,
@@ -296,8 +308,24 @@ def seed(
     html → product_pages, llm → invoice_texts.
     """
     project_dir: Path = ctx.obj["project_dir"]
-    _, sources, models = _load(project_dir)
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    project, sources, models = _load(project_dir)
+    try:
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+        sources = apply_source_path_overrides(sources, resolved)
+    except ProfileError as e:
+        raise ConfigClickError(str(e)) from e
     source = _pick_source(sources, source_name)
+    if _is_remote_source_path(source.path):
+        raise ConfigClickError(
+            f"`dbt-ml seed` only supports local source paths; source "
+            f"'{source.name}' points to remote path '{source.path}'. "
+            "Use a local target source_paths override, or seed remote storage "
+            "outside dbt-ml."
+        )
 
     if data_type:
         seeder = _SEEDERS_BY_TYPE[data_type]
@@ -536,8 +564,7 @@ def run(
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
-        for warning in r.warnings:
-            click.echo(f"  WARNING: {warning}", err=True)
+        _echo_warnings(r)
 
     usage_lines = [
         f"{r.model_name:<22}{_usage_summary(r.metrics)}"
@@ -551,6 +578,24 @@ def run(
 
     if any(r.errors for r in results):
         ctx.exit(1)
+
+
+_MAX_WARNING_LINES = 5
+
+
+def _echo_warnings(r: ModelRunResult) -> None:
+    """Backend warnings under the model's summary row, capped so a corpus-wide
+    papercut (one warning per document) can't flood the terminal. The full set
+    is always in run_results.json. Warnings never change the exit code."""
+    shown = list(r.warnings.items())[:_MAX_WARNING_LINES]
+    for message, count in shown:
+        suffix = f" ({count} documents)" if count > 1 else ""
+        click.echo(f"  WARNING: {message}{suffix}", err=True)
+    hidden = len(r.warnings) - len(shown)
+    if hidden > 0:
+        click.echo(
+            f"  ... {hidden} more distinct warnings (see run_results.json)", err=True
+        )
 
 
 def _usage_summary(m: dict[str, object]) -> str:
@@ -678,8 +723,7 @@ def _echo_build(result: BuildResult) -> None:
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
-        for warning in r.warnings:
-            click.echo(f"  WARNING: {warning}", err=True)
+        _echo_warnings(r)
     for name in result.skipped:
         click.echo(f"{name:<22}{'-':<12}{'-':>8}{'-':>10}  SKIPPED (upstream failed)")
 
@@ -882,9 +926,13 @@ def source() -> None:
 def source_freshness(ctx: click.Context) -> None:
     """Check source freshness against configured warn/error thresholds."""
     project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
     try:
-        results = check_freshness(project_dir)
-    except ConfigError as e:
+        results = check_freshness(
+            project_dir, target=target, profiles_dir=profiles_dir
+        )
+    except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
     except SourceError as e:
         raise click.ClickException(str(e)) from e
@@ -965,9 +1013,13 @@ def _run_watch(
     try:
         dag = validate_project_contract(project, sources, models, project_dir)
         selected = dag.select_models(select=select, exclude=exclude)
-    except (ConfigError, SelectionError) as e:
+        required_sources = set(dag.required_sources(selected))
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+        sources = apply_source_path_overrides(sources, resolved)
+    except (ConfigError, SelectionError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
-    required_sources = set(dag.required_sources(selected))
     watch_paths = []
     for s in sources:
         if s.name not in required_sources:
@@ -1036,6 +1088,10 @@ def _backend_for_source(source: SourceConfig, models: list[ModelConfig]) -> str:
         ):
             return model.extraction.backend or "json"
     return "json"
+
+
+def _is_remote_source_path(path: str) -> bool:
+    return path.startswith("gs://")
 
 
 def _pick_source(sources: list[SourceConfig], name: str | None) -> SourceConfig:

@@ -75,6 +75,26 @@
 - `dbt-ml clean` preserves the local DuckDB warehouse; use an explicitly
   scoped administrative workflow when warehouse relations must be dropped.
 
+### Extraction (issue #108)
+
+- html backend: two opt-in heading detectors for corpora that style headings
+  instead of using `<h1>`–`<h6>` (SEC inline-XBRL filings):
+  `styled_headings: true` heuristically treats short, fully-bold leaf blocks
+  as headings with levels ranked by font size, and `heading_selectors:`
+  accepts explicit CSS selectors with selector order setting the level.
+- `sections` entries now carry a `source` field: `"tag"`, `"selector"`, or
+  `"style"`. Both detectors are off by default; existing extractions are
+  unaffected.
+
+### Observability
+
+- Backend extraction warnings (missing json fields, empty pdf pages, html
+  selectors matching nothing) are no longer dropped: the runner aggregates
+  them per model as distinct message → document count, `dbt-ml run`/`build`
+  print a WARNING section under each model (capped at 5 distinct messages),
+  and `run_results.json` carries the full counts per model plus a run-level
+  `counts.warnings` total. Warnings never change the exit code.
+
 ## v0.2.7 - 2026-07-10
 
 ### Security (issue #65)

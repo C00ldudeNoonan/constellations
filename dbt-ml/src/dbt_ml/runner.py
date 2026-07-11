@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -30,7 +31,12 @@ from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
 from .paths import resolve_within_project
-from .profile import ResolvedProfile, resolve_llm_options, resolve_profile
+from .profile import (
+    ResolvedProfile,
+    apply_source_path_overrides,
+    resolve_llm_options,
+    resolve_profile,
+)
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import TransformContext, load_transform, transform_call_arity
 from .versioning import compute_code_version
@@ -192,7 +198,9 @@ class ModelRunResult:
     rows_written: int = 0
     duration_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    # Non-fatal backend warnings, aggregated: distinct message -> number of
+    # documents that raised it. Never affects status or exit code.
+    warnings: dict[str, int] = field(default_factory=dict)
     artifact_path: str | None = None
     artifact_version: str | None = None
     training_input: dict[str, Any] | None = None
@@ -223,6 +231,7 @@ def run_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
     )
@@ -276,6 +285,7 @@ def build_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
     )
@@ -509,12 +519,12 @@ def _run_extraction_model(
     use_full = model.materialization == "full" or full_refresh
 
     errors: list[str] = []
-    warnings: list[str] = []
+    warning_counts: Counter[str] = Counter()
     if not docs:
-        warnings.append(
+        warning_counts[
             f"Source '{source_name}' matched zero documents; verify its path and "
             "file_pattern."
-        )
+        ] += 1
     usage_totals: dict[str, Any] = {}
     full_state_records: list[tuple[str, str, str]] = []
     full_committed = False
@@ -534,12 +544,10 @@ def _run_extraction_model(
             if err is not None or result is None:
                 errors.append(f"{doc.relative_path}: {err}")
                 continue
+            warning_counts.update(set(result.warnings))
             for key, value in result.metrics.items():
                 if isinstance(value, int | float):
                     usage_totals[key] = usage_totals.get(key, 0) + value
-            warnings.extend(
-                f"{doc.relative_path}: {warning}" for warning in result.warnings
-            )
             chunk_rows.append(
                 _row_for_extraction(
                     doc,
@@ -700,7 +708,7 @@ def _run_extraction_model(
         documents_deleted=deleted,
         rows_written=rows_written,
         errors=errors,
-        warnings=warnings,
+        warnings=dict(warning_counts),
         metrics=usage_totals,
     )
 

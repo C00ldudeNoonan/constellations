@@ -322,10 +322,10 @@ def test_zero_match_model_creates_testable_typed_relation(
 ) -> None:
     run_result = run_project(fresh_project, select="raw_invoices")
     assert run_result[0].rows_written == 0
-    assert run_result[0].warnings == [
+    assert run_result[0].warnings == {
         "Source 'vendor_invoices' matched zero documents; verify its path and "
-        "file_pattern."
-    ]
+        "file_pattern.": 1
+    }
 
     results = run_project_tests(fresh_project, select="raw_invoices")
 

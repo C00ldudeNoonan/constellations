@@ -355,6 +355,58 @@ def test_seed_allows_external_source_with_flag(escaping_project: Path) -> None:
 # ─── ml.artifact.path ────────────────────────────────────────────────────────
 
 
+def test_seed_uses_profile_trusted_source_path_override(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    dst = tmp_path / "project"
+    shutil.copytree(
+        example_project_dir,
+        dst,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    outside = tmp_path / "operator_seed_data"
+    profiles = dst / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text()
+        + f"      source_paths:\n        vendor_invoices: {outside.as_posix()}\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--project-dir", str(dst), "--target", "dev", "seed", "--count", "2"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(list(outside.glob("*.json"))) == 2
+    assert not (dst / "data" / "invoices").exists()
+
+
+def test_seed_rejects_remote_profile_source_path_override(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    dst = tmp_path / "project"
+    shutil.copytree(
+        example_project_dir,
+        dst,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    profiles = dst / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text()
+        + "      source_paths:\n        vendor_invoices: gs://bucket/prod/invoices\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--project-dir", str(dst), "--target", "dev", "seed", "--count", "2"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "only supports local source paths" in result.output
+    assert "gs://bucket/prod/invoices" in result.output
+    assert not (dst / "gs:").exists()
+
+
 def _ml(path: str, external: bool = False) -> MLConfig:
     return MLConfig(
         task="features",

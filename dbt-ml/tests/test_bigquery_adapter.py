@@ -476,13 +476,36 @@ def test_materialize_full_applies_layout_and_recreates() -> None:
     df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
     adapter.materialize_full("docs", df, options=opts)
 
-    # dropped first: a load job cannot change an existing table's layout
-    assert client.dropped == ["proj.ds.docs"]
-    _, _, job_config = client.loads[0]
+    # Replacement is staged with the layout (validating it), THEN the target
+    # drops and the staging table renames in — a bad layout never destroys
+    # the last good table.
+    _, staging_id, job_config = client.loads[0]
+    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
     assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
     assert job_config.time_partitioning.type_ == "DAY"
     assert job_config.time_partitioning.field == "filing_date"
     assert job_config.clustering_fields == ["cik"]
+    assert client.dropped == ["proj.ds.docs"]
+    rename_sql = client.queries[-1][0]
+    staging_table = staging_id.removeprefix("proj.ds.")
+    assert rename_sql == (
+        f"ALTER TABLE `proj`.`ds`.`{staging_table}` RENAME TO `docs`"
+    )
+
+
+def test_materialize_full_bad_layout_keeps_target() -> None:
+    class _FailingLoadClient(_FakeClient):
+        def load_table_from_file(self, fobj: Any, table_id: str, job_config: Any = None) -> Any:
+            raise RuntimeError("partition column type mismatch")
+
+    client = _FailingLoadClient()
+    adapter = _adapter(client)
+    opts = _parse_options({"partition_by": {"field": "no_such_column"}})
+    with pytest.raises(RuntimeError, match="mismatch"):
+        adapter.materialize_full(
+            "docs", pl.DataFrame({"document_id": ["a"]}), options=opts
+        )
+    assert "proj.ds.docs" not in client.dropped  # last good table survives
 
 
 def test_materialize_full_without_options_keeps_plain_truncate() -> None:
@@ -546,14 +569,231 @@ def test_full_chunks_ctas_carries_partition_and_cluster_clauses() -> None:
         options=opts,
     )
     assert total == 1
-    swap_sql = client.queries[0][0]
+    create_sql = client.queries[0][0]
+    # the replacement is created (validating the layout) before any drop
+    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
     assert (
-        "CREATE OR REPLACE TABLE `proj`.`ds`.`docs` "
         "PARTITION BY DATE_TRUNC(`filing_date`, MONTH) "
-        "CLUSTER BY `cik`, `form_type` AS SELECT" in swap_sql
+        "CLUSTER BY `cik`, `form_type` AS SELECT" in create_sql
     )
-    # target dropped before the swap so the new layout can apply
     assert client.dropped[0] == "proj.ds.docs"
+    assert "RENAME TO `docs`" in client.queries[1][0]
+
+
+def test_full_chunks_bad_layout_keeps_target() -> None:
+    client = _FakeClient()
+    client.query_results = [_FailingJob()]  # replacement CTAS rejected
+    adapter = _adapter(client)
+    opts = _parse_options({"cluster_by": ["no_such_column"]})
+    with pytest.raises(RuntimeError, match="simulated"):
+        adapter.materialize_full_chunks(
+            "docs", iter([pl.DataFrame({"document_id": ["a"]})]), options=opts
+        )
+    assert "proj.ds.docs" not in client.dropped  # last good table survives
+    # both staging tables are cleaned up
+    assert all(d.startswith("proj.ds.dbt_ml_staging__docs__") for d in client.dropped)
+    assert len(client.dropped) == 2
+
+
+def test_table_options_require_partitioning_where_relevant() -> None:
+    with pytest.raises(AdapterError, match="require_partition_filter"):
+        _parse_options({"require_partition_filter": True})
+    with pytest.raises(AdapterError, match="partition_expiration_days"):
+        _parse_options({"partition_expiration_days": 30})
+
+
+def test_labels_validated_client_side() -> None:
+    with pytest.raises(AdapterError, match="label key"):
+        _parse_options({"labels": {"Team": "econ"}})
+    with pytest.raises(AdapterError, match="label value"):
+        _parse_options({"labels": {"team": "Econ!"}})
+    assert _parse_options({"labels": {"team": "econ"}}).labels == {"team": "econ"}
+
+
+def test_materialize_full_applies_table_options_and_kms() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "partition_by": {"field": "filing_date"},
+            "require_partition_filter": True,
+            "partition_expiration_days": 90,
+            "hours_to_expiration": 48,
+            "labels": {"team": "econ", "env": "prod"},
+            "kms_key_name": "projects/p/locations/us/keyRings/r/cryptoKeys/k",
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_full("docs", df, options=opts)
+
+    _, _, job_config = client.loads[0]
+    assert job_config.destination_encryption_configuration.kms_key_name == (
+        "projects/p/locations/us/keyRings/r/cryptoKeys/k"
+    )
+    assert job_config.labels == {"team": "econ", "env": "prod"}
+
+    alter_sql, alter_config = client.queries[0]
+    # options are configured on the staging replacement before the swap
+    assert alter_sql.startswith("ALTER TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
+    assert " SET OPTIONS (" in alter_sql
+    assert "require_partition_filter = TRUE" in alter_sql
+    assert "partition_expiration_days = 90" in alter_sql
+    assert (
+        "expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+        "INTERVAL 48 HOUR)" in alter_sql
+    )
+    assert "labels = [('env', 'prod'), ('team', 'econ')]" in alter_sql
+    assert "kms_key_name" not in alter_sql  # set at create, never re-keyed
+    assert alter_config.labels == {"team": "econ", "env": "prod"}
+
+
+def test_incremental_create_applies_post_create_options() -> None:
+    client = _FakeClient()  # get_table -> NotFound
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {"partition_by": {"field": "filing_date"}, "require_partition_filter": True}
+    )
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_incremental("docs", df, key_col="document_id", options=opts)
+    alter_sql, _ = client.queries[0]
+    assert alter_sql.startswith("ALTER TABLE")
+    assert "require_partition_filter = TRUE" in alter_sql
+
+
+def test_full_chunks_ctas_carries_options_clause() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "partition_by": {"field": "filing_date"},
+            "labels": {"team": "econ"},
+            "kms_key_name": "projects/p/locations/us/keyRings/r/cryptoKeys/k",
+        }
+    )
+    adapter.materialize_full_chunks(
+        "docs",
+        iter([pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})]),
+        options=opts,
+    )
+    swap_sql = client.queries[0][0]
+    assert "PARTITION BY `filing_date` OPTIONS (" in swap_sql
+    assert "labels = [('team', 'econ')]" in swap_sql
+    assert (
+        "kms_key_name = 'projects/p/locations/us/keyRings/r/cryptoKeys/k'"
+        in swap_sql
+    )
+    # labels also ride the load + swap jobs
+    assert client.loads[0][2].labels == {"team": "econ"}
+    assert client.queries[0][1].labels == {"team": "econ"}
+
+
+# ─── incremental_strategy: insert_overwrite ──────────────────────────────────
+
+
+def test_insert_overwrite_requires_time_partitioning() -> None:
+    with pytest.raises(AdapterError, match="requires"):
+        _parse_options({"incremental_strategy": "insert_overwrite"})
+    with pytest.raises(AdapterError, match="field"):
+        _parse_options(
+            {
+                "incremental_strategy": "insert_overwrite",
+                "partition_by": {"data_type": "timestamp"},  # ingestion-time
+            }
+        )
+    with pytest.raises(AdapterError, match="time"):
+        _parse_options(
+            {
+                "incremental_strategy": "insert_overwrite",
+                "partition_by": {
+                    "field": "n",
+                    "data_type": "int64",
+                    "range": {"start": 0, "end": 10, "interval": 1},
+                },
+            }
+        )
+
+
+def test_insert_overwrite_replaces_partitions_via_script() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "incremental_strategy": "insert_overwrite",
+            "partition_by": {"field": "filing_date"},
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_incremental("docs", df, key_col="document_id", options=opts)
+
+    script, _ = client.queries[0]
+    assert "DECLARE dbt_ml_partitions ARRAY<DATE>;" in script
+    assert (
+        "SET dbt_ml_partitions = ARRAY(SELECT DISTINCT `filing_date` FROM"
+        in script
+    )
+    assert "WHERE `filing_date` IS NOT NULL" in script
+    assert "USING" in script and "ON FALSE" in script
+    assert (
+        "WHEN NOT MATCHED BY SOURCE AND target.`filing_date` "
+        "IN UNNEST(dbt_ml_partitions) THEN DELETE" in script
+    )
+    assert "WHEN NOT MATCHED THEN INSERT (`document_id`, `filing_date`)" in script
+    assert "WHEN MATCHED THEN UPDATE" not in script
+    assert len(client.dropped) == 1  # staging cleanup
+
+
+def test_insert_overwrite_monthly_truncates_partition_identity() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "ts"]
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "incremental_strategy": "insert_overwrite",
+            "partition_by": {
+                "field": "ts",
+                "data_type": "timestamp",
+                "granularity": "month",
+            },
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "ts": ["2026-01-01T00:00:00Z"]})
+    adapter.materialize_incremental("docs", df, key_col="document_id", options=opts)
+    script, _ = client.queries[0]
+    assert "ARRAY<TIMESTAMP>" in script
+    assert "SELECT DISTINCT TIMESTAMP_TRUNC(`ts`, MONTH)" in script
+    assert "TIMESTAMP_TRUNC(target.`ts`, MONTH) IN UNNEST" in script
+
+
+def test_insert_overwrite_needs_partition_column_in_batch() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "incremental_strategy": "insert_overwrite",
+            "partition_by": {"field": "filing_date"},
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "x": [1]})
+    with pytest.raises(AdapterError, match="filing_date"):
+        adapter.materialize_incremental(
+            "docs", df, key_col="document_id", options=opts
+        )
+    assert client.loads == []  # rejected before staging anything
+
+
+def test_merge_stays_default_with_table_options() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    adapter = _adapter(client)
+    opts = _parse_options({"labels": {"team": "econ"}})
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_incremental("docs", df, key_col="document_id", options=opts)
+    sql, query_config = client.queries[0]
+    assert sql.startswith("MERGE")
+    assert "WHEN MATCHED THEN UPDATE SET" in sql
+    assert query_config.labels == {"team": "econ"}
 
 
 def test_duckdb_ignores_warehouse_options(tmp_path: Path) -> None:

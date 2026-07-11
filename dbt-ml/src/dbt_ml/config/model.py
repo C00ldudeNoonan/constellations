@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -14,8 +17,110 @@ from pydantic import (
 
 from .identifiers import validate_node_name
 
+_STRICT_CONFIG = ConfigDict(extra="forbid")
+
+INTERNAL_LINEAGE_FIELDS = frozenset(
+    {
+        "document_id",
+        "source_path",
+        "source_uri",
+        "source_metadata",
+        "content_hash",
+        "code_version",
+        "backend_name",
+        "backend_version",
+        "extracted_at",
+    }
+)
+
+_LLM_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
+    "max_tokens": (1, 65_536),
+    "max_retries": (0, 20),
+    "max_concurrent": (1, 100),
+}
+_LLM_NUMBER_BOUNDS: dict[str, tuple[float, float]] = {
+    "temperature": (0.0, 1.0),
+    "batch_poll_seconds": (0.1, 3600.0),
+}
+
+
+def validate_llm_numeric_options(options: Mapping[str, Any]) -> None:
+    for name, (minimum, maximum) in _LLM_INTEGER_BOUNDS.items():
+        if name not in options:
+            continue
+        value = options[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"llm option '{name}' must be an integer between "
+                f"{minimum} and {maximum}"
+            )
+        if not minimum <= value <= maximum:
+            raise ValueError(
+                f"llm option '{name}' must be between {minimum} and {maximum}; "
+                f"got {value}"
+            )
+
+    for number_name, (number_minimum, number_maximum) in _LLM_NUMBER_BOUNDS.items():
+        if number_name not in options:
+            continue
+        value = options[number_name]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(
+                f"llm option '{number_name}' must be a number between "
+                f"{number_minimum} and {number_maximum}"
+            )
+        numeric = float(value)
+        if (
+            not math.isfinite(numeric)
+            or not number_minimum <= numeric <= number_maximum
+        ):
+            raise ValueError(
+                f"llm option '{number_name}' must be between "
+                f"{number_minimum} and {number_maximum}; got {value}"
+            )
+
+
+def _configured_extraction_field_names(options: Mapping[str, Any]) -> set[str]:
+    names: set[str] = set()
+    fields = options.get("fields")
+    if isinstance(fields, list):
+        for field in fields:
+            if isinstance(field, str):
+                names.add(field)
+            elif isinstance(field, dict) and isinstance(field.get("name"), str):
+                names.add(field["name"])
+
+    frontmatter_fields = options.get("frontmatter_fields")
+    if isinstance(frontmatter_fields, list):
+        names.update(field for field in frontmatter_fields if isinstance(field, str))
+
+    for option in ("text_field", "body_field"):
+        value = options.get(option)
+        if isinstance(value, str):
+            names.add(value)
+
+    selectors = options.get("selectors")
+    if isinstance(selectors, dict):
+        names.update(name for name in selectors if isinstance(name, str))
+    return names
+
+
+def validate_extraction_field_names(options: Mapping[str, Any]) -> None:
+    conflicts = sorted(
+        name
+        for name in _configured_extraction_field_names(options)
+        if name.casefold() in INTERNAL_LINEAGE_FIELDS
+    )
+    if conflicts:
+        raise ValueError(
+            "extraction fields collide with reserved dbt-ml lineage columns: "
+            f"{', '.join(conflicts)}"
+        )
+
 
 class ExtractionConfig(BaseModel):
+    model_config = _STRICT_CONFIG
+
     backend: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     # Rows flush to the warehouse every N documents (issue #77) — bounds
@@ -23,8 +128,22 @@ class ExtractionConfig(BaseModel):
     # from code_version: it changes execution, never output content.
     flush_every: int = Field(default=5000, gt=0)
 
+    @field_validator("options")
+    @classmethod
+    def _validate_options(cls, options: dict[str, Any]) -> dict[str, Any]:
+        if "api_key_env" in options:
+            raise ValueError(
+                "llm option 'api_key_env' is operator-owned configuration; "
+                "set it under `llm:` in profiles.yml, not in model extraction options"
+            )
+        validate_extraction_field_names(options)
+        validate_llm_numeric_options(options)
+        return options
+
 
 class TransformConfig(BaseModel):
+    model_config = _STRICT_CONFIG
+
     type: str
     module: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
@@ -41,6 +160,8 @@ class ChunkConfig(BaseModel):
     chunk_overlap: overlap carried between adjacent chunks, same unit.
     encoding:      tiktoken encoding name for the tokens strategy.
     """
+
+    model_config = _STRICT_CONFIG
 
     strategy: Literal["recursive", "tokens"] = "recursive"
     text_field: str = "text"
@@ -61,6 +182,8 @@ class ChunkConfig(BaseModel):
 
 
 class MLArtifactConfig(BaseModel):
+    model_config = _STRICT_CONFIG
+
     path: Path | None = None
     include_metrics: bool = True
     # Opt-in for an artifact location outside the project directory
@@ -73,6 +196,8 @@ class MLArtifactConfig(BaseModel):
 
 
 class MLConfig(BaseModel):
+    model_config = _STRICT_CONFIG
+
     task: Literal[
         "features",
         "classifier",
@@ -91,12 +216,46 @@ class MLConfig(BaseModel):
 
 
 class FieldConfig(BaseModel):
+    model_config = _STRICT_CONFIG
+
     name: str
     description: str | None = None
+    data_type: Literal[
+        "string", "integer", "float", "boolean", "date", "timestamp", "json"
+    ] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("data_type", "data-type", "type", "dtype"),
+    )
+
+    @field_validator("data_type", mode="before")
+    @classmethod
+    def _normalize_data_type(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        aliases = {
+            "str": "string",
+            "text": "string",
+            "varchar": "string",
+            "int": "integer",
+            "int64": "integer",
+            "bigint": "integer",
+            "number": "float",
+            "double": "float",
+            "float64": "float",
+            "decimal": "float",
+            "bool": "boolean",
+            "datetime": "timestamp",
+            "datetime64": "timestamp",
+            "object": "json",
+            "array": "json",
+            "struct": "json",
+        }
+        return aliases.get(normalized, normalized)
 
 
 class ModelConfig(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     name: str
     description: str | None = None
@@ -146,7 +305,9 @@ class ModelConfig(BaseModel):
 
 
 class ModelFile(BaseModel):
-    version: int = 2
+    model_config = _STRICT_CONFIG
+
+    version: Literal[2] = 2
     models: list[ModelConfig]
 
     @model_validator(mode="after")

@@ -9,7 +9,9 @@ document the runner decided to process.
 
 Auth is Application Default Credentials — `gcloud auth application-default
 login` locally, or GOOGLE_APPLICATION_CREDENTIALS pointing at a
-service-account JSON in CI. google-cloud-storage ships as the `gcs` extra.
+service-account JSON in CI. Set `project:` on the source or
+GOOGLE_CLOUD_PROJECT when ADC cannot infer a project. google-cloud-storage
+ships as the `gcs` extra.
 
 Listing is bounded by `max_objects` on the source (default 5000) so a typo'd
 prefix cannot silently crawl a whole bucket.
@@ -17,9 +19,11 @@ prefix cannot silently crawl a whole bucket.
 from __future__ import annotations
 
 import fnmatch
+import importlib
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..config.loader import ConfigError
 from ..config.source import SourceConfig
 from ..versioning import compute_document_id
 from .base import DocumentRef, DocumentSource, SourceError, SourceScan
@@ -32,10 +36,9 @@ _INSTALL_HINT = (
 
 def _storage() -> Any:
     try:
-        from google.cloud import storage  # type: ignore[attr-defined]
+        return importlib.import_module("google.cloud.storage")
     except ImportError as e:
         raise SourceError(_INSTALL_HINT) from e
-    return storage
 
 
 def parse_gcs_path(path: str) -> tuple[str, str]:
@@ -69,13 +72,29 @@ class GCSDocumentSource(DocumentSource):
     def __init__(self) -> None:
         self._client: Any = None
 
-    def _get_client(self) -> Any:
+    def _get_client(self, project: str | None = None) -> Any:
         if self._client is None:
-            self._client = self._make_client()
+            self._client = self._make_client(project)
         return self._client
 
-    def _make_client(self) -> Any:
-        return _storage().Client()
+    def _make_client(self, project: str | None = None) -> Any:
+        storage = _storage()
+        from google.auth.exceptions import DefaultCredentialsError
+
+        try:
+            return storage.Client(project=project)
+        except DefaultCredentialsError as e:
+            raise ConfigError(
+                "GCS Application Default Credentials were not found or are invalid. "
+                "Run `gcloud auth application-default login` locally, or set "
+                "GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON file."
+            ) from e
+        except OSError as e:
+            raise ConfigError(
+                "The Google Cloud project for the GCS source could not be determined. "
+                "Set `project:` on the source or set GOOGLE_CLOUD_PROJECT. User "
+                "Application Default Credentials may not include a default project."
+            ) from e
 
     def discover(self, source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
         bucket_name, prefix = parse_gcs_path(source.path)
@@ -84,7 +103,7 @@ class GCSDocumentSource(DocumentSource):
         # to a trailing slash keeps sibling prefixes out.
         list_prefix = f"{prefix.rstrip('/')}/" if prefix else ""
         listed = list(
-            self._get_client().list_blobs(
+            self._get_client(source.project).list_blobs(
                 bucket_name,
                 prefix=list_prefix or None,
                 max_results=source.max_objects + 1,
@@ -118,6 +137,7 @@ class GCSDocumentSource(DocumentSource):
                 "md5_hash": getattr(blob, "md5_hash", None),
                 "crc32c": getattr(blob, "crc32c", None),
                 "etag": getattr(blob, "etag", None),
+                "project": source.project,
             }
             refs.append(
                 DocumentRef(
@@ -136,7 +156,7 @@ class GCSDocumentSource(DocumentSource):
     def fetch(self, ref: DocumentRef, work_dir: Path) -> Path:
         assert ref.source_metadata is not None
         meta = ref.source_metadata
-        bucket = self._get_client().bucket(meta["bucket"])
+        bucket = self._get_client(meta.get("project")).bucket(meta["bucket"])
         # Pin the listed generation: a concurrent rewrite between discovery
         # and fetch yields the listed bytes, not silently newer ones.
         blob = bucket.blob(meta["name"], generation=meta.get("generation"))

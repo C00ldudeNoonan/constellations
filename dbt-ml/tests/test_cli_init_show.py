@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 from pathlib import Path
 
+import click
+import pytest
 from click.testing import CliRunner
 
 from dbt_ml.cli import _safe_console_text, cli
@@ -187,6 +190,40 @@ def test_show_output_is_safe_for_strict_cp1252_console() -> None:
     safe.encode("cp1252", errors="strict")
     assert safe != text
     assert "shape: (1, 1)" in safe
+
+
+def test_show_output_is_safe_when_console_wrapper_reports_replace() -> None:
+    class ReplacingCp1252Stream:
+        encoding = "cp1252"
+        errors = "replace"
+
+    text = "shape: (1, 1)\n\u250c\u2500\u2500\u2510\n\u6771\u4eac"
+    safe = _safe_console_text(text, ReplacingCp1252Stream())
+
+    safe.encode("cp1252", errors="strict")
+    assert safe != text
+
+
+def test_show_writes_through_same_strict_cp1252_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, example_project_dir: Path
+) -> None:
+    dst = _copy_example(tmp_path, example_project_dir)
+    generate_invoices(1, dst / "data" / "invoices", seed=1)
+    run_project(dst)
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    monkeypatch.setattr(click, "get_text_stream", lambda name: stream)
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(dst), "show", "raw_invoices", "--limit", "1"]
+    )
+
+    stream.flush()
+    rendered = raw.getvalue().decode("cp1252")
+    assert result.exit_code == 0, result.output
+    assert "shape: (1," in rendered
+    assert "\u250c" not in rendered
 
 
 def test_show_missing_db(tmp_path: Path, example_project_dir: Path) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dbt_ml.config.model import ExtractionConfig, TransformConfig
+from dbt_ml.config.model import ExtractionConfig, FieldConfig, TransformConfig
 from dbt_ml.versioning import (
     compute_code_version,
     compute_content_hash,
@@ -45,6 +45,23 @@ def test_code_version_changes_with_config(tmp_path: Path) -> None:
         project_dir=tmp_path,
     )
     assert a != b
+
+
+def test_code_version_changes_with_field_data_type(tmp_path: Path) -> None:
+    cfg = ExtractionConfig(backend="json", options={"fields": ["value"]})
+    integer = compute_code_version(
+        extraction=cfg,
+        transform=None,
+        fields=[FieldConfig(name="value", data_type="integer")],
+        project_dir=tmp_path,
+    )
+    string = compute_code_version(
+        extraction=cfg,
+        transform=None,
+        fields=[FieldConfig(name="value", data_type="string")],
+        project_dir=tmp_path,
+    )
+    assert integer != string
 
 
 def test_code_version_changes_with_module_contents(tmp_path: Path) -> None:

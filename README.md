@@ -5,14 +5,14 @@ models, a dependency DAG, `ref()`, tests, incremental builds, lineage, and a
 manifest artifact — to folders of documents: PDFs, markdown, HTML, JSON,
 email, and free-form text.
 
-If you know dbt, you already know dbt-ml. You declare sources and models in
-YAML; dbt-ml builds the DAG, runs it incrementally, materializes the results to
-your warehouse, runs your tests, and emits artifacts other tools can consume.
+dbt users will recognize the workflow: declare sources and models in YAML,
+build a DAG, materialize incrementally, test the results, and emit artifacts.
+dbt-ml is a standalone CLI rather than a dbt package or dbt adapter.
 
-> **Status: working proof of concept.** Pure Python, DuckDB warehouse today.
-> The warehouse adapter pattern (v0.2.1, merged) opens the path to the
-> dbt-core adapter set — LanceDB, Postgres, Snowflake, BigQuery, Databricks,
-> Redshift. See [`dbt-ml/README.md`](dbt-ml/README.md) for the full reference.
+> **Status: active pure-Python preview.** Shipped capabilities include DuckDB
+> and BigQuery warehouses, local and GCS sources, deterministic chunk models,
+> classic text ML, and six extraction backends. See
+> [`dbt-ml/README.md`](dbt-ml/README.md) for the full reference.
 
 ## What a pipeline looks like
 
@@ -82,14 +82,13 @@ uv run dbt-ml init invoices --template pdf   # scaffold a project
 cd invoices
 uv run dbt-ml run                            # build the DAG into DuckDB
 uv run dbt-ml test                           # run the schema tests
-uv run dbt-ml show extracted_invoices        # peek at the result
+uv run dbt-ml show raw_pdf_text               # peek at the scaffolded result
 ```
 
 ```
-model                 kind        mater.         processed   skipped    rows   time(s)
---------------------------------------------------------------------------------------
-raw_pdf_text          extraction  incremental            5         0       5     0.31
-extracted_invoices    transform   full                   0         0       5     2.10
+model                 kind        mater.         processed   skipped  deleted    rows   time(s)
+-----------------------------------------------------------------------------------------------
+raw_pdf_text          extraction  incremental            5         0        0       5     0.31
 ```
 
 ## Why dbt-ml
@@ -115,13 +114,26 @@ fitting the workflow analytics engineers already use.**
 - **Built-in text/ML preprocessing** — token counting, encoding repair,
   language detection, text statistics, near-duplicate detection (MinHash), and
   PII redaction (Microsoft Presidio).
+- **Warehouse and source adapters** — DuckDB or BigQuery materialization, with
+  local files or generation-pinned GCS objects as source documents.
+- **RAG and classic ML primitives** — deterministic recursive/token chunking;
+  count, TF-IDF, and hashing features; and naive Bayes text classification.
 - **dbt-shaped everything** — `ref()`, `--select` / `--exclude` selectors with
-  `tag:` support, `not_null` / `unique` / `min_rows` / custom-Python tests with
-  warn/error severities, source freshness, profiles with `--target`.
+  `tag:` support, structural and deterministic quality tests, custom-Python
+  tests, warn/error severities, source freshness, and profiles with `--target`.
 - **Artifacts** — `manifest.json`, `run_results.json`, a static docs site, and
-  `emit-dbt-sources` to hand off to a dbt-duckdb project.
+  `emit-dbt-sources` to hand tables to a dbt project using the matching
+  DuckDB or BigQuery adapter.
 - **Composes with dbt** — dbt-ml does the unstructured → structured "E"; dbt
   does the SQL "T", reading dbt-ml's tables as native sources.
+
+## Install
+
+```bash
+uv add dbt-ml
+# Optional cloud integrations:
+uv add 'dbt-ml[bigquery,gcs]'
+```
 
 ## Quickstart
 
@@ -129,15 +141,28 @@ fitting the workflow analytics engineers already use.**
 git clone https://github.com/C00ldudeNoonan/dbt-ml
 cd dbt-ml/dbt-ml
 uv sync
-cd examples/pdf_invoice_pipeline
-uv run dbt-ml seed --count 5      # generate synthetic invoice PDFs
-uv run dbt-ml run
-uv run dbt-ml test
+uv run dbt-ml --project-dir examples/invoice_pipeline seed --count 5
+uv run dbt-ml --project-dir examples/invoice_pipeline run
+uv run dbt-ml --project-dir examples/invoice_pipeline test
 ```
 
-Six runnable examples live in [`dbt-ml/examples/`](dbt-ml/examples/) — invoices,
-blog posts, support tickets (SLA breach detection), PDF → LLM extraction, and a
-dbt-duckdb consumer project.
+Nine runnable projects live in [`dbt-ml/examples/`](dbt-ml/examples/): invoices,
+blog posts, support tickets, arXiv quality checks, PDF-to-LLM extraction, direct
+LLM extraction, RAG chunks, classic text ML, and a dbt consumer project.
+
+## Security model
+
+Only run projects you trust: Python transforms and custom tests execute in the
+dbt-ml process. Project-controlled paths are confined to the project unless an
+explicit `external: true` boundary is supported; local source patterns cannot
+traverse parents or symlinks. Profiles select destinations and credential names
+and must be reviewed as trusted configuration. The LLM backend sends document
+text to Anthropic using the configured environment variable, and the PII
+transform retains non-target input columns unless you explicitly project or
+drop them.
+`dbt-ml clean` removes known local artifacts without resetting a warehouse. See
+the [full security notes](dbt-ml/README.md#security-notes) before running
+third-party projects or sensitive documents.
 
 ## Documentation
 

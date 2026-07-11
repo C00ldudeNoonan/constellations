@@ -8,8 +8,9 @@ import polars as pl
 import pytest
 
 from dbt_ml.adapters import WarehouseAdapter, create_adapter, parse_warehouse_config
-from dbt_ml.checks import run_project_tests
+from dbt_ml.checks import run_model_tests, run_project_tests
 from dbt_ml.checks.schema import TestResult, UnknownTestError, evaluate_test_spec
+from dbt_ml.config.model import ModelConfig
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoices
 
@@ -289,6 +290,48 @@ def test_unknown_severity_raises(populated_db: WarehouseAdapter) -> None:
             table_ref=populated_db.table_ref("items"),
             adapter=populated_db,
         )
+
+
+def test_missing_model_relation_is_a_clean_test_failure(
+    populated_db: WarehouseAdapter,
+) -> None:
+    results = run_model_tests(
+        ModelConfig(name="missing_model", tests=["not_empty"]),
+        populated_db,
+    )
+
+    assert len(results) == 1
+    assert results[0].test_name == "relation_exists"
+    assert results[0].status == "fail"
+    assert results[0].is_hard_failure
+    assert results[0].message == (
+        "Materialized relation for model 'missing_model' is missing. "
+        "Run the model before testing it; a model that matched zero documents "
+        "may not have created a relation."
+    )
+
+
+def test_model_without_tests_does_not_require_a_relation(
+    populated_db: WarehouseAdapter,
+) -> None:
+    assert run_model_tests(ModelConfig(name="missing_model"), populated_db) == []
+
+
+def test_zero_match_model_creates_testable_typed_relation(
+    fresh_project: Path,
+) -> None:
+    run_result = run_project(fresh_project, select="raw_invoices")
+    assert run_result[0].rows_written == 0
+    assert run_result[0].warnings == [
+        "Source 'vendor_invoices' matched zero documents; verify its path and "
+        "file_pattern."
+    ]
+
+    results = run_project_tests(fresh_project, select="raw_invoices")
+
+    assert results
+    assert all(result.status == "pass" for result in results)
+    assert all(result.test_name != "relation_exists" for result in results)
 
 
 def test_end_to_end_passes(fresh_project: Path) -> None:

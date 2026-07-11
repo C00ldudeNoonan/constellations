@@ -8,11 +8,16 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
 import pytest
+from click.testing import CliRunner
+from google.auth.exceptions import DefaultCredentialsError
 
+from dbt_ml.cli import cli
+from dbt_ml.config import ConfigError
 from dbt_ml.config.source import SourceConfig
 from dbt_ml.freshness import check_freshness
 from dbt_ml.runner import run_project
@@ -118,6 +123,41 @@ def test_parse_gcs_path_invalid(bad: str) -> None:
 def test_scheme_routing() -> None:
     assert isinstance(get_document_source("gs://bkt/raw"), GCSDocumentSource)
     assert isinstance(get_document_source("data/invoices"), LocalDocumentSource)
+
+
+def test_explicit_project_is_passed_to_storage_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects: list[str | None] = []
+    client = _FakeStorageClient([_FakeBlob("raw/docs/a.html")])
+
+    def _client(*, project: str | None = None) -> _FakeStorageClient:
+        projects.append(project)
+        return client
+
+    monkeypatch.setattr(
+        "dbt_ml.sources.gcs._storage", lambda: SimpleNamespace(Client=_client)
+    )
+
+    refs = GCSDocumentSource().discover(_cfg(project="econ-prod"), tmp_path)
+
+    assert projects == ["econ-prod"]
+    assert refs[0].source_metadata is not None
+    assert refs[0].source_metadata["project"] == "econ-prod"
+
+
+def test_missing_adc_is_configuration_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _client(*, project: str | None = None) -> None:
+        raise DefaultCredentialsError("credentials unavailable")
+
+    monkeypatch.setattr(
+        "dbt_ml.sources.gcs._storage", lambda: SimpleNamespace(Client=_client)
+    )
+
+    with pytest.raises(ConfigError, match="Application Default Credentials"):
+        GCSDocumentSource().discover(_cfg(), tmp_path)
 
 
 # ─── discovery ──────────────────────────────────────────────────────────────
@@ -281,7 +321,9 @@ def test_incremental_run_against_fake_gcs(
         _json_blob("raw/msft.json", 1, ticker="MSFT", revenue=200),
     ]
     client = _FakeStorageClient(blobs)
-    monkeypatch.setattr(GCSDocumentSource, "_make_client", lambda self: client)
+    monkeypatch.setattr(
+        GCSDocumentSource, "_make_client", lambda self, project=None: client
+    )
 
     results = run_project(gcs_project)
     raw = results[0]
@@ -330,7 +372,9 @@ def test_freshness_for_gcs_source(
     gcs_project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = _FakeStorageClient([_json_blob("raw/acme.json", 1, ticker="ACME")])
-    monkeypatch.setattr(GCSDocumentSource, "_make_client", lambda self: client)
+    monkeypatch.setattr(
+        GCSDocumentSource, "_make_client", lambda self, project=None: client
+    )
 
     results = check_freshness(gcs_project)
     assert results[0].status == "pass"
@@ -346,7 +390,9 @@ def test_freshness_propagates_source_errors(
     client = _FakeStorageClient(
         [_json_blob("raw/a.json", 1), _json_blob("raw/b.json", 1)]
     )
-    monkeypatch.setattr(GCSDocumentSource, "_make_client", lambda self: client)
+    monkeypatch.setattr(
+        GCSDocumentSource, "_make_client", lambda self, project=None: client
+    )
     filings = gcs_project / "sources" / "filings.yml"
     filings.write_text(
         filings.read_text().replace(
@@ -356,6 +402,26 @@ def test_freshness_propagates_source_errors(
     )
     with pytest.raises(SourceError, match="max_objects"):
         check_freshness(gcs_project)
+
+
+def test_missing_gcs_project_is_actionable_exit_2(
+    gcs_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _client(*, project: str | None = None) -> None:
+        raise OSError(
+            "Project was not passed and could not be determined from the environment."
+        )
+
+    monkeypatch.setattr(
+        "dbt_ml.sources.gcs._storage", lambda: SimpleNamespace(Client=_client)
+    )
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(gcs_project), "build"])
+
+    assert result.exit_code == 2, result.output
+    assert "GOOGLE_CLOUD_PROJECT" in result.output
+    assert "project:" in result.output
+    assert "Traceback" not in result.output
 
 
 # ─── optional integration (needs real GCS credentials) ─────────────────────

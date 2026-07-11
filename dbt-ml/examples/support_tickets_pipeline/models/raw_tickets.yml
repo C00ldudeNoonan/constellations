@@ -27,15 +27,31 @@ models:
 
     fields:
       - name: ticket_id
+        data_type: string
       - name: product
+        data_type: string
       - name: priority
+        data_type: string
       - name: status
+        data_type: string
       - name: customer_tier
+        data_type: string
       - name: assigned_team
+        data_type: string
+      - name: customer_name
+        data_type: string
+      - name: customer_email
+        data_type: string
+      - name: summary
+        data_type: string
       - name: created_at
+        data_type: string
       - name: first_response_at
+        data_type: string
       - name: resolved_at
+        data_type: string
       - name: sla_target_hours
+        data_type: float
 
     tags: [raw, tickets]
 

@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config.model import ChunkConfig, ExtractionConfig, MLConfig, TransformConfig
+from .config.model import (
+    ChunkConfig,
+    ExtractionConfig,
+    FieldConfig,
+    MLConfig,
+    TransformConfig,
+)
+from .paths import resolve_within_project
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -25,6 +32,7 @@ def compute_code_version(
     ml: MLConfig | None = None,
     chunk: ChunkConfig | None = None,
     depends_on: list[str] | None = None,
+    fields: list[FieldConfig] | None = None,
     project_dir: Path,
 ) -> str:
     payload: dict[str, Any] = {
@@ -42,6 +50,11 @@ def compute_code_version(
         else None,
         "chunk": chunk.model_dump() if chunk else None,
         "depends_on": depends_on or None,
+        "fields": [
+            {"name": field.name, "data_type": field.data_type} for field in fields
+        ]
+        if fields
+        else None,
     }
     if transform and transform.module:
         module_file = resolve_module_file(transform.module, project_dir)
@@ -58,7 +71,12 @@ def resolve_module_file(module: str, project_dir: Path) -> Path:
     """Resolve a dotted module path (e.g. 'transforms.summarize') to a .py file
     relative to the project directory."""
     parts = module.split(".")
-    return project_dir / Path(*parts).with_suffix(".py")
+    relative_path = Path(*parts).with_suffix(".py")
+    return resolve_within_project(
+        relative_path,
+        project_dir,
+        surface=f"Python module '{module}'",
+    )
 
 
 def _hash_file(path: Path) -> str:

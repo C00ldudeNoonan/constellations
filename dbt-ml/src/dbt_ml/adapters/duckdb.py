@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 import duckdb
 import polars as pl
 
 from ..config.profile import WarehouseConfig
-from .base import AdapterError, WarehouseAdapter
+from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
 from .registry import register
 
 
@@ -128,15 +129,22 @@ class DuckDBAdapter(WarehouseAdapter):
     ) -> int:
         if df.height == 0:
             return 0
+        validate_incremental_keys(df, key_col)
+        existing = self._table_columns(table)
+        if existing is not None and key_col not in existing:
+            raise AdapterError(
+                f"Incremental target '{table}' is missing key column '{key_col}'"
+            )
         full = self.table_ref(table)
         self.connection.register("dbt_ml_staging", df)
         try:
-            self.connection.execute(
-                f"CREATE TABLE IF NOT EXISTS {full} AS "
-                f"SELECT * FROM dbt_ml_staging LIMIT 0"
-            )
-            insert_cols = self._reconcile_schema(table, df, on_schema_change)
-            if key_col in df.columns:
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                self.connection.execute(
+                    f"CREATE TABLE IF NOT EXISTS {full} AS "
+                    f"SELECT * FROM dbt_ml_staging LIMIT 0"
+                )
+                insert_cols = self._reconcile_schema(table, df, on_schema_change)
                 key = self.quote_ident(key_col)
                 self.connection.execute(
                     f"""
@@ -145,10 +153,15 @@ class DuckDBAdapter(WarehouseAdapter):
                     WHERE target.{key} = source.{key}
                     """
                 )
-            col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
-            self.connection.execute(
-                f"INSERT INTO {full} BY NAME SELECT {col_list} FROM dbt_ml_staging"
-            )
+                col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
+                self.connection.execute(
+                    f"INSERT INTO {full} BY NAME SELECT {col_list} FROM dbt_ml_staging"
+                )
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
         finally:
             self.connection.unregister("dbt_ml_staging")
         return df.height
@@ -156,7 +169,7 @@ class DuckDBAdapter(WarehouseAdapter):
     def materialize_full_chunks(
         self, table: str, chunks: Iterable[pl.DataFrame]
     ) -> int:
-        staging = f"dbt_ml_staging__{table}"
+        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
         staging_ref = self.table_ref(staging)
         total = 0
         first = True
@@ -189,29 +202,47 @@ class DuckDBAdapter(WarehouseAdapter):
                 # contract for an empty frame) rather than swap in nothing.
                 self.drop_table(table)
                 return 0
-            self.connection.execute(f"DROP TABLE IF EXISTS {self.table_ref(table)}")
-            self.connection.execute(
-                f"ALTER TABLE {staging_ref} RENAME TO {self.quote_ident(table)}"
-            )
-        except Exception:
-            self.connection.execute(f"DROP TABLE IF EXISTS {staging_ref}")
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                self.connection.execute(
+                    f"DROP TABLE IF EXISTS {self.table_ref(table)}"
+                )
+                self._rename_staging(staging_ref, table)
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
+        except BaseException as error:
+            try:
+                self.connection.execute(f"DROP TABLE IF EXISTS {staging_ref}")
+            except Exception as cleanup_error:
+                error.add_note(f"Failed to clean staging table: {cleanup_error}")
             raise
         return total
+
+    def _rename_staging(self, staging_ref: str, table: str) -> None:
+        self.connection.execute(
+            f"ALTER TABLE {staging_ref} RENAME TO {self.quote_ident(table)}"
+        )
+
+    def _table_columns(self, table: str) -> list[str] | None:
+        rows = self.connection.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
+            "ORDER BY ordinal_position",
+            [self.catalog, self.schema, table],
+        ).fetchall()
+        if not rows:
+            return None
+        return [str(row[0]) for row in rows]
 
     def _reconcile_schema(
         self, table: str, df: pl.DataFrame, on_schema_change: str
     ) -> list[str]:
         """Compare staging columns against the existing table and apply the
         on_schema_change policy. Returns the staging columns to insert."""
-        target_cols = [
-            r[0]
-            for r in self.connection.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
-                "ORDER BY ordinal_position",
-                [self.catalog, self.schema, table],
-            ).fetchall()
-        ]
+        target_cols = self._table_columns(table) or []
         new = [c for c in df.columns if c not in target_cols]
         removed = [c for c in target_cols if c not in df.columns]
         if not new and not removed:
@@ -286,8 +317,8 @@ class DuckDBAdapter(WarehouseAdapter):
     def rows(self, sql: str, params: list[Any] | None = None) -> list[tuple[Any, ...]]:
         return cast(list[tuple[Any, ...]], self.execute(sql, params).fetchall())
 
-    def clean(self) -> str:
-        """Delete the DuckDB file. Closes the connection if open."""
+    def _reset_storage_for_test(self) -> str:
+        """Delete the DuckDB file for isolated adapter integration teardown."""
         if self._con is not None:
             self._close()
         path = self._resolved_path()

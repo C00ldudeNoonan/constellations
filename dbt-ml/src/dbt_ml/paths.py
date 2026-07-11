@@ -8,8 +8,7 @@ could otherwise read, write, or delete anywhere the operator can. Policy:
   `external: true` (sources, ml.artifact) — layout paths and model-level llm
   cache paths have no opt-in.
 - profiles.yml paths (warehouse, llm cache) are trusted operator-local
-  config, like dbt's; `dbt-ml clean` additionally requires --force when the
-  warehouse file lives outside the project directory.
+  config, like dbt's. `dbt-ml clean` does not invoke warehouse cleanup.
 """
 from __future__ import annotations
 

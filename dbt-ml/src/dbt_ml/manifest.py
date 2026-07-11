@@ -115,6 +115,15 @@ def build_run_results(
     target_block = _target_block(project_dir, target=target, profiles_dir=profiles_dir)
     catalog = target_block["catalog"] if target_block else None
     schema = target_block["schema"] if target_block else None
+    _, sources, models = load_project(project_dir)
+    dag = ProjectDAG(sources, models)
+    model_names = {model.name for model in models}
+    considered_models = [
+        name
+        for name in [*(r.model_name for r in results), *skipped]
+        if name in model_names
+    ]
+    sources_considered = dag.required_sources(considered_models)
 
     result_rows: list[dict[str, Any]] = []
     n_error = 0
@@ -143,6 +152,7 @@ def build_run_results(
         "status": overall,
         "elapsed_seconds": elapsed_seconds,
         "target": target_block,
+        "sources_considered": sources_considered,
         "counts": {
             "total": len(results) + len(skipped),
             "success": len(results) - n_error,
@@ -259,6 +269,7 @@ def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
             ml=model.ml,
             chunk=model.chunk,
             depends_on=_code_version_depends_on(model),
+            fields=model.fields,
             project_dir=project_dir,
         ),
     }
@@ -313,6 +324,7 @@ def compute_modified_models(
             transform=model.transform,
             ml=model.ml,
             chunk=model.chunk,
+            fields=model.fields,
             project_dir=project_dir,
         )
         if previous.get(model.name) != current:

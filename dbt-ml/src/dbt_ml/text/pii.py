@@ -36,14 +36,17 @@ class PIIEntity:
     score: float    # 0.0–1.0 Presidio confidence
     text: str       # the substring that was matched
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_text: bool = False) -> dict[str, Any]:
+        """Serialize detection metadata, excluding matched text by default."""
+        result = {
             "type": self.type,
             "start": self.start,
             "end": self.end,
             "score": round(self.score, 4),
-            "text": self.text,
         }
+        if include_text:
+            result["text"] = self.text
+        return result
 
 
 @functools.lru_cache(maxsize=1)

@@ -22,7 +22,12 @@ import yaml
 from pydantic import ValidationError
 
 from .adapters import AdapterError, parse_warehouse_config
-from .config.profile import LLMConfig, ProfileConfig, WarehouseConfig
+from .config.profile import (
+    DEFAULT_LLM_API_KEY_ENV,
+    LLMConfig,
+    ProfileConfig,
+    WarehouseConfig,
+)
 from .config.project import ProjectConfig
 
 PROFILES_FILENAME = "profiles.yml"
@@ -146,18 +151,34 @@ def _legacy_env_dir() -> str | None:
 def _discover_profiles_file(
     project_dir: Path, profiles_dir: Path | None
 ) -> Path | None:
-    candidates: list[Path] = []
+    trusted_candidates: list[Path] = []
     if profiles_dir is not None:
-        candidates.append(profiles_dir / PROFILES_FILENAME)
+        trusted_candidates.append(profiles_dir / PROFILES_FILENAME)
     env_dir = os.environ.get(PROFILES_DIR_ENV) or _legacy_env_dir()
     if env_dir:
-        candidates.append(Path(env_dir) / PROFILES_FILENAME)
-    candidates.append(project_dir / PROFILES_FILENAME)
-    candidates.append(Path.home() / ".dbt_ml" / PROFILES_FILENAME)
+        trusted_candidates.append(Path(env_dir) / PROFILES_FILENAME)
 
-    for p in candidates:
-        if p.exists():
-            return p
+    for path in trusted_candidates:
+        if path.exists():
+            return path
+
+    project_local = project_dir / PROFILES_FILENAME
+    if project_local.is_symlink():
+        raise ProfileError(
+            f"Refusing to load symlinked project-local profiles file "
+            f"{project_local}. Use a regular file in the project, or pass "
+            "--profiles-dir for an operator-trusted profile."
+        )
+    if project_local.exists():
+        if not project_local.is_file():
+            raise ProfileError(
+                f"Project-local profiles path is not a regular file: {project_local}"
+            )
+        return project_local
+
+    global_profile = Path.home() / ".dbt_ml" / PROFILES_FILENAME
+    if global_profile.exists():
+        return global_profile
     return None
 
 
@@ -186,7 +207,19 @@ def _interpolate_env_vars(value: Any, path: Path) -> Any:
 
         return _ENV_VAR_RE.sub(_sub, value)
     if isinstance(value, dict):
-        return {k: _interpolate_env_vars(v, path) for k, v in value.items()}
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            if (
+                key == "api_key_env"
+                and isinstance(item, str)
+                and _ENV_VAR_RE.search(item)
+            ):
+                raise ProfileError(
+                    f"{path}: llm.api_key_env must name an environment variable "
+                    "directly; do not interpolate its secret value with env_var()."
+                )
+            out[key] = _interpolate_env_vars(item, path)
+        return out
     if isinstance(value, list):
         return [_interpolate_env_vars(v, path) for v in value]
     return value
@@ -213,12 +246,24 @@ def resolve_llm_options(
 ) -> dict[str, Any]:
     """Merge profile.llm defaults into model-level extraction options.
 
-    Model-level options always win; profile.llm fills in what's missing.
+    Model-level execution options win; the credential variable remains
+    operator-owned profile configuration.
     """
-    if resolved.llm is None:
-        return options
-
+    if "api_key_env" in options:
+        raise ProfileError(
+            "llm option 'api_key_env' is operator-owned configuration; set it "
+            "under `llm:` in profiles.yml, not in model extraction options"
+        )
     merged = dict(options)
+    merged.setdefault(
+        "api_key_env",
+        resolved.llm.api_key_env
+        if resolved.llm is not None
+        else DEFAULT_LLM_API_KEY_ENV,
+    )
+    if resolved.llm is None:
+        return merged
+
     merged.setdefault("model", resolved.llm.model)
     if resolved.llm.cache_path is not None:
         merged.setdefault("cache_path", str(resolved.llm.cache_path))

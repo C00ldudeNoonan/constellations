@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from dbt_ml.backends import get_backend
-from dbt_ml.backends.llm_backend import LLMBackend
+from dbt_ml.backends.llm_backend import LLMBackend, extract_fields_from_text
+
+
+@pytest.fixture(autouse=True)
+def _default_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
 
 
 class _CallCounter:
@@ -187,10 +193,111 @@ def test_llm_backend_no_api_key_raises(
 ) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     backend = get_backend("llm")
-    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+    unread = tmp_path / "not-read.txt"
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY") as exc_info:
         backend.extract(
-            doc, {"cache_path": str(tmp_path / "c.duckdb"), "fields": schema}
+            unread, {"cache_path": str(tmp_path / "c.duckdb"), "fields": schema}
         )
+    assert "test-api-key" not in str(exc_info.value)
+
+
+def test_invalid_numeric_options_fail_before_file_or_api_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, schema: list[dict[str, Any]]
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    missing = tmp_path / "must-not-be-read.txt"
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        get_backend("llm").extract(
+            missing,
+            {"fields": schema, "max_tokens": 0},
+        )
+
+
+def test_reusable_llm_helper_validates_limits_before_injected_call(
+    schema: list[dict[str, Any]],
+) -> None:
+    called = False
+
+    def _unexpected(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {}
+
+    with pytest.raises(ValueError, match="max_concurrent"):
+        extract_fields_from_text(
+            "text",
+            fields_spec=schema,
+            max_concurrent=0,
+            call_api=_unexpected,
+        )
+
+    assert not called
+
+
+def test_custom_api_key_env_wins_for_sync_and_reusable_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    doc: Path,
+    schema: list[dict[str, Any]],
+) -> None:
+    init_kwargs: list[dict[str, Any]] = []
+
+    class _FakeMessages:
+        def create(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[
+                    SimpleNamespace(
+                        type="tool_use", name="extract", input={"vendor": "Acme"}
+                    )
+                ],
+                usage=SimpleNamespace(),
+            )
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs: Any) -> None:
+            init_kwargs.append(kwargs)
+            self.messages = _FakeMessages()
+
+    secret = "custom-secret-that-must-not-leak"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-default-secret")
+    monkeypatch.setenv("DBT_ML_ANTHROPIC_KEY", secret)
+    monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
+
+    result = get_backend("llm").extract(
+        doc,
+        {"fields": schema, "api_key_env": "DBT_ML_ANTHROPIC_KEY"},
+    )
+
+    assert result.fields == {"vendor": "Acme"}
+    helper_fields = extract_fields_from_text(
+        "invoice text",
+        fields_spec=schema,
+        api_key_env="DBT_ML_ANTHROPIC_KEY",
+    )
+    assert helper_fields == {"vendor": "Acme"}
+    assert init_kwargs == [
+        {"api_key": secret, "max_retries": 4},
+        {"api_key": secret, "max_retries": 4},
+    ]
+    assert secret not in caplog.text
+
+
+def test_missing_custom_api_key_does_not_fall_back_to_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, schema: list[dict[str, Any]]
+) -> None:
+    fallback_secret = "wrong-default-secret"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", fallback_secret)
+    monkeypatch.delenv("DBT_ML_ANTHROPIC_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="DBT_ML_ANTHROPIC_KEY") as exc_info:
+        get_backend("llm").extract(
+            tmp_path / "not-read.txt",
+            {"fields": schema, "api_key_env": "DBT_ML_ANTHROPIC_KEY"},
+        )
+
+    assert fallback_secret not in str(exc_info.value)
 
 
 def test_generation_params_default_and_override(
@@ -201,13 +308,23 @@ def test_generation_params_default_and_override(
     backend = get_backend("llm")
 
     backend.extract(doc, {"fields": schema})
-    assert counter.kwargs == {"temperature": 0.0, "max_tokens": 2048, "max_retries": 4}
+    assert counter.kwargs == {
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "max_retries": 4,
+    }
 
     backend.extract(
         doc,
         {"fields": schema, "temperature": 0.3, "max_tokens": 8192, "max_retries": 1},
     )
-    assert counter.kwargs == {"temperature": 0.3, "max_tokens": 8192, "max_retries": 1}
+    assert counter.kwargs == {
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "temperature": 0.3,
+        "max_tokens": 8192,
+        "max_retries": 1,
+    }
 
 
 def test_temperature_is_part_of_cache_key(
@@ -256,7 +373,7 @@ def test_truncated_response_is_an_error(
     with pytest.raises(RuntimeError, match="max_tokens"):
         backend.extract(doc, {"fields": schema})
 
-    assert init_kwargs == {"max_retries": 4}
+    assert init_kwargs == {"api_key": "test-key", "max_retries": 4}
     assert create_kwargs["temperature"] == 0.0
     assert create_kwargs["max_tokens"] == 2048
     assert isinstance(create_kwargs["system"], str)

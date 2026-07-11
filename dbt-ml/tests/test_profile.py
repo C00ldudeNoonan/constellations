@@ -191,6 +191,7 @@ def test_llm_options_merged_from_profile(tmp_path: Path) -> None:
                 "llm": {
                     "provider": "anthropic",
                     "model": "claude-haiku-4-5",
+                    "api_key_env": "DBT_ML_ANTHROPIC_KEY",
                     "cache_path": "./target/cache.duckdb",
                 },
             }
@@ -200,6 +201,7 @@ def test_llm_options_merged_from_profile(tmp_path: Path) -> None:
     resolved = resolve_profile(project, tmp_path)
     options = resolve_llm_options({"fields": [{"name": "x"}]}, resolved)
     assert options["model"] == "claude-haiku-4-5"
+    assert options["api_key_env"] == "DBT_ML_ANTHROPIC_KEY"
     assert options["cache_path"].endswith("cache.duckdb")
     assert options["fields"] == [{"name": "x"}]
 
@@ -221,6 +223,28 @@ def test_model_option_overrides_profile(tmp_path: Path) -> None:
         {"model": "claude-sonnet-4-6", "fields": []}, resolved
     )
     assert options["model"] == "claude-sonnet-4-6"
+
+
+def test_model_api_key_env_cannot_override_profile(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {"type": "duckdb", "path": "./d.duckdb", "schema": "d"},
+                "llm": {
+                    "provider": "anthropic",
+                    "api_key_env": "PROFILE_ANTHROPIC_KEY",
+                },
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with pytest.raises(ProfileError, match="operator-owned"):
+        resolve_llm_options(
+            {"api_key_env": "MODEL_ANTHROPIC_KEY", "fields": []}, resolved
+        )
 
 
 def test_resolved_profile_is_frozen_dataclass(tmp_path: Path) -> None:
@@ -296,6 +320,35 @@ def test_env_var_missing_without_default_raises(
     project, _, _ = load_project(tmp_path)
     with pytest.raises(ProfileError, match="DBT_ML_NOT_SET_ANYWHERE"):
         resolve_profile(project, tmp_path)
+
+
+def test_api_key_env_rejects_secret_interpolation_without_leaking_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    secret = "sk-ant-distinctive-secret-value"
+    monkeypatch.setenv("DBT_ML_SECRET_KEY", secret)
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/db.duckdb",
+                "      llm:",
+                '        api_key_env: "{{ env_var(\'DBT_ML_SECRET_KEY\') }}"',
+            ]
+        )
+        + "\n",
+    )
+
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match="name an environment variable") as exc_info:
+        resolve_profile(project, tmp_path)
+    assert secret not in str(exc_info.value)
 
 
 # ─── per-adapter warehouse config validation (issue #73) ────────────────────

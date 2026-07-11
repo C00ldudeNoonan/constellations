@@ -5,20 +5,24 @@ dbt-ml is a small, focused Python project. Contributions welcome.
 ## Setup
 
 ```bash
-git clone https://github.com/<your-org>/dbt-ml
-cd dbt-ml
-uv sync
+git clone https://github.com/C00ldudeNoonan/dbt-ml
+cd dbt-ml/dbt-ml
+uv sync --all-extras --dev --locked
 uv run pytest -q
 ```
 
 ## Local checks (required before opening a PR)
 
 ```bash
-uv run ruff check         # lint
-uv run pytest -q          # tests
+uv run pip-audit --skip-editable  # dependency advisories
+uv run ruff check                 # lint
+uv run mypy                       # strict type checking
+uv run pytest -q                  # tests
 ```
 
-CI runs both on every push and PR (see `.github/workflows/ci.yml`).
+CI runs the dependency audit, Ruff, and pytest on every push and PR. Release
+validation also runs mypy and builds the distributions; see the workflows in
+the repository-level `.github/workflows/` directory.
 
 ## Adding a new backend
 
@@ -48,17 +52,34 @@ CI runs both on every push and PR (see `.github/workflows/ci.yml`).
 3. Raise `click.ClickException` from any `*Error` exception you catch.
 4. Update README's CLI section.
 
+## Security and correctness invariants
+
+- Route paths from project YAML through the boundary helpers in `paths.py`.
+  External access must be an explicit, reviewable opt-in.
+- Local document discovery and fetch must not follow symlinks. Preserve the
+  no-follow walk and verified scratch-copy boundary in `sources/local.py`.
+- Configuration and artifacts may carry credential environment-variable names,
+  never resolved secret values. Do not log secrets or raw document content.
+- Validate incremental keys before mutation and keep each adapter write atomic.
+- Raw PII evidence is opt-in. A redacted output does not make retained input
+  columns safe; tests and examples must project sensitive originals away.
+- User-facing cleanup commands remove owned local artifacts only. Warehouse-wide
+  reset behavior must not hide behind a familiar dbt command name.
+
 ## Scope discipline
 
-dbt-ml v1 is intentionally limited:
+The current implementation boundaries are:
 
-- DuckDB-only. No Snowflake/BigQuery adapters in v1.
-- Pure Python. No Rust until the model is proven.
-- LLM provider is Anthropic-only. Bedrock/Vertex/OpenAI are v2.
-- Schema tests are the four listed in README, plus custom Python. No dbt-style
-  generic test machinery in v1.
+- Python 3.12+ only; no Rust or PyO3.
+- DuckDB and BigQuery are the implemented warehouse adapters. State follows the
+  active adapter; do not introduce new DuckDB assumptions into orchestration.
+- Local filesystem and GCS are the implemented document-source types.
+- Anthropic is the only implemented LLM provider.
+- dbt-ml is dbt-shaped but standalone. Its artifacts and test semantics must be
+  documented explicitly rather than assumed to be dbt-core contracts.
 
-If a change pulls in any of the above, push back or open a discussion first.
+Extend these boundaries through the existing adapter/provider seams and include
+contract tests for every supported implementation.
 
 ## Commit style
 
@@ -73,5 +94,8 @@ docs: rewrite README quickstart for end users
 
 ## Releasing
 
-Bump `version` in `pyproject.toml`, update `CHANGELOG.md`, tag the commit
-`v0.X.Y`. PyPI publishing is manual today (`uv build && uv publish`).
+Follow [`docs/release.md`](docs/release.md). Update `pyproject.toml` and the
+changelog, then push a matching `vX.Y.Z` tag. The release workflow verifies the
+tag, audits, lints, type-checks, tests, builds the distributions, publishes to
+PyPI, and creates the matching GitHub Release. Do not publish manually from a
+developer workstation.

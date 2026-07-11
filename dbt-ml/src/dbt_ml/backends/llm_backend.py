@@ -3,14 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
+from ..config.model import validate_llm_numeric_options
+from ..config.profile import (
+    DEFAULT_LLM_API_KEY_ENV,
+    resolve_llm_credential,
+)
 from .base import BaseBackend, ExtractionResult
 from .registry import register
 
@@ -69,6 +74,7 @@ class LLMBackend(BaseBackend):
         max_retries:    SDK retry budget for rate limits / transient errors
                         (default 4, exponential backoff)
         max_concurrent: Max in-flight API calls process-wide (default 4)
+        api_key_env:    Environment variable containing the Anthropic API key
         batch:          Submit uncached documents through the Message Batches
                         API — 50% token cost, minutes-latency (default false;
                         keep off for dev loops)
@@ -82,6 +88,8 @@ class LLMBackend(BaseBackend):
         return [".txt", ".md"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        validate_llm_numeric_options(options)
+        api_key_env, _ = _require_llm_api_key(options)
         fields_spec = options.get("fields")
         if not fields_spec or not isinstance(fields_spec, list):
             raise ValueError(
@@ -94,7 +102,7 @@ class LLMBackend(BaseBackend):
             model=options.get("model", _DEFAULT_MODEL),
             system=options.get("system_prompt", _DEFAULT_SYSTEM),
             cache_path=options.get("cache_path"),
-            call_api=self._call_api,
+            call_api=partial(self._call_api, api_key_env=api_key_env),
             temperature=float(options.get("temperature", _DEFAULT_TEMPERATURE)),
             max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
             max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
@@ -120,6 +128,8 @@ class LLMBackend(BaseBackend):
         single batch, results come back keyed by custom_id, and every response
         is cached so re-runs are free. Per-document failures come back as
         Exception entries; only submission itself can fail the whole batch."""
+        validate_llm_numeric_options(options)
+        api_key_env, _ = _require_llm_api_key(options)
         fields_spec = options.get("fields")
         if not fields_spec or not isinstance(fields_spec, list):
             raise ValueError(
@@ -182,7 +192,11 @@ class LLMBackend(BaseBackend):
                 }
                 for j, (_, text, _) in enumerate(pending)
             ]
-            items = _run_message_batch(requests, poll_seconds=poll_seconds)
+            items = _run_message_batch(
+                requests,
+                poll_seconds=poll_seconds,
+                api_key_env=api_key_env,
+            )
             for j, (i, _, content_hash) in enumerate(pending):
                 by_index[i] = self._resolve_batch_item(
                     items.get(f"req-{j}"),
@@ -253,6 +267,7 @@ def extract_fields_from_text(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
 ) -> dict[str, Any]:
     """Extract structured fields from a string of text by calling Claude.
 
@@ -273,6 +288,7 @@ def extract_fields_from_text(
         max_tokens=max_tokens,
         max_retries=max_retries,
         max_concurrent=max_concurrent,
+        api_key_env=api_key_env,
     )
     return fields
 
@@ -289,11 +305,20 @@ def extract_fields_with_usage(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
     hit is zero tokens and zero API calls — the cache stores only fields, and
     cached responses cost nothing."""
+    validate_llm_numeric_options(
+        {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "max_retries": max_retries,
+            "max_concurrent": max_concurrent,
+        }
+    )
     content_hash = hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
     schema_hash = _hash_schema(system, fields_spec, temperature)
     cache_key = f"{model}|{content_hash}|{schema_hash}"
@@ -304,7 +329,10 @@ def extract_fields_with_usage(
         if cached is not None:
             return cached, {"api_calls": 0, "cache_hits": 1, **_ZERO_USAGE}
 
-    fn = call_api or _default_call_api
+    fn = call_api
+    if fn is None:
+        resolved_env, _ = _require_llm_api_key({"api_key_env": api_key_env})
+        fn = partial(_default_call_api, api_key_env=resolved_env)
     with _gate(max_concurrent):
         raw = fn(
             text,
@@ -345,16 +373,13 @@ def _default_call_api(
     temperature: float = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
+    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Either export it or seed the "
-            "llm cache so re-runs hit cached responses."
-        )
+    _, api_key = _require_llm_api_key({"api_key_env": api_key_env})
     from anthropic import Anthropic
 
     # The SDK retries 429s / 5xx / timeouts with exponential backoff.
-    client = Anthropic(max_retries=max_retries)
+    client = Anthropic(api_key=api_key, max_retries=max_retries)
     resp = client.messages.create(  # type: ignore[call-overload]
         model=model,
         max_tokens=max_tokens,
@@ -397,19 +422,18 @@ def _parse_extract_response(
 
 
 def _run_message_batch(
-    requests: list[dict[str, Any]], *, poll_seconds: float
+    requests: list[dict[str, Any]],
+    *,
+    poll_seconds: float,
+    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
 ) -> dict[str, Any]:
     """Submit one Message Batch, poll to completion, return items keyed by
     custom_id (results stream back unordered). Injectable for testing, like
     `_default_call_api`."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Either export it or seed the "
-            "llm cache so re-runs hit cached responses."
-        )
+    _, api_key = _require_llm_api_key({"api_key_env": api_key_env})
     from anthropic import Anthropic
 
-    client = Anthropic()
+    client = Anthropic(api_key=api_key)
     batch = client.messages.batches.create(requests=requests)  # type: ignore[arg-type]
     log.info("submitted message batch %s (%d requests)", batch.id, len(requests))
     while True:
@@ -427,6 +451,15 @@ def _run_message_batch(
         )
         time.sleep(poll_seconds)
     return {r.custom_id: r for r in client.messages.batches.results(batch.id)}
+
+
+def _require_llm_api_key(options: dict[str, Any]) -> tuple[str, str]:
+    api_key_env, api_key = resolve_llm_credential(options)
+    if not api_key:
+        raise RuntimeError(
+            f"{api_key_env} is not set. Export it before running an LLM model."
+        )
+    return api_key_env, api_key
 
 
 def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:

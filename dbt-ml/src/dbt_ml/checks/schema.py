@@ -8,27 +8,14 @@ from typing import Any
 import polars as pl
 
 from ..adapters import WarehouseAdapter
+from ..test_specs import (
+    SUPPORTED_TESTS,
+    TestSpecError,
+    parse_test_spec,
+)
 from .python import CustomTestError, run_python_test
 
-SUPPORTED_TESTS = {
-    "not_null",
-    "unique",
-    "min_rows",
-    "not_empty",
-    "python",
-    # deterministic ML/statistical quality checks (issue #10, Tier 1 + grounding)
-    "matches_regex",
-    "accepted_values",
-    "accepted_range",
-    "null_rate",
-    "grounded_in",
-    "relationships",
-}
-SUPPORTED_SEVERITIES = {"error", "warn"}
-
-
-class UnknownTestError(Exception):
-    pass
+UnknownTestError = TestSpecError
 
 
 @dataclass
@@ -74,32 +61,19 @@ def evaluate_test_spec(
     When `store_failures` is set, supporting tests persist their failing rows to
     a `dbt_ml_test_failures__…` table and record it on the result.
     """
-    if isinstance(spec, str):
-        return _apply_severity(
-            _run_named_test(
-                spec, None, model_name, table_ref, adapter, project_dir, store_failures
-            ),
-            "error",
-        )
-    if isinstance(spec, dict):
-        body = dict(spec)
-        severity = body.pop("severity", "error")
-        if severity not in SUPPORTED_SEVERITIES:
-            raise UnknownTestError(
-                f"Unknown severity '{severity}'. Allowed: {sorted(SUPPORTED_SEVERITIES)}"
-            )
-        if len(body) != 1:
-            raise UnknownTestError(
-                f"Test spec must have exactly one test key (plus optional severity), got: {spec!r}"
-            )
-        ((test_name, arg),) = body.items()
-        return _apply_severity(
-            _run_named_test(
-                test_name, arg, model_name, table_ref, adapter, project_dir, store_failures
-            ),
-            severity,
-        )
-    raise UnknownTestError(f"Unsupported test spec: {spec!r}")
+    parsed = parse_test_spec(spec)
+    return _apply_severity(
+        _run_named_test(
+            parsed.name,
+            parsed.argument,
+            model_name,
+            table_ref,
+            adapter,
+            project_dir,
+            store_failures,
+        ),
+        parsed.severity,
+    )
 
 
 def _apply_severity(results: list[TestResult], severity: str) -> list[TestResult]:

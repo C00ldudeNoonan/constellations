@@ -16,11 +16,17 @@ models:
 
     fields:
       - name: title
+        data_type: string
       - name: author
+        data_type: string
       - name: date
+        data_type: string
       - name: tags
+        data_type: json
       - name: body
+        data_type: string
       - name: word_count
+        data_type: integer
 
     tests:
       - not_null: [title, author, date]

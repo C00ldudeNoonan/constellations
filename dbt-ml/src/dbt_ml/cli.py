@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import time
 from collections.abc import Callable
@@ -11,8 +10,10 @@ import click
 
 from .adapters import AdapterError, create_adapter
 from .checks import TestResult, run_project_tests
+from .compiler import validate_project_contract
 from .config import ConfigError, load_project
 from .config.model import ModelConfig
+from .config.profile import resolve_llm_credential
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import DAGError, ProjectDAG, SelectionError, parse_ref
@@ -20,8 +21,8 @@ from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
-from .paths import is_within_project, resolve_within_project
-from .profile import ProfileError, resolve_profile
+from .paths import resolve_within_project
+from .profile import ProfileError, resolve_llm_options, resolve_profile
 from .runner import BuildResult, RunError, build_project, clean_project, run_project
 from .sources import SourceError
 from .synth import (
@@ -84,12 +85,12 @@ def compile(ctx: click.Context) -> None:
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
     project, sources, models = _load(project_dir)
-    dag = _build_dag(sources, models)
     try:
+        dag = validate_project_contract(project, sources, models, project_dir)
         manifest_path = write_manifest(
             project_dir, target=target, profiles_dir=profiles_dir
         )
-    except ProfileError as e:
+    except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
 
     click.echo(f"Project: {project.name} v{project.version}")
@@ -102,7 +103,7 @@ def compile(ctx: click.Context) -> None:
     click.echo("")
     click.echo(f"Wrote {manifest_path.relative_to(project_dir)}")
 
-    # Surface backend-related warnings (e.g. missing ANTHROPIC_API_KEY).
+    # Surface backend-related warnings (e.g. a missing LLM credential).
     for warning in _compile_warnings(project, models, project_dir, target, profiles_dir):
         click.echo(f"warning: {warning}", err=True)
 
@@ -122,20 +123,29 @@ def _compile_warnings(
     }
 
     if "llm" in backends_in_use:
-        env_var = "ANTHROPIC_API_KEY"
         try:
             resolved = resolve_profile(
                 project, project_dir, target=target, profiles_dir=profiles_dir
             )
-            if resolved.llm is not None:
-                env_var = resolved.llm.api_key_env
         except ProfileError:
-            pass
+            return out
 
-        if not os.environ.get(env_var):
+        missing: set[str] = set()
+        for model in models:
+            if model.extraction is None:
+                continue
+            backend = model.extraction.backend or project.extraction.default_backend
+            if backend != "llm":
+                continue
+            options = resolve_llm_options(model.extraction.options, resolved)
+            env_var, api_key = resolve_llm_credential(options)
+            if not api_key:
+                missing.add(env_var)
+
+        for env_var in sorted(missing):
             out.append(
                 f"{env_var} is not set; models using the `llm` backend will fail "
-                "at run time unless every input is already cached."
+                "at run time."
             )
 
     return out
@@ -243,15 +253,13 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
     except AdapterError as e:
         raise click.ClickException(str(e)) from e
 
-    click.echo(_safe_console_text(str(df)))
+    stdout = click.get_text_stream("stdout")
+    click.echo(_safe_console_text(str(df), stdout), file=stdout)
 
 
 def _safe_console_text(text: str, stream: object | None = None) -> str:
     target = stream or click.get_text_stream("stdout")
     encoding = getattr(target, "encoding", None) or "utf-8"
-    errors = getattr(target, "errors", None) or "strict"
-    if errors != "strict":
-        return text
     return text.encode(encoding, errors="replace").decode(
         encoding, errors="replace"
     )
@@ -459,7 +467,7 @@ def run(
     state: Path | None,
     json_output: bool,
 ) -> None:
-    """Extract and materialize selected models into DuckDB."""
+    """Extract and materialize selected models into the configured warehouse."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -528,6 +536,8 @@ def run(
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
+        for warning in r.warnings:
+            click.echo(f"  WARNING: {warning}", err=True)
 
     usage_lines = [
         f"{r.model_name:<22}{_usage_summary(r.metrics)}"
@@ -668,6 +678,8 @@ def _echo_build(result: BuildResult) -> None:
         )
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
+        for warning in r.warnings:
+            click.echo(f"  WARNING: {warning}", err=True)
     for name in result.skipped:
         click.echo(f"{name:<22}{'-':<12}{'-':>8}{'-':>10}  SKIPPED (upstream failed)")
 
@@ -790,9 +802,10 @@ def emit_dbt_sources(
 ) -> None:
     """Write a dbt-compatible sources.yml declaring dbt_ml's materialized tables.
 
-    Drop the output into a dbt-duckdb project so dbt models can refer to the
-    dbt-ml tables via `{{ source(...) }}`. With --dagster-meta, each table also
-    carries a Dagster asset key for the dagster-dbt integration.
+    Drop the output into a dbt project using the matching warehouse adapter so
+    models can refer to dbt-ml tables via `{{ source(...) }}`. With
+    --dagster-meta, each table also carries a Dagster asset key for the
+    dagster-dbt integration.
     """
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
@@ -906,41 +919,19 @@ def source_freshness(ctx: click.Context) -> None:
 
 
 @cli.command()
-@click.option(
-    "--force",
-    is_flag=True,
-    help="Allow deleting a warehouse file outside the project directory.",
-)
 @click.pass_context
-def clean(ctx: click.Context, force: bool) -> None:
-    """Delete the project's DuckDB output file."""
+def clean(ctx: click.Context) -> None:
+    """Remove generated files under the project's target path.
+
+    Known local artifacts are removed without invoking a warehouse-level reset.
+    Configured databases and unknown files under target-path are preserved.
+    """
     project_dir: Path = ctx.obj["project_dir"]
-    profiles_dir = ctx.obj["profiles_dir"]
-    target = ctx.obj["target"]
     try:
-        project, _, _ = load_project(project_dir)
-        resolved = resolve_profile(
-            project, project_dir, target=target, profiles_dir=profiles_dir
-        )
-    except (ConfigError, ProfileError) as e:
+        path = clean_project(project_dir)
+    except (ConfigError, RunError) as e:
         raise ConfigClickError(str(e)) from e
-
-    local = resolved.warehouse.local_path()
-    if local is not None and not force:
-        # Profile paths are trusted for read/write, but a delete pointed
-        # outside the project must be explicit (issue #65).
-        resolved_local = (project_dir / local).resolve()
-        if not is_within_project(resolved_local, project_dir):
-            raise ConfigClickError(
-                f"The configured warehouse file {resolved_local} is outside "
-                "the project directory. Pass --force to delete it."
-            )
-
-    try:
-        path = clean_project(project_dir, target=target, profiles_dir=profiles_dir)
-    except (ConfigError, ProfileError) as e:
-        raise ConfigClickError(str(e)) from e
-    click.echo(f"Removed {path}")
+    click.echo(f"Cleaned generated artifacts under {path}")
 
 
 def _load(project_dir: Path) -> tuple[ProjectConfig, list[SourceConfig], list[ModelConfig]]:
@@ -970,9 +961,17 @@ def _run_watch(
     """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
     from watchfiles import watch
 
-    _, sources, _ = _load(project_dir)
+    project, sources, models = _load(project_dir)
+    try:
+        dag = validate_project_contract(project, sources, models, project_dir)
+        selected = dag.select_models(select=select, exclude=exclude)
+    except (ConfigError, SelectionError) as e:
+        raise ConfigClickError(str(e)) from e
+    required_sources = set(dag.required_sources(selected))
     watch_paths = []
     for s in sources:
+        if s.name not in required_sources:
+            continue
         try:
             candidate = resolve_within_project(
                 s.path,

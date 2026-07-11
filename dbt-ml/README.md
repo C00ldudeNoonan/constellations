@@ -5,11 +5,11 @@ documents — PDFs, markdown, HTML, JSON, email, free-form text — into warehou
 tables. Incremental processing, schema tests, dbt-style selectors, profiles,
 and a manifest artifact you can wire into other tools.
 
-This is the v0.1 PoC: pure Python, DuckDB warehouse. **v0.2 is in scope** —
-adding RAG support (chunking, embeddings, vector storage via LanceDB) and a
-warehouse adapter pattern aimed at the dbt-core set (Postgres, Snowflake,
-BigQuery, Databricks, …). A full Rust+Python rebuild is sketched as a
-longer-term v2 direction.
+The current v0.2 preview is pure Python and supports DuckDB and BigQuery
+warehouses, local and GCS sources, document chunk models, and executable
+classic text-ML providers. Additional warehouse adapters, embeddings, and
+vector stores remain roadmap work; Rust and PyO3 are explicitly out of scope
+through v0.2.
 
 ## Where dbt-ml fits
 
@@ -34,8 +34,8 @@ selectors + tests + artifacts pattern, applied to unstructured data.
 ## You have a folder of files. Get them into your warehouse.
 
 ```bash
-# Install (once it's published; today: clone and `uv sync`)
-uv add git+https://github.com/<your-org>/dbt-ml    # or local: uv pip install -e .
+# Install from PyPI
+uv add dbt-ml
 
 # 1. Scaffold a project for whatever shape your data is
 uv run dbt-ml init my_project --template pdf      # or json, markdown, html
@@ -60,7 +60,7 @@ extraction, dbt handoff) is opt-in on top.
 | **Source**         | A glob over a folder. `*.pdf`, `*.json`, `*.html`, `*.md` — your choice.        |
 | **Extraction model** | One row per source file, produced by a backend (pdf, json, markdown, html, llm). |
 | **Transform model**  | A Python module returning a Polars DataFrame, depends on other models via `ref()`. |
-| **Classic ML model** | A planned `ml:` model for deterministic text/document ML: features, classifiers, clustering, topic models, NLP enrichment. |
+| **Classic ML model** | An executable `ml:` model for deterministic features and classifiers, with persisted artifacts. |
 | **Materialization**  | `full` (always replace) or `incremental` (skip unchanged input on re-runs).      |
 | **Tests**          | `not_null`, `unique`, `min_rows`, custom Python — with `severity: warn` if you want.|
 | **Profile**        | Warehouse + LLM config, swappable per `--target dev|prod`. No credentials in models. |
@@ -75,7 +75,7 @@ extraction, dbt handoff) is opt-in on top.
 | `pdf`      | `*.pdf`           | Per-page text via pypdf. Warns on empty extracts (likely scanned). Deterministic, no API. |
 | `html`     | `*.html`/`*.htm`  | Body text + CSS selectors + OpenGraph/meta via BeautifulSoup. Deterministic, no API.      |
 | `email`    | `*.eml`           | from/to/subject/date/body via stdlib `email`. Deterministic, no API.                      |
-| `llm`      | `*.txt`/`*.md`    | Claude tool-use → structured fields. Responses cached. Requires `ANTHROPIC_API_KEY`.      |
+| `llm`      | `*.txt`/`*.md`    | Claude tool-use → structured fields. Uses the variable named by profile `llm.api_key_env` (default `ANTHROPIC_API_KEY`). |
 
 Add a new backend = drop a file under `src/dbt_ml/backends/`, inherit from
 `BaseBackend`, decorate with `@register`. No plugin system needed for v1.
@@ -84,8 +84,9 @@ Add a new backend = drop a file under `src/dbt_ml/backends/`, inherit from
 
 dbt-ml projects are local code-and-data projects. Only run projects you trust:
 Python transforms and custom Python tests execute in your Python process, and
-project YAML controls source globs, warehouse paths, cache paths, and artifact
-paths.
+project configuration controls source globs, generated paths, and executable
+modules. The discovered profile controls warehouse, cache, and credential
+environment-variable names.
 
 Document parsers process local files with third-party libraries. Keep
 dependencies current before running dbt-ml over untrusted PDFs, HTML, email, or
@@ -104,9 +105,12 @@ path, or a symlink) is a configuration error (exit 2):
 | Path | Confined | Opt-out |
 |---|---|---|
 | `source.path` | yes | `external: true` on the source |
+| `source.file_pattern` | relative only; absolute paths and `..` are rejected | none |
+| matched local source files | must stay below the resolved source root; symlinks are not followed | none |
 | `ml.artifact.path` | yes | `external: true` on the artifact block |
 | `source-paths` / `model-paths` / `transform-paths` / `target-path` | always | none |
 | model-level llm `cache_path` | always | put it in profiles.yml instead |
+| legacy inline `duckdb.path` | always | move external paths into profiles.yml |
 
 ```yaml
 sources:
@@ -115,10 +119,26 @@ sources:
     external: true
 ```
 
-**profiles.yml paths** (warehouse `path:`, llm `cache_path:`) are your
-machine's config, like dbt's — they are trusted as-is. The one exception is
-deletion: `dbt-ml clean` refuses to remove a warehouse file outside the
-project directory unless you pass `--force`.
+`external: true` permits the declared source root outside the project. It does
+not permit pattern traversal or symlinked source files. Local discovery hashes
+through no-follow file descriptors where the platform supports them; fetches
+are verified snapshots in per-run scratch space, so a path swap after discovery
+does not change the bytes sent to a parser or remote model.
+
+Project, source, and model YAML must be regular files under their configured
+roots. Configuration discovery does not follow symlinked files or directories.
+
+**profiles.yml paths** (warehouse `path:`, llm `cache_path:`) are operator
+configuration, like dbt's, and are trusted as-is. An implicit project-local
+profiles file must be a regular file; pass `--profiles-dir` when intentionally
+using an operator-managed symlink.
+
+`dbt-ml clean` removes only known local artifacts under `target-path`
+(`manifest.json`, `run_results.json`, generated `sources.yml`, `docs/`, and
+classic-ML `artifacts/`). It preserves configured warehouse/cache files and
+unknown files, never calls an adapter-level database/schema/dataset reset,
+rejects project-root or source/model/transform overlap, and refuses symlinked
+paths. There is no `--force` option.
 
 Running a third-party project still executes its Python transforms and custom
 tests, and remote sources (`gs://…`) reach whatever your ambient credentials
@@ -138,6 +158,21 @@ extraction:
     batch_poll_seconds: 30 # optional poll interval
 ```
 
+### LLM credentials
+
+`api_key_env` stores an environment-variable name, never a secret. Runtime
+resolves the exact profile-owned variable and passes its value explicitly to
+synchronous and batch Anthropic clients; it never falls back to
+`ANTHROPIC_API_KEY` when another variable is configured. Model YAML cannot
+choose a credential variable. Missing credentials name only the variable and
+fail before a document is read or submitted, and `compile` uses the same
+resolution logic for its warning.
+
+Reusable transform helpers are not profile-ambient. Pass
+`api_key_env=ctx.llm.api_key_env` when calling
+`extract_fields_from_text()` from a custom transform. LLM extraction models
+preflight credentials even if their response cache is warm.
+
 ## The CLI
 
 ```
@@ -154,11 +189,19 @@ dbt-ml source freshness                                    # mtime vs warn_after
 dbt-ml docs generate [--output DIR]                        # static HTML site from manifest.json
 dbt-ml docs serve [--port N]                               # local http.server over target/docs/
 dbt-ml emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
-dbt-ml clean                                               # delete the project's DuckDB
+dbt-ml clean                                               # remove known target artifacts; preserve warehouses
 
 # Global flags (work on every command):
 dbt-ml --project-dir <dir> --profiles-dir <dir> --target <name> <command>
 ```
+
+Project, source, model, and profile models reject unknown keys; source/model
+YAML accepts schema `version: 2`. Before profile resolution, source discovery,
+or warehouse mutation, `compile`, `run`, and `build` validate registered
+backend names, source/model edge kinds, supported materializations, transform
+and custom-test modules/call signatures, built-in test option shapes, and
+relationship targets. Relationship tests add a DAG predecessor so their target
+relation is built first. Configuration failures exit 2.
 
 ### Useful flags
 
@@ -167,6 +210,8 @@ dbt-ml --project-dir <dir> --profiles-dir <dir> --target <name> <command>
 - `--threads N` parallelizes per-document extraction within an extraction
   model. Most useful for PDF / LLM / HTML (I/O- or API-bound). The LLM cache
   is lock-serialized so threading is safe.
+- `--select` / `--exclude` limit source discovery as well as model execution;
+  an unrelated GCS branch is never listed or authenticated.
 
 ## Selectors
 
@@ -228,6 +273,11 @@ my_project:
 Lookup order: `--profiles-dir` flag → `$DBT_ML_PROFILES_DIR` →
 `<project>/profiles.yml` → `~/.dbt_ml/profiles.yml`.
 
+Set `api_key_env` to the name of the credential variable itself, as above; do
+not wrap it in `env_var()`. dbt-ml deliberately rejects secret-value
+interpolation in this field so validation errors and resolved configuration
+cannot contain the key.
+
 ### BigQuery
 
 Install the extra, then point a target at a GCP project. Profile fields
@@ -261,17 +311,19 @@ my_project:
 ```
 
 Materialized tables, `--store-failures` tables, and incremental state all
-live in the configured dataset — no DuckDB involved. `dbt-ml clean` drops
-the whole dataset. `emit-dbt-sources` emits `database: <project>` /
-`schema: <dataset>` so a dbt-bigquery project can consume the tables
-directly.
+live in the configured dataset — no DuckDB involved. `dbt-ml clean` does not
+drop or mutate the BigQuery dataset; it only removes known local target
+artifacts. `emit-dbt-sources` emits `database: <project>` / `schema: <dataset>`
+so a dbt-bigquery project can consume the tables directly.
 
 String values support `{{ env_var('NAME') }}` and
 `{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
 profiles need, so credentials and per-environment paths stay out of the file.
-An unset variable with no default is a load-time error. Each `warehouse:`
-block is validated against the config schema of the adapter named by `type:`;
-unknown types and typo'd fields fail at resolve time with the adapter named.
+`api_key_env` is the deliberate exception: it must be a literal variable name.
+An unset interpolated variable with no default is a load-time error. Each
+`warehouse:` block is validated against the config schema of the adapter named
+by `type:`; unknown types and typo'd fields fail at resolve time with the
+adapter named.
 
 ## GCS sources
 
@@ -288,6 +340,7 @@ version: 2
 sources:
   - name: report_html
     path: gs://my-raw-bucket/reports   # bucket + prefix
+    project: my-gcp-project             # optional when ADC cannot infer it
     file_pattern: "*.html"             # basename match; "2026/*.html" matches paths
     max_objects: 20000                 # listing bound (default 5000)
 
@@ -308,7 +361,9 @@ and a `source_metadata` JSON column (size, updated, content type, hashes).
 
 Auth is Application Default Credentials: `gcloud auth application-default
 login` locally, or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
-service-account JSON in CI.
+service-account JSON in CI. User ADC may not carry a default Google Cloud
+project; set `GOOGLE_CLOUD_PROJECT` or add `project:` to the GCS source when
+project inference is unavailable.
 
 ## Document extraction contract
 
@@ -317,12 +372,37 @@ Every extraction row carries identity, lineage, and parser provenance:
 `gs://bucket/name#generation` for GCS), `content_hash`, `code_version`,
 `backend_name`, `backend_version` (the parsing library's version, e.g.
 `pypdf/6.1`), and `extracted_at` (one UTC timestamp per run). Remote
-sources add `source_metadata` JSON.
+sources populate the nullable `source_metadata` JSON column.
 
 > Upgrading note: these columns are new — existing *incremental*
 > extraction models will report a schema change on their next reprocess;
 > run once with `--full-refresh` (or set
 > `on_schema_change: append_new_columns`).
+
+### Declared extraction schema
+
+Top-level model `fields:` is the warehouse output contract for extraction
+payload columns. Lineage columns above are automatic; when `fields:` is
+non-empty, undeclared backend payload fields are dropped before materialization.
+
+```yaml
+fields:
+  - name: invoice_id
+    data_type: string
+  - name: total
+    data_type: float
+  - name: paid
+    data_type: boolean
+```
+
+Supported types are `string`, `integer`, `float`, `boolean`, `date`,
+`timestamp`, and `json` (`type:` and `dtype:` are accepted input aliases for
+`data_type:`). A successful zero-document run materializes a typed, zero-row
+relation from this contract, so downstream tests and models see a real table.
+Type changes participate in `code_version`; invalid casts fail without
+publishing a full-model staging table. A declared field without `data_type`
+defaults to string. Omitting `fields:` retains legacy dynamic backend output,
+but cannot type payload columns for an initially empty corpus.
 
 Structure-preserving options for document parsing:
 
@@ -368,14 +448,22 @@ Extraction streams rows to the warehouse every `flush_every` documents
   materialization: incremental
 ```
 
-Incremental models upsert rows *and* state per flush — a killed run keeps
-its completed chunks, and the re-run picks up only the remainder. Full
-models stream into a `dbt_ml_staging__*` table that atomically replaces the
-target at the end. Changing `flush_every` never invalidates incremental
+Incremental writes are atomic per flush: DuckDB uses a transaction and
+BigQuery loads a unique staging table then executes one `MERGE`. Missing,
+NULL, or duplicate incremental keys are rejected before mutation. A killed
+run keeps successful earlier flushes and their state, and the re-run picks up
+the remainder. With BigQuery `append_new_columns`, schema addition happens
+before the `MERGE`; a failed merge preserves all rows but can leave the new,
+nullable column in place.
+
+Full models publish a unique staging table only after every document
+succeeds. A parser/backend error preserves the previous target and state.
+Backend warnings and zero-source-match warnings appear in the CLI and
+`run_results.json`. Changing `flush_every` never invalidates incremental
 state. One edge: with `on_schema_change: fail` and more than one flush, the
 first flush is compared against the existing table — heterogeneous corpora
-whose early documents lack a column can fail where a whole-run union
-carried it; use `append_new_columns` there.
+whose early documents lack a column can fail where a whole-run union carried
+it; use `append_new_columns` there.
 
 ## Chunking (RAG)
 
@@ -452,12 +540,37 @@ python -m spacy download en_core_web_sm
 Without the model, calls into `redact_pii` raise a clear `PIIError` pointing
 at this command.
 
+For a customer-facing relation, use an allow-list projection:
+
+```yaml
+- name: redacted_tickets
+  depends_on: [ref('raw_tickets')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.redact_pii
+    options:
+      text_field: summary
+      output_field: summary_redacted
+      entities_field: pii_entities
+      keep_fields: [ticket_id, summary_redacted, pii_entities]
+```
+
+`entities_field` stores type, offsets, and confidence by default; it does not
+store the matched substring. `include_raw_text: true` opts back into raw PII
+evidence and makes that output sensitive. When `output_field` differs from
+`text_field`, the original text is dropped unless `retain_input_text: true` is
+set. `keep_fields` and `drop_fields` are mutually exclusive, and unknown
+projection fields fail loudly. Other upstream columns are otherwise retained,
+so use `keep_fields` for a relation that must exclude names, email addresses,
+or other sensitive source columns.
+
 ## Classic text and document ML
 
-Classic ML is a first-class dbt-ml lane alongside LLM/RAG work. The v0.2 design
-adds an `ml:` model block for deterministic text and document workflows such as
-Count/TF-IDF/hashing features, supervised classification/regression,
-clustering, topic models, and NLP enrichment.
+Classic ML is a first-class dbt-ml lane alongside LLM/RAG work. The `ml:`
+model block executes deterministic text/document workflows and persists their
+artifacts; shipped providers cover Count/TF-IDF/hashing features and Naive
+Bayes classification. Additional regression, clustering, topic-model, and NLP
+providers remain roadmap work.
 
 ```yaml
 - name: ticket_tfidf
@@ -501,7 +614,8 @@ tests:
   - unique: [a, b]                       # composite (compiled to dbt_utils on emit)
   - min_rows: 100
   - not_empty                            # bare-string form of min_rows: 1
-  - not_null: total, severity: warn      # warn doesn't fail the run
+  - not_null: total                      # warn doesn't fail the run
+    severity: warn
   - relationships: { column: vendor_id, to: ref('vendors'), field: id }  # referential integrity
   - python: tests.my_check               # custom: tests/my_check.py defines run(con, table_ref) -> str | None
 ```
@@ -546,13 +660,17 @@ stops before it pollutes everything downstream.
 | `examples/support_tickets_pipeline/`| JSON tickets → open queue + SLA breaches + per-team workload (no LLM)  |
 | `examples/arxiv_papers/`            | arXiv metadata → deterministic data-quality checks (incl. `grounded_in`) |
 | `examples/dbt_consumer/`            | dbt-duckdb project consuming dbt-ml-materialized tables                 |
+| `examples/classic_text_ml/`         | deterministic sparse text features + Naive Bayes classification        |
+| `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
 
 Each example is runnable end-to-end with `uv run dbt-ml --project-dir examples/<name> ...`.
 
-## Composing with dbt (dbt-duckdb)
+## Composing with dbt
 
-dbt-ml and dbt can share a DuckDB file: dbt-ml does the unstructured→structured
-"E", dbt does the SQL "T". The bridge:
+dbt-ml does the unstructured→structured "E" and dbt does the SQL "T".
+`emit-dbt-sources` targets the matching adapter: dbt-duckdb can share the
+DuckDB file, and dbt-bigquery can read the configured BigQuery dataset. The
+DuckDB bridge:
 
 ```bash
 uv run dbt-ml --project-dir examples/invoice_pipeline run
@@ -568,16 +686,18 @@ becomes a `dbt_utils.unique_combination_of_columns` macro test.
 
 ## Artifacts
 
-Every `dbt-ml compile` / `dbt-ml run` writes to `target/`:
+`dbt-ml compile` writes the manifest; `run` and `build` write the manifest and
+run results under `target-path`:
 
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
   model, DAG nodes+edges+execution order. Re-generated each run.
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
-  elapsed) plus per-model documents processed/skipped, rows written, duration,
-  errors, `status`, and the fully-qualified output `relation`. LLM extraction
-  models also carry token accounting in `metrics` (API calls, cache hits,
-  input/output/cache tokens, and `estimated_cost_usd` when the profile sets
-  `pricing:`). `run`/`build` also accept `--json` to print this payload to stdout.
+  elapsed, and `sources_considered`) plus per-model documents
+  processed/skipped, rows written, duration, warnings, errors, `status`, and
+  the fully-qualified output `relation`. LLM extraction models also carry
+  token accounting in `metrics` (API calls, cache hits, input/output/cache
+  tokens, and `estimated_cost_usd` when the profile sets `pricing:`).
+  `run`/`build` also accept `--json` to print this payload to stdout.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`dbt-ml docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `dbt-ml docs serve`.
@@ -606,7 +726,10 @@ third run (1 changed)                       0.3s    →  18.2k docs/sec
 full-refresh                                4.3s    →   1.2k docs/sec
 ```
 
-Linear through 5k. Bottleneck is single-threaded extraction; parallelism is a v2 item.
+These historical v0.1 numbers are a local baseline, not a service-level
+guarantee. Current runs support `--threads` for per-document extraction and
+parallel independent model batches; benchmark your own parser, warehouse, and
+source mix.
 
 ## Layout
 
@@ -616,12 +739,12 @@ src/dbt_ml/
 ├── config/                # pydantic models for project/source/model/profile + loader
 ├── profile.py             # profile discovery + resolution (warehouse + llm)
 ├── dag.py                 # graphlib-based DAG, selectors (+ name +, tag:foo), Mermaid render
-├── state.py               # DuckDB-backed incremental state
+├── adapters/              # warehouse adapters + adapter-owned incremental state
 ├── runner.py              # extract → materialize orchestration
 ├── manifest.py            # target/manifest.json + run_results.json
 ├── dbt_export.py          # target/sources.yml (dbt-shaped)
 ├── freshness.py           # source mtime check
-├── backends/              # json, markdown, pdf, html, llm
+├── backends/              # json, markdown, pdf, html, email, llm
 ├── transforms/runner.py   # loads user Python transform modules + TransformContext
 ├── checks/                # schema tests + custom Python tests + severity
 ├── synth/                 # synthetic data generators per shape
@@ -630,30 +753,13 @@ src/dbt_ml/
 
 ## Roadmap
 
-**v0.2 — RAG + warehouse adapter pattern.** Tracked in GitHub issues
-tagged `roadmap`. The four headline pieces:
+The live plan is maintained in GitHub issues tagged
+[`roadmap`](https://github.com/C00ldudeNoonan/dbt-ml/issues?q=is%3Aissue+label%3Aroadmap).
+Already shipped in the v0.2 preview: the warehouse adapter seam, DuckDB and
+BigQuery, GCS sources, recursive/token chunk models, layout-preserving HTML/PDF
+metadata, PII redaction, and the first classic-ML providers.
 
-1. **Warehouse adapter pattern** matching dbt-core's set. v0.2 starts with
-   DuckDB (current) + LanceDB (lakehouse-style vector store); subsequent
-   versions add Postgres, then Snowflake / BigQuery / Databricks / Redshift.
-2. **Chunking primitives** as a first-class model kind: recursive (default),
-   token-aware, layout-aware, optional Anthropic Contextual Retrieval
-   (49–67% retrieval failure reduction per published numbers).
-3. **Embedding primitives** as a first-class model kind: Voyage, Cohere,
-   OpenAI, and local sentence-transformers providers. Same cache mechanic
-   as today's LLM backend so re-runs are free.
-4. **Layout-aware OSS parsers** as additional backends: Docling (privacy +
-   table quality), Marker (best OSS layout fidelity).
-
-**Deferred beyond v0.2:**
-
-- Rust CLI + PyO3 bridge.
-- Metaxy integration (replace `state.py` with `MetadataStore`).
-- Field-level lineage (`version_from: [ref('x').field_a]`).
-- Parallel *model* execution (today's `--threads` parallelizes within a model).
-- Managed parser backends (Reducto, Mistral OCR 3, LlamaParse) — generic
-  remote-parser adapter pattern when there's a real ask.
-- Reranker hooks (Cohere Rerank, Voyage Rerank).
-- Multi-LLM-provider adapters (Bedrock, Vertex, OpenAI structured output).
-- PII detection / redaction (Microsoft Presidio).
-- Ragas integration (`dbt-ml eval`).
+Next adapter work follows dbt-core's warehouse set over time: Postgres first,
+then Snowflake, Databricks, and Redshift. Embeddings/vector storage, more parser
+providers, and evaluation/reranking remain roadmap items. Incremental state
+stays adapter-owned. Rust, PyO3, and Metaxy remain explicitly deferred.

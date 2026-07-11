@@ -30,6 +30,7 @@ def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
     llm_cfg = ctx.llm
     model = llm_cfg.model if llm_cfg else "claude-haiku-4-5"
     cache_path = str(llm_cfg.cache_path) if llm_cfg and llm_cfg.cache_path else None
+    api_key_env = llm_cfg.api_key_env if llm_cfg else "ANTHROPIC_API_KEY"
 
     rows = []
     for row in raw.iter_rows(named=True):
@@ -38,6 +39,7 @@ def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
             fields_spec=SCHEMA,
             model=model,
             cache_path=cache_path,
+            api_key_env=api_key_env,
         )
         rows.append({"document_id": row["document_id"], **fields})
 

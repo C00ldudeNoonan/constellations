@@ -10,18 +10,22 @@ class DuckDBConfig(BaseModel):
     `profile:`. Prefer a profiles.yml `warehouse:` block; this is slated for
     removal once the legacy no-profile path goes away."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     path: Path = Path("./target/dbt_ml.duckdb")
     schema_name: str = Field(default="dbt_ml", alias="schema")
 
 
 class ExtractionDefaults(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     default_backend: str = "json"
 
 
 class ProjectConfig(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, protected_namespaces=())
+    model_config = ConfigDict(
+        populate_by_name=True, extra="forbid", protected_namespaces=()
+    )
 
     name: str
     version: str = "0.1.0"

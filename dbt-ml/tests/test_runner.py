@@ -101,6 +101,31 @@ def test_end_to_end_run(fresh_project: Path) -> None:
     assert rows[0][0] == 10
 
 
+def test_warehouse_options_portable_and_state_preserving(fresh_project: Path) -> None:
+    """BigQuery-shaped warehouse_options on a DuckDB target are ignored
+    (dev/prod portability, issue #91) and never invalidate incremental state."""
+    generate_invoices(5, fresh_project / "data" / "invoices", seed=1)
+    run_project(fresh_project, select="raw_invoices")
+
+    raw_yml = fresh_project / "models" / "raw_invoices.yml"
+    updated = raw_yml.read_text().replace(
+        "    materialization: incremental",
+        "    materialization: incremental\n"
+        "    warehouse_options:\n"
+        "      partition_by:\n"
+        "        field: issue_date\n"
+        "      cluster_by: [vendor]",
+        1,
+    )
+    assert "warehouse_options" in updated
+    raw_yml.write_text(updated)
+
+    (result,) = run_project(fresh_project, select="raw_invoices")
+    assert result.errors == []
+    assert result.documents_processed == 0
+    assert result.documents_skipped == 5
+
+
 def test_second_run_is_incremental(fresh_project: Path) -> None:
     invoices_dir = fresh_project / "data" / "invoices"
     generate_invoices(5, invoices_dir, seed=1)

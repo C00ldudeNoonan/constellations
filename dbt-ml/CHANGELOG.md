@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### BigQuery model-level parity (issue #91)
+
+- New model-level `warehouse_options:` block, opaque to core and validated by
+  the active adapter — BigQuery rejects unknown/malformed keys at run time;
+  adapters with no layout knobs (DuckDB) ignore the block, so one project can
+  target DuckDB in dev and BigQuery in prod.
+- BigQuery honors `partition_by` (time, ingestion-time, and integer-range,
+  mirroring dbt-bigquery's config shape) and `cluster_by` (up to 4 columns).
+  Layout applies when a table is created or fully rebuilt; changing layout on
+  an existing incremental table requires `--full-refresh`. Rebuilds stage and
+  validate the replacement before swapping, so a bad layout declaration never
+  destroys the last good table.
+- Table options: `require_partition_filter`, `partition_expiration_days`,
+  `hours_to_expiration` (table TTL), `labels` (applied to the table and as
+  job labels on the model's load/query jobs), and `kms_key_name` (set at
+  create time via the load job's encryption configuration or CREATE DDL).
+- `incremental_strategy: insert_overwrite` — dbt-bigquery's dynamic
+  partition-replacement for incremental models (time partitioning with a
+  field only). Requires that documents sharing a partition re-extract
+  together and that a run's changed documents fit one `flush_every` batch;
+  `merge` stays the default and is always correct.
+- `warehouse_options` is excluded from `code_version`: declaring or tuning
+  layout never reprocesses documents.
+- Deferred from #91: `table_format: iceberg` (BigLake) — creating Iceberg
+  tables needs explicit column DDL, which lands with #86's table contracts.
+
 ### Security
 
 - Local `source.file_pattern` values must be relative and cannot contain `..`.

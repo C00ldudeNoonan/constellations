@@ -268,6 +268,13 @@ class ModelConfig(BaseModel):
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
     on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
+    # Adapter-specific physical-layout knobs (issue #91), opaque to core:
+    # the active adapter validates its own keys (e.g. BigQuery partition_by /
+    # cluster_by); adapters that support none ignore the block so one project
+    # can target DuckDB in dev and BigQuery in prod. Excluded from
+    # code_version: layout never changes row content. Changing partitioning
+    # on an existing table requires --full-refresh to rebuild it.
+    warehouse_options: dict[str, Any] = Field(default_factory=dict)
     tests: list[Any] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 

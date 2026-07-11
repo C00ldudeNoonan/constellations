@@ -17,6 +17,7 @@ parameters, converted to BigQuery query parameters here.
 from __future__ import annotations
 
 import io
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -25,7 +26,14 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 import polars as pl
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from ..config.profile import WarehouseConfig
 from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
@@ -160,6 +168,109 @@ class BigQueryWarehouseConfig(WarehouseConfig):
         return self.project
 
 
+class BigQueryPartitionRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: int
+    end: int
+    interval: int = Field(gt=0)
+
+
+class BigQueryPartitionBy(BaseModel):
+    """Mirrors dbt-bigquery's `partition_by` resource config: a time column
+    (timestamp/date/datetime + granularity), an integer-range column
+    (int64 + range), or ingestion time when `field` is omitted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str | None = None
+    data_type: Literal["timestamp", "date", "datetime", "int64"] = "date"
+    granularity: Literal["hour", "day", "month", "year"] = "day"
+    range: BigQueryPartitionRange | None = None
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> BigQueryPartitionBy:
+        if self.data_type == "int64":
+            if self.field is None:
+                raise ValueError("int64 partitioning requires `field`")
+            if self.range is None:
+                raise ValueError(
+                    "int64 partitioning requires `range` (start/end/interval)"
+                )
+        elif self.range is not None:
+            raise ValueError("`range` applies only to `data_type: int64`")
+        if self.data_type == "date" and self.granularity == "hour":
+            raise ValueError("date columns cannot partition by hour granularity")
+        return self
+
+
+_LABEL_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
+_LABEL_VALUE_RE = re.compile(r"^[a-z0-9_-]{0,63}$")
+
+
+class BigQueryWarehouseOptions(BaseModel):
+    """Model-level `warehouse_options` for BigQuery (issue #91). Layout
+    (partitioning/clustering) applies when a target table is (re)created; an
+    existing incremental table keeps its layout until --full-refresh rebuilds
+    it. Table options (labels, expirations, require_partition_filter,
+    kms_key_name) are set on every (re)create; `labels` are also attached to
+    the load and query jobs the adapter runs for the model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    partition_by: BigQueryPartitionBy | None = None
+    cluster_by: list[str] = Field(default_factory=list, max_length=4)
+    require_partition_filter: bool | None = None
+    partition_expiration_days: float | None = Field(default=None, gt=0)
+    hours_to_expiration: int | None = Field(default=None, gt=0)
+    labels: dict[str, str] = Field(default_factory=dict)
+    kms_key_name: str | None = None
+    # merge (default) upserts by key. insert_overwrite replaces every
+    # partition present in the incoming batch — dbt-bigquery semantics,
+    # for pipelines that reprocess whole partitions at a time.
+    incremental_strategy: Literal["merge", "insert_overwrite"] = "merge"
+
+    @field_validator("cluster_by", mode="before")
+    @classmethod
+    def _single_column_ok(cls, value: Any) -> Any:
+        return [value] if isinstance(value, str) else value
+
+    @field_validator("labels")
+    @classmethod
+    def _validate_labels(cls, labels: dict[str, str]) -> dict[str, str]:
+        for key, value in labels.items():
+            if not _LABEL_KEY_RE.match(key):
+                raise ValueError(
+                    f"label key {key!r} must be 1-63 chars of lowercase "
+                    "letters, digits, _ or -, starting with a letter"
+                )
+            if not _LABEL_VALUE_RE.match(value):
+                raise ValueError(
+                    f"label value {value!r} must be 0-63 chars of lowercase "
+                    "letters, digits, _ or -"
+                )
+        return labels
+
+    @model_validator(mode="after")
+    def _validate_partition_dependencies(self) -> BigQueryWarehouseOptions:
+        if self.partition_by is None:
+            for name in ("require_partition_filter", "partition_expiration_days"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"`{name}` requires `partition_by`")
+        if self.incremental_strategy == "insert_overwrite":
+            if self.partition_by is None or self.partition_by.field is None:
+                raise ValueError(
+                    "incremental_strategy: insert_overwrite requires "
+                    "`partition_by` with a `field`"
+                )
+            if self.partition_by.data_type == "int64":
+                raise ValueError(
+                    "incremental_strategy: insert_overwrite supports time "
+                    "partitioning only (timestamp/date/datetime)"
+                )
+        return self
+
+
 def parse_keyfile_json(value: dict[str, Any] | str) -> dict[str, Any]:
     """`keyfile_json` accepts a YAML mapping, a JSON string, or base64-encoded
     JSON (matching dbt-bigquery, where CI pipelines inject it via env vars)."""
@@ -268,6 +379,10 @@ class BigQueryAdapter(WarehouseAdapter):
     @classmethod
     def config_model(cls) -> type[WarehouseConfig]:
         return BigQueryWarehouseConfig
+
+    @classmethod
+    def warehouse_options_model(cls) -> type[BaseModel] | None:
+        return BigQueryWarehouseOptions
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
@@ -411,14 +526,23 @@ class BigQueryAdapter(WarehouseAdapter):
 
     # ─── querying ────────────────────────────────────────────────────────
 
-    def _run_query(self, sql: str, params: list[Any] | None = None) -> Any:
+    def _run_query(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        job_labels: dict[str, str] | None = None,
+    ) -> Any:
         bigquery = _bigquery()
         cfg = self._cfg
         kwargs: dict[str, Any] = {}
-        if params:
-            kwargs["job_config"] = bigquery.QueryJobConfig(
-                query_parameters=to_query_parameters(params)
-            )
+        if params or job_labels:
+            job_config = bigquery.QueryJobConfig()
+            if params:
+                job_config.query_parameters = to_query_parameters(params)
+            if job_labels:
+                job_config.labels = dict(job_labels)
+            kwargs["job_config"] = job_config
         if cfg.job_creation_timeout_seconds is not None:
             kwargs["timeout"] = cfg.job_creation_timeout_seconds
         if cfg.job_retries == 0:
@@ -462,6 +586,178 @@ class BigQueryAdapter(WarehouseAdapter):
 
     # ─── materialization ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _layout(options: BaseModel | None) -> BigQueryWarehouseOptions | None:
+        if options is None:
+            return None
+        assert isinstance(options, BigQueryWarehouseOptions)
+        return options
+
+    def _apply_layout_to_load(
+        self, job_config: Any, options: BaseModel | None
+    ) -> None:
+        """Partitioning/clustering/encryption on a load job creating the
+        target table; labels ride along as job labels."""
+        layout = self._layout(options)
+        if layout is None:
+            return
+        bigquery = _bigquery()
+        if layout.kms_key_name:
+            job_config.destination_encryption_configuration = (
+                bigquery.EncryptionConfiguration(kms_key_name=layout.kms_key_name)
+            )
+        if layout.labels:
+            job_config.labels = dict(layout.labels)
+        if layout.cluster_by:
+            job_config.clustering_fields = list(layout.cluster_by)
+        pb = layout.partition_by
+        if pb is None:
+            return
+        if pb.data_type == "int64":
+            assert pb.range is not None
+            job_config.range_partitioning = bigquery.RangePartitioning(
+                field=pb.field,
+                range_=bigquery.PartitionRange(
+                    start=pb.range.start, end=pb.range.end, interval=pb.range.interval
+                ),
+            )
+        else:
+            job_config.time_partitioning = bigquery.TimePartitioning(
+                type_=pb.granularity.upper(), field=pb.field
+            )
+
+    def _partition_expression(self, pb: BigQueryPartitionBy) -> str:
+        if pb.data_type == "int64":
+            assert pb.field is not None and pb.range is not None
+            return (
+                f"RANGE_BUCKET({self.quote_ident(pb.field)}, "
+                f"GENERATE_ARRAY({pb.range.start}, {pb.range.end}, "
+                f"{pb.range.interval}))"
+            )
+        granularity = pb.granularity.upper()
+        if pb.field is None:
+            if granularity == "DAY":
+                return "_PARTITIONDATE"
+            return f"TIMESTAMP_TRUNC(_PARTITIONTIME, {granularity})"
+        return self._partition_scalar(pb, self.quote_ident(pb.field))
+
+    @staticmethod
+    def _partition_scalar(pb: BigQueryPartitionBy, ref: str) -> str:
+        """The partition identity of `ref` (a column reference) for a
+        time-partitioned table."""
+        granularity = pb.granularity.upper()
+        if pb.data_type == "date":
+            return ref if granularity == "DAY" else f"DATE_TRUNC({ref}, {granularity})"
+        trunc = "TIMESTAMP_TRUNC" if pb.data_type == "timestamp" else "DATETIME_TRUNC"
+        return f"{trunc}({ref}, {granularity})"
+
+    def _insert_overwrite_script(
+        self,
+        table: str,
+        staging: str,
+        columns: list[str],
+        pb: BigQueryPartitionBy,
+    ) -> str:
+        """dbt-bigquery's dynamic insert_overwrite: collect the partitions
+        present in the batch, then one MERGE that drops those partitions and
+        inserts the batch. Rows with a NULL partition value insert without
+        clearing the NULL partition."""
+        assert pb.field is not None
+        array_type = {
+            "date": "DATE",
+            "timestamp": "TIMESTAMP",
+            "datetime": "DATETIME",
+        }[pb.data_type]
+        field = self.quote_ident(pb.field)
+        source_expr = self._partition_scalar(pb, field)
+        target_expr = self._partition_scalar(pb, f"target.{field}")
+        insert_columns = ", ".join(self.quote_ident(c) for c in columns)
+        insert_values = ", ".join(f"source.{self.quote_ident(c)}" for c in columns)
+        return (
+            f"DECLARE dbt_ml_partitions ARRAY<{array_type}>;\n"
+            f"SET dbt_ml_partitions = ARRAY(SELECT DISTINCT {source_expr} "
+            f"FROM {self.table_ref(staging)} WHERE {field} IS NOT NULL);\n"
+            f"MERGE {self.table_ref(table)} AS target "
+            f"USING {self.table_ref(staging)} AS source ON FALSE "
+            f"WHEN NOT MATCHED BY SOURCE AND {target_expr} "
+            "IN UNNEST(dbt_ml_partitions) THEN DELETE "
+            f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
+            f"VALUES ({insert_values});"
+        )
+
+    @staticmethod
+    def _sql_string(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    def _table_option_entries(
+        self, layout: BigQueryWarehouseOptions, *, include_kms: bool
+    ) -> list[str]:
+        """`key = value` entries for OPTIONS(...) in CREATE and ALTER DDL.
+        kms_key_name is create-only: on load-created tables encryption is
+        already set via the job config, and re-keying via ALTER is out of
+        scope for a materialization run."""
+        entries: list[str] = []
+        if layout.require_partition_filter is not None:
+            entries.append(
+                "require_partition_filter = "
+                + ("TRUE" if layout.require_partition_filter else "FALSE")
+            )
+        if layout.partition_expiration_days is not None:
+            entries.append(
+                f"partition_expiration_days = {layout.partition_expiration_days}"
+            )
+        if layout.hours_to_expiration is not None:
+            entries.append(
+                "expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+                f"INTERVAL {layout.hours_to_expiration} HOUR)"
+            )
+        if layout.labels:
+            pairs = ", ".join(
+                f"({self._sql_string(k)}, {self._sql_string(v)})"
+                for k, v in sorted(layout.labels.items())
+            )
+            entries.append(f"labels = [{pairs}]")
+        if include_kms and layout.kms_key_name:
+            entries.append(f"kms_key_name = {self._sql_string(layout.kms_key_name)}")
+        return entries
+
+    def _ddl_layout_clauses(self, options: BaseModel | None) -> str:
+        """` PARTITION BY … CLUSTER BY … OPTIONS (…)` for CREATE TABLE DDL,
+        or ''."""
+        layout = self._layout(options)
+        if layout is None:
+            return ""
+        clauses: list[str] = []
+        if layout.partition_by is not None:
+            clauses.append(
+                f"PARTITION BY {self._partition_expression(layout.partition_by)}"
+            )
+        if layout.cluster_by:
+            clauses.append(
+                "CLUSTER BY "
+                + ", ".join(self.quote_ident(c) for c in layout.cluster_by)
+            )
+        option_entries = self._table_option_entries(layout, include_kms=True)
+        if option_entries:
+            clauses.append(f"OPTIONS ({', '.join(option_entries)})")
+        return (" " + " ".join(clauses)) if clauses else ""
+
+    def _apply_post_create_options(
+        self, table: str, options: BaseModel | None
+    ) -> None:
+        """Table options a load job cannot express, set right after a load
+        creates the table."""
+        layout = self._layout(options)
+        if layout is None:
+            return
+        entries = self._table_option_entries(layout, include_kms=False)
+        if not entries:
+            return
+        self._run_query(
+            f"ALTER TABLE {self.table_ref(table)} SET OPTIONS ({', '.join(entries)})",
+            job_labels=layout.labels,
+        )
+
     def _load_parquet(self, table: str, df: pl.DataFrame, job_config: Any) -> None:
         buffer = io.BytesIO()
         df.write_parquet(buffer)
@@ -471,7 +767,9 @@ class BigQueryAdapter(WarehouseAdapter):
         )
         job.result()
 
-    def materialize_full(self, table: str, df: pl.DataFrame) -> int:
+    def materialize_full(
+        self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None
+    ) -> int:
         if df.width == 0:
             self.drop_table(table)
             return 0
@@ -480,8 +778,48 @@ class BigQueryAdapter(WarehouseAdapter):
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
-        self._load_parquet(table, df, job_config)
+        layout = self._layout(options)
+        if layout is None:
+            self._load_parquet(table, df, job_config)
+            return df.height
+
+        # A load job cannot change an existing table's partitioning or
+        # clustering spec, and dropping the target up front would make a bad
+        # layout declaration destructive. Build the replacement in a staging
+        # table — the load validates partition/cluster columns against the
+        # data — then swap. The target only drops after the replacement is
+        # fully created and configured.
+        self._apply_layout_to_load(job_config, options)
+        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+        target_dropped = False
+        try:
+            self._load_parquet(staging, df, job_config)
+            self._apply_post_create_options(staging, options)
+            self.drop_table(table)
+            target_dropped = True
+            self._rename_table(staging, table, job_labels=layout.labels or None)
+        except BaseException as error:
+            if target_dropped:
+                error.add_note(
+                    f"Target '{table}' was dropped but the swap failed; the "
+                    f"replacement data is preserved in '{staging}'."
+                )
+            else:
+                try:
+                    self.drop_table(staging)
+                except Exception as cleanup_error:
+                    error.add_note(f"Failed to clean staging table: {cleanup_error}")
+            raise
         return df.height
+
+    def _rename_table(
+        self, current: str, new_name: str, *, job_labels: dict[str, str] | None = None
+    ) -> None:
+        self._run_query(
+            f"ALTER TABLE {self.table_ref(current)} "
+            f"RENAME TO {self.quote_ident(new_name)}",
+            job_labels=job_labels,
+        )
 
     def materialize_incremental(
         self,
@@ -490,6 +828,7 @@ class BigQueryAdapter(WarehouseAdapter):
         *,
         key_col: str,
         on_schema_change: str = "fail",
+        options: BaseModel | None = None,
     ) -> int:
         if df.height == 0:
             return 0
@@ -504,7 +843,9 @@ class BigQueryAdapter(WarehouseAdapter):
                 source_format=bigquery.SourceFormat.PARQUET,
                 write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
             )
+            self._apply_layout_to_load(job_config, options)
             self._load_parquet(table, load_df, job_config)
+            self._apply_post_create_options(table, options)
             return df.height
 
         if key_col not in existing:
@@ -515,6 +856,19 @@ class BigQueryAdapter(WarehouseAdapter):
         allow_field_addition = plan.allow_field_addition
         if plan.columns_to_load != list(df.columns):
             load_df = df.select(plan.columns_to_load)
+
+        layout = self._layout(options)
+        job_labels = layout.labels if layout is not None else None
+        insert_overwrite = (
+            layout is not None and layout.incremental_strategy == "insert_overwrite"
+        )
+        if insert_overwrite:
+            assert layout is not None and layout.partition_by is not None
+            if layout.partition_by.field not in load_df.columns:
+                raise AdapterError(
+                    f"insert_overwrite on '{table}' needs partition column "
+                    f"'{layout.partition_by.field}' in the incremental batch"
+                )
 
         if allow_field_addition:
             schema_config = bigquery.LoadJobConfig(
@@ -531,30 +885,42 @@ class BigQueryAdapter(WarehouseAdapter):
         )
         try:
             self._load_parquet(staging, load_df, staging_config)
-            final_columns = [*existing]
-            final_columns.extend(c for c in load_df.columns if c not in final_columns)
-            assignments = ", ".join(
-                f"target.{self.quote_ident(column)} = "
-                f"source.{self.quote_ident(column)}"
-                if column in load_df.columns
-                else f"target.{self.quote_ident(column)} = NULL"
-                for column in final_columns
-            )
-            insert_columns = ", ".join(
-                self.quote_ident(column) for column in load_df.columns
-            )
-            insert_values = ", ".join(
-                f"source.{self.quote_ident(column)}" for column in load_df.columns
-            )
-            self._run_query(
-                f"MERGE {self.table_ref(table)} AS target "
-                f"USING {self.table_ref(staging)} AS source "
-                f"ON target.{self.quote_ident(key_col)} = "
-                f"source.{self.quote_ident(key_col)} "
-                f"WHEN MATCHED THEN UPDATE SET {assignments} "
-                f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
-                f"VALUES ({insert_values})"
-            )
+            if insert_overwrite:
+                assert layout is not None and layout.partition_by is not None
+                self._run_query(
+                    self._insert_overwrite_script(
+                        table, staging, list(load_df.columns), layout.partition_by
+                    ),
+                    job_labels=job_labels,
+                )
+            else:
+                final_columns = [*existing]
+                final_columns.extend(
+                    c for c in load_df.columns if c not in final_columns
+                )
+                assignments = ", ".join(
+                    f"target.{self.quote_ident(column)} = "
+                    f"source.{self.quote_ident(column)}"
+                    if column in load_df.columns
+                    else f"target.{self.quote_ident(column)} = NULL"
+                    for column in final_columns
+                )
+                insert_columns = ", ".join(
+                    self.quote_ident(column) for column in load_df.columns
+                )
+                insert_values = ", ".join(
+                    f"source.{self.quote_ident(column)}" for column in load_df.columns
+                )
+                self._run_query(
+                    f"MERGE {self.table_ref(table)} AS target "
+                    f"USING {self.table_ref(staging)} AS source "
+                    f"ON target.{self.quote_ident(key_col)} = "
+                    f"source.{self.quote_ident(key_col)} "
+                    f"WHEN MATCHED THEN UPDATE SET {assignments} "
+                    f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
+                    f"VALUES ({insert_values})",
+                    job_labels=job_labels,
+                )
         except BaseException as error:
             try:
                 self.drop_table(staging)
@@ -566,10 +932,18 @@ class BigQueryAdapter(WarehouseAdapter):
         return df.height
 
     def materialize_full_chunks(
-        self, table: str, chunks: Iterable[pl.DataFrame]
+        self,
+        table: str,
+        chunks: Iterable[pl.DataFrame],
+        *,
+        options: BaseModel | None = None,
     ) -> int:
         bigquery = _bigquery()
+        layout = self._layout(options)
+        job_labels = layout.labels if layout is not None else None
         staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+        replacement: str | None = None
+        target_dropped = False
         total = 0
         first = True
         try:
@@ -582,6 +956,8 @@ class BigQueryAdapter(WarehouseAdapter):
                         else bigquery.WriteDisposition.WRITE_APPEND
                     ),
                 )
+                if job_labels:
+                    job_config.labels = dict(job_labels)
                 if not first:
                     # Union intra-run schema drift: new columns are added,
                     # columns missing from a chunk load as NULL.
@@ -593,15 +969,42 @@ class BigQueryAdapter(WarehouseAdapter):
                 total += df.height
             if first:
                 return self.materialize_full(table, pl.DataFrame())
-            self._run_query(
-                f"CREATE OR REPLACE TABLE {self.table_ref(table)} "
-                f"AS SELECT * FROM {self.table_ref(staging)}"
-            )
+            layout_clauses = self._ddl_layout_clauses(options)
+            if layout_clauses:
+                # CREATE OR REPLACE cannot change an existing table's
+                # partitioning spec, and dropping the target before the CTAS
+                # is validated would make a bad layout declaration
+                # destructive. Materialize the replacement (validating the
+                # declared layout against real columns), then swap.
+                replacement = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+                self._run_query(
+                    f"CREATE TABLE {self.table_ref(replacement)}{layout_clauses} "
+                    f"AS SELECT * FROM {self.table_ref(staging)}",
+                    job_labels=job_labels,
+                )
+                self.drop_table(table)
+                target_dropped = True
+                self._rename_table(replacement, table, job_labels=job_labels)
+            else:
+                self._run_query(
+                    f"CREATE OR REPLACE TABLE {self.table_ref(table)} "
+                    f"AS SELECT * FROM {self.table_ref(staging)}",
+                    job_labels=job_labels,
+                )
         except BaseException as error:
-            try:
-                self.drop_table(staging)
-            except Exception as cleanup_error:
-                error.add_note(f"Failed to clean staging table: {cleanup_error}")
+            if target_dropped:
+                error.add_note(
+                    f"Target '{table}' was dropped but the swap failed; the "
+                    f"replacement data is preserved in '{replacement}'."
+                )
+                cleanup = [staging]
+            else:
+                cleanup = [staging, replacement] if replacement else [staging]
+            for name in cleanup:
+                try:
+                    self.drop_table(name)
+                except Exception as cleanup_error:
+                    error.add_note(f"Failed to clean staging table: {cleanup_error}")
             raise
         else:
             self.drop_table(staging)

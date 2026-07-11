@@ -270,13 +270,13 @@ def test_full_materialization_streams_through_staging(
     chunk_counts: list[int] = []
     orig = DuckDBAdapter.materialize_full_chunks
 
-    def spy(self: DuckDBAdapter, table: str, chunks: Any) -> int:
+    def spy(self: DuckDBAdapter, table: str, chunks: Any, **kwargs: Any) -> int:
         def counting() -> Any:
             for df in chunks:
                 chunk_counts.append(df.height)
                 yield df
 
-        return orig(self, table, counting())
+        return orig(self, table, counting(), **kwargs)
 
     monkeypatch.setattr(DuckDBAdapter, "materialize_full_chunks", spy)
 

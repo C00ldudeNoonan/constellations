@@ -18,6 +18,7 @@ from types import TracebackType
 from typing import Any, Self
 
 import polars as pl
+from pydantic import BaseModel, ValidationError
 
 from ..config.profile import WarehouseConfig
 
@@ -63,6 +64,31 @@ class WarehouseAdapter(ABC):
     def config_model(cls) -> type[WarehouseConfig]:
         """The WarehouseConfig subclass this adapter's profile block
         validates against."""
+
+    @classmethod
+    def warehouse_options_model(cls) -> type[BaseModel] | None:
+        """Pydantic model validating model-level `warehouse_options` for this
+        adapter (issue #91), or None when the adapter supports none. A None
+        adapter ignores the block entirely — a project can carry e.g. BigQuery
+        partitioning config while its dev target runs DuckDB."""
+        return None
+
+    def parse_warehouse_options(
+        self, options: dict[str, Any], *, model_name: str
+    ) -> BaseModel | None:
+        """Validate a model's `warehouse_options` against this adapter's
+        options model. Unknown keys are a config error on adapters that
+        declare a model, and ignored on adapters that don't."""
+        options_model = self.warehouse_options_model()
+        if not options or options_model is None:
+            return None
+        try:
+            return options_model.model_validate(options)
+        except ValidationError as e:
+            raise AdapterError(
+                f"Model '{model_name}': invalid warehouse_options for "
+                f"{self.adapter_type()}: {e}"
+            ) from e
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
@@ -121,8 +147,14 @@ class WarehouseAdapter(ABC):
     # ─── materialization ──────────────────────────────────────────────────
 
     @abstractmethod
-    def materialize_full(self, table: str, df: pl.DataFrame) -> int:
-        """Replace `table` with `df`. Returns row count written."""
+    def materialize_full(
+        self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None
+    ) -> int:
+        """Replace `table` with `df`. Returns row count written.
+
+        `options` is this adapter's parsed warehouse_options (from
+        `parse_warehouse_options`); it shapes physical layout when the target
+        table is (re)created and is None for adapters that support none."""
 
     @abstractmethod
     def materialize_incremental(
@@ -132,6 +164,7 @@ class WarehouseAdapter(ABC):
         *,
         key_col: str,
         on_schema_change: str = "fail",
+        options: BaseModel | None = None,
     ) -> int:
         """Upsert rows in `df` into `table`, keyed on `key_col`. Returns rows written.
 
@@ -139,11 +172,19 @@ class WarehouseAdapter(ABC):
         differ from the existing table's, `on_schema_change` decides:
         `fail` raises with a hint to --full-refresh; `append_new_columns`
         adds missing columns to the table (existing rows get NULL);
-        `ignore` inserts only the columns the table already has."""
+        `ignore` inserts only the columns the table already has.
+
+        `options` (parsed warehouse_options) applies only when the target
+        table does not exist yet — an existing table keeps its physical
+        layout until --full-refresh rebuilds it."""
 
     @abstractmethod
     def materialize_full_chunks(
-        self, table: str, chunks: Iterable[pl.DataFrame]
+        self,
+        table: str,
+        chunks: Iterable[pl.DataFrame],
+        *,
+        options: BaseModel | None = None,
     ) -> int:
         """Replace `table` with the concatenation of `chunks` without holding
         them all in memory (issue #77): chunks land in a staging table

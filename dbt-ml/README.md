@@ -320,6 +320,54 @@ drop or mutate the BigQuery dataset; it only removes known local target
 artifacts. `emit-dbt-sources` emits `database: <project>` / `schema: <dataset>`
 so a dbt-bigquery project can consume the tables directly.
 
+#### Partitioning & clustering (`warehouse_options`)
+
+Models may declare adapter-specific physical layout under
+`warehouse_options:` (issue #91), mirroring dbt-bigquery's `partition_by` /
+`cluster_by` resource configs:
+
+```yaml
+- name: filings_chunks
+  materialization: incremental
+  warehouse_options:
+    partition_by:
+      field: filing_date        # omit for ingestion-time partitioning
+      data_type: date           # timestamp | date (default) | datetime | int64
+      granularity: day          # hour | day (default) | month | year
+      # int64 instead takes: range: {start: 0, end: 100, interval: 10}
+    cluster_by: [cik, form_type] # up to 4 columns; a single string works too
+    require_partition_filter: true
+    partition_expiration_days: 365
+    hours_to_expiration: 72      # whole-table TTL
+    labels: {team: econ, env: prod}   # table labels + job labels
+    kms_key_name: projects/p/locations/us/keyRings/r/cryptoKeys/k
+    incremental_strategy: merge  # or insert_overwrite (see below)
+```
+
+The block is validated by the *active* adapter: BigQuery rejects unknown or
+malformed keys at run time, while adapters with no layout knobs (DuckDB
+today) ignore it entirely — so one project can run DuckDB in dev and
+BigQuery in prod. Layout applies when the table is created or fully
+rebuilt (`full` models rebuild every run); an existing incremental table
+keeps its layout, so adding or changing `partition_by` on an incremental
+model needs one `--full-refresh`. Rebuilds are staged and swapped: the
+replacement table is built and validated first, so a bad layout
+declaration fails the run without touching the last good table.
+`warehouse_options` never changes `code_version` — declaring it does not
+reprocess documents. `labels` are applied to the table and to the load /
+query jobs the run issues for that model (for cost attribution).
+
+**`incremental_strategy: insert_overwrite`** replaces every partition
+present in the incoming batch instead of merging by `document_id` —
+dbt-bigquery semantics, with partition pruning instead of a full-table
+key scan. Two contracts come with it: documents sharing a partition must
+always re-extract together (unchanged documents in a touched partition
+are dropped, because incremental batches contain only changed documents),
+and one run's changed documents must fit in a single flush
+(`flush_every`, default 5000) so a partition is never split across
+flushes. Time partitioning with a `field` is required. When in doubt,
+stay on `merge` — it is always correct.
+
 String values support `{{ env_var('NAME') }}` and
 `{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
 profiles need, so credentials and per-environment paths stay out of the file.

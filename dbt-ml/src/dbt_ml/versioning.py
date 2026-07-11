@@ -38,7 +38,10 @@ def compute_code_version(
     payload: dict[str, Any] = {
         # flush_every shapes execution (memory/flush cadence), never output
         # content — including it would invalidate every model's incremental
-        # state on upgrade.
+        # state on upgrade. ModelConfig.warehouse_options stays out for the
+        # same reason (issue #91): partitioning/clustering shape physical
+        # layout, not row content, and applying a layout change needs
+        # --full-refresh regardless.
         "extraction": extraction.model_dump(exclude={"flush_every"})
         if extraction
         else None,

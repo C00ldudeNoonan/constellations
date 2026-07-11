@@ -435,6 +435,17 @@ def _run_model(
     return result
 
 
+def _warehouse_options(adapter: WarehouseAdapter, model: ModelConfig) -> Any:
+    """Parse model-level warehouse_options through the active adapter,
+    surfacing validation problems as a model config error."""
+    try:
+        return adapter.parse_warehouse_options(
+            model.warehouse_options, model_name=model.name
+        )
+    except AdapterError as e:
+        raise RunError(str(e)) from e
+
+
 def _run_extraction_model(
     *,
     model: ModelConfig,
@@ -485,6 +496,7 @@ def _run_extraction_model(
         fields=model.fields,
         project_dir=project_dir,
     )
+    warehouse_opts = _warehouse_options(adapter, model)
 
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(model.name) if is_incremental else {}
@@ -633,7 +645,9 @@ def _run_extraction_model(
                     yield _empty_extraction_frame(model)
 
             try:
-                rows_written = adapter.materialize_full_chunks(model.name, _frames())
+                rows_written = adapter.materialize_full_chunks(
+                    model.name, _frames(), options=warehouse_opts
+                )
                 full_committed = True
             except _FullExtractionFailed:
                 rows_written = 0
@@ -663,6 +677,7 @@ def _run_extraction_model(
                             if first_flush
                             else "append_new_columns"
                         ),
+                        options=warehouse_opts,
                     )
                 except AdapterError as e:
                     # RunError so `build` fails this model and blocks
@@ -680,7 +695,11 @@ def _run_extraction_model(
 
             if not docs and model.name not in existing_tables:
                 try:
-                    adapter.materialize_full(model.name, _empty_extraction_frame(model))
+                    adapter.materialize_full(
+                        model.name,
+                        _empty_extraction_frame(model),
+                        options=warehouse_opts,
+                    )
                 except AdapterError as e:
                     raise RunError(str(e)) from e
 
@@ -871,7 +890,9 @@ def _run_transform_model(
             f"Transform '{model.transform.module}' must return a polars.DataFrame"
         )
 
-    adapter.materialize_full(model.name, output)
+    adapter.materialize_full(
+        model.name, output, options=_warehouse_options(adapter, model)
+    )
 
     return ModelRunResult(
         model_name=model.name,
@@ -915,6 +936,7 @@ def _run_chunk_model(
         depends_on=[upstream],
         project_dir=project_dir,
     )
+    warehouse_opts = _warehouse_options(adapter, model)
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(model.name) if is_incremental else {}
 
@@ -977,7 +999,9 @@ def _run_chunk_model(
     if rows or full_refresh or model.materialization == "full":
         chunk_df = pl.DataFrame(rows) if rows else pl.DataFrame()
         if model.materialization == "full" or full_refresh:
-            rows_written = adapter.materialize_full(model.name, chunk_df)
+            rows_written = adapter.materialize_full(
+                model.name, chunk_df, options=warehouse_opts
+            )
         else:
             try:
                 rows_written = adapter.materialize_incremental(
@@ -985,6 +1009,7 @@ def _run_chunk_model(
                     chunk_df,
                     key_col="chunk_id",
                     on_schema_change=model.on_schema_change,
+                    options=warehouse_opts,
                 )
             except AdapterError as e:
                 raise RunError(str(e)) from e
@@ -1059,7 +1084,9 @@ def _run_ml_model(
     except Exception as e:
         raise RunError(f"ML model '{model.name}' failed: {e}") from e
 
-    rows_written = adapter.materialize_full(model.name, output.df)
+    rows_written = adapter.materialize_full(
+        model.name, output.df, options=_warehouse_options(adapter, model)
+    )
     return ModelRunResult(
         model_name=model.name,
         materialization=model.materialization,

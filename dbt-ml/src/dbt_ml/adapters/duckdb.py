@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import duckdb
 import polars as pl
+from pydantic import BaseModel
 
 from ..config.profile import WarehouseConfig
 from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
@@ -108,7 +109,9 @@ class DuckDBAdapter(WarehouseAdapter):
 
     # ─── materialization ─────────────────────────────────────────────────
 
-    def materialize_full(self, table: str, df: pl.DataFrame) -> int:
+    def materialize_full(
+        self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None
+    ) -> int:
         full = self.table_ref(table)
         self.connection.register("dbt_ml_staging", df)
         try:
@@ -126,6 +129,7 @@ class DuckDBAdapter(WarehouseAdapter):
         *,
         key_col: str,
         on_schema_change: str = "fail",
+        options: BaseModel | None = None,
     ) -> int:
         if df.height == 0:
             return 0
@@ -167,7 +171,11 @@ class DuckDBAdapter(WarehouseAdapter):
         return df.height
 
     def materialize_full_chunks(
-        self, table: str, chunks: Iterable[pl.DataFrame]
+        self,
+        table: str,
+        chunks: Iterable[pl.DataFrame],
+        *,
+        options: BaseModel | None = None,
     ) -> int:
         staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
         staging_ref = self.table_ref(staging)

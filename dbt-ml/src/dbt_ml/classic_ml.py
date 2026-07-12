@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import math
+import os
 import re
+import shutil
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import Any, Literal, TypedDict, cast
+from uuid import uuid4
 
 import polars as pl
 
@@ -88,6 +96,37 @@ class ClassicMLRun:
     training_input: dict[str, Any]
     metrics: dict[str, Any]
     artifact_metadata: dict[str, Any]
+    _publication: ClassicMLArtifactPublication | None = field(default=None, repr=False)
+
+    def publish_artifact(self) -> None:
+        if self._publication is not None:
+            self._publication.publish()
+
+    def discard_staged_artifact(self) -> None:
+        if self._publication is not None:
+            self._publication.discard()
+
+
+@dataclass
+class ClassicMLArtifactPublication:
+    final_path: Path
+    staged_path: Path
+    registry_path: Path
+    model_name: str
+    registry_entry: dict[str, Any]
+    _finished: bool = field(default=False, init=False, repr=False)
+
+    def publish(self) -> None:
+        if self._finished:
+            return
+        _publish_staged_artifact(self)
+        self._finished = True
+
+    def discard(self) -> None:
+        if self._finished:
+            return
+        _remove_path(self.staged_path)
+        self._finished = True
 
 
 class ClassicMLArtifactError(ValueError):
@@ -114,6 +153,7 @@ def run_classic_ml_model(
     adapter: WarehouseAdapter,
 ) -> ClassicMLRun:
     assert model.ml is not None
+    _recover_artifact_publications(project, project_dir)
     contract = validate_ml_contract(model, project, project_dir)
     if contract.task == "features":
         return _run_features(
@@ -196,15 +236,23 @@ def _run_features(
             metrics=all_metrics,
             code_version=code_version,
         )
-        _write_artifact(artifact_path, metadata, vectorizer)
-        metadata = _read_metadata(artifact_path)
-        _write_artifact_registry(
-            project=project,
-            project_dir=project_dir,
-            model=model,
-            artifact_path=artifact_path,
-            metadata=metadata,
-        )
+        staged_path = _new_artifact_staging_path(artifact_path)
+        try:
+            _write_artifact(staged_path, metadata, vectorizer)
+            metadata, _ = _read_artifact(staged_path, provider, ml)
+            publication = _artifact_publication(
+                project=project,
+                project_dir=project_dir,
+                model=model,
+                artifact_path=artifact_path,
+                staged_path=staged_path,
+                metadata=metadata,
+            )
+        except BaseException:
+            _remove_path(staged_path)
+            raise
+    else:
+        publication = None
 
     if ml.mode == "fit":
         df = pl.DataFrame(
@@ -227,6 +275,7 @@ def _run_features(
         training_input=metadata.get("training_input", training_input),
         metrics=_project_metrics(ml, all_metrics),
         artifact_metadata=metadata,
+        _publication=publication,
     )
 
 
@@ -287,18 +336,25 @@ def _run_classifier(
             metrics=all_metrics,
             code_version=code_version,
         )
-        _write_classifier_artifact(artifact_path, metadata, classifier)
-        metadata = _read_metadata(artifact_path)
-        _write_artifact_registry(
-            project=project,
-            project_dir=project_dir,
-            model=model,
-            artifact_path=artifact_path,
-            metadata=metadata,
-        )
+        staged_path = _new_artifact_staging_path(artifact_path)
+        try:
+            _write_classifier_artifact(staged_path, metadata, classifier)
+            metadata, _ = _read_classifier_artifact(staged_path, provider, ml)
+            publication = _artifact_publication(
+                project=project,
+                project_dir=project_dir,
+                model=model,
+                artifact_path=artifact_path,
+                staged_path=staged_path,
+                metadata=metadata,
+            )
+        except BaseException:
+            _remove_path(staged_path)
+            raise
     elif ml.mode in {"predict", "load_pretrained"}:
         predictions = _classifier_prediction_rows(rows, classifier, source_name)
         all_metrics = _classifier_metrics(rows, predictions, classifier)
+        publication = None
 
     if ml.mode == "fit":
         df = pl.DataFrame(
@@ -322,6 +378,7 @@ def _run_classifier(
         training_input=metadata.get("training_input", training_input),
         metrics=_project_metrics(ml, all_metrics),
         artifact_metadata=metadata,
+        _publication=publication,
     )
 
 
@@ -1430,19 +1487,42 @@ def _artifact_files_hash(
     return h.hexdigest()
 
 
-def _write_artifact_registry(
+def _new_artifact_staging_path(artifact_path: Path) -> Path:
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        mkdtemp(
+            prefix=f".{artifact_path.name}.staging-",
+            dir=artifact_path.parent,
+        )
+    )
+
+
+def _recover_artifact_publications(
+    project: ProjectConfig,
+    project_dir: Path,
+) -> None:
+    registry_dir = project_dir / project.target_path / "artifacts"
+    if not registry_dir.exists():
+        return
+    registry_path = registry_dir / ARTIFACT_REGISTRY_FILENAME
+    lock_path = registry_path.with_name(f".{registry_path.name}.lock")
+    with _exclusive_file_lock(lock_path):
+        _recover_pending_publications(registry_path)
+
+
+def _artifact_publication(
     *,
     project: ProjectConfig,
     project_dir: Path,
     model: ModelConfig,
     artifact_path: Path,
+    staged_path: Path,
     metadata: dict[str, Any],
-) -> None:
+) -> ClassicMLArtifactPublication:
     registry_dir = project_dir / project.target_path / "artifacts"
     registry_dir.mkdir(parents=True, exist_ok=True)
     registry_path = registry_dir / ARTIFACT_REGISTRY_FILENAME
-    registry = _read_artifact_registry(registry_path)
-    entry: dict[str, Any] = {
+    entry = {
         "model_name": model.name,
         "artifact_path": _display_path(artifact_path, project_dir),
         "artifact_version": metadata["artifact_version"],
@@ -1455,19 +1535,259 @@ def _write_artifact_registry(
     }
     if "metrics" in metadata:
         entry["metrics"] = metadata["metrics"]
-    registry["artifacts"][model.name] = entry
-    registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True))
+    return ClassicMLArtifactPublication(
+        final_path=artifact_path,
+        staged_path=staged_path,
+        registry_path=registry_path,
+        model_name=model.name,
+        registry_entry=entry,
+    )
+
+
+def _publish_staged_artifact(publication: ClassicMLArtifactPublication) -> None:
+    final_path = publication.final_path
+    staged_path = publication.staged_path
+    registry_path = publication.registry_path
+    if not staged_path.is_dir() or staged_path.is_symlink():
+        raise ClassicMLArtifactError(
+            f"staged artifact is missing or invalid at {staged_path}"
+        )
+    if final_path.is_symlink() or (final_path.exists() and not final_path.is_dir()):
+        raise ClassicMLArtifactError(
+            f"artifact path is not a regular directory: {final_path}"
+        )
+
+    lock_path = registry_path.with_name(f".{registry_path.name}.lock")
+    with _exclusive_file_lock(lock_path):
+        _recover_pending_publications(registry_path)
+        registry_before = _read_artifact_registry(registry_path)
+        publication_id = uuid4().hex
+        backup_path = final_path.with_name(
+            f".{final_path.name}.backup-{publication_id}"
+        )
+        journal_path = registry_path.with_name(
+            f".artifact-publication-{publication_id}.json"
+        )
+        journal: dict[str, Any] = {
+            "publication_id": publication_id,
+            "model_name": publication.model_name,
+            "artifact_version": publication.registry_entry["artifact_version"],
+            "final_path": str(final_path),
+            "staged_path": str(staged_path),
+            "backup_path": str(backup_path),
+            "prior_artifact_exists": final_path.exists(),
+            "registry_before": registry_before,
+        }
+        _atomic_write_json(journal_path, journal)
+
+        try:
+            if final_path.exists():
+                os.replace(final_path, backup_path)
+            os.replace(staged_path, final_path)
+
+            registry = deepcopy(registry_before)
+            artifacts = registry.setdefault("artifacts", {})
+            if not isinstance(artifacts, dict):
+                raise ClassicMLArtifactError(
+                    f"malformed artifact registry at {registry_path}: 'artifacts' must be an object"
+                )
+            artifacts[publication.model_name] = publication.registry_entry
+            _publish_registry(registry_path, registry)
+        except BaseException as error:
+            try:
+                _rollback_publication(journal_path, journal, registry_path)
+            except BaseException as rollback_error:
+                error.add_note(
+                    f"Failed to roll back artifact publication: {rollback_error}"
+                )
+            raise
+        else:
+            _cleanup_committed_publication(journal_path, journal)
+
+
+def _publish_registry(path: Path, registry: dict[str, Any]) -> None:
+    _atomic_write_json(path, registry)
+
+
+def _recover_pending_publications(registry_path: Path) -> None:
+    for journal_path in sorted(
+        registry_path.parent.glob(".artifact-publication-*.json")
+    ):
+        journal = _read_json_object(journal_path, "artifact publication journal")
+        model_name = journal.get("model_name")
+        artifact_version = journal.get("artifact_version")
+        final_path = Path(str(journal.get("final_path", "")))
+        registry = _read_artifact_registry(registry_path)
+        artifacts = registry.get("artifacts")
+        entry = artifacts.get(model_name) if isinstance(artifacts, dict) else None
+        committed = (
+            isinstance(entry, dict)
+            and entry.get("artifact_version") == artifact_version
+            and _artifact_version_at(final_path) == artifact_version
+        )
+        if committed:
+            _cleanup_committed_publication(journal_path, journal)
+        else:
+            _rollback_publication(journal_path, journal, registry_path)
+
+
+def _rollback_publication(
+    journal_path: Path,
+    journal: dict[str, Any],
+    registry_path: Path,
+) -> None:
+    final_path, staged_path, backup_path = _validated_journal_paths(
+        journal_path, journal
+    )
+    artifact_version = journal["artifact_version"]
+    prior_exists = bool(journal["prior_artifact_exists"])
+    registry_before = journal.get("registry_before")
+    if not isinstance(registry_before, dict):
+        raise ClassicMLArtifactError(
+            f"malformed artifact publication journal at {journal_path}"
+        )
+
+    if backup_path.exists():
+        _remove_path(final_path)
+        os.replace(backup_path, final_path)
+    elif not prior_exists and _artifact_version_at(final_path) == artifact_version:
+        _remove_path(final_path)
+
+    _atomic_write_json(registry_path, registry_before)
+    _remove_path(staged_path)
+    journal_path.unlink(missing_ok=True)
+
+
+def _cleanup_committed_publication(
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    try:
+        _, staged_path, backup_path = _validated_journal_paths(journal_path, journal)
+        _remove_path(backup_path)
+        _remove_path(staged_path)
+        journal_path.unlink(missing_ok=True)
+    except OSError as error:
+        raise ClassicMLArtifactError(
+            "Committed artifact publication cleanup remains pending at "
+            f"{journal_path}; retry before publishing another artifact"
+        ) from error
+
+
+def _validated_journal_paths(
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> tuple[Path, Path, Path]:
+    publication_id = journal.get("publication_id")
+    final_raw = journal.get("final_path")
+    staged_raw = journal.get("staged_path")
+    backup_raw = journal.get("backup_path")
+    if not all(
+        isinstance(value, str) and value
+        for value in (publication_id, final_raw, staged_raw, backup_raw)
+    ):
+        raise ClassicMLArtifactError(
+            f"malformed artifact publication journal at {journal_path}"
+        )
+    assert isinstance(publication_id, str)
+    assert isinstance(final_raw, str)
+    assert isinstance(staged_raw, str)
+    assert isinstance(backup_raw, str)
+    final_path = Path(final_raw)
+    staged_path = Path(staged_raw)
+    backup_path = Path(backup_raw)
+    valid = (
+        journal_path.name == f".artifact-publication-{publication_id}.json"
+        and final_path.is_absolute()
+        and staged_path.is_absolute()
+        and backup_path.is_absolute()
+        and staged_path.parent == final_path.parent
+        and backup_path.parent == final_path.parent
+        and staged_path.name.startswith(f".{final_path.name}.staging-")
+        and backup_path.name == f".{final_path.name}.backup-{publication_id}"
+    )
+    if not valid:
+        raise ClassicMLArtifactError(
+            f"malformed artifact publication journal paths at {journal_path}"
+        )
+    return final_path, staged_path, backup_path
+
+
+def _artifact_version_at(path: Path) -> str | None:
+    try:
+        metadata = _read_metadata(path)
+    except (ClassicMLArtifactError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    version = metadata.get("artifact_version")
+    return version if isinstance(version, str) else None
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        module = importlib.import_module("msvcrt" if os.name == "nt" else "fcntl")
+        if os.name == "nt":
+            module.locking(handle.fileno(), module.LK_LOCK, 1)
+        else:
+            module.flock(handle.fileno(), module.LOCK_EX)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                module.locking(handle.fileno(), module.LK_UNLCK, 1)
+            else:
+                module.flock(handle.fileno(), module.LOCK_UN)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
 
 
 def _read_artifact_registry(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"artifact_schema_version": ARTIFACT_SCHEMA_VERSION, "artifacts": {}}
-    registry = json.loads(path.read_text())
-    if not isinstance(registry, dict):
-        return {"artifact_schema_version": ARTIFACT_SCHEMA_VERSION, "artifacts": {}}
+    registry = _read_json_object(path, "artifact registry")
     registry.setdefault("artifact_schema_version", ARTIFACT_SCHEMA_VERSION)
-    registry.setdefault("artifacts", {})
-    return cast(dict[str, Any], registry)
+    artifacts = registry.setdefault("artifacts", {})
+    if not isinstance(artifacts, dict):
+        raise ClassicMLArtifactError(
+            f"malformed artifact registry at {path}: 'artifacts' must be an object"
+        )
+    return registry
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise ClassicMLArtifactError(f"malformed {label} at {path}: {e}") from e
+    if not isinstance(payload, dict):
+        raise ClassicMLArtifactError(f"malformed {label} at {path}: expected an object")
+    return cast(dict[str, Any], payload)
 
 
 def _display_path(path: Path, project_dir: Path) -> str:

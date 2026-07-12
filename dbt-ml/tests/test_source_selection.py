@@ -176,3 +176,36 @@ def test_watch_observes_only_selected_graph_source_paths(
     assert result.exit_code == 0, result.output
     assert watched == [((mixed_source_project / "data" / "local").resolve(),)]
     assert forbidden_gcs_client == []
+
+
+def test_watch_with_empty_tag_selection_is_a_successful_noop(
+    mixed_source_project: Path,
+    forbidden_gcs_client: list[str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import watchfiles
+
+    watch_called = False
+
+    def _watch(*paths: Path, **kwargs: object) -> tuple[()]:
+        nonlocal watch_called
+        watch_called = True
+        return ()
+
+    monkeypatch.setattr(watchfiles, "watch", _watch)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "--project-dir",
+            str(mixed_source_project),
+            "--watch",
+            "--select",
+            "tag:not_present",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No models selected." in result.output
+    assert not watch_called
+    assert forbidden_gcs_client == []

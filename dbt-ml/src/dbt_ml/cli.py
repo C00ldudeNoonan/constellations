@@ -1075,6 +1075,9 @@ def _run_watch(
     try:
         dag = validate_project_contract(project, sources, models, project_dir)
         selected = dag.select_models(select=select, exclude=exclude)
+        if not selected:
+            click.echo("No models selected.")
+            return
         required_sources = set(dag.required_sources(selected))
         resolved = resolve_profile(
             project, project_dir, target=target, profiles_dir=profiles_dir

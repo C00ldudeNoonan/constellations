@@ -1111,6 +1111,7 @@ def _run_ml_model(
             "but ML models only support `full` today. Set `materialization: full` "
             "(or omit it) — see issue #53."
         )
+    output = None
     try:
         output = run_classic_ml_model(
             model=model,
@@ -1118,12 +1119,17 @@ def _run_ml_model(
             project_dir=project_dir,
             adapter=adapter,
         )
-    except Exception as e:
+        rows_written = adapter.materialize_full(
+            model.name, output.df, options=_warehouse_options(adapter, model)
+        )
+        output.publish_artifact()
+    except BaseException as e:
+        if output is not None:
+            output.discard_staged_artifact()
+        if not isinstance(e, Exception):
+            raise
         raise RunError(f"ML model '{model.name}' failed: {e}") from e
 
-    rows_written = adapter.materialize_full(
-        model.name, output.df, options=_warehouse_options(adapter, model)
-    )
     return ModelRunResult(
         model_name=model.name,
         materialization=model.materialization,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import blake2b
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from unittest.mock import Mock
 import polars as pl
 import pytest
 
+import dbt_ml.classic_ml as classic_ml
 from dbt_ml.adapters import WarehouseAdapter
 from dbt_ml.classic_ml import (
     ARTIFACT_SCHEMA_VERSION,
@@ -28,6 +31,7 @@ from dbt_ml.ml_contracts import (
     validate_ml_contract,
     validate_ml_project_contracts,
 )
+from dbt_ml.runner import RunError, _run_ml_model
 
 
 def _model(ml: dict[str, object]) -> ModelConfig:
@@ -313,6 +317,7 @@ def test_requested_metrics_and_include_metrics_are_honored(tmp_path: Path) -> No
         project_dir=tmp_path,
         adapter=adapter,
     )
+    output.publish_artifact()
 
     assert output.metrics == {"vocabulary_size": 3}
     assert "metrics" not in output.artifact_metadata
@@ -338,6 +343,212 @@ def test_requested_metrics_are_projected_into_artifact(tmp_path: Path) -> None:
 
     assert output.metrics == {"feature_rows": output.df.height}
     assert output.artifact_metadata["metrics"] == output.metrics
+    output.discard_staged_artifact()
+
+
+def _publication_adapter() -> Mock:
+    adapter = Mock(spec=WarehouseAdapter)
+    adapter.table_ref.return_value = '"p"."raw"'
+    adapter.query_df.return_value = pl.DataFrame(
+        {"document_id": ["1", "2"], "text": ["red blue", "blue green"]}
+    )
+    adapter.parse_warehouse_options.return_value = None
+    adapter.materialize_full.return_value = 2
+    return adapter
+
+
+def _write_prior_publication(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
+    artifact_path = tmp_path / "target" / "artifacts" / "derived"
+    artifact_path.mkdir(parents=True)
+    (artifact_path / "sentinel.txt").write_text("prior artifact")
+    registry_path = artifact_path.parent / "registry.json"
+    registry: dict[str, object] = {
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "artifacts": {
+            "derived": {
+                "model_name": "derived",
+                "artifact_path": "target/artifacts/derived",
+                "artifact_version": "prior-version",
+            }
+        },
+    }
+    registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True))
+    return artifact_path, registry_path, registry
+
+
+def _assert_no_publication_debris(artifact_path: Path) -> None:
+    names = {path.name for path in artifact_path.parent.iterdir()}
+    assert not any(".staging-" in name for name in names)
+    assert not any(".backup-" in name for name in names)
+    assert not any(name.startswith(".artifact-publication-") for name in names)
+
+
+def test_warehouse_failure_preserves_prior_artifact_and_registry(
+    tmp_path: Path,
+) -> None:
+    artifact_path, registry_path, registry_before = _write_prior_publication(tmp_path)
+    adapter = _publication_adapter()
+    adapter.materialize_full.side_effect = RuntimeError("warehouse failed")
+
+    with pytest.raises(RunError, match="warehouse failed"):
+        _run_ml_model(
+            model=_model(_features()),
+            project=ProjectConfig(name="p"),
+            project_dir=tmp_path,
+            adapter=adapter,
+        )
+
+    assert (artifact_path / "sentinel.txt").read_text() == "prior artifact"
+    assert json.loads(registry_path.read_text()) == registry_before
+    _assert_no_publication_debris(artifact_path)
+
+
+def test_registry_failure_rolls_back_replacement_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path, registry_path, registry_before = _write_prior_publication(tmp_path)
+    adapter = _publication_adapter()
+
+    def fail_registry(_path: Path, _registry: dict[str, object]) -> None:
+        raise OSError("registry publish failed")
+
+    monkeypatch.setattr(classic_ml, "_publish_registry", fail_registry)
+
+    with pytest.raises(RunError, match="registry publish failed"):
+        _run_ml_model(
+            model=_model(_features()),
+            project=ProjectConfig(name="p"),
+            project_dir=tmp_path,
+            adapter=adapter,
+        )
+
+    adapter.materialize_full.assert_called_once()
+    assert (artifact_path / "sentinel.txt").read_text() == "prior artifact"
+    assert json.loads(registry_path.read_text()) == registry_before
+    _assert_no_publication_debris(artifact_path)
+
+
+def test_registry_failure_does_not_advertise_first_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _publication_adapter()
+
+    def fail_registry(_path: Path, _registry: dict[str, object]) -> None:
+        raise OSError("registry publish failed")
+
+    monkeypatch.setattr(classic_ml, "_publish_registry", fail_registry)
+
+    with pytest.raises(RunError, match="registry publish failed"):
+        _run_ml_model(
+            model=_model(_features()),
+            project=ProjectConfig(name="p"),
+            project_dir=tmp_path,
+            adapter=adapter,
+        )
+
+    artifact_path = tmp_path / "target" / "artifacts" / "derived"
+    registry_path = artifact_path.parent / "registry.json"
+    assert not artifact_path.exists()
+    assert json.loads(registry_path.read_text())["artifacts"] == {}
+    _assert_no_publication_debris(artifact_path)
+
+
+def test_parallel_artifact_publications_preserve_all_registry_entries(
+    tmp_path: Path,
+) -> None:
+    outputs = []
+    for model_name in ("first", "second"):
+        model = ModelConfig(
+            name=model_name,
+            depends_on=["ref('raw')"],
+            ml=_features(artifact={"path": f"target/artifacts/{model_name}"}),
+        )
+        outputs.append(
+            run_classic_ml_model(
+                model=model,
+                project=ProjectConfig(name="p"),
+                project_dir=tmp_path,
+                adapter=_publication_adapter(),
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda output: output.publish_artifact(), outputs))
+
+    registry_path = tmp_path / "target" / "artifacts" / "registry.json"
+    registry = json.loads(registry_path.read_text())
+    assert set(registry["artifacts"]) == {"first", "second"}
+    for output in outputs:
+        entry = registry["artifacts"][output.artifact_path.name]
+        assert entry["artifact_version"] == output.artifact_version
+
+
+def test_pending_replacement_is_rolled_back_during_recovery(tmp_path: Path) -> None:
+    artifact_path, registry_path, registry_before = _write_prior_publication(tmp_path)
+    output = run_classic_ml_model(
+        model=_model(_features()),
+        project=ProjectConfig(name="p"),
+        project_dir=tmp_path,
+        adapter=_publication_adapter(),
+    )
+    publication = output._publication
+    assert publication is not None
+
+    backup_path = artifact_path.with_name(".derived.backup-interrupted")
+    journal_path = registry_path.with_name(".artifact-publication-interrupted.json")
+    journal = {
+        "publication_id": "interrupted",
+        "model_name": "derived",
+        "artifact_version": output.artifact_version,
+        "final_path": str(artifact_path),
+        "staged_path": str(publication.staged_path),
+        "backup_path": str(backup_path),
+        "prior_artifact_exists": True,
+        "registry_before": registry_before,
+    }
+    classic_ml._atomic_write_json(journal_path, journal)
+    os.replace(artifact_path, backup_path)
+    os.replace(publication.staged_path, artifact_path)
+
+    classic_ml._recover_artifact_publications(ProjectConfig(name="p"), tmp_path)
+
+    assert (artifact_path / "sentinel.txt").read_text() == "prior artifact"
+    assert json.loads(registry_path.read_text()) == registry_before
+    _assert_no_publication_debris(artifact_path)
+
+
+def test_malformed_recovery_journal_cannot_remove_unrelated_paths(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "target" / "artifacts" / "registry.json"
+    registry_path.parent.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "sentinel.txt").write_text("keep")
+    journal_path = registry_path.with_name(".artifact-publication-unsafe.json")
+    classic_ml._atomic_write_json(
+        journal_path,
+        {
+            "publication_id": "unsafe",
+            "model_name": "derived",
+            "artifact_version": "new",
+            "final_path": str(victim),
+            "staged_path": str(tmp_path / "not-a-generated-staging-path"),
+            "backup_path": str(tmp_path / "not-a-generated-backup-path"),
+            "prior_artifact_exists": True,
+            "registry_before": {
+                "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                "artifacts": {},
+            },
+        },
+    )
+
+    with pytest.raises(classic_ml.ClassicMLArtifactError, match="journal paths"):
+        classic_ml._recover_pending_publications(registry_path)
+
+    assert (victim / "sentinel.txt").read_text() == "keep"
 
 
 @pytest.mark.parametrize(
@@ -602,12 +813,13 @@ def _fit_artifact(tmp_path: Path) -> tuple[ModelConfig, Mock]:
     adapter.table_ref.return_value = '"p"."raw"'
     adapter.query_df.return_value = pl.DataFrame({"text": ["red blue"]})
     model = _model(_features())
-    run_classic_ml_model(
+    output = run_classic_ml_model(
         model=model,
         project=ProjectConfig(name="p"),
         project_dir=tmp_path,
         adapter=adapter,
     )
+    output.publish_artifact()
     return model, adapter
 
 

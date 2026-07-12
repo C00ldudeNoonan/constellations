@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Classic ML determinism (issue #122)
+- Training input is now read in a canonical order (by `document_id`/`id`
+  when present, else by row content), so training hashes, vocabularies,
+  model payloads, and prediction mappings no longer depend on warehouse
+  row-return order.
+- Proportional `min_df`/`max_df` now follow vectorizer conventions:
+  `min_df: 0.5` keeps terms in at least half the documents
+  (`df >= ceil`), `max_df: 0.5` keeps terms in at most half
+  (`df <= floor`). An empty corpus selects no terms.
+- `builtin.hashing` derives its `alternate_sign` bit from a digest byte
+  independent of bucket selection; previously an even `n_features` tied
+  sign to bucket parity.
+- **Artifact schema bumped to v2**: features and hashes from v1 artifacts
+  are not comparable, so `predict`/`load_pretrained` reject them with a
+  refit hint instead of silently reusing them. Re-run `fit`/`fit_transform`
+  once after upgrading.
+
 ### BigQuery model-level parity (issue #91)
 
 - New model-level `warehouse_options:` block, opaque to core and validated by

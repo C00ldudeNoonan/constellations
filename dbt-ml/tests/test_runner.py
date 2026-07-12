@@ -324,8 +324,10 @@ def test_classic_ml_tfidf_end_to_end(tmp_path: Path) -> None:
     metadata_path = artifact / "metadata.json"
     assert metadata_path.exists()
     assert (artifact / "vocabulary.json").exists()
+    from dbt_ml.classic_ml import ARTIFACT_SCHEMA_VERSION
+
     metadata = json.loads(metadata_path.read_text())
-    assert metadata["artifact_schema_version"] == 1
+    assert metadata["artifact_schema_version"] == ARTIFACT_SCHEMA_VERSION
     assert metadata["artifact_type"] == "classic_ml"
     assert metadata["artifact_version"] == ml_result.artifact_version
     assert metadata["artifact_files_hash"]

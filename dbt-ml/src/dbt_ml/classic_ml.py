@@ -20,7 +20,11 @@ from .dag import parse_ref
 from .paths import resolve_within_project
 from .versioning import compute_code_version
 
-ARTIFACT_SCHEMA_VERSION = 1
+# v2 (issue #122): canonical training-row order, vectorizer-convention
+# min_df/max_df rounding, and an independent hashing sign bit — features and
+# hashes from v1 artifacts are not comparable, so v1 artifacts are rejected
+# with a refit hint rather than silently reused.
+ARTIFACT_SCHEMA_VERSION = 2
 ARTIFACT_REGISTRY_FILENAME = "registry.json"
 _TOKEN_RE = re.compile(r"\w+")
 _FEATURE_PROVIDERS = {"builtin.count", "builtin.tfidf", "builtin.hashing"}
@@ -356,13 +360,25 @@ def _artifact_path(
     return project_dir / project.target_path / "artifacts" / model.name
 
 
+def _canonical_row_key(row: dict[str, Any]) -> tuple[int, str]:
+    """Warehouses return `SELECT *` in arbitrary order; training input must
+    not depend on it. Order by the stable document identifier when present,
+    else by canonical row content — identical rows are interchangeable."""
+    for key in ("document_id", "id"):
+        value = row.get(key)
+        if value is not None:
+            return (0, str(value))
+    return (1, json.dumps(row, sort_keys=True, default=str))
+
+
 def _source_rows(
     df: pl.DataFrame,
     text_field: str,
     label_field: str | None = None,
 ) -> list[dict[str, Any]]:
+    ordered = sorted(df.iter_rows(named=True), key=_canonical_row_key)
     rows: list[dict[str, Any]] = []
-    for index, row in enumerate(df.iter_rows(named=True)):
+    for index, row in enumerate(ordered):
         text = "" if row[text_field] is None else str(row[text_field])
         row_id = str(row.get("document_id") or row.get("id") or index)
         payload: dict[str, Any] = {"row_index": index, "row_id": row_id, "text": text}
@@ -485,8 +501,10 @@ def _select_terms(
     n_docs: int,
     options: TextOptions,
 ) -> list[str]:
-    min_count = _df_threshold(options["min_df"], n_docs, default=1, ceiling=False)
-    max_count = _df_threshold(options["max_df"], n_docs, default=n_docs, ceiling=True)
+    if n_docs == 0:
+        return []
+    min_count = _df_threshold(options["min_df"], n_docs, default=1, ceiling=True)
+    max_count = _df_threshold(options["max_df"], n_docs, default=n_docs, ceiling=False)
     terms = [
         term for term, count in doc_freq.items()
         if count >= min_count and count <= max_count
@@ -505,6 +523,10 @@ def _df_threshold(
     default: int,
     ceiling: bool,
 ) -> int:
+    """Vectorizer semantics: a proportional min_df keeps terms appearing in
+    at least that fraction of documents (df >= ceil(min_df * n)), and a
+    proportional max_df keeps terms in at most that fraction
+    (df <= floor(max_df * n))."""
     if value is None:
         return default
     if isinstance(value, float) and 0 < value <= 1:
@@ -605,10 +627,13 @@ def _hashed_feature_rows(
     for row, tokens in zip(rows, doc_tokens, strict=True):
         bucket_values: Counter[int] = Counter()
         for token in tokens:
-            digest = hashlib.blake2b(token.encode(), digest_size=8).digest()
-            hashed = int.from_bytes(digest, byteorder="big", signed=False)
+            # The sign bit comes from a digest byte the bucket never sees:
+            # deriving both from one value ties sign to bucket parity
+            # whenever n_features is even, biasing collisions.
+            digest = hashlib.blake2b(token.encode(), digest_size=9).digest()
+            hashed = int.from_bytes(digest[:8], byteorder="big", signed=False)
             bucket = hashed % n_features
-            sign = -1 if options["alternate_sign"] and hashed % 2 else 1
+            sign = -1 if options["alternate_sign"] and digest[8] & 1 else 1
             bucket_values[bucket] += sign
         for bucket in sorted(bucket_values):
             value = float(bucket_values[bucket])
@@ -1025,7 +1050,8 @@ def _validate_metadata(
     if schema_version != ARTIFACT_SCHEMA_VERSION:
         raise IncompatibleClassicMLArtifactError(
             f"incompatible artifact schema at {path}: expected "
-            f"{ARTIFACT_SCHEMA_VERSION}, found {schema_version!r}"
+            f"{ARTIFACT_SCHEMA_VERSION}, found {schema_version!r}; "
+            "feature semantics changed - run fit or fit_transform to rebuild"
         )
     if metadata.get("artifact_type") != "classic_ml":
         raise IncompatibleClassicMLArtifactError(

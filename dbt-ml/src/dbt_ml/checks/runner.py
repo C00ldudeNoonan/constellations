@@ -30,7 +30,13 @@ def run_project_tests(
         # Local import: manifest.py imports from runner.py at module level.
         from ..manifest import compute_modified_models
 
-        modified = compute_modified_models(models, project_dir, state)
+        modified = compute_modified_models(
+            models,
+            project_dir,
+            state,
+            project=project,
+            resolved=resolved,
+        )
     selected_names = set(
         dag.select_models(select=select, exclude=exclude, modified=modified)
     )

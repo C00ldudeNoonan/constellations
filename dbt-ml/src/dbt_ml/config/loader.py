@@ -11,6 +11,12 @@ from pydantic import ValidationError
 from .model import ModelConfig, ModelFile
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
+from .yaml_diagnostics import (
+    YamlDocument,
+    YamlProvenance,
+    format_yaml_parse_error,
+    parse_yaml_document,
+)
 
 
 class ConfigError(Exception):
@@ -29,7 +35,15 @@ def load_project(
         description="Project configuration",
     )
 
-    project = _parse_yaml(project_path, ProjectConfig)
+    project, project_document = _parse_yaml_with_document(
+        project_path,
+        ProjectConfig,
+    )
+    project._yaml_provenance = YamlProvenance(
+        file_path=project_path,
+        config_path=(),
+        _document=project_document,
+    )
 
     # Local import: paths.py imports ConfigError from this module.
     from ..paths import resolve_within_project
@@ -85,24 +99,31 @@ def load_project(
                 ModelFile,
                 lambda f: f.models,
                 description="Model configuration",
+                attach_model_provenance=True,
             )
         )
 
     return project, sources, models
 
 
-def _parse_yaml[T](path: Path, model: type[T]) -> T:
+def _parse_yaml_with_document[T](
+    path: Path,
+    model: type[T],
+) -> tuple[T, YamlDocument]:
     try:
         with path.open() as f:
-            data: Any = yaml.safe_load(f) or {}
+            document = parse_yaml_document(f.read())
     except yaml.YAMLError as e:
-        raise ConfigError(f"Malformed YAML at {path}:\n{e}") from e
+        raise ConfigError(format_yaml_parse_error(path, e)) from e
     except OSError as e:
         raise ConfigError(f"Could not read YAML configuration file {path}: {e}") from e
+    data: Any = document.data if document.data is not None else {}
     try:
-        return model.model_validate(data)  # type: ignore[attr-defined,no-any-return]
+        parsed = model.model_validate(data)  # type: ignore[attr-defined]
     except ValidationError as e:
-        raise ConfigError(f"Invalid YAML at {path}:\n{e}") from e
+        diagnostics = document.format_validation_errors(path, e)
+        raise ConfigError(f"Invalid YAML at {path}:\n{diagnostics}") from e
+    return parsed, document
 
 
 def _load_yaml_dir[F, I](
@@ -111,6 +132,7 @@ def _load_yaml_dir[F, I](
     extract: Any,
     *,
     description: str,
+    attach_model_provenance: bool = False,
 ) -> list[I]:
     if not directory.exists():
         return []
@@ -154,8 +176,20 @@ def _load_yaml_dir[F, I](
                 allowed_root=directory,
                 description=description,
             )
-            parsed = _parse_yaml(path, file_model)
-            out.extend(extract(parsed))
+            parsed, document = _parse_yaml_with_document(path, file_model)
+            items: list[I] = list(extract(parsed))
+            if attach_model_provenance:
+                for index, item in enumerate(items):
+                    if not isinstance(item, ModelConfig):
+                        raise TypeError(
+                            "Model YAML provenance can only be attached to ModelConfig"
+                        )
+                    item._yaml_provenance = YamlProvenance(
+                        file_path=path,
+                        config_path=("models", index),
+                        _document=document,
+                    )
+            out.extend(items)
     return out
 
 

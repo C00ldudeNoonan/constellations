@@ -58,7 +58,7 @@ extraction, dbt handoff) is opt-in on top.
 | Concept            | What it means                                                                  |
 |--------------------|--------------------------------------------------------------------------------|
 | **Source**         | A glob over a folder. `*.pdf`, `*.json`, `*.html`, `*.md` — your choice.        |
-| **Extraction model** | One row per source file, produced by a backend (pdf, json, markdown, html, llm). |
+| **Extraction model** | One row per source file, produced by a backend (JSON, Markdown, PDF, HTML, email, or LLM). |
 | **Transform model**  | A Python module returning a Polars DataFrame, depends on other models via `ref()`. |
 | **Classic ML model** | An executable `ml:` model for deterministic features and classifiers, with persisted artifacts. |
 | **Materialization**  | `full` (always replace) or `incremental` (skip unchanged input on re-runs).      |
@@ -77,8 +77,11 @@ extraction, dbt handoff) is opt-in on top.
 | `email`    | `*.eml`           | from/to/subject/date/body via stdlib `email`. Deterministic, no API.                      |
 | `llm`      | `*.txt`/`*.md`    | Claude tool-use → structured fields. Uses the variable named by profile `llm.api_key_env` (default `ANTHROPIC_API_KEY`). |
 
-Add a new backend = drop a file under `src/dbt_ml/backends/`, inherit from
-`BaseBackend`, decorate with `@register`. No plugin system needed for v1.
+Add a new backend by inheriting from `BaseBackend`, defining a strict Pydantic
+option model, and decorating it with `@register(options_model=...)`. Bare
+`@register` remains a pass-through compatibility path for existing third-party
+backends, but new backends should publish a typed option contract so compile
+and runtime enforce the same configuration.
 
 ## Security Notes
 
@@ -201,7 +204,14 @@ or warehouse mutation, `compile`, `run`, and `build` validate registered
 backend names, source/model edge kinds, supported materializations, transform
 and custom-test modules/call signatures, built-in test option shapes, and
 relationship targets. Relationship tests add a DAG predecessor so their target
-relation is built first. Configuration failures exit 2.
+relation is built first. Every shipped extraction backend has a strict,
+backend-specific option schema; unknown options, wrong types, invalid LLM field
+schemas, and out-of-range execution settings fail before source discovery.
+Executable classic-ML tasks, providers, provider options, metrics, and artifact
+paths are checked by the same preflight. YAML schema diagnostics include the
+file, one-based line and column, and full configuration path without echoing
+the rejected input value; duplicate mapping keys are rejected at their second
+declaration. Configuration failures exit 2.
 
 ### Useful flags
 

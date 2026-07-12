@@ -125,7 +125,9 @@ def test_training_hash_invariant_under_permutation() -> None:
 def test_vectorizer_payload_invariant_under_permutation(provider: str) -> None:
     options = _text_options({})
     payloads = [
-        _fit_vectorizer(_source_rows(_frame(order), "text"), provider, options)
+        _fit_vectorizer(
+            _source_rows(_frame(order), "text"), provider, options, {}
+        )
         for order in PERMUTATIONS
     ]
     assert payloads[0] == payloads[1] == payloads[2]

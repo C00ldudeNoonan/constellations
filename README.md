@@ -121,6 +121,9 @@ fitting the workflow analytics engineers already use.**
 - **dbt-shaped everything** — `ref()`, `--select` / `--exclude` selectors with
   `tag:` support, structural and deterministic quality tests, custom-Python
   tests, warn/error severities, source freshness, and profiles with `--target`.
+- **Compile before I/O** — strict per-backend and classic-ML contracts fail
+  before source discovery or warehouse access, with file, line, column, and
+  configuration-path diagnostics for invalid YAML.
 - **Artifacts** — `manifest.json`, `run_results.json`, a static docs site, and
   `emit-dbt-sources` to hand tables to a dbt project using the matching
   DuckDB or BigQuery adapter.

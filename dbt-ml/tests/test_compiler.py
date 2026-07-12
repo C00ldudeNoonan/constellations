@@ -54,6 +54,8 @@ def test_invalid_backend_is_exit_2_before_profile_resolution(
     assert result.exit_code == 2, result.output
     assert "typo_backend" in result.output
     assert "not registered" in result.output
+    assert "dbt_ml_project.yml:4:20" in result.output
+    assert "[extraction.default_backend]" in result.output
     assert "no profiles.yml" not in result.output
 
 
@@ -65,6 +67,108 @@ def test_explicit_unregistered_backend_is_rejected(tmp_path: Path) -> None:
             [_extraction("raw", backend="missing")],
             tmp_path,
         )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["compile"],
+        ["run"],
+        ["build"],
+        ["test"],
+        ["run", "--watch"],
+    ],
+)
+def test_invalid_backend_options_fail_before_profile_or_source_access(
+    tmp_path: Path, command: list[str]
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: invalid_options\nprofile: deliberately_missing\n"
+        "extraction:\n  default_backend: json\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: gs://bucket/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction:\n"
+        "      options:\n        include_text: true\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), *command]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid options for extraction backend 'json'" in result.output
+    assert "options.include_text" in result.output
+    assert "raw.yml:7:23" in result.output
+    assert "models.0.extraction.options.include_text" in result.output
+    assert "no profiles.yml" not in result.output
+
+
+def test_model_llm_cache_path_escape_fails_before_profile_resolution(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: invalid_cache\nprofile: deliberately_missing\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: gs://bucket/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction:\n      backend: llm\n"
+        "      options:\n        cache_path: ../outside.duckdb\n"
+        "        fields:\n          - {name: title, type: string}\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), "run"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "llm cache_path" in result.output
+    assert "outside the project directory" in result.output
+    assert "raw.yml:8:21" in result.output
+    assert "models.0.extraction.options.cache_path" in result.output
+    assert "no profiles.yml" not in result.output
+
+
+@pytest.mark.parametrize("command", [["compile"], ["run"], ["build"], ["test"]])
+def test_non_executable_ml_contract_fails_before_profile_resolution(
+    tmp_path: Path, command: list[str]
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: invalid_ml\nprofile: deliberately_missing\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "models.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: raw_docs\n    source: ref('docs')\n"
+        "    extraction:\n      backend: json\n"
+        "  - name: unsupported_regression\n"
+        "    depends_on: [ref('raw_docs')]\n"
+        "    ml:\n      task: regressor\n      text_field: text\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), *command]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "task 'regressor' is not executable" in result.output
+    assert "models.yml:10:13" in result.output
+    assert "models.1.ml.task" in result.output
+    assert "no profiles.yml" not in result.output
 
 
 @pytest.mark.parametrize(

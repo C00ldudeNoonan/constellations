@@ -19,7 +19,13 @@ from typing import Any, cast
 import polars as pl
 
 from .adapters import AdapterError, WarehouseAdapter, create_adapter
-from .backends import BaseBackend, ExtractionResult, get_backend
+from .backends import (
+    BackendOptionsError,
+    BaseBackend,
+    ExtractionResult,
+    get_backend,
+    validate_backend_options,
+)
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
@@ -39,7 +45,7 @@ from .profile import (
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import TransformContext, load_transform, transform_call_arity
-from .versioning import compute_code_version
+from .versioning import compute_code_version, compute_model_code_version
 
 log = logging.getLogger(__name__)
 
@@ -144,7 +150,12 @@ def _apply_extraction_contract(
 
 
 def _modified_set(
-    models: list[ModelConfig], project_dir: Path, state: Path | None
+    models: list[ModelConfig],
+    project_dir: Path,
+    state: Path | None,
+    *,
+    project: ProjectConfig,
+    resolved: ResolvedProfile,
 ) -> set[str] | None:
     """None when no state manifest was given (state:modified then errors in
     selection); otherwise the models whose code_version diverged from it."""
@@ -153,7 +164,13 @@ def _modified_set(
     # Local import: manifest.py imports ModelRunResult from this module.
     from .manifest import compute_modified_models
 
-    return compute_modified_models(models, project_dir, state)
+    return compute_modified_models(
+        models,
+        project_dir,
+        state,
+        project=project,
+        resolved=resolved,
+    )
 
 
 class _SerializedAdapter:
@@ -233,7 +250,15 @@ def run_project(
     )
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
-        select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
+        select=select,
+        exclude=exclude,
+        modified=_modified_set(
+            models,
+            project_dir,
+            state,
+            project=project,
+            resolved=resolved,
+        ),
     )
 
     required_sources = set(dag.required_sources(selected))
@@ -287,7 +312,15 @@ def build_project(
     )
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
-        select=select, exclude=exclude, modified=_modified_set(models, project_dir, state)
+        select=select,
+        exclude=exclude,
+        modified=_modified_set(
+            models,
+            project_dir,
+            state,
+            project=project,
+            resolved=resolved,
+        ),
     )
 
     required_sources = set(dag.required_sources(selected))
@@ -478,6 +511,10 @@ def _run_extraction_model(
                 ),
             }
         options = resolve_llm_options(options, resolved)
+    try:
+        options = validate_backend_options(backend_name, options)
+    except BackendOptionsError as e:
+        raise RunError(f"Extraction model '{model.name}' has {e}") from e
 
     if not model.source:
         raise RunError(f"Extraction model '{model.name}' must declare a `source:`")
@@ -490,11 +527,11 @@ def _run_extraction_model(
     docs = discovered.refs
     source_backend = discovered.backend
 
-    code_version = compute_code_version(
-        extraction=model.extraction,
-        transform=None,
-        fields=model.fields,
-        project_dir=project_dir,
+    code_version = compute_model_code_version(
+        model,
+        project,
+        project_dir,
+        resolved=resolved,
     )
     warehouse_opts = _warehouse_options(adapter, model)
 

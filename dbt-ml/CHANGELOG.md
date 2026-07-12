@@ -96,6 +96,26 @@
   modules and call signatures, built-in test specifications, and relationship
   targets. Relationship targets are DAG predecessors, so `build` orders them
   before the referencing test.
+- All six extraction backends now publish strict typed option contracts and
+  capability metadata. Compile and runtime share the same validation, so
+  unknown options, wrong types, invalid field schemas, and unsafe bounds fail
+  before document reads or API calls.
+- Classic-ML preflight now validates executable task/provider pairs,
+  provider-specific options, required fields, metrics, and artifact paths.
+  Prediction artifacts are validated before the warehouse is queried.
+- Project, source, model, profile, and adapter-specific warehouse validation
+  errors now report the YAML file, one-based line and column, and full config
+  path without including rejected input values.
+- Duplicate YAML mapping keys are rejected at the second declaration while
+  standard merge defaults with explicit overrides remain supported.
+- Incremental and `state:modified` fingerprints now include the effective
+  backend implementation and profile-merged LLM model/system settings, so
+  operator-level semantic changes reprocess affected documents.
+- Classic-ML artifact directories must have one compatible writer contract;
+  readers preserve their data relation as `depends_on[0]` and add the writer
+  as an ordering dependency. Persisted provider options and payload shapes are
+  validated before warehouse reads, and metric selection/include settings now
+  control emitted and persisted metrics.
 - GCS sources accept an explicit `project:` and missing ADC/project inference
   now exits 2 with actionable guidance instead of a raw traceback (#105).
 - Tests against a genuinely missing model relation return a structured
@@ -109,6 +129,13 @@
 
 - Unknown configuration keys that were previously ignored now fail. Correct
   misspellings and keep source/model file `version: 2`.
+- Extraction backend options no longer coerce quoted booleans or accept
+  undocumented/ignored keys. Classic-ML roadmap tasks fail compile until they
+  have an executable provider; prediction modes must use the options persisted
+  in their artifact rather than declaring `ml.options` again.
+- Projects that intentionally share a Classic-ML artifact path must declare a
+  single fit writer and list that writer after the reader's first data
+  dependency. Generic third-party pretrained files are not yet accepted.
 - LLM extraction models require the configured credential variable even when
   their response cache is warm. Put `api_key_env` under profile `llm:`, not
   model options.

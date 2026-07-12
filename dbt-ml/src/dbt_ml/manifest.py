@@ -10,10 +10,16 @@ from typing import Any
 
 from .config import load_project
 from .config.model import ModelConfig
-from .dag import ProjectDAG, parse_ref
-from .profile import ProfileError, apply_source_path_overrides, resolve_profile
+from .config.project import ProjectConfig
+from .dag import ProjectDAG
+from .profile import (
+    ProfileError,
+    ResolvedProfile,
+    apply_source_path_overrides,
+    resolve_profile,
+)
 from .runner import ModelRunResult
-from .versioning import compute_code_version
+from .versioning import compute_model_code_version
 
 MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
@@ -56,7 +62,9 @@ def build_manifest(
             }
             for s in sources
         ],
-        "models": [_model_dict(m, project_dir) for m in models],
+        "models": [
+            _model_dict(m, project, project_dir, resolved) for m in models
+        ],
         "dag": {
             "execution_order": dag.execution_order(),
             "nodes": [
@@ -239,7 +247,12 @@ def _dbt_ml_version() -> str:
         return "unknown"
 
 
-def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
+def _model_dict(
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    resolved: ResolvedProfile,
+) -> dict[str, Any]:
     if model.extraction is not None:
         kind = "extraction"
     elif model.ml is not None:
@@ -265,22 +278,13 @@ def _model_dict(model: ModelConfig, project_dir: Path) -> dict[str, Any]:
         "chunk": model.chunk.model_dump() if model.chunk else None,
         "fields": [f.model_dump() for f in model.fields],
         "tests": model.tests,
-        "code_version": compute_code_version(
-            extraction=model.extraction,
-            transform=model.transform,
-            ml=model.ml,
-            chunk=model.chunk,
-            depends_on=_code_version_depends_on(model),
-            fields=model.fields,
-            project_dir=project_dir,
+        "code_version": compute_model_code_version(
+            model,
+            project,
+            project_dir,
+            resolved=resolved,
         ),
     }
-
-
-def _code_version_depends_on(model: ModelConfig) -> list[str] | None:
-    if model.chunk is None or not model.depends_on:
-        return None
-    return [parse_ref(dep) for dep in model.depends_on]
 
 
 class StateError(Exception):
@@ -314,20 +318,34 @@ def read_state_code_versions(state_path: Path) -> dict[str, str]:
 
 
 def compute_modified_models(
-    models: list[ModelConfig], project_dir: Path, state_path: Path
+    models: list[ModelConfig],
+    project_dir: Path,
+    state_path: Path,
+    *,
+    project: ProjectConfig | None = None,
+    resolved: ResolvedProfile | None = None,
+    target: str | None = None,
+    profiles_dir: Path | None = None,
 ) -> set[str]:
     """Models whose code_version differs from the state manifest, or that
     the state manifest has never seen."""
     previous = read_state_code_versions(state_path)
+    if project is None:
+        project, _, _ = load_project(project_dir)
+    if resolved is None:
+        resolved = resolve_profile(
+            project,
+            project_dir,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
     modified: set[str] = set()
     for model in models:
-        current = compute_code_version(
-            extraction=model.extraction,
-            transform=model.transform,
-            ml=model.ml,
-            chunk=model.chunk,
-            fields=model.fields,
-            project_dir=project_dir,
+        current = compute_model_code_version(
+            model,
+            project,
+            project_dir,
+            resolved=resolved,
         )
         if previous.get(model.name) != current:
             modified.add(model.name)

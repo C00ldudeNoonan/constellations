@@ -30,6 +30,11 @@ from .config.profile import (
 )
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
+from .config.yaml_diagnostics import (
+    YamlDocument,
+    format_yaml_parse_error,
+    parse_yaml_document,
+)
 
 PROFILES_FILENAME = "profiles.yml"
 PROFILES_DIR_ENV = "DBT_ML_PROFILES_DIR"
@@ -76,7 +81,7 @@ def resolve_profile(
             f"~/.dbt_ml/profiles.yml."
         )
 
-    profiles = _load_profiles_file(profiles_path)
+    profiles, profiles_document = _load_profiles_file(profiles_path)
     if project.profile not in profiles:
         raise ProfileError(
             f"Profile '{project.profile}' not in {profiles_path}. "
@@ -95,6 +100,24 @@ def resolve_profile(
     try:
         warehouse = parse_warehouse_config(selected.warehouse)
     except AdapterError as e:
+        validation_error = e.__cause__
+        if isinstance(validation_error, ValidationError):
+            prefix = (
+                project.profile,
+                "outputs",
+                target_name,
+                "warehouse",
+            )
+            diagnostics = profiles_document.format_validation_errors(
+                profiles_path,
+                validation_error,
+                prefix=prefix,
+            )
+            warehouse_type = selected.warehouse.get("type", "duckdb")
+            raise ProfileError(
+                f"Invalid {warehouse_type} warehouse YAML at {profiles_path}:\n"
+                f"{diagnostics}"
+            ) from e
         raise ProfileError(
             f"{profiles_path}: profile '{project.profile}' target '{target_name}': {e}"
         ) from e
@@ -268,11 +291,24 @@ def _interpolate_env_vars(value: Any, path: Path) -> Any:
     return value
 
 
-def _load_profiles_file(path: Path) -> dict[str, ProfileConfig]:
-    with path.open() as f:
-        data: Any = yaml.safe_load(f) or {}
+def _load_profiles_file(
+    path: Path,
+) -> tuple[dict[str, ProfileConfig], YamlDocument]:
+    try:
+        with path.open() as f:
+            document = parse_yaml_document(f.read())
+    except yaml.YAMLError as e:
+        raise ProfileError(format_yaml_parse_error(path, e)) from e
+    except OSError as e:
+        raise ProfileError(f"Could not read profiles file {path}: {e}") from e
+    data: Any = document.data if document.data is not None else {}
     if not isinstance(data, dict):
-        raise ProfileError(f"{path}: top-level must be a mapping of profile names")
+        diagnostic = document.format_message(
+            path,
+            (),
+            "top-level must be a mapping of profile names",
+        )
+        raise ProfileError(diagnostic)
     data = _interpolate_env_vars(data, path)
 
     out: dict[str, ProfileConfig] = {}
@@ -280,8 +316,13 @@ def _load_profiles_file(path: Path) -> dict[str, ProfileConfig]:
         try:
             out[name] = ProfileConfig.model_validate(body)
         except ValidationError as e:
-            raise ProfileError(f"{path}: profile '{name}' invalid:\n{e}") from e
-    return out
+            diagnostics = document.format_validation_errors(
+                path,
+                e,
+                prefix=(name,),
+            )
+            raise ProfileError(f"Invalid profile YAML at {path}:\n{diagnostics}") from e
+    return out, document
 
 
 def resolve_llm_options(

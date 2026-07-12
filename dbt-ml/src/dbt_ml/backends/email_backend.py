@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from .base import BaseBackend, ExtractionResult
+from .options import EmailBackendOptions
 from .registry import register
 
 
-@register
+@register(options_model=EmailBackendOptions)
 class EmailBackend(BaseBackend):
     """Read .eml files via stdlib `email`. No external dependencies.
 
@@ -28,6 +29,7 @@ class EmailBackend(BaseBackend):
         return [".eml"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        options = self.parse_options(options)
         msg: Message = message_from_bytes(path.read_bytes())
         warnings: list[str] = []
         fields: dict[str, Any] = {

@@ -3,12 +3,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .backends import list_backends
+from .backends import BackendOptionsError, list_backends, validate_backend_options
 from .config.loader import ConfigError
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
+from .config.yaml_diagnostics import ConfigPath
 from .dag import DAGError, ProjectDAG, parse_ref
+from .ml_contracts import MLContractError, validate_ml_project_contracts
+from .paths import resolve_within_project
 from .test_specs import TestSpecError, parse_test_spec
 from .transforms import load_transform, transform_call_arity
 
@@ -25,16 +28,22 @@ def validate_project_contract(
     model_names = {model.name for model in models}
     duplicates = source_names & model_names
     if duplicates:
-        raise ConfigError(
-            f"Source and model names must be unique; duplicated: {sorted(duplicates)}"
+        duplicate_model = next(model for model in models if model.name in duplicates)
+        raise _model_error(
+            duplicate_model,
+            f"Source and model names must be unique; duplicated: {sorted(duplicates)}",
+            ("name",),
         )
 
     available_backends = set(list_backends())
     default_backend = project.extraction.default_backend
     if default_backend not in available_backends:
         raise ConfigError(
-            f"Default extraction backend '{default_backend}' is not registered. "
-            f"Available: {sorted(available_backends)}"
+            project.format_yaml_diagnostic(
+                f"Default extraction backend '{default_backend}' is not registered. "
+                f"Available: {sorted(available_backends)}",
+                relative_path=("extraction", "default_backend"),
+            )
         )
 
     for model in models:
@@ -44,12 +53,56 @@ def validate_project_contract(
         if model.extraction is not None:
             backend = model.extraction.backend or default_backend
             if backend not in available_backends:
-                raise ConfigError(
+                raise _model_error(
+                    model,
                     f"Extraction model '{model.name}' uses unregistered backend "
-                    f"'{backend}'. Available: {sorted(available_backends)}"
+                    f"'{backend}'. Available: {sorted(available_backends)}",
+                    ("extraction", "backend"),
                 )
+            if backend == "llm" and "api_key_env" in model.extraction.options:
+                raise _model_error(
+                    model,
+                    "llm option 'api_key_env' is operator-owned configuration; "
+                    "set it under `llm:` in profiles.yml, not in model "
+                    "extraction options",
+                    ("extraction", "options", "api_key_env"),
+                )
+            try:
+                validate_backend_options(backend, model.extraction.options)
+            except BackendOptionsError as e:
+                error_path = getattr(e, "path", ("options",))
+                raise _model_error(
+                    model,
+                    f"Extraction model '{model.name}' has {e}",
+                    ("extraction", *error_path),
+                ) from e
+            if backend == "llm" and "cache_path" in model.extraction.options:
+                try:
+                    resolve_within_project(
+                        model.extraction.options["cache_path"],
+                        project_dir,
+                        surface=f"Model '{model.name}' llm cache_path",
+                        hint="Set llm.cache_path in profiles.yml for locations "
+                        "outside the project.",
+                    )
+                except ConfigError as e:
+                    raise _model_error(
+                        model,
+                        str(e),
+                        ("extraction", "options", "cache_path"),
+                    ) from e
         if model.transform is not None:
             _validate_transform(model, project_dir)
+    try:
+        validate_ml_project_contracts(models, project, project_dir)
+    except MLContractError as e:
+        implicated = next(
+            (model for model in models if model.name == e.model_name),
+            None,
+        )
+        if implicated is None:
+            raise ConfigError(str(e)) from e
+        raise _model_error(implicated, str(e), e.path) from e
 
     try:
         return ProjectDAG(sources, models)
@@ -67,8 +120,10 @@ def _validate_tests(
         try:
             parsed = parse_test_spec(spec)
         except TestSpecError as e:
-            raise ConfigError(
-                f"Model '{model.name}' test[{index}] is invalid: {e}"
+            raise _model_error(
+                model,
+                f"Model '{model.name}' test[{index}] is invalid: {e}",
+                ("tests", index),
             ) from e
         if parsed.name == "python":
             module_path = parsed.argument
@@ -78,14 +133,18 @@ def _validate_tests(
         if target is None:
             continue
         if target in source_names:
-            raise ConfigError(
+            raise _model_error(
+                model,
                 f"Model '{model.name}' relationships test target '{target}' is a "
-                "source; relationship targets must be models"
+                "source; relationship targets must be models",
+                ("tests", index),
             )
         if target not in model_names:
-            raise ConfigError(
+            raise _model_error(
+                model,
                 f"Model '{model.name}' relationships test references unknown model "
-                f"'{target}'"
+                f"'{target}'",
+                ("tests", index),
             )
 
 
@@ -93,9 +152,11 @@ def _validate_python_test(
     model: ModelConfig, index: int, module_path: str, project_dir: Path
 ) -> None:
     if not _MODULE_PATTERN.fullmatch(module_path):
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"Model '{model.name}' test[{index}] python module '{module_path}' is not "
-            "a valid dotted Python module path"
+            "a valid dotted Python module path",
+            ("tests", index),
         )
     # Local import avoids a compiler <-> checks package import cycle.
     from .checks.python import CustomTestError, load_python_test
@@ -103,9 +164,11 @@ def _validate_python_test(
     try:
         load_python_test(module_path, project_dir)
     except CustomTestError as e:
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"Model '{model.name}' test[{index}] python module '{module_path}' is "
-            f"invalid: {e}"
+            f"invalid: {e}",
+            ("tests", index),
         ) from e
 
 
@@ -113,50 +176,67 @@ def _validate_model_edges(
     model: ModelConfig, source_names: set[str], model_names: set[str]
 ) -> None:
     if model.kind_block_count != 1:
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"Model '{model.name}' must declare exactly one of "
-            "extraction/transform/ml/chunk"
+            "extraction/transform/ml/chunk",
         )
 
     if model.extraction is not None:
         if not model.source:
-            raise ConfigError(
-                f"Extraction model '{model.name}' must declare exactly one `source:`"
+            raise _model_error(
+                model,
+                f"Extraction model '{model.name}' must declare exactly one `source:`",
+                ("source",),
             )
         if model.depends_on is not None:
-            raise ConfigError(
-                f"Extraction model '{model.name}' must use `source:`, not `depends_on:`"
+            raise _model_error(
+                model,
+                f"Extraction model '{model.name}' must use `source:`, not `depends_on:`",
+                ("depends_on",),
             )
         target = parse_ref(model.source)
         if target in model_names:
-            raise ConfigError(
+            raise _model_error(
+                model,
                 f"Extraction model '{model.name}' source '{target}' is a model; "
-                "extraction sources must reference source nodes"
+                "extraction sources must reference source nodes",
+                ("source",),
             )
         if target not in source_names:
-            raise ConfigError(
-                f"Extraction model '{model.name}' references unknown source '{target}'"
+            raise _model_error(
+                model,
+                f"Extraction model '{model.name}' references unknown source '{target}'",
+                ("source",),
             )
         return
 
     if model.source is not None:
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"{_kind_label(model)} model '{model.name}' must use `depends_on:`, "
-            "not `source:`"
+            "not `source:`",
+            ("source",),
         )
 
     dependencies = model.depends_on or []
     if model.transform is not None and not dependencies:
-        raise ConfigError(
-            f"Transform model '{model.name}' must declare at least one `depends_on:` model"
+        raise _model_error(
+            model,
+            f"Transform model '{model.name}' must declare at least one `depends_on:` model",
+            ("depends_on",),
         )
     if model.ml is not None and not dependencies:
-        raise ConfigError(
-            f"ML model '{model.name}' must declare at least one `depends_on:` model"
+        raise _model_error(
+            model,
+            f"ML model '{model.name}' must declare at least one `depends_on:` model",
+            ("depends_on",),
         )
     if model.chunk is not None and len(dependencies) != 1:
-        raise ConfigError(
-            f"Chunk model '{model.name}' must declare exactly one `depends_on:` model"
+        raise _model_error(
+            model,
+            f"Chunk model '{model.name}' must declare exactly one `depends_on:` model",
+            ("depends_on",),
         )
 
     dependency_targets = [parse_ref(dependency) for dependency in dependencies]
@@ -164,55 +244,87 @@ def _validate_model_edges(
         target for target in set(dependency_targets) if dependency_targets.count(target) > 1
     )
     if duplicate_targets:
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"{_kind_label(model)} model '{model.name}' declares duplicate "
-            f"dependencies: {duplicate_targets}"
+            f"dependencies: {duplicate_targets}",
+            ("depends_on",),
         )
 
-    for target in dependency_targets:
+    for index, target in enumerate(dependency_targets):
         if target in source_names:
-            raise ConfigError(
+            raise _model_error(
+                model,
                 f"{_kind_label(model)} model '{model.name}' dependency '{target}' is "
-                "a source; non-extraction models must depend on models"
+                "a source; non-extraction models must depend on models",
+                ("depends_on", index),
             )
         if target not in model_names:
-            raise ConfigError(
+            raise _model_error(
+                model,
                 f"{_kind_label(model)} model '{model.name}' references unknown model "
-                f"'{target}'"
+                f"'{target}'",
+                ("depends_on", index),
             )
 
 
 def _validate_materialization(model: ModelConfig) -> None:
     if model.transform is not None and model.materialization != "full":
-        raise ConfigError(
-            f"Transform model '{model.name}' only supports `materialization: full`"
+        raise _model_error(
+            model,
+            f"Transform model '{model.name}' only supports `materialization: full`",
+            ("materialization",),
         )
     if model.ml is not None and model.materialization != "full":
-        raise ConfigError(f"ML model '{model.name}' only supports `materialization: full`")
+        raise _model_error(
+            model,
+            f"ML model '{model.name}' only supports `materialization: full`",
+            ("materialization",),
+        )
 
 
 def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
     assert model.transform is not None
     transform = model.transform
     if transform.type != "python":
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"Transform model '{model.name}' has unsupported type '{transform.type}'; "
-            "supported: python"
+            "supported: python",
+            ("transform", "type"),
         )
     if not transform.module:
-        raise ConfigError(f"Transform model '{model.name}' requires a `module:`")
+        raise _model_error(
+            model,
+            f"Transform model '{model.name}' requires a `module:`",
+            ("transform", "module"),
+        )
     if not _MODULE_PATTERN.fullmatch(transform.module):
-        raise ConfigError(
+        raise _model_error(
+            model,
             f"Transform model '{model.name}' module '{transform.module}' is not a "
-            "valid dotted Python module path"
+            "valid dotted Python module path",
+            ("transform", "module"),
         )
     try:
         transform_fn = load_transform(transform.module, project_dir)
         transform_call_arity(transform_fn)
     except (Exception, SystemExit) as e:
-        raise ConfigError(
-            f"Transform model '{model.name}' module '{transform.module}' is invalid: {e}"
+        raise _model_error(
+            model,
+            f"Transform model '{model.name}' module '{transform.module}' is invalid: {e}",
+            ("transform", "module"),
         ) from e
+
+
+def _model_error(
+    model: ModelConfig,
+    message: str,
+    relative_path: ConfigPath = (),
+) -> ConfigError:
+    return ConfigError(
+        model.format_yaml_diagnostic(message, relative_path=relative_path)
+    )
 
 
 def _kind_label(model: ModelConfig) -> str:

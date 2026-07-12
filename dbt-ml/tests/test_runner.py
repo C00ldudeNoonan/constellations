@@ -137,6 +137,44 @@ def test_second_run_is_incremental(fresh_project: Path) -> None:
     assert raw.documents_skipped == 5
 
 
+def test_default_backend_change_reprocesses_incremental_documents(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: effective_backend\n"
+        "extraction:\n  default_backend: json\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n"
+        "  - name: docs\n    path: data/docs\n    file_pattern: '*.json'\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: raw_docs\n    source: ref('docs')\n"
+        "    extraction: {}\n    materialization: incremental\n"
+        "    on_schema_change: append_new_columns\n"
+    )
+    data_dir = tmp_path / "data" / "docs"
+    data_dir.mkdir(parents=True)
+    (data_dir / "doc.json").write_text("{}")
+
+    first = run_project(tmp_path)
+    first_raw = next(result for result in first if result.model_name == "raw_docs")
+    assert first_raw.documents_processed == 1
+
+    project_file = tmp_path / "dbt_ml_project.yml"
+    project_file.write_text(
+        project_file.read_text().replace("default_backend: json", "default_backend: markdown")
+    )
+    second = run_project(tmp_path)
+    second_raw = next(result for result in second if result.model_name == "raw_docs")
+
+    assert second_raw.documents_processed == 1
+    assert second_raw.documents_skipped == 0
+
+
 def test_changed_doc_is_reprocessed(fresh_project: Path) -> None:
     invoices_dir = fresh_project / "data" / "invoices"
     generate_invoices(5, invoices_dir, seed=1)
@@ -318,7 +356,7 @@ def test_classic_ml_tfidf_end_to_end(tmp_path: Path) -> None:
     assert ml_result.training_input["refs"] == ["raw_tickets"]
     assert ml_result.training_input["row_count"] == 8
     assert ml_result.metrics["vocabulary_size"] > 0
-    assert ml_result.metrics["feature_rows"] == ml_result.rows_written
+    assert set(ml_result.metrics) == {"row_count", "vocabulary_size"}
 
     artifact = project / "target" / "artifacts" / "ticket_tfidf"
     metadata_path = artifact / "metadata.json"

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -10,12 +9,14 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     field_serializer,
     field_validator,
     model_validator,
 )
 
 from .identifiers import validate_node_name
+from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 _STRICT_CONFIG = ConfigDict(extra="forbid")
 
@@ -32,53 +33,6 @@ INTERNAL_LINEAGE_FIELDS = frozenset(
         "extracted_at",
     }
 )
-
-_LLM_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
-    "max_tokens": (1, 65_536),
-    "max_retries": (0, 20),
-    "max_concurrent": (1, 100),
-}
-_LLM_NUMBER_BOUNDS: dict[str, tuple[float, float]] = {
-    "temperature": (0.0, 1.0),
-    "batch_poll_seconds": (0.1, 3600.0),
-}
-
-
-def validate_llm_numeric_options(options: Mapping[str, Any]) -> None:
-    for name, (minimum, maximum) in _LLM_INTEGER_BOUNDS.items():
-        if name not in options:
-            continue
-        value = options[name]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(
-                f"llm option '{name}' must be an integer between "
-                f"{minimum} and {maximum}"
-            )
-        if not minimum <= value <= maximum:
-            raise ValueError(
-                f"llm option '{name}' must be between {minimum} and {maximum}; "
-                f"got {value}"
-            )
-
-    for number_name, (number_minimum, number_maximum) in _LLM_NUMBER_BOUNDS.items():
-        if number_name not in options:
-            continue
-        value = options[number_name]
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError(
-                f"llm option '{number_name}' must be a number between "
-                f"{number_minimum} and {number_maximum}"
-            )
-        numeric = float(value)
-        if (
-            not math.isfinite(numeric)
-            or not number_minimum <= numeric <= number_maximum
-        ):
-            raise ValueError(
-                f"llm option '{number_name}' must be between "
-                f"{number_minimum} and {number_maximum}; got {value}"
-            )
-
 
 def _configured_extraction_field_names(options: Mapping[str, Any]) -> set[str]:
     names: set[str] = set()
@@ -131,13 +85,7 @@ class ExtractionConfig(BaseModel):
     @field_validator("options")
     @classmethod
     def _validate_options(cls, options: dict[str, Any]) -> dict[str, Any]:
-        if "api_key_env" in options:
-            raise ValueError(
-                "llm option 'api_key_env' is operator-owned configuration; "
-                "set it under `llm:` in profiles.yml, not in model extraction options"
-            )
         validate_extraction_field_names(options)
-        validate_llm_numeric_options(options)
         return options
 
 
@@ -257,6 +205,8 @@ class FieldConfig(BaseModel):
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
+    _yaml_provenance: YamlProvenance | None = PrivateAttr(default=None)
+
     name: str
     description: str | None = None
     source: str | None = None
@@ -308,6 +258,23 @@ class ModelConfig(BaseModel):
         return sum(
             b is not None
             for b in (self.extraction, self.transform, self.ml, self.chunk)
+        )
+
+    @property
+    def yaml_provenance(self) -> YamlProvenance | None:
+        return self._yaml_provenance
+
+    def format_yaml_diagnostic(
+        self,
+        message: str,
+        *,
+        relative_path: ConfigPath = (),
+    ) -> str:
+        if self._yaml_provenance is None:
+            return message
+        return self._yaml_provenance.format_message(
+            message,
+            relative_path=relative_path,
         )
 
 

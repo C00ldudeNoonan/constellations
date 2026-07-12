@@ -6,10 +6,11 @@ from typing import Any
 from pypdf import PdfReader
 
 from .base import BaseBackend, ExtractionResult
+from .options import PdfBackendOptions
 from .registry import register
 
 
-@register
+@register(options_model=PdfBackendOptions)
 class PdfBackend(BaseBackend):
     """Read .pdf files via pypdf; extract text per page.
 
@@ -33,6 +34,7 @@ class PdfBackend(BaseBackend):
         return f"pypdf/{pypdf.__version__}"
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        options = self.parse_options(options)
         text_field = options.get("text_field", "text")
         include_text = options.get("include_text", True)
         include_page_count = options.get("include_page_count", True)

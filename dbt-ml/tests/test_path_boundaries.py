@@ -16,6 +16,7 @@ from dbt_ml.cli import cli
 from dbt_ml.config import ConfigError, SourceConfig, load_project
 from dbt_ml.config.model import MLArtifactConfig, MLConfig, ModelConfig
 from dbt_ml.config.project import ProjectConfig
+from dbt_ml.ml_contracts import MLContractError, validate_ml_contract
 from dbt_ml.paths import resolve_within_project
 from dbt_ml.runner import run_project
 from dbt_ml.sources import LocalDocumentSource, SourceError
@@ -417,23 +418,19 @@ def _ml(path: str, external: bool = False) -> MLConfig:
 
 
 def test_artifact_path_escape_rejected(tmp_path: Path) -> None:
-    from dbt_ml.classic_ml import _artifact_path
-
     project = tmp_path / "project"
     project.mkdir()
     model = ModelConfig(name="m", ml=_ml("../artifacts"))
-    with pytest.raises(ConfigError, match=r"ml\.artifact\.path"):
-        _artifact_path(model.ml, model, ProjectConfig(name="p"), project)
+    with pytest.raises(MLContractError, match=r"ml\.artifact\.path"):
+        validate_ml_contract(model, ProjectConfig(name="p"), project)
 
 
 def test_artifact_path_external_allowed(tmp_path: Path) -> None:
-    from dbt_ml.classic_ml import _artifact_path
-
     project = tmp_path / "project"
     project.mkdir()
     model = ModelConfig(name="m", ml=_ml("../artifacts", external=True))
-    resolved = _artifact_path(model.ml, model, ProjectConfig(name="p"), project)
-    assert resolved == (tmp_path / "artifacts").resolve()
+    contract = validate_ml_contract(model, ProjectConfig(name="p"), project)
+    assert contract.artifact_path == (tmp_path / "artifacts").resolve()
 
 
 # ─── model-level llm cache_path ──────────────────────────────────────────────

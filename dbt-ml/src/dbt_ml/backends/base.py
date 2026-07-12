@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +36,12 @@ class BaseBackend(ABC):
     @abstractmethod
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult: ...
 
+    def parse_options(self, options: dict[str, Any]) -> dict[str, Any]:
+        """Validate this backend's options and return their canonical form."""
+        from .options import validate_backend_options
+
+        return validate_backend_options(self.name(), options)
+
     def extract_batch(
         self, paths: list[Path], options: dict[str, Any]
     ) -> list[ExtractionResult | Exception]:
@@ -53,13 +62,42 @@ class BaseBackend(ABC):
         """Parser identity recorded on every extracted row (issue #85), so a
         row can always be traced to the code that produced it. Backends built
         on a parsing library report that library's version."""
-        from importlib.metadata import PackageNotFoundError, version
+        return f"dbt-ml/{_dbt_ml_version()}"
 
-        try:
-            return f"dbt-ml/{version('dbt-ml')}"
-        except PackageNotFoundError:
-            return "dbt-ml/unknown"
+    def implementation_identity(self) -> str:
+        """dbt-ml release and source identity for incremental invalidation."""
+        backend_type = type(self)
+        backend_module = inspect.getmodule(backend_type)
+        payload = {
+            "dbt_ml_version": _dbt_ml_version(),
+            "backend_class": f"{backend_type.__module__}.{backend_type.__qualname__}",
+            "base_source": _source_digest(BaseBackend),
+            "backend_class_source": _source_digest(backend_type),
+            "backend_module_source": _source_digest(backend_module),
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.blake2b(canonical.encode(), digest_size=8).hexdigest()
+        return f"dbt-ml/{payload['dbt_ml_version']}+backend/{digest}"
 
     def validate(self) -> None:
         """Raise if the backend's runtime deps are missing. Default: no-op."""
         return None
+
+
+def _dbt_ml_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("dbt-ml")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _source_digest(obj: Any) -> str | None:
+    if obj is None:
+        return None
+    try:
+        source = inspect.getsource(obj)
+    except (OSError, TypeError):
+        return None
+    return hashlib.blake2b(source.encode(), digest_size=8).hexdigest()

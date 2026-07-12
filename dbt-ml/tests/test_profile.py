@@ -488,8 +488,11 @@ def test_unknown_warehouse_field_rejected(tmp_path: Path) -> None:
         + "\n",
     )
     project, _, _ = load_project(tmp_path)
-    with pytest.raises(ProfileError, match="pth_typo"):
+    with pytest.raises(ProfileError, match="pth_typo") as exc_info:
         resolve_profile(project, tmp_path)
+    message = str(exc_info.value)
+    assert "profiles.yml:8:9" in message
+    assert "test_proj.outputs.dev.warehouse.pth_typo" in message
 
 
 @pytest.mark.parametrize("bad_key", ["source_path", "source-path"])
@@ -514,5 +517,90 @@ def test_unknown_target_field_rejected(tmp_path: Path, bad_key: str) -> None:
     )
     project, _, _ = load_project(tmp_path)
 
-    with pytest.raises(ProfileError, match=bad_key):
+    with pytest.raises(ProfileError, match=bad_key) as exc_info:
         resolve_profile(project, tmp_path)
+    message = str(exc_info.value)
+    assert "profiles.yml:8:7" in message
+    assert f"test_proj.outputs.dev.{bad_key}" in message
+
+
+def test_profile_validation_diagnostic_does_not_echo_secret_input(
+    tmp_path: Path,
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    secret = "sk-distinctive-invalid-profile-secret"
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/db.duckdb",
+                "      llm:",
+                f"        api_key: {secret}",
+            ]
+        )
+        + "\n",
+    )
+
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError) as exc_info:
+        resolve_profile(project, tmp_path)
+
+    message = str(exc_info.value)
+    assert "profiles.yml:8:9" in message
+    assert "test_proj.outputs.dev.llm.api_key" in message
+    assert "Extra inputs are not permitted" in message
+    assert secret not in message
+
+
+def test_duplicate_profile_key_is_rejected_at_second_key_without_value(
+    tmp_path: Path,
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    secret = "distinctive-duplicate-profile-secret"
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                f"  target: {secret}",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/db.duckdb",
+            ]
+        )
+        + "\n",
+    )
+
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError) as exc_info:
+        resolve_profile(project, tmp_path)
+
+    message = str(exc_info.value)
+    assert "profiles.yml:3:3 [test_proj.target]" in message
+    assert "duplicate mapping key" in message
+    assert secret not in message
+
+
+@pytest.mark.parametrize("contents", ["[]\n", "0\n", "false\n"])
+def test_falsy_profile_document_is_not_treated_as_empty_mapping(
+    tmp_path: Path,
+    contents: str,
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(tmp_path, contents)
+
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError) as exc_info:
+        resolve_profile(project, tmp_path)
+
+    message = str(exc_info.value)
+    assert "profiles.yml:1:1 [<root>]" in message
+    assert "top-level must be a mapping of profile names" in message

@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import Any
 
 from .base import BaseBackend, ExtractionResult
+from .options import JsonBackendOptions
 from .registry import register
 
 
-@register
+@register(options_model=JsonBackendOptions)
 class JsonBackend(BaseBackend):
     def name(self) -> str:
         return "json"
@@ -17,6 +18,7 @@ class JsonBackend(BaseBackend):
         return [".json"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        options = self.parse_options(options)
         with path.open() as f:
             data = json.load(f)
 

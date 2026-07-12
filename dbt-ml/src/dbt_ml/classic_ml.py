@@ -17,7 +17,12 @@ from .adapters import WarehouseAdapter
 from .config.model import MLConfig, ModelConfig
 from .config.project import ProjectConfig
 from .dag import parse_ref
-from .paths import resolve_within_project
+from .ml_contracts import (
+    ExecutableMLContract,
+    MLContractError,
+    validate_ml_contract,
+    validate_persisted_ml_options,
+)
 from .versioning import compute_code_version
 
 # v2 (issue #122): canonical training-row order, vectorizer-convention
@@ -27,8 +32,6 @@ from .versioning import compute_code_version
 ARTIFACT_SCHEMA_VERSION = 2
 ARTIFACT_REGISTRY_FILENAME = "registry.json"
 _TOKEN_RE = re.compile(r"\w+")
-_FEATURE_PROVIDERS = {"builtin.count", "builtin.tfidf", "builtin.hashing"}
-_CLASSIFIER_PROVIDERS = {"builtin.naive_bayes"}
 _ENGLISH_STOP_WORDS = {
     "a",
     "an",
@@ -110,57 +113,31 @@ def run_classic_ml_model(
     adapter: WarehouseAdapter,
 ) -> ClassicMLRun:
     assert model.ml is not None
-    if model.ml.task == "features":
-        provider = _feature_provider(model.ml.provider)
+    contract = validate_ml_contract(model, project, project_dir)
+    if contract.task == "features":
         return _run_features(
             model=model,
             ml=model.ml,
-            provider=provider,
+            contract=contract,
             project=project,
             project_dir=project_dir,
             adapter=adapter,
         )
-    if model.ml.task == "classifier":
-        classifier_provider = _classifier_provider(model.ml.provider)
-        return _run_classifier(
-            model=model,
-            ml=model.ml,
-            provider=classifier_provider,
-            project=project,
-            project_dir=project_dir,
-            adapter=adapter,
-        )
-    raise NotImplementedError(
-        f"ML task '{model.ml.task}' is not executable yet; "
-        "supported tasks are 'features' and 'classifier'."
+    return _run_classifier(
+        model=model,
+        ml=model.ml,
+        contract=contract,
+        project=project,
+        project_dir=project_dir,
+        adapter=adapter,
     )
-
-
-def _feature_provider(provider: str | None) -> FeatureProvider:
-    provider = provider or "builtin.tfidf"
-    if provider not in _FEATURE_PROVIDERS:
-        raise NotImplementedError(
-            f"ML provider '{provider}' is not executable yet for task 'features'; "
-            "supported feature providers are builtin.count, builtin.tfidf, and builtin.hashing."
-        )
-    return cast(FeatureProvider, provider)
-
-
-def _classifier_provider(provider: str | None) -> ClassifierProvider:
-    provider = provider or "builtin.naive_bayes"
-    if provider not in _CLASSIFIER_PROVIDERS:
-        raise NotImplementedError(
-            f"ML provider '{provider}' is not executable yet for task 'classifier'; "
-            "supported classifier provider is builtin.naive_bayes."
-        )
-    return cast(ClassifierProvider, provider)
 
 
 def _run_features(
     *,
     model: ModelConfig,
     ml: MLConfig,
-    provider: FeatureProvider,
+    contract: ExecutableMLContract,
     project: ProjectConfig,
     project_dir: Path,
     adapter: WarehouseAdapter,
@@ -170,6 +147,13 @@ def _run_features(
     if not ml.text_field:
         raise ValueError(f"ML model '{model.name}' requires ml.text_field.")
 
+    provider = cast(FeatureProvider, contract.provider)
+    options = _text_options(contract.options)
+    artifact_path = contract.artifact_path
+    if ml.mode in {"predict", "load_pretrained"}:
+        metadata, vectorizer = _read_artifact(artifact_path, provider, ml)
+        options = _text_options(vectorizer["options"])
+
     source_name = parse_ref(model.depends_on[0])
     source_df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(source_name)}")
     if ml.text_field not in source_df.columns:
@@ -178,8 +162,6 @@ def _run_features(
             f"is not present in '{source_name}'."
         )
 
-    options = _text_options(ml.options)
-    artifact_path = _artifact_path(ml, model, project, project_dir)
     rows = _source_rows(source_df, ml.text_field)
     training_input = _training_input(model.depends_on, rows)
     code_version = compute_code_version(
@@ -190,14 +172,27 @@ def _run_features(
     )
 
     if ml.mode in {"fit_transform", "fit"}:
-        vectorizer = _fit_vectorizer(rows, provider, options)
+        vectorizer = _fit_vectorizer(rows, provider, options, contract.options)
+
+    doc_tokens = [_analyze(row["text"], options) for row in rows]
+    features = _feature_rows(rows, doc_tokens, vectorizer, source_name)
+    all_metrics = {
+        "row_count": len(rows),
+        "vocabulary_size": len(vectorizer["vocabulary"]),
+        "feature_rows": len(features),
+    }
+    if provider == "builtin.hashing":
+        all_metrics["hash_buckets"] = vectorizer["n_features"]
+
+    if ml.mode in {"fit_transform", "fit"}:
         metadata = _metadata(
             model=model,
             ml=ml,
             provider=provider,
             training_input=training_input,
             vectorizer=vectorizer,
-            options=options,
+            provider_options=contract.options,
+            metrics=all_metrics,
             code_version=code_version,
         )
         _write_artifact(artifact_path, metadata, vectorizer)
@@ -209,21 +204,6 @@ def _run_features(
             artifact_path=artifact_path,
             metadata=metadata,
         )
-    elif ml.mode in {"predict", "load_pretrained"}:
-        metadata, vectorizer = _read_artifact(artifact_path, provider, ml)
-        options = _text_options(vectorizer["options"])
-    else:
-        raise ValueError(f"Unsupported ML mode: {ml.mode}")
-
-    doc_tokens = [_analyze(row["text"], options) for row in rows]
-    features = _feature_rows(rows, doc_tokens, vectorizer, source_name)
-    metrics = {
-        "row_count": len(rows),
-        "vocabulary_size": len(vectorizer["vocabulary"]),
-        "feature_rows": len(features),
-    }
-    if provider == "builtin.hashing":
-        metrics["hash_buckets"] = vectorizer["n_features"]
 
     if ml.mode == "fit":
         df = pl.DataFrame(
@@ -244,7 +224,7 @@ def _run_features(
         artifact_path=artifact_path,
         artifact_version=str(metadata["artifact_version"]),
         training_input=metadata.get("training_input", training_input),
-        metrics=metrics,
+        metrics=_project_metrics(ml, all_metrics),
         artifact_metadata=metadata,
     )
 
@@ -253,7 +233,7 @@ def _run_classifier(
     *,
     model: ModelConfig,
     ml: MLConfig,
-    provider: ClassifierProvider,
+    contract: ExecutableMLContract,
     project: ProjectConfig,
     project_dir: Path,
     adapter: WarehouseAdapter,
@@ -264,6 +244,12 @@ def _run_classifier(
         raise ValueError(f"ML model '{model.name}' requires ml.text_field.")
     if ml.mode in {"fit_transform", "fit"} and not ml.label_field:
         raise ValueError(f"Classifier model '{model.name}' requires ml.label_field for fitting.")
+
+    provider = cast(ClassifierProvider, contract.provider)
+    options = _text_options(contract.options)
+    artifact_path = contract.artifact_path
+    if ml.mode in {"predict", "load_pretrained"}:
+        metadata, classifier = _read_classifier_artifact(artifact_path, provider, ml)
 
     source_name = parse_ref(model.depends_on[0])
     source_df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(source_name)}")
@@ -278,8 +264,6 @@ def _run_classifier(
             f"is not present in '{source_name}'."
         )
 
-    options = _text_options(ml.options)
-    artifact_path = _artifact_path(ml, model, project, project_dir)
     rows = _source_rows(source_df, ml.text_field, ml.label_field)
     training_input = _training_input(model.depends_on, rows)
     code_version = compute_code_version(
@@ -290,16 +274,16 @@ def _run_classifier(
     )
 
     if ml.mode in {"fit_transform", "fit"}:
-        classifier = _fit_naive_bayes(rows, provider, options, ml.options)
+        classifier = _fit_naive_bayes(rows, provider, options, contract.options)
         predictions = _classifier_prediction_rows(rows, classifier, source_name)
-        metrics = _classifier_metrics(rows, predictions, classifier)
+        all_metrics = _classifier_metrics(rows, predictions, classifier)
         metadata = _classifier_metadata(
             model=model,
             ml=ml,
             provider=provider,
             training_input=training_input,
             classifier=classifier,
-            metrics=metrics,
+            metrics=all_metrics,
             code_version=code_version,
         )
         _write_classifier_artifact(artifact_path, metadata, classifier)
@@ -312,11 +296,8 @@ def _run_classifier(
             metadata=metadata,
         )
     elif ml.mode in {"predict", "load_pretrained"}:
-        metadata, classifier = _read_classifier_artifact(artifact_path, provider, ml)
         predictions = _classifier_prediction_rows(rows, classifier, source_name)
-        metrics = _classifier_metrics(rows, predictions, classifier)
-    else:
-        raise ValueError(f"Unsupported ML mode: {ml.mode}")
+        all_metrics = _classifier_metrics(rows, predictions, classifier)
 
     if ml.mode == "fit":
         df = pl.DataFrame(
@@ -326,7 +307,7 @@ def _run_classifier(
                     "row_count": len(rows),
                     "class_count": len(classifier["classes"]),
                     "vocabulary_size": len(classifier["vocabulary"]),
-                    "accuracy": metrics.get("accuracy"),
+                    "accuracy": all_metrics.get("accuracy"),
                 }
             ]
         )
@@ -338,26 +319,9 @@ def _run_classifier(
         artifact_path=artifact_path,
         artifact_version=str(metadata["artifact_version"]),
         training_input=metadata.get("training_input", training_input),
-        metrics=metrics,
+        metrics=_project_metrics(ml, all_metrics),
         artifact_metadata=metadata,
     )
-
-
-def _artifact_path(
-    ml: MLConfig,
-    model: ModelConfig,
-    project: ProjectConfig,
-    project_dir: Path,
-) -> Path:
-    if ml.artifact.path is not None:
-        return resolve_within_project(
-            ml.artifact.path,
-            project_dir,
-            surface=f"Model '{model.name}' ml.artifact.path",
-            external=ml.artifact.external,
-            hint="Set `external: true` on the artifact block to allow it.",
-        )
-    return project_dir / project.target_path / "artifacts" / model.name
 
 
 def _canonical_row_key(row: dict[str, Any]) -> tuple[int, str, str]:
@@ -460,9 +424,10 @@ def _fit_vectorizer(
     rows: list[dict[str, Any]],
     provider: FeatureProvider,
     options: TextOptions,
+    provider_options: dict[str, Any],
 ) -> dict[str, Any]:
     if provider == "builtin.hashing":
-        return _fit_hashing_vectorizer(provider, options)
+        return _fit_hashing_vectorizer(provider, options, provider_options)
 
     doc_tokens = [_analyze(row["text"], options) for row in rows]
     doc_freq: Counter[str] = Counter()
@@ -482,11 +447,15 @@ def _fit_vectorizer(
         "vocabulary": terms,
         "idf": idf_by_term,
         "n_features": len(terms),
-        "options": _serializable_options(options),
+        "options": dict(provider_options),
     }
 
 
-def _fit_hashing_vectorizer(provider: FeatureProvider, options: TextOptions) -> dict[str, Any]:
+def _fit_hashing_vectorizer(
+    provider: FeatureProvider,
+    options: TextOptions,
+    provider_options: dict[str, Any],
+) -> dict[str, Any]:
     n_features = options["n_features"]
     if n_features <= 0:
         raise ValueError("ml.options.n_features must be positive for builtin.hashing.")
@@ -495,7 +464,7 @@ def _fit_hashing_vectorizer(provider: FeatureProvider, options: TextOptions) -> 
         "vocabulary": [],
         "idf": {},
         "n_features": n_features,
-        "options": _serializable_options(options),
+        "options": dict(provider_options),
     }
 
 
@@ -542,7 +511,14 @@ def _analyze(text: str, options: TextOptions) -> list[str]:
     if options["lowercase"]:
         text = text.lower()
     if options["analyzer"] == "word":
-        tokens = re.findall(options["token_pattern"], text)
+        pattern = re.compile(options["token_pattern"])
+        matches = list(pattern.finditer(text))
+        if any(match.start() == match.end() for match in matches):
+            raise ValueError("ml.options.token_pattern produced an empty match")
+        group = 1 if pattern.groups == 1 else 0
+        tokens = [match.group(group) for match in matches]
+        if any(not token for token in tokens):
+            raise ValueError("ml.options.token_pattern produced an empty token")
         tokens = [token for token in tokens if token not in options["stop_words"]]
         return _token_ngrams(tokens, options["ngram_range"])
     if options["analyzer"] == "char_wb":
@@ -745,7 +721,7 @@ def _fit_naive_bayes(
         "classes": classes,
         "vocabulary": vocabulary,
         "n_features": len(vocabulary),
-        "options": _serializable_options(options),
+        "options": dict(raw_options),
         "class_doc_counts": dict(class_doc_counts),
         "class_log_prior": class_log_prior,
         "feature_log_prob": feature_log_prob,
@@ -828,6 +804,12 @@ def _classifier_metrics(
     return metrics
 
 
+def _project_metrics(ml: MLConfig, metrics: dict[str, Any]) -> dict[str, Any]:
+    if not ml.metrics:
+        return dict(metrics)
+    return {name: metrics.get(name) for name in ml.metrics}
+
+
 def _metadata(
     *,
     model: ModelConfig,
@@ -835,13 +817,14 @@ def _metadata(
     provider: FeatureProvider,
     training_input: dict[str, Any],
     vectorizer: dict[str, Any],
-    options: TextOptions,
+    provider_options: dict[str, Any],
+    metrics: dict[str, Any],
     code_version: str,
 ) -> dict[str, Any]:
     files = ["metadata.json"]
     if provider != "builtin.hashing":
         files.append("vocabulary.json")
-    return {
+    metadata: dict[str, Any] = {
         "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
         "artifact_type": "classic_ml",
         "model_name": model.name,
@@ -855,21 +838,22 @@ def _metadata(
                 "task": ml.task,
                 "provider": provider,
                 "text_field": ml.text_field,
-                "options": _serializable_options(options),
+                "options": provider_options,
             }
         ),
         "runtime": _runtime_versions(provider),
         "training_input": training_input,
-        "metrics": {
-            "row_count": training_input["row_count"],
-            "vocabulary_size": len(vectorizer["vocabulary"]),
+        "integrity": {
             "feature_count": vectorizer["n_features"],
         },
         "files": files,
-        "options": _serializable_options(options),
+        "options": provider_options,
         "vocabulary_hash": _hash_json(vectorizer["vocabulary"]),
         "idf_hash": _hash_json(vectorizer["idf"]),
     }
+    if ml.artifact.include_metrics:
+        metadata["metrics"] = _project_metrics(ml, metrics)
+    return metadata
 
 
 def _classifier_metadata(
@@ -882,7 +866,7 @@ def _classifier_metadata(
     metrics: dict[str, Any],
     code_version: str,
 ) -> dict[str, Any]:
-    return {
+    metadata: dict[str, Any] = {
         "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
         "artifact_type": "classic_ml",
         "model_name": model.name,
@@ -898,27 +882,24 @@ def _classifier_metadata(
                 "provider": provider,
                 "text_field": ml.text_field,
                 "label_field": ml.label_field,
-                "options": {
-                    "text": classifier["options"],
-                    "alpha": classifier["alpha"],
-                },
+                "options": classifier["options"],
             }
         ),
         "runtime": _runtime_versions(provider),
         "training_input": training_input,
-        "metrics": {
-            "row_count": metrics["row_count"],
+        "integrity": {
             "class_count": metrics["class_count"],
-            "vocabulary_size": metrics["vocabulary_size"],
-            "accuracy": metrics.get("accuracy"),
+            "feature_count": len(classifier["vocabulary"]),
         },
         "files": ["metadata.json", "model.json"],
         "options": classifier["options"],
-        "classifier_options": {"alpha": classifier["alpha"]},
         "classes_hash": _hash_json(classifier["classes"]),
         "vocabulary_hash": _hash_json(classifier["vocabulary"]),
         "model_hash": _hash_json(_classifier_payload(classifier)),
     }
+    if ml.artifact.include_metrics:
+        metadata["metrics"] = _project_metrics(ml, metrics)
+    return metadata
 
 
 def _write_artifact(
@@ -955,33 +936,136 @@ def _read_artifact(
     ml: MLConfig,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     metadata = _read_metadata(path)
-    _validate_metadata(metadata, path, provider, ml)
+    expected_files = (
+        ("metadata.json",)
+        if provider == "builtin.hashing"
+        else ("metadata.json", "vocabulary.json")
+    )
+    _validate_metadata(metadata, path, provider, ml, expected_files=expected_files)
+    metadata_options = _validated_persisted_options(
+        provider,
+        metadata.get("options"),
+        path,
+        surface="metadata",
+    )
     if provider == "builtin.hashing":
+        integrity = metadata.get("integrity")
+        if isinstance(integrity, dict) and "feature_count" in integrity:
+            feature_count = integrity["feature_count"]
+            if feature_count != metadata_options["n_features"]:
+                raise IncompatibleClassicMLArtifactError(
+                    f"incompatible artifact integrity at {path}: feature_count does "
+                    "not match persisted n_features"
+                )
+        else:
+            legacy_metrics = metadata.get("metrics")
+            if not isinstance(legacy_metrics, dict):
+                raise IncompatibleClassicMLArtifactError(
+                    f"incompatible hashing artifact integrity at {path}: missing "
+                    "feature_count"
+                )
+            feature_count = legacy_metrics.get("feature_count")
+        if isinstance(feature_count, bool) or not isinstance(feature_count, int):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible hashing artifact integrity at {path}: feature_count "
+                "must be an integer"
+            )
+        if feature_count != metadata_options["n_features"]:
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible hashing artifact integrity at {path}: expected "
+                f"{metadata_options['n_features']} features, found {feature_count!r}"
+            )
         vectorizer = {
             "provider": provider,
             "vocabulary": [],
             "idf": {},
-            "n_features": metadata["metrics"]["feature_count"],
-            "options": metadata["options"],
+            "n_features": metadata_options["n_features"],
+            "options": metadata_options,
         }
         _validate_artifact_payload(metadata, path, vectorizer)
         return metadata, vectorizer
 
     vocab_path = path / "vocabulary.json"
-    if not vocab_path.exists():
-        raise MissingClassicMLArtifactError(
-            f"missing artifact payload 'vocabulary.json' at {path}; "
-            "run fit or fit_transform again"
+    _validate_artifact_payload(metadata, path, {})
+    vocab_payload = _read_artifact_json(vocab_path, path, "vocabulary")
+    try:
+        if vocab_payload.get("provider") != provider:
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible vocabulary provider at {path}: expected {provider}, "
+                f"found {vocab_payload.get('provider')!r}"
+            )
+        vocabulary = vocab_payload["terms"]
+        idf_payload = vocab_payload["idf"]
+        if (
+            not isinstance(vocabulary, list)
+            or any(not isinstance(term, str) for term in vocabulary)
+            or len(vocabulary) != len(set(vocabulary))
+        ):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible vocabulary terms at {path}: expected unique strings"
+            )
+        if not isinstance(idf_payload, dict):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible vocabulary idf values at {path}: expected an object"
+            )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int | float)
+            for value in idf_payload.values()
+        ):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible vocabulary idf values at {path}: expected numbers"
+            )
+        idf = {str(key): float(value) for key, value in idf_payload.items()}
+        if any(not math.isfinite(value) for value in idf.values()):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible vocabulary idf values at {path}: values must be finite"
+            )
+        if provider == "builtin.count" and idf:
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible count-vector artifact at {path}: idf must be empty"
+            )
+        if provider == "builtin.tfidf" and set(idf) != set(vocabulary):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible TF-IDF artifact at {path}: idf keys must match terms"
+            )
+        payload_options = _validated_persisted_options(
+            provider,
+            vocab_payload.get("options"),
+            path,
+            surface="vocabulary payload",
         )
-    vocab_payload = json.loads(vocab_path.read_text())
+    except ClassicMLArtifactError:
+        raise
+    except (KeyError, TypeError, ValueError) as e:
+        raise IncompatibleClassicMLArtifactError(
+            f"malformed vocabulary payload at {path}: {e}"
+        ) from e
+    if payload_options != metadata_options:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible vocabulary options at {path}: metadata and payload differ"
+        )
     vectorizer = {
         "provider": provider,
-        "vocabulary": [str(t) for t in vocab_payload["terms"]],
-        "idf": {str(k): float(v) for k, v in vocab_payload["idf"].items()},
-        "n_features": len(vocab_payload["terms"]),
-        "options": vocab_payload["options"],
+        "vocabulary": vocabulary,
+        "idf": idf,
+        "n_features": len(vocabulary),
+        "options": payload_options,
     }
-    _validate_artifact_payload(metadata, path, vectorizer)
+    integrity = metadata.get("integrity")
+    if integrity is not None:
+        if not isinstance(integrity, dict):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible artifact integrity at {path}: expected an object"
+            )
+        feature_count = integrity.get("feature_count")
+        if (
+            isinstance(feature_count, bool)
+            or not isinstance(feature_count, int)
+            or feature_count != len(vocabulary)
+        ):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible artifact integrity at {path}: feature_count mismatch"
+            )
     return metadata, vectorizer
 
 
@@ -991,15 +1075,160 @@ def _read_classifier_artifact(
     ml: MLConfig,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     metadata = _read_metadata(path)
-    _validate_metadata(metadata, path, provider, ml)
+    _validate_metadata(
+        metadata,
+        path,
+        provider,
+        ml,
+        expected_files=("metadata.json", "model.json"),
+    )
+    metadata_options_payload = metadata.get("options")
+    if isinstance(metadata_options_payload, dict) and "alpha" not in metadata_options_payload:
+        legacy_classifier_options = metadata.get("classifier_options")
+        if isinstance(legacy_classifier_options, dict) and "alpha" in legacy_classifier_options:
+            metadata_options_payload = {
+                **metadata_options_payload,
+                "alpha": legacy_classifier_options["alpha"],
+            }
+    metadata_options = _validated_persisted_options(
+        provider,
+        metadata_options_payload,
+        path,
+        surface="metadata",
+    )
     model_path = path / "model.json"
-    if not model_path.exists():
-        raise MissingClassicMLArtifactError(
-            f"missing artifact payload 'model.json' at {path}; run fit or fit_transform again"
+    _validate_artifact_payload(metadata, path, {})
+    classifier = _read_artifact_json(model_path, path, "classifier model")
+    payload_options_raw = classifier.get("options")
+    if isinstance(payload_options_raw, dict) and "alpha" not in payload_options_raw:
+        payload_options_raw = {**payload_options_raw, "alpha": classifier.get("alpha")}
+    payload_options = _validated_persisted_options(
+        provider,
+        payload_options_raw,
+        path,
+        surface="classifier payload",
+    )
+    if payload_options != metadata_options:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible classifier options at {path}: metadata and payload differ"
         )
-    classifier = cast(dict[str, Any], json.loads(model_path.read_text()))
-    _validate_artifact_payload(metadata, path, classifier)
+    classifier["options"] = payload_options
+    classifier["alpha"] = float(payload_options["alpha"])
+    _validate_classifier_payload(classifier, path, provider)
+    integrity = metadata.get("integrity")
+    if integrity is not None:
+        if not isinstance(integrity, dict):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible classifier integrity at {path}: expected an object"
+            )
+        class_count = integrity.get("class_count")
+        feature_count = integrity.get("feature_count")
+        if (
+            isinstance(class_count, bool)
+            or not isinstance(class_count, int)
+            or class_count != len(classifier["classes"])
+        ):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible classifier integrity at {path}: class_count mismatch"
+            )
+        if (
+            isinstance(feature_count, bool)
+            or not isinstance(feature_count, int)
+            or feature_count != len(classifier["vocabulary"])
+        ):
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible classifier integrity at {path}: feature_count mismatch"
+            )
     return metadata, classifier
+
+
+def _validated_persisted_options(
+    provider: FeatureProvider | ClassifierProvider,
+    options: object,
+    path: Path,
+    *,
+    surface: str,
+) -> dict[str, Any]:
+    try:
+        return validate_persisted_ml_options(provider, options)
+    except MLContractError as e:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible {surface} at {path}: {e}"
+        ) from e
+
+
+def _validate_classifier_payload(
+    classifier: dict[str, Any],
+    path: Path,
+    provider: ClassifierProvider,
+) -> None:
+    try:
+        if classifier.get("provider") != provider:
+            raise ValueError(
+                f"expected provider {provider}, found {classifier.get('provider')!r}"
+            )
+        classes = classifier["classes"]
+        vocabulary = classifier["vocabulary"]
+        if (
+            not isinstance(classes, list)
+            or not classes
+            or any(not isinstance(label, str) for label in classes)
+            or len(classes) != len(set(classes))
+        ):
+            raise ValueError("classes must be a non-empty list of unique strings")
+        if (
+            not isinstance(vocabulary, list)
+            or any(not isinstance(term, str) for term in vocabulary)
+            or len(vocabulary) != len(set(vocabulary))
+        ):
+            raise ValueError("vocabulary must be a list of unique strings")
+        if (
+            isinstance(classifier["n_features"], bool)
+            or not isinstance(classifier["n_features"], int)
+            or classifier["n_features"] != len(vocabulary)
+        ):
+            raise ValueError("n_features must match vocabulary length")
+        alpha = float(classifier["alpha"])
+        if not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError("alpha must be finite and positive")
+
+        class_fields = ("class_doc_counts", "class_log_prior", "default_log_prob")
+        for field in class_fields:
+            values = classifier[field]
+            if not isinstance(values, dict) or set(values) != set(classes):
+                raise ValueError(f"{field} keys must match classes")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                for value in values.values()
+            ):
+                raise ValueError(f"{field} values must be finite numbers")
+
+        probabilities = classifier["feature_log_prob"]
+        if not isinstance(probabilities, dict) or set(probabilities) != set(classes):
+            raise ValueError("feature_log_prob keys must match classes")
+        for label in classes:
+            values = probabilities[label]
+            if not isinstance(values, dict) or set(values) != set(vocabulary):
+                raise ValueError(
+                    f"feature_log_prob[{label!r}] keys must match vocabulary"
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                for value in values.values()
+            ):
+                raise ValueError(
+                    f"feature_log_prob[{label!r}] values must be finite numbers"
+                )
+    except ClassicMLArtifactError:
+        raise
+    except (KeyError, TypeError, ValueError) as e:
+        raise IncompatibleClassicMLArtifactError(
+            f"malformed classifier payload at {path}: {e}"
+        ) from e
 
 
 def _classifier_payload(classifier: dict[str, Any]) -> dict[str, Any]:
@@ -1038,9 +1267,38 @@ def _read_metadata(path: Path) -> dict[str, Any]:
     metadata_path = path / "metadata.json"
     if not metadata_path.exists():
         raise MissingClassicMLArtifactError(
-            f"missing artifact metadata at {metadata_path}; run fit or fit_transform first"
+            f"missing artifact metadata at {metadata_path}; run fit/fit_transform or "
+            "supply a dbt-ml-native artifact first"
         )
-    return cast(dict[str, Any], json.loads(metadata_path.read_text()))
+    return _read_artifact_json(metadata_path, path, "metadata")
+
+
+def _read_artifact_json(
+    file_path: Path,
+    artifact_path: Path,
+    label: str,
+) -> dict[str, Any]:
+    if not file_path.exists():
+        raise MissingClassicMLArtifactError(
+            f"missing artifact payload '{file_path.name}' at {artifact_path}; run "
+            "fit/fit_transform or supply a dbt-ml-native artifact first"
+        )
+    if file_path.is_symlink() or not file_path.is_file():
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible {label} at {artifact_path}: expected a regular, "
+            "non-symlink file"
+        )
+    try:
+        payload = json.loads(file_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise IncompatibleClassicMLArtifactError(
+            f"malformed {label} JSON at {artifact_path}: {e}"
+        ) from e
+    if not isinstance(payload, dict):
+        raise IncompatibleClassicMLArtifactError(
+            f"malformed {label} JSON at {artifact_path}: expected an object"
+        )
+    return cast(dict[str, Any], payload)
 
 
 def _validate_metadata(
@@ -1048,6 +1306,8 @@ def _validate_metadata(
     path: Path,
     provider: str,
     ml: MLConfig,
+    *,
+    expected_files: tuple[str, ...],
 ) -> None:
     schema_version = metadata.get("artifact_schema_version")
     if schema_version != ARTIFACT_SCHEMA_VERSION:
@@ -1070,6 +1330,41 @@ def _validate_metadata(
             f"incompatible artifact task at {path}: expected {ml.task}, "
             f"found {metadata.get('task')!r}"
         )
+    if metadata.get("mode") not in {"fit", "fit_transform", "load_pretrained"}:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible artifact mode at {path}: expected a fitted or pretrained "
+            "artifact, "
+            f"found {metadata.get('mode')!r}"
+        )
+    files = metadata.get("files")
+    if files != list(expected_files):
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible artifact file contract at {path}: expected "
+            f"{list(expected_files)!r}, found {files!r}"
+        )
+    runtime = metadata.get("runtime")
+    required_runtime_fields = ("python", "dbt_ml", "polars", "provider")
+    if not isinstance(runtime, dict) or any(
+        not isinstance(runtime.get(field), str) or not runtime[field]
+        for field in required_runtime_fields
+    ):
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible artifact runtime contract at {path}: expected non-empty "
+            f"fields {list(required_runtime_fields)!r}"
+        )
+    if runtime["provider"] != provider:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible artifact runtime provider at {path}: expected {provider}, "
+            f"found {runtime['provider']!r}"
+        )
+    if not isinstance(metadata.get("options"), dict):
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible artifact options at {path}: expected an object"
+        )
+    if not isinstance(metadata.get("artifact_files_hash"), str):
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible artifact file hash at {path}: expected a string"
+        )
     expected_version = _artifact_version(metadata)
     if metadata.get("artifact_version") != expected_version:
         raise StaleClassicMLArtifactError(
@@ -1083,7 +1378,14 @@ def _validate_artifact_payload(
     vectorizer: dict[str, Any],
 ) -> None:
     payload_files = [f for f in metadata.get("files", []) if f != "metadata.json"]
-    actual_hash = _artifact_files_hash(path, payload_files, vectorizer)
+    try:
+        actual_hash = _artifact_files_hash(path, payload_files, vectorizer)
+    except ClassicMLArtifactError:
+        raise
+    except OSError as e:
+        raise IncompatibleClassicMLArtifactError(
+            f"could not validate artifact payload at {path}: {e}"
+        ) from e
     expected_hash = metadata.get("artifact_files_hash")
     if actual_hash != expected_hash:
         raise StaleClassicMLArtifactError(
@@ -1137,7 +1439,7 @@ def _write_artifact_registry(
     registry_dir.mkdir(parents=True, exist_ok=True)
     registry_path = registry_dir / ARTIFACT_REGISTRY_FILENAME
     registry = _read_artifact_registry(registry_path)
-    registry["artifacts"][model.name] = {
+    entry: dict[str, Any] = {
         "model_name": model.name,
         "artifact_path": _display_path(artifact_path, project_dir),
         "artifact_version": metadata["artifact_version"],
@@ -1147,8 +1449,10 @@ def _write_artifact_registry(
         "config_hash": metadata["config_hash"],
         "artifact_files_hash": metadata["artifact_files_hash"],
         "training_input": metadata["training_input"],
-        "metrics": metadata["metrics"],
     }
+    if "metrics" in metadata:
+        entry["metrics"] = metadata["metrics"]
+    registry["artifacts"][model.name] = entry
     registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True))
 
 
@@ -1184,22 +1488,6 @@ def _package_version(name: str) -> str:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
-
-
-def _serializable_options(options: TextOptions) -> dict[str, Any]:
-    return {
-        "analyzer": options["analyzer"],
-        "lowercase": options["lowercase"],
-        "token_pattern": options["token_pattern"],
-        "ngram_range": list(options["ngram_range"]),
-        "stop_words": sorted(options["stop_words"]),
-        "min_df": options["min_df"],
-        "max_df": options["max_df"],
-        "max_features": options["max_features"],
-        "binary": options["binary"],
-        "n_features": options["n_features"],
-        "alternate_sign": options["alternate_sign"],
-    }
 
 
 def _empty_feature_df() -> pl.DataFrame:

@@ -223,6 +223,7 @@ def test_compile_unknown_model_key_is_precise_exit_2(tmp_path: Path) -> None:
 
     assert result.exit_code == 2, result.output
     assert "strict.yml" in result.output
+    assert "strict.yml:7:5" in result.output
     assert "models.0.materializtion" in result.output
     assert "Extra inputs are not permitted" in result.output
     assert not (project / "target" / "manifest.json").exists()
@@ -240,7 +241,240 @@ def test_compile_unknown_source_key_is_precise_exit_2(tmp_path: Path) -> None:
 
     assert result.exit_code == 2, result.output
     assert "docs.yml" in result.output
+    assert "docs.yml:5:5" in result.output
     assert "sources.0.file_patern" in result.output
+
+
+def test_nested_validation_error_reports_value_location(tmp_path: Path) -> None:
+    project = _compile_fixture(
+        tmp_path,
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    extraction:\n      backend: json\n      flush_every: 0\n",
+    )
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(project), "compile"])
+
+    assert result.exit_code == 2, result.output
+    assert "strict.yml:6:20" in result.output
+    assert "models.0.extraction.flush_every" in result.output
+    assert "Input should be greater than 0" in result.output
+
+
+def test_missing_field_reports_parent_location_and_full_path(tmp_path: Path) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text("name: located_project\n")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "missing.yml").write_text(
+        "version: 2\nsources:\n  - path: data\n"
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    message = str(exc_info.value)
+    assert "missing.yml:3:5" in message
+    assert "sources.0.name" in message
+    assert "Field required" in message
+
+
+def test_validation_diagnostic_does_not_echo_invalid_input(tmp_path: Path) -> None:
+    secret = "distinctive-invalid-input-secret"
+    project = _compile_fixture(
+        tmp_path,
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    extraction:\n      backend: json\n"
+        f"    materializtion: {secret}\n",
+    )
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(project), "compile"])
+
+    assert result.exit_code == 2, result.output
+    assert "strict.yml:6:5" in result.output
+    assert "models.0.materializtion" in result.output
+    assert secret not in result.output
+
+
+def test_malformed_yaml_reports_one_based_location_without_source_line(
+    tmp_path: Path,
+) -> None:
+    secret = "distinctive-malformed-secret"
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        f"name: project\ninvalid: [{secret}\n"
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    message = str(exc_info.value)
+    assert "dbt_ml_project.yml:3:1" in message
+    assert "expected ',' or ']'" in message
+    assert secret not in message
+
+
+@pytest.mark.parametrize(
+    ("directory", "filename", "contents", "expected_location"),
+    [
+        (
+            None,
+            "dbt_ml_project.yml",
+            "name: first\nname: distinctive-duplicate-secret\n",
+            "dbt_ml_project.yml:2:1 [name]",
+        ),
+        (
+            "sources",
+            "duplicate.yml",
+            "version: 2\nsources:\n  - name: first\n"
+            "    name: distinctive-duplicate-secret\n    path: data\n",
+            "duplicate.yml:4:5 [sources.0.name]",
+        ),
+        (
+            "models",
+            "duplicate.yml",
+            "version: 2\nmodels:\n  - name: first\n"
+            "    name: distinctive-duplicate-secret\n"
+            "    extraction:\n      backend: json\n",
+            "duplicate.yml:4:5 [models.0.name]",
+        ),
+    ],
+)
+def test_explicit_duplicate_mapping_keys_are_rejected_at_second_key(
+    tmp_path: Path,
+    directory: str | None,
+    filename: str,
+    contents: str,
+    expected_location: str,
+) -> None:
+    if directory is None:
+        path = tmp_path / filename
+    else:
+        (tmp_path / "dbt_ml_project.yml").write_text("name: duplicate_project\n")
+        path = tmp_path / directory / filename
+        path.parent.mkdir()
+    path.write_text(contents)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    message = str(exc_info.value)
+    assert expected_location in message
+    assert "duplicate mapping key" in message
+    assert "distinctive-duplicate-secret" not in message
+
+
+def test_yaml_merge_key_can_be_overridden_explicitly(tmp_path: Path) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "<<: &defaults\n  name: inherited\n  version: '0.1.0'\n"
+        "name: explicit\n"
+    )
+
+    project, _, _ = load_project(tmp_path)
+
+    assert project.name == "explicit"
+
+
+def test_duplicate_merge_directive_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "<<: &identity\n  name: inherited\n"
+        "<<: &release\n  version: '0.1.0'\n"
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    message = str(exc_info.value)
+    assert "dbt_ml_project.yml:3:1 [<<]" in message
+    assert "duplicate mapping key" in message
+
+
+@pytest.mark.parametrize("contents", ["[]\n", "0\n", "false\n"])
+def test_falsy_non_mapping_project_document_is_not_treated_as_empty(
+    tmp_path: Path,
+    contents: str,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(contents)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    message = str(exc_info.value)
+    assert "dbt_ml_project.yml:1:1 [<root>]" in message
+    assert "Input should be a valid dictionary" in message
+
+
+@pytest.mark.parametrize("directory", ["sources", "models"])
+def test_falsy_yaml_file_document_reaches_its_file_schema(
+    tmp_path: Path,
+    directory: str,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text("name: falsy_file_project\n")
+    config_dir = tmp_path / directory
+    config_dir.mkdir()
+    config_path = config_dir / "falsy.yml"
+    config_path.write_text("[]\n")
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    message = str(exc_info.value)
+    assert "falsy.yml:1:1 [<root>]" in message
+    assert "Input should be a valid dictionary" in message
+
+
+def test_loaded_project_exposes_excluded_yaml_provenance(tmp_path: Path) -> None:
+    project_path = tmp_path / "dbt_ml_project.yml"
+    project_path.write_text(
+        "name: provenance_project\n"
+        "extraction:\n  default_backend: json\n"
+    )
+
+    project, _, _ = load_project(tmp_path)
+
+    provenance = project.yaml_provenance
+    assert provenance is not None
+    assert provenance.file_path == project_path.resolve()
+    assert provenance.config_path == ()
+    assert project.format_yaml_diagnostic(
+        "backend is unavailable",
+        relative_path=("extraction", "default_backend"),
+    ) == (
+        f"{project_path.resolve()}:3:20 "
+        "[extraction.default_backend] backend is unavailable"
+    )
+    assert "yaml_provenance" not in project.model_dump()
+    assert "yaml_provenance" not in project.model_dump_json()
+
+
+def test_loaded_model_exposes_excluded_yaml_provenance(tmp_path: Path) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text("name: provenance_project\n")
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    model_path = model_dir / "located.yml"
+    model_path.write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    extraction:\n      backend: json\n"
+    )
+
+    _, _, models = load_project(tmp_path)
+
+    model = models[0]
+    provenance = model.yaml_provenance
+    assert provenance is not None
+    assert provenance.file_path == model_path.resolve()
+    assert provenance.config_path == ("models", 0)
+    assert model.format_yaml_diagnostic(
+        "backend is unavailable",
+        relative_path=("extraction", "backend"),
+    ) == (
+        f"{model_path.resolve()}:5:16 "
+        "[models.0.extraction.backend] backend is unavailable"
+    )
+    assert model.format_yaml_diagnostic(
+        "source is required",
+        relative_path=("source",),
+    ) == (
+        f"{model_path.resolve()}:3:5 [models.0.source] source is required"
+    )
+    assert "yaml_provenance" not in model.model_dump()
+    assert "yaml_provenance" not in model.model_dump_json()
 
 
 @pytest.mark.parametrize("directory, root_key", [("sources", "sources"), ("models", "models")])
@@ -316,25 +550,16 @@ def test_model_cannot_select_operator_credential_environment_variable(
     assert "profiles.yml" in result.output
 
 
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [
-        ("temperature", -0.1),
-        ("temperature", float("nan")),
-        ("max_tokens", 0),
-        ("max_tokens", 65_537),
-        ("max_retries", 21),
-        ("max_concurrent", 0),
-        ("max_concurrent", True),
-        ("batch_poll_seconds", 0),
-        ("batch_poll_seconds", 3601),
-    ],
-)
-def test_extraction_config_rejects_unbounded_llm_numeric_options(
-    name: str, value: object
-) -> None:
-    with pytest.raises(ValueError, match=f"llm option '{name}'"):
-        ExtractionConfig(backend="llm", options={name: value})
+def test_extraction_config_defers_backend_owned_option_names() -> None:
+    options = {
+        "api_key_env": "CUSTOM_CONFIG_VALUE",
+        "temperature": -10.0,
+        "max_tokens": 0,
+    }
+
+    config = ExtractionConfig(backend="custom", options=options)
+
+    assert config.options == options
 
 
 def test_invalid_llm_option_fails_before_gcs_source_discovery(

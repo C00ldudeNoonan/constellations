@@ -42,8 +42,23 @@ def test_markdown_projection(tmp_path: Path) -> None:
 
 def test_markdown_word_count(tmp_path: Path) -> None:
     doc = _write(tmp_path / "p.md", "---\ntitle: T\n---\none two three four\n")
-    result = get_backend("markdown").extract(doc, {"compute_word_count": True})
+    result = get_backend("markdown").extract(
+        doc,
+        {"frontmatter_fields": [], "compute_word_count": True},
+    )
     assert result.fields["word_count"] == 4
+
+
+def test_dynamic_frontmatter_collision_uses_backend_owned_fields(tmp_path: Path) -> None:
+    doc = _write(
+        tmp_path / "p.md",
+        "---\nbody: frontmatter body\nword_count: 999\n---\none two three\n",
+    )
+
+    result = get_backend("markdown").extract(doc, {"compute_word_count": True})
+
+    assert result.fields["body"] == "one two three\n"
+    assert result.fields["word_count"] == 3
 
 
 def test_markdown_missing_frontmatter(tmp_path: Path) -> None:

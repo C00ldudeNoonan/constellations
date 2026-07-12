@@ -11,12 +11,12 @@ from typing import Any
 
 import duckdb
 
-from ..config.model import validate_llm_numeric_options
 from ..config.profile import (
     DEFAULT_LLM_API_KEY_ENV,
     resolve_llm_credential,
 )
 from .base import BaseBackend, ExtractionResult
+from .options import LLMBackendOptions, validate_llm_numeric_options
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,11 @@ def _gate(size: int) -> threading.BoundedSemaphore:
         return _GATES[size]
 
 
-@register
+@register(
+    options_model=LLMBackendOptions,
+    native_batch=True,
+    requires_credentials=True,
+)
 class LLMBackend(BaseBackend):
     """LLM-based extraction backend.
 
@@ -88,6 +92,7 @@ class LLMBackend(BaseBackend):
         return [".txt", ".md"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        options = self.parse_options(options)
         validate_llm_numeric_options(options)
         api_key_env, _ = _require_llm_api_key(options)
         fields_spec = options.get("fields")
@@ -128,6 +133,7 @@ class LLMBackend(BaseBackend):
         single batch, results come back keyed by custom_id, and every response
         is cached so re-runs are free. Per-document failures come back as
         Exception entries; only submission itself can fail the whole batch."""
+        options = self.parse_options(options)
         validate_llm_numeric_options(options)
         api_key_env, _ = _require_llm_api_key(options)
         fields_spec = options.get("fields")

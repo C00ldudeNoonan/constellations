@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+
+from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 
 class DuckDBConfig(BaseModel):
@@ -27,6 +29,8 @@ class ProjectConfig(BaseModel):
         populate_by_name=True, extra="forbid", protected_namespaces=()
     )
 
+    _yaml_provenance: YamlProvenance | None = PrivateAttr(default=None)
+
     name: str
     version: str = "0.1.0"
     profile: str | None = None
@@ -43,3 +47,20 @@ class ProjectConfig(BaseModel):
         default_factory=lambda: [Path("transforms")], alias="transform-paths"
     )
     target_path: Path = Field(default=Path("target"), alias="target-path")
+
+    @property
+    def yaml_provenance(self) -> YamlProvenance | None:
+        return self._yaml_provenance
+
+    def format_yaml_diagnostic(
+        self,
+        message: str,
+        *,
+        relative_path: ConfigPath = (),
+    ) -> str:
+        if self._yaml_provenance is None:
+            return message
+        return self._yaml_provenance.format_message(
+            message,
+            relative_path=relative_path,
+        )

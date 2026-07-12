@@ -16,6 +16,7 @@ from bs4.element import (
 )
 
 from .base import BaseBackend, ExtractionResult
+from .options import HtmlBackendOptions
 from .registry import register
 
 _HEADING_TAGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
@@ -39,7 +40,7 @@ _BOLD_STYLE_RE = re.compile(r"font-weight\s*:\s*(?:bold(?:er)?|[6-9]\d\d)\b", re
 _FONT_SIZE_RE = re.compile(r"font-size\s*:\s*([\d.]+)\s*(pt|px)", re.I)
 
 
-@register
+@register(options_model=HtmlBackendOptions)
 class HtmlBackend(BaseBackend):
     """Read .html files via BeautifulSoup.
 
@@ -86,6 +87,7 @@ class HtmlBackend(BaseBackend):
         return [".html", ".htm"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        options = self.parse_options(options)
         parser = options.get("parser", "html.parser")
         soup = BeautifulSoup(path.read_text(), parser)
 

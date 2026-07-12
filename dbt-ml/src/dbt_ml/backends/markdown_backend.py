@@ -6,10 +6,11 @@ from typing import Any
 import yaml
 
 from .base import BaseBackend, ExtractionResult
+from .options import MarkdownBackendOptions
 from .registry import register
 
 
-@register
+@register(options_model=MarkdownBackendOptions)
 class MarkdownBackend(BaseBackend):
     """Reads `.md` files. YAML frontmatter (between `---` fences) becomes fields;
     the rest is the body. Options:
@@ -17,6 +18,9 @@ class MarkdownBackend(BaseBackend):
         frontmatter_fields: [a, b, ...]   # optional projection
         include_body: bool (default true)
         compute_word_count: bool (default false)
+
+    With no frontmatter projection, backend-owned `body` and `word_count`
+    fields overwrite same-named dynamic frontmatter keys.
     """
 
     def name(self) -> str:
@@ -26,6 +30,7 @@ class MarkdownBackend(BaseBackend):
         return [".md", ".markdown"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        options = self.parse_options(options)
         content = path.read_text()
         warnings: list[str] = []
         frontmatter, body = self._split_frontmatter(content, warnings)
@@ -40,6 +45,8 @@ class MarkdownBackend(BaseBackend):
         else:
             fields.update(frontmatter)
 
+        # Dynamic frontmatter is unknowable during compile. Derived fields
+        # intentionally win so their documented meaning remains deterministic.
         if options.get("include_body", True):
             fields["body"] = body
         if options.get("compute_word_count", False):

@@ -71,6 +71,46 @@ def test_source_rows_canonical_order_without_identifier() -> None:
     assert results[0] == results[1] == results[2]
 
 
+def test_chunked_rows_sharing_document_id_order_deterministically() -> None:
+    """Chunk models repeat document_id across a document's chunks; ties must
+    break on chunk_id, not warehouse return order."""
+    chunks = [
+        ("doc1", "doc1:0", "first chunk of the filing"),
+        ("doc1", "doc1:1", "second chunk of the filing"),
+        ("doc1", "doc1:2", "third chunk of the filing"),
+        ("doc2", "doc2:0", "another document entirely"),
+    ]
+
+    def frame(order: list[int]) -> pl.DataFrame:
+        rows = [chunks[i] for i in order]
+        return pl.DataFrame(
+            {
+                "document_id": [r[0] for r in rows],
+                "chunk_id": [r[1] for r in rows],
+                "text": [r[2] for r in rows],
+            }
+        )
+
+    results = [_source_rows(frame(order), "text") for order in PERMUTATIONS]
+    assert results[0] == results[1] == results[2]
+    assert [r["text"].split()[0] for r in results[0]] == [
+        "first",
+        "second",
+        "third",
+        "another",
+    ]
+
+
+def test_duplicate_document_id_ties_break_on_content() -> None:
+    frame_a = pl.DataFrame(
+        {"document_id": ["d", "d"], "text": ["alpha", "beta"]}
+    )
+    frame_b = pl.DataFrame(
+        {"document_id": ["d", "d"], "text": ["beta", "alpha"]}
+    )
+    assert _source_rows(frame_a, "text") == _source_rows(frame_b, "text")
+
+
 def test_training_hash_invariant_under_permutation() -> None:
     hashes = {
         _training_input(

@@ -360,15 +360,18 @@ def _artifact_path(
     return project_dir / project.target_path / "artifacts" / model.name
 
 
-def _canonical_row_key(row: dict[str, Any]) -> tuple[int, str]:
+def _canonical_row_key(row: dict[str, Any]) -> tuple[int, str, str]:
     """Warehouses return `SELECT *` in arbitrary order; training input must
-    not depend on it. Order by the stable document identifier when present,
-    else by canonical row content — identical rows are interchangeable."""
-    for key in ("document_id", "id"):
+    not depend on it. Order by the stable row identifier when present —
+    chunk_id before document_id, since chunk models repeat document_id
+    across a document's chunks — with canonical row content breaking any
+    remaining ties (fully identical rows are interchangeable)."""
+    content = json.dumps(row, sort_keys=True, default=str)
+    for key in ("chunk_id", "document_id", "id"):
         value = row.get(key)
         if value is not None:
-            return (0, str(value))
-    return (1, json.dumps(row, sort_keys=True, default=str))
+            return (0, str(value), content)
+    return (1, content, "")
 
 
 def _source_rows(

@@ -1664,9 +1664,11 @@ def _cleanup_committed_publication(
         _remove_path(backup_path)
         _remove_path(staged_path)
         journal_path.unlink(missing_ok=True)
-    except OSError:
-        # A later publication will recover this committed journal and retry cleanup.
-        pass
+    except OSError as error:
+        raise ClassicMLArtifactError(
+            "Committed artifact publication cleanup remains pending at "
+            f"{journal_path}; retry before publishing another artifact"
+        ) from error
 
 
 def _validated_journal_paths(

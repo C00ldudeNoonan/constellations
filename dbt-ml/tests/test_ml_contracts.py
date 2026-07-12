@@ -455,6 +455,56 @@ def test_registry_failure_does_not_advertise_first_publication(
     _assert_no_publication_debris(artifact_path)
 
 
+def test_committed_journal_blocks_later_publication_until_cleanup_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path, registry_path, _ = _write_prior_publication(tmp_path)
+    first_adapter = _publication_adapter()
+    original_remove_path = classic_ml._remove_path
+
+    def fail_backup_cleanup(path: Path) -> None:
+        if ".backup-" in path.name:
+            raise OSError("backup is busy")
+        original_remove_path(path)
+
+    monkeypatch.setattr(classic_ml, "_remove_path", fail_backup_cleanup)
+
+    with pytest.raises(RunError, match="cleanup remains pending"):
+        _run_ml_model(
+            model=_model(_features()),
+            project=ProjectConfig(name="p"),
+            project_dir=tmp_path,
+            adapter=first_adapter,
+        )
+
+    committed_registry = json.loads(registry_path.read_text())
+    committed_version = committed_registry["artifacts"]["derived"][
+        "artifact_version"
+    ]
+    assert json.loads((artifact_path / "metadata.json").read_text())[
+        "artifact_version"
+    ] == committed_version
+    assert list(registry_path.parent.glob(".artifact-publication-*.json"))
+
+    second_adapter = _publication_adapter()
+    with pytest.raises(
+        classic_ml.ClassicMLArtifactError, match="cleanup remains pending"
+    ):
+        run_classic_ml_model(
+            model=_model(_features()),
+            project=ProjectConfig(name="p"),
+            project_dir=tmp_path,
+            adapter=second_adapter,
+        )
+
+    second_adapter.query_df.assert_not_called()
+    assert json.loads(registry_path.read_text()) == committed_registry
+    assert json.loads((artifact_path / "metadata.json").read_text())[
+        "artifact_version"
+    ] == committed_version
+
+
 def test_parallel_artifact_publications_preserve_all_registry_entries(
     tmp_path: Path,
 ) -> None:

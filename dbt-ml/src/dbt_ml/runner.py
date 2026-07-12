@@ -36,6 +36,7 @@ from .config.profile import PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
+from .hashing import HASH_DIGEST_SIZE
 from .paths import resolve_within_project
 from .profile import (
     ResolvedProfile,
@@ -1067,7 +1068,9 @@ def _run_chunk_model(
 
 
 def _chunk_input_hash(text: str) -> str:
-    return "text:" + hashlib.blake2b(text.encode(), digest_size=8).hexdigest()
+    return "text:" + hashlib.blake2b(
+        text.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
 
 
 def _chunk_row(

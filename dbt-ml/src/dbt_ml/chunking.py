@@ -10,6 +10,7 @@ import hashlib
 from dataclasses import dataclass
 
 from .config.model import ChunkConfig
+from .hashing import HASH_DIGEST_SIZE
 
 # Separator hierarchy for the recursive splitter: try to break on the largest
 # semantic boundary that keeps a chunk under the size limit, falling back to
@@ -27,7 +28,7 @@ def chunk_id(document_id: str, index: int, text: str) -> str:
     """Deterministic, content-addressed: identical (document, position, text)
     always yields the same id, so unchanged re-runs are stable and any text
     change produces a new id."""
-    h = hashlib.blake2b(digest_size=16)
+    h = hashlib.blake2b(digest_size=HASH_DIGEST_SIZE)
     h.update(f"{document_id}|{index}|".encode())
     h.update(text.encode())
     return h.hexdigest()

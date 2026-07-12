@@ -207,10 +207,6 @@ class ProjectDAG:
             if not tag:
                 raise SelectionError(f"Empty tag in selector '{token}'")
             seeds = {n for n, node in self.nodes.items() if tag in node.tags}
-            if not seeds:
-                raise SelectionError(
-                    f"No nodes tagged '{tag}'. Known tags: {sorted(self._all_tags())}"
-                )
         else:
             if body not in self.nodes:
                 raise SelectionError(
@@ -225,12 +221,6 @@ class ProjectDAG:
             if down:
                 result |= _bfs(seed, self.successors)
         return result
-
-    def _all_tags(self) -> set[str]:
-        out: set[str] = set()
-        for node in self.nodes.values():
-            out |= node.tags
-        return out
 
     def all_nodes_in_order(self) -> list[Node]:
         return [self.nodes[name] for name in self._sorted]

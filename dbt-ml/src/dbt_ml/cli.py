@@ -5,6 +5,7 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -62,6 +63,52 @@ class ConfigClickError(click.ClickException):
 _CONFIG_ERRORS = (ConfigError, DAGError, SelectionError, ProfileError, StateError)
 
 
+def _context_override(
+    name: str,
+    *,
+    resolve_path: bool = False,
+) -> Callable[[click.Context, click.Parameter, Any], Any]:
+    def callback(
+        ctx: click.Context,
+        _param: click.Parameter,
+        value: Any,
+    ) -> Any:
+        if value is not None:
+            ctx.ensure_object(dict)
+            ctx.obj[name] = value.resolve() if resolve_path else value
+        return value
+
+    return callback
+
+
+def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
+    """Allow dbt-style global options after a project-aware subcommand."""
+    command = click.option(
+        "--target",
+        default=None,
+        expose_value=False,
+        callback=_context_override("target"),
+        help="Target name within the active profile.",
+    )(command)
+    command = click.option(
+        "--profiles-dir",
+        type=click.Path(exists=True, file_okay=False, path_type=Path),
+        default=None,
+        expose_value=False,
+        callback=_context_override("profiles_dir", resolve_path=True),
+        help="Directory containing profiles.yml. Overrides discovery.",
+    )(command)
+    command = click.option(
+        "--project-dir",
+        type=click.Path(exists=True, file_okay=False, path_type=Path),
+        default=None,
+        expose_value=False,
+        callback=_context_override("project_dir", resolve_path=True),
+        help="Path to the dbt-ml project (where dbt_ml_project.yml lives).",
+    )(command)
+    return command
+
+
 @click.group()
 @click.option(
     "--project-dir",
@@ -90,6 +137,7 @@ def cli(
 
 
 @cli.command()
+@_project_context_options
 @click.pass_context
 def compile(ctx: click.Context) -> None:
     """Parse YAML, validate DAG, write target/manifest.json."""
@@ -237,6 +285,7 @@ def init(name: str, template: str) -> None:
 @cli.command()
 @click.argument("model_name")
 @click.option("--limit", default=10, show_default=True, help="Number of rows to show.")
+@_project_context_options
 @click.pass_context
 def show(ctx: click.Context, model_name: str, limit: int) -> None:
     """Pretty-print rows from a materialized model table."""
@@ -293,6 +342,7 @@ def _safe_console_text(text: str, stream: object | None = None) -> str:
     default=None,
     help="Synthetic data shape. Defaults based on the source's backend.",
 )
+@_project_context_options
 @click.pass_context
 def seed(
     ctx: click.Context,
@@ -356,6 +406,7 @@ def seed(
 
 
 @cli.command()
+@_project_context_options
 @click.pass_context
 def graph(ctx: click.Context) -> None:
     """Print a Mermaid diagram of the project DAG."""
@@ -382,6 +433,7 @@ def graph(ctx: click.Context) -> None:
     show_default=True,
     help="Output format.",
 )
+@_project_context_options
 @click.pass_context
 def ls(
     ctx: click.Context,
@@ -484,6 +536,7 @@ def _model_kind(model: ModelConfig) -> str:
     is_flag=True,
     help="Print the run_results.json payload to stdout instead of the table.",
 )
+@_project_context_options
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -641,6 +694,7 @@ def _usage_summary(m: dict[str, object]) -> str:
     is_flag=True,
     help="Print the run_results.json payload to stdout instead of the table.",
 )
+@_project_context_options
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -765,6 +819,7 @@ def _test_failure_label(t: TestResult) -> str:
     default=None,
     help="Previous manifest.json (or its directory) for state:modified selection.",
 )
+@_project_context_options
 @click.pass_context
 def test(
     ctx: click.Context,
@@ -835,6 +890,7 @@ def test(
     help="Stamp meta.dagster.asset_key on each table so the emitted sources map "
     "cleanly onto dagster-dbt assets. Ignored by pure dbt.",
 )
+@_project_context_options
 @click.pass_context
 def emit_dbt_sources(
     ctx: click.Context,
@@ -871,6 +927,7 @@ def emit_dbt_sources(
 
 
 @cli.group()
+@_project_context_options
 def docs() -> None:
     """Generate or serve a static docs site for the project."""
 
@@ -882,6 +939,7 @@ def docs() -> None:
     default=None,
     help="Output dir (default: <target-path>/docs).",
 )
+@_project_context_options
 @click.pass_context
 def docs_generate(ctx: click.Context, output: Path | None) -> None:
     """Render target/docs/*.html driven by manifest.json + run_results.json."""
@@ -904,6 +962,7 @@ def docs_generate(ctx: click.Context, output: Path | None) -> None:
 
 @docs.command("serve")
 @click.option("--port", default=8080, show_default=True, help="HTTP port.")
+@_project_context_options
 @click.pass_context
 def docs_serve(ctx: click.Context, port: int) -> None:
     """Serve the generated docs over http.server. Ctrl-C to stop."""
@@ -917,11 +976,13 @@ def docs_serve(ctx: click.Context, port: int) -> None:
 
 
 @cli.group()
+@_project_context_options
 def source() -> None:
     """Inspect sources (freshness, etc.)."""
 
 
 @source.command("freshness")
+@_project_context_options
 @click.pass_context
 def source_freshness(ctx: click.Context) -> None:
     """Check source freshness against configured warn/error thresholds."""
@@ -967,6 +1028,7 @@ def source_freshness(ctx: click.Context) -> None:
 
 
 @cli.command()
+@_project_context_options
 @click.pass_context
 def clean(ctx: click.Context) -> None:
     """Remove generated files under the project's target path.
@@ -1013,6 +1075,9 @@ def _run_watch(
     try:
         dag = validate_project_contract(project, sources, models, project_dir)
         selected = dag.select_models(select=select, exclude=exclude)
+        if not selected:
+            click.echo("No models selected.")
+            return
         required_sources = set(dag.required_sources(selected))
         resolved = resolve_profile(
             project, project_dir, target=target, profiles_dir=profiles_dir

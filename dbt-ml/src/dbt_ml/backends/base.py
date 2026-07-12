@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..hashing import HASH_DIGEST_SIZE
+
 
 @dataclass
 class ExtractionResult:
@@ -76,7 +78,9 @@ class BaseBackend(ABC):
             "backend_module_source": _source_digest(backend_module),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.blake2b(canonical.encode(), digest_size=8).hexdigest()
+        digest = hashlib.blake2b(
+            canonical.encode(), digest_size=HASH_DIGEST_SIZE
+        ).hexdigest()
         return f"dbt-ml/{payload['dbt_ml_version']}+backend/{digest}"
 
     def validate(self) -> None:
@@ -100,4 +104,6 @@ def _source_digest(obj: Any) -> str | None:
         source = inspect.getsource(obj)
     except (OSError, TypeError):
         return None
-    return hashlib.blake2b(source.encode(), digest_size=8).hexdigest()
+    return hashlib.blake2b(
+        source.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()

@@ -22,6 +22,7 @@ from dbt_ml.classic_ml import (
 from dbt_ml.config import load_project
 from dbt_ml.config.model import ModelConfig
 from dbt_ml.config.project import ProjectConfig
+from dbt_ml.hashing import HASH_DIGEST_SIZE
 from dbt_ml.ml_contracts import (
     MLContractError,
     _same_filesystem,
@@ -635,7 +636,7 @@ def test_malformed_artifact_payload_is_domain_error_before_query(tmp_path: Path)
     payload_path.write_text("{")
     metadata_path = artifact / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
-    digest = blake2b(digest_size=8)
+    digest = blake2b(digest_size=HASH_DIGEST_SIZE)
     digest.update(b"vocabulary.json")
     digest.update(payload_path.read_bytes())
     metadata["artifact_files_hash"] = digest.hexdigest()

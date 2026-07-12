@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Ergonomics and hash hardening (issue #78)
+
+- `--project-dir`, `--profiles-dir`, and `--target` can be placed either before
+  or after project-aware subcommands, matching common dbt CLI usage.
+- An unmatched `tag:` selector now produces an empty selection instead of a
+  configuration error; CLI commands report `No models selected.` and succeed.
+- Content, identity, code-version, artifact, and LLM-cache hashes now use
+  16-byte BLAKE2b digests. Existing incremental state and LLM cache entries
+  miss once after upgrading, and fitted Classic ML artifacts must be rebuilt.
+
 ### Classic ML determinism (issue #122)
 - Training input is now read in a canonical order (by `document_id`/`id`
   when present, else by row content), so training hashes, vocabularies,

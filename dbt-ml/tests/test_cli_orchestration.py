@@ -49,6 +49,47 @@ def test_run_json_emits_parseable_payload(
     assert result.output.strip() == on_disk.strip()
 
 
+def test_global_context_options_work_after_subcommand(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    dst = _copy_example(tmp_path, example_project_dir)
+    generate_invoices(2, dst / "data" / "invoices", seed=1)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "run",
+            "--project-dir",
+            str(dst),
+            "--profiles-dir",
+            str(dst),
+            "--target",
+            "dev",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["metadata"]["target"]["name"] == "dev"
+
+
+def test_run_with_unmatched_tag_succeeds_with_empty_selection(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    dst = _copy_example(tmp_path, example_project_dir)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["run", "--project-dir", str(dst), "--select", "tag:not_present"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No models selected." in result.output
+
+
 def test_run_malformed_yaml_exits_2(tmp_path: Path, example_project_dir: Path) -> None:
     dst = _copy_example(tmp_path, example_project_dir)
     (dst / "dbt_ml_project.yml").write_text("name: broken\nversion: [oops\n")

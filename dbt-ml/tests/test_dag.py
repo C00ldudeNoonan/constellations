@@ -198,9 +198,8 @@ def test_tag_with_ancestors(tagged_dag: ProjectDAG) -> None:
     assert set(tagged_dag.select_models(select="+tag:agg")) == {"a", "b", "c"}
 
 
-def test_unknown_tag_raises(tagged_dag: ProjectDAG) -> None:
-    with pytest.raises(SelectionError, match="No nodes tagged 'nonsense'"):
-        tagged_dag.select_models(select="tag:nonsense")
+def test_unknown_tag_selects_nothing(tagged_dag: ProjectDAG) -> None:
+    assert tagged_dag.select_models(select="tag:nonsense") == []
 
 
 def test_empty_tag_raises(tagged_dag: ProjectDAG) -> None:

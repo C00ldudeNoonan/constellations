@@ -17,6 +17,7 @@ from .adapters import WarehouseAdapter
 from .config.model import MLConfig, ModelConfig
 from .config.project import ProjectConfig
 from .dag import parse_ref
+from .hashing import HASH_DIGEST_SIZE
 from .ml_contracts import (
     ExecutableMLContract,
     MLContractError,
@@ -372,7 +373,9 @@ def _training_input(depends_on: list[str], rows: list[dict[str, Any]]) -> dict[s
     return {
         "refs": [parse_ref(ref) for ref in depends_on],
         "row_count": len(rows),
-        "content_hash": hashlib.blake2b(raw.encode(), digest_size=8).hexdigest(),
+        "content_hash": hashlib.blake2b(
+            raw.encode(), digest_size=HASH_DIGEST_SIZE
+        ).hexdigest(),
     }
 
 
@@ -1414,7 +1417,7 @@ def _artifact_files_hash(
                 "n_features": vectorizer["n_features"],
             }
         )
-    h = hashlib.blake2b(digest_size=8)
+    h = hashlib.blake2b(digest_size=HASH_DIGEST_SIZE)
     for filename in sorted(payload_files):
         file_path = path / filename
         if not file_path.exists():
@@ -1527,4 +1530,4 @@ def _empty_prediction_df() -> pl.DataFrame:
 
 def _hash_json(value: Any) -> str:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    return hashlib.blake2b(raw.encode(), digest_size=8).hexdigest()
+    return hashlib.blake2b(raw.encode(), digest_size=HASH_DIGEST_SIZE).hexdigest()

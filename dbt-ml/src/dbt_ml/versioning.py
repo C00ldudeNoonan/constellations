@@ -23,6 +23,7 @@ from .config.model import (
 )
 from .config.project import ProjectConfig
 from .dag import parse_ref
+from .hashing import HASH_DIGEST_SIZE
 from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options
 
@@ -44,7 +45,9 @@ def compute_content_hash(path: Path) -> str:
 
 
 def compute_document_id(scope: str, relative_path: str) -> str:
-    return hashlib.blake2b(f"{scope}:{relative_path}".encode(), digest_size=8).hexdigest()
+    return hashlib.blake2b(
+        f"{scope}:{relative_path}".encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
 
 
 def compute_code_version(
@@ -94,7 +97,9 @@ def compute_code_version(
             payload["transform_code_hash"] = "missing"
 
     canonical = _canonical_json(payload)
-    return hashlib.blake2b(canonical.encode(), digest_size=8).hexdigest()
+    return hashlib.blake2b(
+        canonical.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
 
 
 def compute_model_code_version(
@@ -157,7 +162,7 @@ def resolve_module_file(module: str, project_dir: Path) -> Path:
 
 
 def _hash_file(path: Path) -> str:
-    h = hashlib.blake2b(digest_size=8)
+    h = hashlib.blake2b(digest_size=HASH_DIGEST_SIZE)
     with path.open("rb") as f:
         while chunk := f.read(_HASH_CHUNK_SIZE):
             h.update(chunk)

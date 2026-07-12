@@ -24,6 +24,7 @@ from dbt_ml.config.model import (
 )
 from dbt_ml.config.profile import LLMConfig
 from dbt_ml.config.project import ExtractionDefaults, ProjectConfig
+from dbt_ml.hashing import HASH_DIGEST_SIZE
 from dbt_ml.profile import ResolvedProfile
 from dbt_ml.versioning import (
     compute_code_version,
@@ -56,12 +57,14 @@ def test_content_hash_changes_with_content(tmp_path: Path) -> None:
     p.write_text('{"x": 1}')
     h2 = compute_content_hash(p)
     assert h1 != h2
+    assert len(h1) == HASH_DIGEST_SIZE * 2
 
 
 def test_document_id_includes_scope() -> None:
     a = compute_document_id("source_a", "invoice.json")
     b = compute_document_id("source_b", "invoice.json")
     assert a != b
+    assert len(a) == HASH_DIGEST_SIZE * 2
 
 
 def test_code_version_stable(tmp_path: Path) -> None:
@@ -69,6 +72,7 @@ def test_code_version_stable(tmp_path: Path) -> None:
     v1 = compute_code_version(extraction=cfg, transform=None, project_dir=tmp_path)
     v2 = compute_code_version(extraction=cfg, transform=None, project_dir=tmp_path)
     assert v1 == v2
+    assert len(v1) == HASH_DIGEST_SIZE * 2
 
 
 def test_fingerprint_set_cannot_collide_with_sentinel_shaped_mapping(

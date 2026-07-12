@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import cast
+
+from ..optional_dependencies import import_optional_dependency
+
 
 def clean_encoding(text: str) -> str:
     """Fix mojibake and common encoding artifacts using ftfy.
@@ -11,6 +15,8 @@ def clean_encoding(text: str) -> str:
     """
     if not text:
         return text
-    import ftfy
+    ftfy = import_optional_dependency(
+        "ftfy", extra="text", feature="Text encoding cleanup"
+    )
 
-    return ftfy.fix_text(text)
+    return cast(str, ftfy.fix_text(text))

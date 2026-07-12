@@ -109,12 +109,11 @@ def _merge_with_overlap(
 def _split_tokens(
     text: str, chunk_size: int, overlap: int, encoding: str
 ) -> list[str]:
-    try:
-        import tiktoken
-    except ImportError as e:  # tiktoken is a core dep, but guard anyway
-        raise RuntimeError(
-            "the `tokens` chunk strategy requires tiktoken"
-        ) from e
+    from .optional_dependencies import import_optional_dependency
+
+    tiktoken = import_optional_dependency(
+        "tiktoken", extra="text", feature="The `tokens` chunk strategy"
+    )
     enc = tiktoken.get_encoding(encoding)
     tokens = enc.encode(text)
     step = chunk_size - overlap

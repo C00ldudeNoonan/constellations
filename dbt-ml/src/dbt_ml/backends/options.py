@@ -18,6 +18,8 @@ from pydantic import (
     model_validator,
 )
 
+from ..optional_dependencies import import_optional_dependency
+
 _STRICT_OPTIONS = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
 _NonEmptyString = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
 _JsonSchemaType = Literal[
@@ -79,7 +81,9 @@ def validate_llm_numeric_options(options: Mapping[str, Any]) -> None:
 
 
 def _validate_css_selector(selector: str) -> str:
-    import soupsieve
+    soupsieve = import_optional_dependency(
+        "soupsieve", extra="html", feature="HTML selector validation"
+    )
 
     try:
         soupsieve.compile(selector)
@@ -92,7 +96,9 @@ _CssSelector = Annotated[_NonEmptyString, AfterValidator(_validate_css_selector)
 
 
 def _available_html_parsers() -> tuple[str, ...]:
-    from bs4.builder import builder_registry
+    builder_registry = import_optional_dependency(
+        "bs4.builder", extra="html", feature="HTML parser validation"
+    ).builder_registry
 
     candidates = ("html.parser", "lxml")
     return tuple(

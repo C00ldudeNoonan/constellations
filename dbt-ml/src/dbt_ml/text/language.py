@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..optional_dependencies import import_optional_dependency
+
 
 def detect_language(text: str, *, default: str | None = None) -> str | None:
     """Return a 2-letter ISO 639-1 language code for `text`, or `default` if
@@ -11,11 +13,13 @@ def detect_language(text: str, *, default: str | None = None) -> str | None:
     """
     if not text or len(text.strip()) < 10:
         return default
-    try:
-        from langdetect import DetectorFactory, detect
+    langdetect = import_optional_dependency(
+        "langdetect", extra="text", feature="Language detection"
+    )
 
+    try:
         # Make detection deterministic across calls.
-        DetectorFactory.seed = 0
-        return str(detect(text))
+        langdetect.DetectorFactory.seed = 0
+        return str(langdetect.detect(text))
     except Exception:
         return default

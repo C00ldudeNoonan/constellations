@@ -490,33 +490,54 @@ version = "0.2.7"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
-    { name = "beautifulsoup4" },
     { name = "click" },
     { name = "cryptography" },
-    { name = "datasketch" },
     { name = "duckdb" },
     { name = "faker" },
-    { name = "fpdf2" },
-    { name = "ftfy" },
     { name = "jinja2" },
-    { name = "langdetect" },
     { name = "polars" },
-    { name = "presidio-analyzer" },
-    { name = "presidio-anonymizer" },
     { name = "pyarrow" },
     { name = "pydantic" },
-    { name = "pypdf" },
     { name = "pyyaml" },
-    { name = "tiktoken" },
     { name = "watchfiles" },
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "beautifulsoup4" },
+    { name = "datasketch" },
+    { name = "fpdf2" },
+    { name = "ftfy" },
+    { name = "google-cloud-bigquery" },
+    { name = "google-cloud-storage" },
+    { name = "langdetect" },
+    { name = "presidio-analyzer" },
+    { name = "presidio-anonymizer" },
+    { name = "pypdf" },
+    { name = "tiktoken" },
+]
 bigquery = [
     { name = "google-cloud-bigquery" },
 ]
 gcs = [
     { name = "google-cloud-storage" },
+]
+html = [
+    { name = "beautifulsoup4" },
+]
+pdf = [
+    { name = "fpdf2" },
+    { name = "pypdf" },
+]
+pii = [
+    { name = "presidio-analyzer" },
+    { name = "presidio-anonymizer" },
+]
+text = [
+    { name = "datasketch" },
+    { name = "ftfy" },
+    { name = "langdetect" },
+    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -533,29 +554,40 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
-    { name = "beautifulsoup4", specifier = ">=4.12" },
+    { name = "beautifulsoup4", marker = "extra == 'all'", specifier = ">=4.12" },
+    { name = "beautifulsoup4", marker = "extra == 'html'", specifier = ">=4.12" },
     { name = "click", specifier = ">=8.1" },
     { name = "cryptography", specifier = ">=48.0.1" },
-    { name = "datasketch", specifier = ">=1.6" },
+    { name = "datasketch", marker = "extra == 'all'", specifier = ">=1.6" },
+    { name = "datasketch", marker = "extra == 'text'", specifier = ">=1.6" },
     { name = "duckdb", specifier = ">=1.0" },
     { name = "faker", specifier = ">=25" },
-    { name = "fpdf2", specifier = ">=2.7" },
-    { name = "ftfy", specifier = ">=6.2" },
+    { name = "fpdf2", marker = "extra == 'all'", specifier = ">=2.7" },
+    { name = "fpdf2", marker = "extra == 'pdf'", specifier = ">=2.7" },
+    { name = "ftfy", marker = "extra == 'all'", specifier = ">=6.2" },
+    { name = "ftfy", marker = "extra == 'text'", specifier = ">=6.2" },
+    { name = "google-cloud-bigquery", marker = "extra == 'all'", specifier = ">=3.25" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3.25" },
+    { name = "google-cloud-storage", marker = "extra == 'all'", specifier = ">=2.16" },
     { name = "google-cloud-storage", marker = "extra == 'gcs'", specifier = ">=2.16" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "langdetect", specifier = ">=1.0" },
+    { name = "langdetect", marker = "extra == 'all'", specifier = ">=1.0" },
+    { name = "langdetect", marker = "extra == 'text'", specifier = ">=1.0" },
     { name = "polars", specifier = ">=1.0" },
-    { name = "presidio-analyzer", specifier = ">=2.2" },
-    { name = "presidio-anonymizer", specifier = ">=2.2" },
+    { name = "presidio-analyzer", marker = "extra == 'all'", specifier = ">=2.2" },
+    { name = "presidio-analyzer", marker = "extra == 'pii'", specifier = ">=2.2" },
+    { name = "presidio-anonymizer", marker = "extra == 'all'", specifier = ">=2.2" },
+    { name = "presidio-anonymizer", marker = "extra == 'pii'", specifier = ">=2.2" },
     { name = "pyarrow", specifier = ">=16" },
     { name = "pydantic", specifier = ">=2.7" },
-    { name = "pypdf", specifier = ">=6.13.0" },
+    { name = "pypdf", marker = "extra == 'all'", specifier = ">=6.13.0" },
+    { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=6.13.0" },
     { name = "pyyaml", specifier = ">=6" },
-    { name = "tiktoken", specifier = ">=0.7" },
+    { name = "tiktoken", marker = "extra == 'all'", specifier = ">=0.7" },
+    { name = "tiktoken", marker = "extra == 'text'", specifier = ">=0.7" },
     { name = "watchfiles", specifier = ">=0.21" },
 ]
-provides-extras = ["bigquery", "gcs"]
+provides-extras = ["bigquery", "gcs", "html", "pdf", "pii", "text", "all"]
 
 [package.metadata.requires-dev]
 dev = [

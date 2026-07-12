@@ -24,7 +24,7 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync dependencies
-        run: uv sync
+        run: uv sync --all-extras --dev --locked
       - name: Dependency audit
         run: uv run pip-audit --skip-editable
       - name: Ruff

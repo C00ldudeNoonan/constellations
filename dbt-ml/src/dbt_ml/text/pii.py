@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
+
+from ..optional_dependencies import (
+    OptionalDependencyError,
+    import_optional_dependency,
+)
 
 if TYPE_CHECKING:
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
 
 
-class PIIError(Exception):
+class PIIError(OptionalDependencyError):
     pass
 
 
@@ -52,15 +57,17 @@ class PIIEntity:
 @functools.lru_cache(maxsize=1)
 def _get_analyzer(model: str = "en_core_web_sm") -> AnalyzerEngine:
     try:
-        from presidio_analyzer import AnalyzerEngine
-        from presidio_analyzer.nlp_engine import NlpEngineProvider
-    except ImportError as e:
-        raise PIIError(
-            "presidio-analyzer is not installed. Run `uv sync` to install."
-        ) from e
+        analyzer_module = import_optional_dependency(
+            "presidio_analyzer", extra="pii", feature="PII detection"
+        )
+        nlp_module = import_optional_dependency(
+            "presidio_analyzer.nlp_engine", extra="pii", feature="PII detection"
+        )
+    except OptionalDependencyError as error:
+        raise PIIError(str(error)) from error
 
     try:
-        nlp_engine = NlpEngineProvider(
+        nlp_engine = nlp_module.NlpEngineProvider(
             nlp_configuration={
                 "nlp_engine_name": "spacy",
                 "models": [{"lang_code": "en", "model_name": model}],
@@ -72,18 +79,23 @@ def _get_analyzer(model: str = "en_core_web_sm") -> AnalyzerEngine:
             f"Run: python -m spacy download {model}"
         ) from e
 
-    return AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
+    return cast(
+        "AnalyzerEngine",
+        analyzer_module.AnalyzerEngine(
+            nlp_engine=nlp_engine, supported_languages=["en"]
+        ),
+    )
 
 
 @functools.lru_cache(maxsize=1)
 def _get_anonymizer() -> AnonymizerEngine:
     try:
-        from presidio_anonymizer import AnonymizerEngine
-    except ImportError as e:
-        raise PIIError(
-            "presidio-anonymizer is not installed. Run `uv sync` to install."
-        ) from e
-    return AnonymizerEngine()  # type: ignore[no-untyped-call]
+        module = import_optional_dependency(
+            "presidio_anonymizer", extra="pii", feature="PII redaction"
+        )
+    except OptionalDependencyError as error:
+        raise PIIError(str(error)) from error
+    return cast("AnonymizerEngine", module.AnonymizerEngine())
 
 
 def detect_pii(

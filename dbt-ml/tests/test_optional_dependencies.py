@@ -8,9 +8,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from dbt_ml import chunking
 from dbt_ml.backends import html_backend, options, pdf_backend
+from dbt_ml.cli import cli
 from dbt_ml.optional_dependencies import OptionalDependencyError
 from dbt_ml.synth import invoice_pdfs
 from dbt_ml.text import dedup, encoding, language, pii, tokens
@@ -95,6 +97,58 @@ import dbt_ml.cli
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_compile_reports_missing_optional_dependency_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text("name: optional_html\n")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction:\n      backend: html\n"
+        "      options:\n        selectors:\n          title: h1\n"
+    )
+    real_import = importlib.import_module
+
+    def import_without_soupsieve(name: str, package: str | None = None) -> object:
+        if name == "soupsieve":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_without_soupsieve)
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), "compile"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "pip install 'dbt-ml[html]'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_run_reports_missing_optional_dependency_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_run(*args: object, **kwargs: object) -> None:
+        raise OptionalDependencyError(
+            "PDF extraction requires an optional dependency. "
+            "Install it with: pip install 'dbt-ml[pdf]'"
+        )
+
+    monkeypatch.setattr("dbt_ml.cli.run_project", fail_run)
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), "run"])
+
+    assert result.exit_code == 2, result.output
+    assert "pip install 'dbt-ml[pdf]'" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_heavy_dependencies_live_only_in_extras() -> None:

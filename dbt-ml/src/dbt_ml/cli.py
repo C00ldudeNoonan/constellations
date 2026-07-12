@@ -22,6 +22,7 @@ from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
 from .manifest import StateError, write_manifest, write_run_results
+from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
 from .profile import (
     ProfileError,
@@ -60,7 +61,14 @@ class ConfigClickError(click.ClickException):
 
 # Errors that mean the project couldn't be coherently set up → exit 2. RunError
 # (a run that started but a model failed hard) stays a plain ClickException → 1.
-_CONFIG_ERRORS = (ConfigError, DAGError, SelectionError, ProfileError, StateError)
+_CONFIG_ERRORS = (
+    ConfigError,
+    DAGError,
+    SelectionError,
+    ProfileError,
+    StateError,
+    OptionalDependencyError,
+)
 
 
 def _context_override(
@@ -150,7 +158,7 @@ def compile(ctx: click.Context) -> None:
         manifest_path = write_manifest(
             project_dir, target=target, profiles_dir=profiles_dir
         )
-    except (ConfigError, ProfileError) as e:
+    except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
 
     click.echo(f"Project: {project.name} v{project.version}")
@@ -1083,7 +1091,7 @@ def _run_watch(
             project, project_dir, target=target, profiles_dir=profiles_dir
         )
         sources = apply_source_path_overrides(sources, resolved)
-    except (ConfigError, SelectionError, ProfileError) as e:
+    except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
     watch_paths = []
     for s in sources:
@@ -1120,7 +1128,7 @@ def _run_watch(
                 profiles_dir=profiles_dir,
                 threads=threads,
             )
-        except (ConfigError, DAGError, SelectionError, RunError, ProfileError) as e:
+        except (*_CONFIG_ERRORS, RunError) as e:
             click.echo(f"error: {e}", err=True)
             return
         write_manifest(project_dir, target=target, profiles_dir=profiles_dir)

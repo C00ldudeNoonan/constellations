@@ -151,6 +151,49 @@ def test_run_reports_missing_optional_dependency_without_traceback(
     assert "Traceback" not in result.output
 
 
+def test_seed_reports_missing_pdf_extra_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: optional_pdf\nprofile: optional_pdf\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "optional_pdf:\n  target: dev\n  outputs:\n    dev:\n"
+        "      warehouse:\n        type: duckdb\n"
+        "        path: target/optional.duckdb\n        schema: optional_pdf\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/pdfs\n"
+    )
+    real_import = importlib.import_module
+
+    def import_without_fpdf(name: str, package: str | None = None) -> object:
+        if name == "fpdf":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_without_fpdf)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir",
+            str(tmp_path),
+            "seed",
+            "--type",
+            "invoice_pdfs",
+            "--count",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "pip install 'dbt-ml[pdf]'" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_heavy_dependencies_live_only_in_extras() -> None:
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
     project = tomllib.loads(pyproject_path.read_text())["project"]

@@ -409,7 +409,10 @@ def seed(
         )
     except ConfigError as e:
         raise ConfigClickError(str(e)) from e
-    paths = seeder(count, output_dir, seed)
+    try:
+        paths = seeder(count, output_dir, seed)
+    except OptionalDependencyError as e:
+        raise ConfigClickError(str(e)) from e
     click.echo(f"Wrote {len(paths)} {label} documents to {output_dir}")
 
 

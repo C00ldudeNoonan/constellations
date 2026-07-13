@@ -26,18 +26,30 @@ from .config.project import ProjectConfig
 from .dag import parse_ref
 from .paths import resolve_within_project
 
-type ExecutableMLTask = Literal["features", "classifier"]
+type ExecutableMLTask = Literal["features", "classifier", "cluster", "topic_model"]
 type ExecutableMLProvider = Literal[
     "builtin.count",
     "builtin.tfidf",
     "builtin.hashing",
     "builtin.naive_bayes",
+    "builtin.kmeans",
+    "builtin.dbscan",
+    "builtin.hdbscan",
+    "builtin.nmf",
+    "builtin.lda",
 ]
+
+# Tasks that consume a document-feature matrix (from a features model or a dense
+# embedding column) rather than raw text, and that emit companion tables.
+_MATRIX_TASKS: frozenset[ExecutableMLTask] = frozenset({"cluster", "topic_model"})
 
 _MAX_NGRAM_SIZE = 64
 _MAX_FEATURES = 10_000_000
 _MAX_HASH_BUCKETS = 2**31
 _MAX_ALPHA = 1_000_000.0
+_MAX_COMPONENTS = 10_000
+_MAX_ITER = 1_000_000
+_MAX_REPRESENTATIVES = 1_000
 _TOKEN_PATTERN = r"\w+"
 _TOKEN_PATTERN_PROBES = (
     "",
@@ -151,6 +163,73 @@ class _NaiveBayesOptions(_VocabularyOptions):
     ] = 1.0
 
 
+class _MatrixInputOptions(BaseModel):
+    """Shared options for tasks that consume a document-feature matrix.
+
+    The matrix is assembled either from an upstream `features` model
+    (long-format `term`/`value` rows, pivoted to documents x terms) or from a
+    dense `embedding` column (e.g. 768-dim vectors)."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    input: Literal["features", "embedding"] = "features"
+    value_field: StrictStr = "value"
+    term_field: StrictStr = "term"
+    embedding_field: StrictStr | None = None
+    # L2 row normalization makes Euclidean distance track cosine similarity —
+    # strongly recommended for TF-IDF and embedding clustering.
+    normalize: Literal["none", "l2"] = "none"
+    representative_docs: Annotated[StrictInt, Field(ge=0, le=_MAX_REPRESENTATIVES)] = 3
+    random_state: Annotated[StrictInt, Field(ge=0)] = 0
+
+    @model_validator(mode="after")
+    def _validate_input(self) -> Self:
+        if self.input == "embedding" and not self.embedding_field:
+            raise ValueError("embedding_field is required when input is 'embedding'")
+        if self.input == "features" and self.embedding_field is not None:
+            raise ValueError("embedding_field applies only when input is 'embedding'")
+        return self
+
+
+class _KMeansOptions(_MatrixInputOptions):
+    n_clusters: Annotated[StrictInt, Field(ge=2, le=_MAX_COMPONENTS)] = 8
+    max_iter: Annotated[StrictInt, Field(ge=1, le=_MAX_ITER)] = 300
+    n_init: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
+
+
+class _DBSCANOptions(_MatrixInputOptions):
+    eps: Annotated[StrictFloat, Field(gt=0.0)] = 0.5
+    min_samples: Annotated[StrictInt, Field(ge=1)] = 5
+    metric: Literal["euclidean", "cosine", "manhattan"] = "euclidean"
+
+
+class _HDBSCANOptions(_MatrixInputOptions):
+    min_cluster_size: Annotated[StrictInt, Field(ge=2)] = 5
+    min_samples: Annotated[StrictInt, Field(ge=1)] | None = None
+    metric: Literal["euclidean", "manhattan"] = "euclidean"
+
+
+class _NMFOptions(_MatrixInputOptions):
+    n_topics: Annotated[StrictInt, Field(ge=2, le=_MAX_COMPONENTS)] = 10
+    max_iter: Annotated[StrictInt, Field(ge=1, le=_MAX_ITER)] = 200
+    top_terms: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
+
+
+class _LDAOptions(_MatrixInputOptions):
+    n_topics: Annotated[StrictInt, Field(ge=2, le=_MAX_COMPONENTS)] = 10
+    max_iter: Annotated[StrictInt, Field(ge=1, le=_MAX_ITER)] = 10
+    top_terms: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
+    learning_method: Literal["batch", "online"] = "batch"
+
+
+_CLUSTER_METRICS = frozenset(
+    {"row_count", "n_clusters", "noise_points", "silhouette", "inertia"}
+)
+_TOPIC_METRICS = frozenset(
+    {"row_count", "n_topics", "reconstruction_error", "perplexity", "topic_coherence"}
+)
+
+
 @dataclass(frozen=True)
 class _ProviderSpec:
     task: ExecutableMLTask
@@ -195,11 +274,43 @@ _PROVIDERS: dict[ExecutableMLProvider, _ProviderSpec] = {
             }
         ),
     ),
+    "builtin.kmeans": _ProviderSpec(
+        task="cluster",
+        options_model=_KMeansOptions,
+        artifact_files=("metadata.json", "model.json"),
+        metrics=_CLUSTER_METRICS,
+    ),
+    "builtin.dbscan": _ProviderSpec(
+        task="cluster",
+        options_model=_DBSCANOptions,
+        artifact_files=("metadata.json", "model.json"),
+        metrics=_CLUSTER_METRICS - {"inertia"},
+    ),
+    "builtin.hdbscan": _ProviderSpec(
+        task="cluster",
+        options_model=_HDBSCANOptions,
+        artifact_files=("metadata.json", "model.json"),
+        metrics=_CLUSTER_METRICS - {"inertia"},
+    ),
+    "builtin.nmf": _ProviderSpec(
+        task="topic_model",
+        options_model=_NMFOptions,
+        artifact_files=("metadata.json", "model.json"),
+        metrics=_TOPIC_METRICS - {"perplexity"},
+    ),
+    "builtin.lda": _ProviderSpec(
+        task="topic_model",
+        options_model=_LDAOptions,
+        artifact_files=("metadata.json", "model.json"),
+        metrics=_TOPIC_METRICS - {"reconstruction_error"},
+    ),
 }
 
 _DEFAULT_PROVIDERS: dict[ExecutableMLTask, ExecutableMLProvider] = {
     "features": "builtin.tfidf",
     "classifier": "builtin.naive_bayes",
+    "cluster": "builtin.kmeans",
+    "topic_model": "builtin.nmf",
 }
 
 
@@ -359,15 +470,15 @@ def validate_ml_contract(
             path=("ml", "provider"),
         )
 
-    if not ml.text_field or not ml.text_field.strip():
+    if task not in _MATRIX_TASKS and (not ml.text_field or not ml.text_field.strip()):
         raise MLContractError(
             f"ML model '{model.name}' requires `ml.text_field`",
             model_name=model.name,
             path=("ml", "text_field"),
         )
-    if task == "features" and ml.label_field is not None:
+    if task in {"features", *_MATRIX_TASKS} and ml.label_field is not None:
         raise MLContractError(
-            f"ML model '{model.name}' task 'features' does not use `ml.label_field`",
+            f"ML model '{model.name}' task '{task}' does not use `ml.label_field`",
             model_name=model.name,
             path=("ml", "label_field"),
         )
@@ -378,6 +489,15 @@ def validate_ml_contract(
                 model_name=model.name,
                 path=("ml", "label_field"),
             )
+
+    if task in _MATRIX_TASKS and ml.mode in {"predict", "load_pretrained"}:
+        raise MLContractError(
+            f"ML model '{model.name}' task '{task}' supports mode 'fit_transform' "
+            "or 'fit' only; assigning new documents to a persisted model is not yet "
+            "supported",
+            model_name=model.name,
+            path=("ml", "mode"),
+        )
 
     if ml.mode in {"predict", "load_pretrained"} and ml.options:
         raise MLContractError(
@@ -501,6 +621,15 @@ def _normalize_legacy_persisted_options(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = dict(options)
+    if provider not in {
+        "builtin.count",
+        "builtin.tfidf",
+        "builtin.naive_bayes",
+        "builtin.hashing",
+    }:
+        # Matrix-task providers (cluster/topic_model) shipped after the legacy
+        # option normalization was introduced, so they have no legacy defaults.
+        return normalized
     if provider in {"builtin.count", "builtin.tfidf", "builtin.naive_bayes"}:
         legacy_defaults: dict[str, Any] = {
             "n_features": 2**20,

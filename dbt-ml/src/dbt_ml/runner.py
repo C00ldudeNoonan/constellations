@@ -1125,6 +1125,12 @@ def _run_ml_model(
         rows_written = adapter.materialize_full(
             model.name, output.df, options=_warehouse_options(adapter, model)
         )
+        for suffix, table_df in output.secondary_tables.items():
+            adapter.materialize_full(
+                f"{model.name}__{suffix}",
+                table_df,
+                options=_warehouse_options(adapter, model),
+            )
         output.publish_artifact()
     except BaseException as e:
         if output is not None:

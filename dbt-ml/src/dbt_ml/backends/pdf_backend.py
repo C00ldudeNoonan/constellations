@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pypdf import PdfReader
-
+from ..optional_dependencies import (
+    import_optional_dependency,
+    optional_dependency_version,
+)
 from .base import BaseBackend, ExtractionResult
 from .options import PdfBackendOptions
 from .registry import register
@@ -29,9 +31,7 @@ class PdfBackend(BaseBackend):
         return [".pdf"]
 
     def version(self) -> str:
-        import pypdf
-
-        return f"pypdf/{pypdf.__version__}"
+        return f"pypdf/{optional_dependency_version('pypdf')}"
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
@@ -43,7 +43,7 @@ class PdfBackend(BaseBackend):
         page_separator = options.get("page_separator", "\n\n")
 
         warnings: list[str] = []
-        reader = PdfReader(str(path))
+        reader = _pypdf().PdfReader(str(path))
         pages: list[str] = []
         for i, page in enumerate(reader.pages):
             try:
@@ -81,3 +81,9 @@ class PdfBackend(BaseBackend):
             fields["pdf_metadata"] = {str(k): str(v) for k, v in md.items()}
 
         return ExtractionResult(fields=fields, warnings=warnings)
+
+
+def _pypdf() -> Any:
+    return import_optional_dependency(
+        "pypdf", extra="pdf", feature="PDF extraction"
+    )

@@ -1,23 +1,20 @@
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import bs4
-from bs4 import BeautifulSoup
-from bs4.element import (
-    CData,
-    Comment,
-    Doctype,
-    NavigableString,
-    ProcessingInstruction,
-    Tag,
+from ..optional_dependencies import (
+    import_optional_dependency,
+    optional_dependency_version,
 )
-
 from .base import BaseBackend, ExtractionResult
 from .options import HtmlBackendOptions
 from .registry import register
+
+if TYPE_CHECKING:
+    from bs4.element import NavigableString, Tag
 
 _HEADING_TAGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 # block-level elements that should force a line break in the rendered text
@@ -81,7 +78,7 @@ class HtmlBackend(BaseBackend):
         return "html"
 
     def version(self) -> str:
-        return f"beautifulsoup4/{bs4.__version__}"
+        return f"beautifulsoup4/{optional_dependency_version('beautifulsoup4')}"
 
     def supported_formats(self) -> list[str]:
         return [".html", ".htm"]
@@ -89,7 +86,7 @@ class HtmlBackend(BaseBackend):
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
         parser = options.get("parser", "html.parser")
-        soup = BeautifulSoup(path.read_text(), parser)
+        soup = _bs4().BeautifulSoup(path.read_text(), parser)
 
         warnings: list[str] = []
         fields: dict[str, Any] = {}
@@ -209,10 +206,14 @@ def _styled_heading_levels(root: Tag) -> dict[int, int]:
 
 
 def _all_text_bold(tag: Tag) -> bool:
+    bs4 = _bs4()
     strings = [
         s
         for s in tag.find_all(string=True)
-        if not isinstance(s, Comment | CData | Doctype | ProcessingInstruction)
+        if not isinstance(
+            s,
+            (bs4.Comment, bs4.CData, bs4.Doctype, bs4.ProcessingInstruction),
+        )
         and str(s).strip()
     ]
     if not strings:
@@ -252,6 +253,7 @@ def _max_font_size_pt(tag: Tag) -> float | None:
 
 
 def _anchor_of(tag: Tag) -> str | None:
+    bs4 = _bs4()
     anchor = tag.get("id")
     if not anchor:
         a = tag.find("a", attrs={"id": True}) or tag.find("a", attrs={"name": True})
@@ -270,6 +272,7 @@ def _render_structured(
     slices a section without re-parsing HTML. Nested tables are flattened
     into their outer table's cell matrix.
     """
+    bs4 = _bs4()
     parts: list[str] = []
     length = 0
     sections: list[dict[str, Any]] = []
@@ -306,9 +309,12 @@ def _render_structured(
 
     def walk(node: Tag) -> None:
         for child in node.children:
-            if isinstance(child, Comment | CData | Doctype | ProcessingInstruction):
+            if isinstance(
+                child,
+                (bs4.Comment, bs4.CData, bs4.Doctype, bs4.ProcessingInstruction),
+            ):
                 continue
-            if isinstance(child, NavigableString):
+            if isinstance(child, bs4.NavigableString):
                 text = " ".join(str(child).split())
                 if text:
                     if parts and not parts[-1].endswith(("\n", " ")):
@@ -362,3 +368,10 @@ def _render_structured(
 
     walk(root)
     return "".join(parts).rstrip("\n"), sections, tables
+
+
+@functools.lru_cache(maxsize=1)
+def _bs4() -> Any:
+    return import_optional_dependency(
+        "bs4", extra="html", feature="HTML extraction"
+    )

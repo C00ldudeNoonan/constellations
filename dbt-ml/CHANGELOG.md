@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Optional feature dependencies (issue #56)
+
+- PDF, HTML, text-processing, and Presidio dependencies now ship through
+  `pdf`, `html`, `text`, and `pii` extras instead of the core install.
+- Optional imports are lazy and report the exact `dbt-ml[...]` installation
+  command when a requested feature is unavailable; `all` installs every
+  optional integration for development and comprehensive deployments.
+
 ### Ergonomics and hash hardening (issue #78)
 
 - `--project-dir`, `--profiles-dir`, and `--target` can be placed either before

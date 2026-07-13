@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+
+from ..optional_dependencies import import_optional_dependency
 
 if TYPE_CHECKING:
     from datasketch import MinHash
@@ -24,12 +26,14 @@ def minhash_signature(text: str, *, num_perm: int = 128, k: int = 5) -> MinHash:
     """Build a MinHash signature for `text`. `num_perm` trades accuracy for
     memory (128 is the datasketch default; 256 for higher precision).
     `k` is the shingle size in words."""
-    from datasketch import MinHash
+    datasketch = import_optional_dependency(
+        "datasketch", extra="text", feature="Near-duplicate detection"
+    )
 
-    mh = MinHash(num_perm=num_perm)
+    mh = datasketch.MinHash(num_perm=num_perm)
     for sh in _shingles(text, k=k):
         mh.update(sh.encode("utf-8"))
-    return mh
+    return cast("MinHash", mh)
 
 
 def near_duplicates(
@@ -44,12 +48,14 @@ def near_duplicates(
     Uses MinHash + LSH for O(n) expected time. Returns one set per cluster;
     singletons are omitted.
     """
-    from datasketch import MinHashLSH
+    datasketch = import_optional_dependency(
+        "datasketch", extra="text", feature="Near-duplicate detection"
+    )
 
     sigs: list[MinHash] = [
         minhash_signature(t, num_perm=num_perm, k=k) for t in texts
     ]
-    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    lsh = datasketch.MinHashLSH(threshold=threshold, num_perm=num_perm)
     for i, sig in enumerate(sigs):
         lsh.insert(str(i), sig)
 

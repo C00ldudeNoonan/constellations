@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from faker import Faker
-from fpdf import FPDF
+
+from ..optional_dependencies import import_optional_dependency
+
+if TYPE_CHECKING:
+    from fpdf import FPDF
 
 _CURRENCIES = ["USD", "EUR", "GBP", "CAD"]
 
@@ -57,7 +61,7 @@ def _make_invoice(fake: Faker, rng: random.Random, index: int) -> dict[str, Any]
 
 
 def _render(inv: dict[str, Any]) -> FPDF:
-    pdf = FPDF()
+    pdf = _fpdf().FPDF()
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 18)
@@ -105,4 +109,10 @@ def _render(inv: dict[str, Any]) -> FPDF:
     pdf.set_font("Helvetica", size=10)
     pdf.cell(0, 6, "Payment terms: Net 30 days.", new_x="LMARGIN", new_y="NEXT")
 
-    return pdf
+    return cast("FPDF", pdf)
+
+
+def _fpdf() -> Any:
+    return import_optional_dependency(
+        "fpdf", extra="pdf", feature="Synthetic PDF generation"
+    )

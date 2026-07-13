@@ -34,8 +34,8 @@ selectors + tests + artifacts pattern, applied to unstructured data.
 ## You have a folder of files. Get them into your warehouse.
 
 ```bash
-# Install from PyPI
-uv add dbt-ml
+# Install from PyPI with the PDF parser used below
+uv add 'dbt-ml[pdf]'
 
 # 1. Scaffold a project for whatever shape your data is
 uv run dbt-ml init my_project --template pdf      # or json, markdown, html
@@ -52,6 +52,25 @@ duckdb target/dbt_ml.duckdb -c "SELECT * FROM my_project.raw_pdf_text LIMIT 5"
 
 That's the whole loop. Everything else (selectors, profiles, tests, LLM
 extraction, dbt handoff) is opt-in on top.
+
+### Optional dependencies
+
+The core install stays lean. Add only the feature groups a project uses:
+
+| Extra | Features |
+|-------|----------|
+| `pdf` | PDF extraction and synthetic PDF generation (`pypdf`, `fpdf2`) |
+| `html` | HTML extraction (`beautifulsoup4`) |
+| `text` | Token counting, encoding cleanup, language detection, and near-duplicate detection |
+| `pii` | Presidio PII detection and redaction; a spaCy language model is still installed separately |
+| `bigquery` | BigQuery warehouse adapter |
+| `gcs` | Google Cloud Storage document sources |
+| `all` | Every optional feature above |
+
+For example, `uv add 'dbt-ml[pdf,text]'` installs PDF and text processing,
+while `uv add 'dbt-ml[all]'` provides the complete development/runtime feature
+set. Invoking a feature whose extra is absent raises an error with the exact
+installation command.
 
 ## What dbt-ml actually does
 

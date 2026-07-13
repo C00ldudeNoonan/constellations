@@ -196,7 +196,7 @@ def _run_features(
         options = _text_options(vectorizer["options"])
 
     source_name = parse_ref(model.depends_on[0])
-    source_df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(source_name)}")
+    source_df = adapter.read_table(source_name)
     if ml.text_field not in source_df.columns:
         raise ValueError(
             f"ML model '{model.name}' text_field '{ml.text_field}' "
@@ -302,7 +302,7 @@ def _run_classifier(
         metadata, classifier = _read_classifier_artifact(artifact_path, provider, ml)
 
     source_name = parse_ref(model.depends_on[0])
-    source_df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(source_name)}")
+    source_df = adapter.read_table(source_name)
     if ml.text_field not in source_df.columns:
         raise ValueError(
             f"ML model '{model.name}' text_field '{ml.text_field}' "

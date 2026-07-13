@@ -15,6 +15,8 @@ import pytest
 
 from dbt_ml.adapters import (
     AdapterError,
+    WarehouseCapability,
+    adapter_capabilities,
     create_adapter,
     list_adapter_types,
     parse_warehouse_config,
@@ -31,6 +33,16 @@ from dbt_ml.adapters.bigquery import (
 
 def test_bigquery_registered() -> None:
     assert "bigquery" in list_adapter_types()
+
+
+def test_bigquery_declares_capabilities_without_transactions() -> None:
+    capabilities = adapter_capabilities("bigquery")
+
+    assert WarehouseCapability.TABULAR_READS in capabilities
+    assert WarehouseCapability.SQL_SCHEMA_TESTS in capabilities
+    assert WarehouseCapability.ATOMIC_FULL_REPLACE in capabilities
+    assert WarehouseCapability.ATOMIC_KEYED_UPSERT in capabilities
+    assert WarehouseCapability.TRANSACTIONS not in capabilities
 
 
 def test_config_dataset_alias() -> None:

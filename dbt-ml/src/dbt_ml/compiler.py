@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .adapters import WarehouseCapability, adapter_capabilities
 from .backends import BackendOptionsError, list_backends, validate_backend_options
 from .config.loader import ConfigError
 from .config.model import ModelConfig
@@ -108,6 +109,55 @@ def validate_project_contract(
         return ProjectDAG(sources, models)
     except DAGError as e:
         raise ConfigError(f"Invalid project DAG: {e}") from e
+
+
+def validate_warehouse_capabilities(
+    models: list[ModelConfig], adapter_type: str
+) -> None:
+    available = adapter_capabilities(adapter_type)
+    for model in models:
+        required: dict[WarehouseCapability, str] = {}
+        if model.materialization == "full":
+            required[WarehouseCapability.ATOMIC_FULL_REPLACE] = (
+                "full materialization"
+            )
+        else:
+            required[WarehouseCapability.ATOMIC_KEYED_UPSERT] = (
+                "incremental materialization"
+            )
+        if model.extraction is not None:
+            required[WarehouseCapability.TYPED_EMPTY_RELATIONS] = (
+                "empty extraction results"
+            )
+            required[WarehouseCapability.CHUNKED_WRITES] = (
+                "bounded extraction writes"
+            )
+        if model.transform is not None or model.ml is not None or model.chunk is not None:
+            required[WarehouseCapability.TABULAR_READS] = (
+                f"{_kind_label(model).lower()} input reads"
+            )
+        if model.tests:
+            required[WarehouseCapability.SQL_SCHEMA_TESTS] = "model tests"
+        if (
+            model.materialization == "incremental"
+            and model.on_schema_change == "append_new_columns"
+        ):
+            required[WarehouseCapability.SCHEMA_EVOLUTION] = (
+                "on_schema_change=append_new_columns"
+            )
+
+        missing = sorted(set(required) - available, key=lambda item: item.value)
+        if not missing:
+            continue
+        details = ", ".join(
+            f"{capability.value} ({required[capability]})"
+            for capability in missing
+        )
+        raise _model_error(
+            model,
+            f"Warehouse adapter '{adapter_type}' cannot execute model "
+            f"'{model.name}'; missing capabilities: {details}",
+        )
 
 
 def _validate_tests(

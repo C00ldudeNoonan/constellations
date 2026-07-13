@@ -6,7 +6,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..config.profile import WarehouseConfig
-from .base import AdapterError, WarehouseAdapter
+from .base import AdapterError, WarehouseAdapter, WarehouseCapability
 
 
 class UnknownAdapterError(AdapterError):
@@ -55,3 +55,13 @@ def create_adapter(
 
 def list_adapter_types() -> list[str]:
     return sorted(_REGISTRY)
+
+
+def adapter_capabilities(adapter_type: str) -> frozenset[WarehouseCapability]:
+    cls = _REGISTRY.get(adapter_type)
+    if cls is None:
+        raise UnknownAdapterError(
+            f"No adapter registered for warehouse.type='{adapter_type}'. "
+            f"Known: {sorted(_REGISTRY)}"
+        )
+    return cls.capabilities()

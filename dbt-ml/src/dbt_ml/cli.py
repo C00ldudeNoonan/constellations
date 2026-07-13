@@ -11,7 +11,7 @@ import click
 
 from .adapters import AdapterError, create_adapter
 from .checks import TestResult, run_project_tests
-from .compiler import validate_project_contract
+from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config import ConfigError, load_project
 from .config.model import ModelConfig
 from .config.profile import resolve_llm_credential
@@ -155,6 +155,10 @@ def compile(ctx: click.Context) -> None:
     project, sources, models = _load(project_dir)
     try:
         dag = validate_project_contract(project, sources, models, project_dir)
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+        validate_warehouse_capabilities(models, resolved.warehouse.type)
         manifest_path = write_manifest(
             project_dir, target=target, profiles_dir=profiles_dir
         )
@@ -313,12 +317,11 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
             tables = adapter.list_tables()
             if model_name not in tables:
                 raise click.ClickException(
-                    f"Table '{model_name}' not found in {adapter.schema_ref}. "
+                    f"Table '{model_name}' not found in the "
+                    f"{adapter.adapter_type()} target. "
                     f"Run `dbt-ml run` first. Available: {tables or '(none)'}"
                 )
-            df = adapter.query_df(
-                f"SELECT * FROM {adapter.table_ref(model_name)} LIMIT {limit}"
-            )
+            df = adapter.read_table(model_name, limit=limit)
     except AdapterError as e:
         raise click.ClickException(str(e)) from e
 
@@ -1092,6 +1095,11 @@ def _run_watch(
         required_sources = set(dag.required_sources(selected))
         resolved = resolve_profile(
             project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+        selected_names = set(selected)
+        validate_warehouse_capabilities(
+            [model for model in models if model.name in selected_names],
+            resolved.warehouse.type,
         )
         sources = apply_source_path_overrides(sources, resolved)
     except _CONFIG_ERRORS as e:

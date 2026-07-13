@@ -197,6 +197,8 @@ class HtmlBackendOptions(_BackendOptions):
     @field_validator("parser")
     @classmethod
     def _validate_parser(cls, parser: str) -> str:
+        if parser == "html.parser":
+            return parser
         available = _available_html_parsers()
         if parser not in available:
             supported = ", ".join(available)

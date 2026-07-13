@@ -254,6 +254,59 @@ def test_unselected_pdf_model_does_not_import_pdf_extra_during_manifest(
     assert "Traceback" not in result.output
 
 
+def test_unselected_html_model_does_not_import_html_extra_during_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: mixed_parsers\nprofile: mixed_parsers\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "mixed_parsers:\n  target: dev\n  outputs:\n    dev:\n"
+        "      warehouse:\n        type: duckdb\n"
+        "        path: target/mixed.duckdb\n        schema: mixed_parsers\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n"
+        "  - name: json_docs\n    path: data/json\n"
+        "    file_pattern: '*.json'\n"
+        "  - name: html_docs\n    path: data/html\n"
+        "    file_pattern: '*.html'\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "models.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: raw_json\n    source: ref('json_docs')\n"
+        "    extraction:\n      backend: json\n"
+        "      options:\n        fields: [title]\n"
+        "  - name: raw_html\n    source: ref('html_docs')\n"
+        "    extraction:\n      backend: html\n"
+    )
+    json_dir = tmp_path / "data" / "json"
+    json_dir.mkdir(parents=True)
+    (json_dir / "one.json").write_text('{"title": "Selected"}')
+
+    def fail_if_parser_validation_runs() -> tuple[str, ...]:
+        raise AssertionError("unselected HTML backend must not inspect bs4 builders")
+
+    def fail_if_imported() -> object:
+        raise AssertionError("unselected HTML backend must not import BeautifulSoup")
+
+    monkeypatch.setattr(options, "_available_html_parsers", fail_if_parser_validation_runs)
+    monkeypatch.setattr(html_backend, "_bs4", fail_if_imported)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--project-dir", str(tmp_path), "run", "--select", "raw_json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = (tmp_path / "target" / "manifest.json").read_text()
+    assert '"raw_html"' in manifest
+    assert "Traceback" not in result.output
+
+
 def test_heavy_dependencies_live_only_in_extras() -> None:
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
     project = tomllib.loads(pyproject_path.read_text())["project"]

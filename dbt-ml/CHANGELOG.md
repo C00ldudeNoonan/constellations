@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.8 - 2026-07-13
 
 ### Optional feature dependencies (issue #56)
 

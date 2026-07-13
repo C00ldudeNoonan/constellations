@@ -5,7 +5,10 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..optional_dependencies import import_optional_dependency
+from ..optional_dependencies import (
+    import_optional_dependency,
+    optional_dependency_version,
+)
 from .base import BaseBackend, ExtractionResult
 from .options import HtmlBackendOptions
 from .registry import register
@@ -75,8 +78,7 @@ class HtmlBackend(BaseBackend):
         return "html"
 
     def version(self) -> str:
-        bs4 = _bs4()
-        return f"beautifulsoup4/{bs4.__version__}"
+        return f"beautifulsoup4/{optional_dependency_version('beautifulsoup4')}"
 
     def supported_formats(self) -> list[str]:
         return [".html", ".htm"]

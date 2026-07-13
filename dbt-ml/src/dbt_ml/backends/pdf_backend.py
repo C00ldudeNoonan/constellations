@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..optional_dependencies import import_optional_dependency
+from ..optional_dependencies import (
+    import_optional_dependency,
+    optional_dependency_version,
+)
 from .base import BaseBackend, ExtractionResult
 from .options import PdfBackendOptions
 from .registry import register
@@ -28,8 +31,7 @@ class PdfBackend(BaseBackend):
         return [".pdf"]
 
     def version(self) -> str:
-        pypdf = _pypdf()
-        return f"pypdf/{pypdf.__version__}"
+        return f"pypdf/{optional_dependency_version('pypdf')}"
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)

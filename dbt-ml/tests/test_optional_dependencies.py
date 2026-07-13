@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from dbt_ml import chunking
+from dbt_ml import chunking, optional_dependencies
 from dbt_ml.backends import html_backend, options, pdf_backend
 from dbt_ml.cli import cli
 from dbt_ml.optional_dependencies import OptionalDependencyError
@@ -28,9 +28,9 @@ def _reset_optional_caches() -> None:
 @pytest.mark.parametrize(
     ("blocked", "extra", "use_feature"),
     [
-        ("pypdf", "pdf", lambda: pdf_backend.PdfBackend().version()),
+        ("pypdf", "pdf", pdf_backend._pypdf),
         ("fpdf", "pdf", invoice_pdfs._fpdf),
-        ("bs4", "html", lambda: html_backend.HtmlBackend().version()),
+        ("bs4", "html", html_backend._bs4),
         ("soupsieve", "html", lambda: options._validate_css_selector("p.title")),
         ("tiktoken", "text", lambda: tokens.count_tokens("hello")),
         ("ftfy", "text", lambda: encoding.clean_encoding("hello")),
@@ -97,6 +97,17 @@ import dbt_ml.cli
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_optional_dependency_version_does_not_import_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_distribution(_distribution: str) -> str:
+        raise optional_dependencies.PackageNotFoundError
+
+    monkeypatch.setattr(optional_dependencies, "version", missing_distribution)
+
+    assert optional_dependencies.optional_dependency_version("pypdf") == "not-installed"
 
 
 def test_compile_reports_missing_optional_dependency_without_traceback(
@@ -191,6 +202,55 @@ def test_seed_reports_missing_pdf_extra_without_traceback(
 
     assert result.exit_code == 2, result.output
     assert "pip install 'dbt-ml[pdf]'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_unselected_pdf_model_does_not_import_pdf_extra_during_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: mixed_parsers\nprofile: mixed_parsers\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "mixed_parsers:\n  target: dev\n  outputs:\n    dev:\n"
+        "      warehouse:\n        type: duckdb\n"
+        "        path: target/mixed.duckdb\n        schema: mixed_parsers\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n"
+        "  - name: json_docs\n    path: data/json\n"
+        "    file_pattern: '*.json'\n"
+        "  - name: pdf_docs\n    path: data/pdf\n"
+        "    file_pattern: '*.pdf'\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "models.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: raw_json\n    source: ref('json_docs')\n"
+        "    extraction:\n      backend: json\n"
+        "      options:\n        fields: [title]\n"
+        "  - name: raw_pdf\n    source: ref('pdf_docs')\n"
+        "    extraction:\n      backend: pdf\n"
+    )
+    json_dir = tmp_path / "data" / "json"
+    json_dir.mkdir(parents=True)
+    (json_dir / "one.json").write_text('{"title": "Selected"}')
+
+    def fail_if_imported() -> object:
+        raise AssertionError("unselected PDF backend must not import pypdf")
+
+    monkeypatch.setattr(pdf_backend, "_pypdf", fail_if_imported)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--project-dir", str(tmp_path), "run", "--select", "raw_json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = (tmp_path / "target" / "manifest.json").read_text()
+    assert '"raw_pdf"' in manifest
     assert "Traceback" not in result.output
 
 

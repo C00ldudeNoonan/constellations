@@ -10,7 +10,12 @@ import polars as pl
 from pydantic import BaseModel
 
 from ..config.profile import WarehouseConfig
-from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
+from .base import (
+    AdapterError,
+    WarehouseAdapter,
+    WarehouseCapability,
+    validate_incremental_keys,
+)
 from .registry import register
 
 
@@ -52,6 +57,10 @@ class DuckDBAdapter(WarehouseAdapter):
     @classmethod
     def config_model(cls) -> type[WarehouseConfig]:
         return DuckDBWarehouseConfig
+
+    @classmethod
+    def capabilities(cls) -> frozenset[WarehouseCapability]:
+        return frozenset(WarehouseCapability)
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 

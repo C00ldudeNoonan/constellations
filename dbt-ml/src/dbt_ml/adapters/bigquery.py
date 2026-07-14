@@ -36,7 +36,12 @@ from pydantic import (
 )
 
 from ..config.profile import WarehouseConfig
-from .base import AdapterError, WarehouseAdapter, validate_incremental_keys
+from .base import (
+    AdapterError,
+    WarehouseAdapter,
+    WarehouseCapability,
+    validate_incremental_keys,
+)
 from .registry import register
 
 _INSTALL_HINT = (
@@ -379,6 +384,13 @@ class BigQueryAdapter(WarehouseAdapter):
     @classmethod
     def config_model(cls) -> type[WarehouseConfig]:
         return BigQueryWarehouseConfig
+
+    @classmethod
+    def capabilities(cls) -> frozenset[WarehouseCapability]:
+        return frozenset(WarehouseCapability) - {
+            WarehouseCapability.ATOMIC_FULL_REPLACE,
+            WarehouseCapability.TRANSACTIONS,
+        }
 
     @classmethod
     def warehouse_options_model(cls) -> type[BaseModel] | None:

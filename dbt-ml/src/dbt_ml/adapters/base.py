@@ -6,13 +6,14 @@ interface for the runner: connect/close, schema management, materialization
 that runner.py / manifest.py / dbt_export.py / cli.py never speak DuckDB
 SQL directly — they call adapter methods.
 
-Today: DuckDB. v0.2.2: LanceDB. Beyond: Postgres / Snowflake / BigQuery /
-Databricks / Redshift, matching the dbt-core set.
+Today: DuckDB and BigQuery. Future warehouse adapters follow the dbt-core set.
+Vector stores such as LanceDB are a separate role and do not emulate this API.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -25,6 +26,22 @@ from ..config.profile import WarehouseConfig
 
 class AdapterError(Exception):
     pass
+
+
+class AdapterCapabilityError(AdapterError):
+    pass
+
+
+class WarehouseCapability(StrEnum):
+    SQL_QUERIES = "sql_queries"
+    TABULAR_READS = "tabular_reads"
+    SQL_SCHEMA_TESTS = "sql_schema_tests"
+    ATOMIC_FULL_REPLACE = "atomic_full_replace"
+    ATOMIC_KEYED_UPSERT = "atomic_keyed_upsert"
+    TRANSACTIONS = "transactions"
+    TYPED_EMPTY_RELATIONS = "typed_empty_relations"
+    CHUNKED_WRITES = "chunked_writes"
+    SCHEMA_EVOLUTION = "schema_evolution"
 
 
 def validate_incremental_keys(df: pl.DataFrame, key_col: str) -> None:
@@ -64,6 +81,25 @@ class WarehouseAdapter(ABC):
     def config_model(cls) -> type[WarehouseConfig]:
         """The WarehouseConfig subclass this adapter's profile block
         validates against."""
+
+    @classmethod
+    @abstractmethod
+    def capabilities(cls) -> frozenset[WarehouseCapability]:
+        """Operations and guarantees callers may rely on for this adapter."""
+
+    @classmethod
+    def supports(cls, capability: WarehouseCapability) -> bool:
+        return capability in cls.capabilities()
+
+    def require_capability(
+        self, capability: WarehouseCapability, *, operation: str
+    ) -> None:
+        if self.supports(capability):
+            return
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not support {operation} "
+            f"(missing capability: {capability.value})"
+        )
 
     @classmethod
     def warehouse_options_model(cls) -> type[BaseModel] | None:
@@ -130,9 +166,15 @@ class WarehouseAdapter(ABC):
         return self.config.schema_name
 
     @property
-    @abstractmethod
     def schema_ref(self) -> str:
         """Quoted, fully-qualified schema reference for use in SQL."""
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES,
+            operation="SQL schema references",
+        )
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement schema_ref"
+        )
 
     def quote_ident(self, name: str) -> str:
         """Quote a single SQL identifier. ANSI rules (double quotes, embedded
@@ -142,6 +184,10 @@ class WarehouseAdapter(ABC):
         return '"' + name.replace('"', '""') + '"'
 
     def table_ref(self, table: str) -> str:
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES,
+            operation="SQL table references",
+        )
         return f"{self.schema_ref}.{self.quote_ident(table)}"
 
     # ─── materialization ──────────────────────────────────────────────────
@@ -203,18 +249,68 @@ class WarehouseAdapter(ABC):
 
     # ─── querying ─────────────────────────────────────────────────────────
 
-    @abstractmethod
-    def execute(self, sql: str, params: list[Any] | None = None) -> Any: ...
+    def read_table(self, table: str, *, limit: int | None = None) -> pl.DataFrame:
+        """Read a materialized relation without exposing SQL to core callers.
 
-    @abstractmethod
-    def query_df(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame: ...
+        SQL adapters inherit this implementation. A future non-SQL tabular
+        warehouse can override it while retaining the same core contract.
+        """
+        self.require_capability(
+            WarehouseCapability.TABULAR_READS,
+            operation="reading materialized tables",
+        )
+        if limit is not None and limit < 0:
+            raise AdapterError("Table read limit must be non-negative")
+        suffix = f" LIMIT {limit}" if limit is not None else ""
+        return self.query_df(f"SELECT * FROM {self.table_ref(table)}{suffix}")
 
-    @abstractmethod
+    def row_count(self, table: str) -> int:
+        """Return the relation row count through a typed core operation."""
+        self.require_capability(
+            WarehouseCapability.TABULAR_READS,
+            operation="counting materialized table rows",
+        )
+        value = self.scalar(f"SELECT COUNT(*) FROM {self.table_ref(table)}")
+        return int(value or 0)
+
+    def execute(self, sql: str, params: list[Any] | None = None) -> Any:
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES,
+            operation="executing SQL",
+        )
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement execute"
+        )
+
+    def query_df(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame:
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES,
+            operation="querying SQL into a DataFrame",
+        )
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement query_df"
+        )
+
     def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
         """First column of first row, or None."""
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES,
+            operation="querying SQL scalar values",
+        )
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement scalar"
+        )
 
-    @abstractmethod
-    def rows(self, sql: str, params: list[Any] | None = None) -> list[tuple[Any, ...]]: ...
+    def rows(
+        self, sql: str, params: list[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        self.require_capability(
+            WarehouseCapability.SQL_QUERIES,
+            operation="querying SQL rows",
+        )
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement rows"
+        )
 
     @abstractmethod
     def list_tables(self) -> list[str]: ...

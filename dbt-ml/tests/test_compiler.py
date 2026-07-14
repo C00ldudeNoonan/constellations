@@ -5,8 +5,12 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from dbt_ml.adapters import WarehouseCapability
 from dbt_ml.cli import cli
-from dbt_ml.compiler import validate_project_contract
+from dbt_ml.compiler import (
+    validate_project_contract,
+    validate_warehouse_capabilities,
+)
 from dbt_ml.config import ConfigError
 from dbt_ml.config.model import ModelConfig
 from dbt_ml.config.project import ProjectConfig
@@ -29,6 +33,48 @@ def _extraction(
         source=f"ref('{source}')",
         extraction={"backend": backend},
     )
+
+
+def test_capability_preflight_rejects_missing_typed_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = ModelConfig(
+        name="chunks",
+        depends_on=["ref('raw')"],
+        chunk={"text_field": "text"},
+    )
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.TABULAR_READS,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(ConfigError, match=r"tabular_reads.*chunk input reads"):
+        validate_warehouse_capabilities([model], "vector_only")
+
+
+def test_capability_preflight_rejects_sql_tests_without_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _extraction("raw")
+    model.tests = ["not_empty"]
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.SQL_SCHEMA_TESTS,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(ConfigError, match=r"sql_schema_tests.*model tests"):
+        validate_warehouse_capabilities([model], "non_sql")
+
+
+def test_bigquery_full_preflight_rejects_non_atomic_replacement() -> None:
+    with pytest.raises(ConfigError, match=r"atomic_full_replace.*full materialization"):
+        validate_warehouse_capabilities([_extraction("raw")], "bigquery")
 
 
 @pytest.mark.parametrize("command", ["compile", "run", "build", "test"])

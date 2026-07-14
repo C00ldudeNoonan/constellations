@@ -7,8 +7,11 @@ import polars as pl
 import pytest
 
 from dbt_ml.adapters import (
+    AdapterCapabilityError,
     AdapterError,
     UnknownAdapterError,
+    WarehouseCapability,
+    adapter_capabilities,
     create_adapter,
     list_adapter_types,
     parse_warehouse_config,
@@ -24,6 +27,22 @@ def _wh(path: Path, schema: str = "testns") -> WarehouseConfig:
 
 def test_registered_types() -> None:
     assert "duckdb" in list_adapter_types()
+
+
+def test_duckdb_declares_core_workflow_capabilities() -> None:
+    capabilities = adapter_capabilities("duckdb")
+
+    assert {
+        WarehouseCapability.SQL_QUERIES,
+        WarehouseCapability.TABULAR_READS,
+        WarehouseCapability.SQL_SCHEMA_TESTS,
+        WarehouseCapability.ATOMIC_FULL_REPLACE,
+        WarehouseCapability.ATOMIC_KEYED_UPSERT,
+        WarehouseCapability.TRANSACTIONS,
+        WarehouseCapability.TYPED_EMPTY_RELATIONS,
+        WarehouseCapability.CHUNKED_WRITES,
+        WarehouseCapability.SCHEMA_EVOLUTION,
+    } <= capabilities
 
 
 def test_unknown_type_raises(tmp_path: Path) -> None:
@@ -53,6 +72,27 @@ def test_list_tables_excludes_failures_tables(tmp_path: Path) -> None:
         tables = adapter.list_tables()
         assert "model_a" in tables
         assert all(not t.startswith("dbt_ml_test_failures__") for t in tables)
+
+
+def test_typed_table_reads_support_limits_and_counts(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_full("widgets", pl.DataFrame({"x": [1, 2, 3]}))
+
+        assert adapter.read_table("widgets", limit=2).to_dicts() == [
+            {"x": 1},
+            {"x": 2},
+        ]
+        assert adapter.row_count("widgets") == 3
+
+
+def test_typed_table_read_reports_missing_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = create_adapter(_wh(tmp_path / "t.duckdb"))
+    monkeypatch.setattr(type(adapter), "capabilities", classmethod(lambda cls: frozenset()))
+
+    with pytest.raises(AdapterCapabilityError, match="tabular_reads"):
+        adapter.read_table("widgets")
 
 
 def test_state_upsert_and_fetch(tmp_path: Path) -> None:

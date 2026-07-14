@@ -29,7 +29,7 @@ from .backends import (
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
-from .compiler import validate_project_contract
+from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config import load_project
 from .config.model import INTERNAL_LINEAGE_FIELDS, ModelConfig
 from .config.profile import PricingConfig
@@ -261,6 +261,10 @@ def run_project(
             resolved=resolved,
         ),
     )
+    validate_warehouse_capabilities(
+        [model for model in models if model.name in set(selected)],
+        resolved.warehouse.type,
+    )
 
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
@@ -322,6 +326,10 @@ def build_project(
             project=project,
             resolved=resolved,
         ),
+    )
+    validate_warehouse_capabilities(
+        [model for model in models if model.name in set(selected)],
+        resolved.warehouse.type,
     )
 
     required_sources = set(dag.required_sources(selected))
@@ -543,7 +551,7 @@ def _run_extraction_model(
         is_incremental
         and not processed_state
         and model.name in existing_tables
-        and adapter.scalar(f"SELECT COUNT(*) FROM {adapter.table_ref(model.name)}") == 0
+        and adapter.row_count(model.name) == 0
     )
 
     docs_to_process: list[DocumentRef] = []
@@ -906,9 +914,7 @@ def _run_transform_model(
     deps: dict[str, pl.DataFrame] = {}
     for dep_ref in model.depends_on:
         dep_name = parse_ref(dep_ref)
-        deps[dep_name] = adapter.query_df(
-            f"SELECT * FROM {adapter.table_ref(dep_name)}"
-        )
+        deps[dep_name] = adapter.read_table(dep_name)
 
     if transform_call_arity(transform_fn) == 2:
         ctx = TransformContext(
@@ -955,7 +961,7 @@ def _run_chunk_model(
             "`depends_on:` (the extraction model to chunk)"
         )
     upstream = parse_ref(model.depends_on[0])
-    df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(upstream)}")
+    df = adapter.read_table(upstream)
     if chunk_cfg.text_field not in df.columns:
         raise RunError(
             f"Chunk model '{model.name}': upstream '{upstream}' has no column "

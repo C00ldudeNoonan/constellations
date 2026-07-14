@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..adapters import WarehouseAdapter, create_adapter
-from ..compiler import validate_project_contract
+from ..adapters import WarehouseAdapter, WarehouseCapability, create_adapter
+from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import load_project
 from ..config.model import ModelConfig
 from ..profile import resolve_profile
@@ -40,6 +40,10 @@ def run_project_tests(
     selected_names = set(
         dag.select_models(select=select, exclude=exclude, modified=modified)
     )
+    validate_warehouse_capabilities(
+        [model for model in models if model.name in selected_names],
+        resolved.warehouse.type,
+    )
 
     results: list[TestResult] = []
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
@@ -66,6 +70,10 @@ def run_model_tests(
 ) -> list[TestResult]:
     if not model.tests:
         return []
+    adapter.require_capability(
+        WarehouseCapability.SQL_SCHEMA_TESTS,
+        operation=f"running tests for model '{model.name}'",
+    )
     if model.name not in set(adapter.list_tables()):
         return [
             TestResult(

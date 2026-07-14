@@ -277,7 +277,7 @@ def test_missing_prediction_artifact_fails_before_warehouse_query(tmp_path: Path
             adapter=adapter,
         )
 
-    adapter.query_df.assert_not_called()
+    adapter.read_table.assert_not_called()
 
 
 def test_ml_contract_error_carries_model_and_yaml_path(tmp_path: Path) -> None:
@@ -301,8 +301,7 @@ def test_runtime_rejects_contextual_zero_width_token_match() -> None:
 
 def test_requested_metrics_and_include_metrics_are_honored(tmp_path: Path) -> None:
     adapter = Mock(spec=WarehouseAdapter)
-    adapter.table_ref.return_value = '"p"."raw"'
-    adapter.query_df.return_value = pl.DataFrame(
+    adapter.read_table.return_value = pl.DataFrame(
         {"document_id": ["1", "2"], "text": ["red blue", "blue green"]}
     )
     model = _model(
@@ -331,8 +330,7 @@ def test_requested_metrics_and_include_metrics_are_honored(tmp_path: Path) -> No
 
 def test_requested_metrics_are_projected_into_artifact(tmp_path: Path) -> None:
     adapter = Mock(spec=WarehouseAdapter)
-    adapter.table_ref.return_value = '"p"."raw"'
-    adapter.query_df.return_value = pl.DataFrame({"text": ["red blue"]})
+    adapter.read_table.return_value = pl.DataFrame({"text": ["red blue"]})
     model = _model(_features(metrics=["feature_rows"]))
 
     output = run_classic_ml_model(
@@ -349,8 +347,7 @@ def test_requested_metrics_are_projected_into_artifact(tmp_path: Path) -> None:
 
 def _publication_adapter() -> Mock:
     adapter = Mock(spec=WarehouseAdapter)
-    adapter.table_ref.return_value = '"p"."raw"'
-    adapter.query_df.return_value = pl.DataFrame(
+    adapter.read_table.return_value = pl.DataFrame(
         {"document_id": ["1", "2"], "text": ["red blue", "blue green"]}
     )
     adapter.parse_warehouse_options.return_value = None
@@ -499,7 +496,7 @@ def test_committed_journal_blocks_later_publication_until_cleanup_succeeds(
             adapter=second_adapter,
         )
 
-    second_adapter.query_df.assert_not_called()
+    second_adapter.read_table.assert_not_called()
     assert json.loads(registry_path.read_text()) == committed_registry
     assert json.loads((artifact_path / "metadata.json").read_text())[
         "artifact_version"
@@ -861,8 +858,7 @@ def test_distinct_artifact_paths_must_not_be_nested(tmp_path: Path) -> None:
 
 def _fit_artifact(tmp_path: Path) -> tuple[ModelConfig, Mock]:
     adapter = Mock(spec=WarehouseAdapter)
-    adapter.table_ref.return_value = '"p"."raw"'
-    adapter.query_df.return_value = pl.DataFrame({"text": ["red blue"]})
+    adapter.read_table.return_value = pl.DataFrame({"text": ["red blue"]})
     model = _model(_features())
     output = run_classic_ml_model(
         model=model,
@@ -888,7 +884,7 @@ def test_malformed_artifact_metadata_is_domain_error_before_query(tmp_path: Path
             adapter=adapter,
         )
 
-    adapter.query_df.assert_not_called()
+    adapter.read_table.assert_not_called()
 
 
 def test_malformed_artifact_payload_is_domain_error_before_query(tmp_path: Path) -> None:
@@ -914,7 +910,7 @@ def test_malformed_artifact_payload_is_domain_error_before_query(tmp_path: Path)
             adapter=adapter,
         )
 
-    adapter.query_df.assert_not_called()
+    adapter.read_table.assert_not_called()
 
 
 def test_persisted_options_use_typed_provider_contract_before_query(tmp_path: Path) -> None:
@@ -934,7 +930,7 @@ def test_persisted_options_use_typed_provider_contract_before_query(tmp_path: Pa
             adapter=adapter,
         )
 
-    adapter.query_df.assert_not_called()
+    adapter.read_table.assert_not_called()
 
 
 def test_invalid_artifact_runtime_contract_fails_before_warehouse_query(
@@ -970,4 +966,4 @@ def test_invalid_artifact_runtime_contract_fails_before_warehouse_query(
             adapter=adapter,
         )
 
-    adapter.query_df.assert_not_called()
+    adapter.read_table.assert_not_called()

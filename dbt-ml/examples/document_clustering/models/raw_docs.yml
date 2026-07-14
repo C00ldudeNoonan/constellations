@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: raw_docs
+    description: "One typed row per corpus document"
+    source: ref('corpus')
+    extraction:
+      backend: json
+      options:
+        fields: [id, text]
+    materialization: incremental
+    fields:
+      - name: id
+        data_type: string
+      - name: text
+        data_type: string
+    tests:
+      - not_null: [id, text]
+      - unique: id

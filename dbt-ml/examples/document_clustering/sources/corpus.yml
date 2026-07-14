@@ -1,0 +1,7 @@
+version: 2
+sources:
+  - name: corpus
+    description: "Small themed document corpus (committed, no seed needed)"
+    path: corpus
+    file_pattern: "*.json"
+    recursive: true

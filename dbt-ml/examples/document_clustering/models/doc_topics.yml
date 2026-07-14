@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: doc_topics
+    description: "NMF topics over TF-IDF features (+ top terms per topic)"
+    depends_on: [ref('doc_tfidf')]
+    ml:
+      task: topic_model
+      mode: fit_transform
+      provider: builtin.nmf
+      artifact:
+        path: target/artifacts/doc_topics
+      metrics: [n_topics, reconstruction_error, topic_coherence]
+      options:
+        n_topics: 3
+        top_terms: 5
+        random_state: 0
+    materialization: full
+    tags: [topic_model, classic_ml]

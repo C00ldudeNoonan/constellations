@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: doc_tfidf
+    description: "TF-IDF features over the document corpus"
+    depends_on: [ref('raw_docs')]
+    ml:
+      task: features
+      mode: fit_transform
+      provider: builtin.tfidf
+      text_field: text
+      artifact:
+        path: target/artifacts/doc_tfidf
+      options:
+        ngram_range: [1, 1]
+        min_df: 1
+        stop_words: english
+    materialization: full
+    tags: [features, classic_ml]

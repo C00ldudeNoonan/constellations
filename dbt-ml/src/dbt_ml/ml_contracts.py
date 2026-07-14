@@ -209,16 +209,26 @@ class _HDBSCANOptions(_MatrixInputOptions):
     metric: Literal["euclidean", "manhattan"] = "euclidean"
 
 
-class _NMFOptions(_MatrixInputOptions):
+class _TopicOptions(_MatrixInputOptions):
     n_topics: Annotated[StrictInt, Field(ge=2, le=_MAX_COMPONENTS)] = 10
+    top_terms: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
+
+    @model_validator(mode="after")
+    def _forbid_embedding_input(self) -> Self:
+        if self.input == "embedding":
+            raise ValueError(
+                "topic modeling requires input='features' (a non-negative term "
+                "matrix); embedding vectors are not supported"
+            )
+        return self
+
+
+class _NMFOptions(_TopicOptions):
     max_iter: Annotated[StrictInt, Field(ge=1, le=_MAX_ITER)] = 200
-    top_terms: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
 
 
-class _LDAOptions(_MatrixInputOptions):
-    n_topics: Annotated[StrictInt, Field(ge=2, le=_MAX_COMPONENTS)] = 10
+class _LDAOptions(_TopicOptions):
     max_iter: Annotated[StrictInt, Field(ge=1, le=_MAX_ITER)] = 10
-    top_terms: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
     learning_method: Literal["batch", "online"] = "batch"
 
 

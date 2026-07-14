@@ -1,0 +1,19 @@
+version: 2
+models:
+  - name: doc_clusters
+    description: "K-means clusters over TF-IDF features (+ representative docs)"
+    depends_on: [ref('doc_tfidf')]
+    ml:
+      task: cluster
+      mode: fit_transform
+      provider: builtin.kmeans
+      artifact:
+        path: target/artifacts/doc_clusters
+      metrics: [n_clusters, silhouette, inertia]
+      options:
+        n_clusters: 3
+        normalize: l2
+        representative_docs: 2
+        random_state: 0
+    materialization: full
+    tags: [cluster, classic_ml]

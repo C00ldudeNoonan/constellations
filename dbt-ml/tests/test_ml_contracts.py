@@ -124,7 +124,7 @@ def test_default_providers_are_resolved(tmp_path: Path) -> None:
     assert classifier_contract.provider == "builtin.naive_bayes"
 
 
-@pytest.mark.parametrize("task", ["regressor", "cluster", "topic_model", "nlp"])
+@pytest.mark.parametrize("task", ["regressor", "nlp"])
 def test_roadmap_tasks_fail_executable_preflight(tmp_path: Path, task: str) -> None:
     with pytest.raises(MLContractError, match=rf"task '{task}' is not executable"):
         validate_ml_contract(

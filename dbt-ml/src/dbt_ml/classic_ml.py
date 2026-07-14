@@ -2137,7 +2137,10 @@ def _fit_matrix_model(
     n_features = int(matrix.shape[1]) if matrix.ndim == 2 else 0
     fitted: dict[str, Any] = {"n_features": n_features, "n_samples": n_samples}
     if n_samples == 0:
-        fitted.update({"labels": [], "centroids": {}, "distances": [], "components": []})
+        if task == "cluster":
+            fitted.update({"labels": [], "centroids": {}, "distances": []})
+        else:
+            fitted.update({"components": [], "doc_topics": [], "n_components": 0})
         return fitted
 
     if task == "cluster":

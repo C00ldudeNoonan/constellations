@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Clustering and topic modeling (issue #42)
+
+- Two new executable Classic ML tasks over a document-feature matrix:
+  `cluster` (providers `builtin.kmeans`, `builtin.dbscan`, `builtin.hdbscan`)
+  and `topic_model` (providers `builtin.nmf`, `builtin.lda`). Backed by
+  scikit-learn through a new `ml` optional extra
+  (`pip install 'dbt-ml[ml]'`).
+- The matrix is assembled from an upstream `features` model (long-format
+  term/value rows pivoted to documents × terms) or from a dense `embedding`
+  column; optional L2 row normalization (`normalize: l2`) makes Euclidean
+  distance track cosine similarity for TF-IDF and embeddings.
+- Each model emits its primary per-document table (cluster assignments or
+  document-topic weights) plus companion tables materialized as
+  `<model>__representative_docs` (cluster) and `<model>__topics` (topic_model).
+- Metrics: `inertia`/`silhouette`/`n_clusters`/`noise_points` (cluster) and
+  `reconstruction_error`/`perplexity`/`topic_coherence`/`n_topics`
+  (topic_model). Fitting is deterministic under `random_state` and invariant
+  to warehouse row order; fitted parameters persist as JSON through the
+  existing atomic artifact-publication path.
+- Modes `fit_transform` and `fit` are supported; assigning new documents to a
+  persisted model (`predict`/`load_pretrained`) is not yet supported.
+
 ## v0.2.8 - 2026-07-13
 
 ### Optional feature dependencies (issue #56)

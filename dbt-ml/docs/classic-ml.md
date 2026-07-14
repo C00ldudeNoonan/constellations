@@ -81,16 +81,17 @@ patterns:
 | `features` | Count, TF-IDF, hashing, dense/sparse document features | `builtin.count`, `builtin.tfidf`, `builtin.hashing` |
 | `classifier` | Supervised document or row classification | `builtin.naive_bayes`, later `sklearn.logistic_regression`, `sklearn.linear_svc`, `sklearn.sgd_classifier` |
 | `regressor` | Supervised numeric prediction | `sklearn.linear_model`, `sklearn.ensemble` |
-| `cluster` | Document clustering and nearest-neighbor grouping | `sklearn.kmeans`, later HDBSCAN-style providers |
-| `topic_model` | Topic discovery and document-topic tables | `sklearn.nmf`, `sklearn.lda` |
+| `cluster` | Document clustering and representative-document grouping | `builtin.kmeans`, `builtin.dbscan`, `builtin.hdbscan` |
+| `topic_model` | Topic discovery and document-topic tables | `builtin.nmf`, `builtin.lda` |
 | `nlp` | Tokenization, POS, NER, sentiment, key phrases | `spacy`, lightweight built-ins |
 
 Providers should remain optional dependencies. The base package should keep
 working for extraction and pure-Python transforms without installing
-scikit-learn or spaCy.
+scikit-learn or spaCy. The `cluster` and `topic_model` providers require the
+`ml` extra (`pip install 'dbt-ml[ml]'`, which installs scikit-learn).
 
-Only `features` and `classifier` are executable today. `regressor`, `cluster`,
-`topic_model`, and `nlp` are roadmap contracts and are rejected during
+`features`, `classifier`, `cluster`, and `topic_model` are executable today.
+`regressor` and `nlp` remain roadmap contracts and are rejected during
 preflight rather than failing after warehouse work begins.
 
 ## Supervised Classification
@@ -122,6 +123,56 @@ one prediction row per input row with `prediction`, `score`, JSON
 `probabilities`, and `correct` when labels are present. `fit` writes artifact
 metadata only, while `predict` and `load_pretrained` reuse a persisted artifact
 against new rows.
+
+## Clustering and Topic Modeling
+
+The `cluster` and `topic_model` tasks consume a **document-feature matrix**
+rather than raw text. The matrix comes from either an upstream `features`
+model (long-format `term`/`value` rows pivoted to documents × terms) or a
+dense `embedding` column (`input: embedding`, `embedding_field: <column>`),
+which makes them a natural fit for RAG embedding analysis. Set `normalize: l2`
+so Euclidean distance tracks cosine similarity — the right default for TF-IDF
+and embeddings.
+
+```yaml
+models:
+  - name: ticket_clusters
+    depends_on: [ref('ticket_tfidf')]
+    ml:
+      task: cluster
+      mode: fit_transform
+      provider: builtin.kmeans        # or builtin.dbscan / builtin.hdbscan
+      metrics: [n_clusters, silhouette, inertia]
+      options:
+        n_clusters: 5
+        normalize: l2
+        representative_docs: 3
+
+  - name: ticket_topics
+    depends_on: [ref('ticket_tfidf')]
+    ml:
+      task: topic_model
+      mode: fit_transform
+      provider: builtin.nmf           # or builtin.lda
+      metrics: [n_topics, reconstruction_error, topic_coherence]
+      options:
+        n_topics: 5
+        top_terms: 8
+```
+
+Each model materializes a **primary per-document table** plus **companion
+tables**:
+
+| task | primary table (`<model>`) | companion tables |
+| --- | --- | --- |
+| `cluster` | one row per document: `cluster`, `distance`, `probability`, `is_noise` | `<model>__representative_docs` (docs nearest each centroid) |
+| `topic_model` | one row per document × topic: `topic`, `weight` (per-doc proportions) | `<model>__topics` (top terms per topic) |
+
+Fitting is deterministic under `random_state` and invariant to warehouse row
+order. Fitted parameters (cluster centroids, topic components) persist as JSON
+through the same atomic artifact-publication path as the other tasks. Modes
+`fit_transform` and `fit` are supported; `predict`/`load_pretrained` (assigning
+new documents to a persisted model) are not yet available for these tasks.
 
 ## Modes
 

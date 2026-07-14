@@ -165,14 +165,23 @@ tables**:
 
 | task | primary table (`<model>`) | companion tables |
 | --- | --- | --- |
-| `cluster` | one row per document: `cluster`, `distance`, `probability`, `is_noise` | `<model>__representative_docs` (docs nearest each centroid) |
+| `cluster` | one row per document: `cluster`, `distance`, `probability`, `is_noise` | `<model>__topics` (c-TF-IDF top terms per cluster), `<model>__representative_docs` (docs nearest each centroid), and `<model>__neighbors` when `nearest_neighbors > 0` |
 | `topic_model` | one row per document × topic: `topic`, `weight` (per-doc proportions) | `<model>__topics` (top terms per topic) |
+
+Clusters are labeled with their most distinctive terms via **c-TF-IDF** (each
+cluster treated as one document), so `<model>__topics` answers "what is this
+cluster about" for both tasks. Set `top_terms: 0` to skip it, or
+`nearest_neighbors: k` to also emit each document's `k` closest documents.
 
 Fitting is deterministic under `random_state` and invariant to warehouse row
 order. Fitted parameters (cluster centroids, topic components) persist as JSON
-through the same atomic artifact-publication path as the other tasks. Modes
-`fit_transform` and `fit` are supported; `predict`/`load_pretrained` (assigning
-new documents to a persisted model) are not yet available for these tasks.
+through the same atomic artifact-publication path as the other tasks.
+
+`fit_transform` and `fit` are supported for every provider. `predict` /
+`load_pretrained` — assigning new documents to a persisted model — are
+supported for `builtin.kmeans` (nearest persisted centroid) and `builtin.nmf`
+(transform against persisted components). Density-based clustering
+(`dbscan`/`hdbscan`) and `builtin.lda` are fit-only.
 
 ## Modes
 

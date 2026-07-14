@@ -1899,76 +1899,83 @@ def _run_matrix_model(
         raise ValueError(f"ML model '{model.name}' must declare depends_on.")
     np = _numpy()
     provider = contract.provider
-    options = contract.options
+    task = contract.task
+    artifact_path = contract.artifact_path
+    is_predict = ml.mode in {"predict", "load_pretrained"}
+
+    persisted = _read_matrix_artifact(artifact_path, provider, ml) if is_predict else None
+    # predict/load_pretrained take the trained options (input, normalize, vocabulary)
+    # from the persisted artifact — `ml.options` is empty in those modes.
+    options = persisted["options"] if persisted is not None else contract.options
+    fixed_features = persisted["feature_names"] if persisted is not None else None
 
     source_name = parse_ref(model.depends_on[0])
     source_df = adapter.query_df(f"SELECT * FROM {adapter.table_ref(source_name)}")
     docs, matrix, feature_names = _assemble_matrix(
-        source_df, source_name, options, model.name, np
+        source_df, source_name, options, model.name, np, fixed_features
     )
     training_input = _matrix_training_input(model.depends_on, docs, matrix)
     code_version = compute_code_version(
         extraction=None, transform=None, ml=ml, project_dir=project_dir
     )
 
+    raw_matrix = matrix
     if options.get("normalize") == "l2":
         matrix = _l2_normalize(matrix, np)
 
-    fitted = _fit_matrix_model(contract.task, provider, options, matrix, np)
-
-    if contract.task == "cluster":
-        all_metrics = _cluster_metrics(matrix, fitted, np)
-        primary_rows = _cluster_primary_rows(docs, fitted, provider, source_name)
-        secondary = {
-            "representative_docs": _dataframe_or_empty(
-                _representative_docs_rows(docs, fitted, options, provider, source_name),
-                _empty_representative_docs_df(),
-            )
-        }
-        empty_primary = _empty_cluster_df()
+    if persisted is not None:
+        fitted = _apply_matrix_model(task, provider, options, matrix, persisted, np)
     else:
-        all_metrics = _topic_metrics(matrix, fitted, np)
-        primary_rows = _topic_document_rows(docs, fitted, provider, source_name)
-        secondary = {
-            "topics": _dataframe_or_empty(
-                _topic_term_rows(feature_names, fitted, options, provider),
-                _empty_topics_df(),
-            )
-        }
-        empty_primary = _empty_document_topics_df()
+        fitted = _fit_matrix_model(task, provider, options, matrix, np)
 
-    model_payload = _matrix_model_payload(
-        provider, contract.task, feature_names, fitted, options
-    )
-    metadata = _matrix_metadata(
-        model=model,
-        ml=ml,
+    all_metrics, primary_rows, secondary, empty_primary = _matrix_outputs(
+        task=task,
         provider=provider,
-        task=contract.task,
-        training_input=training_input,
-        model_payload=model_payload,
         options=options,
-        metrics=all_metrics,
-        code_version=code_version,
+        docs=docs,
+        matrix=matrix,
+        raw_matrix=raw_matrix,
+        fitted=fitted,
+        feature_names=feature_names,
+        source_name=source_name,
+        np=np,
     )
-    artifact_path = contract.artifact_path
-    staged_path = _new_artifact_staging_path(artifact_path)
-    try:
-        _write_matrix_artifact(staged_path, metadata, model_payload)
-        publication = _artifact_publication(
-            project=project,
-            project_dir=project_dir,
-            model=model,
-            artifact_path=artifact_path,
-            staged_path=staged_path,
-            metadata=metadata,
+
+    if persisted is not None:
+        metadata = _read_metadata(artifact_path)
+        publication = None
+    else:
+        model_payload = _matrix_model_payload(
+            provider, task, feature_names, fitted, options
         )
-    except BaseException:
-        _remove_path(staged_path)
-        raise
+        metadata = _matrix_metadata(
+            model=model,
+            ml=ml,
+            provider=provider,
+            task=task,
+            training_input=training_input,
+            model_payload=model_payload,
+            options=options,
+            metrics=all_metrics,
+            code_version=code_version,
+        )
+        staged_path = _new_artifact_staging_path(artifact_path)
+        try:
+            _write_matrix_artifact(staged_path, metadata, model_payload)
+            publication = _artifact_publication(
+                project=project,
+                project_dir=project_dir,
+                model=model,
+                artifact_path=artifact_path,
+                staged_path=staged_path,
+                metadata=metadata,
+            )
+        except BaseException:
+            _remove_path(staged_path)
+            raise
 
     if ml.mode == "fit":
-        primary_df = pl.DataFrame([_matrix_fit_summary(contract.task, fitted, metadata)])
+        primary_df = pl.DataFrame([_matrix_fit_summary(task, fitted, metadata)])
         secondary = {}
     else:
         primary_df = pl.DataFrame(primary_rows) if primary_rows else empty_primary
@@ -1983,6 +1990,50 @@ def _run_matrix_model(
         secondary_tables=secondary,
         _publication=publication,
     )
+
+
+def _matrix_outputs(
+    *,
+    task: str,
+    provider: str,
+    options: dict[str, Any],
+    docs: list[_MatrixDoc],
+    matrix: Any,
+    raw_matrix: Any,
+    fitted: dict[str, Any],
+    feature_names: list[str],
+    source_name: str,
+    np: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, pl.DataFrame], pl.DataFrame]:
+    if task == "cluster":
+        metrics = _cluster_metrics(matrix, fitted, np)
+        primary_rows = _cluster_primary_rows(docs, fitted, provider, source_name)
+        secondary = {
+            "topics": _dataframe_or_empty(
+                _cluster_term_rows(feature_names, raw_matrix, fitted, options, provider, np),
+                _empty_topics_df(),
+            ),
+            "representative_docs": _dataframe_or_empty(
+                _representative_docs_rows(docs, fitted, options, provider, source_name),
+                _empty_representative_docs_df(),
+            ),
+        }
+        if options.get("nearest_neighbors", 0):
+            secondary["neighbors"] = _dataframe_or_empty(
+                _neighbor_rows(docs, matrix, options, provider, source_name),
+                _empty_neighbors_df(),
+            )
+        return metrics, primary_rows, secondary, _empty_cluster_df()
+
+    metrics = _topic_metrics(matrix, fitted, np)
+    primary_rows = _topic_document_rows(docs, fitted, provider, source_name)
+    secondary = {
+        "topics": _dataframe_or_empty(
+            _topic_term_rows(feature_names, fitted, options, provider),
+            _empty_topics_df(),
+        )
+    }
+    return metrics, primary_rows, secondary, _empty_document_topics_df()
 
 
 def _dataframe_or_empty(rows: list[dict[str, Any]], empty: pl.DataFrame) -> pl.DataFrame:
@@ -2003,12 +2054,15 @@ def _assemble_matrix(
     options: dict[str, Any],
     model_name: str,
     np: Any,
+    fixed_features: list[str] | None = None,
 ) -> tuple[list[_MatrixDoc], Any, list[str]]:
     if options.get("input") == "embedding":
         return _assemble_embedding_matrix(
-            source_df, source_name, options, model_name, np
+            source_df, source_name, options, model_name, np, fixed_features
         )
-    return _assemble_feature_matrix(source_df, source_name, options, model_name, np)
+    return _assemble_feature_matrix(
+        source_df, source_name, options, model_name, np, fixed_features
+    )
 
 
 def _assemble_feature_matrix(
@@ -2017,6 +2071,7 @@ def _assemble_feature_matrix(
     options: dict[str, Any],
     model_name: str,
     np: Any,
+    fixed_features: list[str] | None,
 ) -> tuple[list[_MatrixDoc], Any, list[str]]:
     term_field = options["term_field"]
     value_field = options["value_field"]
@@ -2047,12 +2102,20 @@ def _assemble_feature_matrix(
         if term not in term_order:
             term_order[term] = int(row["term_index"]) if has_term_index else len(term_order)
     docs = sorted(docs_by_id.values(), key=lambda d: (d.row_index, d.row_id))
-    feature_names = sorted(term_order, key=lambda t: (term_order[t], t))
+    # predict/load_pretrained align new documents onto the trained vocabulary:
+    # unseen terms are dropped, missing terms stay zero.
+    feature_names = (
+        list(fixed_features)
+        if fixed_features is not None
+        else sorted(term_order, key=lambda t: (term_order[t], t))
+    )
     col_of = {term: i for i, term in enumerate(feature_names)}
     matrix = np.zeros((len(docs), len(feature_names)), dtype=float)
     for i, doc in enumerate(docs):
         for term, value in doc_terms[doc.row_id].items():
-            matrix[i, col_of[term]] = value
+            column = col_of.get(term)
+            if column is not None:
+                matrix[i, column] = value
     return docs, matrix, feature_names
 
 
@@ -2062,6 +2125,7 @@ def _assemble_embedding_matrix(
     options: dict[str, Any],
     model_name: str,
     np: Any,
+    fixed_features: list[str] | None,
 ) -> tuple[list[_MatrixDoc], Any, list[str]]:
     field = options["embedding_field"]
     if field not in source_df.columns:
@@ -2069,10 +2133,11 @@ def _assemble_embedding_matrix(
             f"ML model '{model_name}' embedding_field '{field}' is not present in "
             f"'{source_name}'."
         )
+    expected_dim = len(fixed_features) if fixed_features is not None else None
     ordered = sorted(source_df.iter_rows(named=True), key=_canonical_row_key)
     docs: list[_MatrixDoc] = []
     vectors: list[list[float]] = []
-    dim: int | None = None
+    dim: int | None = expected_dim
     for index, row in enumerate(ordered):
         vector = row[field]
         if vector is None:
@@ -2102,7 +2167,11 @@ def _assemble_embedding_matrix(
             )
         )
         vectors.append(values)
-    feature_names = [f"dim_{i}" for i in range(dim or 0)]
+    feature_names = (
+        list(fixed_features)
+        if fixed_features is not None
+        else [f"dim_{i}" for i in range(dim or 0)]
+    )
     matrix = np.array(vectors, dtype=float) if vectors else np.zeros((0, dim or 0))
     return docs, matrix, feature_names
 
@@ -2124,6 +2193,93 @@ def _matrix_training_input(
             raw.encode(), digest_size=HASH_DIGEST_SIZE
         ).hexdigest(),
     }
+
+
+def _read_matrix_artifact(
+    path: Path,
+    provider: str,
+    ml: MLConfig,
+) -> dict[str, Any]:
+    metadata = _read_metadata(path)
+    _validate_metadata(
+        metadata, path, provider, ml, expected_files=("metadata.json", "model.json")
+    )
+    _validate_artifact_payload(metadata, path, {})
+    payload = _read_artifact_json(path / "model.json", path, "matrix model")
+    feature_names = payload.get("feature_names")
+    if not isinstance(feature_names, list) or any(
+        not isinstance(name, str) for name in feature_names
+    ):
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible matrix artifact at {path}: feature_names must be strings"
+        )
+    if payload.get("provider") != provider:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible matrix artifact at {path}: expected provider {provider}, "
+            f"found {payload.get('provider')!r}"
+        )
+    payload["options"] = _validated_persisted_options(
+        cast(Any, provider), payload.get("options"), path, surface="matrix payload"
+    )
+    return payload
+
+
+def _apply_matrix_model(
+    task: str,
+    provider: str,
+    options: dict[str, Any],
+    matrix: Any,
+    payload: dict[str, Any],
+    np: Any,
+) -> dict[str, Any]:
+    n_samples = int(matrix.shape[0])
+    n_features = int(matrix.shape[1]) if matrix.ndim == 2 else 0
+    fitted: dict[str, Any] = {"n_features": n_features, "n_samples": n_samples}
+    if task == "cluster":
+        if n_samples == 0:
+            fitted.update({"labels": [], "centroids": {}, "distances": []})
+            return fitted
+        centers = payload["cluster_centers"]
+        labels_sorted = sorted(int(label) for label in centers)
+        center_arr = np.array([centers[str(label)] for label in labels_sorted])
+        distances_to_centers = np.linalg.norm(
+            matrix[:, None, :] - center_arr[None, :, :], axis=2
+        )
+        nearest = distances_to_centers.argmin(axis=1)
+        fitted["labels"] = [int(labels_sorted[i]) for i in nearest]
+        fitted["distances"] = [
+            float(distances_to_centers[i, nearest[i]]) for i in range(n_samples)
+        ]
+        fitted["centroids"] = {
+            str(label): center_arr[i].tolist()
+            for i, label in enumerate(labels_sorted)
+        }
+        return fitted
+
+    components = np.array(payload["components"])
+    if n_samples == 0:
+        fitted.update(
+            {
+                "components": components.tolist(),
+                "doc_topics": [],
+                "n_components": int(components.shape[0]),
+            }
+        )
+        return fitted
+    decomposition = _sklearn("sklearn.decomposition")
+    weights, _, _ = decomposition.non_negative_factorization(
+        matrix,
+        H=components,
+        n_components=int(components.shape[0]),
+        update_H=False,
+        init="custom",
+        max_iter=options["max_iter"],
+        random_state=options["random_state"],
+    )
+    fitted["components"] = components.tolist()
+    fitted["doc_topics"] = _normalize_rows(weights, np).tolist()
+    fitted["n_components"] = int(components.shape[0])
+    return fitted
 
 
 def _fit_matrix_model(
@@ -2398,6 +2554,85 @@ def _topic_term_rows(
     return rows
 
 
+def _cluster_term_rows(
+    feature_names: list[str],
+    raw_matrix: Any,
+    fitted: dict[str, Any],
+    options: dict[str, Any],
+    provider: str,
+    np: Any,
+) -> list[dict[str, Any]]:
+    """Label clusters with their most distinctive terms via c-TF-IDF: treat each
+    cluster as one document and rank terms by term frequency within the cluster
+    weighted by inverse cluster frequency (BERTopic's cluster-labeling trick)."""
+    top_terms = options.get("top_terms", 0)
+    if top_terms == 0 or not feature_names or options.get("input") == "embedding":
+        return []
+    labels = fitted["labels"]
+    clusters = sorted({label for label in labels if label != -1})
+    if not clusters:
+        return []
+    label_arr = np.array(labels)
+    class_freq = np.array(
+        [raw_matrix[label_arr == cluster].sum(axis=0) for cluster in clusters]
+    )
+    class_totals = class_freq.sum(axis=1, keepdims=True)
+    tf = class_freq / np.clip(class_totals, 1e-12, None)
+    term_freq = class_freq.sum(axis=0)
+    average_terms = float(class_freq.sum(axis=1).mean())
+    idf = np.log(1 + average_terms / np.clip(term_freq, 1e-12, None))
+    ctfidf = tf * idf
+    rows: list[dict[str, Any]] = []
+    for row_index, cluster in enumerate(clusters):
+        weights = ctfidf[row_index]
+        ranked = sorted(
+            range(len(weights)), key=lambda j: (-weights[j], feature_names[j])
+        )
+        for rank, j in enumerate(ranked[:top_terms]):
+            rows.append(
+                {
+                    "provider": provider,
+                    "topic": cluster,
+                    "rank": rank,
+                    "term": feature_names[j],
+                    "weight": float(weights[j]),
+                }
+            )
+    return rows
+
+
+def _neighbor_rows(
+    docs: list[_MatrixDoc],
+    matrix: Any,
+    options: dict[str, Any],
+    provider: str,
+    source_name: str,
+) -> list[dict[str, Any]]:
+    k = options.get("nearest_neighbors", 0)
+    if k == 0 or len(docs) < 2:
+        return []
+    np = _numpy()
+    distances = np.linalg.norm(matrix[:, None, :] - matrix[None, :, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    rows: list[dict[str, Any]] = []
+    for i, doc in enumerate(docs):
+        order = list(np.argsort(distances[i])[:k])
+        for rank, j in enumerate(order):
+            if not np.isfinite(distances[i][j]):
+                continue
+            row: dict[str, Any] = {
+                "source_model": source_name,
+                "provider": provider,
+                "row_id": doc.row_id,
+                "neighbor_row_id": docs[j].row_id,
+                "rank": rank,
+                "distance": float(distances[i][j]),
+            }
+            _attach_doc_identity(row, doc)
+            rows.append(row)
+    return rows
+
+
 def _attach_doc_identity(row: dict[str, Any], doc: _MatrixDoc) -> None:
     if doc.document_id is not None:
         row["document_id"] = doc.document_id
@@ -2610,5 +2845,18 @@ def _empty_topics_df() -> pl.DataFrame:
             "rank": pl.Int64,
             "term": pl.String,
             "weight": pl.Float64,
+        }
+    )
+
+
+def _empty_neighbors_df() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "source_model": pl.String,
+            "provider": pl.String,
+            "row_id": pl.String,
+            "neighbor_row_id": pl.String,
+            "rank": pl.Int64,
+            "distance": pl.Float64,
         }
     )

@@ -180,6 +180,11 @@ class _MatrixInputOptions(BaseModel):
     # strongly recommended for TF-IDF and embedding clustering.
     normalize: Literal["none", "l2"] = "none"
     representative_docs: Annotated[StrictInt, Field(ge=0, le=_MAX_REPRESENTATIVES)] = 3
+    # Top terms per group emitted to the `<model>__topics` companion (0 disables).
+    # For clusters these come from c-TF-IDF; for topic models from components.
+    top_terms: Annotated[StrictInt, Field(ge=0, le=1000)] = 10
+    # Per-document nearest neighbors emitted to `<model>__neighbors` (0 disables).
+    nearest_neighbors: Annotated[StrictInt, Field(ge=0, le=1000)] = 0
     random_state: Annotated[StrictInt, Field(ge=0)] = 0
 
     @model_validator(mode="after")
@@ -211,7 +216,6 @@ class _HDBSCANOptions(_MatrixInputOptions):
 
 class _TopicOptions(_MatrixInputOptions):
     n_topics: Annotated[StrictInt, Field(ge=2, le=_MAX_COMPONENTS)] = 10
-    top_terms: Annotated[StrictInt, Field(ge=1, le=1000)] = 10
 
     @model_validator(mode="after")
     def _forbid_embedding_input(self) -> Self:
@@ -500,11 +504,14 @@ def validate_ml_contract(
                 path=("ml", "label_field"),
             )
 
-    if task in _MATRIX_TASKS and ml.mode in {"predict", "load_pretrained"}:
+    if (
+        provider in {"builtin.dbscan", "builtin.hdbscan", "builtin.lda"}
+        and ml.mode in {"predict", "load_pretrained"}
+    ):
         raise MLContractError(
-            f"ML model '{model.name}' task '{task}' supports mode 'fit_transform' "
-            "or 'fit' only; assigning new documents to a persisted model is not yet "
-            "supported",
+            f"ML model '{model.name}' provider '{provider}' supports mode "
+            "'fit_transform' or 'fit' only; it cannot assign new documents to a "
+            "persisted model (use builtin.kmeans or builtin.nmf for prediction)",
             model_name=model.name,
             path=("ml", "mode"),
         )

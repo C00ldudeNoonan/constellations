@@ -14,6 +14,10 @@ models:
         n_clusters: 3
         normalize: l2
         representative_docs: 2
+        # c-TF-IDF top terms per cluster -> doc_clusters__topics
+        top_terms: 5
+        # per-document nearest neighbors -> doc_clusters__neighbors
+        nearest_neighbors: 3
         random_state: 0
     materialization: full
     tags: [cluster, classic_ml]

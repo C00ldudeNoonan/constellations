@@ -253,10 +253,20 @@ def test_topic_model_rejects_embedding_input(tmp_path: Path) -> None:
         )
 
 
-def test_matrix_tasks_reject_prediction_modes(tmp_path: Path) -> None:
-    with pytest.raises(MLContractError, match="supports mode 'fit_transform'"):
+@pytest.mark.parametrize(
+    ("task", "provider"),
+    [
+        ("cluster", "builtin.dbscan"),
+        ("cluster", "builtin.hdbscan"),
+        ("topic_model", "builtin.lda"),
+    ],
+)
+def test_non_parametric_providers_reject_prediction(
+    tmp_path: Path, task: str, provider: str
+) -> None:
+    with pytest.raises(MLContractError, match="cannot assign new documents"):
         validate_ml_contract(
-            _model({"task": "cluster", "mode": "predict"}),
+            _model({"task": task, "mode": "predict", "provider": provider}),
             ProjectConfig(name="p"),
             tmp_path,
         )
@@ -268,6 +278,84 @@ def test_cluster_rejects_label_field(tmp_path: Path) -> None:
             _model({"task": "cluster", "label_field": "y"}),
             ProjectConfig(name="p"),
             tmp_path,
+        )
+
+
+# ─── cluster labeling (c-TF-IDF) and nearest neighbors ───────────────────────
+
+
+def test_cluster_emits_ctfidf_topic_terms(tmp_path: Path) -> None:
+    ml = _cluster_ml(n_clusters=3, normalize="l2", top_terms=2)
+    output = _run(tmp_path, ml, _features_df(_THEMES))
+    topics = output.secondary_tables["topics"].to_dicts()
+    assert {t["topic"] for t in topics} == {0, 1, 2}
+    theme_terms = [{"goal", "team"}, {"stock", "market"}, {"recipe", "flour"}]
+    for cluster in {t["topic"] for t in topics}:
+        terms = {t["term"] for t in topics if t["topic"] == cluster}
+        assert any(terms <= theme for theme in theme_terms)
+
+
+def test_cluster_emits_nearest_neighbors(tmp_path: Path) -> None:
+    ml = _cluster_ml(n_clusters=3, normalize="l2", nearest_neighbors=2)
+    output = _run(tmp_path, ml, _features_df(_THEMES))
+    neighbors = output.secondary_tables["neighbors"].to_dicts()
+    by_doc: dict[str, list[tuple[int, str]]] = {}
+    for row in neighbors:
+        by_doc.setdefault(row["row_id"], []).append((row["rank"], row["neighbor_row_id"]))
+    assert all(len(v) <= 2 for v in by_doc.values())
+    # a document's nearest neighbor shares its theme prefix (a/b/c).
+    for row_id, entries in by_doc.items():
+        nearest = min(entries)[1]
+        assert nearest[0] == row_id[0]
+
+
+# ─── prediction / artifact reload ────────────────────────────────────────────
+
+
+def test_kmeans_predict_reuses_persisted_artifact(tmp_path: Path) -> None:
+    trained = _run(tmp_path, _km3(), _features_df(_THEMES))
+    trained.publish_artifact()
+
+    predicted = _run(
+        tmp_path,
+        {"task": "cluster", "mode": "load_pretrained", "provider": "builtin.kmeans"},
+        _features_df(_THEMES),
+    )
+    assert predicted.artifact_version == trained.artifact_version
+    assert _partition(predicted.df.to_dicts()) == _partition(trained.df.to_dicts())
+
+
+def test_nmf_predict_reuses_persisted_components(tmp_path: Path) -> None:
+    trained = _run(tmp_path, _topic_ml(n_topics=3), _features_df(_THEMES))
+    trained.publish_artifact()
+
+    predicted = _run(
+        tmp_path,
+        {"task": "topic_model", "mode": "load_pretrained", "provider": "builtin.nmf"},
+        _features_df(_THEMES),
+    )
+    assert predicted.artifact_version == trained.artifact_version
+    assert predicted.df.height == len(_THEMES) * 3
+
+    def dominant(rows: list[dict[str, Any]]) -> dict[str, int]:
+        best: dict[str, tuple[float, int]] = {}
+        for row in rows:
+            key = row["row_id"]
+            if key not in best or row["weight"] > best[key][0]:
+                best[key] = (row["weight"], row["topic"])
+        return {k: v[1] for k, v in best.items()}
+
+    assert dominant(predicted.df.to_dicts()) == dominant(trained.df.to_dicts())
+
+
+def test_predict_before_fit_reports_missing_artifact(tmp_path: Path) -> None:
+    from dbt_ml.classic_ml import MissingClassicMLArtifactError
+
+    with pytest.raises(MissingClassicMLArtifactError):
+        _run(
+            tmp_path,
+            {"task": "cluster", "mode": "load_pretrained", "provider": "builtin.kmeans"},
+            _features_df(_THEMES),
         )
 
 

@@ -72,6 +72,11 @@ def test_capability_preflight_rejects_sql_tests_without_support(
         validate_warehouse_capabilities([model], "non_sql")
 
 
+def test_bigquery_full_preflight_rejects_non_atomic_replacement() -> None:
+    with pytest.raises(ConfigError, match=r"atomic_full_replace.*full materialization"):
+        validate_warehouse_capabilities([_extraction("raw")], "bigquery")
+
+
 @pytest.mark.parametrize("command", ["compile", "run", "build", "test"])
 def test_invalid_backend_is_exit_2_before_profile_resolution(
     tmp_path: Path, command: str

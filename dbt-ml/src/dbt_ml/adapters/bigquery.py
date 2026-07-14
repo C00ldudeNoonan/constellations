@@ -388,6 +388,7 @@ class BigQueryAdapter(WarehouseAdapter):
     @classmethod
     def capabilities(cls) -> frozenset[WarehouseCapability]:
         return frozenset(WarehouseCapability) - {
+            WarehouseCapability.ATOMIC_FULL_REPLACE,
             WarehouseCapability.TRANSACTIONS,
         }
 

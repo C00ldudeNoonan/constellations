@@ -35,12 +35,12 @@ def test_bigquery_registered() -> None:
     assert "bigquery" in list_adapter_types()
 
 
-def test_bigquery_declares_capabilities_without_transactions() -> None:
+def test_bigquery_declares_only_implemented_guarantees() -> None:
     capabilities = adapter_capabilities("bigquery")
 
     assert WarehouseCapability.TABULAR_READS in capabilities
     assert WarehouseCapability.SQL_SCHEMA_TESTS in capabilities
-    assert WarehouseCapability.ATOMIC_FULL_REPLACE in capabilities
+    assert WarehouseCapability.ATOMIC_FULL_REPLACE not in capabilities
     assert WarehouseCapability.ATOMIC_KEYED_UPSERT in capabilities
     assert WarehouseCapability.TRANSACTIONS not in capabilities
 

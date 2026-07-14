@@ -43,7 +43,7 @@ gets the same clear error rather than an attribute error or silent skip.
 | SQL queries and references | yes | yes |
 | typed tabular reads | yes | yes |
 | SQL-backed schema tests | yes | yes |
-| atomic full replacement | yes | yes |
+| atomic full replacement | yes | no |
 | atomic keyed upsert | yes | yes |
 | multi-statement transactions | yes | no |
 | typed empty relations | yes | yes |
@@ -53,6 +53,10 @@ gets the same clear error rather than an attribute error or silent skip.
 Capabilities describe implemented guarantees, not aspirations. Streaming reads
 with projection and predicate pushdown are not declared until a typed streaming
 read API exists.
+
+BigQuery does not declare atomic full replacement. A layout-changing replacement
+must drop the existing target before renaming its staged replacement, so a rename
+failure can temporarily leave the target unavailable.
 
 ## Unsupported workflows
 

@@ -7,15 +7,24 @@ and in the `run` summary output.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
+import dbt_ml.runner as runner_module
 from dbt_ml.backends import llm_backend
 from dbt_ml.cli import cli
 from dbt_ml.manifest import write_manifest, write_run_results
+from dbt_ml.providers import (
+    BatchInferenceItem,
+    BatchInferenceRequest,
+    BatchInferenceResult,
+    InferenceResult,
+    ProviderUsage,
+)
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoice_texts
 
@@ -77,6 +86,10 @@ def test_run_aggregates_usage_per_model(llm_project: Path, fake_api: dict) -> No
     assert r.metrics["input_tokens"] == 3000
     assert r.metrics["output_tokens"] == 300
     assert "estimated_cost_usd" not in r.metrics  # no pricing configured
+    assert r.provider == "anthropic"
+    assert r.provider_model == "claude-haiku-4-5"
+    assert r.provider_implementation is not None
+    assert r.provider_implementation.startswith("dbt-ml/")
 
 
 def test_cache_hits_counted_with_zero_tokens(
@@ -114,6 +127,67 @@ def test_pricing_config_yields_cost_estimate(
     assert r.metrics["estimated_cost_usd"] == pytest.approx(0.0045)
 
 
+def test_batch_cost_uses_selected_provider_multiplier(
+    monkeypatch: pytest.MonkeyPatch, llm_project: Path
+) -> None:
+    profiles = llm_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "        cache_path: ./target/llm_cache.duckdb",
+            "        cache_path: ./target/llm_cache.duckdb\n"
+            "        pricing:\n"
+            "          input_usd_per_mtok: 1.0\n"
+            "          output_usd_per_mtok: 5.0\n",
+        )
+    )
+    model = llm_project / "models" / "raw_invoices_llm.yml"
+    model.write_text(
+        model.read_text().replace("      options:", "      options:\n        batch: true", 1)
+    )
+
+    def fake_batch(
+        requests: list[BatchInferenceRequest],
+        *,
+        provider: str,
+        poll_seconds: float,
+        api_key_env: str,
+        max_retries: int,
+    ) -> BatchInferenceResult:
+        del provider, poll_seconds, api_key_env, max_retries
+        return BatchInferenceResult(
+            tuple(
+                BatchInferenceItem(
+                    request.request_id,
+                    result=InferenceResult(
+                        output={**_FIELDS, "invoice_id": f"INV-{index}"},
+                        usage=ProviderUsage(**_CALL_USAGE),
+                    ),
+                )
+                for index, request in enumerate(requests)
+            ),
+            batch_submissions=1,
+        )
+
+    class DiscountProvider:
+        batch_cost_multiplier = 0.25
+
+        def implementation_identity(self) -> str:
+            return "test/provider-implementation"
+
+    monkeypatch.setattr(llm_backend, "_run_message_batch", fake_batch)
+    monkeypatch.setattr(
+        runner_module,
+        "get_inference_provider",
+        lambda _name: DiscountProvider(),
+    )
+
+    results = run_project(llm_project)
+    r = next(x for x in results if x.model_name == "raw_invoices_llm")
+
+    assert r.metrics["estimated_cost_usd"] == pytest.approx(0.001125)
+    assert r.provider_implementation == "test/provider-implementation"
+
+
 def test_usage_persisted_in_run_results(llm_project: Path, fake_api: dict) -> None:
     results = run_project(llm_project)
     payload = json.loads(write_run_results(llm_project, results).read_text())
@@ -122,6 +196,10 @@ def test_usage_persisted_in_run_results(llm_project: Path, fake_api: dict) -> No
     )
     assert row["metrics"]["api_calls"] == 3
     assert row["metrics"]["input_tokens"] == 3000
+    assert row["provider"] == "anthropic"
+    assert row["provider_model"] == "claude-haiku-4-5"
+    assert row["provider_implementation"].startswith("dbt-ml/")
+    assert "api_key" not in json.dumps(row)
 
 
 def test_run_summary_prints_usage_line(llm_project: Path, fake_api: dict) -> None:
@@ -129,6 +207,7 @@ def test_run_summary_prints_usage_line(llm_project: Path, fake_api: dict) -> Non
     result = runner.invoke(cli, ["--project-dir", str(llm_project), "run"])
     assert result.exit_code == 0, result.output
     assert "llm: 3 calls, 0 cache hits" in result.output
+    assert "provider=anthropic model=claude-haiku-4-5" in result.output
     assert "3,000 in / 300 out tokens" in result.output
 
 
@@ -153,6 +232,33 @@ def test_compile_warning_uses_configured_api_key_env(
     assert "warning: DBT_ML_ANTHROPIC_KEY is not set" in result.output
     assert "warning: ANTHROPIC_API_KEY is not set" not in result.output
     assert "wrong-default-secret" not in result.output
+
+
+def test_compile_warns_for_llm_transform_without_llm_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    project = tmp_path / "transform_project"
+    shutil.copytree(
+        repo / "examples" / "invoice_pipeline",
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    transform_yml = project / "models" / "invoice_summary.yml"
+    transform_yml.write_text(
+        transform_yml.read_text().replace(
+            "      module: transforms.summarize",
+            "      module: transforms.summarize\n      uses_llm: true",
+        )
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(project), "compile"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "warning: ANTHROPIC_API_KEY is not set" in result.output
 
 
 def test_api_key_secret_is_not_persisted_or_logged(
@@ -187,6 +293,68 @@ def test_api_key_secret_is_not_persisted_or_logged(
     assert fallback_secret not in caplog.text
 
 
+def test_provider_failure_does_not_leak_secret_or_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    llm_project: Path,
+) -> None:
+    profiles = llm_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "api_key_env: ANTHROPIC_API_KEY",
+            "api_key_env: DBT_ML_FAILURE_KEY",
+        )
+    )
+    secret = "provider-failure-secret"
+    prompt_marker = "private-prompt-content"
+    monkeypatch.setenv("DBT_ML_FAILURE_KEY", secret)
+
+    class FailingMessages:
+        def create(self, **kwargs: object) -> None:
+            del kwargs
+            raise RuntimeError(f"SDK failure {secret} {prompt_marker}")
+
+    class FailingAnthropic:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.messages = FailingMessages()
+
+    monkeypatch.setattr("anthropic.Anthropic", FailingAnthropic)
+    caplog.set_level(logging.DEBUG)
+
+    results = run_project(llm_project)
+    write_manifest(llm_project)
+    run_results_path = write_run_results(llm_project, results)
+    serialized = run_results_path.read_text()
+
+    assert results[0].errors
+    assert "ProviderRequestError" in results[0].errors[0]
+    assert secret not in serialized
+    assert prompt_marker not in serialized
+    assert secret not in caplog.text
+    assert prompt_marker not in caplog.text
+
+
+def test_missing_credential_name_is_not_persisted(
+    monkeypatch: pytest.MonkeyPatch, llm_project: Path
+) -> None:
+    profiles = llm_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "api_key_env: ANTHROPIC_API_KEY",
+            "api_key_env: PRIVATE_CREDENTIAL_ENV",
+        )
+    )
+    monkeypatch.delenv("PRIVATE_CREDENTIAL_ENV", raising=False)
+
+    results = run_project(llm_project)
+    serialized = write_run_results(llm_project, results).read_text()
+
+    assert results[0].errors
+    assert "provider configuration is invalid" in results[0].errors[0]
+    assert "PRIVATE_CREDENTIAL_ENV" not in serialized
+
+
 def test_non_llm_backend_has_empty_metrics(
     tmp_path: Path, example_project_dir: Path
 ) -> None:
@@ -202,3 +370,6 @@ def test_non_llm_backend_has_empty_metrics(
     results = run_project(dst)
     raw = next(x for x in results if x.model_name == "raw_invoices")
     assert raw.metrics == {}
+    assert raw.provider is None
+    assert raw.provider_model is None
+    assert raw.provider_implementation is None

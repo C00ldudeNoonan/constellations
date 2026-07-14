@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from dbt_ml.backends import get_backend
+from dbt_ml.backends import get_backend, llm_backend
 from dbt_ml.backends.llm_backend import LLMBackend, extract_fields_from_text
+from dbt_ml.hashing import HASH_DIGEST_SIZE
 
 
 @pytest.fixture(autouse=True)
@@ -252,7 +254,7 @@ def test_custom_api_key_env_wins_for_sync_and_reusable_clients(
                         type="tool_use", name="extract", input={"vendor": "Acme"}
                     )
                 ],
-                usage=SimpleNamespace(),
+                usage=SimpleNamespace(input_tokens=0, output_tokens=0),
             )
 
     class _FakeAnthropic:
@@ -309,6 +311,7 @@ def test_generation_params_default_and_override(
 
     backend.extract(doc, {"fields": schema})
     assert counter.kwargs == {
+        "provider": "anthropic",
         "api_key_env": "ANTHROPIC_API_KEY",
         "temperature": 0.0,
         "max_tokens": 2048,
@@ -320,6 +323,7 @@ def test_generation_params_default_and_override(
         {"fields": schema, "temperature": 0.3, "max_tokens": 8192, "max_retries": 1},
     )
     assert counter.kwargs == {
+        "provider": "anthropic",
         "api_key_env": "ANTHROPIC_API_KEY",
         "temperature": 0.3,
         "max_tokens": 8192,
@@ -340,6 +344,90 @@ def test_temperature_is_part_of_cache_key(
     assert counter.calls == 2, "different temperature must not reuse cached output"
     backend.extract(doc, {**opts, "temperature": 0.7})
     assert counter.calls == 2
+
+
+def test_max_tokens_is_part_of_cache_key(
+    monkeypatch: pytest.MonkeyPatch, doc: Path, schema: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    counter = _CallCounter({"vendor": "v", "invoice_id": "i", "total": 0.0})
+    monkeypatch.setattr(LLMBackend, "_call_api", counter)
+    backend = get_backend("llm")
+    opts = {"cache_path": str(tmp_path / "cache.duckdb"), "fields": schema}
+
+    backend.extract(doc, opts)
+    backend.extract(doc, {**opts, "max_tokens": 4096})
+    backend.extract(doc, {**opts, "max_tokens": 4096})
+
+    assert counter.calls == 2
+
+
+def test_cache_key_separates_provider_and_backend_implementations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    common = {
+        "provider": "anthropic",
+        "model": "shared-model",
+        "content_hash": "content",
+        "schema_hash": "schema",
+        "max_tokens": 2048,
+    }
+    first = llm_backend._cache_key(
+        **common,
+        provider_identity="implementation-one-with-sensitive-path",
+    )
+    second = llm_backend._cache_key(
+        **common,
+        provider_identity="implementation-two",
+    )
+    monkeypatch.setattr(
+        llm_backend,
+        "_llm_backend_implementation_identity",
+        lambda: "changed-backend-implementation",
+    )
+    third = llm_backend._cache_key(
+        **common,
+        provider_identity="implementation-two",
+    )
+
+    assert first != second
+    assert second != third
+    assert "sensitive-path" not in first
+
+
+def test_legacy_cache_entry_is_not_reused(tmp_path: Path) -> None:
+    text = "legacy cached document"
+    model = "claude-haiku-4-5"
+    system = "extract"
+    fields_spec = [{"name": "x"}]
+    content_hash = hashlib.blake2b(
+        text.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+    schema_hash = llm_backend._hash_schema(system, fields_spec, 0.0)
+    legacy_key = f"{model}|{content_hash}|{schema_hash}"
+    cache_path = tmp_path / "cache.duckdb"
+    llm_backend._cache_put(
+        cache_path,
+        legacy_key,
+        model=model,
+        content_hash=content_hash,
+        schema_hash=schema_hash,
+        fields={"x": "legacy"},
+    )
+    counter = _CallCounter({"x": "fresh"})
+
+    fields, usage = llm_backend.extract_fields_with_usage(
+        text,
+        fields_spec=fields_spec,
+        model=model,
+        system=system,
+        cache_path=cache_path,
+        call_api=counter,
+    )
+
+    assert fields == {"x": "fresh"}
+    assert usage["cache_hits"] == 0
+    assert counter.calls == 1
+    assert llm_backend._cache_get(cache_path, legacy_key) == {"x": "legacy"}
 
 
 def test_truncated_response_is_an_error(

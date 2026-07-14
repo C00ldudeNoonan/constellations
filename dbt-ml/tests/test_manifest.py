@@ -52,6 +52,105 @@ def test_manifest_has_code_versions(fresh_project: Path) -> None:
     )
 
 
+def test_manifest_emits_safe_effective_inference_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "\n".join(
+            [
+                "name: llm_project",
+                "version: '0.1.0'",
+                "profile: llm_project",
+                "source-paths: ['sources']",
+                "model-paths: ['models']",
+            ]
+        )
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "\n".join(
+            [
+                "llm_project:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/dbt_ml.duckdb",
+                "      llm:",
+                "        provider: anthropic",
+                "        model: effective-model",
+                "        api_key_env: PRIVATE_PROVIDER_KEY",
+            ]
+        )
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "documents.yml").write_text(
+        "\n".join(
+            [
+                "version: 2",
+                "sources:",
+                "  - name: documents",
+                "    path: data/documents",
+            ]
+        )
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "extract.yml").write_text(
+        "\n".join(
+            [
+                "version: 2",
+                "models:",
+                "  - name: extracted_documents",
+                "    source: ref('documents')",
+                "    extraction:",
+                "      backend: llm",
+                "      options:",
+                "        fields:",
+                "          - name: title",
+                "            type: string",
+            ]
+        )
+    )
+    monkeypatch.setenv("PRIVATE_PROVIDER_KEY", "credential-value-must-not-leak")
+
+    manifest = build_manifest(tmp_path)
+    model = next(
+        item
+        for item in manifest["models"]
+        if item["name"] == "extracted_documents"
+    )
+
+    assert model["inference"]["provider"] == "anthropic"
+    assert model["inference"]["model"] == "effective-model"
+    assert model["inference"]["implementation"].startswith("dbt-ml/")
+    assert set(model["inference"]) == {"provider", "model", "implementation"}
+
+    (tmp_path / "models" / "context.yml").write_text(
+        "\n".join(
+            [
+                "version: 2",
+                "models:",
+                "  - name: agent_context",
+                "    depends_on:",
+                "      - ref('extracted_documents')",
+                "    transform:",
+                "      type: python",
+                "      module: transforms.agent_context",
+                "      uses_llm: true",
+            ]
+        )
+    )
+    transform_model = next(
+        item for item in build_manifest(tmp_path)["models"]
+        if item["name"] == "agent_context"
+    )
+    assert transform_model["inference"] == model["inference"]
+
+    serialized = json.dumps(manifest)
+    assert "PRIVATE_PROVIDER_KEY" not in serialized
+    assert "credential-value-must-not-leak" not in serialized
+
+
 def test_manifest_emits_ml_models(tmp_path: Path) -> None:
     (tmp_path / "dbt_ml_project.yml").write_text(
         "\n".join(

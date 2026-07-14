@@ -1,8 +1,8 @@
 """LLM-extract structured invoice fields from raw PDF text.
 
-Reads `raw_pdf_text` (one row per PDF), calls Claude per row with a JSON
-schema, returns a Polars DataFrame. Cache path + model id come from the
-active profile's `llm:` block — no credentials in this file.
+Reads `raw_pdf_text` (one row per PDF), calls the profile-selected inference
+provider per row with a JSON schema, and returns a Polars DataFrame. Provider,
+model, cache path, and credential-variable name come from the active profile.
 """
 from __future__ import annotations
 
@@ -28,18 +28,26 @@ SCHEMA = [
 def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
     raw = deps["raw_pdf_text"]
     llm_cfg = ctx.llm
-    model = llm_cfg.model if llm_cfg else "claude-haiku-4-5"
+    provider = llm_cfg.provider if llm_cfg else "anthropic"
+    model = llm_cfg.model if llm_cfg else None
     cache_path = str(llm_cfg.cache_path) if llm_cfg and llm_cfg.cache_path else None
-    api_key_env = llm_cfg.api_key_env if llm_cfg else "ANTHROPIC_API_KEY"
+    api_key_env = llm_cfg.api_key_env if llm_cfg else None
+    system_options = (
+        {"system": llm_cfg.system_prompt}
+        if llm_cfg and llm_cfg.system_prompt is not None
+        else {}
+    )
 
     rows = []
     for row in raw.iter_rows(named=True):
         fields = extract_fields_from_text(
             row["text"],
             fields_spec=SCHEMA,
+            provider=provider,
             model=model,
             cache_path=cache_path,
             api_key_env=api_key_env,
+            **system_options,
         )
         rows.append({"document_id": row["document_id"], **fields})
 

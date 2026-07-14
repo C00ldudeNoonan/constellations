@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -14,7 +15,6 @@ from .checks import TestResult, run_project_tests
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config import ConfigError, load_project
 from .config.model import ModelConfig
-from .config.profile import resolve_llm_credential
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import DAGError, ProjectDAG, SelectionError, parse_ref
@@ -29,6 +29,11 @@ from .profile import (
     apply_source_path_overrides,
     resolve_llm_options,
     resolve_profile,
+)
+from .providers import (
+    ProviderConfigurationError,
+    ProviderNotFoundError,
+    get_inference_provider,
 )
 from .runner import (
     BuildResult,
@@ -66,6 +71,8 @@ _CONFIG_ERRORS = (
     DAGError,
     SelectionError,
     ProfileError,
+    ProviderConfigurationError,
+    ProviderNotFoundError,
     StateError,
     OptionalDependencyError,
 )
@@ -188,13 +195,19 @@ def _compile_warnings(
     profiles_dir: Path | None,
 ) -> list[str]:
     out: list[str] = []
-    backends_in_use = {
-        (m.extraction.backend or project.extraction.default_backend)
-        for m in models
-        if m.extraction is not None
-    }
+    uses_llm = any(
+        (
+            model.extraction is not None
+            and (
+                model.extraction.backend or project.extraction.default_backend
+            )
+            == "llm"
+        )
+        or (model.transform is not None and model.transform.uses_llm)
+        for model in models
+    )
 
-    if "llm" in backends_in_use:
+    if uses_llm:
         try:
             resolved = resolve_profile(
                 project, project_dir, target=target, profiles_dir=profiles_dir
@@ -204,20 +217,32 @@ def _compile_warnings(
 
         missing: set[str] = set()
         for model in models:
-            if model.extraction is None:
+            if model.extraction is not None and (
+                model.extraction.backend or project.extraction.default_backend
+            ) == "llm":
+                options = resolve_llm_options(model.extraction.options, resolved)
+            elif model.transform is not None and model.transform.uses_llm:
+                options = resolve_llm_options({}, resolved)
+            else:
                 continue
-            backend = model.extraction.backend or project.extraction.default_backend
-            if backend != "llm":
+            provider = get_inference_provider(str(options["provider"]))
+            if not provider.requires_credentials:
                 continue
-            options = resolve_llm_options(model.extraction.options, resolved)
-            env_var, api_key = resolve_llm_credential(options)
-            if not api_key:
+            env_value = options.get("api_key_env") or provider.default_credential_env
+            if env_value is None:
+                out.append(
+                    f"Inference provider '{provider.name()}' requires credentials; "
+                    "configure llm.api_key_env in profiles.yml."
+                )
+                continue
+            env_var = str(env_value)
+            if not os.environ.get(env_var):
                 missing.add(env_var)
 
         for env_var in sorted(missing):
             out.append(
-                f"{env_var} is not set; models using the `llm` backend will fail "
-                "at run time."
+                f"{env_var} is not set; models using LLM inference will fail at "
+                "run time."
             )
 
     return out
@@ -634,7 +659,8 @@ def run(
         _echo_warnings(r)
 
     usage_lines = [
-        f"{r.model_name:<22}{_usage_summary(r.metrics)}"
+        f"{r.model_name:<22}"
+        f"{_usage_summary(r.metrics, provider=r.provider, model=r.provider_model)}"
         for r in results
         if "api_calls" in r.metrics
     ]
@@ -665,9 +691,19 @@ def _echo_warnings(r: ModelRunResult) -> None:
         )
 
 
-def _usage_summary(m: dict[str, object]) -> str:
-    """One-line LLM usage: calls, cache hits, tokens, optional cost estimate."""
+def _usage_summary(
+    m: dict[str, object],
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> str:
+    """One-line provider usage: calls, cache hits, tokens, and optional cost."""
     parts = [f"llm: {m.get('api_calls', 0)} calls, {m.get('cache_hits', 0)} cache hits"]
+    if provider is not None:
+        identity = f"provider={provider}"
+        if model is not None:
+            identity += f" model={model}"
+        parts.append(identity)
     tokens_in = m.get("input_tokens", 0)
     tokens_out = m.get("output_tokens", 0)
     if tokens_in or tokens_out:
@@ -675,6 +711,8 @@ def _usage_summary(m: dict[str, object]) -> str:
     cost = m.get("estimated_cost_usd")
     if cost is not None:
         parts.append(f"~${cost:.4f}")
+    elif (reported_cost := m.get("reported_cost_usd")) is not None:
+        parts.append(f"${reported_cost:.4f} reported")
     return "  ".join(parts)
 
 

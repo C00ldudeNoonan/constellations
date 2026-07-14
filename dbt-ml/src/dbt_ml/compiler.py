@@ -13,6 +13,11 @@ from .config.yaml_diagnostics import ConfigPath
 from .dag import DAGError, ProjectDAG, parse_ref
 from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
+from .providers import (
+    ProviderConfigurationError,
+    ProviderNotFoundError,
+    get_inference_provider,
+)
 from .test_specs import TestSpecError, parse_test_spec
 from .transforms import load_transform, transform_call_arity
 
@@ -69,7 +74,9 @@ def validate_project_contract(
                     ("extraction", "options", "api_key_env"),
                 )
             try:
-                validate_backend_options(backend, model.extraction.options)
+                canonical_options = validate_backend_options(
+                    backend, model.extraction.options
+                )
             except BackendOptionsError as e:
                 error_path = getattr(e, "path", ("options",))
                 raise _model_error(
@@ -77,6 +84,23 @@ def validate_project_contract(
                     f"Extraction model '{model.name}' has {e}",
                     ("extraction", *error_path),
                 ) from e
+            if backend == "llm":
+                provider_name = str(canonical_options.get("provider", "anthropic"))
+                try:
+                    provider = get_inference_provider(provider_name)
+                except (ProviderNotFoundError, ProviderConfigurationError) as e:
+                    raise _model_error(
+                        model,
+                        str(e),
+                        ("extraction", "options", "provider"),
+                    ) from e
+                if canonical_options.get("batch") and not provider.supports_native_batch:
+                    raise _model_error(
+                        model,
+                        f"Inference provider '{provider_name}' does not support "
+                        "native batch execution",
+                        ("extraction", "options", "batch"),
+                    )
             if backend == "llm" and "cache_path" in model.extraction.options:
                 try:
                     resolve_within_project(

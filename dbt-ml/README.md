@@ -94,7 +94,7 @@ installation command.
 | `pdf`      | `*.pdf`           | Per-page text via pypdf. Warns on empty extracts (likely scanned). Deterministic, no API. |
 | `html`     | `*.html`/`*.htm`  | Body text + CSS selectors + OpenGraph/meta via BeautifulSoup. Deterministic, no API.      |
 | `email`    | `*.eml`           | from/to/subject/date/body via stdlib `email`. Deterministic, no API.                      |
-| `llm`      | `*.txt`/`*.md`    | Claude tool-use → structured fields. Uses the variable named by profile `llm.api_key_env` (default `ANTHROPIC_API_KEY`). |
+| `llm`      | `*.txt`/`*.md`    | Registered inference provider → structured fields. Provider, model, and credential-variable name come from the active profile. |
 
 Add a new backend by inheriting from `BaseBackend`, defining a strict Pydantic
 option model, and decorating it with `@register(options_model=...)`. Bare
@@ -167,33 +167,45 @@ tests, and remote sources (`gs://…`) reach whatever your ambient credentials
 allow — review projects you didn't write before running them.
 
 For scheduled/orchestrated runs, the `llm` backend can route uncached documents
-through the Anthropic Message Batches API — 50% token cost, at the price of
-minutes-scale latency (the run blocks until the batch completes). Cache hits
-still resolve locally, and the cost estimate in run results applies the batch
-discount automatically. Keep it off for dev loops:
+through a provider's native batch API. The built-in Anthropic provider applies
+its 50% batch multiplier, at the price of minutes-scale latency (the run blocks
+until the batch completes). Cache hits still resolve locally, and the cost
+estimate in run results applies the selected provider's batch multiplier.
+Keep it off for dev loops:
 
 ```yaml
 extraction:
   backend: llm
   options:
-    batch: true            # Message Batches API: 50% token cost, minutes-latency
+    batch: true            # provider-native batch; higher latency, often cheaper
     batch_poll_seconds: 30 # optional poll interval
 ```
 
 ### LLM credentials
 
 `api_key_env` stores an environment-variable name, never a secret. Runtime
-resolves the exact profile-owned variable and passes its value explicitly to
-synchronous and batch Anthropic clients; it never falls back to
-`ANTHROPIC_API_KEY` when another variable is configured. Model YAML cannot
-choose a credential variable. Missing credentials name only the variable and
-fail before a document is read or submitted, and `compile` uses the same
-resolution logic for its warning.
+resolves the exact profile-owned variable and passes a protected credential to
+the selected provider. It never substitutes a different provider's default
+credential variable. Model YAML cannot choose a credential variable. Missing
+credentials name only the variable and fail before a document is read or
+submitted, and `compile` uses the same resolution logic for its warning.
 
-Reusable transform helpers are not profile-ambient. Pass
-`api_key_env=ctx.llm.api_key_env` when calling
-`extract_fields_from_text()` from a custom transform. LLM extraction models
-preflight credentials even if their response cache is warm.
+Reusable transform helpers are not profile-ambient. A transform that calls one
+must declare the dependency so profile changes invalidate state and provider
+provenance appears in artifacts:
+
+```yaml
+transform:
+  type: python
+  module: transforms.enrich
+  uses_llm: true
+```
+
+Pass the effective `ctx.llm.provider`, `model`, and `api_key_env` to
+`extract_fields_from_text()`; when `ctx.llm.system_prompt` is set, pass it as
+the helper's `system=` argument. This keeps provider selection and credentials
+operator-governed. LLM extraction models preflight credentials even if their
+response cache is warm.
 
 ## The CLI
 

@@ -26,13 +26,14 @@ from .backends import (
     get_backend,
     validate_backend_options,
 )
+from .backends.options import LLMBackendOptions
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config import load_project
 from .config.model import INTERNAL_LINEAGE_FIELDS, ModelConfig
-from .config.profile import PricingConfig
+from .config.profile import DEFAULT_LLM_PROVIDER, PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
@@ -43,6 +44,17 @@ from .profile import (
     apply_source_path_overrides,
     resolve_llm_options,
     resolve_profile,
+)
+from .providers import (
+    InferenceProvider,
+    ProviderBatchError,
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderRequestError,
+    ProviderResponseError,
+    get_inference_provider,
+    resolve_provider_model,
+    sanitized_provider_error,
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import TransformContext, load_transform, transform_call_arity
@@ -75,6 +87,51 @@ _EXTRACTION_FIELD_DTYPES: dict[str, Any] = {
 
 class RunError(Exception):
     pass
+
+
+def _artifact_error_text(error: Exception) -> str:
+    provider_error = _provider_error_in_chain(error)
+    if isinstance(provider_error, ProviderConfigurationError):
+        return "ProviderConfigurationError: provider configuration is invalid"
+    if isinstance(provider_error, ProviderRequestError):
+        safe = sanitized_provider_error(
+            provider_error.provider,
+            provider_error.operation,
+            provider_error,
+        )
+        return f"ProviderRequestError: {safe}"
+    if isinstance(provider_error, ProviderResponseError):
+        return "ProviderResponseError: provider response is invalid"
+    if isinstance(provider_error, ProviderBatchError):
+        return "ProviderBatchError: provider batch operation failed"
+    if isinstance(provider_error, ProviderError):
+        return "ProviderError: provider operation failed"
+    return f"{type(error).__name__}: {error}"
+
+
+def _provider_error_in_chain(error: BaseException) -> ProviderError | None:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, ProviderError):
+            return current
+        current = current.__cause__
+    return None
+
+
+def _log_execution_failure(
+    message: str,
+    name: str,
+    error: Exception,
+) -> None:
+    provider_error = _provider_error_in_chain(error)
+    if provider_error is not None:
+        log.debug(
+            f"{message} [%s]",
+            name,
+            type(provider_error).__name__,
+        )
+    else:
+        log.debug(message, name, exc_info=True)
 
 
 class _FullExtractionFailed(Exception):
@@ -210,6 +267,9 @@ class ModelRunResult:
     materialization: str
     kind: str  # "extraction" | "transform"
     backend: str | None = None
+    provider: str | None = None
+    provider_model: str | None = None
+    provider_implementation: str | None = None
     documents_processed: int = 0
     documents_skipped: int = 0
     documents_deleted: int = 0
@@ -365,7 +425,7 @@ def build_project(
                         model_name=name,
                         materialization=model.materialization,
                         kind="unknown",
-                        errors=[str(e)],
+                        errors=[_artifact_error_text(e)],
                     )
                 )
                 blocked |= dag.descendants(name)
@@ -525,6 +585,18 @@ def _run_extraction_model(
     except BackendOptionsError as e:
         raise RunError(f"Extraction model '{model.name}' has {e}") from e
 
+    inference_provider: InferenceProvider | None = None
+    provider_name: str | None = None
+    provider_model: str | None = None
+    provider_implementation: str | None = None
+    if backend_name == "llm":
+        llm_options = LLMBackendOptions.model_validate(options)
+        provider_name = llm_options.provider
+        inference_provider = get_inference_provider(provider_name)
+        assert llm_options.model is not None
+        provider_model = llm_options.model
+        provider_implementation = inference_provider.implementation_identity()
+
     if not model.source:
         raise RunError(f"Extraction model '{model.name}' must declare a `source:`")
     source_name = parse_ref(model.source)
@@ -633,8 +705,10 @@ def _run_extraction_model(
                 local_path = source_backend.fetch(doc, work_dir)
                 return doc, backend.extract(local_path, options), None
             except Exception as e:
-                log.debug("extraction failed for %s", doc.relative_path, exc_info=True)
-                return doc, None, f"{type(e).__name__}: {e}"
+                _log_execution_failure(
+                    "extraction failed for %s", doc.relative_path, e
+                )
+                return doc, None, _artifact_error_text(e)
 
         def _iter_extracted() -> (
             Iterator[list[tuple[DocumentRef, ExtractionResult | None, str | None]]]
@@ -642,7 +716,7 @@ def _run_extraction_model(
             if options.get("batch") and docs_to_process:
                 # One Batches API submission for the whole model (#75); only
                 # the materialization of its results is chunked.
-                all_extracted = _extract_batched(
+                all_extracted, batch_metrics = _extract_batched(
                     docs_to_process,
                     source_backend,
                     backend,
@@ -650,6 +724,9 @@ def _run_extraction_model(
                     work_dir,
                     model.name,
                 )
+                for key, value in batch_metrics.items():
+                    if isinstance(value, int | float):
+                        usage_totals[key] = usage_totals.get(key, 0) + value
                 for i in range(0, len(all_extracted), flush_every):
                     yield all_extracted[i : i + flush_every]
                 return
@@ -753,10 +830,8 @@ def _run_extraction_model(
         usage_totals["batch"] = True
     if usage_totals and resolved.llm is not None and resolved.llm.pricing is not None:
         cost = _estimate_cost(usage_totals, resolved.llm.pricing)
-        if options.get("batch"):
-            # The Batch API bills 50%, and every non-cache token in these
-            # totals went through it (cache hits contribute zero tokens).
-            cost = round(cost * 0.5, 6)
+        if options.get("batch") and inference_provider is not None:
+            cost = round(cost * inference_provider.batch_cost_multiplier, 6)
         usage_totals["estimated_cost_usd"] = cost
 
     if use_full and full_committed:
@@ -768,6 +843,9 @@ def _run_extraction_model(
         materialization=model.materialization,
         kind="extraction",
         backend=backend_name,
+        provider=provider_name,
+        provider_model=provider_model,
+        provider_implementation=provider_implementation,
         documents_processed=len(docs_to_process),
         documents_skipped=skipped,
         documents_deleted=deleted,
@@ -800,7 +878,10 @@ def _extract_batched(
     options: dict[str, Any],
     work_dir: Path,
     model_name: str,
-) -> list[tuple[DocumentRef, ExtractionResult | None, str | None]]:
+) -> tuple[
+    list[tuple[DocumentRef, ExtractionResult | None, str | None]],
+    dict[str, Any],
+]:
     """Batch-mode extraction: fetch everything up front, hand the backend one
     extract_batch() call, and map its aligned results back per document. Fetch
     and per-item failures stay per-document; only batch submission itself
@@ -815,13 +896,16 @@ def _extract_batched(
 
     fetched = [(doc, path) for doc, path, err in entries if path is not None]
     try:
-        batch_out = (
-            backend.extract_batch([p for _, p in fetched], options) if fetched else []
+        batch_output = (
+            backend.extract_batch_with_metrics([p for _, p in fetched], options)
+            if fetched
+            else None
         )
     except Exception as e:
         raise RunError(
             f"Batch extraction failed for model '{model_name}': {e}"
         ) from e
+    batch_out = batch_output.items if batch_output is not None else []
     by_doc_id = {
         doc.document_id: res
         for (doc, _), res in zip(fetched, batch_out, strict=True)
@@ -834,10 +918,10 @@ def _extract_batched(
             continue
         res = by_doc_id[doc.document_id]
         if isinstance(res, Exception):
-            out.append((doc, None, f"{type(res).__name__}: {res}"))
+            out.append((doc, None, _artifact_error_text(res)))
         else:
             out.append((doc, res, None))
-    return out
+    return out, batch_output.metrics if batch_output is not None else {}
 
 
 def _row_for_extraction(
@@ -910,24 +994,52 @@ def _run_transform_model(
             f"Transform model '{model.name}' must declare `depends_on:` for v1"
         )
 
+    provider_name: str | None = None
+    provider_model: str | None = None
+    provider_implementation: str | None = None
+    if model.transform.uses_llm:
+        provider_name = (
+            resolved.llm.provider
+            if resolved.llm is not None
+            else DEFAULT_LLM_PROVIDER
+        )
+        selected_model = resolved.llm.model if resolved.llm is not None else None
+        try:
+            provider = get_inference_provider(provider_name)
+            provider_model = resolve_provider_model(provider, selected_model)
+            provider_implementation = provider.implementation_identity()
+        except Exception as e:
+            raise RunError(
+                f"Transform model '{model.name}' could not initialize inference: "
+                f"{_artifact_error_text(e)}"
+            ) from e
+
     transform_fn = load_transform(model.transform.module, project_dir)
     deps: dict[str, pl.DataFrame] = {}
     for dep_ref in model.depends_on:
         dep_name = parse_ref(dep_ref)
         deps[dep_name] = adapter.read_table(dep_name)
 
-    if transform_call_arity(transform_fn) == 2:
-        ctx = TransformContext(
-            project_dir=project_dir,
-            profile_name=resolved.profile_name,
-            target_name=resolved.target_name,
-            warehouse=resolved.warehouse,
-            llm=resolved.llm,
-            options=dict(model.transform.options),
-        )
-        output = transform_fn(deps, ctx)
-    else:
-        output = transform_fn(deps)
+    try:
+        if transform_call_arity(transform_fn) == 2:
+            ctx = TransformContext(
+                project_dir=project_dir,
+                profile_name=resolved.profile_name,
+                target_name=resolved.target_name,
+                warehouse=resolved.warehouse,
+                llm=resolved.llm,
+                options=dict(model.transform.options),
+            )
+            output = transform_fn(deps, ctx)
+        else:
+            output = transform_fn(deps)
+    except RunError:
+        raise
+    except Exception as e:
+        _log_execution_failure("transform failed for %s", model.name, e)
+        raise RunError(
+            f"Transform model '{model.name}' failed: {_artifact_error_text(e)}"
+        ) from e
 
     if not isinstance(output, pl.DataFrame):
         raise RunError(
@@ -942,6 +1054,9 @@ def _run_transform_model(
         model_name=model.name,
         materialization=model.materialization,
         kind="transform",
+        provider=provider_name,
+        provider_model=provider_model,
+        provider_implementation=provider_implementation,
         rows_written=output.height,
     )
 

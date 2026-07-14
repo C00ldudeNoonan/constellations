@@ -15,6 +15,16 @@ import pytest
 
 from dbt_ml.backends import get_backend, llm_backend
 from dbt_ml.backends.base import ExtractionResult
+from dbt_ml.providers import (
+    BatchInferenceItem,
+    BatchInferenceRequest,
+    BatchInferenceResult,
+    InferenceRequest,
+    InferenceResult,
+    ProviderRequestError,
+    ProviderResponseError,
+    ProviderUsage,
+)
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoice_texts
 
@@ -26,29 +36,25 @@ def _default_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
 
 
-def _succeeded_item(
+def _succeeded_result(
     fields: dict[str, Any],
     *,
     input_tokens: int = 100,
     output_tokens: int = 10,
-    stop_reason: str = "tool_use",
-) -> SimpleNamespace:
-    message = SimpleNamespace(
-        stop_reason=stop_reason,
-        content=[SimpleNamespace(type="tool_use", name="extract", input=fields)],
-        usage=SimpleNamespace(
+) -> InferenceResult:
+    return InferenceResult(
+        fields,
+        usage=ProviderUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cache_read_input_tokens=0,
-            cache_creation_input_tokens=0,
         ),
     )
-    return SimpleNamespace(result=SimpleNamespace(type="succeeded", message=message))
 
 
-def _errored_item() -> SimpleNamespace:
-    return SimpleNamespace(
-        result=SimpleNamespace(type="errored", error=SimpleNamespace(type="api_error"))
+def _errored_item(request_id: str = "req-1") -> BatchInferenceItem:
+    return BatchInferenceItem(
+        request_id,
+        error=ProviderRequestError("anthropic", "batch item", code="errored"),
     )
 
 
@@ -57,29 +63,40 @@ class _FakeBatchAPI:
     the document text, building the result dict in reverse order to prove
     custom_id keying (results stream back unordered in the real API)."""
 
-    def __init__(self, overrides: dict[str, SimpleNamespace] | None = None) -> None:
+    def __init__(
+        self, overrides: dict[str, BatchInferenceItem] | None = None
+    ) -> None:
         self.calls = 0
-        self.submitted: list[list[dict[str, Any]]] = []
+        self.submitted: list[list[BatchInferenceRequest]] = []
         self.overrides = overrides or {}
 
     def __call__(
         self,
-        requests: list[dict[str, Any]],
+        requests: list[BatchInferenceRequest],
         *,
+        provider: str,
         poll_seconds: float,
         api_key_env: str,
-    ) -> dict[str, Any]:
+        max_retries: int,
+    ) -> BatchInferenceResult:
         self.calls += 1
         self.submitted.append(requests)
-        out: dict[str, Any] = {}
+        out: list[BatchInferenceItem] = []
         for req in reversed(requests):
-            cid = req["custom_id"]
+            cid = req.request_id
             if cid in self.overrides:
-                out[cid] = self.overrides[cid]
+                out.append(self.overrides[cid])
                 continue
-            text = req["params"]["messages"][0]["content"]
-            out[cid] = _succeeded_item({"vendor": f"v-{text[:8]}", "total": 1.0})
-        return out
+            text = req.request.content
+            out.append(
+                BatchInferenceItem(
+                    cid,
+                    result=_succeeded_result(
+                        {"vendor": f"v-{text[:8]}", "total": 1.0}
+                    ),
+                )
+            )
+        return BatchInferenceResult(tuple(out), batch_submissions=1)
 
 
 @pytest.fixture
@@ -170,7 +187,10 @@ def test_llm_batch_errored_item_isolated(
 def test_llm_batch_max_tokens_item_is_error(
     monkeypatch: pytest.MonkeyPatch, docs: list[Path], tmp_path: Path
 ) -> None:
-    truncated = _succeeded_item({"vendor": "x", "total": 0}, stop_reason="max_tokens")
+    truncated = BatchInferenceItem(
+        "req-0",
+        error=ProviderResponseError("LLM response truncated at max_tokens=2048"),
+    )
     fake = _FakeBatchAPI(overrides={"req-0": truncated})
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
 
@@ -211,14 +231,27 @@ def test_message_batch_uses_custom_api_key_env(
     monkeypatch.setenv("DBT_ML_BATCH_KEY", secret)
     monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
 
+    request = BatchInferenceRequest(
+        "req-0",
+        InferenceRequest(
+            model="claude-haiku-4-5",
+            content="invoice",
+            system_prompt="extract",
+            output_schema={"type": "object", "properties": {}},
+        ),
+    )
     result = llm_backend._run_message_batch(
-        [{"custom_id": "req-0", "params": {}}],
+        [request],
         poll_seconds=0,
         api_key_env="DBT_ML_BATCH_KEY",
     )
 
-    assert result == {}
-    assert init_kwargs == {"api_key": secret}
+    assert len(result.items) == 1
+    assert result.items[0].request_id == "req-0"
+    assert result.items[0].error is not None
+    assert "missing_result" in str(result.items[0].error)
+    assert result.batch_submissions == 1
+    assert init_kwargs == {"api_key": secret, "max_retries": 4}
     assert len(submitted) == 1
     assert secret not in caplog.text
 
@@ -240,7 +273,17 @@ def test_message_batch_missing_custom_key_fails_before_client_creation(
 
     with pytest.raises(RuntimeError, match="DBT_ML_BATCH_KEY") as exc_info:
         llm_backend._run_message_batch(
-            [{"custom_id": "req-0", "params": {}}],
+            [
+                BatchInferenceRequest(
+                    "req-0",
+                    InferenceRequest(
+                        model="claude-haiku-4-5",
+                        content="invoice",
+                        system_prompt="extract",
+                        output_schema={"type": "object", "properties": {}},
+                    ),
+                )
+            ],
             poll_seconds=0,
             api_key_env="DBT_ML_BATCH_KEY",
         )
@@ -269,8 +312,8 @@ def batch_project(tmp_path: Path) -> Path:
     return dst
 
 
-def _invoice_item(n: int) -> SimpleNamespace:
-    return _succeeded_item(
+def _invoice_result(n: int) -> InferenceResult:
+    return _succeeded_result(
         {
             "vendor": "Batched Vendor",
             "invoice_id": f"INV-{n}",
@@ -289,15 +332,21 @@ def test_runner_batch_mode_end_to_end(
     calls = {"n": 0}
 
     def fake(
-        requests: list[dict[str, Any]],
+        requests: list[BatchInferenceRequest],
         *,
+        provider: str,
         poll_seconds: float,
         api_key_env: str,
-    ) -> dict[str, Any]:
+        max_retries: int,
+    ) -> BatchInferenceResult:
         calls["n"] += 1
-        return {
-            req["custom_id"]: _invoice_item(i) for i, req in enumerate(requests)
-        }
+        return BatchInferenceResult(
+            tuple(
+                BatchInferenceItem(req.request_id, result=_invoice_result(i))
+                for i, req in enumerate(requests)
+            ),
+            batch_submissions=1,
+        )
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
 
@@ -333,12 +382,20 @@ def test_runner_batch_cost_estimate_halved(
     )
 
     def fake(
-        requests: list[dict[str, Any]],
+        requests: list[BatchInferenceRequest],
         *,
+        provider: str,
         poll_seconds: float,
         api_key_env: str,
-    ) -> dict[str, Any]:
-        return {req["custom_id"]: _invoice_item(i) for i, req in enumerate(requests)}
+        max_retries: int,
+    ) -> BatchInferenceResult:
+        return BatchInferenceResult(
+            tuple(
+                BatchInferenceItem(req.request_id, result=_invoice_result(i))
+                for i, req in enumerate(requests)
+            ),
+            batch_submissions=1,
+        )
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
 
@@ -352,14 +409,19 @@ def test_runner_batch_isolates_per_document_errors(
     monkeypatch: pytest.MonkeyPatch, batch_project: Path
 ) -> None:
     def fake(
-        requests: list[dict[str, Any]],
+        requests: list[BatchInferenceRequest],
         *,
+        provider: str,
         poll_seconds: float,
         api_key_env: str,
-    ) -> dict[str, Any]:
-        out = {req["custom_id"]: _invoice_item(i) for i, req in enumerate(requests)}
-        out["req-1"] = _errored_item()
-        return out
+        max_retries: int,
+    ) -> BatchInferenceResult:
+        out = [
+            BatchInferenceItem(req.request_id, result=_invoice_result(i))
+            for i, req in enumerate(requests)
+        ]
+        out[1] = _errored_item()
+        return BatchInferenceResult(tuple(out), batch_submissions=1)
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
 
@@ -368,3 +430,29 @@ def test_runner_batch_isolates_per_document_errors(
     assert r.rows_written == 2
     assert len(r.errors) == 1
     assert "errored" in r.errors[0]
+
+
+def test_runner_records_batch_submission_when_every_item_fails(
+    monkeypatch: pytest.MonkeyPatch, batch_project: Path
+) -> None:
+    def fake(
+        requests: list[BatchInferenceRequest],
+        *,
+        provider: str,
+        poll_seconds: float,
+        api_key_env: str,
+        max_retries: int,
+    ) -> BatchInferenceResult:
+        del provider, poll_seconds, api_key_env, max_retries
+        return BatchInferenceResult(
+            tuple(_errored_item(request.request_id) for request in requests),
+            batch_submissions=1,
+        )
+
+    monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
+
+    results = run_project(batch_project)
+    result = next(x for x in results if x.model_name == "raw_invoices_llm")
+
+    assert len(result.errors) == 3
+    assert result.metrics["batch_submissions"] == 1

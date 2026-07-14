@@ -268,6 +268,68 @@ def test_transform_aggregates_dependency(fresh_project: Path) -> None:
     assert rows[0][1] == pytest.approx(raw_rows[0][1])
 
 
+def test_llm_transform_reports_provider_provenance(fresh_project: Path) -> None:
+    profiles = fresh_project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text().replace(
+            "        schema: dbt_ml",
+            "        schema: dbt_ml\n"
+            "      llm:\n"
+            "        provider: anthropic\n"
+            "        model: provenance-model",
+        )
+    )
+    transform_yml = fresh_project / "models" / "invoice_summary.yml"
+    transform_yml.write_text(
+        transform_yml.read_text().replace(
+            "      module: transforms.summarize",
+            "      module: transforms.summarize\n      uses_llm: true",
+        )
+    )
+    generate_invoices(3, fresh_project / "data" / "invoices", seed=1)
+
+    results = run_project(fresh_project)
+    summary = next(r for r in results if r.model_name == "invoice_summary")
+
+    assert summary.provider == "anthropic"
+    assert summary.provider_model == "provenance-model"
+    assert summary.provider_implementation is not None
+    payload = json.loads(write_run_results(fresh_project, results).read_text())
+    row = next(r for r in payload["results"] if r["model_name"] == "invoice_summary")
+    assert row["provider"] == "anthropic"
+    assert row["provider_model"] == "provenance-model"
+    assert row["provider_implementation"] == summary.provider_implementation
+
+
+def test_llm_transform_provider_failure_is_isolated_and_sanitized(
+    fresh_project: Path,
+) -> None:
+    transform_yml = fresh_project / "models" / "invoice_summary.yml"
+    transform_yml.write_text(
+        transform_yml.read_text().replace(
+            "      module: transforms.summarize",
+            "      module: transforms.summarize\n      uses_llm: true",
+        )
+    )
+    (fresh_project / "transforms" / "summarize.py").write_text(
+        "from dbt_ml.providers import ProviderConfigurationError\n\n"
+        "def run(deps, ctx):\n"
+        "    raise ProviderConfigurationError('PRIVATE_LLM_ENV is not set')\n"
+    )
+    generate_invoices(3, fresh_project / "data" / "invoices", seed=1)
+
+    result = build_project(fresh_project)
+    summary = next(
+        r for r in result.run_results if r.model_name == "invoice_summary"
+    )
+
+    assert summary.errors == [
+        "ProviderConfigurationError: provider configuration is invalid"
+    ]
+    assert "PRIVATE_LLM_ENV" not in json.dumps(summary.errors)
+    assert "monthly_totals" in {r.model_name for r in result.run_results}
+
+
 def test_run_with_select(fresh_project: Path) -> None:
     generate_invoices(5, fresh_project / "data" / "invoices", seed=2)
     results = run_project(fresh_project, select="raw_invoices")

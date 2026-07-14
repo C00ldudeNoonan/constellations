@@ -26,6 +26,12 @@ class ExtractionResult:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class BatchExtractionOutput:
+    items: list[ExtractionResult | Exception]
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
 class BaseBackend(ABC):
     """Contract every extraction backend implements."""
 
@@ -50,8 +56,7 @@ class BaseBackend(ABC):
         """Extract many documents in one call, returning one entry per input
         path (aligned): an ExtractionResult, or the Exception that document
         raised — per-document failures never abort the batch. Default is a
-        sequential extract() loop; backends with a native batch path (llm →
-        Anthropic Message Batches, issue #75) override."""
+        sequential extract() loop; backends with a native batch path override."""
         out: list[ExtractionResult | Exception] = []
         for path in paths:
             try:
@@ -59,6 +64,11 @@ class BaseBackend(ABC):
             except Exception as e:
                 out.append(e)
         return out
+
+    def extract_batch_with_metrics(
+        self, paths: list[Path], options: dict[str, Any]
+    ) -> BatchExtractionOutput:
+        return BatchExtractionOutput(self.extract_batch(paths, options))
 
     def version(self) -> str:
         """Parser identity recorded on every extracted row (issue #85), so a

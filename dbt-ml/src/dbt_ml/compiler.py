@@ -84,8 +84,12 @@ def validate_project_contract(
                     f"Extraction model '{model.name}' has {e}",
                     ("extraction", *error_path),
                 ) from e
-            if backend == "llm":
-                provider_name = str(canonical_options.get("provider", "anthropic"))
+            # Provider checks here only apply when the model pins one — the
+            # canonical default may not be the effective provider, which the
+            # profile selects. resolve_llm_options re-validates registration
+            # and batch capability against the resolved profile.
+            if backend == "llm" and "provider" in model.extraction.options:
+                provider_name = str(canonical_options["provider"])
                 try:
                     provider = get_inference_provider(provider_name)
                 except (ProviderNotFoundError, ProviderConfigurationError) as e:

@@ -357,20 +357,16 @@ def resolve_llm_options(
             "under `llm:` in profiles.yml, not in model extraction options"
         )
     merged = dict(options)
-    if (
-        resolved.llm is not None
-        and "provider" in merged
-        and merged["provider"] != resolved.llm.provider
-    ):
+    profile_provider = (
+        resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER
+    )
+    if "provider" in merged and merged["provider"] != profile_provider:
         raise ProfileError(
             "llm option 'provider' cannot override the profile provider because "
             "credentials are operator-owned; select the provider under `llm:` "
             "in profiles.yml"
         )
-    provider_name = str(
-        merged.get("provider")
-        or (resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER)
-    )
+    provider_name = str(merged.get("provider") or profile_provider)
     try:
         provider = get_inference_provider(provider_name)
     except (ProviderNotFoundError, ProviderConfigurationError) as e:

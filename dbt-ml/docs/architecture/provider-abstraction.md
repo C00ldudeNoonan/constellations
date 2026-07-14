@@ -85,21 +85,25 @@ outputs:
 ```
 
 The target binds the provider to its operator-owned credential environment.
-A model may override the model ID, but it cannot switch to a different provider
-under that credential. Named multi-provider credentials are deliberately
-deferred until the profile contract can represent them without sending one
-provider's secret to another integration.
+Provider selection always lives in the profile: a model may override the model
+ID, but it cannot switch to a different provider — with or without an `llm:`
+block, model YAML naming any provider other than the profile-effective one is
+a profile error. Named multi-provider credentials are deliberately deferred
+until the profile contract can represent them without sending one provider's
+secret to another integration.
 
 The selected provider is part of the transformation's semantic identity. Its
-implementation identity hashes the contract version, dbt-ml version, provider
-class, provider module, and versions of provider-declared SDK distributions so
-implementation or dependency changes can invalidate state and cache entries
-without exposing configuration secrets.
+implementation identity hashes the contract version, provider class, and
+versions of provider-declared SDK distributions. It deliberately excludes the
+dbt-ml release and module source digests so cached responses and incremental
+state survive routine upgrades; semantic changes to the contract are signalled
+by bumping `PROVIDER_CONTRACT_VERSION`, and request-shaping changes in a
+provider integration ship as SDK version bumps.
 
 The LLM response cache also includes the provider name, model, contract version,
-provider implementation identity, dbt-ml LLM backend identity, schema, content,
-temperature, and output-token limit. Legacy Anthropic entries intentionally miss
-the versioned cache and are not reused after the cache contract changes.
+provider implementation identity, schema, content, temperature, and output-token
+limit. Legacy pre-contract entries can never be read under the versioned key
+format, so they are pruned from the cache file on the next write.
 
 Manifest model entries and per-model run results expose only the effective
 provider, model, and hashed implementation identity. Credential names and values
@@ -131,6 +135,16 @@ of forwarding raw response bodies.
 This gives run results a stable error vocabulary while leaving detailed SDK
 diagnostics behind the credential boundary. Provider request IDs are allowed
 for operational correlation but response bodies and headers are not.
+
+For local diagnosis, setting `DBT_ML_DEBUG_PROVIDER_ERRORS=1` logs a redacted
+copy of the original SDK traceback at DEBUG level at the point of conversion:
+`redacted_exception_text()` masks the revealed credential, document content,
+and system prompt, so an SDK that echoes a secret back in its error message
+cannot leak it. The switch is off by default because an SDK error can also
+echo request fragments no allowlist anticipates, and debug logs are often
+shipped to aggregators — enable it only while diagnosing a failure locally.
+Raised errors, run results, and artifacts carry only the sanitized form in
+either mode.
 
 ## Anthropic mapping
 

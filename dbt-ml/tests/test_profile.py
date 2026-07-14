@@ -261,6 +261,40 @@ def test_model_provider_cannot_override_profile_credentials(tmp_path: Path) -> N
         )
 
 
+def test_model_provider_requires_profile_selection_without_llm_block(
+    tmp_path: Path,
+) -> None:
+    """Provider selection is operator-owned even when the profile has no
+    `llm:` block — model YAML cannot opt into a non-default provider."""
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "d",
+                },
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.llm is None
+
+    with pytest.raises(ProfileError, match="cannot override the profile provider"):
+        resolve_llm_options(
+            {"provider": "another-provider", "fields": [{"name": "x"}]},
+            resolved,
+        )
+
+    options = resolve_llm_options(
+        {"provider": "anthropic", "fields": [{"name": "x"}]}, resolved
+    )
+    assert options["provider"] == "anthropic"
+
+
 def test_model_api_key_env_cannot_override_profile(tmp_path: Path) -> None:
     _write_project(tmp_path, profile="test_proj")
     _write_profiles(

@@ -170,6 +170,37 @@ def test_provider_without_native_batch_is_rejected_at_compile(
         )
 
 
+def test_provider_checks_defer_to_profile_when_model_does_not_pin_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a model-pinned provider the effective provider is profile
+    configuration, so registration and batch capability are validated in
+    resolve_llm_options — not against the canonical default here."""
+
+    def _forbidden(_name: str) -> None:
+        raise AssertionError("provider registry must not be consulted")
+
+    monkeypatch.setattr("dbt_ml.compiler.get_inference_provider", _forbidden)
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "batch": True,
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    validate_project_contract(
+        ProjectConfig(name="p"),
+        [_source()],
+        [model],
+        tmp_path,
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [

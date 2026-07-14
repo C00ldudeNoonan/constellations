@@ -89,7 +89,7 @@ def test_run_aggregates_usage_per_model(llm_project: Path, fake_api: dict) -> No
     assert r.provider == "anthropic"
     assert r.provider_model == "claude-haiku-4-5"
     assert r.provider_implementation is not None
-    assert r.provider_implementation.startswith("dbt-ml/")
+    assert r.provider_implementation.startswith("provider-v")
 
 
 def test_cache_hits_counted_with_zero_tokens(
@@ -198,7 +198,7 @@ def test_usage_persisted_in_run_results(llm_project: Path, fake_api: dict) -> No
     assert row["metrics"]["input_tokens"] == 3000
     assert row["provider"] == "anthropic"
     assert row["provider_model"] == "claude-haiku-4-5"
-    assert row["provider_implementation"].startswith("dbt-ml/")
+    assert row["provider_implementation"].startswith("provider-v")
     assert "api_key" not in json.dumps(row)
 
 
@@ -333,6 +333,41 @@ def test_provider_failure_does_not_leak_secret_or_prompt(
     assert prompt_marker not in serialized
     assert secret not in caplog.text
     assert prompt_marker not in caplog.text
+
+
+def test_opt_in_provider_debug_logs_redacted_sdk_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    llm_project: Path,
+) -> None:
+    """DBT_ML_DEBUG_PROVIDER_ERRORS=1 surfaces the SDK traceback at DEBUG
+    for local diagnosis, with the credential value masked. Artifacts stay
+    sanitized either way."""
+    secret = "provider-debug-secret"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    monkeypatch.setenv("DBT_ML_DEBUG_PROVIDER_ERRORS", "1")
+
+    class FailingMessages:
+        def create(self, **kwargs: object) -> None:
+            del kwargs
+            raise RuntimeError(f"SDK failure diagnostic detail {secret}")
+
+    class FailingAnthropic:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.messages = FailingMessages()
+
+    monkeypatch.setattr("anthropic.Anthropic", FailingAnthropic)
+    caplog.set_level(logging.DEBUG)
+
+    results = run_project(llm_project)
+    serialized = write_run_results(llm_project, results).read_text()
+
+    assert results[0].errors
+    assert secret not in serialized
+    assert secret not in caplog.text
+    assert "SDK failure diagnostic detail" in caplog.text
+    assert "[redacted]" in caplog.text
 
 
 def test_missing_credential_name_is_not_persisted(

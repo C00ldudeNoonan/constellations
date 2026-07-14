@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
-from functools import cache, partial
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +26,16 @@ from ..providers import (
     ProviderRuntimeOptions,
     ProviderUsage,
     get_inference_provider,
+    provider_error_debug_enabled,
+    redacted_exception_text,
     resolve_provider_model,
     sanitized_provider_error,
 )
 from .base import BaseBackend, BatchExtractionOutput, ExtractionResult
 from .options import LLMBackendOptions, validate_llm_numeric_options
 from .registry import register
+
+log = logging.getLogger(__name__)
 
 _DEFAULT_SYSTEM = (
     "You extract structured fields from documents. "
@@ -467,6 +472,19 @@ def _default_call_api(
             provider, "inference", error
         ) from None
     except Exception as error:
+        if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "provider '%s' inference failed:\n%s",
+                provider,
+                redacted_exception_text(
+                    error,
+                    sensitive=(
+                        credential.reveal() if credential else None,
+                        request.content,
+                        request.system_prompt,
+                    ),
+                ),
+            )
         raise ProviderRequestError(
             provider, "inference", code=type(error).__name__
         ) from None
@@ -496,6 +514,18 @@ def _run_message_batch(
             provider, "batch inference", error
         ) from None
     except Exception as error:
+        if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+            sensitive: list[str | None] = [
+                credential.reveal() if credential else None
+            ]
+            for item in requests:
+                sensitive.append(item.request.content)
+                sensitive.append(item.request.system_prompt)
+            log.debug(
+                "provider '%s' batch inference failed:\n%s",
+                provider,
+                redacted_exception_text(error, sensitive=tuple(sensitive)),
+            )
         raise ProviderRequestError(
             provider, "batch inference", code=type(error).__name__
         ) from None
@@ -583,10 +613,13 @@ def _cache_key(
     schema_hash: str,
     max_tokens: int,
 ) -> str:
+    # Keyed on the semantic request plus the provider's contract identity —
+    # not the backend implementation or dbt-ml release, so cached responses
+    # survive routine upgrades. Row-shaping changes invalidate incremental
+    # state through the model code version instead.
     canonical = json.dumps(
         {
             "contract_version": PROVIDER_CONTRACT_VERSION,
-            "backend_identity": _llm_backend_implementation_identity(),
             "provider": provider,
             "provider_identity": provider_identity,
             "model": model,
@@ -601,11 +634,6 @@ def _cache_key(
         canonical.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
     return f"provider-v{PROVIDER_CONTRACT_VERSION}|{provider}|{model}|{digest}"
-
-
-@cache
-def _llm_backend_implementation_identity() -> str:
-    return LLMBackend().implementation_identity()
 
 
 def _cache_get(path: Path, key: str) -> dict[str, Any] | None:
@@ -659,6 +687,7 @@ def _cache_put_locked(
             )
             """
         )
+        _prune_legacy_entries(con, path)
         con.execute(
             """
             INSERT INTO llm_cache
@@ -672,3 +701,21 @@ def _cache_put_locked(
         )
     finally:
         con.close()
+
+
+# Paths already swept this process; guarded by _CACHE_WRITE_LOCK.
+_PRUNED_CACHE_PATHS: set[str] = set()
+
+
+def _prune_legacy_entries(con: duckdb.DuckDBPyConnection, path: Path) -> None:
+    """Drop pre-provider-contract rows (`{model}|{content}|{schema}` keys).
+
+    They can never be read again — every current key carries the
+    `provider-v…|` prefix — so they only grow the cache file. Versioned
+    entries are kept even across contract bumps to keep downgrades cheap.
+    """
+    resolved = str(path.resolve())
+    if resolved in _PRUNED_CACHE_PATHS:
+        return
+    con.execute("DELETE FROM llm_cache WHERE cache_key NOT LIKE 'provider-v%'")
+    _PRUNED_CACHE_PATHS.add(resolved)

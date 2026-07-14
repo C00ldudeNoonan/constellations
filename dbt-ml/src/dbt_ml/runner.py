@@ -118,22 +118,6 @@ def _provider_error_in_chain(error: BaseException) -> ProviderError | None:
     return None
 
 
-def _log_execution_failure(
-    message: str,
-    name: str,
-    error: Exception,
-) -> None:
-    provider_error = _provider_error_in_chain(error)
-    if provider_error is not None:
-        log.debug(
-            f"{message} [%s]",
-            name,
-            type(provider_error).__name__,
-        )
-    else:
-        log.debug(message, name, exc_info=True)
-
-
 class _FullExtractionFailed(Exception):
     pass
 
@@ -593,7 +577,11 @@ def _run_extraction_model(
         llm_options = LLMBackendOptions.model_validate(options)
         provider_name = llm_options.provider
         inference_provider = get_inference_provider(provider_name)
-        assert llm_options.model is not None
+        if llm_options.model is None:
+            raise RunError(
+                f"Extraction model '{model.name}' has no effective LLM model; "
+                "set one in the model options or profile"
+            )
         provider_model = llm_options.model
         provider_implementation = inference_provider.implementation_identity()
 
@@ -705,8 +693,11 @@ def _run_extraction_model(
                 local_path = source_backend.fetch(doc, work_dir)
                 return doc, backend.extract(local_path, options), None
             except Exception as e:
-                _log_execution_failure(
-                    "extraction failed for %s", doc.relative_path, e
+                # Provider errors reach here already sanitized with their
+                # chains severed; redacted SDK diagnostics were logged at the
+                # provider boundary. Safe to log in full.
+                log.debug(
+                    "extraction failed for %s", doc.relative_path, exc_info=True
                 )
                 return doc, None, _artifact_error_text(e)
 
@@ -1036,7 +1027,7 @@ def _run_transform_model(
     except RunError:
         raise
     except Exception as e:
-        _log_execution_failure("transform failed for %s", model.name, e)
+        log.debug("transform failed for %s", model.name, exc_info=True)
         raise RunError(
             f"Transform model '{model.name}' failed: {_artifact_error_text(e)}"
         ) from e

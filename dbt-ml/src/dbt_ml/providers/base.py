@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
+import logging
 import math
 import os
 import re
+import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from importlib.metadata import version as package_version
 from typing import Any, ClassVar
 
 from ..hashing import HASH_DIGEST_SIZE
+
+log = logging.getLogger(__name__)
 
 PROVIDER_CONTRACT_VERSION = 1
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -75,6 +78,41 @@ class ProviderResponseError(ProviderError):
 
 class ProviderBatchError(ProviderError):
     pass
+
+
+PROVIDER_DEBUG_ENV = "DBT_ML_DEBUG_PROVIDER_ERRORS"
+
+
+def provider_error_debug_enabled() -> bool:
+    """Whether operators opted into redacted SDK diagnostics in debug logs.
+
+    Off by default: an SDK error message can echo fragments of the request
+    that no allowlist can anticipate, and debug logs are often shipped to
+    aggregators. Known sensitive values are masked either way; the switch
+    only exists for local diagnosis.
+    """
+    value = os.environ.get(PROVIDER_DEBUG_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def redacted_exception_text(
+    error: BaseException,
+    *,
+    sensitive: Sequence[str | None] = (),
+) -> str:
+    """Full traceback text with known sensitive values masked.
+
+    For opt-in local debug logging at provider boundaries only — raised
+    errors and artifacts always carry the sanitized `ProviderError` form
+    instead. Callers pass every value that must not appear (revealed
+    credential, request content, system prompt) so genuine SDK diagnostics
+    survive while a provider echoing a secret back cannot leak it.
+    """
+    text = "".join(traceback.format_exception(error))
+    for value in sensitive:
+        if value:
+            text = text.replace(value, "[redacted]")
+    return text
 
 
 def sanitized_provider_error(
@@ -473,6 +511,19 @@ class InferenceProvider(BaseProvider):
                     )
                 )
             except Exception as error:
+                if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        "%s sequential batch item failed:\n%s",
+                        self.name(),
+                        redacted_exception_text(
+                            error,
+                            sensitive=(
+                                credential.reveal() if credential else None,
+                                item.request.content,
+                                item.request.system_prompt,
+                            ),
+                        ),
+                    )
                 items.append(
                     BatchInferenceItem(
                         item.request_id,
@@ -578,6 +629,20 @@ class EmbeddingProvider(BaseProvider):
                 self.name(), "embedding", error
             ) from None
         except Exception as error:
+            # Redacted diagnostics stay in local debug logs; raised errors
+            # and artifacts carry only the sanitized form.
+            if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "%s embedding failed:\n%s",
+                    self.name(),
+                    redacted_exception_text(
+                        error,
+                        sensitive=(
+                            credential.reveal() if credential else None,
+                            *request.texts,
+                        ),
+                    ),
+                )
             raise ProviderRequestError(
                 self.name(), "embedding", code=type(error).__name__
             ) from None
@@ -613,25 +678,17 @@ class EmbeddingProvider(BaseProvider):
     ) -> EmbeddingResult: ...
 
 
-def _dbt_ml_version() -> str:
-    try:
-        return package_version("dbt-ml")
-    except PackageNotFoundError:
-        return "unknown"
-
-
 @cache
 def _implementation_identity(provider_type: type[BaseProvider]) -> str:
-    provider_module = inspect.getmodule(provider_type)
+    # Deliberately excludes the dbt-ml release and module source digests:
+    # cached responses and incremental state should survive routine upgrades.
+    # Semantic changes to the contract bump PROVIDER_CONTRACT_VERSION instead,
+    # and request-shaping changes in a provider ship as SDK version bumps.
     payload = {
         "contract_version": PROVIDER_CONTRACT_VERSION,
-        "dbt_ml_version": _dbt_ml_version(),
         "provider_class": (
             f"{provider_type.__module__}.{provider_type.__qualname__}"
         ),
-        "contract_module_source": _source_digest(inspect.getmodule(BaseProvider)),
-        "provider_class_source": _source_digest(provider_type),
-        "provider_module_source": _source_digest(provider_module),
         "provider_dependency_versions": {
             package: _distribution_version(package)
             for package in provider_type.implementation_packages
@@ -641,19 +698,7 @@ def _implementation_identity(provider_type: type[BaseProvider]) -> str:
     digest = hashlib.blake2b(
         canonical.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
-    return f"dbt-ml/{payload['dbt_ml_version']}+provider/{digest}"
-
-
-def _source_digest(obj: Any) -> str | None:
-    if obj is None:
-        return None
-    try:
-        source = inspect.getsource(obj)
-    except (OSError, TypeError):
-        return None
-    return hashlib.blake2b(
-        source.encode(), digest_size=HASH_DIGEST_SIZE
-    ).hexdigest()
+    return f"provider-v{PROVIDER_CONTRACT_VERSION}/{digest}"
 
 
 def _distribution_version(package: str) -> str:

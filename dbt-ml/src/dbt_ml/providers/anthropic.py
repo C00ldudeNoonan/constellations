@@ -19,6 +19,8 @@ from .base import (
     ProviderResponseError,
     ProviderRuntimeOptions,
     ProviderUsage,
+    provider_error_debug_enabled,
+    redacted_exception_text,
 )
 from .registry import register_inference_provider
 
@@ -57,6 +59,20 @@ class AnthropicInferenceProvider(InferenceProvider):
                 messages=[{"role": "user", "content": request.content}],
             )
         except Exception as error:
+            # SDK diagnostics never cross the provider boundary; a redacted
+            # copy stays in local debug logs for operators.
+            if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "anthropic inference request failed:\n%s",
+                    redacted_exception_text(
+                        error,
+                        sensitive=(
+                            api_key,
+                            request.content,
+                            request.system_prompt,
+                        ),
+                    ),
+                )
             raise ProviderRequestError(
                 self.name(), "inference", code=type(error).__name__
             ) from None
@@ -116,6 +132,13 @@ class AnthropicInferenceProvider(InferenceProvider):
                 time.sleep(poll_seconds)
             raw_items = list(client.messages.batches.results(batch.id))
         except Exception as error:
+            if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "anthropic native batch failed:\n%s",
+                    redacted_exception_text(
+                        error, sensitive=_batch_sensitive_values(api_key, requests)
+                    ),
+                )
             raise ProviderBatchError(
                 f"{self.name()} native batch failed [{type(error).__name__}]",
                 safe_for_display=True,
@@ -180,6 +203,16 @@ class AnthropicInferenceProvider(InferenceProvider):
             else:
                 items.append(BatchInferenceItem(request_id, result=result))
         return BatchInferenceResult(tuple(items), batch_submissions=1)
+
+
+def _batch_sensitive_values(
+    api_key: str, requests: Sequence[BatchInferenceRequest]
+) -> tuple[str, ...]:
+    values = [api_key]
+    for item in requests:
+        values.append(item.request.content)
+        values.append(item.request.system_prompt)
+    return tuple(values)
 
 
 def _credential_value(credential: ProviderCredential | None) -> str:

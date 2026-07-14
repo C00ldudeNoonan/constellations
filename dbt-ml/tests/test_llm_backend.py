@@ -10,6 +10,8 @@ import pytest
 from dbt_ml.backends import get_backend, llm_backend
 from dbt_ml.backends.llm_backend import LLMBackend, extract_fields_from_text
 from dbt_ml.hashing import HASH_DIGEST_SIZE
+from dbt_ml.providers import base as provider_base
+from dbt_ml.providers import get_inference_provider
 
 
 @pytest.fixture(autouse=True)
@@ -361,9 +363,7 @@ def test_max_tokens_is_part_of_cache_key(
     assert counter.calls == 2
 
 
-def test_cache_key_separates_provider_and_backend_implementations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_cache_key_separates_provider_implementations() -> None:
     common = {
         "provider": "anthropic",
         "model": "shared-model",
@@ -379,19 +379,46 @@ def test_cache_key_separates_provider_and_backend_implementations(
         **common,
         provider_identity="implementation-two",
     )
-    monkeypatch.setattr(
-        llm_backend,
-        "_llm_backend_implementation_identity",
-        lambda: "changed-backend-implementation",
-    )
-    third = llm_backend._cache_key(
-        **common,
-        provider_identity="implementation-two",
-    )
 
     assert first != second
-    assert second != third
     assert "sensitive-path" not in first
+
+
+def test_cache_key_survives_dbt_ml_release_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response cache is keyed on the semantic request and the provider
+    contract identity — never the dbt-ml release — so routine upgrades do
+    not force paid re-extraction."""
+    common = {
+        "provider": "anthropic",
+        "model": "shared-model",
+        "content_hash": "content",
+        "schema_hash": "schema",
+        "max_tokens": 2048,
+    }
+    versions = {"dbt-ml": "1.0", "anthropic": "5.0"}
+    monkeypatch.setattr(
+        "dbt_ml.providers.base.package_version",
+        lambda package: versions[package],
+    )
+    try:
+        provider_base._implementation_identity.cache_clear()
+        identity = get_inference_provider("anthropic").implementation_identity()
+        first = llm_backend._cache_key(**common, provider_identity=identity)
+        versions["dbt-ml"] = "2.0"
+        provider_base._implementation_identity.cache_clear()
+        bumped_identity = get_inference_provider(
+            "anthropic"
+        ).implementation_identity()
+        second = llm_backend._cache_key(
+            **common, provider_identity=bumped_identity
+        )
+    finally:
+        provider_base._implementation_identity.cache_clear()
+
+    assert identity == bumped_identity
+    assert first == second
 
 
 def test_legacy_cache_entry_is_not_reused(tmp_path: Path) -> None:
@@ -427,7 +454,46 @@ def test_legacy_cache_entry_is_not_reused(tmp_path: Path) -> None:
     assert fields == {"x": "fresh"}
     assert usage["cache_hits"] == 0
     assert counter.calls == 1
-    assert llm_backend._cache_get(cache_path, legacy_key) == {"x": "legacy"}
+
+
+def test_legacy_cache_entries_are_pruned_on_write(tmp_path: Path) -> None:
+    """Rows written before the provider contract can never be read again;
+    the first write into a cache file sweeps them out."""
+    import duckdb
+
+    cache_path = tmp_path / "cache.duckdb"
+    con = duckdb.connect(str(cache_path))
+    con.execute(
+        """
+        CREATE TABLE llm_cache (
+            cache_key VARCHAR PRIMARY KEY,
+            model VARCHAR NOT NULL,
+            content_hash VARCHAR NOT NULL,
+            schema_hash VARCHAR NOT NULL,
+            response_json VARCHAR NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO llm_cache VALUES "
+        "('claude-haiku-4-5|abc|def', 'claude-haiku-4-5', 'abc', 'def', "
+        "'{\"x\": \"legacy\"}', current_timestamp)"
+    )
+    con.close()
+
+    new_key = "provider-v1|anthropic|claude-haiku-4-5|digest"
+    llm_backend._cache_put(
+        cache_path,
+        new_key,
+        model="claude-haiku-4-5",
+        content_hash="abc",
+        schema_hash="def",
+        fields={"x": "fresh"},
+    )
+
+    assert llm_backend._cache_get(cache_path, "claude-haiku-4-5|abc|def") is None
+    assert llm_backend._cache_get(cache_path, new_key) == {"x": "fresh"}
 
 
 def test_truncated_response_is_an_error(

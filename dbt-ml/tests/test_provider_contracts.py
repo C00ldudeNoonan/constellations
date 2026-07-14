@@ -604,7 +604,7 @@ def test_provider_implementation_identity_is_stable_and_class_specific() -> None
     alternate = AlternateProvider().implementation_identity()
 
     assert first == second
-    assert first.startswith("dbt-ml/")
+    assert first.startswith("provider-v")
     assert first != alternate
 
 

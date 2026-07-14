@@ -21,6 +21,8 @@ from .base import (
     ProviderResponseError,
     ProviderRuntimeOptions,
     ProviderUsage,
+    provider_error_debug_enabled,
+    redacted_exception_text,
     resolve_provider_model,
     sanitized_provider_error,
 )
@@ -59,6 +61,8 @@ __all__ = [
     "get_inference_provider",
     "list_embedding_providers",
     "list_inference_providers",
+    "provider_error_debug_enabled",
+    "redacted_exception_text",
     "register_embedding_provider",
     "register_inference_provider",
     "resolve_provider_model",

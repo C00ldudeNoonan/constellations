@@ -122,7 +122,7 @@ def test_manifest_emits_safe_effective_inference_descriptor(
 
     assert model["inference"]["provider"] == "anthropic"
     assert model["inference"]["model"] == "effective-model"
-    assert model["inference"]["implementation"].startswith("dbt-ml/")
+    assert model["inference"]["implementation"].startswith("provider-v")
     assert set(model["inference"]) == {"provider", "model", "implementation"}
 
     (tmp_path / "models" / "context.yml").write_text(

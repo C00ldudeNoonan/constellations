@@ -58,8 +58,11 @@ the repository-level `.github/workflows/` directory.
   External access must be an explicit, reviewable opt-in.
 - Local document discovery and fetch must not follow symlinks. Preserve the
   no-follow walk and verified scratch-copy boundary in `sources/local.py`.
-- Configuration and artifacts may carry credential environment-variable names,
-  never resolved secret values. Do not log secrets or raw document content.
+- Parse credentials into the shared protected reference/value types before
+  generic interpolation. Neither credential values nor environment-variable
+  names may enter reprs, dumps, equality/hashing, artifacts, or diagnostics;
+  reveal a value only at the native SDK boundary. Do not log secrets or raw
+  document content.
 - Validate incremental keys before mutation and keep each adapter write atomic.
 - Raw PII evidence is opt-in. A redacted output does not make retained input
   columns safe; tests and examples must project sensitive originals away.

@@ -8,6 +8,7 @@ import pytest
 
 from dbt_ml.adapters import (
     AdapterCapabilityError,
+    AdapterConfigError,
     AdapterError,
     StateRecord,
     StateScope,
@@ -66,6 +67,73 @@ def test_unknown_type_raises(tmp_path: Path) -> None:
         parse_warehouse_config(
             {"type": "no_such_warehouse", "path": str(tmp_path / "x"), "schema": "s"}
         )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {
+            "type": "bigquery",
+            "project": "p",
+            "token": "distinctive-protected-input-secret",
+        },
+        {
+            "type": "no_such_warehouse",
+            "token": "distinctive-protected-input-secret",
+        },
+    ],
+)
+def test_adapter_entrypoint_errors_scrub_raw_traceback_inputs(
+    raw: dict[str, str],
+) -> None:
+    sentinel = "distinctive-protected-input-secret"
+
+    with pytest.raises(AdapterError) as exc_info:
+        parse_warehouse_config(raw)
+
+    error = exc_info.value
+    assert sentinel not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/dbt_ml/" in traceback.tb_frame.f_code.co_filename:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_config_validation_error_retains_only_sanitized_details(
+    tmp_path: Path,
+) -> None:
+    sentinel = "distinctive-invalid-warehouse-secret"
+    raw = {
+        "type": "duckdb",
+        "path": str(tmp_path / "x.duckdb"),
+        "pth_typo": sentinel,
+    }
+
+    with pytest.raises(AdapterConfigError) as exc_info:
+        parse_warehouse_config(raw)
+
+    error = exc_info.value
+    rendered = repr((error, error.validation_details))
+    assert sentinel not in rendered
+    assert raw["pth_typo"] == sentinel
+    assert error.validation_details == (
+        {
+            "loc": ("pth_typo",),
+            "msg": "Extra inputs are not permitted",
+            "type": "extra_forbidden",
+        },
+    )
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/dbt_ml/" in traceback.tb_frame.f_code.co_filename:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
 
 def test_duckdb_creates_schema_and_state(tmp_path: Path) -> None:

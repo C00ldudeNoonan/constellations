@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import re
 import sys
 import traceback
 from abc import ABC, abstractmethod
@@ -16,12 +15,17 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from typing import Any, ClassVar
 
+from ..credentials import (
+    CredentialReference,
+    CredentialReferenceError,
+    CredentialResolutionError,
+    ProtectedCredential,
+)
 from ..hashing import HASH_DIGEST_SIZE
 
 log = logging.getLogger(__name__)
 
-PROVIDER_CONTRACT_VERSION = 1
-_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PROVIDER_CONTRACT_VERSION = 2
 
 
 class ProviderError(RuntimeError):
@@ -207,22 +211,7 @@ def sanitized_provider_error(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ProviderCredential:
-    env_var: str
-    _value: str = field(repr=False, compare=False, hash=False)
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.env_var, str)
-            or not _ENV_VAR_NAME.fullmatch(self.env_var)
-        ):
-            raise ValueError("credential env_var is invalid")
-        if not isinstance(self._value, str) or not self._value:
-            raise ValueError("credential value must not be empty")
-
-    def reveal(self) -> str:
-        return self._value
+ProviderCredential = ProtectedCredential
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,28 +455,52 @@ class BaseProvider(ABC):
     def name(cls) -> str:
         return cls.provider_name
 
-    def resolve_credential(self, env_var: str | None) -> ProviderCredential | None:
+    def resolve_credential(
+        self,
+        env_var: str | CredentialReference | None,
+    ) -> ProviderCredential | None:
         if not self.requires_credentials:
             return None
+        failure: ProviderConfigurationError | None = None
+        reference: CredentialReference | None = None
         selected = env_var or self.default_credential_env
-        if not isinstance(selected, str) or not selected:
-            raise ProviderConfigurationError(
+        if selected is None:
+            failure = ProviderConfigurationError(
                 f"{self.name()} requires a configured credential environment variable",
                 safe_for_display=True,
             )
-        if not _ENV_VAR_NAME.fullmatch(selected):
-            raise ProviderConfigurationError(
-                f"{self.name()} credential environment variable name is invalid",
-                safe_for_display=True,
-            )
-        value = os.environ.get(selected)
-        if not value:
-            raise ProviderConfigurationError(
-                f"{selected} is not set. Export it before running provider "
-                f"'{self.name()}'.",
-                safe_for_display=True,
-            )
-        return ProviderCredential(selected, value)
+        else:
+            try:
+                reference = (
+                    selected
+                    if isinstance(selected, CredentialReference)
+                    else CredentialReference.from_env_name(selected)
+                )
+            except (TypeError, CredentialReferenceError):
+                failure = ProviderConfigurationError(
+                    f"{self.name()} credential environment variable name is invalid",
+                    safe_for_display=True,
+                )
+        if reference is not None:
+            try:
+                return reference.resolve()
+            except CredentialResolutionError:
+                failure = ProviderConfigurationError(
+                    f"Inference provider '{self.name()}' credential environment "
+                    "variable is not set or is empty.",
+                    safe_for_display=True,
+                )
+            except Exception as error:
+                failure = ProviderConfigurationError(
+                    f"Inference provider '{self.name()}' credential resolution "
+                    f"failed [{type(error).__name__}].",
+                    safe_for_display=True,
+                )
+        env_var = None
+        selected = None
+        if failure is not None:
+            raise failure
+        raise AssertionError("provider credential resolution did not complete")
 
     def implementation_identity(self) -> str:
         return _implementation_identity(type(self))
@@ -563,14 +576,7 @@ class InferenceProvider(BaseProvider):
                     log.debug(
                         "%s sequential batch item failed:\n%s",
                         self.name(),
-                        redacted_exception_text(
-                            error,
-                            sensitive=(
-                                credential.reveal() if credential else None,
-                                item.request.content,
-                                item.request.system_prompt,
-                            ),
-                        ),
+                        redacted_exception_text(error),
                     )
                 items.append(
                     BatchInferenceItem(
@@ -664,6 +670,8 @@ def resolve_provider_model(
     provider: InferenceProvider,
     model: str | None,
 ) -> str:
+    failure: ProviderConfigurationError | None = None
+    selected: Any = None
     try:
         selected = provider.resolve_model(model)
     except ProviderError as error:
@@ -671,16 +679,20 @@ def resolve_provider_model(
             provider.name(), "model resolution", error
         )
         if isinstance(safe, ProviderConfigurationError):
-            raise safe from None
-        raise ProviderConfigurationError(
-            f"Inference provider '{provider.name()}' model resolution failed",
-            safe_for_display=True,
-        ) from None
+            failure = safe
+        else:
+            failure = ProviderConfigurationError(
+                f"Inference provider '{provider.name()}' model resolution failed",
+                safe_for_display=True,
+            )
     except Exception:
-        raise ProviderConfigurationError(
+        failure = ProviderConfigurationError(
             f"Inference provider '{provider.name()}' model resolution failed",
             safe_for_display=True,
-        ) from None
+        )
+    if failure is not None:
+        model = None
+        raise failure
     if not isinstance(selected, str) or not selected:
         raise ProviderConfigurationError(
             f"Inference provider '{provider.name()}' returned an invalid model",
@@ -697,6 +709,8 @@ class EmbeddingProvider(BaseProvider):
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
     ) -> EmbeddingResult:
+        failure: ProviderError | None = None
+        result: Any = None
         try:
             result = self._embed(
                 request,
@@ -704,9 +718,9 @@ class EmbeddingProvider(BaseProvider):
                 runtime=runtime,
             )
         except ProviderError as error:
-            raise sanitized_provider_error(
+            failure = sanitized_provider_error(
                 self.name(), "embedding", error
-            ) from None
+            )
         except Exception as error:
             # Redacted diagnostics stay in local debug logs; raised errors
             # and artifacts carry only the sanitized form.
@@ -714,17 +728,13 @@ class EmbeddingProvider(BaseProvider):
                 log.debug(
                     "%s embedding failed:\n%s",
                     self.name(),
-                    redacted_exception_text(
-                        error,
-                        sensitive=(
-                            credential.reveal() if credential else None,
-                            *request.texts,
-                        ),
-                    ),
+                    redacted_exception_text(error),
                 )
-            raise ProviderRequestError(
+            failure = ProviderRequestError(
                 self.name(), "embedding", code=type(error).__name__
-            ) from None
+            )
+        if failure is not None:
+            raise failure
         if not isinstance(result, EmbeddingResult):
             raise ProviderResponseError(
                 "provider embedding result has an invalid type",

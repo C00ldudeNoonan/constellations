@@ -15,6 +15,7 @@ from typing import Any
 import duckdb
 
 from ..config.profile import DEFAULT_LLM_PROVIDER
+from ..credentials import CredentialReference, CredentialReferenceError
 from ..hashing import HASH_DIGEST_SIZE
 from ..providers import (
     PROVIDER_CONTRACT_VERSION,
@@ -23,6 +24,7 @@ from ..providers import (
     BatchInferenceResult,
     InferenceProvider,
     InferenceRequest,
+    InferenceResult,
     ProviderCredential,
     ProviderError,
     ProviderRequestError,
@@ -62,6 +64,19 @@ _CACHE_WRITE_LOCK = threading.Lock()
 # disagree get independent gates (combined ceiling = sum of distinct sizes).
 _GATES: dict[int, threading.BoundedSemaphore] = {}
 _GATES_LOCK = threading.Lock()
+
+type CredentialSelector = str | CredentialReference | None
+
+
+def _protect_credential_selector(
+    selector: CredentialSelector,
+) -> tuple[CredentialReference | None, bool]:
+    if selector is None or isinstance(selector, CredentialReference):
+        return selector, True
+    try:
+        return CredentialReference.from_env_name(selector), True
+    except CredentialReferenceError:
+        return None, False
 
 
 def _gate(size: int) -> threading.BoundedSemaphore:
@@ -112,7 +127,7 @@ class LLMBackend(BaseBackend):
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
         provider = get_inference_provider(provider_name)
         model = resolve_provider_model(provider, options.get("model"))
-        api_key_env = _api_key_env(options) or provider.default_credential_env
+        api_key_env = _provider_api_key_env(options, provider)
         _resolve_provider_credential(provider, api_key_env)
         fields_spec = options.get("fields")
         if not fields_spec or not isinstance(fields_spec, list):
@@ -167,7 +182,7 @@ class LLMBackend(BaseBackend):
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
         provider = get_inference_provider(provider_name)
         model = resolve_provider_model(provider, options.get("model"))
-        api_key_env = _api_key_env(options) or provider.default_credential_env
+        api_key_env = _provider_api_key_env(options, provider)
         _resolve_provider_credential(provider, api_key_env)
         if not provider.supports_native_batch:
             raise RuntimeError(
@@ -317,7 +332,7 @@ def extract_fields_from_text(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-    api_key_env: str | None = None,
+    api_key_env: CredentialSelector = None,
 ) -> dict[str, Any]:
     """Extract structured fields from text with a registered provider.
 
@@ -327,6 +342,13 @@ def extract_fields_from_text(
 
     `call_api` remains injectable for compatibility and deterministic tests.
     """
+    api_key_env, credential_reference_is_valid = _protect_credential_selector(
+        api_key_env
+    )
+    if not credential_reference_is_valid:
+        raise ValueError(
+            "llm api_key_env must be a valid environment-variable name"
+        )
     fields, _ = extract_fields_with_usage(
         text,
         fields_spec=fields_spec,
@@ -357,12 +379,19 @@ def extract_fields_with_usage(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-    api_key_env: str | None = None,
+    api_key_env: CredentialSelector = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
     hit is zero tokens and zero API calls — the cache stores only fields, and
     cached responses cost nothing."""
+    api_key_env, credential_reference_is_valid = _protect_credential_selector(
+        api_key_env
+    )
+    if not credential_reference_is_valid:
+        raise ValueError(
+            "llm api_key_env must be a valid environment-variable name"
+        )
     validate_llm_numeric_options(
         {
             "temperature": temperature,
@@ -451,9 +480,18 @@ def _default_call_api(
     temperature: float = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
-    api_key_env: str | None = None,
+    api_key_env: CredentialSelector = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     provider_instance = get_inference_provider(provider)
+    api_key_env, credential_reference_is_valid = _protect_credential_selector(
+        api_key_env
+    )
+    if not credential_reference_is_valid:
+        raise ProviderRequestError(
+            provider,
+            "credential resolution",
+            code="invalid_credential_reference",
+        )
     credential = _resolve_provider_credential(provider_instance, api_key_env)
     request = _inference_request(
         content=content,
@@ -463,6 +501,8 @@ def _default_call_api(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    failure: ProviderError | None = None
+    result: InferenceResult | None = None
     try:
         result = provider_instance.validate_result(
             provider_instance.complete(
@@ -472,26 +512,23 @@ def _default_call_api(
             )
         )
     except ProviderError as error:
-        raise sanitized_provider_error(
+        failure = sanitized_provider_error(
             provider, "inference", error
-        ) from None
+        )
     except Exception as error:
         if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
             log.debug(
                 "provider '%s' inference failed:\n%s",
                 provider,
-                redacted_exception_text(
-                    error,
-                    sensitive=(
-                        credential.reveal() if credential else None,
-                        request.content,
-                        request.system_prompt,
-                    ),
-                ),
+                redacted_exception_text(error),
             )
-        raise ProviderRequestError(
+        failure = ProviderRequestError(
             provider, "inference", code=type(error).__name__
-        ) from None
+        )
+    if failure is not None:
+        raise failure
+    if result is None:
+        raise AssertionError("provider inference did not produce a result")
     return dict(result.output), result.usage.to_metrics()
 
 
@@ -500,11 +537,22 @@ def _run_message_batch(
     *,
     provider: str = DEFAULT_LLM_PROVIDER,
     poll_seconds: float,
-    api_key_env: str | None = None,
+    api_key_env: CredentialSelector = None,
     max_retries: int = _DEFAULT_MAX_RETRIES,
 ) -> BatchInferenceResult:
     provider_instance = get_inference_provider(provider)
+    api_key_env, credential_reference_is_valid = _protect_credential_selector(
+        api_key_env
+    )
+    if not credential_reference_is_valid:
+        raise ProviderRequestError(
+            provider,
+            "credential resolution",
+            code="invalid_credential_reference",
+        )
     credential = _resolve_provider_credential(provider_instance, api_key_env)
+    failure: ProviderError | None = None
+    result: BatchInferenceResult | None = None
     try:
         result = provider_instance.complete_batch(
             requests,
@@ -512,27 +560,26 @@ def _run_message_batch(
             runtime=ProviderRuntimeOptions(max_retries=max_retries),
             poll_seconds=poll_seconds,
         )
-        return provider_instance.validate_batch_result(requests, result)
+        result = provider_instance.validate_batch_result(requests, result)
     except ProviderError as error:
-        raise sanitized_provider_error(
+        failure = sanitized_provider_error(
             provider, "batch inference", error
-        ) from None
+        )
     except Exception as error:
         if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
-            sensitive: list[str | None] = [
-                credential.reveal() if credential else None
-            ]
-            for item in requests:
-                sensitive.append(item.request.content)
-                sensitive.append(item.request.system_prompt)
             log.debug(
                 "provider '%s' batch inference failed:\n%s",
                 provider,
-                redacted_exception_text(error, sensitive=tuple(sensitive)),
+                redacted_exception_text(error),
             )
-        raise ProviderRequestError(
+        failure = ProviderRequestError(
             provider, "batch inference", code=type(error).__name__
-        ) from None
+        )
+    if failure is not None:
+        raise failure
+    if result is None:
+        raise AssertionError("provider batch inference did not produce a result")
+    return result
 
 
 def _inference_request(
@@ -560,25 +607,61 @@ def _inference_request(
 
 def _resolve_provider_credential(
     provider: InferenceProvider,
-    api_key_env: str | None,
+    api_key_env: CredentialSelector,
 ) -> ProviderCredential | None:
+    api_key_env, credential_reference_is_valid = _protect_credential_selector(
+        api_key_env
+    )
+    failure: ProviderError | None = None
+    credential: ProviderCredential | None = None
+    if not credential_reference_is_valid:
+        failure = ProviderRequestError(
+            provider.name(),
+            "credential resolution",
+            code="invalid_credential_reference",
+        )
     try:
-        return provider.resolve_credential(api_key_env)
+        if failure is None:
+            credential = provider.resolve_credential(api_key_env)
     except ProviderError as error:
-        raise sanitized_provider_error(
+        failure = sanitized_provider_error(
             provider.name(), "credential resolution", error
-        ) from None
+        )
     except Exception as error:
-        raise ProviderRequestError(
+        failure = ProviderRequestError(
             provider.name(),
             "credential resolution",
             code=type(error).__name__,
-        ) from None
+        )
+    if failure is not None:
+        raise failure
+    return credential
 
 
-def _api_key_env(options: dict[str, Any]) -> str | None:
+def _api_key_env(
+    options: dict[str, Any],
+) -> tuple[CredentialReference | None, bool]:
     value = options.get("api_key_env")
-    return str(value) if value is not None else None
+    if not isinstance(value, str | CredentialReference | None):
+        return None, False
+    return _protect_credential_selector(value)
+
+
+def _provider_api_key_env(
+    options: dict[str, Any], provider: InferenceProvider
+) -> CredentialReference | None:
+    configured, credential_reference_is_valid = _api_key_env(options)
+    if not credential_reference_is_valid:
+        options = {}
+        raise ValueError(
+            "llm api_key_env must be a valid environment-variable name"
+        )
+    if configured is not None:
+        return configured
+    default = provider.default_credential_env
+    if default is None:
+        return None
+    return CredentialReference.from_env_name(default)
 
 
 def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:

@@ -56,9 +56,12 @@ Use these maintained references rather than copying volatile feature lists:
 - Configuration discovery must accept regular, non-symlink files only. Local
   source discovery and fetch must not follow symlinks; preserve the no-follow
   walk and verified scratch-copy boundary in `sources/local.py`.
-- Never expose resolved credentials in logs, caches, artifacts, or diagnostics.
-  Raw documents, provider response bodies/headers, and sensitive exception text
-  must not enter logs or artifacts. Warehouses and caches may contain intended
+- Never expose resolved credentials or credential environment-variable names in
+  logs, caches, artifacts, config dumps, hashing, or diagnostics. Preserve
+  references through validation and reveal values only at native SDK
+  construction. Raw documents, provider response bodies/headers, and sensitive
+  exception text must not enter logs or artifacts. Warehouses and caches may
+  contain intended
   outputs; configured prompts and cached values can be sensitive, so minimize
   and document artifact-visible fields and preserve owner-only cache storage.
 - Validate incremental keys before mutation. Use each adapter's declared

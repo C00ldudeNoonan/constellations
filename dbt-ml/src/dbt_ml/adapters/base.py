@@ -30,6 +30,28 @@ class AdapterError(Exception):
     pass
 
 
+class AdapterConfigError(AdapterError):
+    """Adapter validation failure carrying only diagnostic-safe details."""
+
+    def __init__(
+        self,
+        message: str,
+        validation_details: Iterable[Mapping[str, Any]],
+    ) -> None:
+        super().__init__(message)
+        self.validation_details = tuple(
+            {
+                "loc": tuple(
+                    part if isinstance(part, str | int) else "<unknown>"
+                    for part in detail.get("loc", ())
+                ),
+                "msg": str(detail.get("msg", "Invalid value")),
+                "type": str(detail.get("type", "value_error")),
+            }
+            for detail in validation_details
+        )
+
+
 class AdapterCapabilityError(AdapterError):
     pass
 

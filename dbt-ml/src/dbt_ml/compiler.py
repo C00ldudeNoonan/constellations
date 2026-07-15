@@ -6,7 +6,7 @@ from pathlib import Path
 from .adapters import WarehouseCapability, adapter_capabilities
 from .backends import BackendOptionsError, list_backends, validate_backend_options
 from .config.loader import ConfigError
-from .config.model import ModelConfig
+from .config.model import ModelConfig, protect_model_llm_credential_option
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .config.yaml_diagnostics import ConfigPath
@@ -30,6 +30,12 @@ def validate_project_contract(
     models: list[ModelConfig],
     project_dir: Path,
 ) -> ProjectDAG:
+    default_backend = project.extraction.default_backend
+    for model in models:
+        extraction = model.extraction
+        if extraction is not None and (extraction.backend or default_backend) == "llm":
+            protect_model_llm_credential_option(model)
+
     source_names = {source.name for source in sources}
     model_names = {model.name for model in models}
     duplicates = source_names & model_names
@@ -42,7 +48,6 @@ def validate_project_contract(
         )
 
     available_backends = set(list_backends())
-    default_backend = project.extraction.default_backend
     if default_backend not in available_backends:
         raise ConfigError(
             project.format_yaml_diagnostic(

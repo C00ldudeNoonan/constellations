@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import ValidationError
 
-from .model import ModelConfig, ModelFile
+from .model import ModelConfig, ModelFile, protect_model_llm_credential_option
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
 from .yaml_diagnostics import (
@@ -85,6 +86,13 @@ def load_project(
         )
 
     models: list[ModelConfig] = []
+    default_backend = project.extraction.default_backend
+
+    def protect_loaded_model(model: ModelConfig) -> None:
+        extraction = model.extraction
+        if extraction is not None and (extraction.backend or default_backend) == "llm":
+            protect_model_llm_credential_option(model)
+
     for model_dir in project.model_paths:
         configured = project_dir / model_dir
         resolved = resolve_within_project(
@@ -100,6 +108,7 @@ def load_project(
                 lambda f: f.models,
                 description="Model configuration",
                 attach_model_provenance=True,
+                postprocess=protect_loaded_model,
             )
         )
 
@@ -110,19 +119,33 @@ def _parse_yaml_with_document[T](
     path: Path,
     model: type[T],
 ) -> tuple[T, YamlDocument]:
+    document: YamlDocument | None = None
+    load_error: ConfigError | None = None
     try:
         with path.open() as f:
             document = parse_yaml_document(f.read())
     except yaml.YAMLError as e:
-        raise ConfigError(format_yaml_parse_error(path, e)) from e
+        load_error = ConfigError(format_yaml_parse_error(path, e))
     except OSError as e:
-        raise ConfigError(f"Could not read YAML configuration file {path}: {e}") from e
+        load_error = ConfigError(
+            f"Could not read YAML configuration file {path}: {e}"
+        )
+    if load_error is not None:
+        raise load_error
+    assert document is not None
     data: Any = document.data if document.data is not None else {}
+    document = document.without_data()
+    validation_failure: ConfigError | None = None
     try:
         parsed = model.model_validate(data)  # type: ignore[attr-defined]
     except ValidationError as e:
         diagnostics = document.format_validation_errors(path, e)
-        raise ConfigError(f"Invalid YAML at {path}:\n{diagnostics}") from e
+        validation_failure = ConfigError(
+            f"Invalid YAML at {path}:\n{diagnostics}"
+        )
+    if validation_failure is not None:
+        data = None
+        raise validation_failure
     return parsed, document
 
 
@@ -133,6 +156,7 @@ def _load_yaml_dir[F, I](
     *,
     description: str,
     attach_model_provenance: bool = False,
+    postprocess: Callable[[I], None] | None = None,
 ) -> list[I]:
     if not directory.exists():
         return []
@@ -178,6 +202,9 @@ def _load_yaml_dir[F, I](
             )
             parsed, document = _parse_yaml_with_document(path, file_model)
             items: list[I] = list(extract(parsed))
+            if postprocess is not None:
+                for item in items:
+                    postprocess(item)
             if attach_model_provenance:
                 for index, item in enumerate(items):
                     if not isinstance(item, ModelConfig):

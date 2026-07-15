@@ -10,7 +10,14 @@ import dbt_ml.providers.base as provider_base
 from dbt_ml.backends import get_backend
 from dbt_ml.backends.llm_backend import extract_fields_from_text
 from dbt_ml.config.profile import resolve_llm_credential
+from dbt_ml.credentials import (
+    CredentialReference,
+    CredentialReferenceError,
+    ProtectedCredential,
+)
+from dbt_ml.hashing import canonical_fingerprint
 from dbt_ml.providers import (
+    PROVIDER_CONTRACT_VERSION,
     BatchInferenceItem,
     BatchInferenceRequest,
     BatchInferenceResult,
@@ -49,6 +56,17 @@ def _request(content: str = "hello") -> InferenceRequest:
             "properties": {"value": {"type": "string"}},
         },
     )
+
+
+def _provider_traceback_locals(error: BaseException) -> str:
+    rendered: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("dbt_ml"):
+            rendered.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    return "\n".join(rendered)
 
 
 class _EchoInferenceProvider(InferenceProvider):
@@ -155,7 +173,6 @@ def test_public_helper_uses_selected_provider_credential_default(
         ) -> InferenceResult:
             del runtime
             assert credential is not None
-            observed["env_var"] = credential.env_var
             observed["value"] = credential.reveal()
             return InferenceResult({"value": request.content})
 
@@ -179,16 +196,15 @@ def test_public_helper_uses_selected_provider_credential_default(
     )
 
     assert fields == {"value": "provider-neutral"}
-    assert observed == {
-        "env_var": "ACME_API_KEY",
-        "value": "selected-provider-key",
-    }
-    assert resolve_llm_credential(
+    assert observed == {"value": "selected-provider-key"}
+    resolved_credential = resolve_llm_credential(
         {"provider": "credential-helper-test"}
-    ) == ("ACME_API_KEY", "selected-provider-key")
-    assert resolve_llm_credential(
-        {"provider": "contract-test"}
-    ) == (None, None)
+    )
+    assert isinstance(resolved_credential, ProtectedCredential)
+    assert not isinstance(resolved_credential, tuple)
+    assert resolved_credential.reveal() == "selected-provider-key"
+    assert "ACME_API_KEY" not in repr(resolved_credential)
+    assert resolve_llm_credential({"provider": "contract-test"}) is None
 
 
 def test_registry_rejects_duplicate_and_invalid_providers() -> None:
@@ -271,6 +287,8 @@ def test_registry_requires_zero_argument_and_sanitized_initialization() -> None:
         get_inference_provider("failing-init-contract-test")
     assert "a-secret" not in str(exc_info.value)
     assert "RuntimeError" in str(exc_info.value)
+    assert "a-secret" not in _provider_traceback_locals(exc_info.value)
+    assert exc_info.value.__context__ is None
 
     class ProviderErrorInitializationProvider(_EchoInferenceProvider):
         provider_name = "provider-error-init-contract-test"
@@ -283,6 +301,8 @@ def test_registry_requires_zero_argument_and_sanitized_initialization() -> None:
         get_inference_provider("provider-error-init-contract-test")
     assert "a-secret" not in str(provider_exc_info.value)
     assert "ProviderConfigurationError" in str(provider_exc_info.value)
+    assert "a-secret" not in _provider_traceback_locals(provider_exc_info.value)
+    assert provider_exc_info.value.__context__ is None
 
 
 def test_unknown_provider_error_lists_safe_available_names() -> None:
@@ -484,6 +504,33 @@ def test_embedding_provider_rejects_misaligned_results() -> None:
         )
 
 
+def test_embedding_error_drops_native_exception_and_credential_locals() -> None:
+    sentinel = "distinctive-embedding-credential-secret"
+
+    class CrashingEmbeddingProvider(_EchoEmbeddingProvider):
+        def _embed(
+            self,
+            request: EmbeddingRequest,
+            *,
+            credential: ProviderCredential | None,
+            runtime: ProviderRuntimeOptions,
+        ) -> EmbeddingResult:
+            del request, credential, runtime
+            raise RuntimeError(sentinel)
+
+    with pytest.raises(ProviderRequestError) as exc_info:
+        CrashingEmbeddingProvider().embed(
+            EmbeddingRequest(model="embed-test", texts=("one",)),
+            credential=ProviderCredential(sentinel),
+            runtime=ProviderRuntimeOptions(),
+        )
+
+    assert sentinel not in str(exc_info.value)
+    assert sentinel not in _provider_traceback_locals(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     ("values", "match"),
     [
@@ -548,20 +595,82 @@ def test_credentials_are_explicit_and_redacted(
     assert credential.reveal() == secret
     assert secret not in repr(credential)
     assert secret not in str(credential)
+    assert "CONTRACT_TEST_API_KEY" not in repr(credential)
+
+    other = ProviderCredential("other-private-value")
+    assert credential == other
+    assert hash(credential) == hash(other)
+    assert canonical_fingerprint(
+        credential, domain="provider-credential-test"
+    ) == canonical_fingerprint(other, domain="provider-credential-test")
 
     monkeypatch.delenv("CONTRACT_TEST_API_KEY")
     with pytest.raises(ProviderConfigurationError) as exc_info:
         CredentialProvider().resolve_credential(None)
     assert secret not in str(exc_info.value)
-    assert "CONTRACT_TEST_API_KEY" in str(exc_info.value)
+    assert "CONTRACT_TEST_API_KEY" not in str(exc_info.value)
+    assert "CONTRACT_TEST_API_KEY" not in _provider_traceback_locals(
+        exc_info.value
+    )
 
     unsafe_env_name = "BAD\nsecret-name"
     with pytest.raises(ProviderConfigurationError) as unsafe_exc_info:
         CredentialProvider().resolve_credential(unsafe_env_name)
     assert unsafe_env_name not in str(unsafe_exc_info.value)
+    assert unsafe_env_name not in _provider_traceback_locals(
+        unsafe_exc_info.value
+    )
 
-    with pytest.raises(ValueError, match="env_var is invalid"):
-        ProviderCredential(unsafe_env_name, secret)
+    with pytest.raises(CredentialReferenceError) as reference_exc_info:
+        CredentialReference.from_env_name(unsafe_env_name)
+    assert unsafe_env_name not in str(reference_exc_info.value)
+
+    with pytest.raises(TypeError):
+        ProviderCredential("LEGACY_ENV_NAME", secret)
+    assert not hasattr(credential, "env_var")
+    assert PROVIDER_CONTRACT_VERSION == 2
+
+
+def test_llm_credential_helper_drops_reference_names_from_traceback_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference_name = "PRIVATE_HELPER_TRACEBACK_REFERENCE"
+    monkeypatch.delenv(reference_name, raising=False)
+
+    class CredentialProvider(_EchoInferenceProvider):
+        provider_name = "credential-traceback-test"
+        requires_credentials = True
+        default_credential_env = None
+
+    register_inference_provider(CredentialProvider)
+
+    with pytest.raises(ProviderConfigurationError) as exc_info:
+        resolve_llm_credential(
+            {
+                "provider": "credential-traceback-test",
+                "api_key_env": reference_name,
+            }
+        )
+
+    assert reference_name not in str(exc_info.value)
+    assert reference_name not in _provider_traceback_locals(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+    with pytest.raises(ProviderConfigurationError) as helper_exc_info:
+        extract_fields_from_text(
+            "credential-safe helper input",
+            fields_spec=[{"name": "value", "type": "string"}],
+            provider="credential-traceback-test",
+            model="test-model",
+            api_key_env=reference_name,
+        )
+
+    assert reference_name not in _provider_traceback_locals(
+        helper_exc_info.value
+    )
+    assert helper_exc_info.value.__cause__ is None
+    assert helper_exc_info.value.__context__ is None
 
 
 def test_request_error_rejects_unsafe_provider_error_text() -> None:
@@ -614,7 +723,7 @@ def test_provider_boundary_replaces_unsafe_provider_error_text() -> None:
 
     assert secret not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
-    assert exc_info.value.__suppress_context__ is True
+    assert exc_info.value.__context__ is None
 
     with pytest.raises(ValueError, match="safe_for_display must be boolean"):
         ProviderResponseError(
@@ -638,7 +747,8 @@ def test_model_resolution_boundary_replaces_unsafe_provider_error() -> None:
 
     assert secret not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
-    assert exc_info.value.__suppress_context__ is True
+    assert exc_info.value.__context__ is None
+    assert secret not in _provider_traceback_locals(exc_info.value)
 
 
 def test_provider_implementation_identity_is_stable_and_class_specific() -> None:

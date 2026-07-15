@@ -228,13 +228,15 @@ def _instantiate[ProviderType: BaseProvider](
     name: str,
     capability: str,
 ) -> ProviderType:
+    failure: ProviderConfigurationError | None = None
     try:
         return cls()
     except Exception as error:
-        raise ProviderConfigurationError(
+        failure = ProviderConfigurationError(
             f"{capability} provider '{name}' could not be initialized "
             f"[{type(error).__name__}]"
-        ) from None
+        )
+    raise failure
 
 
 def _is_provider_name(value: object) -> bool:

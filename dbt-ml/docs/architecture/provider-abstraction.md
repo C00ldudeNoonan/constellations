@@ -123,11 +123,17 @@ the context or artifacts.
 
 ## Credentials and errors
 
-Providers receive a `ProviderCredential` resolved from an environment-variable
-name. The secret value is excluded from its representation, comparison, and
-hashing, and access requires an explicit `reveal()` call at the SDK boundary.
-Provider implementations must never place the revealed value in logs,
-artifacts, usage metadata, cache keys, or exceptions.
+Provider contract v2 carries a `CredentialReference` through profile and
+backend validation, then resolves it to a `ProviderCredential` only at the
+provider boundary. `ProviderCredential` is an alias of `ProtectedCredential`:
+it is constructed as `ProviderCredential(value)`, has no `.env_var` attribute,
+and requires an explicit `reveal()` call at native SDK construction. Protected
+values and credential-reference names are excluded from representation,
+serialization, comparison, hashing, and fingerprints.
+`resolve_llm_credential()` likewise returns this protected value or `None`,
+rather than the v1 `(env_name, value)` tuple. Provider implementations must
+never place the revealed value in logs, artifacts, usage metadata, cache keys,
+or exceptions.
 
 Errors crossing the provider boundary use the `ProviderError` hierarchy.
 Unexpected SDK exceptions become `ProviderRequestError` values containing the

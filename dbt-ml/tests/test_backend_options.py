@@ -20,6 +20,7 @@ from dbt_ml.backends import (
     validate_backend_options,
 )
 from dbt_ml.cli import cli
+from dbt_ml.credentials import CredentialReference
 
 
 def test_option_contracts_cover_every_shipped_backend() -> None:
@@ -106,7 +107,63 @@ def test_shipped_backends_expose_distinct_implementation_identities() -> None:
 def test_documented_backend_option_shapes_are_valid(
     backend: str, options: dict[str, object]
 ) -> None:
-    assert validate_backend_options(backend, options) == options
+    validated = validate_backend_options(backend, options)
+    if backend != "llm":
+        assert validated == options
+        return
+
+    reference = validated.pop("api_key_env")
+    expected = dict(options)
+    expected.pop("api_key_env")
+    assert validated == expected
+    assert isinstance(reference, CredentialReference)
+    assert "TEST_ANTHROPIC_KEY" not in repr(reference)
+
+
+def test_llm_credential_reference_is_opaque_but_survives_runtime_validation(
+) -> None:
+    raw_reference = "PRIVATE_LLM_CREDENTIAL"
+    parsed = get_backend_option_contract("llm").options_model.model_validate(
+        {
+            "fields": [{"name": "title", "type": "string"}],
+            "api_key_env": raw_reference,
+        }
+    )
+
+    assert raw_reference not in repr(parsed)
+    assert raw_reference not in parsed.model_dump()
+    assert raw_reference not in parsed.model_dump_json()
+
+    validated = validate_backend_options(
+        "llm",
+        {
+            "fields": [{"name": "title", "type": "string"}],
+            "api_key_env": raw_reference,
+        },
+    )
+    assert isinstance(validated["api_key_env"], CredentialReference)
+    assert raw_reference not in repr(validated)
+
+
+def test_backend_validation_error_drops_credential_reference_input() -> None:
+    raw_reference = "PRIVATE_INVALID_LLM_OPTIONS_REFERENCE"
+
+    with pytest.raises(BackendOptionsError) as exc_info:
+        validate_backend_options(
+            "llm",
+            {"fields": [], "api_key_env": raw_reference},
+        )
+
+    error = exc_info.value
+    assert raw_reference not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("dbt_ml"):
+            assert raw_reference not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
 
 @pytest.mark.parametrize("alias", ["data_type", "data-type", "dtype"])

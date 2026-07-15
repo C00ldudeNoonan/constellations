@@ -159,9 +159,10 @@ LLM extraction, RAG chunks, classic text ML, and a dbt consumer project.
 Only run projects you trust: Python transforms and custom tests execute in the
 dbt-ml process. Project-controlled paths are confined to the project unless an
 explicit `external: true` boundary is supported; local source patterns cannot
-traverse parents or symlinks. Profiles select destinations and credential names
-and must be reviewed as trusted configuration. The LLM backend sends document
-text to Anthropic using the configured environment variable, and the PII
+traverse parents or symlinks. Profiles select destinations and opaque credential
+references and must be reviewed as trusted configuration; credential values and
+reference names stay out of artifacts and diagnostics. The LLM backend sends
+document text to Anthropic using the configured environment variable, and the PII
 transform retains non-target input columns unless you explicitly project or
 drop them.
 `dbt-ml clean` removes known local artifacts without resetting a warehouse. See

@@ -243,8 +243,9 @@ def test_compile_warning_uses_configured_api_key_env(
     )
 
     assert result.exit_code == 0, result.output
-    assert "warning: DBT_ML_ANTHROPIC_KEY is not set" in result.output
-    assert "warning: ANTHROPIC_API_KEY is not set" not in result.output
+    assert "warning: Inference provider 'anthropic' credential" in result.output
+    assert "DBT_ML_ANTHROPIC_KEY" not in result.output
+    assert "ANTHROPIC_API_KEY" not in result.output
     assert "wrong-default-secret" not in result.output
 
 
@@ -272,7 +273,8 @@ def test_compile_warns_for_llm_transform_without_llm_extraction(
     )
 
     assert result.exit_code == 0, result.output
-    assert "warning: ANTHROPIC_API_KEY is not set" in result.output
+    assert "warning: Inference provider 'anthropic' credential" in result.output
+    assert "ANTHROPIC_API_KEY" not in result.output
 
 
 def test_api_key_secret_is_not_persisted_or_logged(

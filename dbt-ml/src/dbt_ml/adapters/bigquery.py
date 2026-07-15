@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import io
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -31,11 +31,20 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    GetCoreSchemaHandler,
+    GetJsonSchemaHandler,
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 
 from ..config.profile import WarehouseConfig
+from ..credentials import (
+    CredentialFreeUrl,
+    CredentialReference,
+    CredentialResolutionError,
+)
 from .base import (
     AdapterError,
     StateRecord,
@@ -99,13 +108,34 @@ DEFAULT_SCOPES = (
 )
 
 AuthMethod = Literal["oauth", "service-account", "service-account-json", "oauth-secrets"]
+_ENV_REFERENCE_JSON_PATTERN = (
+    r"^\{\{[ \t]*env_var\([ \t]*(['\"])[A-Za-z_][A-Za-z0-9_]*"
+    r"\1[ \t]*\)[ \t]*\}\}$"
+)
+
+
+class _ProtectedBigQueryInput:
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return "<redacted>"
+
+    __str__ = __repr__
+
+    def take(self) -> Any:
+        value = self.value
+        self.value = None
+        return value
 
 
 class BigQueryWarehouseConfig(WarehouseConfig):
-    """Field names mirror dbt-bigquery's profile so existing dbt profiles
-    port over. `method:` may be omitted — it is inferred from which
-    credential fields are present (keyfile → service-account, keyfile_json →
-    service-account-json, token/refresh_token → oauth-secrets, else oauth/ADC).
+    """Non-secret fields mirror dbt-bigquery's profile. Secret-bearing fields
+    accept only an exact ``env_var()`` reference, which remains opaque until
+    native credential construction. `method:` may be omitted and is inferred
+    from the selected auth fields.
 
     profiles.yml:
 
@@ -128,13 +158,37 @@ class BigQueryWarehouseConfig(WarehouseConfig):
 
     # ─── auth (dbt-bigquery parity) ───────────────────────────────────────
     method: AuthMethod | None = None
-    keyfile: Path | None = None
-    keyfile_json: dict[str, Any] | str | None = None  # dict, JSON, or base64 JSON
-    token: str | None = None
-    refresh_token: str | None = None
+    keyfile: Path | CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    keyfile_json: CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    token: CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    refresh_token: CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
     client_id: str | None = None
-    client_secret: str | None = None
-    token_uri: str | None = None
+    client_secret: CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    token_uri: CredentialReference | CredentialFreeUrl | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
     impersonate_service_account: str | None = None
     scopes: list[str] = Field(default_factory=lambda: list(DEFAULT_SCOPES))
 
@@ -148,44 +202,182 @@ class BigQueryWarehouseConfig(WarehouseConfig):
     job_creation_timeout_seconds: float | None = None
     job_execution_timeout_seconds: float | None = None
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        model_schema = handler(source_type)
+        return core_schema.chain_schema(
+            [
+                core_schema.no_info_plain_validator_function(
+                    _ProtectedBigQueryInput,
+                    json_schema_input_schema=model_schema,
+                ),
+                core_schema.no_info_plain_validator_function(
+                    cls._prepare_model_input,
+                    json_schema_input_schema=model_schema,
+                ),
+                model_schema,
+            ]
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        schema: CoreSchema,
+        handler: GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        json_schema = handler(schema)
+        resolved = handler.resolve_ref_schema(json_schema)
+        properties = resolved.get("properties", {})
+        for field_name in (
+            "client_secret",
+            "keyfile",
+            "keyfile_json",
+            "refresh_token",
+            "token",
+            "token_uri",
+        ):
+            property_schema = properties.get(field_name, {})
+            for candidate in property_schema.get("anyOf", ()):
+                if candidate.get("format") == "password":
+                    candidate["pattern"] = _ENV_REFERENCE_JSON_PATTERN
+                    candidate["description"] = (
+                        "Exact {{ env_var('NAME') }} credential reference"
+                    )
+        return json_schema
+
+    @classmethod
+    def _prepare_model_input(cls, wrapped: _ProtectedBigQueryInput) -> Any:
+        raw = wrapped.take()
+        if isinstance(raw, cls):
+            return raw
+        if not isinstance(raw, Mapping):
+            raise PydanticCustomError(
+                "bigquery_config",
+                "BigQuery warehouse config must be a mapping",
+            )
+        try:
+            return cls.prepare_profile_input(raw)
+        except (TypeError, ValueError) as error:
+            raise PydanticCustomError(
+                "protected_bigquery_config",
+                str(error),
+            ) from None
+
+    @classmethod
+    def prepare_profile_input(cls, raw: Mapping[str, Any]) -> dict[str, Any]:
+        prepared = dict(raw)
+        for field_name in (
+            "keyfile_json",
+            "token",
+            "refresh_token",
+            "client_secret",
+        ):
+            value = prepared.get(field_name)
+            if value is None or isinstance(value, CredentialReference):
+                continue
+            try:
+                prepared[field_name] = (
+                    CredentialReference.from_env_var_expression(value)
+                )
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"`{field_name}` must be an exact "
+                    "{{ env_var('NAME') }} reference with no default; move "
+                    "literal credentials to an environment variable"
+                ) from None
+
+        for field_name in ("keyfile", "token_uri"):
+            value = prepared.get(field_name)
+            if value is None or isinstance(value, CredentialReference):
+                continue
+            if isinstance(value, str) and (
+                "{{" in value or "env_var(" in value
+            ):
+                try:
+                    prepared[field_name] = (
+                        CredentialReference.from_env_var_expression(value)
+                    )
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"`{field_name}` environment configuration must be an "
+                        "exact {{ env_var('NAME') }} reference with no default"
+                    ) from None
+
+        token_uri = prepared.get("token_uri")
+        if isinstance(token_uri, str):
+            prepared["token_uri"] = _validate_token_uri(token_uri)
+        return prepared
+
     @model_validator(mode="after")
     def _resolve_auth_method(self) -> BigQueryWarehouseConfig:
         if self.keyfile is not None and self.keyfile_json is not None:
             raise ValueError("set either `keyfile` or `keyfile_json`, not both")
+
+        oauth_values = (
+            self.token,
+            self.refresh_token,
+            self.client_id,
+            self.client_secret,
+            self.token_uri,
+        )
+        has_oauth_values = any(value is not None for value in oauth_values)
+        if (self.keyfile is not None or self.keyfile_json is not None) and (
+            has_oauth_values
+        ):
+            raise ValueError(
+                "service-account and OAuth credential fields cannot be combined"
+            )
+
         inferred: AuthMethod
         if self.keyfile is not None:
             inferred = "service-account"
         elif self.keyfile_json is not None:
             inferred = "service-account-json"
-        elif self.token or self.refresh_token:
+        elif has_oauth_values:
             inferred = "oauth-secrets"
         else:
             inferred = "oauth"
         if self.method is None:
             self.method = inferred
-        elif self.method != inferred and inferred != "oauth":
-            raise ValueError(
-                f"method '{self.method}' conflicts with the credential fields "
-                f"provided (which imply '{inferred}')"
-            )
 
         if self.method == "service-account" and self.keyfile is None:
             raise ValueError("method 'service-account' requires `keyfile`")
         if self.method == "service-account-json" and self.keyfile_json is None:
             raise ValueError("method 'service-account-json' requires `keyfile_json`")
         if self.method == "oauth-secrets":
-            has_refresh_set = all(
-                (self.refresh_token, self.client_id, self.client_secret, self.token_uri)
+            refresh_values = (
+                self.refresh_token,
+                self.client_id,
+                self.client_secret,
+                self.token_uri,
             )
-            if not self.token and not has_refresh_set:
+            has_refresh_set = all(value is not None for value in refresh_values)
+            has_partial_refresh_set = any(
+                value is not None for value in refresh_values
+            ) and not has_refresh_set
+            if has_partial_refresh_set or (
+                self.token is None and not has_refresh_set
+            ):
                 raise ValueError(
                     "method 'oauth-secrets' requires `token`, or all of "
                     "`refresh_token`, `client_id`, `client_secret`, `token_uri`"
                 )
+
+        if self.method != inferred:
+            raise ValueError(
+                f"method '{self.method}' conflicts with the credential fields "
+                f"provided (which imply '{inferred}')"
+            )
         return self
 
     def absolutize(self, project_dir: Path) -> BigQueryWarehouseConfig:
-        if self.keyfile is None:
+        if self.keyfile is None or isinstance(
+            self.keyfile, CredentialReference
+        ):
             return self
         return self.model_copy(
             update={"keyfile": (project_dir / self.keyfile).resolve()}
@@ -196,6 +388,10 @@ class BigQueryWarehouseConfig(WarehouseConfig):
 
     def catalog_name(self) -> str:
         return self.project
+
+
+def _validate_token_uri(value: str) -> CredentialFreeUrl:
+    return CredentialFreeUrl(value)
 
 
 class BigQueryPartitionRange(BaseModel):
@@ -302,24 +498,37 @@ class BigQueryWarehouseOptions(BaseModel):
 
 
 def parse_keyfile_json(value: dict[str, Any] | str) -> dict[str, Any]:
-    """`keyfile_json` accepts a YAML mapping, a JSON string, or base64-encoded
-    JSON (matching dbt-bigquery, where CI pipelines inject it via env vars)."""
+    """Decode a resolved service-account mapping, JSON, or base64 JSON value."""
     import base64
     import json
 
     if isinstance(value, dict):
         return value
+    if not isinstance(value, str):
+        del value
+        raise AdapterError(
+            "keyfile_json must be a mapping, a JSON string, or base64-encoded JSON"
+        )
+    parsed: Any = None
+    failure: AdapterError | None = None
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         try:
             parsed = json.loads(base64.b64decode(value, validate=True))
-        except Exception as e:
-            raise AdapterError(
+        except Exception:
+            failure = AdapterError(
                 "keyfile_json must be a mapping, a JSON string, or base64-encoded JSON"
-            ) from e
+            )
+    if failure is not None:
+        value = ""
+        parsed = None
+        raise failure
     if not isinstance(parsed, dict):
-        raise AdapterError("keyfile_json must decode to a JSON object")
+        value = ""
+        parsed = None
+        failure = AdapterError("keyfile_json must decode to a JSON object")
+        raise failure
     return parsed
 
 
@@ -438,50 +647,98 @@ class BigQueryAdapter(WarehouseAdapter):
     def _credentials(self) -> Any:
         """Build google credentials per the configured auth method, then apply
         impersonation and quota-project wrapping — mirroring dbt-bigquery."""
+        failure: AdapterError | None = None
+        try:
+            return self._build_credentials()
+        except ImportError:
+            failure = AdapterError(_INSTALL_HINT)
+        except CredentialResolutionError as error:
+            failure = AdapterError(str(error))
+        except AdapterError as error:
+            failure = AdapterError(str(error))
+        except Exception:
+            failure = AdapterError("BigQuery credential construction failed")
+        if failure is not None:
+            raise failure
+        raise AssertionError("unreachable credential construction state")
+
+    def _build_credentials(self) -> Any:
         cfg = self._cfg
         scopes = tuple(cfg.scopes)
-        try:
-            if cfg.method == "service-account":
-                from google.oauth2 import service_account
+        if cfg.method == "service-account":
+            from google.oauth2 import service_account
 
-                creds = service_account.Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
-                    str(cfg.keyfile), scopes=scopes
-                )
-            elif cfg.method == "service-account-json":
-                from google.oauth2 import service_account
+            keyfile = cfg.keyfile
+            if isinstance(keyfile, CredentialReference):
+                keyfile_value = keyfile.resolve().reveal()
+                keyfile_path = Path(keyfile_value)
+                if self.project_dir is not None and not keyfile_path.is_absolute():
+                    keyfile_path = (self.project_dir / keyfile_path).resolve()
+            else:
+                assert isinstance(keyfile, Path)
+                keyfile_path = keyfile
+            creds = service_account.Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
+                str(keyfile_path), scopes=scopes
+            )
+        elif cfg.method == "service-account-json":
+            from google.oauth2 import service_account
 
-                assert cfg.keyfile_json is not None
-                creds = service_account.Credentials.from_service_account_info(  # type: ignore[no-untyped-call]
-                    parse_keyfile_json(cfg.keyfile_json), scopes=scopes
-                )
-            elif cfg.method == "oauth-secrets":
-                from google.oauth2.credentials import Credentials as UserCredentials
+            assert cfg.keyfile_json is not None
+            keyfile_json = cfg.keyfile_json.resolve().reveal()
+            creds = service_account.Credentials.from_service_account_info(  # type: ignore[no-untyped-call]
+                parse_keyfile_json(keyfile_json), scopes=scopes
+            )
+        elif cfg.method == "oauth-secrets":
+            from google.oauth2.credentials import Credentials as UserCredentials
 
-                creds = UserCredentials(  # type: ignore[no-untyped-call]
-                    token=cfg.token,
-                    refresh_token=cfg.refresh_token,
-                    client_id=cfg.client_id,
-                    client_secret=cfg.client_secret,
-                    token_uri=cfg.token_uri,
-                    scopes=scopes,
-                )
-            else:  # oauth: gcloud Application Default Credentials
-                import google.auth
+            token = (
+                cfg.token.resolve().reveal()
+                if cfg.token is not None
+                else None
+            )
+            refresh_token = (
+                cfg.refresh_token.resolve().reveal()
+                if cfg.refresh_token is not None
+                else None
+            )
+            client_secret = (
+                cfg.client_secret.resolve().reveal()
+                if cfg.client_secret is not None
+                else None
+            )
+            token_uri = cfg.token_uri
+            resolved_token_uri: str | None
+            if isinstance(token_uri, CredentialReference):
+                resolved_token_uri = token_uri.resolve().reveal()
+            elif token_uri is not None:
+                resolved_token_uri = str(token_uri)
+            else:
+                resolved_token_uri = None
+            if resolved_token_uri is not None:
+                resolved_token_uri = str(_validate_token_uri(resolved_token_uri))
+            creds = UserCredentials(  # type: ignore[no-untyped-call]
+                token=token,
+                refresh_token=refresh_token,
+                client_id=cfg.client_id,
+                client_secret=client_secret,
+                token_uri=resolved_token_uri,
+                scopes=scopes,
+            )
+        else:  # oauth: gcloud Application Default Credentials
+            import google.auth
 
-                creds, _ = google.auth.default(scopes=scopes)
+            creds, _ = google.auth.default(scopes=scopes)
 
-            if cfg.impersonate_service_account:
-                from google.auth import impersonated_credentials
+        if cfg.impersonate_service_account:
+            from google.auth import impersonated_credentials
 
-                creds = impersonated_credentials.Credentials(  # type: ignore[no-untyped-call]
-                    source_credentials=creds,
-                    target_principal=cfg.impersonate_service_account,
-                    target_scopes=list(scopes),
-                )
-            if cfg.quota_project:
-                creds = creds.with_quota_project(cfg.quota_project)
-        except ImportError as e:
-            raise AdapterError(_INSTALL_HINT) from e
+            creds = impersonated_credentials.Credentials(  # type: ignore[no-untyped-call]
+                source_credentials=creds,
+                target_principal=cfg.impersonate_service_account,
+                target_scopes=list(scopes),
+            )
+        if cfg.quota_project:
+            creds = creds.with_quota_project(cfg.quota_project)
         return creds
 
     def _default_job_config(self) -> Any | None:

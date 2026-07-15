@@ -21,7 +21,12 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from .adapters import AdapterError, parse_warehouse_config
+from .adapters import (
+    AdapterConfigError,
+    AdapterError,
+    parse_warehouse_config,
+    prepare_warehouse_profile_input,
+)
 from .config.profile import (
     DEFAULT_LLM_PROVIDER,
     LLMConfig,
@@ -103,30 +108,35 @@ def resolve_profile(
         )
 
     selected = profile.outputs[target_name]
+    warehouse_error: ProfileError | None = None
     try:
         warehouse = parse_warehouse_config(selected.warehouse)
-    except AdapterError as e:
-        validation_error = e.__cause__
-        if isinstance(validation_error, ValidationError):
-            prefix = (
-                project.profile,
-                "outputs",
-                target_name,
-                "warehouse",
-            )
-            diagnostics = profiles_document.format_validation_errors(
-                profiles_path,
-                validation_error,
-                prefix=prefix,
-            )
-            warehouse_type = selected.warehouse.get("type", "duckdb")
-            raise ProfileError(
-                f"Invalid {warehouse_type} warehouse YAML at {profiles_path}:\n"
-                f"{diagnostics}"
-            ) from e
-        raise ProfileError(
-            f"{profiles_path}: profile '{project.profile}' target '{target_name}': {e}"
-        ) from e
+    except AdapterConfigError as error:
+        prefix = (
+            project.profile,
+            "outputs",
+            target_name,
+            "warehouse",
+        )
+        diagnostics = profiles_document.format_validation_details(
+            profiles_path,
+            error.validation_details,
+            prefix=prefix,
+        )
+        warehouse_type = selected.warehouse.get("type", "duckdb")
+        warehouse_error = ProfileError(
+            f"Invalid {warehouse_type} warehouse YAML at {profiles_path}:\n"
+            f"{diagnostics}"
+        )
+    except AdapterError as error:
+        warehouse_error = ProfileError(
+            f"{profiles_path}: profile '{project.profile}' target '{target_name}': "
+            f"{error}"
+        )
+    if warehouse_error is not None:
+        del selected, profile
+        profiles = {}
+        raise warehouse_error from None
     llm = _absolutize_llm(selected.llm, project_dir)
     if llm is not None:
         try:
@@ -267,10 +277,21 @@ def _discover_profiles_file(
 
 
 # `{{ env_var('NAME') }}` or `{{ env_var('NAME', 'default') }}` — the one piece
-# of dbt's Jinja grammar profiles need, so secrets stay out of the file.
+# of dbt's Jinja grammar profiles need for routing values. Adapter credential
+# hooks replace protected references before this interpolation runs.
 _ENV_VAR_RE = re.compile(
     r"\{\{\s*env_var\(\s*(['\"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)\1"
     r"(?:\s*,\s*(['\"])(?P<default>.*?)\3)?\s*\)\s*\}\}"
+)
+_PROTECTED_PROFILE_REFERENCE_FIELDS = frozenset(
+    {
+        "client_secret",
+        "keyfile",
+        "keyfile_json",
+        "refresh_token",
+        "token",
+        "token_uri",
+    }
 )
 
 
@@ -309,28 +330,77 @@ def _interpolate_env_vars(value: Any, path: Path) -> Any:
     return value
 
 
+def _prepare_profile_warehouses(data: dict[Any, Any], path: Path) -> None:
+    for profile in data.values():
+        if not isinstance(profile, dict):
+            continue
+        outputs = profile.get("outputs")
+        if not isinstance(outputs, dict):
+            continue
+        for target in outputs.values():
+            if not isinstance(target, dict):
+                continue
+            warehouse = target.get("warehouse")
+            if not isinstance(warehouse, dict):
+                continue
+            prepared = dict(warehouse)
+            warehouse_type = prepared.get("type")
+            if isinstance(warehouse_type, str):
+                prepared["type"] = _interpolate_env_vars(warehouse_type, path)
+            try:
+                protected = prepare_warehouse_profile_input(prepared)
+            except AdapterError as error:
+                raise ProfileError(f"{path}: {error}") from None
+            for key in _PROTECTED_PROFILE_REFERENCE_FIELDS:
+                item = protected.get(key)
+                if isinstance(item, str) and _ENV_VAR_RE.search(item):
+                    raise ProfileError(
+                        f"{path}: credential field `{key}` was not protected by "
+                        "a registered adapter; refusing generic env_var() "
+                        "interpolation"
+                    )
+            target["warehouse"] = protected
+
+
 def _load_profiles_file(
     path: Path,
 ) -> tuple[dict[str, ProfileConfig], YamlDocument]:
+    document: YamlDocument | None = None
+    load_error: ProfileError | None = None
     try:
         with path.open() as f:
             document = parse_yaml_document(f.read())
     except yaml.YAMLError as e:
-        raise ProfileError(format_yaml_parse_error(path, e)) from e
+        load_error = ProfileError(format_yaml_parse_error(path, e))
     except OSError as e:
-        raise ProfileError(f"Could not read profiles file {path}: {e}") from e
+        load_error = ProfileError(f"Could not read profiles file {path}: {e}")
+    if load_error is not None:
+        raise load_error
+    assert document is not None
     data: Any = document.data if document.data is not None else {}
+    document = document.without_data()
     if not isinstance(data, dict):
         diagnostic = document.format_message(
             path,
             (),
             "top-level must be a mapping of profile names",
         )
-        raise ProfileError(diagnostic)
-    data = _interpolate_env_vars(data, path)
+        data = None
+        load_error = ProfileError(diagnostic)
+        raise load_error
+    profile_input_error: ProfileError | None = None
+    try:
+        _prepare_profile_warehouses(data, path)
+        data = _interpolate_env_vars(data, path)
+    except ProfileError as error:
+        profile_input_error = ProfileError(str(error))
+    if profile_input_error is not None:
+        data = {}
+        raise profile_input_error
 
     out: dict[str, ProfileConfig] = {}
     for name, body in data.items():
+        validation_failure: ProfileError | None = None
         try:
             out[name] = ProfileConfig.model_validate(body)
         except ValidationError as e:
@@ -339,7 +409,14 @@ def _load_profiles_file(
                 e,
                 prefix=(name,),
             )
-            raise ProfileError(f"Invalid profile YAML at {path}:\n{diagnostics}") from e
+            validation_failure = ProfileError(
+                f"Invalid profile YAML at {path}:\n{diagnostics}"
+            )
+        if validation_failure is not None:
+            body = {}
+            data = {}
+            out = {}
+            raise validation_failure
     return out, document
 
 
@@ -352,10 +429,12 @@ def resolve_llm_options(
     operator-owned profile configuration.
     """
     if "api_key_env" in options:
-        raise ProfileError(
+        credential_ownership_error = ProfileError(
             "llm option 'api_key_env' is operator-owned configuration; set it "
             "under `llm:` in profiles.yml, not in model extraction options"
         )
+        options = {}
+        raise credential_ownership_error
     merged = dict(options)
     profile_provider = (
         resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER

@@ -271,7 +271,7 @@ def test_message_batch_missing_custom_key_fails_before_client_creation(
     monkeypatch.delenv("DBT_ML_BATCH_KEY", raising=False)
     monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
 
-    with pytest.raises(RuntimeError, match="DBT_ML_BATCH_KEY") as exc_info:
+    with pytest.raises(RuntimeError, match="credential environment variable") as exc_info:
         llm_backend._run_message_batch(
             [
                 BatchInferenceRequest(
@@ -290,6 +290,7 @@ def test_message_batch_missing_custom_key_fails_before_client_creation(
 
     assert not constructed
     assert fallback_secret not in str(exc_info.value)
+    assert "DBT_ML_BATCH_KEY" not in str(exc_info.value)
 
 
 # ─── runner end-to-end ─────────────────────────────────────────────────────

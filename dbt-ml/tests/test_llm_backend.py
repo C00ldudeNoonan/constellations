@@ -11,6 +11,7 @@ import pytest
 
 from dbt_ml.backends import get_backend, llm_backend
 from dbt_ml.backends.llm_backend import LLMBackend, extract_fields_from_text
+from dbt_ml.credentials import CredentialReference
 from dbt_ml.hashing import HASH_DIGEST_SIZE
 from dbt_ml.providers import base as provider_base
 from dbt_ml.providers import get_inference_provider
@@ -200,11 +201,12 @@ def test_llm_backend_no_api_key_raises(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     backend = get_backend("llm")
     unread = tmp_path / "not-read.txt"
-    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY") as exc_info:
+    with pytest.raises(RuntimeError, match="credential environment variable") as exc_info:
         backend.extract(
             unread, {"cache_path": str(tmp_path / "c.duckdb"), "fields": schema}
         )
     assert "test-api-key" not in str(exc_info.value)
+    assert "ANTHROPIC_API_KEY" not in str(exc_info.value)
 
 
 def test_invalid_numeric_options_fail_before_file_or_api_access(
@@ -297,13 +299,14 @@ def test_missing_custom_api_key_does_not_fall_back_to_default(
     monkeypatch.setenv("ANTHROPIC_API_KEY", fallback_secret)
     monkeypatch.delenv("DBT_ML_ANTHROPIC_KEY", raising=False)
 
-    with pytest.raises(RuntimeError, match="DBT_ML_ANTHROPIC_KEY") as exc_info:
+    with pytest.raises(RuntimeError, match="credential environment variable") as exc_info:
         get_backend("llm").extract(
             tmp_path / "not-read.txt",
             {"fields": schema, "api_key_env": "DBT_ML_ANTHROPIC_KEY"},
         )
 
     assert fallback_secret not in str(exc_info.value)
+    assert "DBT_ML_ANTHROPIC_KEY" not in str(exc_info.value)
 
 
 def test_generation_params_default_and_override(
@@ -314,9 +317,11 @@ def test_generation_params_default_and_override(
     backend = get_backend("llm")
 
     backend.extract(doc, {"fields": schema})
+    first_reference = counter.kwargs.pop("api_key_env")
+    assert isinstance(first_reference, CredentialReference)
+    assert "ANTHROPIC_API_KEY" not in repr(first_reference)
     assert counter.kwargs == {
         "provider": "anthropic",
-        "api_key_env": "ANTHROPIC_API_KEY",
         "temperature": 0.0,
         "max_tokens": 2048,
         "max_retries": 4,
@@ -326,9 +331,11 @@ def test_generation_params_default_and_override(
         doc,
         {"fields": schema, "temperature": 0.3, "max_tokens": 8192, "max_retries": 1},
     )
+    second_reference = counter.kwargs.pop("api_key_env")
+    assert isinstance(second_reference, CredentialReference)
+    assert "ANTHROPIC_API_KEY" not in repr(second_reference)
     assert counter.kwargs == {
         "provider": "anthropic",
-        "api_key_env": "ANTHROPIC_API_KEY",
         "temperature": 0.3,
         "max_tokens": 8192,
         "max_retries": 1,

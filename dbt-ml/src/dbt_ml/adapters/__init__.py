@@ -4,6 +4,7 @@ from . import (
 )
 from .base import (
     AdapterCapabilityError,
+    AdapterConfigError,
     AdapterError,
     StateRecord,
     StateScope,
@@ -17,11 +18,13 @@ from .registry import (
     create_adapter,
     list_adapter_types,
     parse_warehouse_config,
+    prepare_warehouse_profile_input,
     register,
 )
 
 __all__ = [
     "AdapterCapabilityError",
+    "AdapterConfigError",
     "AdapterError",
     "StateRecord",
     "StateScope",
@@ -33,5 +36,6 @@ __all__ = [
     "create_adapter",
     "list_adapter_types",
     "parse_warehouse_config",
+    "prepare_warehouse_profile_input",
     "register",
 ]

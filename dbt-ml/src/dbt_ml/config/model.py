@@ -9,12 +9,15 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    GetCoreSchemaHandler,
     PrivateAttr,
     field_serializer,
     field_validator,
     model_validator,
 )
+from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 
+from ..credentials import CredentialReference, CredentialReferenceError
 from .identifiers import validate_node_name
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
@@ -33,6 +36,46 @@ INTERNAL_LINEAGE_FIELDS = frozenset(
         "extracted_at",
     }
 )
+
+
+class _RedactedConfigInput:
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return "<redacted>"
+
+    __str__ = __repr__
+
+    def take(self) -> Any:
+        value = self.value
+        self.value = None
+        return value
+
+
+def _protect_extraction_mapping(raw: Mapping[str, Any]) -> dict[str, Any]:
+    prepared = dict(raw)
+    if prepared.get("backend") != "llm":
+        return prepared
+    options = prepared.get("options")
+    if not isinstance(options, Mapping) or "api_key_env" not in options:
+        return prepared
+    protected_options = dict(options)
+    value = protected_options["api_key_env"]
+    if not isinstance(value, CredentialReference):
+        try:
+            value = CredentialReference.from_env_name(value)
+        except (TypeError, CredentialReferenceError):
+            raise PydanticCustomError(
+                "credential_reference",
+                "llm api_key_env is operator-owned configuration and must be "
+                "set in profiles.yml",
+            ) from None
+    protected_options["api_key_env"] = value
+    prepared["options"] = protected_options
+    return prepared
 
 def _configured_extraction_field_names(options: Mapping[str, Any]) -> set[str]:
     names: set[str] = set()
@@ -81,6 +124,39 @@ class ExtractionConfig(BaseModel):
     # memory and gives incremental runs per-flush crash recovery. Excluded
     # from code_version: it changes execution, never output content.
     flush_every: int = Field(default=5000, gt=0)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        model_schema = handler(source_type)
+        return core_schema.chain_schema(
+            [
+                core_schema.no_info_plain_validator_function(
+                    _RedactedConfigInput,
+                    json_schema_input_schema=model_schema,
+                ),
+                core_schema.no_info_plain_validator_function(
+                    cls._prepare_model_input,
+                    json_schema_input_schema=model_schema,
+                ),
+                model_schema,
+            ]
+        )
+
+    @classmethod
+    def _prepare_model_input(cls, wrapped: _RedactedConfigInput) -> Any:
+        raw = wrapped.take()
+        if isinstance(raw, cls):
+            return raw
+        if not isinstance(raw, Mapping):
+            raise PydanticCustomError(
+                "extraction_config",
+                "extraction config must be a mapping",
+            )
+        return _protect_extraction_mapping(raw)
 
     @field_validator("options")
     @classmethod
@@ -229,6 +305,43 @@ class ModelConfig(BaseModel):
     tests: list[Any] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        model_schema = handler(source_type)
+        return core_schema.chain_schema(
+            [
+                core_schema.no_info_plain_validator_function(
+                    _RedactedConfigInput,
+                    json_schema_input_schema=model_schema,
+                ),
+                core_schema.no_info_plain_validator_function(
+                    cls._prepare_model_input,
+                    json_schema_input_schema=model_schema,
+                ),
+                model_schema,
+            ]
+        )
+
+    @classmethod
+    def _prepare_model_input(cls, wrapped: _RedactedConfigInput) -> Any:
+        raw = wrapped.take()
+        if isinstance(raw, cls):
+            return raw
+        if not isinstance(raw, Mapping):
+            raise PydanticCustomError(
+                "model_config",
+                "model config must be a mapping",
+            )
+        prepared = dict(raw)
+        extraction = prepared.get("extraction")
+        if isinstance(extraction, Mapping):
+            prepared["extraction"] = _protect_extraction_mapping(extraction)
+        return prepared
+
     @field_validator("name")
     @classmethod
     def _validate_name(cls, v: str) -> str:
@@ -277,6 +390,21 @@ class ModelConfig(BaseModel):
             message,
             relative_path=relative_path,
         )
+
+
+def protect_model_llm_credential_option(model: ModelConfig) -> None:
+    extraction = model.extraction
+    if extraction is None or "api_key_env" not in extraction.options:
+        return
+    value = extraction.options["api_key_env"]
+    if isinstance(value, CredentialReference):
+        return
+    try:
+        extraction.options["api_key_env"] = CredentialReference.from_env_name(
+            value
+        )
+    except (TypeError, CredentialReferenceError):
+        extraction.options["api_key_env"] = None
 
 
 class ModelFile(BaseModel):

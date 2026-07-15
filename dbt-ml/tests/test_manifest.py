@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
+from dbt_ml.docs import generate_docs
 from dbt_ml.hashing import HASH_DIGEST_SIZE
 from dbt_ml.manifest import (
     MANIFEST_FILENAME,
     RUN_RESULTS_FILENAME,
     build_manifest,
+    build_run_results,
     write_manifest,
     write_run_results,
 )
@@ -149,6 +151,57 @@ def test_manifest_emits_safe_effective_inference_descriptor(
     serialized = json.dumps(manifest)
     assert "PRIVATE_PROVIDER_KEY" not in serialized
     assert "credential-value-must-not-leak" not in serialized
+
+
+def test_bigquery_credentials_are_absent_from_artifacts_and_docs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_name = "DISTINCTIVE_ARTIFACT_BQ_TOKEN_REFERENCE"
+    secret = "distinctive-artifact-bq-token-value"
+    monkeypatch.setenv(env_name, secret)
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "\n".join(
+            [
+                "name: bigquery_artifact_project",
+                "version: '0.1.0'",
+                "profile: bigquery_artifact_project",
+            ]
+        )
+        + "\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "\n".join(
+            [
+                "bigquery_artifact_project:",
+                "  target: prod",
+                "  outputs:",
+                "    prod:",
+                "      warehouse:",
+                "        type: bigquery",
+                "        project: public-project-id",
+                f'        token: "{{{{ env_var(\'{env_name}\') }}}}"',
+            ]
+        )
+        + "\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "models").mkdir()
+
+    manifest = build_manifest(tmp_path)
+    run_results = build_run_results(tmp_path, [])
+    write_manifest(tmp_path)
+    write_run_results(tmp_path, [])
+    docs = generate_docs(tmp_path)
+
+    rendered = json.dumps({"manifest": manifest, "run_results": run_results})
+    rendered += "".join(
+        path.read_text()
+        for path in (tmp_path / "target").rglob("*")
+        if path.is_file()
+    )
+    assert docs.pages_written == 2
+    assert env_name not in rendered
+    assert secret not in rendered
 
 
 def test_manifest_emits_ml_models(tmp_path: Path) -> None:

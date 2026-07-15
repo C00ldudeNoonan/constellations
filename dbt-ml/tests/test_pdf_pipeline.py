@@ -13,6 +13,7 @@ import duckdb
 import pytest
 
 from dbt_ml.backends import llm_backend
+from dbt_ml.credentials import CredentialReference
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoice_pdfs
 
@@ -115,12 +116,14 @@ def test_pdf_transform_propagates_custom_api_key_env(
     )
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("DBT_ML_ANTHROPIC_KEY", "custom-test-key")
-    seen_envs: list[str] = []
+    seen_references: list[CredentialReference] = []
 
     def fake_api(
         content: str, model: str, system: str, fields_spec: list, **kwargs: object
     ) -> dict:
-        seen_envs.append(str(kwargs["api_key_env"]))
+        reference = kwargs["api_key_env"]
+        assert isinstance(reference, CredentialReference)
+        seen_references.append(reference)
         return {
             "invoice_id": "INV-CUSTOM-KEY",
             "vendor": "Mocked Vendor",
@@ -133,5 +136,7 @@ def test_pdf_transform_propagates_custom_api_key_env(
 
     results = run_project(pdf_project)
 
-    assert seen_envs == ["DBT_ML_ANTHROPIC_KEY"]
+    assert len(seen_references) == 1
+    assert seen_references[0].is_available()
+    assert "DBT_ML_ANTHROPIC_KEY" not in repr(seen_references[0])
     assert not next(r for r in results if r.model_name == "extracted_invoices").errors

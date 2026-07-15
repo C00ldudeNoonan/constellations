@@ -21,6 +21,7 @@ from .base import (
     ProviderUsage,
     provider_error_debug_enabled,
     redacted_exception_text,
+    sanitized_provider_error,
 )
 from .registry import register_inference_provider
 
@@ -45,39 +46,28 @@ class AnthropicInferenceProvider(InferenceProvider):
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
     ) -> InferenceResult:
-        api_key = _credential_value(credential)
+        failure: ProviderError | None = None
         try:
-            from anthropic import Anthropic
-
-            client = Anthropic(api_key=api_key, max_retries=runtime.max_retries)
-            response = client.messages.create(  # type: ignore[call-overload]
-                model=request.model,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                system=request.system_prompt,
-                tools=[_structured_output_tool(request)],
-                tool_choice={"type": "tool", "name": request.output_name},
-                messages=[{"role": "user", "content": request.content}],
+            return _complete_with_sdk(
+                request,
+                credential=credential,
+                runtime=runtime,
             )
+        except ProviderError as error:
+            failure = sanitized_provider_error(self.name(), "inference", error)
         except Exception as error:
-            # SDK diagnostics never cross the provider boundary; a redacted
-            # copy stays in local debug logs for operators.
             if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
                 log.debug(
                     "anthropic inference request failed:\n%s",
-                    redacted_exception_text(
-                        error,
-                        sensitive=(
-                            api_key,
-                            request.content,
-                            request.system_prompt,
-                        ),
-                    ),
+                    redacted_exception_text(error),
                 )
-            raise ProviderRequestError(
+            failure = ProviderRequestError(
                 self.name(), "inference", code=type(error).__name__
-            ) from None
-        return _parse_response_safely(response, request)
+            )
+        if failure is not None:
+            del request
+            raise failure
+        raise AssertionError("anthropic inference did not produce a result")
 
     def complete_batch(
         self,
@@ -87,133 +77,183 @@ class AnthropicInferenceProvider(InferenceProvider):
         runtime: ProviderRuntimeOptions,
         poll_seconds: float,
     ) -> BatchInferenceResult:
-        self._validate_batch_inputs(requests, poll_seconds=poll_seconds)
-        if not requests:
-            return BatchInferenceResult(())
-        api_key = _credential_value(credential)
-        payload = [
-            {
-                "custom_id": item.request_id,
-                "params": {
-                    "model": item.request.model,
-                    "max_tokens": item.request.max_tokens,
-                    "temperature": item.request.temperature,
-                    "system": item.request.system_prompt,
-                    "tools": [_structured_output_tool(item.request)],
-                    "tool_choice": {
-                        "type": "tool",
-                        "name": item.request.output_name,
-                    },
-                    "messages": [
-                        {"role": "user", "content": item.request.content}
-                    ],
-                },
-            }
-            for item in requests
-        ]
+        result: BatchInferenceResult | None = None
+        failure: Exception | None = None
         try:
-            from anthropic import Anthropic
-
-            client = Anthropic(api_key=api_key, max_retries=runtime.max_retries)
-            batch = client.messages.batches.create(requests=payload)  # type: ignore[arg-type]
-            log.info("submitted message batch %s (%d requests)", batch.id, len(payload))
-            while True:
-                batch = client.messages.batches.retrieve(batch.id)
-                if batch.processing_status == "ended":
-                    break
-                counts = batch.request_counts
-                log.info(
-                    "batch %s: %s (processing=%d succeeded=%d errored=%d)",
-                    batch.id,
-                    batch.processing_status,
-                    counts.processing,
-                    counts.succeeded,
-                    counts.errored,
-                )
-                time.sleep(poll_seconds)
-            raw_items = list(client.messages.batches.results(batch.id))
+            self._validate_batch_inputs(requests, poll_seconds=poll_seconds)
+            if not requests:
+                return BatchInferenceResult(())
+            result = _complete_batch_with_sdk(
+                requests,
+                credential=credential,
+                runtime=runtime,
+                poll_seconds=poll_seconds,
+            )
+        except ValueError as error:
+            failure = ValueError(str(error))
+        except ProviderError as error:
+            failure = sanitized_provider_error(
+                self.name(), "batch inference", error
+            )
         except Exception as error:
             if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
                 log.debug(
                     "anthropic native batch failed:\n%s",
-                    redacted_exception_text(
-                        error, sensitive=_batch_sensitive_values(api_key, requests)
-                    ),
+                    redacted_exception_text(error),
                 )
-            raise ProviderBatchError(
+            failure = ProviderBatchError(
                 f"{self.name()} native batch failed [{type(error).__name__}]",
                 safe_for_display=True,
-            ) from None
-
-        request_ids = {item.request_id for item in requests}
-        raw_by_id: dict[str, Any] = {}
-        for raw in raw_items:
-            request_id = getattr(raw, "custom_id", None)
-            if not isinstance(request_id, str) or not request_id:
-                raise ProviderBatchError(
-                    f"{self.name()} native batch returned an invalid request ID",
-                    safe_for_display=True,
-                )
-            if request_id not in request_ids:
-                raise ProviderBatchError(
-                    f"{self.name()} native batch returned an unknown request ID",
-                    safe_for_display=True,
-                )
-            if request_id in raw_by_id:
-                raise ProviderBatchError(
-                    f"{self.name()} native batch returned a duplicate request ID",
-                    safe_for_display=True,
-                )
-            raw_by_id[request_id] = raw
-
-        items: list[BatchInferenceItem] = []
-        for item in requests:
-            request_id = item.request_id
-            raw_item = raw_by_id.get(request_id)
-            if raw_item is None:
-                items.append(
-                    BatchInferenceItem(
-                        request_id,
-                        error=ProviderRequestError(
-                            self.name(), "batch item", code="missing_result"
-                        ),
-                    )
-                )
-                continue
-            raw_result = getattr(raw_item, "result", None)
-            result_type = getattr(raw_result, "type", None)
-            if result_type != "succeeded":
-                raw_error = getattr(raw_result, "error", None)
-                raw_code = getattr(raw_error, "type", None)
-                error_code = raw_code if isinstance(raw_code, str) else "batch_error"
-                items.append(
-                    BatchInferenceItem(
-                        request_id,
-                        error=ProviderRequestError(
-                            self.name(), "batch item", code=error_code
-                        ),
-                    )
-                )
-                continue
-            try:
-                result = _parse_response_safely(
-                    getattr(raw_result, "message", None), item.request
-                )
-            except ProviderError as error:
-                items.append(BatchInferenceItem(request_id, error=error))
-            else:
-                items.append(BatchInferenceItem(request_id, result=result))
-        return BatchInferenceResult(tuple(items), batch_submissions=1)
+            )
+        if failure is not None:
+            requests = ()
+            raise failure
+        if result is None:
+            raise AssertionError("anthropic batch did not produce results")
+        return result
 
 
-def _batch_sensitive_values(
-    api_key: str, requests: Sequence[BatchInferenceRequest]
-) -> tuple[str, ...]:
-    values = [api_key]
+def _complete_with_sdk(
+    request: InferenceRequest,
+    *,
+    credential: ProviderCredential | None,
+    runtime: ProviderRuntimeOptions,
+) -> InferenceResult:
+    from anthropic import Anthropic
+
+    api_key = _credential_value(credential)
+    client = Anthropic(api_key=api_key, max_retries=runtime.max_retries)
+    response = client.messages.create(  # type: ignore[call-overload]
+        model=request.model,
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        system=request.system_prompt,
+        tools=[_structured_output_tool(request)],
+        tool_choice={"type": "tool", "name": request.output_name},
+        messages=[{"role": "user", "content": request.content}],
+    )
+    return _parse_response_safely(response, request)
+
+
+def _complete_batch_with_sdk(
+    requests: Sequence[BatchInferenceRequest],
+    *,
+    credential: ProviderCredential | None,
+    runtime: ProviderRuntimeOptions,
+    poll_seconds: float,
+) -> BatchInferenceResult:
+    from anthropic import Anthropic
+
+    api_key = _credential_value(credential)
+    payload = [
+        {
+            "custom_id": item.request_id,
+            "params": {
+                "model": item.request.model,
+                "max_tokens": item.request.max_tokens,
+                "temperature": item.request.temperature,
+                "system": item.request.system_prompt,
+                "tools": [_structured_output_tool(item.request)],
+                "tool_choice": {
+                    "type": "tool",
+                    "name": item.request.output_name,
+                },
+                "messages": [{"role": "user", "content": item.request.content}],
+            },
+        }
+        for item in requests
+    ]
+    client = Anthropic(api_key=api_key, max_retries=runtime.max_retries)
+    batch = client.messages.batches.create(requests=payload)  # type: ignore[arg-type]
+    log.info("submitted message batch %s (%d requests)", batch.id, len(payload))
+    while True:
+        batch = client.messages.batches.retrieve(batch.id)
+        if batch.processing_status == "ended":
+            break
+        counts = batch.request_counts
+        log.info(
+            "batch %s: %s (processing=%d succeeded=%d errored=%d)",
+            batch.id,
+            batch.processing_status,
+            counts.processing,
+            counts.succeeded,
+            counts.errored,
+        )
+        time.sleep(poll_seconds)
+    raw_items = list(client.messages.batches.results(batch.id))
+    return _normalize_batch_results(requests, raw_items)
+
+
+def _normalize_batch_results(
+    requests: Sequence[BatchInferenceRequest],
+    raw_items: Sequence[Any],
+) -> BatchInferenceResult:
+    request_ids = {item.request_id for item in requests}
+    raw_by_id: dict[str, Any] = {}
+    for raw in raw_items:
+        request_id = getattr(raw, "custom_id", None)
+        if not isinstance(request_id, str) or not request_id:
+            raise ProviderBatchError(
+                "anthropic native batch returned an invalid request ID",
+                safe_for_display=True,
+            )
+        if request_id not in request_ids:
+            raise ProviderBatchError(
+                "anthropic native batch returned an unknown request ID",
+                safe_for_display=True,
+            )
+        if request_id in raw_by_id:
+            raise ProviderBatchError(
+                "anthropic native batch returned a duplicate request ID",
+                safe_for_display=True,
+            )
+        raw_by_id[request_id] = raw
+
+    items: list[BatchInferenceItem] = []
     for item in requests:
-        values.append(item.request.content)
-        values.append(item.request.system_prompt)
-    return tuple(values)
+        request_id = item.request_id
+        raw_item = raw_by_id.get(request_id)
+        if raw_item is None:
+            items.append(
+                BatchInferenceItem(
+                    request_id,
+                    error=ProviderRequestError(
+                        "anthropic", "batch item", code="missing_result"
+                    ),
+                )
+            )
+            continue
+        raw_result = getattr(raw_item, "result", None)
+        result_type = getattr(raw_result, "type", None)
+        if result_type != "succeeded":
+            raw_error = getattr(raw_result, "error", None)
+            raw_code = getattr(raw_error, "type", None)
+            error_code = raw_code if isinstance(raw_code, str) else "batch_error"
+            items.append(
+                BatchInferenceItem(
+                    request_id,
+                    error=ProviderRequestError(
+                        "anthropic", "batch item", code=error_code
+                    ),
+                )
+            )
+            continue
+        try:
+            parsed = _parse_response_safely(
+                getattr(raw_result, "message", None), item.request
+            )
+        except ProviderError as error:
+            items.append(
+                BatchInferenceItem(
+                    request_id,
+                    error=sanitized_provider_error(
+                        "anthropic", "batch item", error
+                    ),
+                )
+            )
+        else:
+            items.append(BatchInferenceItem(request_id, result=parsed))
+    return BatchInferenceResult(tuple(items), batch_submissions=1)
 
 
 def _credential_value(credential: ProviderCredential | None) -> str:

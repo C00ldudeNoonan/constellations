@@ -94,6 +94,7 @@ class TransformConfig(BaseModel):
 
     type: str
     module: str | None = None
+    uses_llm: bool = False
     options: dict[str, Any] = Field(default_factory=dict)
 
 

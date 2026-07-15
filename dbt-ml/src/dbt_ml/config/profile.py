@@ -4,22 +4,38 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_LLM_API_KEY_ENV = "ANTHROPIC_API_KEY"
+DEFAULT_LLM_PROVIDER = "anthropic"
 _ENV_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
 _ENV_NAME_RE = re.compile(_ENV_NAME_PATTERN)
 
 
-def resolve_llm_credential(options: Mapping[str, Any]) -> tuple[str, str | None]:
-    """Return the configured environment-variable name and its current value.
+def resolve_llm_credential(
+    options: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Return the configured credential-variable name and current value.
 
-    The secret is deliberately resolved only at the client boundary. Runtime
-    options and artifacts carry the variable name, never the credential value.
+    This compatibility helper returns ``(None, None)`` for credential-free
+    providers. New runtime code passes ``ProviderCredential`` at the provider
+    boundary instead of carrying raw values.
     """
-    api_key_env = options.get("api_key_env", DEFAULT_LLM_API_KEY_ENV)
+    from ..providers import get_inference_provider
+
+    provider_name = options.get("provider", DEFAULT_LLM_PROVIDER)
+    if not isinstance(provider_name, str):
+        raise ValueError("llm provider must be a registered provider name")
+    provider = get_inference_provider(provider_name)
+    if not provider.requires_credentials:
+        return None, None
+    api_key_env = options.get("api_key_env") or provider.default_credential_env
+    if api_key_env is None:
+        raise ValueError(
+            f"llm api_key_env must be configured for provider '{provider_name}'"
+        )
     if not isinstance(api_key_env, str) or not _ENV_NAME_RE.fullmatch(api_key_env):
         raise ValueError(
             "llm api_key_env must be a valid environment-variable name"
@@ -78,10 +94,14 @@ class LLMConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["anthropic"] = "anthropic"
-    model: str = "claude-haiku-4-5"
-    api_key_env: str = Field(
-        default=DEFAULT_LLM_API_KEY_ENV, pattern=_ENV_NAME_PATTERN
+    provider: str = Field(
+        default=DEFAULT_LLM_PROVIDER,
+        min_length=1,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    model: str | None = Field(default=None, min_length=1)
+    api_key_env: str | None = Field(
+        default=None, pattern=_ENV_NAME_PATTERN
     )
     cache_path: Path | None = None
     system_prompt: str | None = None

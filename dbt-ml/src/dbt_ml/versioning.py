@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from .backends import get_backend, validate_backend_options
+from .backends.options import LLMBackendOptions
 from .config.model import (
     ChunkConfig,
     ExtractionConfig,
@@ -21,11 +22,13 @@ from .config.model import (
     ModelConfig,
     TransformConfig,
 )
+from .config.profile import DEFAULT_LLM_PROVIDER
 from .config.project import ProjectConfig
 from .dag import parse_ref
 from .hashing import HASH_DIGEST_SIZE
 from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options
+from .providers import get_inference_provider, resolve_provider_model
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
@@ -59,6 +62,7 @@ def compute_code_version(
     depends_on: list[str] | None = None,
     fields: list[FieldConfig] | None = None,
     effective_extraction: Mapping[str, Any] | None = None,
+    effective_transform: Mapping[str, Any] | None = None,
     project_dir: Path,
 ) -> str:
     payload: dict[str, Any] = {
@@ -75,7 +79,13 @@ def compute_code_version(
             if extraction
             else None
         ),
-        "transform": transform.model_dump() if transform else None,
+        "transform": (
+            dict(effective_transform)
+            if effective_transform is not None
+            else transform.model_dump()
+            if transform
+            else None
+        ),
         # artifact.external is boundary policy, not code identity (see
         # flush_every above).
         "ml": ml.model_dump(mode="json", exclude={"artifact": {"external"}})
@@ -110,12 +120,10 @@ def compute_model_code_version(
     resolved: ResolvedProfile | None = None,
 ) -> str:
     effective_extraction: dict[str, Any] | None = None
-    if model.extraction is not None:
-        backend_name = model.extraction.backend or project.extraction.default_backend
-        options = model.extraction.options
-        if backend_name == "llm" and resolved is not None:
-            options = resolve_llm_options(options, resolved)
-        canonical_options = validate_backend_options(backend_name, options)
+    effective_transform: dict[str, Any] | None = None
+    resolved_extraction = _resolve_extraction_options(model, project, resolved)
+    if resolved_extraction is not None:
+        backend_name, canonical_options = resolved_extraction
         semantic_options = (
             {
                 key: value
@@ -132,6 +140,19 @@ def compute_model_code_version(
             "backend_implementation": backend.implementation_identity(),
             "options": semantic_options,
         }
+        if backend_name == "llm":
+            effective_extraction["inference"] = _inference_descriptor(
+                canonical_options
+            )
+    if model.transform is not None and model.transform.uses_llm:
+        effective_transform = model.transform.model_dump()
+        effective_transform["inference"] = _profile_inference_descriptor(resolved)
+        effective_transform["llm_helper_implementation"] = get_backend(
+            "llm"
+        ).implementation_identity()
+        effective_transform["system_prompt_fingerprint"] = (
+            _profile_system_prompt_fingerprint(resolved)
+        )
 
     return compute_code_version(
         extraction=model.extraction,
@@ -145,8 +166,87 @@ def compute_model_code_version(
         ),
         fields=model.fields,
         effective_extraction=effective_extraction,
+        effective_transform=effective_transform,
         project_dir=project_dir,
     )
+
+
+def describe_model_inference(
+    model: ModelConfig,
+    project: ProjectConfig,
+    *,
+    resolved: ResolvedProfile | None = None,
+) -> dict[str, str] | None:
+    """Return the effective, artifact-safe inference implementation descriptor."""
+    if model.transform is not None and model.transform.uses_llm:
+        return _profile_inference_descriptor(resolved)
+    resolved_extraction = _resolve_extraction_options(model, project, resolved)
+    if resolved_extraction is None:
+        return None
+    backend_name, canonical_options = resolved_extraction
+    if backend_name != "llm":
+        return None
+    return _inference_descriptor(canonical_options)
+
+
+def _resolve_extraction_options(
+    model: ModelConfig,
+    project: ProjectConfig,
+    resolved: ResolvedProfile | None,
+) -> tuple[str, dict[str, Any]] | None:
+    if model.extraction is None:
+        return None
+    backend_name = model.extraction.backend or project.extraction.default_backend
+    options = model.extraction.options
+    if backend_name == "llm" and resolved is not None:
+        options = resolve_llm_options(options, resolved)
+    return backend_name, validate_backend_options(backend_name, options)
+
+
+def _inference_descriptor(options: Mapping[str, Any]) -> dict[str, str]:
+    effective = LLMBackendOptions.model_validate(options)
+    return _provider_descriptor(effective.provider, effective.model)
+
+
+def _profile_inference_descriptor(
+    resolved: ResolvedProfile | None,
+) -> dict[str, str]:
+    provider_name = (
+        resolved.llm.provider
+        if resolved is not None and resolved.llm is not None
+        else DEFAULT_LLM_PROVIDER
+    )
+    model = (
+        resolved.llm.model
+        if resolved is not None and resolved.llm is not None
+        else None
+    )
+    return _provider_descriptor(provider_name, model)
+
+
+def _profile_system_prompt_fingerprint(
+    resolved: ResolvedProfile | None,
+) -> str:
+    system_prompt = (
+        resolved.llm.system_prompt
+        if resolved is not None and resolved.llm is not None
+        else None
+    )
+    canonical = _canonical_json({"system_prompt": system_prompt})
+    return hashlib.blake2b(
+        canonical.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+
+
+def _provider_descriptor(
+    provider_name: str, model: str | None
+) -> dict[str, str]:
+    provider = get_inference_provider(provider_name)
+    return {
+        "provider": provider_name,
+        "model": resolve_provider_model(provider, model),
+        "implementation": provider.implementation_identity(),
+    }
 
 
 def resolve_module_file(module: str, project_dir: Path) -> Path:

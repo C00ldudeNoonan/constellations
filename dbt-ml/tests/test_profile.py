@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -206,6 +207,7 @@ def test_llm_options_merged_from_profile(tmp_path: Path) -> None:
     project, _, _ = load_project(tmp_path)
     resolved = resolve_profile(project, tmp_path)
     options = resolve_llm_options({"fields": [{"name": "x"}]}, resolved)
+    assert options["provider"] == "anthropic"
     assert options["model"] == "claude-haiku-4-5"
     assert options["api_key_env"] == "DBT_ML_ANTHROPIC_KEY"
     assert options["cache_path"].endswith("cache.duckdb")
@@ -231,6 +233,68 @@ def test_model_option_overrides_profile(tmp_path: Path) -> None:
     assert options["model"] == "claude-sonnet-4-6"
 
 
+def test_model_provider_cannot_override_profile_credentials(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "d",
+                },
+                "llm": {
+                    "provider": "anthropic",
+                    "api_key_env": "PROFILE_ANTHROPIC_KEY",
+                },
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    with pytest.raises(ProfileError, match="cannot override the profile provider"):
+        resolve_llm_options(
+            {"provider": "another-provider", "fields": [{"name": "x"}]},
+            resolved,
+        )
+
+
+def test_model_provider_requires_profile_selection_without_llm_block(
+    tmp_path: Path,
+) -> None:
+    """Provider selection is operator-owned even when the profile has no
+    `llm:` block — model YAML cannot opt into a non-default provider."""
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "d",
+                },
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.llm is None
+
+    with pytest.raises(ProfileError, match="cannot override the profile provider"):
+        resolve_llm_options(
+            {"provider": "another-provider", "fields": [{"name": "x"}]},
+            resolved,
+        )
+
+    options = resolve_llm_options(
+        {"provider": "anthropic", "fields": [{"name": "x"}]}, resolved
+    )
+    assert options["provider"] == "anthropic"
+
+
 def test_model_api_key_env_cannot_override_profile(tmp_path: Path) -> None:
     _write_project(tmp_path, profile="test_proj")
     _write_profiles(
@@ -251,6 +315,68 @@ def test_model_api_key_env_cannot_override_profile(tmp_path: Path) -> None:
         resolve_llm_options(
             {"api_key_env": "MODEL_ANTHROPIC_KEY", "fields": []}, resolved
         )
+
+
+def test_profile_selected_provider_enforces_native_batch_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = SimpleNamespace(
+        default_credential_env=None,
+        supports_native_batch=False,
+        resolve_model=lambda model: model or "sync-model",
+    )
+    monkeypatch.setattr("dbt_ml.profile.get_inference_provider", lambda _name: provider)
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "main",
+                },
+                "llm": {"provider": "sync-only-profile-test"},
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    with pytest.raises(ProfileError, match="does not support native batch"):
+        resolve_llm_options(
+            {"batch": True, "fields": [{"name": "x"}]},
+            resolved,
+        )
+
+
+def test_provider_initialization_failure_is_a_profile_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dbt_ml.providers import ProviderConfigurationError
+
+    def fail_provider(_name: str) -> None:
+        raise ProviderConfigurationError("provider initialization failed safely")
+
+    monkeypatch.setattr("dbt_ml.profile.get_inference_provider", fail_provider)
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "main",
+                },
+                "llm": {"provider": "failing-profile-provider", "model": "m"},
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(ProfileError, match="initialization failed safely"):
+        resolve_profile(project, tmp_path)
 
 
 def test_resolved_profile_is_frozen_dataclass(tmp_path: Path) -> None:

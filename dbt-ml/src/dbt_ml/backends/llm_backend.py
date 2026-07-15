@@ -3,29 +3,47 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import stat
 import threading
-import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
-from ..config.profile import (
-    DEFAULT_LLM_API_KEY_ENV,
-    resolve_llm_credential,
-)
+from ..config.profile import DEFAULT_LLM_PROVIDER
 from ..hashing import HASH_DIGEST_SIZE
-from .base import BaseBackend, ExtractionResult
+from ..providers import (
+    PROVIDER_CONTRACT_VERSION,
+    BatchInferenceItem,
+    BatchInferenceRequest,
+    BatchInferenceResult,
+    InferenceProvider,
+    InferenceRequest,
+    ProviderCredential,
+    ProviderError,
+    ProviderRequestError,
+    ProviderResponseError,
+    ProviderRuntimeOptions,
+    ProviderUsage,
+    get_inference_provider,
+    provider_error_debug_enabled,
+    redacted_exception_text,
+    resolve_provider_model,
+    sanitized_provider_error,
+)
+from .base import BaseBackend, BatchExtractionOutput, ExtractionResult
 from .options import LLMBackendOptions, validate_llm_numeric_options
 from .registry import register
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "claude-haiku-4-5"
 _DEFAULT_SYSTEM = (
     "You extract structured fields from documents. "
-    "Call the `extract` tool with the requested fields. "
+    "Return structured fields that match the requested output schema. "
     "If a field is genuinely missing from the document, use null."
 )
 # Extraction wants reproducibility, not creativity.
@@ -34,8 +52,6 @@ _DEFAULT_MAX_TOKENS = 2048
 _DEFAULT_MAX_RETRIES = 4
 _DEFAULT_MAX_CONCURRENT = 4
 _DEFAULT_BATCH_POLL_SECONDS = 30.0
-# Anthropic Message Batches API ceiling; multi-batch chunking is deferred.
-_MAX_BATCH_REQUESTS = 100_000
 
 # DuckDB cache writes can race when extraction is parallelized; serialize them.
 _CACHE_WRITE_LOCK = threading.Lock()
@@ -63,15 +79,15 @@ def _gate(size: int) -> threading.BoundedSemaphore:
 class LLMBackend(BaseBackend):
     """LLM-based extraction backend.
 
-    Configures a schema in YAML; calls Claude with tool use to enforce structured
-    output; caches responses in a DuckDB file keyed on (model, content_hash,
-    schema_hash) so re-runs are free.
+    Configures a schema in YAML, delegates structured output to a registered
+    inference provider, and caches responses in DuckDB so re-runs are free.
 
     Options:
-        model:          Claude model id (default: claude-haiku-4-5)
+        provider:       Registered inference provider (default: anthropic)
+        model:          Provider model id (default is owned by the provider)
         system_prompt:  Override system prompt
         cache_path:     Path to cache file (recommended: ./target/llm_cache.duckdb)
-        fields:         [{name, type, description?}] — schema for tool input_schema
+        fields:         [{name, type, description?}] — structured output schema
         temperature:    Sampling temperature (default 0 — deterministic extraction;
                         part of the cache key)
         max_tokens:     Response budget (default 2048); a truncated response is
@@ -79,10 +95,8 @@ class LLMBackend(BaseBackend):
         max_retries:    SDK retry budget for rate limits / transient errors
                         (default 4, exponential backoff)
         max_concurrent: Max in-flight API calls process-wide (default 4)
-        api_key_env:    Environment variable containing the Anthropic API key
-        batch:          Submit uncached documents through the Message Batches
-                        API — 50% token cost, minutes-latency (default false;
-                        keep off for dev loops)
+        api_key_env:    Operator-owned credential environment variable
+        batch:          Use the provider's native batch API (default false)
         batch_poll_seconds: Poll interval while a batch runs (default 30)
     """
 
@@ -95,7 +109,11 @@ class LLMBackend(BaseBackend):
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
-        api_key_env, _ = _require_llm_api_key(options)
+        provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
+        provider = get_inference_provider(provider_name)
+        model = resolve_provider_model(provider, options.get("model"))
+        api_key_env = _api_key_env(options) or provider.default_credential_env
+        _resolve_provider_credential(provider, api_key_env)
         fields_spec = options.get("fields")
         if not fields_spec or not isinstance(fields_spec, list):
             raise ValueError(
@@ -105,10 +123,15 @@ class LLMBackend(BaseBackend):
         fields, usage = extract_fields_with_usage(
             path.read_text(),
             fields_spec=fields_spec,
-            model=options.get("model", _DEFAULT_MODEL),
+            provider=provider_name,
+            model=model,
             system=options.get("system_prompt", _DEFAULT_SYSTEM),
             cache_path=options.get("cache_path"),
-            call_api=partial(self._call_api, api_key_env=api_key_env),
+            call_api=partial(
+                self._call_api,
+                provider=provider_name,
+                api_key_env=api_key_env,
+            ),
             temperature=float(options.get("temperature", _DEFAULT_TEMPERATURE)),
             max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
             max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
@@ -129,20 +152,33 @@ class LLMBackend(BaseBackend):
     def extract_batch(
         self, paths: list[Path], options: dict[str, Any]
     ) -> list[ExtractionResult | Exception]:
-        """One Message Batches API submission for every uncached document
-        (issue #75 part 2): cache hits resolve locally, the rest go up as a
-        single batch, results come back keyed by custom_id, and every response
-        is cached so re-runs are free. Per-document failures come back as
-        Exception entries; only submission itself can fail the whole batch."""
+        return self.extract_batch_with_metrics(paths, options).items
+
+    def extract_batch_with_metrics(
+        self, paths: list[Path], options: dict[str, Any]
+    ) -> BatchExtractionOutput:
+        """One native batch submission for every uncached document (issue #75
+        part 2): cache hits resolve locally, the rest go up as a single batch,
+        results come back keyed by request ID, and every response is cached so
+        re-runs are free. Per-document failures come back as Exception entries;
+        only submission itself can fail the whole batch."""
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
-        api_key_env, _ = _require_llm_api_key(options)
+        provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
+        provider = get_inference_provider(provider_name)
+        model = resolve_provider_model(provider, options.get("model"))
+        api_key_env = _api_key_env(options) or provider.default_credential_env
+        _resolve_provider_credential(provider, api_key_env)
+        if not provider.supports_native_batch:
+            raise RuntimeError(
+                f"Inference provider '{provider_name}' does not support native "
+                "batch execution; disable `batch:`."
+            )
         fields_spec = options.get("fields")
         if not fields_spec or not isinstance(fields_spec, list):
             raise ValueError(
                 "llm backend requires `options.fields: [{name, type, ...}]`"
             )
-        model = options.get("model", _DEFAULT_MODEL)
         system = options.get("system_prompt", _DEFAULT_SYSTEM)
         temperature = float(options.get("temperature", _DEFAULT_TEMPERATURE))
         max_tokens = int(options.get("max_tokens", _DEFAULT_MAX_TOKENS))
@@ -152,9 +188,12 @@ class LLMBackend(BaseBackend):
         cache_path = options.get("cache_path")
         cache_path_obj = Path(cache_path) if cache_path is not None else None
         schema_hash = _hash_schema(system, fields_spec, temperature)
+        provider_identity = provider.implementation_identity()
+        max_retries = int(options.get("max_retries", _DEFAULT_MAX_RETRIES))
 
         by_index: dict[int, ExtractionResult | Exception] = {}
-        pending: list[tuple[int, str, str]] = []
+        batch_metrics: dict[str, Any] = {}
+        pending: list[tuple[int, str, str, str]] = []
         for i, path in enumerate(paths):
             try:
                 text = path.read_text()
@@ -164,7 +203,14 @@ class LLMBackend(BaseBackend):
             content_hash = hashlib.blake2b(
                 text.encode(), digest_size=HASH_DIGEST_SIZE
             ).hexdigest()
-            cache_key = f"{model}|{content_hash}|{schema_hash}"
+            cache_key = _cache_key(
+                provider=provider_name,
+                provider_identity=provider_identity,
+                model=model,
+                content_hash=content_hash,
+                schema_hash=schema_hash,
+                max_tokens=max_tokens,
+            )
             cached = (
                 _cache_get(cache_path_obj, cache_key)
                 if cache_path_obj is not None
@@ -176,75 +222,69 @@ class LLMBackend(BaseBackend):
                     metrics={"api_calls": 0, "cache_hits": 1, **_ZERO_USAGE},
                 )
                 continue
-            pending.append((i, text, content_hash))
+            pending.append((i, text, content_hash, cache_key))
 
         if pending:
-            if len(pending) > _MAX_BATCH_REQUESTS:
-                raise RuntimeError(
-                    f"{len(pending)} uncached documents exceed the Message "
-                    f"Batches API limit of {_MAX_BATCH_REQUESTS} requests per "
-                    "batch. Split the run with --select, or disable `batch:`."
-                )
-            tool = _extract_tool(fields_spec)
             requests = [
-                {
-                    "custom_id": f"req-{j}",
-                    "params": {
-                        "model": model,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "system": system,
-                        "tools": [tool],
-                        "tool_choice": {"type": "tool", "name": "extract"},
-                        "messages": [{"role": "user", "content": text}],
-                    },
-                }
-                for j, (_, text, _) in enumerate(pending)
+                BatchInferenceRequest(
+                    f"req-{j}",
+                    _inference_request(
+                        content=text,
+                        model=model,
+                        system=system,
+                        fields_spec=fields_spec,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    ),
+                )
+                for j, (_, text, _, _) in enumerate(pending)
             ]
-            items = _run_message_batch(
+            batch_result = _run_message_batch(
                 requests,
+                provider=provider_name,
                 poll_seconds=poll_seconds,
                 api_key_env=api_key_env,
+                max_retries=max_retries,
             )
-            for j, (i, _, content_hash) in enumerate(pending):
+            batch_metrics["batch_submissions"] = batch_result.batch_submissions
+            items = {item.request_id: item for item in batch_result.items}
+            for j, (i, _, content_hash, cache_key) in enumerate(pending):
                 by_index[i] = self._resolve_batch_item(
                     items.get(f"req-{j}"),
-                    max_tokens=max_tokens,
                     cache_path=cache_path_obj,
+                    cache_key=cache_key,
                     model=model,
                     content_hash=content_hash,
                     schema_hash=schema_hash,
                 )
 
-        return [by_index[i] for i in range(len(paths))]
+        return BatchExtractionOutput(
+            [by_index[i] for i in range(len(paths))],
+            metrics=batch_metrics,
+        )
 
     @staticmethod
     def _resolve_batch_item(
-        item: Any,
+        item: BatchInferenceItem | None,
         *,
-        max_tokens: int,
         cache_path: Path | None,
+        cache_key: str,
         model: str,
         content_hash: str,
         schema_hash: str,
     ) -> ExtractionResult | Exception:
         if item is None:
-            return RuntimeError("Message Batches API returned no result for document")
-        result_type = item.result.type
-        if result_type != "succeeded":
-            detail = getattr(item.result, "error", None)
-            suffix = f": {detail}" if detail is not None else ""
-            return RuntimeError(f"batch request {result_type}{suffix}")
-        try:
-            fields, usage = _parse_extract_response(
-                item.result.message, max_tokens=max_tokens
-            )
-        except RuntimeError as e:
-            return e
+            return RuntimeError("Provider batch returned no result for document")
+        if item.error is not None:
+            return item.error
+        if item.result is None:
+            return RuntimeError("Provider batch returned an empty result")
+        fields = dict(item.result.output)
+        usage = item.result.usage.to_metrics()
         if cache_path is not None:
             _cache_put(
                 cache_path,
-                f"{model}|{content_hash}|{schema_hash}",
+                cache_key,
                 model=model,
                 content_hash=content_hash,
                 schema_hash=schema_hash,
@@ -268,7 +308,8 @@ def extract_fields_from_text(
     text: str,
     *,
     fields_spec: list[dict[str, Any]],
-    model: str = _DEFAULT_MODEL,
+    provider: str = DEFAULT_LLM_PROVIDER,
+    model: str | None = None,
     system: str = _DEFAULT_SYSTEM,
     cache_path: str | Path | None = None,
     call_api: Any = None,
@@ -276,19 +317,20 @@ def extract_fields_from_text(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
+    api_key_env: str | None = None,
 ) -> dict[str, Any]:
-    """Extract structured fields from a string of text by calling Claude.
+    """Extract structured fields from text with a registered provider.
 
     Reusable from transform models that need to LLM-process rows of text
     (e.g. text extracted from PDFs in an upstream model). Discards usage;
     call `extract_fields_with_usage` to get token accounting too.
 
-    `call_api` is injectable for testing; defaults to the real Anthropic call.
+    `call_api` remains injectable for compatibility and deterministic tests.
     """
     fields, _ = extract_fields_with_usage(
         text,
         fields_spec=fields_spec,
+        provider=provider,
         model=model,
         system=system,
         cache_path=cache_path,
@@ -306,7 +348,8 @@ def extract_fields_with_usage(
     text: str,
     *,
     fields_spec: list[dict[str, Any]],
-    model: str = _DEFAULT_MODEL,
+    provider: str = DEFAULT_LLM_PROVIDER,
+    model: str | None = None,
     system: str = _DEFAULT_SYSTEM,
     cache_path: str | Path | None = None,
     call_api: Any = None,
@@ -314,7 +357,7 @@ def extract_fields_with_usage(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
+    api_key_env: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
@@ -328,11 +371,20 @@ def extract_fields_with_usage(
             "max_concurrent": max_concurrent,
         }
     )
+    provider_instance = get_inference_provider(provider)
+    resolved_model = resolve_provider_model(provider_instance, model)
     content_hash = hashlib.blake2b(
         text.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
     schema_hash = _hash_schema(system, fields_spec, temperature)
-    cache_key = f"{model}|{content_hash}|{schema_hash}"
+    cache_key = _cache_key(
+        provider=provider,
+        provider_identity=provider_instance.implementation_identity(),
+        model=resolved_model,
+        content_hash=content_hash,
+        schema_hash=schema_hash,
+        max_tokens=max_tokens,
+    )
 
     cache_path_obj = Path(cache_path) if cache_path is not None else None
     if cache_path_obj is not None:
@@ -342,12 +394,15 @@ def extract_fields_with_usage(
 
     fn = call_api
     if fn is None:
-        resolved_env, _ = _require_llm_api_key({"api_key_env": api_key_env})
-        fn = partial(_default_call_api, api_key_env=resolved_env)
+        fn = partial(
+            _default_call_api,
+            provider=provider,
+            api_key_env=api_key_env,
+        )
     with _gate(max_concurrent):
         raw = fn(
             text,
-            model,
+            resolved_model,
             system,
             fields_spec,
             temperature=temperature,
@@ -361,13 +416,24 @@ def extract_fields_with_usage(
         result_fields, call_usage = raw
     else:
         result_fields, call_usage = raw, {}
-    usage = {"api_calls": 1, "cache_hits": 0, **_ZERO_USAGE, **call_usage}
+    if not isinstance(result_fields, dict):
+        raise ProviderResponseError(
+            "provider structured output must be a mapping",
+            safe_for_display=True,
+        )
+    normalized_usage = ProviderUsage.from_mapping(call_usage).to_metrics()
+    usage = {
+        "api_calls": 1,
+        "cache_hits": 0,
+        **_ZERO_USAGE,
+        **normalized_usage,
+    }
 
     if cache_path_obj is not None:
         _cache_put(
             cache_path_obj,
             cache_key,
-            model=model,
+            model=resolved_model,
             content_hash=content_hash,
             schema_hash=schema_hash,
             fields=result_fields,
@@ -381,96 +447,138 @@ def _default_call_api(
     system: str,
     fields_spec: list[dict[str, Any]],
     *,
+    provider: str = DEFAULT_LLM_PROVIDER,
     temperature: float = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
-    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
+    api_key_env: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    _, api_key = _require_llm_api_key({"api_key_env": api_key_env})
-    from anthropic import Anthropic
-
-    # The SDK retries 429s / 5xx / timeouts with exponential backoff.
-    client = Anthropic(api_key=api_key, max_retries=max_retries)
-    resp = client.messages.create(  # type: ignore[call-overload]
+    provider_instance = get_inference_provider(provider)
+    credential = _resolve_provider_credential(provider_instance, api_key_env)
+    request = _inference_request(
+        content=content,
         model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
         system=system,
-        tools=[_extract_tool(fields_spec)],
-        tool_choice={"type": "tool", "name": "extract"},
-        messages=[{"role": "user", "content": content}],
+        fields_spec=fields_spec,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
-    return _parse_extract_response(resp, max_tokens=max_tokens)
-
-
-def _extract_tool(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "name": "extract",
-        "description": "Return the extracted structured fields from the document.",
-        "input_schema": _input_schema(fields_spec),
-    }
-
-
-def _parse_extract_response(
-    resp: Any, *, max_tokens: int
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Fields + usage from a Messages API response — shared by the synchronous
-    call and per-item batch results (identical message shape)."""
-    if resp.stop_reason == "max_tokens":
-        raise RuntimeError(
-            f"LLM response truncated at max_tokens={max_tokens}; partial "
-            "extractions are never used. Raise `max_tokens` in the model's "
-            "extraction options."
+    try:
+        result = provider_instance.validate_result(
+            provider_instance.complete(
+                request,
+                credential=credential,
+                runtime=ProviderRuntimeOptions(max_retries=max_retries),
+            )
         )
-    usage = {
-        key: getattr(resp.usage, key, None) or 0
-        for key in _ZERO_USAGE
-    }
-    for block in resp.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "extract":
-            return dict(block.input), usage
-    raise RuntimeError("LLM did not return an `extract` tool call")
+    except ProviderError as error:
+        raise sanitized_provider_error(
+            provider, "inference", error
+        ) from None
+    except Exception as error:
+        if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "provider '%s' inference failed:\n%s",
+                provider,
+                redacted_exception_text(
+                    error,
+                    sensitive=(
+                        credential.reveal() if credential else None,
+                        request.content,
+                        request.system_prompt,
+                    ),
+                ),
+            )
+        raise ProviderRequestError(
+            provider, "inference", code=type(error).__name__
+        ) from None
+    return dict(result.output), result.usage.to_metrics()
 
 
 def _run_message_batch(
-    requests: list[dict[str, Any]],
+    requests: list[BatchInferenceRequest],
     *,
+    provider: str = DEFAULT_LLM_PROVIDER,
     poll_seconds: float,
-    api_key_env: str = DEFAULT_LLM_API_KEY_ENV,
-) -> dict[str, Any]:
-    """Submit one Message Batch, poll to completion, return items keyed by
-    custom_id (results stream back unordered). Injectable for testing, like
-    `_default_call_api`."""
-    _, api_key = _require_llm_api_key({"api_key_env": api_key_env})
-    from anthropic import Anthropic
-
-    client = Anthropic(api_key=api_key)
-    batch = client.messages.batches.create(requests=requests)  # type: ignore[arg-type]
-    log.info("submitted message batch %s (%d requests)", batch.id, len(requests))
-    while True:
-        batch = client.messages.batches.retrieve(batch.id)
-        if batch.processing_status == "ended":
-            break
-        counts = batch.request_counts
-        log.info(
-            "batch %s: %s (processing=%d succeeded=%d errored=%d)",
-            batch.id,
-            batch.processing_status,
-            counts.processing,
-            counts.succeeded,
-            counts.errored,
+    api_key_env: str | None = None,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+) -> BatchInferenceResult:
+    provider_instance = get_inference_provider(provider)
+    credential = _resolve_provider_credential(provider_instance, api_key_env)
+    try:
+        result = provider_instance.complete_batch(
+            requests,
+            credential=credential,
+            runtime=ProviderRuntimeOptions(max_retries=max_retries),
+            poll_seconds=poll_seconds,
         )
-        time.sleep(poll_seconds)
-    return {r.custom_id: r for r in client.messages.batches.results(batch.id)}
+        return provider_instance.validate_batch_result(requests, result)
+    except ProviderError as error:
+        raise sanitized_provider_error(
+            provider, "batch inference", error
+        ) from None
+    except Exception as error:
+        if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+            sensitive: list[str | None] = [
+                credential.reveal() if credential else None
+            ]
+            for item in requests:
+                sensitive.append(item.request.content)
+                sensitive.append(item.request.system_prompt)
+            log.debug(
+                "provider '%s' batch inference failed:\n%s",
+                provider,
+                redacted_exception_text(error, sensitive=tuple(sensitive)),
+            )
+        raise ProviderRequestError(
+            provider, "batch inference", code=type(error).__name__
+        ) from None
 
 
-def _require_llm_api_key(options: dict[str, Any]) -> tuple[str, str]:
-    api_key_env, api_key = resolve_llm_credential(options)
-    if not api_key:
-        raise RuntimeError(
-            f"{api_key_env} is not set. Export it before running an LLM model."
-        )
-    return api_key_env, api_key
+def _inference_request(
+    *,
+    content: str,
+    model: str,
+    system: str,
+    fields_spec: list[dict[str, Any]],
+    temperature: float,
+    max_tokens: int,
+) -> InferenceRequest:
+    return InferenceRequest(
+        model=model,
+        content=content,
+        system_prompt=system,
+        output_schema=_input_schema(fields_spec),
+        output_name="extract",
+        output_description=(
+            "Return the extracted structured fields from the document."
+        ),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def _resolve_provider_credential(
+    provider: InferenceProvider,
+    api_key_env: str | None,
+) -> ProviderCredential | None:
+    try:
+        return provider.resolve_credential(api_key_env)
+    except ProviderError as error:
+        raise sanitized_provider_error(
+            provider.name(), "credential resolution", error
+        ) from None
+    except Exception as error:
+        raise ProviderRequestError(
+            provider.name(),
+            "credential resolution",
+            code=type(error).__name__,
+        ) from None
+
+
+def _api_key_env(options: dict[str, Any]) -> str | None:
+    value = options.get("api_key_env")
+    return str(value) if value is not None else None
 
 
 def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:
@@ -500,8 +608,43 @@ def _hash_schema(
     ).hexdigest()
 
 
+def _cache_key(
+    *,
+    provider: str,
+    provider_identity: str,
+    model: str,
+    content_hash: str,
+    schema_hash: str,
+    max_tokens: int,
+) -> str:
+    # Keyed on the semantic request plus the provider's contract identity —
+    # not the backend implementation or dbt-ml release, so cached responses
+    # survive routine upgrades. Row-shaping changes invalidate incremental
+    # state through the model code version instead.
+    canonical = json.dumps(
+        {
+            "contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": provider,
+            "provider_identity": provider_identity,
+            "model": model,
+            "content_hash": content_hash,
+            "schema_hash": schema_hash,
+            "max_tokens": max_tokens,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.blake2b(
+        canonical.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+    return f"provider-v{PROVIDER_CONTRACT_VERSION}|{provider}|{model}|{digest}"
+
+
 def _cache_get(path: Path, key: str) -> dict[str, Any] | None:
-    if not path.exists():
+    if os.name == "nt":
+        if not path.exists():
+            return None
+    elif not _harden_cache_files(path, require_main=True):
         return None
     con = duckdb.connect(str(path), read_only=True)
     try:
@@ -537,30 +680,115 @@ def _cache_put_locked(
     schema_hash: str,
     fields: dict[str, Any],
 ) -> None:
-    con = duckdb.connect(str(path))
-    try:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS llm_cache (
-                cache_key VARCHAR PRIMARY KEY,
-                model VARCHAR NOT NULL,
-                content_hash VARCHAR NOT NULL,
-                schema_hash VARCHAR NOT NULL,
-                response_json VARCHAR NOT NULL,
-                created_at TIMESTAMP NOT NULL
+    if os.name != "nt":
+        _harden_cache_files(path, require_main=False)
+    with _private_cache_umask():
+        con = duckdb.connect(str(path))
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS llm_cache (
+                    cache_key VARCHAR PRIMARY KEY,
+                    model VARCHAR NOT NULL,
+                    content_hash VARCHAR NOT NULL,
+                    schema_hash VARCHAR NOT NULL,
+                    response_json VARCHAR NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+                """
             )
-            """
-        )
-        con.execute(
-            """
-            INSERT INTO llm_cache
-                (cache_key, model, content_hash, schema_hash, response_json, created_at)
-            VALUES (?, ?, ?, ?, ?, current_timestamp)
-            ON CONFLICT (cache_key) DO UPDATE SET
-                response_json = excluded.response_json,
-                created_at    = excluded.created_at
-            """,
-            [key, model, content_hash, schema_hash, json.dumps(fields)],
-        )
+            _prune_legacy_entries(con, path)
+            con.execute(
+                """
+                INSERT INTO llm_cache
+                    (cache_key, model, content_hash, schema_hash, response_json, created_at)
+                VALUES (?, ?, ?, ?, ?, current_timestamp)
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    response_json = excluded.response_json,
+                    created_at    = excluded.created_at
+                """,
+                [key, model, content_hash, schema_hash, json.dumps(fields)],
+            )
+        finally:
+            con.close()
+    if os.name != "nt":
+        _harden_cache_files(path, require_main=True)
+
+
+@contextmanager
+def _private_cache_umask() -> Iterator[None]:
+    if os.name == "nt":
+        yield
+        return
+    # DuckDB creates its write-ahead log beside the database. The process-wide
+    # mask is restored immediately, while the cache write lock serializes this
+    # package's writers.
+    previous = os.umask(0o077)
+    try:
+        yield
     finally:
-        con.close()
+        os.umask(previous)
+
+
+def _harden_cache_files(path: Path, *, require_main: bool) -> bool:
+    main_exists = _harden_optional_cache_file(path)
+    _harden_optional_cache_file(Path(f"{path}.wal"))
+    if require_main and not main_exists:
+        return False
+    return main_exists
+
+
+def _harden_optional_cache_file(path: Path) -> bool:
+    try:
+        _harden_existing_cache_file(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _harden_existing_cache_file(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("LLM cache path must be a regular, non-symlink file")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        if os.path.lexists(path):
+            raise ValueError(
+                "LLM cache path must be a regular, non-symlink file"
+            ) from error
+        raise
+    except OSError as error:
+        raise ValueError(
+            "LLM cache path must be a regular, non-symlink file"
+        ) from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(
+                "LLM cache path must be a regular, non-symlink file"
+            )
+        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+    finally:
+        os.close(descriptor)
+
+
+# Paths already swept this process; guarded by _CACHE_WRITE_LOCK.
+_PRUNED_CACHE_PATHS: set[str] = set()
+
+
+def _prune_legacy_entries(con: duckdb.DuckDBPyConnection, path: Path) -> None:
+    """Drop pre-provider-contract rows (`{model}|{content}|{schema}` keys).
+
+    They can never be read again — every current key carries the
+    `provider-v…|` prefix — so they only grow the cache file. Versioned
+    entries are kept even across contract bumps to keep downgrades cheap.
+    """
+    resolved = str(path.resolve())
+    if resolved in _PRUNED_CACHE_PATHS:
+        return
+    con.execute("DELETE FROM llm_cache WHERE cache_key NOT LIKE 'provider-v%'")
+    _PRUNED_CACHE_PATHS.add(resolved)

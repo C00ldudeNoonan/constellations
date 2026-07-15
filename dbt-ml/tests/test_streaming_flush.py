@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -18,6 +17,13 @@ import pytest
 from dbt_ml.adapters.base import AdapterError
 from dbt_ml.adapters.duckdb import DuckDBAdapter
 from dbt_ml.backends import llm_backend
+from dbt_ml.providers import (
+    BatchInferenceItem,
+    BatchInferenceRequest,
+    BatchInferenceResult,
+    InferenceResult,
+    ProviderUsage,
+)
 from dbt_ml.runner import RunError, run_project
 from dbt_ml.synth import generate_invoice_texts, generate_invoices
 
@@ -382,40 +388,35 @@ def test_batch_mode_single_submission_chunked_flushes(
     batch_calls = {"n": 0}
 
     def fake_batch(
-        requests: list[dict[str, Any]],
+        requests: list[BatchInferenceRequest],
         *,
+        provider: str,
         poll_seconds: float,
         api_key_env: str,
-    ) -> dict[str, Any]:
+        max_retries: int,
+    ) -> BatchInferenceResult:
         batch_calls["n"] += 1
-        out = {}
+        out: list[BatchInferenceItem] = []
         for i, req in enumerate(requests):
-            msg = SimpleNamespace(
-                stop_reason="tool_use",
-                content=[
-                    SimpleNamespace(
-                        type="tool_use",
-                        name="extract",
-                        input={
+            out.append(
+                BatchInferenceItem(
+                    req.request_id,
+                    result=InferenceResult(
+                        {
                             "vendor": "V",
                             "invoice_id": f"I-{i}",
                             "issue_date": "2026-01-01",
                             "currency": "USD",
                             "total": 1.0,
                         },
-                    )
-                ],
-                usage=SimpleNamespace(
+                        usage=ProviderUsage(
                     input_tokens=100,
                     output_tokens=10,
-                    cache_read_input_tokens=0,
-                    cache_creation_input_tokens=0,
+                        ),
+                    ),
                 ),
             )
-            out[req["custom_id"]] = SimpleNamespace(
-                result=SimpleNamespace(type="succeeded", message=msg)
-            )
-        return out
+        return BatchInferenceResult(tuple(out), batch_submissions=1)
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake_batch)
 

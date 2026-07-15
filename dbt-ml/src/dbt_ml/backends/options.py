@@ -22,6 +22,10 @@ from ..optional_dependencies import import_optional_dependency
 
 _STRICT_OPTIONS = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
 _NonEmptyString = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
+_ProviderName = Annotated[
+    str,
+    StringConstraints(min_length=1, pattern=r"^[a-z0-9][a-z0-9_-]*$"),
+]
 _JsonSchemaType = Literal[
     "array",
     "boolean",
@@ -250,7 +254,7 @@ class LLMFieldSpec(_BackendOptions):
         validation_alias=AliasChoices("type", "data_type", "data-type", "dtype"),
     )
     description: str | None = None
-    # The backend forwards an array's item schema to Anthropic unchanged. Keep
+    # The backend forwards an array's item schema to providers unchanged. Keep
     # extension keywords available while validating the part dbt-ml consumes.
     items: dict[str, Any] | None = None
 
@@ -276,10 +280,11 @@ class LLMFieldSpec(_BackendOptions):
 
 class LLMBackendOptions(_BackendOptions):
     fields: list[LLMFieldSpec] = Field(min_length=1)
-    model: _NonEmptyString = "claude-haiku-4-5"
+    provider: _ProviderName = "anthropic"
+    model: _NonEmptyString | None = None
     system_prompt: str = (
         "You extract structured fields from documents. "
-        "Call the `extract` tool with the requested fields. "
+        "Return structured fields that match the requested output schema. "
         "If a field is genuinely missing from the document, use null."
     )
     cache_path: str | Path | None = None
@@ -287,8 +292,8 @@ class LLMBackendOptions(_BackendOptions):
     max_tokens: int = Field(default=2048, ge=1, le=65_536)
     max_retries: int = Field(default=4, ge=0, le=20)
     max_concurrent: int = Field(default=4, ge=1, le=100)
-    api_key_env: _NonEmptyString = Field(
-        default="ANTHROPIC_API_KEY", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
+    api_key_env: _NonEmptyString | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
     )
     batch: bool = False
     batch_poll_seconds: float = Field(

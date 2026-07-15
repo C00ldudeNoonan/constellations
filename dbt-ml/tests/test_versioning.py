@@ -251,6 +251,104 @@ def test_profile_llm_semantics_change_model_code_version(tmp_path: Path) -> None
     )
 
 
+def test_llm_dependent_transform_versions_profile_inference(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform=TransformConfig(type="python", uses_llm=True),
+    )
+    project = ProjectConfig(name="p")
+    first = compute_model_code_version(
+        model,
+        project,
+        tmp_path,
+        resolved=_resolved_llm(
+            tmp_path, model="claude-a", system_prompt="prompt a"
+        ),
+    )
+    second = compute_model_code_version(
+        model,
+        project,
+        tmp_path,
+        resolved=_resolved_llm(
+            tmp_path, model="claude-b", system_prompt="prompt a"
+        ),
+    )
+    third = compute_model_code_version(
+        model,
+        project,
+        tmp_path,
+        resolved=_resolved_llm(
+            tmp_path, model="claude-a", system_prompt="prompt b"
+        ),
+    )
+
+    assert first != second
+    assert first != third
+
+
+def _llm_model(*, provider: str, model: str) -> ModelConfig:
+    return ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction=ExtractionConfig(
+            backend="llm",
+            options={
+                "provider": provider,
+                "model": model,
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        ),
+    )
+
+
+def test_provider_and_model_change_model_code_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "dbt_ml.versioning.get_inference_provider",
+        lambda name: SimpleNamespace(
+            implementation_identity=lambda: f"implementation/{name}",
+            resolve_model=lambda model: model,
+        ),
+    )
+    project = ProjectConfig(name="p")
+    baseline = compute_model_code_version(
+        _llm_model(provider="provider-a", model="model-a"), project, tmp_path
+    )
+
+    assert baseline != compute_model_code_version(
+        _llm_model(provider="provider-b", model="model-a"), project, tmp_path
+    )
+    assert baseline != compute_model_code_version(
+        _llm_model(provider="provider-a", model="model-b"), project, tmp_path
+    )
+
+
+def test_provider_implementation_changes_model_code_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _llm_model(provider="provider-a", model="model-a")
+    project = ProjectConfig(name="p")
+    monkeypatch.setattr(
+        "dbt_ml.versioning.get_inference_provider",
+        lambda name: SimpleNamespace(
+            implementation_identity=lambda: "implementation/one",
+            resolve_model=lambda selected: selected,
+        ),
+    )
+    first = compute_model_code_version(model, project, tmp_path)
+    monkeypatch.setattr(
+        "dbt_ml.versioning.get_inference_provider",
+        lambda name: SimpleNamespace(
+            implementation_identity=lambda: "implementation/two",
+            resolve_model=lambda selected: selected,
+        ),
+    )
+
+    assert first != compute_model_code_version(model, project, tmp_path)
+
+
 def test_llm_execution_only_options_do_not_change_model_code_version(
     tmp_path: Path,
 ) -> None:

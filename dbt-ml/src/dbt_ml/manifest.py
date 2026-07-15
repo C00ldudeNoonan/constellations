@@ -19,7 +19,7 @@ from .profile import (
     resolve_profile,
 )
 from .runner import ModelRunResult
-from .versioning import compute_model_code_version
+from .versioning import compute_model_code_version, describe_model_inference
 
 MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
@@ -264,7 +264,7 @@ def _model_dict(
     else:
         kind = "unknown"
 
-    return {
+    model_dict = {
         "name": model.name,
         "description": model.description,
         "kind": kind,
@@ -285,6 +285,10 @@ def _model_dict(
             resolved=resolved,
         ),
     }
+    inference = describe_model_inference(model, project, resolved=resolved)
+    if inference is not None:
+        model_dict["inference"] = inference
+    return model_dict
 
 
 class StateError(Exception):

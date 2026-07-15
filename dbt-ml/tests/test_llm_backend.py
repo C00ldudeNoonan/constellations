@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from dbt_ml.backends import get_backend
+from dbt_ml.backends import get_backend, llm_backend
 from dbt_ml.backends.llm_backend import LLMBackend, extract_fields_from_text
+from dbt_ml.hashing import HASH_DIGEST_SIZE
+from dbt_ml.providers import base as provider_base
+from dbt_ml.providers import get_inference_provider
 
 
 @pytest.fixture(autouse=True)
@@ -252,7 +258,7 @@ def test_custom_api_key_env_wins_for_sync_and_reusable_clients(
                         type="tool_use", name="extract", input={"vendor": "Acme"}
                     )
                 ],
-                usage=SimpleNamespace(),
+                usage=SimpleNamespace(input_tokens=0, output_tokens=0),
             )
 
     class _FakeAnthropic:
@@ -309,6 +315,7 @@ def test_generation_params_default_and_override(
 
     backend.extract(doc, {"fields": schema})
     assert counter.kwargs == {
+        "provider": "anthropic",
         "api_key_env": "ANTHROPIC_API_KEY",
         "temperature": 0.0,
         "max_tokens": 2048,
@@ -320,6 +327,7 @@ def test_generation_params_default_and_override(
         {"fields": schema, "temperature": 0.3, "max_tokens": 8192, "max_retries": 1},
     )
     assert counter.kwargs == {
+        "provider": "anthropic",
         "api_key_env": "ANTHROPIC_API_KEY",
         "temperature": 0.3,
         "max_tokens": 8192,
@@ -340,6 +348,252 @@ def test_temperature_is_part_of_cache_key(
     assert counter.calls == 2, "different temperature must not reuse cached output"
     backend.extract(doc, {**opts, "temperature": 0.7})
     assert counter.calls == 2
+
+
+def test_max_tokens_is_part_of_cache_key(
+    monkeypatch: pytest.MonkeyPatch, doc: Path, schema: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    counter = _CallCounter({"vendor": "v", "invoice_id": "i", "total": 0.0})
+    monkeypatch.setattr(LLMBackend, "_call_api", counter)
+    backend = get_backend("llm")
+    opts = {"cache_path": str(tmp_path / "cache.duckdb"), "fields": schema}
+
+    backend.extract(doc, opts)
+    backend.extract(doc, {**opts, "max_tokens": 4096})
+    backend.extract(doc, {**opts, "max_tokens": 4096})
+
+    assert counter.calls == 2
+
+
+def test_cache_key_separates_provider_implementations() -> None:
+    common = {
+        "provider": "anthropic",
+        "model": "shared-model",
+        "content_hash": "content",
+        "schema_hash": "schema",
+        "max_tokens": 2048,
+    }
+    first = llm_backend._cache_key(
+        **common,
+        provider_identity="implementation-one-with-sensitive-path",
+    )
+    second = llm_backend._cache_key(
+        **common,
+        provider_identity="implementation-two",
+    )
+
+    assert first != second
+    assert "sensitive-path" not in first
+
+
+def test_cache_key_survives_dbt_ml_release_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response cache is keyed on the semantic request and the provider
+    contract identity — never the dbt-ml release — so routine upgrades do
+    not force paid re-extraction."""
+    common = {
+        "provider": "anthropic",
+        "model": "shared-model",
+        "content_hash": "content",
+        "schema_hash": "schema",
+        "max_tokens": 2048,
+    }
+    versions = {"dbt-ml": "1.0", "anthropic": "5.0"}
+    monkeypatch.setattr(
+        "dbt_ml.providers.base.package_version",
+        lambda package: versions[package],
+    )
+    try:
+        provider_base._implementation_identity.cache_clear()
+        identity = get_inference_provider("anthropic").implementation_identity()
+        first = llm_backend._cache_key(**common, provider_identity=identity)
+        versions["dbt-ml"] = "2.0"
+        provider_base._implementation_identity.cache_clear()
+        bumped_identity = get_inference_provider(
+            "anthropic"
+        ).implementation_identity()
+        second = llm_backend._cache_key(
+            **common, provider_identity=bumped_identity
+        )
+    finally:
+        provider_base._implementation_identity.cache_clear()
+
+    assert identity == bumped_identity
+    assert first == second
+
+
+def test_legacy_cache_entry_is_not_reused(tmp_path: Path) -> None:
+    text = "legacy cached document"
+    model = "claude-haiku-4-5"
+    system = "extract"
+    fields_spec = [{"name": "x"}]
+    content_hash = hashlib.blake2b(
+        text.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+    schema_hash = llm_backend._hash_schema(system, fields_spec, 0.0)
+    legacy_key = f"{model}|{content_hash}|{schema_hash}"
+    cache_path = tmp_path / "cache.duckdb"
+    llm_backend._cache_put(
+        cache_path,
+        legacy_key,
+        model=model,
+        content_hash=content_hash,
+        schema_hash=schema_hash,
+        fields={"x": "legacy"},
+    )
+    counter = _CallCounter({"x": "fresh"})
+
+    fields, usage = llm_backend.extract_fields_with_usage(
+        text,
+        fields_spec=fields_spec,
+        model=model,
+        system=system,
+        cache_path=cache_path,
+        call_api=counter,
+    )
+
+    assert fields == {"x": "fresh"}
+    assert usage["cache_hits"] == 0
+    assert counter.calls == 1
+
+
+def test_legacy_cache_entries_are_pruned_on_write(tmp_path: Path) -> None:
+    """Rows written before the provider contract can never be read again;
+    the first write into a cache file sweeps them out."""
+    import duckdb
+
+    cache_path = tmp_path / "cache.duckdb"
+    con = duckdb.connect(str(cache_path))
+    con.execute(
+        """
+        CREATE TABLE llm_cache (
+            cache_key VARCHAR PRIMARY KEY,
+            model VARCHAR NOT NULL,
+            content_hash VARCHAR NOT NULL,
+            schema_hash VARCHAR NOT NULL,
+            response_json VARCHAR NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO llm_cache VALUES "
+        "('claude-haiku-4-5|abc|def', 'claude-haiku-4-5', 'abc', 'def', "
+        "'{\"x\": \"legacy\"}', current_timestamp)"
+    )
+    con.close()
+
+    new_key = "provider-v1|anthropic|claude-haiku-4-5|digest"
+    llm_backend._cache_put(
+        cache_path,
+        new_key,
+        model="claude-haiku-4-5",
+        content_hash="abc",
+        schema_hash="def",
+        fields={"x": "fresh"},
+    )
+
+    assert llm_backend._cache_get(cache_path, "claude-haiku-4-5|abc|def") is None
+    assert llm_backend._cache_get(cache_path, new_key) == {"x": "fresh"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_cache_file_is_private_and_rejects_symlinks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "cache.duckdb"
+    wal_path = Path(f"{cache_path}.wal")
+    wal_modes: list[int] = []
+    real_connect = llm_backend.duckdb.connect
+
+    class InspectingConnection:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._connection = real_connect(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+        def execute(self, *args: object, **kwargs: object) -> object:
+            result = self._connection.execute(*args, **kwargs)
+            if args and "INSERT INTO llm_cache" in str(args[0]):
+                wal_modes.append(stat.S_IMODE(wal_path.stat().st_mode))
+            return result
+
+    monkeypatch.setattr(llm_backend.duckdb, "connect", InspectingConnection)
+    original_umask = os.umask(0o022)
+    try:
+        llm_backend._cache_put(
+            cache_path,
+            "provider-v1|anthropic|model|private",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
+    finally:
+        os.umask(original_umask)
+
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+    assert wal_modes == [0o600]
+
+    os.chmod(cache_path, 0o644)
+    llm_backend._cache_put(
+        cache_path,
+        "provider-v1|anthropic|model|normalized",
+        model="model",
+        content_hash="content",
+        schema_hash="schema",
+        fields={"private": "value"},
+    )
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+
+    symlink_path = tmp_path / "cache-link.duckdb"
+    symlink_path.symlink_to(cache_path)
+    with pytest.raises(ValueError, match="non-symlink"):
+        llm_backend._cache_put(
+            symlink_path,
+            "provider-v1|anthropic|model|symlink",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
+    with pytest.raises(ValueError, match="non-symlink"):
+        llm_backend._cache_get(symlink_path, "private")
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged")
+    wal_path.symlink_to(victim)
+    with pytest.raises(ValueError, match="non-symlink"):
+        llm_backend._cache_put(
+            cache_path,
+            "provider-v1|anthropic|model|wal-symlink",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
+    assert victim.read_text() == "unchanged"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX special files")
+def test_cache_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    cache_path = tmp_path / "cache.fifo"
+    os.mkfifo(cache_path)
+
+    with pytest.raises(ValueError, match="regular"):
+        llm_backend._cache_get(cache_path, "key")
+    with pytest.raises(ValueError, match="regular"):
+        llm_backend._cache_put(
+            cache_path,
+            "provider-v1|anthropic|model|fifo",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
 
 
 def test_truncated_response_is_an_error(

@@ -9,6 +9,7 @@ models:
     transform:
       type: python
       module: transforms.llm_extract
+      uses_llm: true
 
     materialization: full
 

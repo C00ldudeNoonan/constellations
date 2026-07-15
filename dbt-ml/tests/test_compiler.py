@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -113,6 +114,91 @@ def test_explicit_unregistered_backend_is_rejected(tmp_path: Path) -> None:
             [_extraction("raw", backend="missing")],
             tmp_path,
         )
+
+
+def test_unregistered_inference_provider_is_rejected(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "provider": "missing-provider",
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"Inference provider 'missing-provider' is not registered",
+    ):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [model],
+            tmp_path,
+        )
+
+
+def test_provider_without_native_batch_is_rejected_at_compile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "dbt_ml.compiler.get_inference_provider",
+        lambda _name: SimpleNamespace(supports_native_batch=False),
+    )
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "provider": "sync-only",
+                "batch": True,
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    with pytest.raises(ConfigError, match="does not support native batch"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [model],
+            tmp_path,
+        )
+
+
+def test_provider_checks_defer_to_profile_when_model_does_not_pin_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a model-pinned provider the effective provider is profile
+    configuration, so registration and batch capability are validated in
+    resolve_llm_options — not against the canonical default here."""
+
+    def _forbidden(_name: str) -> None:
+        raise AssertionError("provider registry must not be consulted")
+
+    monkeypatch.setattr("dbt_ml.compiler.get_inference_provider", _forbidden)
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "batch": True,
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    validate_project_contract(
+        ProjectConfig(name="p"),
+        [_source()],
+        [model],
+        tmp_path,
+    )
 
 
 @pytest.mark.parametrize(

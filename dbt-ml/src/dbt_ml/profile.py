@@ -23,7 +23,7 @@ from pydantic import ValidationError
 
 from .adapters import AdapterError, parse_warehouse_config
 from .config.profile import (
-    DEFAULT_LLM_API_KEY_ENV,
+    DEFAULT_LLM_PROVIDER,
     LLMConfig,
     ProfileConfig,
     WarehouseConfig,
@@ -34,6 +34,12 @@ from .config.yaml_diagnostics import (
     YamlDocument,
     format_yaml_parse_error,
     parse_yaml_document,
+)
+from .providers import (
+    ProviderConfigurationError,
+    ProviderNotFoundError,
+    get_inference_provider,
+    resolve_provider_model,
 )
 
 PROFILES_FILENAME = "profiles.yml"
@@ -121,11 +127,23 @@ def resolve_profile(
         raise ProfileError(
             f"{profiles_path}: profile '{project.profile}' target '{target_name}': {e}"
         ) from e
+    llm = _absolutize_llm(selected.llm, project_dir)
+    if llm is not None:
+        try:
+            provider = get_inference_provider(llm.provider)
+            llm = llm.model_copy(
+                update={"model": resolve_provider_model(provider, llm.model)}
+            )
+        except (ProviderNotFoundError, ProviderConfigurationError) as e:
+            raise ProfileError(
+                f"{profiles_path}: profile '{project.profile}' target "
+                f"'{target_name}' selects {e}"
+            ) from e
     return ResolvedProfile(
         profile_name=project.profile,
         target_name=target_name,
         warehouse=warehouse.absolutize(project_dir),
-        llm=_absolutize_llm(selected.llm, project_dir),
+        llm=llm,
         source_paths=selected.source_paths,
         profiles_path=profiles_path,
     )
@@ -339,16 +357,43 @@ def resolve_llm_options(
             "under `llm:` in profiles.yml, not in model extraction options"
         )
     merged = dict(options)
-    merged.setdefault(
-        "api_key_env",
-        resolved.llm.api_key_env
-        if resolved.llm is not None
-        else DEFAULT_LLM_API_KEY_ENV,
+    profile_provider = (
+        resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER
     )
+    if "provider" in merged and merged["provider"] != profile_provider:
+        raise ProfileError(
+            "llm option 'provider' cannot override the profile provider because "
+            "credentials are operator-owned; select the provider under `llm:` "
+            "in profiles.yml"
+        )
+    provider_name = str(merged.get("provider") or profile_provider)
+    try:
+        provider = get_inference_provider(provider_name)
+    except (ProviderNotFoundError, ProviderConfigurationError) as e:
+        raise ProfileError(str(e)) from e
+    merged["provider"] = provider_name
+    requested_model = merged.get("model")
+    if requested_model is None and resolved.llm is not None:
+        requested_model = resolved.llm.model
+    try:
+        merged["model"] = resolve_provider_model(provider, requested_model)
+    except ProviderConfigurationError as e:
+        raise ProfileError(str(e)) from e
+    if merged.get("batch") and not provider.supports_native_batch:
+        raise ProfileError(
+            f"Inference provider '{provider_name}' does not support native "
+            "batch execution"
+        )
+    api_key_env = (
+        resolved.llm.api_key_env
+        if resolved.llm is not None and resolved.llm.api_key_env is not None
+        else provider.default_credential_env
+    )
+    if api_key_env is not None:
+        merged.setdefault("api_key_env", api_key_env)
     if resolved.llm is None:
         return merged
 
-    merged.setdefault("model", resolved.llm.model)
     if resolved.llm.cache_path is not None:
         merged.setdefault("cache_path", str(resolved.llm.cache_path))
     if resolved.llm.system_prompt is not None:

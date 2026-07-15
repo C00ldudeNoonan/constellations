@@ -5,15 +5,34 @@ from types import SimpleNamespace
 
 import pytest
 
+from dbt_ml.adapters import AdapterError, StateScope, create_adapter
 from dbt_ml.config import load_project
 from dbt_ml.config.source import SourceConfig
+from dbt_ml.credentials import CredentialReference
+from dbt_ml.hashing import canonical_fingerprint
 from dbt_ml.profile import (
     ProfileError,
     ResolvedProfile,
+    _load_profiles_file,
     apply_source_path_overrides,
     resolve_llm_options,
     resolve_profile,
 )
+
+
+def _assert_error_does_not_retain(
+    error: BaseException,
+    *sentinels: str,
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/dbt_ml/" in traceback.tb_frame.f_code.co_filename:
+            rendered = repr(traceback.tb_frame.f_locals)
+            for sentinel in sentinels:
+                assert sentinel not in rendered
+        traceback = traceback.tb_next
 
 
 def _write_project(
@@ -209,7 +228,10 @@ def test_llm_options_merged_from_profile(tmp_path: Path) -> None:
     options = resolve_llm_options({"fields": [{"name": "x"}]}, resolved)
     assert options["provider"] == "anthropic"
     assert options["model"] == "claude-haiku-4-5"
-    assert options["api_key_env"] == "DBT_ML_ANTHROPIC_KEY"
+    reference = options["api_key_env"]
+    assert isinstance(reference, CredentialReference)
+    assert "DBT_ML_ANTHROPIC_KEY" not in repr(reference)
+    assert "DBT_ML_ANTHROPIC_KEY" not in repr(options)
     assert options["cache_path"].endswith("cache.duckdb")
     assert options["fields"] == [{"name": "x"}]
 
@@ -311,10 +333,13 @@ def test_model_api_key_env_cannot_override_profile(tmp_path: Path) -> None:
     )
     project, _, _ = load_project(tmp_path)
     resolved = resolve_profile(project, tmp_path)
-    with pytest.raises(ProfileError, match="operator-owned"):
+    model_reference = "MODEL_ANTHROPIC_KEY"
+    with pytest.raises(ProfileError, match="operator-owned") as exc_info:
         resolve_llm_options(
-            {"api_key_env": "MODEL_ANTHROPIC_KEY", "fields": []}, resolved
+            {"api_key_env": model_reference, "fields": []}, resolved
         )
+
+    _assert_error_does_not_retain(exc_info.value, model_reference)
 
 
 def test_profile_selected_provider_enforces_native_batch_capability(
@@ -552,6 +577,296 @@ def test_api_key_env_rejects_secret_interpolation_without_leaking_value(
     with pytest.raises(ProfileError, match="name an environment variable") as exc_info:
         resolve_profile(project, tmp_path)
     assert secret not in str(exc_info.value)
+    _assert_error_does_not_retain(
+        exc_info.value,
+        secret,
+        "DBT_ML_SECRET_KEY",
+    )
+
+
+def _bigquery_profile(credential_lines: list[str]) -> str:
+    return (
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: prod",
+                "  outputs:",
+                "    prod:",
+                "      warehouse:",
+                "        type: bigquery",
+                "        project: example-project",
+                *[f"        {line}" for line in credential_lines],
+            ]
+        )
+        + "\n"
+    )
+
+
+def test_bigquery_references_remain_opaque_until_sdk_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    env_names = (
+        "DISTINCTIVE_REFRESH_REFERENCE",
+        "DISTINCTIVE_CLIENT_SECRET_REFERENCE",
+        "DISTINCTIVE_TOKEN_URI_REFERENCE",
+    )
+    _write_profiles_raw(
+        tmp_path,
+        _bigquery_profile(
+            [
+                'refresh_token: "{{ env_var(\'DISTINCTIVE_REFRESH_REFERENCE\') }}"',
+                "client_id: public-client-id",
+                'client_secret: "{{ env_var(\'DISTINCTIVE_CLIENT_SECRET_REFERENCE\') }}"',
+                'token_uri: "{{ env_var(\'DISTINCTIVE_TOKEN_URI_REFERENCE\') }}"',
+            ]
+        ),
+    )
+    for env_name in env_names:
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        CredentialReference,
+        "resolve",
+        lambda self: pytest.fail("profile resolution accessed a credential"),
+    )
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    profiles, _ = _load_profiles_file(tmp_path / "profiles.yml")
+
+    rendered: list[str] = [
+        repr(resolved),
+        repr(resolved.warehouse),
+        repr(resolved.warehouse.model_dump()),
+        resolved.warehouse.model_dump_json(),
+        repr(profiles),
+        repr(profiles["test_proj"].model_dump()),
+        profiles["test_proj"].model_dump_json(),
+    ]
+    for env_name in env_names:
+        assert all(env_name not in value for value in rendered)
+
+
+def test_missing_inactive_bigquery_reference_does_not_break_active_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    env_name = "DISTINCTIVE_INACTIVE_BQ_TOKEN"
+    monkeypatch.delenv(env_name, raising=False)
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/dev.duckdb",
+                "    prod:",
+                "      warehouse:",
+                "        type: bigquery",
+                "        project: example-project",
+                f'        token: "{{{{ env_var(\'{env_name}\') }}}}"',
+            ]
+        )
+        + "\n",
+    )
+    project, _, _ = load_project(tmp_path)
+
+    assert resolve_profile(project, tmp_path).warehouse.type == "duckdb"
+    prod = resolve_profile(project, tmp_path, target="prod")
+    adapter = create_adapter(prod.warehouse, project_dir=tmp_path)
+    with pytest.raises(AdapterError) as exc_info:
+        adapter._credentials()  # type: ignore[attr-defined]
+
+    message = str(exc_info.value)
+    assert "not set or is empty" in message
+    assert env_name not in message
+
+
+def test_environment_selected_bigquery_type_protects_credentials_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    env_name = "DISTINCTIVE_TYPE_SELECTED_BQ_TOKEN"
+    monkeypatch.setenv("DBT_ML_WAREHOUSE_TYPE", "bigquery")
+    monkeypatch.delenv(env_name, raising=False)
+    _write_profiles_raw(
+        tmp_path,
+        _bigquery_profile(
+            [f'token: "{{{{ env_var(\'{env_name}\') }}}}"']
+        ).replace("type: bigquery", 'type: "{{ env_var(\'DBT_ML_WAREHOUSE_TYPE\') }}"'),
+    )
+    project, _, _ = load_project(tmp_path)
+
+    resolved = resolve_profile(project, tmp_path)
+    adapter = create_adapter(resolved.warehouse, project_dir=tmp_path)
+
+    with pytest.raises(AdapterError) as exc_info:
+        adapter._credentials()  # type: ignore[attr-defined]
+
+    assert env_name not in str(exc_info.value)
+
+
+def test_unknown_adapter_protects_references_without_resolving_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    env_name = "DISTINCTIVE_UNKNOWN_ADAPTER_TOKEN"
+    secret = "distinctive-unknown-adapter-secret"
+    monkeypatch.setenv(env_name, secret)
+    _write_profiles_raw(
+        tmp_path,
+        _bigquery_profile(
+            [f'token: "{{{{ env_var(\'{env_name}\') }}}}"']
+        ).replace("type: bigquery", "type: future-warehouse"),
+    )
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(ProfileError) as exc_info:
+        resolve_profile(project, tmp_path)
+
+    message = str(exc_info.value)
+    assert "No adapter registered" in message
+    assert env_name not in message
+    assert secret not in message
+
+
+def test_inactive_unknown_adapter_keeps_credential_reference_opaque(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    env_name = "DISTINCTIVE_INACTIVE_FUTURE_TOKEN"
+    monkeypatch.delenv(env_name, raising=False)
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./target/dev.duckdb",
+                    "schema": "dbt_ml",
+                }
+            }
+        },
+    )
+    profiles_path = tmp_path / "profiles.yml"
+    profiles_path.write_text(
+        profiles_path.read_text()
+        + "    future:\n"
+        + "      warehouse:\n"
+        + "        type: future-warehouse\n"
+        + f'        token: "{{{{ env_var(\'{env_name}\') }}}}"\n'
+    )
+    profiles, _ = _load_profiles_file(profiles_path)
+
+    future = profiles["test_proj"].outputs["future"]
+    rendered = repr(future) + repr(future.model_dump()) + future.model_dump_json()
+    assert env_name not in rendered
+    assert isinstance(future.warehouse["token"], CredentialReference)
+
+
+def test_protected_field_names_do_not_affect_nonwarehouse_interpolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    monkeypatch.setenv("TOKEN_SOURCE_PATH", "data/token-source")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/dev.duckdb",
+                "      source_paths:",
+                '        token: "{{ env_var(\'TOKEN_SOURCE_PATH\') }}"',
+            ]
+        )
+        + "\n",
+    )
+    project, _, _ = load_project(tmp_path)
+
+    resolved = resolve_profile(project, tmp_path)
+
+    assert resolved.source_paths == {"token": "data/token-source"}
+
+
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_value"),
+    [
+        ("token", "literal-secret-sentinel"),
+        ("keyfile_json", '{"private_key":"literal-secret-sentinel"}'),
+        ("keyfile_json", "{private_key: literal-secret-sentinel}"),
+        (
+            "client_secret",
+            '"{{ env_var(\'DISTINCTIVE_UNSAFE_REFERENCE\', \'fallback-secret\') }}"',
+        ),
+        (
+            "refresh_token",
+            '"prefix-{{ env_var(\'DISTINCTIVE_UNSAFE_REFERENCE\') }}"',
+        ),
+    ],
+)
+def test_bigquery_legacy_secret_forms_fail_without_echoing_input(
+    tmp_path: Path,
+    field_name: str,
+    unsafe_value: str,
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        _bigquery_profile([f"{field_name}: {unsafe_value}"]),
+    )
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(ProfileError) as exc_info:
+        resolve_profile(project, tmp_path)
+
+    message = str(exc_info.value)
+    assert field_name in message
+    assert "literal-secret-sentinel" not in message
+    assert "DISTINCTIVE_UNSAFE_REFERENCE" not in message
+    assert "fallback-secret" not in message
+
+
+def test_bigquery_credential_reference_rotation_does_not_change_identity() -> None:
+    from dbt_ml.adapters import parse_warehouse_config
+
+    first = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "example-project",
+            "token": "{{ env_var('FIRST_PRIVATE_TOKEN_REFERENCE') }}",
+        }
+    )
+    second = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "example-project",
+            "token": "{{ env_var('SECOND_PRIVATE_TOKEN_REFERENCE') }}",
+        }
+    )
+
+    assert first == second
+    assert canonical_fingerprint(
+        first, domain="profile-test"
+    ) == canonical_fingerprint(second, domain="profile-test")
+    assert StateScope.for_target_descriptor(
+        "model",
+        stage="retrieval_publish",
+        descriptor={"warehouse": first},
+    ) == StateScope.for_target_descriptor(
+        "model",
+        stage="retrieval_publish",
+        descriptor={"warehouse": second},
+    )
+    rendered = repr(first.model_dump()) + first.model_dump_json()
+    assert "FIRST_PRIVATE_TOKEN_REFERENCE" not in rendered
 
 
 # ─── per-adapter warehouse config validation (issue #73) ────────────────────
@@ -596,6 +911,7 @@ def test_invalid_duckdb_config_names_adapter(tmp_path: Path) -> None:
 
 def test_unknown_warehouse_field_rejected(tmp_path: Path) -> None:
     """Typo'd keys fail loudly instead of being silently ignored."""
+    sentinel = "distinctive-invalid-warehouse-secret"
     _write_project(tmp_path, profile="test_proj")
     _write_profiles_raw(
         tmp_path,
@@ -608,7 +924,7 @@ def test_unknown_warehouse_field_rejected(tmp_path: Path) -> None:
                 "      warehouse:",
                 "        type: duckdb",
                 "        path: ./target/db.duckdb",
-                "        pth_typo: ./oops",
+                f"        pth_typo: {sentinel}",
             ]
         )
         + "\n",
@@ -619,6 +935,10 @@ def test_unknown_warehouse_field_rejected(tmp_path: Path) -> None:
     message = str(exc_info.value)
     assert "profiles.yml:8:9" in message
     assert "test_proj.outputs.dev.warehouse.pth_typo" in message
+    assert sentinel not in message
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_error_does_not_retain(exc_info.value, sentinel)
 
 
 @pytest.mark.parametrize("bad_key", ["source_path", "source-path"])
@@ -681,6 +1001,7 @@ def test_profile_validation_diagnostic_does_not_echo_secret_input(
     assert "test_proj.outputs.dev.llm.api_key" in message
     assert "Extra inputs are not permitted" in message
     assert secret not in message
+    _assert_error_does_not_retain(exc_info.value, secret)
 
 
 def test_duplicate_profile_key_is_rejected_at_second_key_without_value(
@@ -713,6 +1034,7 @@ def test_duplicate_profile_key_is_rejected_at_second_key_without_value(
     assert "profiles.yml:3:3 [test_proj.target]" in message
     assert "duplicate mapping key" in message
     assert secret not in message
+    _assert_error_does_not_retain(exc_info.value, secret)
 
 
 @pytest.mark.parametrize("contents", ["[]\n", "0\n", "false\n"])

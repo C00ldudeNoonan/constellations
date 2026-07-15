@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Protected credential references (issue #154)
+
+- BigQuery service-account JSON, OAuth tokens, refresh tokens, client secrets,
+  and environment-backed keyfile/token endpoints now remain opaque references
+  until native Google credential construction. Inline secrets, defaults, mixed
+  interpolation, cross-method credential fields, and URL user-info fail safely.
+- Protected references and values share one provider/warehouse/future-retrieval
+  contract. Their values and environment-variable names are excluded from
+  reprs, Pydantic dumps, equality, hashing, artifacts, diagnostics, and debug
+  logs; native credential-construction errors are sanitized.
+- Existing exact `{{ env_var('NAME') }}` BigQuery references remain valid.
+  Literal service-account JSON and OAuth secrets must move to environment
+  variables; noncredential profile interpolation remains unchanged.
+- The Python provider contract is now v2. `ProviderCredential(env_var, value)`
+  becomes the opaque `ProviderCredential(value)` (an alias of
+  `ProtectedCredential`), and `.env_var` is removed. `resolve_llm_credential()`
+  now returns that protected value or `None`, not an `(env_name, value)` tuple;
+  provider implementations reveal it only while constructing the native SDK.
+
 ### Metadata-aware incremental state (issue #139)
 
 - Chunk invalidation now fingerprints the effective text and every carried

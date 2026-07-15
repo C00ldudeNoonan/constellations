@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from ..credentials import CredentialReference
 from ..optional_dependencies import import_optional_dependency
 
 _STRICT_OPTIONS = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
@@ -292,8 +293,10 @@ class LLMBackendOptions(_BackendOptions):
     max_tokens: int = Field(default=2048, ge=1, le=65_536)
     max_retries: int = Field(default=4, ge=0, le=20)
     max_concurrent: int = Field(default=4, ge=1, le=100)
-    api_key_env: _NonEmptyString | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
+    api_key_env: CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
     )
     batch: bool = False
     batch_poll_seconds: float = Field(
@@ -364,6 +367,7 @@ def validate_backend_options(
     leaves backend defaults in one place: each backend's runtime implementation.
     """
     contract = get_backend_option_contract(backend)
+    failure: BackendOptionsError | None = None
     try:
         parsed = contract.options_model.model_validate(dict(options))
     except ValidationError as e:
@@ -381,13 +385,19 @@ def validate_backend_options(
         first_location = (
             tuple(validation_errors[0]["loc"]) if validation_errors else ()
         )
-        raise BackendOptionsError(
+        failure = BackendOptionsError(
             f"Invalid options for extraction backend '{backend}': {joined}",
             path=("options", *first_location),
-        ) from None
-    return parsed.model_dump(
+        )
+    if failure is not None:
+        options = {}
+        raise failure
+    validated = parsed.model_dump(
         mode="python",
         by_alias=True,
         exclude_none=True,
         exclude_unset=True,
     )
+    if isinstance(parsed, LLMBackendOptions) and parsed.api_key_env is not None:
+        validated["api_key_env"] = parsed.api_key_env
+    return validated

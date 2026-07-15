@@ -94,7 +94,7 @@ installation command.
 | `pdf`      | `*.pdf`           | Per-page text via pypdf. Warns on empty extracts (likely scanned). Deterministic, no API. |
 | `html`     | `*.html`/`*.htm`  | Body text + CSS selectors + OpenGraph/meta via BeautifulSoup. Deterministic, no API.      |
 | `email`    | `*.eml`           | from/to/subject/date/body via stdlib `email`. Deterministic, no API.                      |
-| `llm`      | `*.txt`/`*.md`    | Registered inference provider → structured fields. Provider, model, and credential-variable name come from the active profile. |
+| `llm`      | `*.txt`/`*.md`    | Registered inference provider → structured fields. Provider, model, and protected credential reference come from the active profile. |
 
 Add a new backend by inheriting from `BaseBackend`, defining a strict Pydantic
 option model, and decorating it with `@register(options_model=...)`. Bare
@@ -107,8 +107,9 @@ and runtime enforce the same configuration.
 dbt-ml projects are local code-and-data projects. Only run projects you trust:
 Python transforms and custom Python tests execute in your Python process, and
 project configuration controls source globs, generated paths, and executable
-modules. The discovered profile controls warehouse, cache, and credential
-environment-variable names.
+modules. The discovered profile controls warehouse, cache, and protected
+credential references. Reference names and values are omitted from artifacts
+and user-facing diagnostics.
 
 Document parsers process local files with third-party libraries. Keep
 dependencies current before running dbt-ml over untrusted PDFs, HTML, email, or
@@ -187,12 +188,18 @@ extraction:
 
 ### LLM credentials
 
-`api_key_env` stores an environment-variable name, never a secret. Runtime
-resolves the exact profile-owned variable and passes a protected credential to
-the selected provider. It never substitutes a different provider's default
-credential variable. Model YAML cannot choose a credential variable. Missing
-credentials name only the variable and fail before a document is read or
-submitted, and `compile` uses the same resolution logic for its warning.
+`api_key_env` selects an environment-variable reference, never a secret.
+Runtime resolves the exact profile-owned reference and passes an opaque value
+to the selected provider. It never substitutes a different provider's default.
+Model YAML cannot choose a credential reference. Missing credentials fail with
+the provider and field policy—not the private reference name—before a provider
+request is submitted, and `compile` applies the same redacted warning policy.
+
+Provider integration authors upgrading to provider contract v2 should accept
+`ProviderCredential(value)` and call `reveal()` only at SDK construction. The
+old two-argument constructor and `.env_var` attribute are removed, and
+`resolve_llm_credential()` returns a protected value (or `None`) instead of a
+tuple.
 
 Reusable transform helpers are not profile-ambient. A transform that calls one
 must declare the dependency so profile changes invalidate state and provider
@@ -329,11 +336,11 @@ cannot contain the key.
 
 ### BigQuery
 
-Install the extra, then point a target at a GCP project. Profile fields
-mirror dbt-bigquery, so an existing dbt profile ports over: auth via ADC
-(`method: oauth`, the default), `keyfile:` (service-account),
-`keyfile_json:` (inline/base64 JSON — CI-friendly with `env_var()`), or
-`token`/`refresh_token` + client secrets (`oauth-secrets`), plus
+Install the extra, then point a target at a GCP project. Non-secret profile
+fields mirror dbt-bigquery. Authentication supports ADC (`method: oauth`, the
+default), a literal or environment-backed `keyfile:` (service account), an
+environment-backed `keyfile_json:`, or environment-backed `token` /
+`refresh_token` / `client_secret` fields (`oauth-secrets`), plus
 `impersonate_service_account`, `scopes`, `execution_project`,
 `quota_project`, `priority`, `maximum_bytes_billed`, and the
 `job_retries` / `job_retry_deadline_seconds` /
@@ -356,8 +363,30 @@ my_project:
         project: my-gcp-project
         dataset: dbt_ml                # `schema:` works too
         location: US                   # optional
-        # keyfile: "{{ env_var('DBT_ML_BQ_KEYFILE') }}"   # optional; omit for ADC
+        # Omit auth fields for ADC, or choose exactly one auth family:
+        # keyfile: ./secrets/service-account.json
+        # keyfile: "{{ env_var('DBT_ML_BQ_KEYFILE') }}"
+        # keyfile_json: "{{ env_var('DBT_ML_BQ_SERVICE_ACCOUNT_JSON') }}"
+        # token: "{{ env_var('DBT_ML_BQ_ACCESS_TOKEN') }}"
 ```
+
+Secret-bearing BigQuery fields accept only an exact, quoted
+`{{ env_var('NAME') }}` reference with no default or surrounding text. The
+reference is preserved without reading the environment—even on an inactive
+target—and is resolved only while constructing Google credentials. The value
+of `keyfile_json` may still be JSON or base64-encoded JSON; the serialized value
+belongs in the environment variable, never inline in YAML. Refresh-token auth
+requires all of `refresh_token`, `client_id`, `client_secret`, and `token_uri`;
+an access token may be supplied alone or with that complete refresh set.
+Credential fields from different auth methods cannot be combined, and
+`token_uri` must be an absolute URL without URL user-info.
+
+Migration is intentionally narrow: existing exact `env_var()` references keep
+working. Move inline `keyfile_json` mappings/JSON/base64 and literal OAuth
+secrets into environment variables, then replace the YAML value with one exact
+reference. Replace mixed interpolation such as
+`Bearer {{ env_var('TOKEN') }}` and credential defaults with an environment
+variable containing the complete value. Literal `keyfile` paths remain valid.
 
 Materialized tables, `--store-failures` tables, and incremental state all
 live in the configured dataset — no DuckDB involved. `dbt-ml clean` does not
@@ -415,9 +444,11 @@ stay on `merge` — it is always correct.
 
 String values support `{{ env_var('NAME') }}` and
 `{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
-profiles need, so credentials and per-environment paths stay out of the file.
-`api_key_env` is the deliberate exception: it must be a literal variable name.
-An unset interpolated variable with no default is a load-time error. Each
+profiles need for non-secret routing and per-environment paths. Protected
+BigQuery credential fields are the deliberate exception: they require one
+exact reference with no default and resolve only at native SDK construction.
+`api_key_env` remains a literal variable name rather than an `env_var()` call.
+An unset ordinary interpolated variable with no default is a load-time error. Each
 `warehouse:` block is validated against the config schema of the adapter named
 by `type:`; unknown types and typo'd fields fail at resolve time with the
 adapter named.

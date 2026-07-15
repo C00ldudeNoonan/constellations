@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import time
 from collections.abc import Callable
@@ -17,6 +16,7 @@ from .config import ConfigError, load_project
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
+from .credentials import CredentialReference, CredentialReferenceError
 from .dag import DAGError, ProjectDAG, SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
@@ -235,13 +235,22 @@ def _compile_warnings(
                     "configure llm.api_key_env in profiles.yml."
                 )
                 continue
-            env_var = str(env_value)
-            if not os.environ.get(env_var):
-                missing.add(env_var)
+            try:
+                reference = (
+                    env_value
+                    if isinstance(env_value, CredentialReference)
+                    else CredentialReference.from_env_name(env_value)
+                )
+            except (TypeError, CredentialReferenceError):
+                missing.add(provider.name())
+                continue
+            if not reference.is_available():
+                missing.add(provider.name())
 
-        for env_var in sorted(missing):
+        for provider_name in sorted(missing):
             out.append(
-                f"{env_var} is not set; models using LLM inference will fail at "
+                f"Inference provider '{provider_name}' credential environment "
+                "variable is not set; models using LLM inference will fail at "
                 "run time."
             )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import os
+import pickle
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from typing import Any
 
 import polars as pl
 import pytest
+from pydantic import ValidationError
 
 from dbt_ml.adapters import (
     AdapterError,
@@ -30,6 +32,7 @@ from dbt_ml.adapters.bigquery import (
     plan_schema_change,
     to_query_parameters,
 )
+from dbt_ml.credentials import ProtectedCredential
 
 # ─── config ─────────────────────────────────────────────────────────────────
 
@@ -1300,10 +1303,14 @@ def test_integration_warehouse_options_round_trip() -> None:
 def test_auth_method_inference() -> None:
     assert _bq_cfg().method == "oauth"
     assert _bq_cfg(keyfile="./sa.json").method == "service-account"
-    assert _bq_cfg(keyfile_json={"type": "service_account"}).method == (
+    assert _bq_cfg(
+        keyfile_json="{{ env_var('BQ_SERVICE_ACCOUNT_JSON') }}"
+    ).method == (
         "service-account-json"
     )
-    assert _bq_cfg(token="tok").method == "oauth-secrets"
+    assert _bq_cfg(token="{{ env_var('BQ_ACCESS_TOKEN') }}").method == (
+        "oauth-secrets"
+    )
 
 
 def _bq_cfg(**extra: Any) -> BigQueryWarehouseConfig:
@@ -1324,17 +1331,141 @@ def test_service_account_requires_keyfile() -> None:
 
 def test_keyfile_and_keyfile_json_conflict() -> None:
     with pytest.raises(AdapterError, match="not both"):
-        _bq_cfg(keyfile="./sa.json", keyfile_json={"a": 1})
+        _bq_cfg(
+            keyfile="./sa.json",
+            keyfile_json="{{ env_var('BQ_SERVICE_ACCOUNT_JSON') }}",
+        )
 
 
 def test_oauth_secrets_requires_token_or_full_refresh_set() -> None:
     with pytest.raises(AdapterError, match="oauth-secrets"):
-        _bq_cfg(method="oauth-secrets", refresh_token="r", client_id="c")
+        _bq_cfg(
+            method="oauth-secrets",
+            refresh_token="{{ env_var('BQ_REFRESH_TOKEN') }}",
+            client_id="c",
+        )
     cfg = _bq_cfg(
-        refresh_token="r", client_id="c", client_secret="s",
+        refresh_token="{{ env_var('BQ_REFRESH_TOKEN') }}",
+        client_id="c",
+        client_secret="{{ env_var('BQ_CLIENT_SECRET') }}",
         token_uri="https://oauth2.googleapis.com/token",
     )
     assert cfg.method == "oauth-secrets"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["keyfile_json", "token", "refresh_token", "client_secret"],
+)
+def test_literal_secret_fields_are_rejected_before_pydantic(
+    field_name: str,
+) -> None:
+    sentinel = "distinctive-literal-secret-sentinel"
+
+    with pytest.raises(AdapterError) as exc_info:
+        _bq_cfg(**{field_name: sentinel})
+
+    message = str(exc_info.value)
+    assert field_name in message
+    assert sentinel not in message
+
+
+def test_direct_config_validation_protects_cross_field_error_inputs() -> None:
+    first_name = "DISTINCTIVE_DIRECT_KEYFILE_REFERENCE"
+    second_name = "DISTINCTIVE_DIRECT_TOKEN_REFERENCE"
+    raw = {
+        "type": "bigquery",
+        "project": "p",
+        "keyfile_json": f"{{{{ env_var('{first_name}') }}}}",
+        "token": f"{{{{ env_var('{second_name}') }}}}",
+    }
+
+    with pytest.raises(ValidationError) as exc_info:
+        BigQueryWarehouseConfig.model_validate(raw)
+
+    error = exc_info.value
+    rendered = "\n".join(
+        (str(error), repr(error), repr(error.errors()), error.json())
+    )
+    assert first_name not in rendered
+    assert second_name not in rendered
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        pickle.dumps(error)
+
+
+def test_direct_config_validation_clears_rejected_literal_input() -> None:
+    sentinel = "distinctive-direct-literal-secret"
+
+    with pytest.raises(ValidationError) as exc_info:
+        BigQueryWarehouseConfig.model_validate(
+            {"type": "bigquery", "project": "p", "token": sentinel}
+        )
+
+    error = exc_info.value
+    rendered = "\n".join(
+        (str(error), repr(error), repr(error.errors()), error.json())
+    )
+    assert sentinel not in rendered
+    assert sentinel.encode() not in pickle.dumps(error)
+
+
+def test_bigquery_schema_describes_exact_environment_references() -> None:
+    properties = BigQueryWarehouseConfig.model_json_schema()["properties"]
+
+    for field_name in (
+        "keyfile_json",
+        "token",
+        "refresh_token",
+        "client_secret",
+    ):
+        credential_schema = next(
+            candidate
+            for candidate in properties[field_name]["anyOf"]
+            if candidate.get("format") == "password"
+        )
+        assert "env_var" in credential_schema["pattern"]
+        assert "Exact {{ env_var('NAME') }}" in credential_schema["description"]
+
+
+@pytest.mark.parametrize(
+    "token_uri",
+    [
+        "https://user@oauth2.googleapis.com/token",
+        "https://user:distinctive-secret@oauth2.googleapis.com/token",
+        "https://%75ser:%73ecret@oauth2.googleapis.com/token",
+    ],
+)
+def test_token_uri_rejects_url_user_information(token_uri: str) -> None:
+    with pytest.raises(AdapterError, match="must not contain URL user information") as exc_info:
+        _bq_cfg(
+            refresh_token="{{ env_var('BQ_REFRESH_TOKEN') }}",
+            client_id="client",
+            client_secret="{{ env_var('BQ_CLIENT_SECRET') }}",
+            token_uri=token_uri,
+        )
+
+    assert "distinctive-secret" not in str(exc_info.value)
+
+
+def test_auth_methods_reject_credentials_for_other_methods() -> None:
+    with pytest.raises(AdapterError, match="cannot be combined"):
+        _bq_cfg(
+            keyfile="./sa.json",
+            token="{{ env_var('BQ_ACCESS_TOKEN') }}",
+        )
+    with pytest.raises(AdapterError, match="conflicts"):
+        _bq_cfg(
+            method="oauth",
+            token="{{ env_var('BQ_ACCESS_TOKEN') }}",
+        )
+
+
+def test_token_credentials_reject_partial_refresh_metadata() -> None:
+    with pytest.raises(AdapterError, match="all of"):
+        _bq_cfg(
+            token="{{ env_var('BQ_ACCESS_TOKEN') }}",
+            client_id="client-without-refresh-set",
+        )
 
 
 def test_default_scopes_match_dbt_bigquery() -> None:
@@ -1361,6 +1492,25 @@ def test_parse_keyfile_json_forms() -> None:
         parse_keyfile_json('["a", "list"]')
 
 
+def test_parse_keyfile_json_error_scrubs_resolved_input() -> None:
+    from dbt_ml.adapters.bigquery import parse_keyfile_json
+
+    sentinel = "distinctive-invalid-service-account-secret"
+
+    with pytest.raises(AdapterError) as exc_info:
+        parse_keyfile_json(sentinel)
+
+    error = exc_info.value
+    assert sentinel not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/dbt_ml/" in traceback.tb_frame.f_code.co_filename:
+            assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
 def test_credentials_service_account_json_scopes_and_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1383,14 +1533,166 @@ def test_credentials_service_account_json_scopes_and_quota(
         "from_service_account_info",
         staticmethod(fake_from_info),
     )
+    monkeypatch.setenv(
+        "BQ_SERVICE_ACCOUNT_JSON", '{"type":"service_account"}'
+    )
     adapter = _adapter(
-        keyfile_json={"type": "service_account"}, quota_project="bill-here"
+        keyfile_json="{{ env_var('BQ_SERVICE_ACCOUNT_JSON') }}",
+        quota_project="bill-here",
     )
     creds = adapter._credentials()
     assert isinstance(creds, _FakeCreds)
     assert captured["info"] == {"type": "service_account"}
     assert list(captured["scopes"]) == _bq_cfg().scopes
     assert captured["quota_project"] == "bill-here"
+
+
+def test_credentials_oauth_reveals_each_value_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.oauth2 import credentials as oauth_credentials
+
+    captured: dict[str, Any] = {}
+    reveal_count = 0
+    original_reveal = ProtectedCredential.reveal
+
+    class _FakeCredentials:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    def counted_reveal(credential: ProtectedCredential) -> str:
+        nonlocal reveal_count
+        reveal_count += 1
+        return original_reveal(credential)
+
+    monkeypatch.setenv("BQ_ACCESS_TOKEN", "access-secret")
+    monkeypatch.setenv("BQ_REFRESH_TOKEN", "refresh-secret")
+    monkeypatch.setenv("BQ_CLIENT_SECRET", "client-secret")
+    monkeypatch.setattr(ProtectedCredential, "reveal", counted_reveal)
+    monkeypatch.setattr(oauth_credentials, "Credentials", _FakeCredentials)
+
+    adapter = _adapter(
+        token="{{ env_var('BQ_ACCESS_TOKEN') }}",
+        refresh_token="{{ env_var('BQ_REFRESH_TOKEN') }}",
+        client_id="public-client-id",
+        client_secret="{{ env_var('BQ_CLIENT_SECRET') }}",
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    credentials = adapter._credentials()
+
+    assert isinstance(credentials, _FakeCredentials)
+    assert captured["token"] == "access-secret"
+    assert captured["refresh_token"] == "refresh-secret"
+    assert captured["client_secret"] == "client-secret"
+    assert captured["client_id"] == "public-client-id"
+    assert reveal_count == 3
+
+
+def test_missing_oauth_reference_fails_before_sdk_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.oauth2 import credentials as oauth_credentials
+
+    called = False
+    env_name = "DISTINCTIVE_MISSING_BQ_TOKEN"
+
+    def unexpected_credentials(**kwargs: Any) -> None:
+        del kwargs
+        nonlocal called
+        called = True
+
+    monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        oauth_credentials,
+        "Credentials",
+        unexpected_credentials,
+    )
+    adapter = _adapter(token=f"{{{{ env_var('{env_name}') }}}}")
+
+    with pytest.raises(AdapterError) as exc_info:
+        adapter._credentials()
+
+    assert called is False
+    assert env_name not in str(exc_info.value)
+
+
+def test_environment_token_uri_rejects_user_information_before_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.oauth2 import credentials as oauth_credentials
+
+    called = False
+
+    def unexpected_credentials(**kwargs: Any) -> None:
+        del kwargs
+        nonlocal called
+        called = True
+
+    monkeypatch.setenv("BQ_REFRESH_TOKEN", "refresh-secret")
+    monkeypatch.setenv("BQ_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv(
+        "BQ_TOKEN_URI",
+        "https://user:distinctive-url-secret@oauth2.googleapis.com/token",
+    )
+    monkeypatch.setattr(
+        oauth_credentials,
+        "Credentials",
+        unexpected_credentials,
+    )
+    adapter = _adapter(
+        refresh_token="{{ env_var('BQ_REFRESH_TOKEN') }}",
+        client_id="public-client-id",
+        client_secret="{{ env_var('BQ_CLIENT_SECRET') }}",
+        token_uri="{{ env_var('BQ_TOKEN_URI') }}",
+    )
+
+    with pytest.raises(AdapterError) as exc_info:
+        adapter._credentials()
+
+    assert called is False
+    assert "distinctive-url-secret" not in str(exc_info.value)
+    assert "BQ_TOKEN_URI" not in str(exc_info.value)
+
+
+def test_native_credential_error_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.oauth2 import credentials as oauth_credentials
+
+    sentinel = "distinctive-native-sdk-secret"
+    env_name = "DISTINCTIVE_NATIVE_ERROR_TOKEN"
+    monkeypatch.setenv(env_name, sentinel)
+
+    def fail_with_secret(**kwargs: Any) -> None:
+        del kwargs
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(oauth_credentials, "Credentials", fail_with_secret)
+    adapter = _adapter(token=f"{{{{ env_var('{env_name}') }}}}")
+
+    with pytest.raises(AdapterError) as exc_info:
+        adapter._credentials()
+
+    rendered = "".join(
+        (str(exc_info.value), repr(exc_info.value), str(exc_info.value.__context__))
+    )
+    assert "credential construction failed" in rendered
+    assert sentinel not in rendered
+    assert env_name not in rendered
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+    traceback_locals: list[str] = []
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        if "/src/dbt_ml/" in traceback.tb_frame.f_code.co_filename:
+            traceback_locals.extend(
+                repr(value) for value in traceback.tb_frame.f_locals.values()
+            )
+        traceback = traceback.tb_next
+    locals_rendered = "\n".join(traceback_locals)
+    assert sentinel not in locals_rendered
+    assert env_name not in locals_rendered
 
 
 def test_credentials_impersonation_wraps_source(
@@ -1428,6 +1730,46 @@ def test_credentials_impersonation_wraps_source(
     assert captured["principal"] == "runner@proj.iam.gserviceaccount.com"
 
 
+def test_environment_keyfile_resolves_relative_to_project_at_sdk_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.oauth2 import service_account
+
+    captured: dict[str, Any] = {}
+
+    class _FakeCredentials:
+        pass
+
+    def fake_from_file(path: str, scopes: Any = None) -> _FakeCredentials:
+        captured["path"] = path
+        captured["scopes"] = scopes
+        return _FakeCredentials()
+
+    monkeypatch.setenv("BQ_KEYFILE_PATH", "./secrets/service-account.json")
+    monkeypatch.setattr(
+        service_account.Credentials,
+        "from_service_account_file",
+        staticmethod(fake_from_file),
+    )
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "keyfile": "{{ env_var('BQ_KEYFILE_PATH') }}",
+        }
+    )
+    adapter = create_adapter(config, project_dir=tmp_path)
+    assert isinstance(adapter, BigQueryAdapter)
+
+    credentials = adapter._credentials()
+
+    assert isinstance(credentials, _FakeCredentials)
+    assert captured["path"] == str(
+        (tmp_path / "secrets" / "service-account.json").resolve()
+    )
+
+
 # ─── execution / billing options ────────────────────────────────────────────
 
 
@@ -1462,9 +1804,13 @@ def test_execution_project_bills_elsewhere_data_stays_qualified(
         return "client"
 
     monkeypatch.setattr(bigquery, "Client", fake_client)
+    monkeypatch.setenv(
+        "BQ_SERVICE_ACCOUNT_JSON", '{"type":"service_account"}'
+    )
 
     adapter = _adapter(
-        keyfile_json={"type": "service_account"}, execution_project="billing-proj"
+        keyfile_json="{{ env_var('BQ_SERVICE_ACCOUNT_JSON') }}",
+        execution_project="billing-proj",
     )
     assert adapter._make_client() == "client"
     assert captured["project"] == "billing-proj"

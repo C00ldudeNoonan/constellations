@@ -5,7 +5,7 @@ from types import ModuleType
 
 import pytest
 from click.testing import CliRunner
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from dbt_ml.cli import cli
 from dbt_ml.config import ConfigError, load_project
@@ -14,6 +14,7 @@ from dbt_ml.config import profile as profile_config_module
 from dbt_ml.config import project as project_config_module
 from dbt_ml.config import source as source_config_module
 from dbt_ml.config.model import ExtractionConfig, FieldConfig, ModelConfig, ModelFile
+from dbt_ml.credentials import CredentialReference
 
 
 def test_load_example_project(example_project_dir: Path) -> None:
@@ -548,6 +549,51 @@ def test_model_cannot_select_operator_credential_environment_variable(
     assert result.exit_code == 2, result.output
     assert "operator-owned configuration" in result.output
     assert "profiles.yml" in result.output
+    assert "GITHUB_TOKEN" not in result.output
+
+
+def test_llm_model_credential_reference_is_opaque_before_compile() -> None:
+    reference_name = "PRIVATE_MODEL_LLM_REFERENCE"
+    config = ModelConfig(
+        name="raw_docs",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "api_key_env": reference_name,
+                "fields": [{"name": "title"}],
+            },
+        },
+    )
+
+    assert config.extraction is not None
+    assert isinstance(
+        config.extraction.options["api_key_env"], CredentialReference
+    )
+    rendered = repr(config) + repr(config.model_dump()) + config.model_dump_json()
+    assert reference_name not in rendered
+
+
+def test_invalid_model_credential_input_is_cleared_before_validation_error() -> None:
+    sentinel = "literal-model-credential-secret"
+
+    with pytest.raises(ValidationError) as exc_info:
+        ModelConfig.model_validate(
+            {
+                "name": "raw_docs",
+                "source": "ref('docs')",
+                "extraction": {
+                    "backend": "llm",
+                    "options": {"api_key_env": sentinel},
+                },
+            }
+        )
+
+    error = exc_info.value
+    rendered = "\n".join(
+        (str(error), repr(error), repr(error.errors()), error.json())
+    )
+    assert sentinel not in rendered
 
 
 def test_extraction_config_defers_backend_owned_option_names() -> None:
@@ -558,8 +604,43 @@ def test_extraction_config_defers_backend_owned_option_names() -> None:
     }
 
     config = ExtractionConfig(backend="custom", options=options)
+    defaulted_config = ExtractionConfig(options=options)
 
     assert config.options == options
+    assert defaulted_config.options == options
+
+
+def test_default_llm_model_is_protected_before_later_yaml_error(
+    tmp_path: Path,
+) -> None:
+    reference_name = "EARLY_LOADED_DEFAULT_LLM_REFERENCE_SENTINEL_154"
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: p\nextraction:\n  default_backend: llm\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "a_valid.yml").write_text(
+        "version: 2\nmodels:\n  - name: first\n"
+        "    extraction:\n      options:\n"
+        f"        api_key_env: {reference_name}\n"
+    )
+    (tmp_path / "models" / "b_invalid.yml").write_text(
+        "version: 2\nmodels:\n  - name: invalid\n"
+        "    extraction: {}\n    unexpected: true\n"
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(tmp_path)
+
+    error = exc_info.value
+    assert reference_name not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("dbt_ml"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
 
 def test_invalid_llm_option_fails_before_gcs_source_discovery(

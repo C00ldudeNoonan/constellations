@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,9 @@ class YamlDocument:
     data: Any
     _positions: dict[ConfigPath, _PathPositions]
 
+    def without_data(self) -> YamlDocument:
+        return YamlDocument(data=None, _positions=self._positions)
+
     def format_validation_errors(
         self,
         path: Path,
@@ -35,13 +39,30 @@ class YamlDocument:
         *,
         prefix: ConfigPath = (),
     ) -> str:
+        return self.format_validation_details(
+            path,
+            error.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            ),
+            prefix=prefix,
+        )
+
+    def format_validation_details(
+        self,
+        path: Path,
+        details: Iterable[Mapping[str, Any]],
+        *,
+        prefix: ConfigPath = (),
+    ) -> str:
         diagnostics: list[str] = []
-        for detail in error.errors(
-            include_url=False,
-            include_context=False,
-            include_input=False,
-        ):
-            location = prefix + tuple(detail["loc"])
+        for detail in details:
+            detail_location = tuple(
+                part if isinstance(part, str | int) else "<unknown>"
+                for part in detail.get("loc", ())
+            )
+            location = prefix + detail_location
             position = self._position_for(location, str(detail["type"]))
             config_path = _render_config_path(location)
             diagnostics.append(

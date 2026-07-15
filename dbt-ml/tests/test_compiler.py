@@ -12,10 +12,11 @@ from dbt_ml.compiler import (
     validate_project_contract,
     validate_warehouse_capabilities,
 )
-from dbt_ml.config import ConfigError
+from dbt_ml.config import ConfigError, load_project
 from dbt_ml.config.model import ModelConfig
 from dbt_ml.config.project import ProjectConfig
 from dbt_ml.config.source import SourceConfig
+from dbt_ml.credentials import CredentialReference
 from dbt_ml.dag import ProjectDAG
 from dbt_ml.runner import build_project
 from dbt_ml.test_specs import TestSpecError as SpecError
@@ -139,6 +140,128 @@ def test_unregistered_inference_provider_is_rejected(tmp_path: Path) -> None:
             [model],
             tmp_path,
         )
+
+
+@pytest.mark.parametrize("explicit_backend", [True, False])
+def test_model_owned_llm_credential_error_drops_reference_from_traceback(
+    tmp_path: Path,
+    explicit_backend: bool,
+) -> None:
+    reference_name = "MODEL_CREDENTIAL_REFERENCE_SENTINEL_154"
+    extraction: dict[str, object] = {
+        "options": {
+            "api_key_env": reference_name,
+            "fields": [{"name": "title", "type": "string"}],
+        }
+    }
+    if explicit_backend:
+        extraction["backend"] = "llm"
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction=extraction,
+    )
+    project = ProjectConfig(
+        name="p",
+        extraction={"default_backend": "llm"},
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        validate_project_contract(project, [_source()], [model], tmp_path)
+
+    error = exc_info.value
+    assert reference_name not in str(error)
+    assert reference_name not in repr(model)
+    assert reference_name not in repr(model.model_dump())
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("dbt_ml"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_loaded_model_credential_error_retains_only_position_provenance(
+    tmp_path: Path,
+) -> None:
+    reference_name = "LOADED_MODEL_CREDENTIAL_REFERENCE_SENTINEL_154"
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: p\nextraction:\n  default_backend: llm\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw\n"
+        "    source: ref('docs')\n"
+        "    extraction:\n"
+        "      options:\n"
+        f"        api_key_env: {reference_name}\n"
+        "        fields:\n"
+        "          - name: title\n"
+    )
+    project, sources, models = load_project(tmp_path)
+    provenance = models[0].yaml_provenance
+    assert provenance is not None
+    assert provenance._document.data is None
+    assert models[0].extraction is not None
+    assert isinstance(
+        models[0].extraction.options["api_key_env"], CredentialReference
+    )
+    rendered = (
+        repr(models[0])
+        + repr(models[0].model_dump())
+        + models[0].model_dump_json()
+    )
+    assert reference_name not in rendered
+
+    with pytest.raises(ConfigError) as exc_info:
+        validate_project_contract(project, sources, models, tmp_path)
+
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("dbt_ml"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_default_llm_credential_is_protected_before_earlier_model_error(
+    tmp_path: Path,
+) -> None:
+    reference_name = "EARLY_MODEL_ERROR_REFERENCE_SENTINEL_154"
+    model = ModelConfig(
+        name="raw",
+        source="ref('missing')",
+        extraction={
+            "options": {
+                "api_key_env": reference_name,
+                "fields": [{"name": "title", "type": "string"}],
+            }
+        },
+    )
+    project = ProjectConfig(
+        name="p",
+        extraction={"default_backend": "llm"},
+    )
+
+    with pytest.raises(ConfigError, match="unknown source") as exc_info:
+        validate_project_contract(project, [_source()], [model], tmp_path)
+
+    assert model.extraction is not None
+    assert isinstance(
+        model.extraction.options["api_key_env"], CredentialReference
+    )
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("dbt_ml"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
 
 def test_provider_without_native_batch_is_rejected_at_compile(

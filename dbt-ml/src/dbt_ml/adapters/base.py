@@ -12,7 +12,8 @@ Vector stores such as LanceDB are a separate role and do not emulate this API.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -22,6 +23,7 @@ import polars as pl
 from pydantic import BaseModel, ValidationError
 
 from ..config.profile import WarehouseConfig
+from ..hashing import canonical_fingerprint
 
 
 class AdapterError(Exception):
@@ -30,6 +32,83 @@ class AdapterError(Exception):
 
 class AdapterCapabilityError(AdapterError):
     pass
+
+
+@dataclass(frozen=True)
+class StateScope:
+    model_name: str
+    stage: str = "materialization"
+    target_identity: str = "warehouse-v1"
+
+    def __post_init__(self) -> None:
+        for field_name in ("model_name", "stage", "target_identity"):
+            if not getattr(self, field_name):
+                raise ValueError(f"State scope {field_name} must not be empty")
+        if self.stage != "materialization" and self.target_identity == "warehouse-v1":
+            raise ValueError(
+                "Non-materialization state scopes require an explicit target_identity; "
+                "use StateScope.for_target_descriptor() for semantic target config"
+            )
+
+    @classmethod
+    def for_target_descriptor(
+        cls,
+        model_name: str,
+        *,
+        stage: str,
+        descriptor: Mapping[str, Any],
+    ) -> Self:
+        """Build a scope from semantic, non-secret serving-target configuration.
+
+        The caller must exclude credentials and execution-only configuration;
+        only the resulting domain-separated fingerprint is retained.
+        """
+        target_identity = canonical_fingerprint(
+            descriptor,
+            domain="dbt-ml-state-target-identity",
+            version=1,
+        )
+        return cls(model_name, stage, target_identity)
+
+
+@dataclass(frozen=True)
+class StateValue:
+    input_fingerprint: str
+    code_version: str
+
+    def __post_init__(self) -> None:
+        if not self.input_fingerprint:
+            raise ValueError("State input_fingerprint must not be empty")
+        if not self.code_version:
+            raise ValueError("State code_version must not be empty")
+
+
+@dataclass(frozen=True)
+class StateRecord:
+    record_key: str
+    input_fingerprint: str
+    code_version: str
+
+    def __post_init__(self) -> None:
+        if not self.record_key:
+            raise ValueError("State record_key must not be empty")
+        if not self.input_fingerprint:
+            raise ValueError("State input_fingerprint must not be empty")
+        if not self.code_version:
+            raise ValueError("State code_version must not be empty")
+
+
+def validate_state_records(records: Sequence[StateRecord]) -> None:
+    keys = [record.record_key for record in records]
+    if len(keys) != len(set(keys)):
+        raise AdapterError("State records contain duplicate record_key values")
+
+
+def validate_state_keys(record_keys: Sequence[str]) -> None:
+    if any(not record_key for record_key in record_keys):
+        raise AdapterError("State record keys must not be empty")
+    if len(record_keys) != len(set(record_keys)):
+        raise AdapterError("State record keys contain duplicate values")
 
 
 class WarehouseCapability(StrEnum):
@@ -130,8 +209,18 @@ class WarehouseAdapter(ABC):
 
     def __enter__(self) -> Self:
         self._connect()
-        self._ensure_schema()
-        self._ensure_state_table()
+        try:
+            self._ensure_schema()
+            self._ensure_state_table()
+        except BaseException as error:
+            try:
+                self._close()
+            except BaseException as close_error:
+                error.add_note(
+                    f"Failed to close warehouse adapter after initialization "
+                    f"failed: {close_error}"
+                )
+            raise
         return self
 
     def __exit__(
@@ -245,6 +334,18 @@ class WarehouseAdapter(ABC):
         number of rows removed. A no-op (returns 0) if the table does not exist."""
 
     @abstractmethod
+    def delete_rows_and_state(
+        self,
+        table: str,
+        *,
+        key_col: str,
+        keys: Sequence[str],
+        state_scope: StateScope,
+        state_record_keys: Sequence[str] | None = None,
+    ) -> int:
+        """Atomically delete target rows and their scoped state when supported."""
+
+    @abstractmethod
     def drop_table(self, table: str) -> None: ...
 
     # ─── querying ─────────────────────────────────────────────────────────
@@ -318,17 +419,23 @@ class WarehouseAdapter(ABC):
     # ─── incremental state CRUD ───────────────────────────────────────────
 
     @abstractmethod
-    def fetch_state(self, model_name: str) -> dict[str, tuple[str, str]]:
-        """Return {document_id: (content_hash, code_version)} for `model_name`."""
+    def fetch_state(self, scope: StateScope) -> dict[str, StateValue]:
+        """Return state values keyed by the stable record identity in `scope`."""
 
     @abstractmethod
     def upsert_state(
-        self, model_name: str, records: list[tuple[str, str, str]]
+        self, scope: StateScope, records: Sequence[StateRecord]
     ) -> None: ...
 
     @abstractmethod
-    def clear_model_state(self, model_name: str) -> None: ...
+    def replace_state(
+        self, scope: StateScope, records: Sequence[StateRecord]
+    ) -> None:
+        """Atomically replace the complete state snapshot for `scope`."""
 
     @abstractmethod
-    def delete_state(self, model_name: str, document_ids: list[str]) -> None:
-        """Remove state rows for the given `document_ids` under `model_name`."""
+    def clear_state(self, scope: StateScope) -> None: ...
+
+    @abstractmethod
+    def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
+        """Remove state rows for `record_keys` within exactly `scope`."""

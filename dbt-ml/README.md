@@ -593,6 +593,26 @@ first flush is compared against the existing table — heterogeneous corpora
 whose early documents lack a column can fail where a whole-run union carried
 it; use `append_new_columns` there.
 
+Incremental state is keyed by a stable record identity within a model, stage,
+and target scope. Extraction and chunk generation use `document_id` because a
+whole document is their retry unit; downstream publication can independently
+track every `chunk_id`. Serving-target descriptors are stored only as a
+canonical fingerprint, so changing non-secret semantic target configuration
+forces publication without persisting the descriptor itself. Target rows and
+their scoped state are deleted together, and new state is recorded only after
+the corresponding materialization succeeds.
+
+Existing state upgrades automatically on the first adapter connection. The
+legacy `(model_name, document_id)` rows are preserved under the
+`materialization` / `warehouse-v1` scope. DuckDB migrates in one transaction;
+BigQuery rejects duplicate legacy keys, builds and verifies a v2 staging copy,
+then atomically replaces the state table. An unrecognized state-table shape
+fails closed with a recovery message instead of being guessed or discarded.
+The first incremental chunk run after this migration performs one deliberate
+rewrite because the metadata-aware fingerprint replaces the legacy text-only
+hash. Chunk IDs remain stable wherever document ID, position, and text are
+unchanged; budget for the one-time warehouse write on large corpora.
+
 ## Chunking (RAG)
 
 A `chunk:` model splits an upstream document's text into one row per chunk —
@@ -617,6 +637,25 @@ column except the split text field — so document lineage (`source_uri`,
 `content_hash`, parser provenance) flows onto every chunk for free.
 Incremental chunk models skip unchanged documents, re-chunk changed ones
 without leaving orphan chunks, and prune chunks of deleted documents.
+
+Chunk identity and row invalidation are deliberately separate:
+
+| upstream change | changes `chunk_id` | invalidates materialized chunk rows |
+|---|---:|---:|
+| `document_id`, chunk position, or chunk text | yes | yes |
+| title, source URI, tenant, ACL/access groups, dates, or other carried metadata | no | yes |
+| native nested mapping key order only | no | no |
+| native nested/list value or list order | no | yes |
+| splitter/code configuration | only if position or text changes | yes |
+
+The invalidation fingerprint uses canonical typed serialization for mappings,
+lists, nulls, timestamps, decimals, and binary values. It includes the split
+text plus every upstream value that survives on the chunk row. Only fields
+replaced by the chunk model (`chunk_id`, `chunk_index`, `chunk_count`, output
+`text`, `chunk_strategy`, `code_version`, and `chunked_at`) are excluded;
+`document_id` is included explicitly. As a result, an ACL-only change rewrites
+the affected rows while preserving stable chunk IDs when their text and
+positions are unchanged.
 
 The recommended document-layer shape (GCS raw files → BigQuery tables):
 

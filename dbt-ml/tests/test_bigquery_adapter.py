@@ -15,6 +15,9 @@ import pytest
 
 from dbt_ml.adapters import (
     AdapterError,
+    StateRecord,
+    StateScope,
+    StateValue,
     WarehouseCapability,
     adapter_capabilities,
     create_adapter,
@@ -175,12 +178,36 @@ class _FailingJob(_FakeJob):
         raise RuntimeError("simulated merge failure")
 
 
+_STATE_V1_SCHEMA = [
+    SimpleNamespace(name=name, field_type=field_type, mode="REQUIRED")
+    for name, field_type in (
+        ("model_name", "STRING"),
+        ("document_id", "STRING"),
+        ("content_hash", "STRING"),
+        ("code_version", "STRING"),
+        ("last_run_at", "TIMESTAMP"),
+    )
+]
+_STATE_V2_SCHEMA = [
+    SimpleNamespace(name=name, field_type=field_type, mode="REQUIRED")
+    for name, field_type in (
+        ("model_name", "STRING"),
+        ("state_scope", "STRING"),
+        ("target_identity", "STRING"),
+        ("record_key", "STRING"),
+        ("input_fingerprint", "STRING"),
+        ("code_version", "STRING"),
+        ("last_run_at", "TIMESTAMP"),
+    )
+]
+
+
 class _FakeClient:
     def __init__(self) -> None:
         self.queries: list[tuple[str, Any]] = []
         self.query_kwargs: list[dict[str, Any]] = []
         self.loads: list[tuple[bytes, str, Any]] = []
-        self.tables: dict[str, list[str]] = {}
+        self.tables: dict[str, list[Any]] = {}
         self.listing: list[str] = []
         self.dropped: list[str] = []
         self.query_results: list[_FakeJob] = []
@@ -201,9 +228,13 @@ class _FakeClient:
 
         if table_id not in self.tables:
             raise NotFound(table_id)
-        return SimpleNamespace(
-            schema=[SimpleNamespace(name=c) for c in self.tables[table_id]]
-        )
+        schema = [
+            field
+            if not isinstance(field, str)
+            else SimpleNamespace(name=field, field_type="STRING", mode="NULLABLE")
+            for field in self.tables[table_id]
+        ]
+        return SimpleNamespace(schema=schema)
 
     def list_tables(self, dataset_id: str) -> list[Any]:
         return [SimpleNamespace(table_id=n) for n in self.listing]
@@ -364,24 +395,315 @@ def test_delete_rows_missing_table_is_noop() -> None:
     assert client.queries == []
 
 
-def test_state_upsert_is_single_merge() -> None:
+def test_state_table_create_uses_v2_schema() -> None:
     client = _FakeClient()
     adapter = _adapter(client)
-    adapter.upsert_state("m1", [("d1", "h1", "v1"), ("d2", "h2", "v2")])
+
+    adapter._ensure_state_table()
+
+    assert len(client.queries) == 1
+    sql, _ = client.queries[0]
+    assert "CREATE TABLE IF NOT EXISTS `proj`.`ds`.`dbt_ml_state`" in sql
+    assert "state_scope STRING NOT NULL" in sql
+    assert "target_identity STRING NOT NULL" in sql
+    assert "record_key STRING NOT NULL" in sql
+    assert "input_fingerprint STRING NOT NULL" in sql
+    assert "document_id" not in sql
+    assert "content_hash" not in sql
+
+
+def test_state_table_v2_schema_is_an_exact_noop() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V2_SCHEMA)
+    adapter = _adapter(client)
+
+    adapter._ensure_state_table()
+
+    assert client.queries == []
+    assert client.dropped == []
+
+
+def test_state_table_rejects_unrecognized_schema_without_mutation() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.dbt_ml_state"] = [
+        *_STATE_V2_SCHEMA,
+        SimpleNamespace(name="unexpected", field_type="STRING", mode="NULLABLE"),
+    ]
+    adapter = _adapter(client)
+
+    with pytest.raises(AdapterError, match="Unsupported dbt_ml_state schema"):
+        adapter._ensure_state_table()
+
+    assert client.queries == []
+    assert client.dropped == []
+
+
+def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    protected_table_ids = {
+        "proj.ds.dbt_ml_staging__state_migration_v2",
+        "proj.ds.dbt_ml_staging__state_migration_v2__user_owned",
+    }
+    for table_id in protected_table_ids:
+        client.tables[table_id] = ["user_data"]
+    client.query_results = [
+        _FakeJob(rows=[(0,)]),
+        _FakeJob(),
+        _FakeJob(rows=[(2, 2)]),
+        _FakeJob(),
+    ]
+    adapter = _adapter(client)
+
+    adapter._ensure_state_table()
+
+    assert len(client.queries) == 4
+    duplicate_sql = client.queries[0][0]
+    assert "GROUP BY model_name, document_id HAVING COUNT(*) > 1" in duplicate_sql
+    stage_sql = client.queries[1][0]
+    assert len(client.dropped) == 1
+    migration_id = client.dropped[0]
+    migration_table = migration_id.removeprefix("proj.ds.")
+    assert migration_table.startswith("dbt_ml_staging__state_migration_v2__")
+    suffix = migration_table.removeprefix("dbt_ml_staging__state_migration_v2__")
+    assert len(suffix) == 32
+    assert set(suffix) <= set("0123456789abcdef")
+    migration_ref = f"`proj`.`ds`.`{migration_table}`"
+    assert f"CREATE TABLE {migration_ref}" in stage_sql
+    assert "CREATE OR REPLACE" not in stage_sql
+    assert "IF NOT EXISTS" not in stage_sql
+    assert "model_name AS model_name" in stage_sql
+    assert "'materialization' AS state_scope" in stage_sql
+    assert "'warehouse-v1' AS target_identity" in stage_sql
+    assert "document_id AS record_key" in stage_sql
+    assert "content_hash AS input_fingerprint" in stage_sql
+    assert "code_version AS code_version" in stage_sql
+    assert "last_run_at AS last_run_at" in stage_sql
+    count_sql = client.queries[2][0]
+    assert count_sql.count("SELECT COUNT(*)") == 2
+    assert migration_ref in count_sql
+    copy_sql = client.queries[3][0]
+    assert copy_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`dbt_ml_state` COPY")
+    assert copy_sql.endswith(f"COPY {migration_ref}")
+    assert protected_table_ids.isdisjoint(client.dropped)
+
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V2_SCHEMA)
+    adapter._ensure_state_table()
+    assert len(client.queries) == 4
+
+
+def test_state_table_migration_count_mismatch_keeps_legacy_table() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.query_results = [
+        _FakeJob(rows=[(0,)]),
+        _FakeJob(),
+        _FakeJob(rows=[(2, 1)]),
+    ]
+    adapter = _adapter(client)
+
+    with pytest.raises(AdapterError, match="row-count verification failed"):
+        adapter._ensure_state_table()
+
+    assert len(client.queries) == 3
+    assert all(" COPY " not in sql for sql, _ in client.queries)
+    assert len(client.dropped) == 1
+    assert client.dropped[0].startswith(
+        "proj.ds.dbt_ml_staging__state_migration_v2__"
+    )
+
+
+def test_state_table_migration_rejects_duplicate_legacy_keys_before_writes() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.query_results = [_FakeJob(rows=[(1,)])]
+    adapter = _adapter(client)
+
+    with pytest.raises(AdapterError, match="keys contain duplicates"):
+        adapter._ensure_state_table()
+
+    assert len(client.queries) == 1
+    assert client.queries[0][0].lstrip().startswith("SELECT COUNT(*)")
+    assert client.dropped == []
+
+
+def test_state_table_migration_collision_never_deletes_existing_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collision_hex = "a" * 32
+    collision_id = (
+        "proj.ds.dbt_ml_staging__state_migration_v2__" + collision_hex
+    )
+    client = _FakeClient()
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.tables[collision_id] = ["user_data"]
+    client.query_results = [_FakeJob(rows=[(0,)]), _FailingJob()]
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        "dbt_ml.adapters.bigquery.uuid4",
+        lambda: SimpleNamespace(hex=collision_hex),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated merge failure"):
+        adapter._ensure_state_table()
+
+    assert collision_id in client.tables
+    assert client.dropped == []
+    create_sql = client.queries[1][0]
+    assert f"CREATE TABLE `proj`.`ds`.`{collision_id.removeprefix('proj.ds.')}`" in create_sql
+    assert "CREATE OR REPLACE" not in create_sql
+    assert "IF NOT EXISTS" not in create_sql
+
+
+def test_state_upsert_is_single_scoped_merge() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    scope = StateScope("m1", stage="publication", target_identity="lancedb:one")
+    adapter.upsert_state(
+        scope,
+        [
+            StateRecord("chunk-1", "h1", "v1"),
+            StateRecord("chunk-2", "h2", "v2"),
+        ],
+    )
 
     sql, job_config = client.queries[0]
     assert sql.strip().startswith("MERGE")
     assert "OFFSET" in sql
+    assert "target.state_scope = source.state_scope" in sql
+    assert "target.target_identity = source.target_identity" in sql
+    assert "target.record_key = source.record_key" in sql
+    assert "WHEN NOT MATCHED BY SOURCE" not in sql
     params = job_config.query_parameters
-    assert params[0].values == ["d1", "d2"]
-    assert params[3].value == "m1"
+    assert params[0].value == "m1"
+    assert params[1].value == "publication"
+    assert params[2].value == "lancedb:one"
+    assert params[3].values == ["chunk-1", "chunk-2"]
+    assert params[4].values == ["h1", "h2"]
+
+
+def test_replace_state_is_one_scoped_merge_for_empty_snapshot() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    scope = StateScope("m1", stage="publication", target_identity="target-b")
+
+    adapter.replace_state(scope, [])
+
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert "WHEN NOT MATCHED BY SOURCE" in sql
+    assert "target.model_name = ?" in sql
+    assert "target.state_scope = ?" in sql
+    assert "target.target_identity = ?" in sql
+    params = job_config.query_parameters
+    assert params[3].values == []
+    assert params[4].values == []
+    assert params[5].values == []
+    assert [param.value for param in params[6:]] == [
+        "m1",
+        "publication",
+        "target-b",
+    ]
 
 
 def test_fetch_state_round_trip_shape() -> None:
     client = _FakeClient()
-    client.query_results = [_FakeJob(rows=[("d1", "h1", "v1"), ("d2", "h2", "v2")])]
+    client.query_results = [_FakeJob(rows=[("chunk-1", "h1", "v1"), ("chunk-2", "h2", "v2")])]
     adapter = _adapter(client)
-    assert adapter.fetch_state("m1") == {"d1": ("h1", "v1"), "d2": ("h2", "v2")}
+    scope = StateScope("m1", stage="publication", target_identity="target-a")
+
+    assert adapter.fetch_state(scope) == {
+        "chunk-1": StateValue("h1", "v1"),
+        "chunk-2": StateValue("h2", "v2"),
+    }
+    sql, job_config = client.queries[0]
+    assert "record_key, input_fingerprint, code_version" in sql
+    assert "state_scope = ? AND target_identity = ?" in sql
+    assert [param.value for param in job_config.query_parameters] == [
+        "m1",
+        "publication",
+        "target-a",
+    ]
+
+
+def test_fetch_state_rejects_duplicate_keys_without_disclosing_them() -> None:
+    secret_key = "sensitive-record-key"
+    client = _FakeClient()
+    client.query_results = [
+        _FakeJob(
+            rows=[
+                (secret_key, "h1", "v1"),
+                (secret_key, "h2", "v2"),
+            ]
+        )
+    ]
+    adapter = _adapter(client)
+
+    with pytest.raises(AdapterError, match="duplicate record keys") as error:
+        adapter.fetch_state(StateScope("m1"))
+
+    assert secret_key not in str(error.value)
+    assert "h1" not in str(error.value)
+    assert "h2" not in str(error.value)
+
+
+def test_state_delete_and_clear_are_exactly_scoped() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    scope = StateScope("m1", stage="publication", target_identity="target-a")
+
+    adapter.delete_state(scope, ["chunk-1", "chunk-2"])
+    adapter.clear_state(scope)
+
+    delete_sql, delete_config = client.queries[0]
+    clear_sql, clear_config = client.queries[1]
+    for sql in (delete_sql, clear_sql):
+        assert "model_name = ? AND state_scope = ? AND target_identity = ?" in sql
+    delete_params = delete_config.query_parameters
+    assert [param.value for param in delete_params[:3]] == [
+        "m1",
+        "publication",
+        "target-a",
+    ]
+    assert delete_params[3].values == ["chunk-1", "chunk-2"]
+    assert [param.value for param in clear_config.query_parameters] == [
+        "m1",
+        "publication",
+        "target-a",
+    ]
+
+
+def test_delete_rows_and_state_uses_one_scoped_transaction() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id"]
+    client.query_results = [_FakeJob(rows=[(2,)])]
+    adapter = _adapter(client)
+    scope = StateScope("chunks", stage="publication", target_identity="target-a")
+
+    deleted = adapter.delete_rows_and_state(
+        "docs",
+        key_col="document_id",
+        keys=["doc-1"],
+        state_scope=scope,
+        state_record_keys=["chunk-1", "chunk-2"],
+    )
+
+    assert deleted == 2
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert "BEGIN TRANSACTION;" in sql
+    assert "COMMIT TRANSACTION;" in sql
+    assert "DELETE FROM `proj`.`ds`.`docs`" in sql
+    assert "DELETE FROM `proj`.`ds`.`dbt_ml_state`" in sql
+    assert "model_name = ? AND state_scope = ? AND target_identity = ?" in sql
+    params = job_config.query_parameters
+    assert params[0].values == ["doc-1"]
+    assert [param.value for param in params[1:4]] == [
+        "chunks",
+        "publication",
+        "target-a",
+    ]
+    assert params[4].values == ["chunk-1", "chunk-2"]
 
 
 def test_list_tables_filters_internal() -> None:
@@ -898,9 +1220,10 @@ def test_integration_full_round_trip() -> None:
             )
             assert rows == [("a", 99), ("b", 2), ("c", 3)]
 
-            adapter.upsert_state("m", [("a", "h", "v")])
-            adapter.upsert_state("m", [("a", "h2", "v2")])
-            assert adapter.fetch_state("m") == {"a": ("h2", "v2")}
+            scope = StateScope("m")
+            adapter.upsert_state(scope, [StateRecord("a", "h", "v")])
+            adapter.upsert_state(scope, [StateRecord("a", "h2", "v2")])
+            assert adapter.fetch_state(scope) == {"a": StateValue("h2", "v2")}
             assert adapter.list_tables() == ["docs"]
     finally:
         assert isinstance(adapter, BigQueryAdapter)

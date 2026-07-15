@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import logging
 import os
@@ -18,7 +17,14 @@ from typing import Any, cast
 
 import polars as pl
 
-from .adapters import AdapterError, WarehouseAdapter, create_adapter
+from .adapters import (
+    AdapterError,
+    StateRecord,
+    StateScope,
+    StateValue,
+    WarehouseAdapter,
+    create_adapter,
+)
 from .backends import (
     BackendOptionsError,
     BaseBackend,
@@ -37,7 +43,7 @@ from .config.profile import DEFAULT_LLM_PROVIDER, PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
-from .hashing import HASH_DIGEST_SIZE
+from .hashing import canonical_fingerprint
 from .paths import resolve_within_project
 from .profile import (
     ResolvedProfile,
@@ -83,6 +89,23 @@ _EXTRACTION_FIELD_DTYPES: dict[str, Any] = {
     "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
     "json": pl.String,
 }
+
+_CHUNK_GENERATED_FIELDS = frozenset(
+    {
+        "chunk_id",
+        "document_id",
+        "chunk_index",
+        "chunk_count",
+        "text",
+        "chunk_strategy",
+        "code_version",
+        "chunked_at",
+    }
+)
+# These upstream values are replaced by the chunk model rather than carried.
+# Everything else, including timestamps and ACL/filter metadata, participates
+# in row invalidation because it is materialized on every generated chunk.
+_CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
 
 
 class RunError(Exception):
@@ -603,9 +626,10 @@ def _run_extraction_model(
         resolved=resolved,
     )
     warehouse_opts = _warehouse_options(adapter, model)
+    state_scope = StateScope(model.name)
 
     is_incremental = model.materialization == "incremental" and not full_refresh
-    processed_state = adapter.fetch_state(model.name) if is_incremental else {}
+    processed_state = adapter.fetch_state(state_scope) if is_incremental else {}
     existing_tables = set(adapter.list_tables()) if is_incremental else set()
     empty_incremental_target = (
         is_incremental
@@ -618,7 +642,7 @@ def _run_extraction_model(
     for doc in docs:
         if is_incremental:
             prior = processed_state.get(doc.document_id)
-            if prior == (doc.content_hash, code_version):
+            if prior == StateValue(doc.content_hash, code_version):
                 continue
         docs_to_process.append(doc)
 
@@ -627,8 +651,12 @@ def _run_extraction_model(
         current_ids = {doc.document_id for doc in docs}
         removed = [doc_id for doc_id in processed_state if doc_id not in current_ids]
         if removed:
-            adapter.delete_rows(model.name, key_col="document_id", keys=removed)
-            adapter.delete_state(model.name, removed)
+            adapter.delete_rows_and_state(
+                model.name,
+                key_col="document_id",
+                keys=removed,
+                state_scope=state_scope,
+            )
             deleted = len(removed)
 
     skipped = len(docs) - len(docs_to_process)
@@ -644,7 +672,7 @@ def _run_extraction_model(
             "file_pattern."
         ] += 1
     usage_totals: dict[str, Any] = {}
-    full_state_records: list[tuple[str, str, str]] = []
+    full_state_records: list[StateRecord] = []
     full_committed = False
     rows_written = 0
     docs_flushed = 0
@@ -655,9 +683,9 @@ def _run_extraction_model(
 
     def _rows_for_chunk(
         extracted: list[tuple[DocumentRef, ExtractionResult | None, str | None]],
-    ) -> tuple[list[dict[str, Any]], list[tuple[str, str, str]]]:
+    ) -> tuple[list[dict[str, Any]], list[StateRecord]]:
         chunk_rows: list[dict[str, Any]] = []
-        chunk_records: list[tuple[str, str, str]] = []
+        chunk_records: list[StateRecord] = []
         for doc, result, err in extracted:
             if err is not None or result is None:
                 errors.append(f"{doc.relative_path}: {err}")
@@ -676,7 +704,9 @@ def _run_extraction_model(
                     extracted_at=extracted_at,
                 )
             )
-            chunk_records.append((doc.document_id, doc.content_hash, code_version))
+            chunk_records.append(
+                StateRecord(doc.document_id, doc.content_hash, code_version)
+            )
         return chunk_rows, chunk_records
 
     # Sources snapshot into a per-model scratch dir, lazily and only for
@@ -798,7 +828,7 @@ def _run_extraction_model(
                     # descendants instead of aborting the whole invocation.
                     raise RunError(str(e)) from e
                 first_flush = False
-                adapter.upsert_state(model.name, chunk_records)
+                adapter.upsert_state(state_scope, chunk_records)
                 log.info(
                     "flushed %d rows (%d/%d docs) for %s",
                     len(chunk_rows),
@@ -826,8 +856,7 @@ def _run_extraction_model(
         usage_totals["estimated_cost_usd"] = cost
 
     if use_full and full_committed:
-        adapter.clear_model_state(model.name)
-        adapter.upsert_state(model.name, full_state_records)
+        adapter.replace_state(state_scope, full_state_records)
 
     return ModelRunResult(
         model_name=model.name,
@@ -1078,6 +1107,7 @@ def _run_chunk_model(
             f"Chunk model '{model.name}': upstream '{upstream}' has no "
             "`document_id`; chunk models read extraction outputs."
         )
+    document_ids = _chunk_document_ids(df, model.name)
 
     code_version = compute_code_version(
         extraction=None,
@@ -1087,30 +1117,37 @@ def _run_chunk_model(
         project_dir=project_dir,
     )
     warehouse_opts = _warehouse_options(adapter, model)
+    state_scope = StateScope(model.name)
     is_incremental = model.materialization == "incremental" and not full_refresh
-    processed_state = adapter.fetch_state(model.name) if is_incremental else {}
+    processed_state = adapter.fetch_state(state_scope) if is_incremental else {}
 
     # Carry every upstream column except the split text field (replaced by the
     # per-chunk text), so lineage (document_id, source_uri, content_hash, …)
     # flows onto every chunk row for free.
-    carry_cols = [c for c in df.columns if c != chunk_cfg.text_field]
+    carry_cols = [
+        c
+        for c in df.columns
+        if c != chunk_cfg.text_field and c not in _CHUNK_GENERATED_FIELDS
+    ]
     chunked_at = datetime.now(UTC).isoformat()
 
     rows: list[dict[str, Any]] = []
-    state_records: list[tuple[str, str, str]] = []
+    state_records: list[StateRecord] = []
     processed = 0
     skipped = 0
     current_ids: set[str] = set()
     changed_ids: list[str] = []
 
-    for record in df.iter_rows(named=True):
-        document_id = str(record["document_id"])
+    for document_id, record in zip(
+        document_ids, df.iter_rows(named=True), strict=True
+    ):
         current_ids.add(document_id)
-        text = str(record[chunk_cfg.text_field] or "")
-        doc_hash = _chunk_input_hash(text)
+        raw_text = record[chunk_cfg.text_field]
+        text = "" if raw_text is None else str(raw_text)
+        doc_hash = _chunk_input_hash(record, text_field=chunk_cfg.text_field)
         if is_incremental:
             prior = processed_state.get(document_id)
-            if prior == (doc_hash, code_version):
+            if prior == StateValue(doc_hash, code_version):
                 skipped += 1
                 continue
             if prior is not None:
@@ -1131,7 +1168,7 @@ def _run_chunk_model(
                     chunked_at=chunked_at,
                 )
             )
-        state_records.append((document_id, doc_hash, code_version))
+        state_records.append(StateRecord(document_id, doc_hash, code_version))
 
     deleted = 0
     if is_incremental:
@@ -1141,8 +1178,12 @@ def _run_chunk_model(
         # chunk_id, which differs for the new chunks).
         stale = removed + changed_ids
         if stale:
-            adapter.delete_rows(model.name, key_col="document_id", keys=stale)
-            adapter.delete_state(model.name, removed)
+            adapter.delete_rows_and_state(
+                model.name,
+                key_col="document_id",
+                keys=stale,
+                state_scope=state_scope,
+            )
             deleted = len(removed)
 
     rows_written = 0
@@ -1164,9 +1205,10 @@ def _run_chunk_model(
             except AdapterError as e:
                 raise RunError(str(e)) from e
 
-    if full_refresh:
-        adapter.clear_model_state(model.name)
-    adapter.upsert_state(model.name, state_records)
+    if model.materialization == "full" or full_refresh:
+        adapter.replace_state(state_scope, state_records)
+    else:
+        adapter.upsert_state(state_scope, state_records)
 
     return ModelRunResult(
         model_name=model.name,
@@ -1179,10 +1221,42 @@ def _run_chunk_model(
     )
 
 
-def _chunk_input_hash(text: str) -> str:
-    return "text:" + hashlib.blake2b(
-        text.encode(), digest_size=HASH_DIGEST_SIZE
-    ).hexdigest()
+def _chunk_document_ids(df: pl.DataFrame, model_name: str) -> list[str]:
+    raw_ids = df["document_id"].to_list()
+    null_count = sum(value is None for value in raw_ids)
+    if null_count:
+        raise RunError(
+            f"Chunk model '{model_name}': upstream `document_id` contains "
+            f"{null_count} NULL value(s)"
+        )
+    document_ids = [str(value) for value in raw_ids]
+    empty_count = sum(not value for value in document_ids)
+    if empty_count:
+        raise RunError(
+            f"Chunk model '{model_name}': upstream `document_id` contains "
+            f"{empty_count} empty value(s)"
+        )
+    duplicate_count = len(document_ids) - len(set(document_ids))
+    if duplicate_count:
+        raise RunError(
+            f"Chunk model '{model_name}': upstream `document_id` contains "
+            f"{duplicate_count} duplicate value(s)"
+        )
+    return document_ids
+
+
+def _chunk_input_hash(record: dict[str, Any], *, text_field: str) -> str:
+    raw_text = record[text_field]
+    effective_input = {
+        "document_id": str(record["document_id"]),
+        "text": "" if raw_text is None else str(raw_text),
+        "carried": {
+            key: value
+            for key, value in record.items()
+            if key != text_field and key not in _CHUNK_INPUT_EXCLUDED_FIELDS
+        },
+    }
+    return canonical_fingerprint(effective_input, domain="chunk-input", version=2)
 
 
 def _chunk_row(

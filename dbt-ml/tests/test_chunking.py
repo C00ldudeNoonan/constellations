@@ -1,15 +1,27 @@
 """Chunk model kind (issue #86): splitter behaviour, deterministic IDs, and
 the registry → chunks contract end to end through the runner."""
+
 from __future__ import annotations
 
+import hashlib
+from datetime import UTC, datetime
+from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 
 import duckdb
+import polars as pl
 import pytest
 
 from dbt_ml.chunking import chunk_id, split_text
 from dbt_ml.config.model import ChunkConfig
+from dbt_ml.hashing import HASH_DIGEST_SIZE
+from dbt_ml.runner import (
+    _CHUNK_INPUT_EXCLUDED_FIELDS,
+    RunError,
+    _chunk_document_ids,
+    _chunk_input_hash,
+)
 
 # ─── splitter ───────────────────────────────────────────────────────────────
 
@@ -55,9 +67,7 @@ def test_long_unbroken_token_is_hard_cut() -> None:
 
 def test_tokens_strategy_splits_by_tokens() -> None:
     text = " ".join(f"token{i}" for i in range(200))
-    chunks = split_text(
-        text, ChunkConfig(strategy="tokens", chunk_size=50, chunk_overlap=10)
-    )
+    chunks = split_text(text, ChunkConfig(strategy="tokens", chunk_size=50, chunk_overlap=10))
     assert len(chunks) > 1
     assert [c.index for c in chunks] == list(range(len(chunks)))
 
@@ -81,9 +91,7 @@ def test_splitter_does_not_inject_trailing_separator() -> None:
 def test_chunks_contain_only_source_characters() -> None:
     """Concatenating chunk text (minus overlap) introduces no characters that
     weren't in the source."""
-    text = "\n\n".join(
-        f"Paragraph {i} has several words in it." for i in range(15)
-    )
+    text = "\n\n".join(f"Paragraph {i} has several words in it." for i in range(15))
     chunks = split_text(text, ChunkConfig(chunk_size=100, chunk_overlap=0))
     source_chars = set(text)
     for chunk in chunks:
@@ -107,15 +115,126 @@ def test_chunk_config_validation() -> None:
         ChunkConfig(chunk_size=100, chunk_overlap=100)
 
 
+def test_chunk_input_fingerprint_is_typed_and_canonical() -> None:
+    first = {
+        "document_id": "doc-1",
+        "body": "unchanged text",
+        "metadata": {"tenant": "econ", "groups": ["reader", "admin"]},
+        "effective_at": datetime(2026, 7, 15, tzinfo=UTC),
+        "weight": Decimal("1.00"),
+        "payload": b"\x00\xff",
+    }
+    reordered = {
+        "payload": b"\x00\xff",
+        "weight": Decimal("1.00"),
+        "effective_at": datetime(2026, 7, 15, tzinfo=UTC),
+        "metadata": {"groups": ["reader", "admin"], "tenant": "econ"},
+        "body": "unchanged text",
+        "document_id": "doc-1",
+    }
+
+    assert _chunk_input_hash(first, text_field="body") == _chunk_input_hash(
+        reordered, text_field="body"
+    )
+
+    changed = dict(first)
+    changed["metadata"] = {"tenant": "econ", "groups": ["admin", "reader"]}
+    assert _chunk_input_hash(first, text_field="body") != _chunk_input_hash(
+        changed, text_field="body"
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["title", "source_uri", "tenant", "access_groups", "effective_date"],
+)
+def test_chunk_input_fingerprint_includes_filter_metadata(field: str) -> None:
+    record = {
+        "document_id": "doc-1",
+        "body": "unchanged text",
+        "title": "old",
+        "source_uri": "gs://bucket/old",
+        "tenant": "tenant-a",
+        "access_groups": ["analyst"],
+        "effective_date": "2026-07-15",
+    }
+    changed = dict(record)
+    changed[field] = "different"
+
+    assert _chunk_input_hash(record, text_field="body") != _chunk_input_hash(
+        changed, text_field="body"
+    )
+
+
+def test_chunk_input_fingerprint_excludes_only_generated_values() -> None:
+    assert _CHUNK_INPUT_EXCLUDED_FIELDS == {
+        "chunk_id",
+        "document_id",
+        "chunk_index",
+        "chunk_count",
+        "text",
+        "chunk_strategy",
+        "code_version",
+        "chunked_at",
+    }
+    record = {
+        "document_id": "doc-1",
+        "body": "unchanged text",
+        "chunk_id": "old-chunk",
+        "chunk_index": 99,
+        "chunk_count": 100,
+        "text": "overwritten",
+        "chunk_strategy": "old",
+        "code_version": "upstream-version",
+        "chunked_at": "yesterday",
+    }
+    changed = {
+        **record,
+        "chunk_id": "other",
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "text": "other",
+        "chunk_strategy": "other",
+        "code_version": "other",
+        "chunked_at": "today",
+    }
+
+    assert _chunk_input_hash(record, text_field="body") == _chunk_input_hash(
+        changed, text_field="body"
+    )
+    changed["document_id"] = "doc-2"
+    assert _chunk_input_hash(record, text_field="body") != _chunk_input_hash(
+        changed, text_field="body"
+    )
+
+
+def test_chunk_input_text_coercion_keeps_zero_false_and_null_distinct() -> None:
+    fingerprints = {
+        _chunk_input_hash({"document_id": "doc", "body": value}, text_field="body")
+        for value in (0, False, None)
+    }
+
+    assert len(fingerprints) == 3
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [(["doc", None], "NULL"), (["doc", ""], "empty"), (["doc", "doc"], "duplicate")],
+)
+def test_chunk_document_identity_is_validated_before_mutation(
+    values: list[str | None], message: str
+) -> None:
+    with pytest.raises(RunError, match=message):
+        _chunk_document_ids(pl.DataFrame({"document_id": values}), "chunks")
+
+
 # ─── end to end: registry → chunks ──────────────────────────────────────────
 
 
 def _chunk_project(tmp_path: Path, *, chunk_size: int = 120) -> Path:
     project = tmp_path / "proj"
     project.mkdir()
-    (project / "dbt_ml_project.yml").write_text(
-        "name: docs\nversion: '0.1.0'\nprofile: docs\n"
-    )
+    (project / "dbt_ml_project.yml").write_text("name: docs\nversion: '0.1.0'\nprofile: docs\n")
     (project / "profiles.yml").write_text(
         "docs:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
         "        type: duckdb\n        path: ./target/db.duckdb\n        schema: docs\n"
@@ -129,7 +248,8 @@ def _chunk_project(tmp_path: Path, *, chunk_size: int = 120) -> Path:
     (project / "models" / "registry.yml").write_text(
         "version: 2\nmodels:\n  - name: document_registry\n"
         "    source: ref('raw_docs')\n    extraction:\n      backend: json\n"
-        "      options:\n        fields: [title, body]\n"
+        "      options:\n"
+        "        fields: [title, body, tenant, access_groups, effective_date]\n"
         "    materialization: incremental\n"
     )
     (project / "models" / "chunks.yml").write_text(
@@ -144,11 +264,17 @@ def _chunk_project(tmp_path: Path, *, chunk_size: int = 120) -> Path:
     return project
 
 
-def _write_doc(project: Path, name: str, title: str, body: str) -> None:
+def _write_doc(
+    project: Path,
+    name: str,
+    title: str,
+    body: str,
+    **metadata: object,
+) -> None:
     import json
 
     (project / "data" / "docs" / name).write_text(
-        json.dumps({"title": title, "body": body})
+        json.dumps({"title": title, "body": body, **metadata})
     )
 
 
@@ -205,6 +331,177 @@ def test_chunk_ids_stable_across_reruns(tmp_path: Path) -> None:
     # unchanged upstream → chunk model skips the document
     assert next(r for r in results if r.model_name == "document_chunks").documents_skipped == 1
     assert {r[0] for r in _chunks(project)} == first
+
+
+def test_legacy_chunk_state_migrates_then_rewrites_once(tmp_path: Path) -> None:
+    from dbt_ml.runner import run_project
+
+    project = _chunk_project(tmp_path)
+    body = ". ".join(f"sentence {i}" for i in range(30))
+    _write_doc(project, "a.json", "Doc A", body)
+    run_project(project)
+    original_ids = {row[0] for row in _chunks(project)}
+
+    old_chunk_hash = "text:" + hashlib.blake2b(
+        body.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+    db_path = project / "target" / "db.duckdb"
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(
+            """
+            CREATE TABLE "db".docs.dbt_ml_state_v1 (
+                model_name VARCHAR NOT NULL,
+                document_id VARCHAR NOT NULL,
+                content_hash VARCHAR NOT NULL,
+                code_version VARCHAR NOT NULL,
+                last_run_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (model_name, document_id)
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO "db".docs.dbt_ml_state_v1
+            SELECT model_name, record_key,
+                   CASE WHEN model_name = 'document_chunks' THEN ?
+                        ELSE input_fingerprint END,
+                   code_version, last_run_at
+            FROM "db".docs.dbt_ml_state
+            """,
+            [old_chunk_hash],
+        )
+        con.execute('DROP TABLE "db".docs.dbt_ml_state')
+        con.execute(
+            'ALTER TABLE "db".docs.dbt_ml_state_v1 RENAME TO dbt_ml_state'
+        )
+    finally:
+        con.close()
+
+    migrated = run_project(project)
+    chunk_result = next(r for r in migrated if r.model_name == "document_chunks")
+    assert chunk_result.documents_processed == 1
+    assert chunk_result.documents_skipped == 0
+    assert {row[0] for row in _chunks(project)} == original_ids
+
+    unchanged = run_project(project)
+    unchanged_chunk = next(
+        r for r in unchanged if r.model_name == "document_chunks"
+    )
+    assert unchanged_chunk.documents_processed == 0
+    assert unchanged_chunk.documents_skipped == 1
+
+
+@pytest.mark.parametrize(
+    ("column", "updated"),
+    [
+        ("title", "Reclassified filing"),
+        ("source_uri", "gs://governed-bucket/reclassified.json"),
+        ("tenant", "tenant-b"),
+        ("access_groups", '["admin","auditor"]'),
+        ("effective_date", "2026-08-01"),
+    ],
+)
+def test_metadata_only_update_rewrites_chunks_with_stable_ids(
+    tmp_path: Path, column: str, updated: str
+) -> None:
+    from dbt_ml.runner import run_project
+
+    project = _chunk_project(tmp_path)
+    _write_doc(
+        project,
+        "a.json",
+        "Economic release",
+        ". ".join(f"sentence {i}" for i in range(30)),
+        tenant="tenant-a",
+        access_groups=["analyst"],
+        effective_date="2026-07-15",
+    )
+    run_project(project)
+    before_ids = {row[0] for row in _chunks(project)}
+
+    db_path = project / "target" / "db.duckdb"
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(
+            f'UPDATE "db".docs.document_registry SET "{column}" = ?',
+            [updated],
+        )
+    finally:
+        con.close()
+
+    results = run_project(project)
+    chunk_result = next(r for r in results if r.model_name == "document_chunks")
+    assert chunk_result.documents_processed == 1
+    assert chunk_result.documents_skipped == 0
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        rows = con.execute(f'SELECT chunk_id, "{column}" FROM "db".docs.document_chunks').fetchall()
+    finally:
+        con.close()
+    assert {row[0] for row in rows} == before_ids
+    assert {row[1] for row in rows} == {updated}
+
+    unchanged = run_project(project)
+    unchanged_chunk = next(r for r in unchanged if r.model_name == "document_chunks")
+    assert unchanged_chunk.documents_processed == 0
+    assert unchanged_chunk.documents_skipped == 1
+
+
+def test_failed_chunk_replacement_cannot_leave_old_state_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dbt_ml.adapters.base import AdapterError
+    from dbt_ml.adapters.duckdb import DuckDBAdapter
+    from dbt_ml.runner import RunError, run_project
+
+    project = _chunk_project(tmp_path)
+    _write_doc(project, "a.json", "Original title", "unchanged body")
+    run_project(project)
+    original_ids = {row[0] for row in _chunks(project)}
+
+    db_path = project / "target" / "db.duckdb"
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(
+            'UPDATE "db".docs.document_registry SET title = ?',
+            ["Restricted title"],
+        )
+    finally:
+        con.close()
+
+    original_materialize = DuckDBAdapter.materialize_incremental
+    failed = False
+
+    def fail_chunk_once(self: DuckDBAdapter, table: str, *args: object, **kwargs: object) -> int:
+        nonlocal failed
+        if table == "document_chunks" and not failed:
+            failed = True
+            raise AdapterError("simulated chunk publication failure")
+        return original_materialize(self, table, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", fail_chunk_once)
+    with pytest.raises(RunError, match="simulated chunk publication failure"):
+        run_project(project)
+
+    con = duckdb.connect(str(db_path))
+    try:
+        assert con.execute('SELECT COUNT(*) FROM "db".docs.document_chunks').fetchone() == (0,)
+        assert con.execute(
+            "SELECT COUNT(*) FROM \"db\".docs.dbt_ml_state WHERE model_name = 'document_chunks'"
+        ).fetchone() == (0,)
+        con.execute(
+            'UPDATE "db".docs.document_registry SET title = ?',
+            ["Original title"],
+        )
+    finally:
+        con.close()
+
+    results = run_project(project)
+    chunk_result = next(r for r in results if r.model_name == "document_chunks")
+    assert chunk_result.documents_processed == 1
+    assert {row[0] for row in _chunks(project)} == original_ids
 
 
 def test_changed_document_rechunks_without_orphans(tmp_path: Path) -> None:
@@ -316,9 +613,7 @@ def test_full_materialization_chunks(tmp_path: Path) -> None:
     # switch the chunk model to full materialization
     chunks_yml = project / "models" / "chunks.yml"
     chunks_yml.write_text(
-        chunks_yml.read_text().replace(
-            "materialization: incremental", "materialization: full"
-        )
+        chunks_yml.read_text().replace("materialization: incremental", "materialization: full")
     )
     _write_doc(project, "a.json", "Doc A", ". ".join(f"sentence {i}" for i in range(20)))
     run_project(project)

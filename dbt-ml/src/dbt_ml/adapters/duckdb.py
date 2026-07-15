@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -12,11 +13,36 @@ from pydantic import BaseModel
 from ..config.profile import WarehouseConfig
 from .base import (
     AdapterError,
+    StateRecord,
+    StateScope,
+    StateValue,
     WarehouseAdapter,
     WarehouseCapability,
     validate_incremental_keys,
+    validate_state_keys,
+    validate_state_records,
 )
 from .registry import register
+
+_STATE_TABLE = "dbt_ml_state"
+_STATE_V1_COLUMNS = (
+    ("model_name", "VARCHAR", "NO"),
+    ("document_id", "VARCHAR", "NO"),
+    ("content_hash", "VARCHAR", "NO"),
+    ("code_version", "VARCHAR", "NO"),
+    ("last_run_at", "TIMESTAMP", "NO"),
+)
+_STATE_V2_COLUMNS = (
+    ("model_name", "VARCHAR", "NO"),
+    ("state_scope", "VARCHAR", "NO"),
+    ("target_identity", "VARCHAR", "NO"),
+    ("record_key", "VARCHAR", "NO"),
+    ("input_fingerprint", "VARCHAR", "NO"),
+    ("code_version", "VARCHAR", "NO"),
+    ("last_run_at", "TIMESTAMP", "NO"),
+)
+_STATE_V1_KEY = ("model_name", "document_id")
+_STATE_V2_KEY = ("model_name", "state_scope", "target_identity", "record_key")
 
 
 class DuckDBWarehouseConfig(WarehouseConfig):
@@ -80,18 +106,107 @@ class DuckDBAdapter(WarehouseAdapter):
         self.connection.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema_ref}")
 
     def _ensure_state_table(self) -> None:
-        self.connection.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.schema_ref}.dbt_ml_state (
+        columns = self._state_columns(_STATE_TABLE)
+        if columns is None:
+            self.connection.execute(self._create_state_table_sql(_STATE_TABLE))
+            return
+
+        primary_key = self._state_primary_key(_STATE_TABLE)
+        if columns == _STATE_V2_COLUMNS and primary_key == _STATE_V2_KEY:
+            return
+        if columns == _STATE_V1_COLUMNS and primary_key == _STATE_V1_KEY:
+            self._migrate_v1_state()
+            return
+
+        shape = ", ".join(name for name, _type, _nullable in columns)
+        raise AdapterError(
+            "Unsupported dbt_ml_state schema; expected the legacy v1 or current "
+            f"v2 shape, found columns: {shape or '(none)'}. Back up the table and "
+            "run --full-refresh after resolving the state schema."
+        )
+
+    def _create_state_table_sql(self, table: str) -> str:
+        return f"""
+            CREATE TABLE {self.schema_ref}.{self.quote_ident(table)} (
                 model_name VARCHAR NOT NULL,
-                document_id VARCHAR NOT NULL,
-                content_hash VARCHAR NOT NULL,
+                state_scope VARCHAR NOT NULL,
+                target_identity VARCHAR NOT NULL,
+                record_key VARCHAR NOT NULL,
+                input_fingerprint VARCHAR NOT NULL,
                 code_version VARCHAR NOT NULL,
                 last_run_at TIMESTAMP NOT NULL,
-                PRIMARY KEY (model_name, document_id)
+                PRIMARY KEY (
+                    model_name, state_scope, target_identity, record_key
+                )
             )
-            """
+        """
+
+    def _state_columns(
+        self, table: str
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        rows = self.connection.execute(
+            "SELECT column_name, data_type, is_nullable "
+            "FROM information_schema.columns "
+            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
+            "ORDER BY ordinal_position",
+            [self.catalog, self.schema, table],
+        ).fetchall()
+        if not rows:
+            return None
+        return tuple(
+            (str(name), str(data_type).upper(), str(nullable))
+            for name, data_type, nullable in rows
         )
+
+    def _state_primary_key(self, table: str) -> tuple[str, ...] | None:
+        row = self.connection.execute(
+            "SELECT constraint_column_names FROM duckdb_constraints() "
+            "WHERE database_name = ? AND schema_name = ? AND table_name = ? "
+            "AND constraint_type = 'PRIMARY KEY'",
+            [self.catalog, self.schema, table],
+        ).fetchone()
+        if row is None:
+            return None
+        return tuple(str(column) for column in row[0])
+
+    def _migrate_v1_state(self) -> None:
+        old_ref = f"{self.schema_ref}.{self.quote_ident(_STATE_TABLE)}"
+        migration_table = f"dbt_ml_staging__state_migration_v2__{uuid4().hex}"
+        migration_ref = f"{self.schema_ref}.{self.quote_ident(migration_table)}"
+        with self._transaction():
+            self.connection.execute(self._create_state_table_sql(migration_table))
+            source_row = self.connection.execute(
+                f"SELECT COUNT(*) FROM {old_ref}"
+            ).fetchone()
+            if source_row is None:
+                raise AdapterError("DuckDB state migration could not count v1 rows")
+            source_count = int(source_row[0])
+            self.connection.execute(
+                f"""
+                INSERT INTO {migration_ref} (
+                    model_name, state_scope, target_identity, record_key,
+                    input_fingerprint, code_version, last_run_at
+                )
+                SELECT model_name, 'materialization', 'warehouse-v1', document_id,
+                       content_hash, code_version, last_run_at
+                FROM {old_ref}
+                """
+            )
+            migrated_row = self.connection.execute(
+                f"SELECT COUNT(*) FROM {migration_ref}"
+            ).fetchone()
+            if migrated_row is None:
+                raise AdapterError("DuckDB state migration could not verify v2 rows")
+            migrated_count = int(migrated_row[0])
+            if migrated_count != source_count:
+                raise AdapterError(
+                    "DuckDB state migration row-count verification failed: "
+                    f"expected {source_count}, migrated {migrated_count}"
+                )
+            self.connection.execute(f"DROP TABLE {old_ref}")
+            self.connection.execute(
+                f"ALTER TABLE {migration_ref} RENAME TO {self.quote_ident(_STATE_TABLE)}"
+            )
 
     # ─── identity ────────────────────────────────────────────────────────
 
@@ -312,6 +427,36 @@ class DuckDBAdapter(WarehouseAdapter):
         deleted = cursor.fetchone()
         return int(deleted[0]) if deleted else 0
 
+    def delete_rows_and_state(
+        self,
+        table: str,
+        *,
+        key_col: str,
+        keys: Sequence[str],
+        state_scope: StateScope,
+        state_record_keys: Sequence[str] | None = None,
+    ) -> int:
+        target_keys = list(keys)
+        scoped_keys = (
+            target_keys if state_record_keys is None else list(state_record_keys)
+        )
+        validate_state_keys(target_keys)
+        validate_state_keys(scoped_keys)
+
+        deleted_count = 0
+        with self._transaction():
+            if target_keys and self._table_columns(table) is not None:
+                placeholders = ", ".join("?" for _ in target_keys)
+                cursor = self.connection.execute(
+                    f"DELETE FROM {self.table_ref(table)} "
+                    f"WHERE {self.quote_ident(key_col)} IN ({placeholders})",
+                    target_keys,
+                )
+                deleted = cursor.fetchone()
+                deleted_count = int(deleted[0]) if deleted else 0
+            self._delete_state_rows(state_scope, scoped_keys)
+        return deleted_count
+
     def drop_table(self, table: str) -> None:
         self.connection.execute(f"DROP TABLE IF EXISTS {self.table_ref(table)}")
 
@@ -362,49 +507,131 @@ class DuckDBAdapter(WarehouseAdapter):
 
     # ─── state CRUD ──────────────────────────────────────────────────────
 
-    def fetch_state(self, model_name: str) -> dict[str, tuple[str, str]]:
+    def fetch_state(self, scope: StateScope) -> dict[str, StateValue]:
         rows = self.connection.execute(
-            f"SELECT document_id, content_hash, code_version "
-            f"FROM {self.schema_ref}.dbt_ml_state WHERE model_name = ?",
-            [model_name],
+            f"SELECT record_key, input_fingerprint, code_version "
+            f"FROM {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ?",
+            [scope.model_name, scope.stage, scope.target_identity],
         ).fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
+        return {str(r[0]): StateValue(str(r[1]), str(r[2])) for r in rows}
 
     def upsert_state(
-        self, model_name: str, records: list[tuple[str, str, str]]
+        self, scope: StateScope, records: Sequence[StateRecord]
+    ) -> None:
+        validate_state_records(records)
+        if not records:
+            return
+        with self._transaction():
+            self._upsert_state_rows(scope, records)
+
+    def replace_state(
+        self, scope: StateScope, records: Sequence[StateRecord]
+    ) -> None:
+        validate_state_records(records)
+        with self._transaction():
+            self._clear_state_rows(scope)
+            self._insert_state_rows(scope, records)
+
+    def clear_state(self, scope: StateScope) -> None:
+        self._clear_state_rows(scope)
+
+    def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
+        validate_state_keys(record_keys)
+        self._delete_state_rows(scope, record_keys)
+
+    def _upsert_state_rows(
+        self, scope: StateScope, records: Sequence[StateRecord]
+    ) -> None:
+        self.connection.executemany(
+            f"""
+            INSERT INTO {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} (
+                model_name, state_scope, target_identity, record_key,
+                input_fingerprint, code_version, last_run_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, current_timestamp)
+            ON CONFLICT (
+                model_name, state_scope, target_identity, record_key
+            ) DO UPDATE SET
+                input_fingerprint = excluded.input_fingerprint,
+                code_version = excluded.code_version,
+                last_run_at  = excluded.last_run_at
+            """,
+            [
+                [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                    record.record_key,
+                    record.input_fingerprint,
+                    record.code_version,
+                ]
+                for record in records
+            ],
+        )
+
+    def _insert_state_rows(
+        self, scope: StateScope, records: Sequence[StateRecord]
     ) -> None:
         if not records:
             return
         self.connection.executemany(
             f"""
-            INSERT INTO {self.schema_ref}.dbt_ml_state
-                (model_name, document_id, content_hash, code_version, last_run_at)
-            VALUES (?, ?, ?, ?, current_timestamp)
-            ON CONFLICT (model_name, document_id) DO UPDATE SET
-                content_hash = excluded.content_hash,
-                code_version = excluded.code_version,
-                last_run_at  = excluded.last_run_at
+            INSERT INTO {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} (
+                model_name, state_scope, target_identity, record_key,
+                input_fingerprint, code_version, last_run_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, current_timestamp)
             """,
-            [[model_name, doc_id, ch, cv] for doc_id, ch, cv in records],
+            [
+                [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                    record.record_key,
+                    record.input_fingerprint,
+                    record.code_version,
+                ]
+                for record in records
+            ],
         )
 
-    def clear_model_state(self, model_name: str) -> None:
+    def _clear_state_rows(self, scope: StateScope) -> None:
         self.connection.execute(
-            f"DELETE FROM {self.schema_ref}.dbt_ml_state WHERE model_name = ?",
-            [model_name],
+            f"DELETE FROM {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ?",
+            [scope.model_name, scope.stage, scope.target_identity],
         )
 
-    def delete_state(self, model_name: str, document_ids: list[str]) -> None:
-        if not document_ids:
+    def _delete_state_rows(
+        self, scope: StateScope, record_keys: Sequence[str]
+    ) -> None:
+        if not record_keys:
             return
-        placeholders = ", ".join("?" for _ in document_ids)
+        placeholders = ", ".join("?" for _ in record_keys)
         self.connection.execute(
-            f"DELETE FROM {self.schema_ref}.dbt_ml_state "
-            f"WHERE model_name = ? AND document_id IN ({placeholders})",
-            [model_name, *document_ids],
+            f"DELETE FROM {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+            f"AND record_key IN ({placeholders})",
+            [scope.model_name, scope.stage, scope.target_identity, *record_keys],
         )
 
     # ─── internals ───────────────────────────────────────────────────────
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            yield
+            self.connection.execute("COMMIT")
+        except BaseException as error:
+            try:
+                self.connection.execute("ROLLBACK")
+            except Exception as rollback_error:
+                error.add_note(
+                    f"Failed to roll back DuckDB transaction: {rollback_error}"
+                )
+            raise
 
     def _resolved_path(self) -> Path:
         config = self.config

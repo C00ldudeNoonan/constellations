@@ -8,7 +8,7 @@ and a manifest artifact you can wire into other tools.
 The current v0.2 preview is pure Python and supports DuckDB and BigQuery
 warehouses, local and GCS sources, document chunk models, and executable
 classic text-ML providers. Additional warehouse adapters, embeddings, and
-vector stores remain roadmap work; Rust and PyO3 are explicitly out of scope
+retrieval stores remain roadmap work; Rust and PyO3 are explicitly out of scope
 through v0.2.
 
 ## Where dbt-ml fits
@@ -618,7 +618,7 @@ unchanged; budget for the one-time warehouse write on large corpora.
 A `chunk:` model splits an upstream document's text into one row per chunk —
 the grain RAG and agent retrieval need. Chunk IDs are deterministic and
 content-addressed, so an unchanged document re-runs to identical IDs (safe
-for incremental MERGE into a warehouse/vector store).
+for incremental MERGE into a warehouse or keyed publish to a retrieval store).
 
 ```yaml
 - name: document_chunks
@@ -930,3 +930,9 @@ Next adapter work follows dbt-core's warehouse set over time: Postgres first,
 then Snowflake, Databricks, and Redshift. Embeddings/vector storage, more parser
 providers, and evaluation/reranking remain roadmap items. Incremental state
 stays adapter-owned. Rust, PyO3, and Metaxy remain explicitly deferred.
+
+The accepted [semantic retrieval architecture](docs/architecture/semantic-retrieval.md)
+defines the planned `search:` DAG resource, `RetrievalStore` boundary, typed
+filters and mandatory policy prefilters, incremental publication state, and
+serving-resource artifacts. It is an implementation contract for roadmap work,
+not a claim that a retrieval store or `dbt-ml search` already ships.

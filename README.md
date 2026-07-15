@@ -174,6 +174,9 @@ third-party projects or sensitive documents.
   and the roadmap.
 - **[Contributing](dbt-ml/CONTRIBUTING.md)** — how to add a backend, test, or
   command.
+- **[Semantic retrieval architecture](dbt-ml/docs/architecture/semantic-retrieval.md)**
+  — the accepted, not-yet-implemented `search:` resource and retrieval-store
+  contract.
 - **[Changelog](dbt-ml/CHANGELOG.md)**
 
 ## License

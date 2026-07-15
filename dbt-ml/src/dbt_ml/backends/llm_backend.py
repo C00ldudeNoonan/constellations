@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import stat
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -637,7 +641,10 @@ def _cache_key(
 
 
 def _cache_get(path: Path, key: str) -> dict[str, Any] | None:
-    if not path.exists():
+    if os.name == "nt":
+        if not path.exists():
+            return None
+    elif not _harden_cache_files(path, require_main=True):
         return None
     con = duckdb.connect(str(path), read_only=True)
     try:
@@ -673,34 +680,100 @@ def _cache_put_locked(
     schema_hash: str,
     fields: dict[str, Any],
 ) -> None:
-    con = duckdb.connect(str(path))
-    try:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS llm_cache (
-                cache_key VARCHAR PRIMARY KEY,
-                model VARCHAR NOT NULL,
-                content_hash VARCHAR NOT NULL,
-                schema_hash VARCHAR NOT NULL,
-                response_json VARCHAR NOT NULL,
-                created_at TIMESTAMP NOT NULL
+    if os.name != "nt":
+        _harden_cache_files(path, require_main=False)
+    with _private_cache_umask():
+        con = duckdb.connect(str(path))
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS llm_cache (
+                    cache_key VARCHAR PRIMARY KEY,
+                    model VARCHAR NOT NULL,
+                    content_hash VARCHAR NOT NULL,
+                    schema_hash VARCHAR NOT NULL,
+                    response_json VARCHAR NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+                """
             )
-            """
-        )
-        _prune_legacy_entries(con, path)
-        con.execute(
-            """
-            INSERT INTO llm_cache
-                (cache_key, model, content_hash, schema_hash, response_json, created_at)
-            VALUES (?, ?, ?, ?, ?, current_timestamp)
-            ON CONFLICT (cache_key) DO UPDATE SET
-                response_json = excluded.response_json,
-                created_at    = excluded.created_at
-            """,
-            [key, model, content_hash, schema_hash, json.dumps(fields)],
-        )
+            _prune_legacy_entries(con, path)
+            con.execute(
+                """
+                INSERT INTO llm_cache
+                    (cache_key, model, content_hash, schema_hash, response_json, created_at)
+                VALUES (?, ?, ?, ?, ?, current_timestamp)
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    response_json = excluded.response_json,
+                    created_at    = excluded.created_at
+                """,
+                [key, model, content_hash, schema_hash, json.dumps(fields)],
+            )
+        finally:
+            con.close()
+    if os.name != "nt":
+        _harden_cache_files(path, require_main=True)
+
+
+@contextmanager
+def _private_cache_umask() -> Iterator[None]:
+    if os.name == "nt":
+        yield
+        return
+    # DuckDB creates its write-ahead log beside the database. The process-wide
+    # mask is restored immediately, while the cache write lock serializes this
+    # package's writers.
+    previous = os.umask(0o077)
+    try:
+        yield
     finally:
-        con.close()
+        os.umask(previous)
+
+
+def _harden_cache_files(path: Path, *, require_main: bool) -> bool:
+    main_exists = _harden_optional_cache_file(path)
+    _harden_optional_cache_file(Path(f"{path}.wal"))
+    if require_main and not main_exists:
+        return False
+    return main_exists
+
+
+def _harden_optional_cache_file(path: Path) -> bool:
+    try:
+        _harden_existing_cache_file(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _harden_existing_cache_file(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("LLM cache path must be a regular, non-symlink file")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        if os.path.lexists(path):
+            raise ValueError(
+                "LLM cache path must be a regular, non-symlink file"
+            ) from error
+        raise
+    except OSError as error:
+        raise ValueError(
+            "LLM cache path must be a regular, non-symlink file"
+        ) from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(
+                "LLM cache path must be a regular, non-symlink file"
+            )
+        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+    finally:
+        os.close(descriptor)
 
 
 # Paths already swept this process; guarded by _CACHE_WRITE_LOCK.

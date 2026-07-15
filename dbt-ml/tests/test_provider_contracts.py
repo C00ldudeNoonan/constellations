@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ def _request(content: str = "hello") -> InferenceRequest:
 
 class _EchoInferenceProvider(InferenceProvider):
     provider_name = "contract-test"
+    implementation_version = "1"
     requires_credentials = False
 
     def complete(
@@ -75,6 +77,7 @@ class _EchoInferenceProvider(InferenceProvider):
 
 class _EchoEmbeddingProvider(EmbeddingProvider):
     provider_name = "contract-test"
+    implementation_version = "1"
     requires_credentials = False
 
     def _embed(
@@ -231,6 +234,13 @@ def test_registry_rejects_duplicate_and_invalid_providers() -> None:
     with pytest.raises(ProviderRegistrationError, match="implementation_packages"):
         register_inference_provider(InvalidImplementationPackages)
 
+    class InvalidImplementationVersion(_EchoInferenceProvider):
+        provider_name = "invalid-implementation-version"
+        implementation_version = "not valid!"
+
+    with pytest.raises(ProviderRegistrationError, match="implementation_version"):
+        register_inference_provider(InvalidImplementationVersion)
+
 
 def test_registry_rejects_abstract_provider() -> None:
     class AbstractProvider(InferenceProvider):
@@ -365,6 +375,52 @@ def test_batch_result_must_align_one_to_one_with_requests() -> None:
 
     with pytest.raises(ProviderBatchError, match="one-to-one"):
         provider.validate_batch_result(requests, missing)
+
+
+def test_batch_result_runs_successful_items_through_provider_validation() -> None:
+    secret = "unsafe-batch-validation-detail"
+
+    class RejectingProvider(_EchoInferenceProvider):
+        def validate_result(self, result: object) -> InferenceResult:
+            del result
+            raise ProviderResponseError(secret)
+
+    request = BatchInferenceRequest("a", _request())
+    raw = BatchInferenceResult(
+        (BatchInferenceItem("a", result=InferenceResult({"value": "a"})),)
+    )
+
+    validated = RejectingProvider().validate_batch_result((request,), raw)
+
+    assert validated.items[0].result is None
+    assert isinstance(validated.items[0].error, ProviderResponseError)
+    assert secret not in str(validated.items[0].error)
+
+
+def test_batch_validation_crash_has_safe_opt_in_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "unsafe-validator-detail"
+
+    class CrashingProvider(_EchoInferenceProvider):
+        def validate_result(self, result: object) -> InferenceResult:
+            del result
+            raise RuntimeError(secret)
+
+    monkeypatch.setenv("DBT_ML_DEBUG_PROVIDER_ERRORS", "1")
+    caplog.set_level(logging.DEBUG)
+    request = BatchInferenceRequest("a", _request())
+    raw = BatchInferenceResult(
+        (BatchInferenceItem("a", result=InferenceResult({"value": "a"})),)
+    )
+
+    validated = CrashingProvider().validate_batch_result((request,), raw)
+
+    assert isinstance(validated.items[0].error, ProviderResponseError)
+    assert secret not in caplog.text
+    assert "builtins.RuntimeError" in caplog.text
+    assert "batch item validation failed" in caplog.text
 
 
 def test_embedding_contract_returns_one_vector_per_input() -> None:
@@ -606,6 +662,45 @@ def test_provider_implementation_identity_is_stable_and_class_specific() -> None
     assert first == second
     assert first.startswith("provider-v")
     assert first != alternate
+
+
+def test_provider_implementation_version_changes_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_base._implementation_identity.cache_clear()
+    first = _EchoInferenceProvider().implementation_identity()
+    with monkeypatch.context() as patch:
+        patch.setattr(_EchoInferenceProvider, "implementation_version", "2")
+        provider_base._implementation_identity.cache_clear()
+        second = _EchoInferenceProvider().implementation_identity()
+    provider_base._implementation_identity.cache_clear()
+
+    assert first != second
+
+
+def test_provider_debug_diagnostic_never_includes_exception_messages() -> None:
+    secret = "private-one\nprivate-two"
+    escaped = secret.replace("\n", r"\n")
+    encoded = "private-one%0Aprivate-two"
+    overlap = "private-one"
+    source = compile(
+        f'raise RuntimeError("{escaped} {encoded} {overlap}")',
+        f"/tmp/{overlap}/sdk.py",
+        "exec",
+    )
+    try:
+        exec(source, {})
+    except RuntimeError as error:
+        diagnostic = provider_base.redacted_exception_text(
+            error,
+            sensitive=(secret, overlap),
+        )
+
+    assert "builtins.RuntimeError" in diagnostic
+    assert "external frame" in diagnostic
+    assert "private-one" not in diagnostic
+    assert "private-two" not in diagnostic
+    assert "%0A" not in diagnostic
 
 
 def test_provider_dependency_version_changes_implementation_identity(

@@ -20,6 +20,7 @@ _EMBEDDING_PROVIDERS: dict[str, type[EmbeddingProvider]] = {}
 _PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DISTRIBUTION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_IMPLEMENTATION_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 @overload
@@ -147,6 +148,14 @@ def _validate_provider_class(
     if not isinstance(name, str) or not _PROVIDER_NAME.fullmatch(name):
         raise ProviderRegistrationError(
             f"{capability} provider name must match {_PROVIDER_NAME.pattern}"
+        )
+    implementation_version = getattr(cls, "implementation_version", None)
+    if not isinstance(implementation_version, str) or not (
+        _IMPLEMENTATION_VERSION.fullmatch(implementation_version)
+    ):
+        raise ProviderRegistrationError(
+            f"{capability} provider implementation_version must match "
+            f"{_IMPLEMENTATION_VERSION.pattern}"
         )
     if not isinstance(cls.requires_credentials, bool):
         raise ProviderRegistrationError(

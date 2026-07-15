@@ -16,7 +16,7 @@ from click.testing import CliRunner
 
 import dbt_ml.runner as runner_module
 from dbt_ml.backends import llm_backend
-from dbt_ml.cli import cli
+from dbt_ml.cli import _usage_summary, cli
 from dbt_ml.manifest import write_manifest, write_run_results
 from dbt_ml.providers import (
     BatchInferenceItem,
@@ -211,6 +211,20 @@ def test_run_summary_prints_usage_line(llm_project: Path, fake_api: dict) -> Non
     assert "3,000 in / 300 out tokens" in result.output
 
 
+def test_usage_summary_keeps_reported_and_estimated_costs() -> None:
+    summary = _usage_summary(
+        {
+            "api_calls": 1,
+            "cache_hits": 0,
+            "reported_cost_usd": 0.5,
+            "estimated_cost_usd": 0.1,
+        }
+    )
+
+    assert "$0.5000 reported" in summary
+    assert "~$0.1000 estimated" in summary
+
+
 def test_compile_warning_uses_configured_api_key_env(
     monkeypatch: pytest.MonkeyPatch, llm_project: Path
 ) -> None:
@@ -340,9 +354,7 @@ def test_opt_in_provider_debug_logs_redacted_sdk_diagnostics(
     caplog: pytest.LogCaptureFixture,
     llm_project: Path,
 ) -> None:
-    """DBT_ML_DEBUG_PROVIDER_ERRORS=1 surfaces the SDK traceback at DEBUG
-    for local diagnosis, with the credential value masked. Artifacts stay
-    sanitized either way."""
+    """Opt-in diagnostics expose stack locations, never SDK error messages."""
     secret = "provider-debug-secret"
     monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
     monkeypatch.setenv("DBT_ML_DEBUG_PROVIDER_ERRORS", "1")
@@ -366,8 +378,10 @@ def test_opt_in_provider_debug_logs_redacted_sdk_diagnostics(
     assert results[0].errors
     assert secret not in serialized
     assert secret not in caplog.text
-    assert "SDK failure diagnostic detail" in caplog.text
-    assert "[redacted]" in caplog.text
+    assert "SDK failure diagnostic detail" not in caplog.text
+    assert "builtins.RuntimeError" in caplog.text
+    assert "external frame" in caplog.text
+    assert "dbt_ml.providers.anthropic" in caplog.text
 
 
 def test_missing_credential_name_is_not_persisted(

@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 @register_inference_provider
 class AnthropicInferenceProvider(InferenceProvider):
     provider_name = "anthropic"
+    implementation_version = "1"
     implementation_packages = ("anthropic",)
     default_model = "claude-haiku-4-5"
     default_credential_env = "ANTHROPIC_API_KEY"

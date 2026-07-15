@@ -56,6 +56,7 @@ from dbt_ml.providers import (
 @register_inference_provider
 class AcmeInferenceProvider(InferenceProvider):
     provider_name = "acme"
+    implementation_version = "1"
     default_model = "acme-small"
     implementation_packages = ("acme-sdk",)
     # implement complete(...)
@@ -93,12 +94,15 @@ until the profile contract can represent them without sending one provider's
 secret to another integration.
 
 The selected provider is part of the transformation's semantic identity. Its
-implementation identity hashes the contract version, provider class, and
-versions of provider-declared SDK distributions. It deliberately excludes the
-dbt-ml release and module source digests so cached responses and incremental
-state survive routine upgrades; semantic changes to the contract are signalled
-by bumping `PROVIDER_CONTRACT_VERSION`, and request-shaping changes in a
-provider integration ship as SDK version bumps.
+implementation identity hashes the contract version, provider class, explicit
+provider `implementation_version`, and versions of provider-declared SDK
+distributions. It deliberately excludes the dbt-ml release and module source
+digests so response-cache entries survive unrelated package upgrades. Provider
+integrations must bump `implementation_version` whenever request shaping or
+response normalization changes; contract-wide changes bump
+`PROVIDER_CONTRACT_VERSION`. Incremental model identity additionally includes
+the LLM backend implementation, so current dbt-ml package upgrades still
+invalidate model state.
 
 The LLM response cache also includes the provider name, model, contract version,
 provider implementation identity, schema, content, temperature, and output-token
@@ -136,15 +140,14 @@ This gives run results a stable error vocabulary while leaving detailed SDK
 diagnostics behind the credential boundary. Provider request IDs are allowed
 for operational correlation but response bodies and headers are not.
 
-For local diagnosis, setting `DBT_ML_DEBUG_PROVIDER_ERRORS=1` logs a redacted
-copy of the original SDK traceback at DEBUG level at the point of conversion:
-`redacted_exception_text()` masks the revealed credential, document content,
-and system prompt, so an SDK that echoes a secret back in its error message
-cannot leak it. The switch is off by default because an SDK error can also
-echo request fragments no allowlist anticipates, and debug logs are often
-shipped to aggregators — enable it only while diagnosing a failure locally.
-Raised errors, run results, and artifacts carry only the sanitized form in
-either mode.
+For local diagnosis, setting `DBT_ML_DEBUG_PROVIDER_ERRORS=1` logs allowlisted
+diagnostics at DEBUG level at the point of conversion. The compatibility helper
+`redacted_exception_text()` never emits exception messages, provider source
+paths, function names, or local values. It includes only recognized exception
+categories, trusted dbt-ml module/line locations, and an external-frame count.
+This avoids relying on fragile replacement of repr-, JSON-, URL-, or
+metadata-encoded request data. Raised errors, run results, and artifacts carry
+only the sanitized form in either mode.
 
 ## Anthropic mapping
 
@@ -164,7 +167,9 @@ metadata so accounting code does not need an Anthropic-specific branch.
 An inference integration should:
 
 1. Subclass `InferenceProvider`, choose a stable `provider_name`, and declare
-   credential, batch, and `implementation_packages` metadata.
+   credential, batch, `implementation_version`, and `implementation_packages`
+   metadata. Bump the implementation version for every behavior change that
+   can affect requests, normalized results, caching, or state.
 2. Translate `InferenceRequest` without changing its output schema or semantic
    options.
 3. Return `InferenceResult` and `ProviderUsage`; never return an SDK response

@@ -708,11 +708,10 @@ def _usage_summary(
     tokens_out = m.get("output_tokens", 0)
     if tokens_in or tokens_out:
         parts.append(f"{tokens_in:,} in / {tokens_out:,} out tokens")
-    cost = m.get("estimated_cost_usd")
-    if cost is not None:
-        parts.append(f"~${cost:.4f}")
-    elif (reported_cost := m.get("reported_cost_usd")) is not None:
+    if (reported_cost := m.get("reported_cost_usd")) is not None:
         parts.append(f"${reported_cost:.4f} reported")
+    if (estimated_cost := m.get("estimated_cost_usd")) is not None:
+        parts.append(f"~${estimated_cost:.4f} estimated")
     return "  ".join(parts)
 
 

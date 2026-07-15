@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -494,6 +496,104 @@ def test_legacy_cache_entries_are_pruned_on_write(tmp_path: Path) -> None:
 
     assert llm_backend._cache_get(cache_path, "claude-haiku-4-5|abc|def") is None
     assert llm_backend._cache_get(cache_path, new_key) == {"x": "fresh"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_cache_file_is_private_and_rejects_symlinks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "cache.duckdb"
+    wal_path = Path(f"{cache_path}.wal")
+    wal_modes: list[int] = []
+    real_connect = llm_backend.duckdb.connect
+
+    class InspectingConnection:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._connection = real_connect(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+        def execute(self, *args: object, **kwargs: object) -> object:
+            result = self._connection.execute(*args, **kwargs)
+            if args and "INSERT INTO llm_cache" in str(args[0]):
+                wal_modes.append(stat.S_IMODE(wal_path.stat().st_mode))
+            return result
+
+    monkeypatch.setattr(llm_backend.duckdb, "connect", InspectingConnection)
+    original_umask = os.umask(0o022)
+    try:
+        llm_backend._cache_put(
+            cache_path,
+            "provider-v1|anthropic|model|private",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
+    finally:
+        os.umask(original_umask)
+
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+    assert wal_modes == [0o600]
+
+    os.chmod(cache_path, 0o644)
+    llm_backend._cache_put(
+        cache_path,
+        "provider-v1|anthropic|model|normalized",
+        model="model",
+        content_hash="content",
+        schema_hash="schema",
+        fields={"private": "value"},
+    )
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+
+    symlink_path = tmp_path / "cache-link.duckdb"
+    symlink_path.symlink_to(cache_path)
+    with pytest.raises(ValueError, match="non-symlink"):
+        llm_backend._cache_put(
+            symlink_path,
+            "provider-v1|anthropic|model|symlink",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
+    with pytest.raises(ValueError, match="non-symlink"):
+        llm_backend._cache_get(symlink_path, "private")
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged")
+    wal_path.symlink_to(victim)
+    with pytest.raises(ValueError, match="non-symlink"):
+        llm_backend._cache_put(
+            cache_path,
+            "provider-v1|anthropic|model|wal-symlink",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
+    assert victim.read_text() == "unchanged"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX special files")
+def test_cache_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    cache_path = tmp_path / "cache.fifo"
+    os.mkfifo(cache_path)
+
+    with pytest.raises(ValueError, match="regular"):
+        llm_backend._cache_get(cache_path, "key")
+    with pytest.raises(ValueError, match="regular"):
+        llm_backend._cache_put(
+            cache_path,
+            "provider-v1|anthropic|model|fifo",
+            model="model",
+            content_hash="content",
+            schema_hash="schema",
+            fields={"private": "value"},
+        )
 
 
 def test_truncated_response_is_an_error(

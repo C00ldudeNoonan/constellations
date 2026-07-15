@@ -115,8 +115,12 @@ dependencies current before running dbt-ml over untrusted PDFs, HTML, email, or
 other documents, since malformed files can trigger parser CPU or memory bugs.
 
 The `llm` backend sends document text to the configured model provider and stores
-cached structured responses in the configured cache database. Use deterministic
-local backends for sensitive documents unless remote processing is intended.
+cached structured responses in plaintext in the configured cache database. New
+POSIX cache databases and transient write-ahead logs are forced to owner-only
+mode (`0600`), but the files still contain extracted document data and must be
+handled as sensitive. Use
+deterministic local backends for sensitive documents unless remote processing is
+intended.
 
 ### Trust model & filesystem boundaries
 

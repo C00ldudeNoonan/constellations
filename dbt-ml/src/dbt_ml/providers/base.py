@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import sys
 import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -80,16 +81,36 @@ class ProviderBatchError(ProviderError):
     pass
 
 
+_DEBUG_EXCEPTION_LABELS: dict[type[BaseException], str] = {
+    ArithmeticError: "builtins.ArithmeticError",
+    AssertionError: "builtins.AssertionError",
+    AttributeError: "builtins.AttributeError",
+    KeyError: "builtins.KeyError",
+    LookupError: "builtins.LookupError",
+    OSError: "builtins.OSError",
+    RuntimeError: "builtins.RuntimeError",
+    TypeError: "builtins.TypeError",
+    ValueError: "builtins.ValueError",
+    ProviderError: "dbt_ml.providers.ProviderError",
+    ProviderRegistrationError: "dbt_ml.providers.ProviderRegistrationError",
+    ProviderNotFoundError: "dbt_ml.providers.ProviderNotFoundError",
+    ProviderConfigurationError: "dbt_ml.providers.ProviderConfigurationError",
+    ProviderRequestError: "dbt_ml.providers.ProviderRequestError",
+    ProviderResponseError: "dbt_ml.providers.ProviderResponseError",
+    ProviderBatchError: "dbt_ml.providers.ProviderBatchError",
+}
+
+
 PROVIDER_DEBUG_ENV = "DBT_ML_DEBUG_PROVIDER_ERRORS"
 
 
 def provider_error_debug_enabled() -> bool:
-    """Whether operators opted into redacted SDK diagnostics in debug logs.
+    """Whether operators opted into allowlisted SDK diagnostics in debug logs.
 
     Off by default: an SDK error message can echo fragments of the request
-    that no allowlist can anticipate, and debug logs are often shipped to
-    aggregators. Known sensitive values are masked either way; the switch
-    only exists for local diagnosis.
+    that no redaction can anticipate, and debug logs are often shipped to
+    aggregators. Diagnostics contain only exception types and stack locations;
+    the switch exists for local diagnosis.
     """
     value = os.environ.get(PROVIDER_DEBUG_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -100,19 +121,45 @@ def redacted_exception_text(
     *,
     sensitive: Sequence[str | None] = (),
 ) -> str:
-    """Full traceback text with known sensitive values masked.
+    """Return allowlisted exception diagnostics without provider metadata.
 
-    For opt-in local debug logging at provider boundaries only — raised
-    errors and artifacts always carry the sanitized `ProviderError` form
-    instead. Callers pass every value that must not appear (revealed
-    credential, request content, system prompt) so genuine SDK diagnostics
-    survive while a provider echoing a secret back cannot leak it.
+    Exact-value replacement cannot safely redact repr-, JSON-, or URL-encoded
+    request data. Keep the compatibility name and argument, but emit only
+    recognized exception categories, dbt-ml module locations, and an external
+    frame count. Raised errors and artifacts still use the sanitized
+    `ProviderError` hierarchy.
     """
-    text = "".join(traceback.format_exception(error))
-    for value in sensitive:
-        if value:
-            text = text.replace(value, "[redacted]")
-    return text
+    del sensitive
+    lines: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        lines.append(
+            _DEBUG_EXCEPTION_LABELS.get(type(current), "external exception")
+        )
+        external_frames = 0
+        for frame, line_number in traceback.walk_tb(current.__traceback__):
+            module_name = frame.f_globals.get("__name__")
+            module = sys.modules.get(module_name) if isinstance(module_name, str) else None
+            if (
+                isinstance(module_name, str)
+                and (module_name == "dbt_ml" or module_name.startswith("dbt_ml."))
+                and module is not None
+                and vars(module) is frame.f_globals
+            ):
+                lines.append(f"  at {module_name}:{line_number}")
+            else:
+                external_frames += 1
+        if external_frames:
+            lines.append(f"  at {external_frames} external frame(s)")
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return "\n".join(lines)
 
 
 def sanitized_provider_error(
@@ -410,6 +457,7 @@ class EmbeddingResult:
 
 class BaseProvider(ABC):
     provider_name: ClassVar[str]
+    implementation_version: ClassVar[str]
     requires_credentials: ClassVar[bool] = True
     default_credential_env: ClassVar[str | None] = None
     implementation_packages: ClassVar[tuple[str, ...]] = ()
@@ -563,20 +611,51 @@ class InferenceProvider(BaseProvider):
                 f"{self.name()} batch result did not align one-to-one with requests",
                 safe_for_display=True,
             )
-        items = tuple(
-            BatchInferenceItem(
-                item.request_id,
-                result=item.result,
-                error=(
-                    sanitized_provider_error(self.name(), "batch item", item.error)
-                    if item.error is not None
-                    else None
-                ),
-            )
-            for item in result.items
-        )
+        items: list[BatchInferenceItem] = []
+        for item in result.items:
+            if item.error is not None:
+                items.append(
+                    BatchInferenceItem(
+                        item.request_id,
+                        error=sanitized_provider_error(
+                            self.name(), "batch item", item.error
+                        ),
+                    )
+                )
+                continue
+            try:
+                validated = self.validate_result(item.result)
+            except ProviderError as error:
+                items.append(
+                    BatchInferenceItem(
+                        item.request_id,
+                        error=sanitized_provider_error(
+                            self.name(), "batch item", error
+                        ),
+                    )
+                )
+            except Exception as error:
+                if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        "%s batch item validation failed:\n%s",
+                        self.name(),
+                        redacted_exception_text(error),
+                    )
+                items.append(
+                    BatchInferenceItem(
+                        item.request_id,
+                        error=ProviderResponseError(
+                            f"{self.name()} batch item returned an invalid response",
+                            safe_for_display=True,
+                        ),
+                    )
+                )
+            else:
+                items.append(
+                    BatchInferenceItem(item.request_id, result=validated)
+                )
         return BatchInferenceResult(
-            items,
+            tuple(items),
             batch_submissions=result.batch_submissions,
         )
 
@@ -681,14 +760,14 @@ class EmbeddingProvider(BaseProvider):
 @cache
 def _implementation_identity(provider_type: type[BaseProvider]) -> str:
     # Deliberately excludes the dbt-ml release and module source digests:
-    # cached responses and incremental state should survive routine upgrades.
-    # Semantic changes to the contract bump PROVIDER_CONTRACT_VERSION instead,
-    # and request-shaping changes in a provider ship as SDK version bumps.
+    # response caches survive unrelated upgrades. Provider behavior changes
+    # bump implementation_version; contract-wide changes bump the contract.
     payload = {
         "contract_version": PROVIDER_CONTRACT_VERSION,
         "provider_class": (
             f"{provider_type.__module__}.{provider_type.__qualname__}"
         ),
+        "provider_implementation_version": provider_type.implementation_version,
         "provider_dependency_versions": {
             package: _distribution_version(package)
             for package in provider_type.implementation_packages

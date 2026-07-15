@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import io
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -38,15 +38,40 @@ from pydantic import (
 from ..config.profile import WarehouseConfig
 from .base import (
     AdapterError,
+    StateRecord,
+    StateScope,
+    StateValue,
     WarehouseAdapter,
     WarehouseCapability,
     validate_incremental_keys,
+    validate_state_keys,
+    validate_state_records,
 )
 from .registry import register
 
 _INSTALL_HINT = (
     "BigQuery support requires google-cloud-bigquery. "
     "Install it with: pip install 'dbt-ml[bigquery]'"
+)
+
+
+_STATE_TABLE = "dbt_ml_state"
+_STATE_MIGRATION_PREFIX = "dbt_ml_staging__state_migration_v2__"
+_STATE_V1_COLUMNS = (
+    ("model_name", "STRING", "REQUIRED"),
+    ("document_id", "STRING", "REQUIRED"),
+    ("content_hash", "STRING", "REQUIRED"),
+    ("code_version", "STRING", "REQUIRED"),
+    ("last_run_at", "TIMESTAMP", "REQUIRED"),
+)
+_STATE_V2_COLUMNS = (
+    ("model_name", "STRING", "REQUIRED"),
+    ("state_scope", "STRING", "REQUIRED"),
+    ("target_identity", "STRING", "REQUIRED"),
+    ("record_key", "STRING", "REQUIRED"),
+    ("input_fingerprint", "STRING", "REQUIRED"),
+    ("code_version", "STRING", "REQUIRED"),
+    ("last_run_at", "TIMESTAMP", "REQUIRED"),
 )
 
 
@@ -501,17 +526,121 @@ class BigQueryAdapter(WarehouseAdapter):
         self.client.create_dataset(dataset, exists_ok=True)
 
     def _ensure_state_table(self) -> None:
-        self.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self._state_ref} (
+        columns = self._state_columns(_STATE_TABLE)
+        if columns is None:
+            self.execute(self._create_state_table_sql(_STATE_TABLE))
+            return
+        if columns == _STATE_V2_COLUMNS:
+            return
+        if columns == _STATE_V1_COLUMNS:
+            self._migrate_v1_state()
+            return
+
+        shape = ", ".join(name for name, _type, _mode in columns)
+        raise AdapterError(
+            "Unsupported dbt_ml_state schema; expected the legacy v1 or current "
+            f"v2 shape, found columns: {shape or '(none)'}. Back up the table and "
+            "run --full-refresh after resolving the state schema."
+        )
+
+    def _create_state_table_sql(
+        self,
+        table: str,
+        *,
+        if_not_exists: bool = True,
+        select: str | None = None,
+    ) -> str:
+        action = "CREATE TABLE IF NOT EXISTS" if if_not_exists else "CREATE TABLE"
+        suffix = f"\n            AS {select}" if select is not None else ""
+        return f"""
+            {action} {self.table_ref(table)} (
                 model_name STRING NOT NULL,
-                document_id STRING NOT NULL,
-                content_hash STRING NOT NULL,
+                state_scope STRING NOT NULL,
+                target_identity STRING NOT NULL,
+                record_key STRING NOT NULL,
+                input_fingerprint STRING NOT NULL,
                 code_version STRING NOT NULL,
                 last_run_at TIMESTAMP NOT NULL
+            ){suffix}
+        """
+
+    def _state_columns(self, table: str) -> tuple[tuple[str, str, str], ...] | None:
+        try:
+            bq_table = self.client.get_table(self._table_id(table))
+        except _not_found_error():
+            return None
+        return tuple(
+            (
+                str(field.name),
+                str(field.field_type).upper(),
+                str(field.mode).upper(),
             )
-            """
+            for field in bq_table.schema
         )
+
+    def _migrate_v1_state(self) -> None:
+        migration_table = f"{_STATE_MIGRATION_PREFIX}{uuid4().hex}"
+        migration_ref = self.table_ref(migration_table)
+        source_select = (
+            "SELECT model_name AS model_name, "
+            "'materialization' AS state_scope, "
+            "'warehouse-v1' AS target_identity, "
+            "document_id AS record_key, "
+            "content_hash AS input_fingerprint, "
+            "code_version AS code_version, "
+            f"last_run_at AS last_run_at FROM {self._state_ref}"
+        )
+        duplicate_count = self.scalar(
+            "SELECT COUNT(*) FROM ("
+            "SELECT model_name, document_id "
+            f"FROM {self._state_ref} "
+            "GROUP BY model_name, document_id HAVING COUNT(*) > 1)"
+        )
+        if int(duplicate_count or 0):
+            raise AdapterError(
+                "Cannot migrate BigQuery dbt_ml_state because legacy "
+                "(model_name, document_id) keys contain duplicates. Back up and "
+                "deduplicate the state table before retrying."
+            )
+        migration_created = False
+        try:
+            self.execute(
+                self._create_state_table_sql(
+                    migration_table,
+                    if_not_exists=False,
+                    select=source_select,
+                )
+            )
+            migration_created = True
+            counts = self.rows(
+                "SELECT "
+                f"(SELECT COUNT(*) FROM {self._state_ref}), "
+                f"(SELECT COUNT(*) FROM {migration_ref})"
+            )
+            if len(counts) != 1 or int(counts[0][0]) != int(counts[0][1]):
+                source_count = int(counts[0][0]) if counts else 0
+                migrated_count = int(counts[0][1]) if counts else 0
+                raise AdapterError(
+                    "BigQuery state migration row-count verification failed: "
+                    f"expected {source_count}, migrated {migrated_count}"
+                )
+            self.execute(f"CREATE OR REPLACE TABLE {self._state_ref} COPY {migration_ref}")
+        except BaseException as error:
+            if migration_created:
+                try:
+                    self.client.delete_table(
+                        self._table_id(migration_table), not_found_ok=True
+                    )
+                except Exception as cleanup_error:
+                    error.add_note(
+                        "Failed to clean BigQuery state migration table: "
+                        f"{cleanup_error}"
+                    )
+            raise
+        else:
+            self.client.delete_table(
+                self._table_id(migration_table), not_found_ok=True
+            )
 
     # ─── identity ────────────────────────────────────────────────────────
 
@@ -530,7 +659,7 @@ class BigQueryAdapter(WarehouseAdapter):
 
     @property
     def _state_ref(self) -> str:
-        return f"{self.schema_ref}.dbt_ml_state"
+        return self.table_ref(_STATE_TABLE)
 
     def _table_id(self, table: str) -> str:
         """Unquoted `project.dataset.table` id for client API calls."""
@@ -1039,6 +1168,52 @@ class BigQueryAdapter(WarehouseAdapter):
         )
         return int(job.num_dml_affected_rows or 0)
 
+    def delete_rows_and_state(
+        self,
+        table: str,
+        *,
+        key_col: str,
+        keys: Sequence[str],
+        state_scope: StateScope,
+        state_record_keys: Sequence[str] | None = None,
+    ) -> int:
+        target_keys = list(keys)
+        scoped_keys = target_keys if state_record_keys is None else list(state_record_keys)
+        validate_state_keys(target_keys)
+        validate_state_keys(scoped_keys)
+        target_exists = bool(target_keys) and self._table_columns(table) is not None
+        if not target_exists and not scoped_keys:
+            return 0
+
+        statements = ["DECLARE deleted_count INT64 DEFAULT 0;", "BEGIN TRANSACTION;"]
+        params: list[Any] = []
+        if target_exists:
+            statements.extend(
+                [
+                    f"DELETE FROM {self.table_ref(table)} "
+                    f"WHERE {self.quote_ident(key_col)} IN UNNEST(?);",
+                    "SET deleted_count = @@row_count;",
+                ]
+            )
+            params.append(target_keys)
+        if scoped_keys:
+            statements.append(
+                f"DELETE FROM {self._state_ref} "
+                "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+                "AND record_key IN UNNEST(?);"
+            )
+            params.extend(
+                [
+                    state_scope.model_name,
+                    state_scope.stage,
+                    state_scope.target_identity,
+                    scoped_keys,
+                ]
+            )
+        statements.extend(["COMMIT TRANSACTION;", "SELECT deleted_count;"])
+        deleted = self.scalar("\n".join(statements), params)
+        return int(deleted or 0)
+
     def drop_table(self, table: str) -> None:
         self.client.delete_table(self._table_id(table), not_found_ok=True)
 
@@ -1056,58 +1231,116 @@ class BigQueryAdapter(WarehouseAdapter):
 
     # ─── state CRUD ──────────────────────────────────────────────────────
 
-    def fetch_state(self, model_name: str) -> dict[str, tuple[str, str]]:
+    def fetch_state(self, scope: StateScope) -> dict[str, StateValue]:
         result = self.rows(
-            f"SELECT document_id, content_hash, code_version FROM {self._state_ref} "
-            "WHERE model_name = ?",
-            [model_name],
+            f"SELECT record_key, input_fingerprint, code_version FROM {self._state_ref} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ?",
+            [scope.model_name, scope.stage, scope.target_identity],
         )
-        return {r[0]: (r[1], r[2]) for r in result}
+        state: dict[str, StateValue] = {}
+        for row in result:
+            record_key = str(row[0])
+            if record_key in state:
+                raise AdapterError(
+                    "BigQuery state contains duplicate record keys in the requested "
+                    "scope; repair the state table before retrying."
+                )
+            state[record_key] = StateValue(str(row[1]), str(row[2]))
+        return state
 
-    def upsert_state(
-        self, model_name: str, records: list[tuple[str, str, str]]
-    ) -> None:
+    def upsert_state(self, scope: StateScope, records: Sequence[StateRecord]) -> None:
+        validate_state_records(records)
         if not records:
             return
-        doc_ids = [r[0] for r in records]
-        hashes = [r[1] for r in records]
-        versions = [r[2] for r in records]
-        # One atomic MERGE (BigQuery has no ON CONFLICT); the three parallel
-        # arrays are zipped by offset.
+        self._merge_state(scope, records, replace=False)
+
+    def replace_state(self, scope: StateScope, records: Sequence[StateRecord]) -> None:
+        validate_state_records(records)
+        self._merge_state(scope, records, replace=True)
+
+    def _merge_state(
+        self,
+        scope: StateScope,
+        records: Sequence[StateRecord],
+        *,
+        replace: bool,
+    ) -> None:
+        record_keys = [record.record_key for record in records]
+        fingerprints = [record.input_fingerprint for record in records]
+        versions = [record.code_version for record in records]
+        replace_clause = (
+            """
+            WHEN NOT MATCHED BY SOURCE
+                AND target.model_name = ?
+                AND target.state_scope = ?
+                AND target.target_identity = ?
+            THEN DELETE
+            """
+            if replace
+            else ""
+        )
+        params: list[Any] = [
+            scope.model_name,
+            scope.stage,
+            scope.target_identity,
+            record_keys,
+            fingerprints,
+            versions,
+        ]
+        if replace:
+            params.extend([scope.model_name, scope.stage, scope.target_identity])
         self._run_query(
             f"""
             MERGE {self._state_ref} AS target
             USING (
                 SELECT
-                    ids[OFFSET(o)] AS document_id,
-                    hs[OFFSET(o)] AS content_hash,
+                    ? AS model_name,
+                    ? AS state_scope,
+                    ? AS target_identity,
+                    ids[OFFSET(o)] AS record_key,
+                    fs[OFFSET(o)] AS input_fingerprint,
                     vs[OFFSET(o)] AS code_version
-                FROM (SELECT ? AS ids, ? AS hs, ? AS vs),
+                FROM (SELECT ? AS ids, ? AS fs, ? AS vs),
                     UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(ids) - 1)) AS o
             ) AS source
-            ON target.model_name = ? AND target.document_id = source.document_id
+            ON target.model_name = source.model_name
+                AND target.state_scope = source.state_scope
+                AND target.target_identity = source.target_identity
+                AND target.record_key = source.record_key
             WHEN MATCHED THEN UPDATE SET
-                content_hash = source.content_hash,
+                input_fingerprint = source.input_fingerprint,
                 code_version = source.code_version,
                 last_run_at = CURRENT_TIMESTAMP()
             WHEN NOT MATCHED THEN INSERT
-                (model_name, document_id, content_hash, code_version, last_run_at)
-                VALUES (?, source.document_id, source.content_hash,
+                (model_name, state_scope, target_identity, record_key,
+                 input_fingerprint, code_version, last_run_at)
+                VALUES (source.model_name, source.state_scope, source.target_identity,
+                        source.record_key, source.input_fingerprint,
                         source.code_version, CURRENT_TIMESTAMP())
+            {replace_clause}
             """,
-            [doc_ids, hashes, versions, model_name, model_name],
+            params,
         )
 
-    def clear_model_state(self, model_name: str) -> None:
+    def clear_state(self, scope: StateScope) -> None:
         self._run_query(
-            f"DELETE FROM {self._state_ref} WHERE model_name = ?", [model_name]
+            f"DELETE FROM {self._state_ref} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ?",
+            [scope.model_name, scope.stage, scope.target_identity],
         )
 
-    def delete_state(self, model_name: str, document_ids: list[str]) -> None:
-        if not document_ids:
+    def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
+        validate_state_keys(record_keys)
+        if not record_keys:
             return
         self._run_query(
             f"DELETE FROM {self._state_ref} "
-            "WHERE model_name = ? AND document_id IN UNNEST(?)",
-            [model_name, list(document_ids)],
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+            "AND record_key IN UNNEST(?)",
+            [
+                scope.model_name,
+                scope.stage,
+                scope.target_identity,
+                list(record_keys),
+            ],
         )

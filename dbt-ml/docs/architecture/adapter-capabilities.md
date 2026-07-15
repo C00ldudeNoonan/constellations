@@ -31,6 +31,15 @@ Core reads relations through typed operations such as `read_table()` and
 `row_count()`. Raw SQL methods remain available to SQL adapters, but callers
 must not assume that SQL is the only way to implement a typed operation.
 
+Incremental state uses a generic stable `record_key` within a `StateScope`
+(model, stage, and safe target identity). Document-grain stages use
+`document_id`; derived publication stages can use `chunk_id` or another stable
+row key. Adapters atomically replace a complete scope and combine target-row
+deletion with scoped state invalidation. Publication remains at-least-once:
+materialize first, then advance only the successfully published record state.
+Target-specific callers derive the stored identity from a semantic, non-secret
+descriptor rather than persisting raw configuration or credentials.
+
 Adapters declare a frozen set of `WarehouseCapability` values. Project
 preflight checks the selected model workload before opening a connection. The
 adapter also guards capability-dependent runtime methods, so direct library use

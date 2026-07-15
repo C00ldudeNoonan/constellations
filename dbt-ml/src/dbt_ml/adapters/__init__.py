@@ -5,6 +5,9 @@ from . import (
 from .base import (
     AdapterCapabilityError,
     AdapterError,
+    StateRecord,
+    StateScope,
+    StateValue,
     WarehouseAdapter,
     WarehouseCapability,
 )
@@ -20,6 +23,9 @@ from .registry import (
 __all__ = [
     "AdapterCapabilityError",
     "AdapterError",
+    "StateRecord",
+    "StateScope",
+    "StateValue",
     "UnknownAdapterError",
     "WarehouseAdapter",
     "WarehouseCapability",

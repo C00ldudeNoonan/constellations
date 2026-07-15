@@ -1,16 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import struct
 from collections.abc import Mapping
-from datetime import date, datetime, time
-from enum import Enum
-from pathlib import Path, PurePath
+from pathlib import Path
 from typing import Any
-
-from pydantic import BaseModel
-from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from .backends import get_backend, validate_backend_options
 from .backends.options import LLMBackendOptions
@@ -25,7 +18,7 @@ from .config.model import (
 from .config.profile import DEFAULT_LLM_PROVIDER
 from .config.project import ProjectConfig
 from .dag import parse_ref
-from .hashing import HASH_DIGEST_SIZE
+from .hashing import HASH_DIGEST_SIZE, canonical_json
 from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options
 from .providers import get_inference_provider, resolve_provider_model
@@ -106,7 +99,7 @@ def compute_code_version(
         else:
             payload["transform_code_hash"] = "missing"
 
-    canonical = _canonical_json(payload)
+    canonical = canonical_json(payload)
     return hashlib.blake2b(
         canonical.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
@@ -232,7 +225,7 @@ def _profile_system_prompt_fingerprint(
         if resolved is not None and resolved.llm is not None
         else None
     )
-    canonical = _canonical_json({"system_prompt": system_prompt})
+    canonical = canonical_json({"system_prompt": system_prompt})
     return hashlib.blake2b(
         canonical.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
@@ -267,88 +260,3 @@ def _hash_file(path: Path) -> str:
         while chunk := f.read(_HASH_CHUNK_SIZE):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _canonical_json(value: Any) -> str:
-    return _encoded_json(_json_safe(value))
-
-
-def _encoded_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return ["enum", _type_identity(value), _json_safe(value.value)]
-    if isinstance(value, BaseModel):
-        return [
-            "pydantic_model",
-            _type_identity(value),
-            _json_safe(value.model_dump(mode="python", by_alias=True)),
-        ]
-    if isinstance(value, PurePath):
-        return ["path", _type_identity(value), value.as_posix()]
-    if type(value) is datetime:
-        return ["datetime", value.isoformat(), value.fold]
-    if type(value) is date:
-        return ["date", value.isoformat()]
-    if type(value) is time:
-        return ["time", value.isoformat(), value.fold]
-    if isinstance(value, Mapping):
-        entries = [
-            [_json_safe(key), _json_safe(item)] for key, item in value.items()
-        ]
-        entries.sort(key=_encoded_json)
-        return ["mapping", _type_identity(value), entries]
-    if isinstance(value, list):
-        return ["sequence", _type_identity(value), [_json_safe(item) for item in value]]
-    if isinstance(value, tuple):
-        return ["sequence", _type_identity(value), [_json_safe(item) for item in value]]
-    if isinstance(value, set | frozenset):
-        items = [_json_safe(item) for item in value]
-        items.sort(key=_encoded_json)
-        return ["set", _type_identity(value), items]
-    if value is None:
-        return ["none"]
-    if type(value) is bool:
-        return ["bool", value]
-    if type(value) is int:
-        return ["int", str(value)]
-    if type(value) is float:
-        return ["float", struct.pack(">d", value).hex()]
-    if type(value) is complex:
-        return [
-            "complex",
-            struct.pack(">d", value.real).hex(),
-            struct.pack(">d", value.imag).hex(),
-        ]
-    if type(value) is str:
-        return ["string", value]
-    if type(value) is bytes:
-        return ["bytes", value.hex()]
-    if type(value) is bytearray:
-        return ["bytearray", bytes(value).hex()]
-    if type(value) is memoryview:
-        return ["memoryview", value.tobytes().hex()]
-    try:
-        converted = to_jsonable_python(value)
-    except PydanticSerializationError as e:
-        raise TypeError(
-            f"Option value of type {type(value).__name__} is not fingerprintable"
-        ) from e
-    if converted is value:
-        raise TypeError(
-            f"Option value of type {type(value).__name__} is not fingerprintable"
-        )
-    return ["special", _type_identity(value), _json_safe(converted)]
-
-
-def _type_identity(value: Any) -> str:
-    value_type = type(value)
-    return f"{value_type.__module__}.{value_type.__qualname__}"

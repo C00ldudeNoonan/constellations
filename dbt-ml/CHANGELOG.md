@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Metadata-aware incremental state (issue #139)
+
+- Chunk invalidation now fingerprints the effective text and every carried
+  upstream value with canonical typed serialization. Metadata-only title,
+  source URI, tenant, ACL/filter, date, nested, decimal, timestamp, and binary
+  changes can no longer leave stale chunk rows; stable text and positions keep
+  their existing `chunk_id` values.
+- Incremental state now uses a generic record key scoped by model, stage, and
+  a safe serving-target fingerprint. This supports independent `chunk_id`
+  publication state without collapsing multiple chunks under one document or
+  reusing state after target configuration changes.
+- DuckDB and BigQuery automatically migrate the legacy document-specific
+  state schema without dropping rows. Unknown schemas fail closed; BigQuery
+  also rejects duplicate legacy keys before migration. Legacy chunk models
+  perform one metadata-fingerprint rewrite after upgrading; stable chunks keep
+  their existing IDs.
+- Target-row deletions and state invalidation share one adapter operation, and
+  full snapshots replace scoped state atomically. Failed publication cannot
+  mark a record current; retries safely replay uncommitted records.
+
 ### Clustering and topic modeling (issue #42)
 
 - Two new executable Classic ML tasks over a document-feature matrix:

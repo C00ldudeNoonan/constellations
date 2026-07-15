@@ -4,18 +4,19 @@ Status: accepted for issue #70.
 
 ## Decision
 
-Warehouse adapters and vector stores are separate roles.
+Warehouse adapters and retrieval stores are separate roles.
 
 A warehouse is the tabular system of record for model outputs, lineage columns,
-incremental state, tests, transforms, and artifacts consumed by dbt. A vector
-store owns vector index lifecycle and nearest-neighbor search. LanceDB therefore
-implements the future `VectorStore` contract; it does not implement
-`WarehouseAdapter` or emulate SQL.
+incremental state, tests, transforms, and artifacts consumed by dbt. A retrieval
+store owns serving-collection/index lifecycle and the typed vector, text,
+filtered, and hybrid query modes it advertises. LanceDB therefore implements the
+future `RetrievalStore` contract; it does not implement `WarehouseAdapter` or
+emulate SQL.
 
-Embedding models will publish their tabular rows and lineage to the configured
-warehouse, then publish vector ids and vectors to the configured vector store.
-The warehouse remains usable when the vector store is unavailable, and vector
-search is never inferred from warehouse behavior.
+Search-index models will read their canonical rows and lineage from the
+configured warehouse, then publish a serving projection to the configured
+retrieval store. The warehouse remains usable when the retrieval store is
+unavailable, and retrieval behavior is never inferred from warehouse behavior.
 
 ## Warehouse contract
 
@@ -82,15 +83,19 @@ failure can temporarily leave the target unavailable.
 workload, so an unsupported unselected model does not block an otherwise valid
 run.
 
-## Vector store boundary
+## Retrieval store boundary
 
-The future vector-store interface will own:
+The original decision used `VectorStore` as a placeholder. The accepted
+[semantic retrieval architecture](semantic-retrieval.md) broadens that role to
+`RetrievalStore` so full-text, typed-filter, and hybrid capabilities do not have
+to masquerade as vector behavior. The retrieval-store interface owns:
 
 - collection and index lifecycle;
-- atomic replacement and keyed vector upsert;
+- atomic replacement and keyed record upsert;
 - vector dimensions and distance metric validation;
-- nearest-neighbor search with explicit filter capability;
-- deletion by stable model/vector ids.
+- typed vector, text, filtered, and hybrid search when advertised;
+- mandatory policy-prefilter enforcement when advertised; and
+- deletion by stable model/record IDs.
 
 It will not own schema tests, Python transforms, tabular incremental state, dbt
 source emission, or arbitrary SQL. Provider and embedding model work can depend

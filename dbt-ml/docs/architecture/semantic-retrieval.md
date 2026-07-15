@@ -382,9 +382,12 @@ interpolation into ordinary Pydantic strings or mappings.
 A future query cache lookup occurs only while holding a ready-generation read
 lease. Its key includes the physical generation and config fingerprint,
 embedding identity, query mode/value fingerprint, effective policy fingerprint,
-user-filter fingerprint, requested projection, and consistency. Literal claims,
-filters, vectors, and text never enter cache metadata. Otherwise an authorized
-or pre-revocation result can be reused across tenants or generations.
+user-filter fingerprint, requested projection, `top_k`, `candidate_k`, `rrf_k`,
+filter-query sort/null ordering, and consistency. Inapplicable fields use a
+domain-separated sentinel rather than being omitted ambiguously. Literal
+claims, filters, vectors, and text never enter cache metadata. Otherwise an
+authorized, differently shaped, or pre-revocation result can be reused across
+tenants, requests, or generations.
 
 ## Canonical collection and row contracts
 

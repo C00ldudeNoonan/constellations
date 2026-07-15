@@ -1,73 +1,120 @@
 # AGENTS.md — dbt-ml
 
-## What this is
+## Scope and sources of truth
 
-dbt-ml is "dbt for unstructured data." v0.1 (merged) is the pure-Python PoC:
-DuckDB warehouse, 6 backends (json/markdown/pdf/html/email/llm), profiles,
-manifest artifacts, dbt-shaped selectors, schema tests, incremental
-materialization. A full Rust+Python design exists as a private working note
-(`docs/private/`, gitignored) and is deferred to a later v2.
+This file applies to the whole repository. A more specific `AGENTS.md`
+supplements these rules and overrides only conflicting guidance in its subtree.
 
-v0.2 is being scoped: see the GitHub issue tagged `roadmap` for the live plan.
-The headline shifts are RAG support (chunking, embeddings, vector storage)
-and broadening warehouse support to match the dbt-core adapter set.
+dbt-ml is a standalone, dbt-shaped Python CLI for turning unstructured data
+into warehouse tables. It is not a dbt package or adapter, and similarly named
+artifacts are not dbt-core contracts unless that compatibility is explicit.
 
-## Scope discipline
+The Python project is nested under `dbt-ml/`. Run Git and GitHub commands from
+the repository root, but run Python, uv, test, lint, type-check, and build
+commands from `dbt-ml/`.
 
-- **No Rust, no PyO3.** Still pure Python through v0.2.
-- **Match dbt-core warehouses over time.** v0.2 starts with DuckDB + LanceDB
-  (lakehouse-style vector store); subsequent versions add Postgres, then
-  Snowflake / BigQuery / Databricks / Redshift via a warehouse adapter
-  pattern. Avoid changes that hard-code DuckDB; route through the adapter.
-- **Metaxy is deferred** — incremental state lives in the warehouse (today
-  `state.py` with DuckDB). When we move to a real adapter pattern, state
-  needs to follow the adapter too.
+Package paths written without a `dbt-ml/` prefix are relative to `dbt-ml/`.
 
-## Build & run
+Use these maintained references rather than copying volatile feature lists:
 
+- `README.md` and `dbt-ml/README.md` — shipped behavior and user guidance.
+- `dbt-ml/CONTRIBUTING.md` — extension contracts and contributor workflow.
+- `dbt-ml/docs/release.md` — release process.
+- GitHub issues labeled `roadmap` — planning context. Verify every claim against
+  current code, tests, and user docs before describing it as implemented.
+
+## Architecture and product boundaries
+
+- Python 3.12+ only. Do not introduce Rust or PyO3 without an explicitly
+  accepted design and scoped task.
+- Keep warehouse-specific SQL/dialect behavior, materialization, quoting, and
+  incremental state behind `src/dbt_ml/adapters/`. State belongs to the active
+  adapter; do not add new DuckDB assumptions to orchestration.
+- Keep document discovery and fetch behind `src/dbt_ml/sources/`, extraction
+  behind `src/dbt_ml/backends/`, and vendor inference behavior behind a provider
+  registry/contract. Establish that seam before adding another vendor; avoid
+  integration-specific branches in `runner.py`.
+- Configuration uses strict Pydantic v2 models. Compiler/preflight validation
+  should reject bad configuration before source discovery, credentials, remote
+  calls, or warehouse mutation.
+- Keep the core installation lean. Optional integrations must import lazily,
+  declare the appropriate extra, and fail with an actionable install command
+  when the extra is absent.
+- Treat dbt-ml artifact shapes as explicit contracts and version schema
+  changes. Do not imply generic dbt artifact, test, state, or selector
+  compatibility that is not implemented.
+- Update user docs, config examples, templates, and artifact fixtures when a
+  public CLI/config/behavior contract changes.
+
+## Security and correctness invariants
+
+- Python transforms and custom tests execute as trusted code; profiles are
+  operator-controlled. Project YAML and source documents still cross strict
+  validation, path, and parser boundaries. None of these inputs are sandboxed.
+- Route paths from project YAML through `paths.py`. External access must be an
+  explicit, reviewable opt-in; profile paths remain operator-controlled.
+- Configuration discovery must accept regular, non-symlink files only. Local
+  source discovery and fetch must not follow symlinks; preserve the no-follow
+  walk and verified scratch-copy boundary in `sources/local.py`.
+- Never expose resolved credentials in logs, caches, artifacts, or diagnostics.
+  Raw documents, provider response bodies/headers, and sensitive exception text
+  must not enter logs or artifacts. Warehouses and caches may contain intended
+  outputs; configured prompts and cached values can be sensitive, so minimize
+  and document artifact-visible fields and preserve owner-only cache storage.
+- Validate incremental keys before mutation. Use each adapter's declared
+  publication guarantees, and advance state only after successful publication;
+  do not assume cross-operation transactions where the adapter lacks them.
+- Cleanup commands may remove only dbt-ml-owned local artifacts. Do not hide
+  warehouse-wide reset behavior behind a familiar dbt command.
+- PII redaction is not sufficient when raw sensitive input columns remain in the
+  output. Tests, examples, and docs must project or drop retained originals.
+
+## Development workflow
+
+From the repository root:
+
+```bash
+cd dbt-ml
+uv sync --all-extras --dev --locked
+uv run pip-audit --skip-editable
+uv run ruff check
+uv run mypy
+uv run pytest -q
 ```
-uv sync                                # install deps
-uv run dbt-ml init my_project           # scaffold (templates: json/pdf/markdown/html)
-uv run dbt-ml seed --count 20           # synthetic data
-uv run dbt-ml run                       # extract + materialize
-uv run dbt-ml test                      # schema + custom python tests
-uv run dbt-ml docs generate             # static HTML site from manifest.json
-uv run pytest                          # dbt-ml package's own tests
-```
 
-## Codex GitHub auth note
+Use targeted tests while iterating, then run the full audit/lint/type/test set
+before handing off implementation, configuration, template, or dependency
+changes. Run `uv build` for packaging or release changes. The default suite must
+not require live provider or cloud credentials; opt-in integration tests must be
+credential-gated and have deterministic unit coverage. Update `uv.lock` only
+when required by an intentional `pyproject.toml` metadata or dependency change,
+and exclude unrelated resolution churn.
 
-Codex desktop sandbox commands can run as `codexsandboxoffline`, which may not
-see the Windows keyring entry that `gh auth login` creates for the interactive
-`alexn` user. If `gh auth status` fails inside the sandbox but the user says
-they reauthed, retry read/write GitHub CLI commands with
-`sandbox_permissions=require_escalated`; the elevated command can access the
-Windows keyring. Do not ask the user to paste tokens into chat.
+## Change and GitHub hygiene
 
-## Conventions
+- Inspect the worktree first. Preserve unrelated user changes, use an isolated
+  worktree when branches conflict, and stage explicit files only.
+- Never commit `target/`, database/WAL files, caches, virtual environments,
+  generated example data, `dist/`, root `docs/research/`, root `docs/private/`,
+  or any `_scratch/` directory. Put reusable review findings in issue/PR
+  comments instead of committing temporary notes.
+- Search open and closed issues before creating one. Comment on an existing
+  tracker when the scope overlaps; create a new issue only for distinct work.
+- Link implementation PRs to their related issues. Use `Closes #…` only when
+  the PR fully satisfies that issue's acceptance criteria; keep parent/design
+  issues open when follow-up work remains.
+- Keep PRs focused, document validation performed, and record intentionally
+  deferred findings on the relevant issue.
+- Never paste or commit access tokens or resolved credentials. Do not work
+  around authentication failures by writing secrets to repository files,
+  temporary notes, command history, or issue/PR comments.
 
-- Python 3.12+, type hints everywhere, ruff clean.
-- Pydantic v2 for config models.
-- Click for CLI.
-- No comments explaining what code does — only why, and only when non-obvious.
+## Code and writing style
 
-## Key files
-
-- `dbt-ml/src/dbt_ml/config/` — Pydantic models for project/source/model/profile YAML
-- `dbt-ml/src/dbt_ml/dag.py` — graphlib-based DAG + selectors + Mermaid render
-- `dbt-ml/src/dbt_ml/state.py` — DuckDB-backed incremental state (per-adapter in v0.2+)
-- `dbt-ml/src/dbt_ml/runner.py` — extract → materialize orchestration
-- `dbt-ml/src/dbt_ml/backends/` — extraction backends
-- `dbt-ml/src/dbt_ml/profile.py` — profile discovery + resolution
-- `dbt-ml/src/dbt_ml/manifest.py` / `docs.py` / `dbt_export.py` — artifacts
-- `dbt-ml/examples/*/` — runnable example projects
-
-## Private working notes
-
-Anything under `docs/research/`, `docs/private/`, or `_scratch/` is gitignored.
-Internal industry research and design sketches live there; never commit them.
-
-## Brand note
-
-"dbt" is always lowercase, even at the start of a sentence. The project name
-here is "dbt-ml" (lowercase). dbt Labs is the company (capital L).
+- Use type hints throughout; mypy is strict. Ruff targets Python 3.12 with a
+  100-column line length.
+- Use Pydantic v2 for configuration and Click for CLI behavior.
+- Comments explain non-obvious reasons or constraints, not line-by-line
+  mechanics.
+- Keep `dbt` and `dbt-ml` lowercase, including at the start of a sentence.
+  Write `dbt Labs` for the company.

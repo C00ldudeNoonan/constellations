@@ -59,6 +59,8 @@ def test_duckdb_declares_core_workflow_capabilities() -> None:
         WarehouseCapability.TYPED_EMPTY_RELATIONS,
         WarehouseCapability.CHUNKED_WRITES,
         WarehouseCapability.SCHEMA_EVOLUTION,
+        WarehouseCapability.STREAMING_TABULAR_READS,
+        WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
     } <= capabilities
 
 

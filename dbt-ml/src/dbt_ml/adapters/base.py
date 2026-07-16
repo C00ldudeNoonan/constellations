@@ -12,14 +12,18 @@ Vector stores such as LanceDB are a separate role and do not emulate this API.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date, datetime
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
 import polars as pl
+import pyarrow as pa
 from pydantic import BaseModel, ValidationError
 
 from ..config.profile import WarehouseConfig
@@ -143,6 +147,252 @@ class WarehouseCapability(StrEnum):
     TYPED_EMPTY_RELATIONS = "typed_empty_relations"
     CHUNKED_WRITES = "chunked_writes"
     SCHEMA_EVOLUTION = "schema_evolution"
+    STREAMING_TABULAR_READS = "streaming_tabular_reads"
+    TABULAR_PREDICATE_PUSHDOWN = "tabular_predicate_pushdown"
+
+
+class ReadPredicateOperator(StrEnum):
+    EQUAL = "eq"
+    NOT_EQUAL = "ne"
+    LESS_THAN = "lt"
+    LESS_THAN_OR_EQUAL = "le"
+    GREATER_THAN = "gt"
+    GREATER_THAN_OR_EQUAL = "ge"
+    IN = "in"
+    NOT_IN = "not_in"
+    IS_NULL = "is_null"
+    IS_NOT_NULL = "is_not_null"
+
+
+ReadScalar = str | int | float | bool | date | datetime
+
+
+@dataclass(frozen=True, repr=False)
+class ReadPredicate:
+    column: str
+    operator: ReadPredicateOperator
+    value: ReadScalar | tuple[ReadScalar, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.column:
+            raise AdapterError("Read predicate column must not be empty")
+        if not isinstance(self.operator, ReadPredicateOperator):
+            raise AdapterError("Read predicate operator is invalid")
+        null_operator = self.operator in {
+            ReadPredicateOperator.IS_NULL,
+            ReadPredicateOperator.IS_NOT_NULL,
+        }
+        membership_operator = self.operator in {
+            ReadPredicateOperator.IN,
+            ReadPredicateOperator.NOT_IN,
+        }
+        if null_operator:
+            if self.value is not None:
+                raise AdapterError(
+                    f"Read predicate operator '{self.operator.value}' does not accept a value"
+                )
+            return
+        if self.value is None:
+            raise AdapterError(
+                f"Read predicate operator '{self.operator.value}' requires a value"
+            )
+        if membership_operator:
+            if not isinstance(self.value, tuple) or not self.value:
+                raise AdapterError(
+                    f"Read predicate operator '{self.operator.value}' requires a non-empty tuple"
+                )
+            if any(not _is_read_scalar(item) for item in self.value):
+                raise AdapterError("Read predicate tuple contains an unsupported value")
+            first_type = type(self.value[0])
+            if any(type(item) is not first_type for item in self.value[1:]):
+                raise AdapterError("Read predicate tuple values must share one type")
+            return
+        if isinstance(self.value, tuple):
+            raise AdapterError(
+                f"Read predicate operator '{self.operator.value}' requires a scalar value"
+            )
+        if not _is_read_scalar(self.value):
+            raise AdapterError("Read predicate contains an unsupported value")
+
+    def __repr__(self) -> str:
+        value = "" if self.value is None else ", value=<redacted>"
+        return (
+            f"ReadPredicate(column={self.column!r}, operator={self.operator.value!r}{value})"
+        )
+
+    def _fingerprint_payload(self) -> dict[str, Any]:
+        return {
+            "column": self.column,
+            "operator": self.operator.value,
+            "value": self.value,
+        }
+
+
+def _is_read_scalar(value: Any) -> bool:
+    if not isinstance(value, str | int | float | bool | date | datetime):
+        return False
+    return not isinstance(value, float) or isfinite(value)
+
+
+@dataclass(frozen=True)
+class TableReadRequest:
+    table: str
+    columns: tuple[str, ...] | None
+    batch_size: int
+    predicates: tuple[ReadPredicate, ...]
+    key_column: str | None
+
+    def __post_init__(self) -> None:
+        if not self.table:
+            raise AdapterError("Table read name must not be empty")
+        if not 1 <= self.batch_size <= 100_000:
+            raise AdapterError("Table read batch_size must be between 1 and 100000")
+        if self.columns is not None:
+            if not self.columns or any(not column for column in self.columns):
+                raise AdapterError("Table read columns must not be empty")
+            if len(self.columns) != len(set(self.columns)):
+                raise AdapterError("Table read columns contain duplicate names")
+        if self.key_column == "":
+            raise AdapterError("Table read key_column must not be empty")
+        if (
+            self.columns is not None
+            and self.key_column is not None
+            and self.key_column not in self.columns
+        ):
+            raise AdapterError("Table read key_column must be included in columns")
+
+    @property
+    def referenced_columns(self) -> frozenset[str]:
+        columns = {predicate.column for predicate in self.predicates}
+        if self.columns is not None:
+            columns.update(self.columns)
+        if self.key_column is not None:
+            columns.add(self.key_column)
+        return frozenset(columns)
+
+    def _fingerprint_payload(self) -> dict[str, Any]:
+        return {
+            "table": self.table,
+            "columns": self.columns,
+            "predicates": [
+                predicate._fingerprint_payload() for predicate in self.predicates
+            ],
+            "key_column": self.key_column,
+        }
+
+
+class ReadOrdering(StrEnum):
+    UNSPECIFIED = "unspecified"
+
+
+def _empty_record_batch(schema: pa.Schema) -> pa.RecordBatch:
+    return pa.RecordBatch.from_arrays(
+        [pa.array([], type=field.type) for field in schema],
+        schema=schema,
+    )
+
+
+class TableReadSnapshot:
+    """One-shot bounded Arrow stream tied to one immutable warehouse snapshot."""
+
+    def __init__(
+        self,
+        *,
+        schema: pa.Schema,
+        fingerprint: str,
+        batches: Iterator[pa.RecordBatch],
+        validate_unchanged: Callable[[], None],
+        close: Callable[[], None],
+        ordering: ReadOrdering = ReadOrdering.UNSPECIFIED,
+        generation_fingerprint: str | None = None,
+    ) -> None:
+        _validate_read_fingerprint(fingerprint)
+        if generation_fingerprint is not None:
+            _validate_read_fingerprint(generation_fingerprint)
+        self.schema = schema
+        self.fingerprint = fingerprint
+        self._generation_fingerprint = generation_fingerprint
+        self.ordering = ordering
+        self._batches = batches
+        self._validate_callback = validate_unchanged
+        self._close_callback = close
+        self._started = False
+        self._exhausted = False
+        self._closed = False
+
+    @property
+    def exhausted(self) -> bool:
+        return self._exhausted
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def generation_fingerprint(self) -> str | None:
+        return self._generation_fingerprint
+
+    def __iter__(self) -> Iterator[pa.RecordBatch]:
+        if self._closed:
+            raise AdapterError("Table read snapshot is closed")
+        if self._started:
+            raise AdapterError("Table read snapshot batches can only be consumed once")
+        self._started = True
+        try:
+            for ordinal, batch in enumerate(self._batches):
+                if not batch.schema.equals(self.schema, check_metadata=False):
+                    batch = _empty_record_batch(batch.schema)
+                    raise AdapterError(
+                        "Warehouse returned an unstable schema while reading table batches "
+                        f"at batch {ordinal}"
+                    )
+                yield batch
+            self._exhausted = True
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException:
+                error.add_note("Failed to close table read snapshot after batch failure")
+            raise
+
+    def validate_unchanged(self) -> None:
+        if self._closed:
+            raise AdapterError("Table read snapshot is closed")
+        self._validate_callback()
+
+    def _set_generation_fingerprint(self, fingerprint: str) -> None:
+        _validate_read_fingerprint(fingerprint)
+        self._generation_fingerprint = fingerprint
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close_batches = getattr(self._batches, "close", None)
+        try:
+            if callable(close_batches):
+                close_batches()
+        except BaseException as error:
+            try:
+                self._close_callback()
+            except BaseException:
+                error.add_note("Failed to close table read snapshot resources")
+            raise
+        else:
+            self._close_callback()
+
+
+def _validate_read_fingerprint(fingerprint: str) -> None:
+    if len(fingerprint) != 32:
+        raise AdapterError(
+            "Table read snapshot fingerprint must be 32 hexadecimal characters"
+        )
+    try:
+        int(fingerprint, 16)
+    except ValueError:
+        raise AdapterError(
+            "Table read snapshot fingerprint must be 32 hexadecimal characters"
+        ) from None
 
 
 def validate_incremental_keys(df: pl.DataFrame, key_col: str) -> None:
@@ -371,6 +621,70 @@ class WarehouseAdapter(ABC):
     def drop_table(self, table: str) -> None: ...
 
     # ─── querying ─────────────────────────────────────────────────────────
+
+    @contextmanager
+    def table_snapshot(
+        self,
+        table: str,
+        *,
+        columns: Sequence[str] | None = None,
+        batch_size: int = 10_000,
+        predicate: ReadPredicate | Sequence[ReadPredicate] | None = None,
+        key_column: str | None = None,
+    ) -> Iterator[TableReadSnapshot]:
+        """Open a bounded, projected, immutable relation snapshot.
+
+        Predicates are combined with logical AND. Ordering is unspecified; a
+        consumer needing deterministic reconciliation must use a separately
+        advertised ordered-read capability.
+        """
+        self.require_capability(
+            WarehouseCapability.STREAMING_TABULAR_READS,
+            operation="streaming materialized table reads",
+        )
+        if predicate is None:
+            predicates: tuple[ReadPredicate, ...] = ()
+        elif isinstance(predicate, ReadPredicate):
+            predicates = (predicate,)
+        else:
+            predicates = tuple(predicate)
+        request = TableReadRequest(
+            table=table,
+            columns=tuple(columns) if columns is not None else None,
+            batch_size=batch_size,
+            predicates=predicates,
+            key_column=key_column,
+        )
+        if request.predicates:
+            self.require_capability(
+                WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
+                operation="typed table predicate pushdown",
+            )
+        snapshot = self._open_table_snapshot(request)
+        try:
+            yield snapshot
+            if snapshot.exhausted:
+                snapshot.validate_unchanged()
+        except BaseException as error:
+            try:
+                snapshot.close()
+            except BaseException:
+                error.add_note(
+                    "Failed to close table read snapshot after operation failure"
+                )
+            raise
+        else:
+            snapshot.close()
+
+    def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
+        self.require_capability(
+            WarehouseCapability.STREAMING_TABULAR_READS,
+            operation="streaming materialized table reads",
+        )
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement "
+            "streaming materialized table reads"
+        )
 
     def read_table(self, table: str, *, limit: int | None = None) -> pl.DataFrame:
         """Read a materialized relation without exposing SQL to core callers.

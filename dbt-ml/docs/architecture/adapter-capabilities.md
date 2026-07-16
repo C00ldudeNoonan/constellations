@@ -1,6 +1,7 @@
 # Adapter capability architecture
 
-Status: accepted for issue #70.
+Status: accepted for issue #70; bounded snapshot reads implemented in issue
+#140.
 
 ## Decision
 
@@ -28,9 +29,12 @@ unavailable, and retrieval behavior is never inferred from warehouse behavior.
 - relation listing and deletion;
 - incremental-state CRUD.
 
-Core reads relations through typed operations such as `read_table()` and
-`row_count()`. Raw SQL methods remain available to SQL adapters, but callers
-must not assume that SQL is the only way to implement a typed operation.
+Core reads small relations through typed operations such as `read_table()` and
+`row_count()`. Serving-sink consumers use `table_snapshot()` for bounded
+projected Arrow batches, typed predicate pushdown, same-snapshot key-domain
+validation, and opaque safe snapshot and generation fingerprints. Raw SQL methods remain
+available to SQL adapters, but callers must not assume that SQL is the only way
+to implement a typed operation.
 
 Incremental state uses a generic stable `record_key` within a `StateScope`
 (model, stage, and safe target identity). Document-grain stages use
@@ -52,6 +56,8 @@ gets the same clear error rather than an attribute error or silent skip.
 | --- | --- | --- |
 | SQL queries and references | yes | yes |
 | typed tabular reads | yes | yes |
+| immutable streaming tabular snapshots | yes | yes |
+| typed predicate pushdown | yes | yes |
 | SQL-backed schema tests | yes | yes |
 | atomic full replacement | yes | no |
 | atomic keyed upsert | yes | yes |
@@ -60,9 +66,62 @@ gets the same clear error rather than an attribute error or silent skip.
 | bounded chunk writes | yes | yes |
 | additive schema evolution | yes | yes |
 
-Capabilities describe implemented guarantees, not aspirations. Streaming reads
-with projection and predicate pushdown are not declared until a typed streaming
-read API exists.
+Capabilities describe implemented guarantees, not aspirations. Adapter sets are
+explicit rather than derived from every enum member, so adding a future
+capability cannot silently advertise unimplemented behavior.
+
+## Bounded snapshot-read contract
+
+`table_snapshot()` accepts a relation, optional projection, batch size, typed
+predicates, and optional stable key column. It guarantees:
+
+- memory bounded by warehouse result paging and the configured output batch,
+  independently of total relation size;
+- one Arrow schema available even for an empty relation, with every emitted
+  batch checked against it;
+- projection and AND-combined typed predicates compiled inside the adapter,
+  with values passed as bound parameters;
+- a warehouse-native NULL and uniqueness preflight over the same filtered
+  snapshot when `key_column` is supplied; a projected read must include that
+  key in its output columns;
+- a one-shot iterator, deterministic context cleanup after exhaustion, error,
+  or early close, and final generation validation after full consumption;
+- an opaque 16-byte handle fingerprint plus a 16-byte generation fingerprint
+  safe for state, cache, and artifact identity; and
+- no ordering guarantee. Ordered state reconciliation is a separate capability
+  tracked by issue #153.
+
+DuckDB opens an independent cursor transaction. MVCC pins the relation version
+through schema inspection, key validation, every Arrow batch, and the final
+context validation; concurrent commits do not change the rows being read. A
+bounded second scan hashes the current projected Arrow stream before successful
+close, so a newer table version cannot silently become ready. The handle
+fingerprint carries an opaque transaction-scoped identity and the generation
+fingerprint hashes the schema and rows; neither exposes row values. This final
+validation means a successful DuckDB snapshot reads the projected relation
+twice. Its generation fingerprint is `None` until every primary batch has been
+consumed; an early-close path cannot be published as a complete generation.
+
+BigQuery executes one uncached query job and pages its immutable result through
+the REST Arrow iterator. The configured page size also caps emitted batches.
+Table `etag`/modification metadata is checked before the first page and after
+full consumption; a changed generation fails rather than allowing a serving
+publisher to mark the read ready. The fingerprint hashes the safe table
+generation, query-job identity, and semantic read shape. A separate stable
+generation fingerprint omits the query job. Query cost remains
+subject to the active profile's project, priority, retry, timeout, and
+`maximum_bytes_billed` settings.
+
+`ReadPredicate` supports equality, inequality, ordered comparisons, membership,
+and NULL checks over strict scalar values. Membership tuples are non-empty and
+homogeneous. Reprs redact values, and adapter errors never include row or
+predicate payloads.
+
+The eager `read_table()` operation remains for small interactive and existing
+model-runner paths. Issue #140 does not claim bounded memory for transform,
+chunk, or classic-ML execution. Search-index publication introduced by issue
+#134 must use `table_snapshot()` and keep it open until its upstream-generation
+readiness check completes.
 
 BigQuery does not declare atomic full replacement. A layout-changing replacement
 must drop the existing target before renaming its staged replacement, so a rename
@@ -78,6 +137,8 @@ failure can temporarily leave the target unavailable.
 - `on_schema_change: append_new_columns` requires schema evolution.
 - `show` uses `read_table()` and reports an adapter capability error if typed
   reads are unavailable.
+- Serving-sink publication requires `streaming_tabular_reads`; a pushed
+  predicate additionally requires `tabular_predicate_pushdown`.
 
 `compile` checks every model. Commands with selectors check the selected model
 workload, so an unsupported unselected model does not block an otherwise valid

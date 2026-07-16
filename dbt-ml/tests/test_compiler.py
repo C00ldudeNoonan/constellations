@@ -11,6 +11,7 @@ from dbt_ml.cli import cli
 from dbt_ml.compiler import (
     validate_project_contract,
     validate_warehouse_capabilities,
+    validate_warehouse_operation_capabilities,
 )
 from dbt_ml.config import ConfigError, load_project
 from dbt_ml.config.model import ModelConfig
@@ -72,6 +73,29 @@ def test_capability_preflight_rejects_sql_tests_without_support(
 
     with pytest.raises(ConfigError, match=r"sql_schema_tests.*model tests"):
         validate_warehouse_capabilities([model], "non_sql")
+
+
+def test_operation_preflight_rejects_missing_streaming_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.STREAMING_TABULAR_READS,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(ConfigError, match=r"streaming_tabular_reads.*search publication"):
+        validate_warehouse_operation_capabilities(
+            "eager_only",
+            {
+                WarehouseCapability.STREAMING_TABULAR_READS: (
+                    "search publication snapshot"
+                )
+            },
+            operation="search-index publication",
+        )
 
 
 def test_bigquery_full_preflight_rejects_non_atomic_replacement() -> None:

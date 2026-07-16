@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import io
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -26,6 +26,7 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 import polars as pl
+import pyarrow as pa
 from pydantic import (
     AliasChoices,
     BaseModel,
@@ -45,11 +46,16 @@ from ..credentials import (
     CredentialReference,
     CredentialResolutionError,
 )
+from ..hashing import canonical_fingerprint
 from .base import (
     AdapterError,
+    ReadPredicate,
+    ReadPredicateOperator,
     StateRecord,
     StateScope,
     StateValue,
+    TableReadRequest,
+    TableReadSnapshot,
     WarehouseAdapter,
     WarehouseCapability,
     validate_incremental_keys,
@@ -603,6 +609,63 @@ def to_query_parameters(params: list[Any]) -> list[Any]:
     return out
 
 
+_READ_BINARY_OPERATORS = {
+    ReadPredicateOperator.EQUAL: "=",
+    ReadPredicateOperator.NOT_EQUAL: "!=",
+    ReadPredicateOperator.LESS_THAN: "<",
+    ReadPredicateOperator.LESS_THAN_OR_EQUAL: "<=",
+    ReadPredicateOperator.GREATER_THAN: ">",
+    ReadPredicateOperator.GREATER_THAN_OR_EQUAL: ">=",
+}
+
+
+def _bigquery_read_predicates(
+    adapter: BigQueryAdapter, predicates: Sequence[ReadPredicate]
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    for predicate in predicates:
+        column = adapter.quote_ident(predicate.column)
+        if predicate.operator in _READ_BINARY_OPERATORS:
+            clauses.append(f"{column} {_READ_BINARY_OPERATORS[predicate.operator]} ?")
+            params.append(predicate.value)
+        elif predicate.operator is ReadPredicateOperator.IN:
+            clauses.append(f"{column} IN UNNEST(?)")
+            params.append(list(cast(tuple[Any, ...], predicate.value)))
+        elif predicate.operator is ReadPredicateOperator.NOT_IN:
+            clauses.append(f"{column} NOT IN UNNEST(?)")
+            params.append(list(cast(tuple[Any, ...], predicate.value)))
+        elif predicate.operator is ReadPredicateOperator.IS_NULL:
+            clauses.append(f"{column} IS NULL")
+        else:
+            assert predicate.operator is ReadPredicateOperator.IS_NOT_NULL
+            clauses.append(f"{column} IS NOT NULL")
+    return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
+
+
+def _bigquery_table_generation(table: Any) -> str:
+    etag = getattr(table, "etag", None)
+    modified = getattr(table, "modified", None)
+    if etag is None and modified is None:
+        raise AdapterError("BigQuery table does not expose a stable generation")
+    return canonical_fingerprint(
+        {
+            "etag": str(etag) if etag is not None else None,
+            "modified": modified,
+            "num_rows": getattr(table, "num_rows", None),
+        },
+        domain="dbt-ml-bigquery-table-generation",
+        version=1,
+    )
+
+
+def _empty_record_batch(schema: pa.Schema) -> pa.RecordBatch:
+    return pa.RecordBatch.from_arrays(
+        [pa.array([], type=field.type) for field in schema],
+        schema=schema,
+    )
+
+
 @register
 class BigQueryAdapter(WarehouseAdapter):
     def __init__(
@@ -621,10 +684,19 @@ class BigQueryAdapter(WarehouseAdapter):
 
     @classmethod
     def capabilities(cls) -> frozenset[WarehouseCapability]:
-        return frozenset(WarehouseCapability) - {
-            WarehouseCapability.ATOMIC_FULL_REPLACE,
-            WarehouseCapability.TRANSACTIONS,
-        }
+        return frozenset(
+            {
+                WarehouseCapability.ATOMIC_KEYED_UPSERT,
+                WarehouseCapability.CHUNKED_WRITES,
+                WarehouseCapability.SCHEMA_EVOLUTION,
+                WarehouseCapability.SQL_QUERIES,
+                WarehouseCapability.SQL_SCHEMA_TESTS,
+                WarehouseCapability.STREAMING_TABULAR_READS,
+                WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
+                WarehouseCapability.TABULAR_READS,
+                WarehouseCapability.TYPED_EMPTY_RELATIONS,
+            }
+        )
 
     @classmethod
     def warehouse_options_model(cls) -> type[BaseModel] | None:
@@ -924,22 +996,25 @@ class BigQueryAdapter(WarehouseAdapter):
 
     # ─── querying ────────────────────────────────────────────────────────
 
-    def _run_query(
+    def _start_query(
         self,
         sql: str,
         params: list[Any] | None = None,
         *,
         job_labels: dict[str, str] | None = None,
+        use_query_cache: bool | None = None,
     ) -> Any:
         bigquery = _bigquery()
         cfg = self._cfg
         kwargs: dict[str, Any] = {}
-        if params or job_labels:
+        if params or job_labels or use_query_cache is not None:
             job_config = bigquery.QueryJobConfig()
             if params:
                 job_config.query_parameters = to_query_parameters(params)
             if job_labels:
                 job_config.labels = dict(job_labels)
+            if use_query_cache is not None:
+                job_config.use_query_cache = use_query_cache
             kwargs["job_config"] = job_config
         if cfg.job_creation_timeout_seconds is not None:
             kwargs["timeout"] = cfg.job_creation_timeout_seconds
@@ -951,9 +1026,232 @@ class BigQueryAdapter(WarehouseAdapter):
             kwargs["job_retry"] = DEFAULT_JOB_RETRY.with_deadline(
                 cfg.job_retry_deadline_seconds
             )
-        job = self.client.query(sql, **kwargs)
+        return self.client.query(sql, **kwargs)
+
+    def _run_query(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        job_labels: dict[str, str] | None = None,
+    ) -> Any:
+        cfg = self._cfg
+        job = self._start_query(sql, params, job_labels=job_labels)
         job.result(timeout=cfg.job_execution_timeout_seconds)
         return job
+
+    def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
+        arrow_batches: Iterator[pa.RecordBatch] | None = None
+        params: list[Any] = []
+        rows: Any = None
+        job: Any = None
+        fully_consumed = False
+        failure: AdapterError | None = None
+        try:
+            table_id = self._table_id(request.table)
+            initial_table = self.client.get_table(table_id)
+            initial_generation = _bigquery_table_generation(initial_table)
+            available_names = tuple(str(field.name) for field in initial_table.schema)
+            available_columns = frozenset(available_names)
+            missing = sorted(request.referenced_columns - available_columns)
+            if missing:
+                raise AdapterError(
+                    "Table snapshot references missing column(s): "
+                    + ", ".join(missing)
+                )
+
+            where_sql, params = _bigquery_read_predicates(self, request.predicates)
+            projection = (
+                "*"
+                if request.columns is None
+                else ", ".join(self.quote_ident(column) for column in request.columns)
+            )
+            output_names = request.columns or available_names
+            hidden_null: str | None = None
+            hidden_duplicate: str | None = None
+            if request.key_column is None:
+                sql = (
+                    f"SELECT {projection} FROM "
+                    f"{self.table_ref(request.table)}{where_sql}"
+                )
+            else:
+                suffix = uuid4().hex
+                hidden_key = f"dbt_ml_read_key_{suffix}"
+                hidden_null = f"dbt_ml_read_nulls_{suffix}"
+                hidden_duplicate = f"dbt_ml_read_duplicates_{suffix}"
+                key = self.quote_ident(request.key_column)
+                sql = (
+                    "WITH dbt_ml_read_source AS ("
+                    f"SELECT {projection}, {key} AS {self.quote_ident(hidden_key)} "
+                    f"FROM {self.table_ref(request.table)}{where_sql}"
+                    ") SELECT * EXCEPT("
+                    f"{self.quote_ident(hidden_key)}), "
+                    f"COUNTIF({self.quote_ident(hidden_key)} IS NULL) OVER() AS "
+                    f"{self.quote_ident(hidden_null)}, "
+                    f"COUNT({self.quote_ident(hidden_key)}) OVER() - "
+                    f"COUNT(DISTINCT {self.quote_ident(hidden_key)}) OVER() AS "
+                    f"{self.quote_ident(hidden_duplicate)} FROM dbt_ml_read_source"
+                )
+
+            job = self._start_query(sql, params, use_query_cache=False)
+            schema_probe = job.to_arrow(
+                create_bqstorage_client=False,
+                max_results=1,
+                timeout=self._cfg.job_execution_timeout_seconds,
+            )
+            query_schema = schema_probe.schema
+            del schema_probe
+            current_generation = _bigquery_table_generation(
+                self.client.get_table(table_id)
+            )
+            if current_generation != initial_generation:
+                raise AdapterError("BigQuery table changed while opening its snapshot")
+            output_indices = [
+                query_schema.get_field_index(name) for name in output_names
+            ]
+            if any(index < 0 for index in output_indices):
+                raise AdapterError(
+                    "BigQuery snapshot returned an unexpected projected schema"
+                )
+            output_schema = pa.schema(
+                [query_schema.field(index) for index in output_indices]
+            )
+            rows = job.result(
+                page_size=request.batch_size,
+                timeout=self._cfg.job_execution_timeout_seconds,
+            )
+            arrow_batches = rows.to_arrow_iterable(
+                bqstorage_client=None,
+                max_queue_size=1,
+                timeout=self._cfg.job_execution_timeout_seconds,
+            )
+
+            def batches() -> Iterator[pa.RecordBatch]:
+                nonlocal fully_consumed
+                validated_key_domain = request.key_column is None
+                batch: pa.RecordBatch | None = None
+                projected: pa.RecordBatch | None = None
+                try:
+                    assert arrow_batches is not None
+                    for batch in arrow_batches:
+                        if not validated_key_domain:
+                            assert hidden_null is not None
+                            assert hidden_duplicate is not None
+                            null_index = batch.schema.get_field_index(hidden_null)
+                            duplicate_index = batch.schema.get_field_index(
+                                hidden_duplicate
+                            )
+                            if null_index < 0 or duplicate_index < 0:
+                                batch = _empty_record_batch(batch.schema)
+                                raise AdapterError(
+                                    "BigQuery snapshot omitted key-domain "
+                                    "validation fields"
+                                )
+                            null_count = int(batch.column(null_index)[0].as_py())
+                            duplicate_count = int(
+                                batch.column(duplicate_index)[0].as_py()
+                            )
+                            if null_count or duplicate_count:
+                                batch = _empty_record_batch(batch.schema)
+                                raise AdapterError(
+                                    "Table snapshot key domain is invalid: "
+                                    f"{null_count} NULL and {duplicate_count} "
+                                    "duplicate value(s)"
+                                )
+                            validated_key_domain = True
+                        projected = batch.select(output_indices)
+                        for offset in range(0, len(projected), request.batch_size):
+                            yield projected.slice(offset, request.batch_size)
+                        projected = None
+                        batch = None
+                    fully_consumed = True
+                except AdapterError:
+                    raise
+                except Exception:
+                    batch = None
+                    projected = None
+                    raise AdapterError(
+                        "BigQuery table snapshot batch read failed"
+                    ) from None
+                finally:
+                    close_batches = getattr(arrow_batches, "close", None)
+                    if callable(close_batches):
+                        close_batches()
+
+            def validate_unchanged() -> None:
+                try:
+                    generation = _bigquery_table_generation(
+                        self.client.get_table(table_id)
+                    )
+                except AdapterError:
+                    raise
+                except Exception:
+                    raise AdapterError(
+                        "BigQuery table snapshot generation could not be validated"
+                    ) from None
+                if generation != initial_generation:
+                    raise AdapterError("BigQuery table changed during its snapshot read")
+
+            def close() -> None:
+                if fully_consumed or job is None:
+                    return
+                try:
+                    job.cancel()
+                except Exception:
+                    pass
+
+            job_id = str(getattr(job, "job_id", "unavailable"))
+            fingerprint = canonical_fingerprint(
+                {
+                    "adapter": self.adapter_type(),
+                    "generation": initial_generation,
+                    "job_id": job_id,
+                    "request": request._fingerprint_payload(),
+                },
+                domain="dbt-ml-warehouse-table-snapshot",
+                version=1,
+            )
+            generation_fingerprint = canonical_fingerprint(
+                {
+                    "generation": initial_generation,
+                    "request": request._fingerprint_payload(),
+                },
+                domain="dbt-ml-warehouse-table-generation",
+                version=1,
+            )
+            return TableReadSnapshot(
+                schema=output_schema,
+                fingerprint=fingerprint,
+                batches=batches(),
+                validate_unchanged=validate_unchanged,
+                close=close,
+                generation_fingerprint=generation_fingerprint,
+            )
+        except AdapterError:
+            params.clear()
+            rows = None
+            arrow_batches = None
+            if job is not None:
+                try:
+                    job.cancel()
+                except Exception:
+                    pass
+            job = None
+            raise
+        except Exception:
+            params.clear()
+            rows = None
+            arrow_batches = None
+            if job is not None:
+                try:
+                    job.cancel()
+                except Exception:
+                    pass
+            job = None
+            failure = AdapterError("BigQuery table snapshot could not be opened")
+        if failure is not None:
+            raise failure
+        raise AssertionError("unreachable BigQuery table snapshot state")
 
     def execute(self, sql: str, params: list[Any] | None = None) -> Any:
         return self._run_query(sql, params).result()

@@ -46,6 +46,8 @@ def test_bigquery_declares_only_implemented_guarantees() -> None:
 
     assert WarehouseCapability.TABULAR_READS in capabilities
     assert WarehouseCapability.SQL_SCHEMA_TESTS in capabilities
+    assert WarehouseCapability.STREAMING_TABULAR_READS in capabilities
+    assert WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN in capabilities
     assert WarehouseCapability.ATOMIC_FULL_REPLACE not in capabilities
     assert WarehouseCapability.ATOMIC_KEYED_UPSERT in capabilities
     assert WarehouseCapability.TRANSACTIONS not in capabilities

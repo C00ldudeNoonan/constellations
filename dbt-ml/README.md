@@ -624,6 +624,48 @@ first flush is compared against the existing table — heterogeneous corpora
 whose early documents lack a column can fail where a whole-run union carried
 it; use `append_new_columns` there.
 
+### Bounded warehouse snapshots
+
+Warehouse consumers that publish to a serving sink can use the adapter's
+`table_snapshot()` context instead of eager `read_table()`. The context exposes
+one immutable Arrow schema, opaque safe snapshot and generation fingerprints,
+and one-shot record batches whose size is validated between 1 and 100,000 rows. Projection,
+AND-combined typed predicates, and an optional same-snapshot NULL/uniqueness
+check for a stable key all execute inside the adapter:
+
+```python
+from dbt_ml.adapters import ReadPredicate, ReadPredicateOperator
+
+with adapter.table_snapshot(
+    "document_chunks",
+    columns=("chunk_id", "text", "embedding", "tenant_id"),
+    batch_size=2_000,
+    predicate=ReadPredicate(
+        "tenant_id", ReadPredicateOperator.EQUAL, trusted_tenant_id
+    ),
+    key_column="chunk_id",
+) as snapshot:
+    for batch in snapshot:
+        publish(batch)
+```
+
+DuckDB holds one MVCC read transaction through the context, derives a content
+generation fingerprint while consuming it, and performs a second bounded scan
+before successful close to reject a newer table version. BigQuery pages one
+uncached query result and rejects the read if the table generation changes
+while the snapshot is opened or consumed; normal query billing and the
+profile's `maximum_bytes_billed` limit still apply. Both adapters push
+projection and predicates into the warehouse. Predicate values are bound
+parameters and redacted from diagnostics.
+
+Batch ordering is deliberately unspecified. Consumers must use stable row keys
+and must keep the context open through their final snapshot validation. The
+DuckDB `generation_fingerprint` becomes available only after full iteration;
+an early close has no publishable generation. The
+existing transform, chunk, and classic-ML runners still use eager
+`read_table()`; this contract bounds serving-sink input reads rather than every
+dbt-ml execution path.
+
 Incremental state is keyed by a stable record identity within a model, stage,
 and target scope. Extraction and chunk generation use `document_id` because a
 whole document is their retry unit; downstream publication can independently

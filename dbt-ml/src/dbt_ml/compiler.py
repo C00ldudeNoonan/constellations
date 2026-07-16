@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 from .adapters import WarehouseCapability, adapter_capabilities
@@ -191,6 +192,27 @@ def validate_warehouse_capabilities(
             f"Warehouse adapter '{adapter_type}' cannot execute model "
             f"'{model.name}'; missing capabilities: {details}",
         )
+
+
+def validate_warehouse_operation_capabilities(
+    adapter_type: str,
+    required: Mapping[WarehouseCapability, str],
+    *,
+    operation: str,
+) -> None:
+    """Preflight a non-model warehouse operation before adapter construction."""
+    available = adapter_capabilities(adapter_type)
+    missing = sorted(set(required) - available, key=lambda item: item.value)
+    if not missing:
+        return
+    details = ", ".join(
+        f"{capability.value} ({required[capability]})"
+        for capability in missing
+    )
+    raise ConfigError(
+        f"Warehouse adapter '{adapter_type}' cannot execute {operation}; "
+        f"missing capabilities: {details}"
+    )
 
 
 def _validate_tests(

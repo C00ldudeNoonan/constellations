@@ -1280,8 +1280,9 @@ relation. Implementation branches by DAG resource type:
 - Warehouse models retain warehouse materialization capability checks.
 - A search index requires the warehouse's typed read capability for its one
   upstream relation and retrieval-store capabilities for its sink.
-- #140 must provide immutable snapshot reads, projected typed batches, and a
-  typed key-domain check. #153 provides ordered/paged state iteration, bounded
+- The #140 warehouse contract provides immutable snapshot reads, projected
+  typed batches, predicate pushdown, and a typed key-domain check. #153 provides
+  ordered/paged state iteration, bounded
   state/upstream diffing, and atomic scope-state replacement; the current #139
   `fetch_state()` full dictionary is not sufficient.
 - The runner lifecycle-manages one warehouse and only the selected retrieval

@@ -2,20 +2,27 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
 import duckdb
 import polars as pl
+import pyarrow as pa
 from pydantic import BaseModel
 
 from ..config.profile import WarehouseConfig
+from ..hashing import canonical_fingerprint
 from .base import (
     AdapterError,
+    ReadPredicate,
+    ReadPredicateOperator,
     StateRecord,
     StateScope,
     StateValue,
+    TableReadRequest,
+    TableReadSnapshot,
     WarehouseAdapter,
     WarehouseCapability,
     validate_incremental_keys,
@@ -43,6 +50,75 @@ _STATE_V2_COLUMNS = (
 )
 _STATE_V1_KEY = ("model_name", "document_id")
 _STATE_V2_KEY = ("model_name", "state_scope", "target_identity", "record_key")
+
+_READ_BINARY_OPERATORS = {
+    ReadPredicateOperator.EQUAL: "=",
+    ReadPredicateOperator.NOT_EQUAL: "!=",
+    ReadPredicateOperator.LESS_THAN: "<",
+    ReadPredicateOperator.LESS_THAN_OR_EQUAL: "<=",
+    ReadPredicateOperator.GREATER_THAN: ">",
+    ReadPredicateOperator.GREATER_THAN_OR_EQUAL: ">=",
+}
+
+
+def _duckdb_read_predicates(
+    adapter: DuckDBAdapter, predicates: Sequence[ReadPredicate]
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    for predicate in predicates:
+        column = adapter.quote_ident(predicate.column)
+        if predicate.operator in _READ_BINARY_OPERATORS:
+            clauses.append(f"{column} {_READ_BINARY_OPERATORS[predicate.operator]} ?")
+            params.append(predicate.value)
+        elif predicate.operator is ReadPredicateOperator.IN:
+            clauses.append(f"{column} IN ?")
+            params.append(list(cast(tuple[Any, ...], predicate.value)))
+        elif predicate.operator is ReadPredicateOperator.NOT_IN:
+            clauses.append(f"{column} NOT IN ?")
+            params.append(list(cast(tuple[Any, ...], predicate.value)))
+        elif predicate.operator is ReadPredicateOperator.IS_NULL:
+            clauses.append(f"{column} IS NULL")
+        else:
+            assert predicate.operator is ReadPredicateOperator.IS_NOT_NULL
+            clauses.append(f"{column} IS NOT NULL")
+    return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
+
+
+def _duckdb_arrow_batches(
+    reader: pa.RecordBatchReader,
+    on_complete: Any,
+) -> Iterator[pa.RecordBatch]:
+    digest = _arrow_reader_digest(reader.schema)
+    batch: pa.RecordBatch | None = None
+    failure: AdapterError | None = None
+    try:
+        for batch in reader:
+            _update_arrow_digest(digest, batch)
+            yield batch
+            batch = None
+        on_complete(digest.hexdigest())
+    except Exception:
+        batch = None
+        failure = AdapterError("DuckDB table snapshot batch read failed")
+    finally:
+        reader.close()
+    if failure is not None:
+        raise failure
+
+
+def _arrow_reader_digest(schema: pa.Schema) -> Any:
+    digest = blake2b(digest_size=16)
+    payload = schema.serialize().to_pybytes()
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+    return digest
+
+
+def _update_arrow_digest(digest: Any, batch: pa.RecordBatch) -> None:
+    payload = batch.serialize().to_pybytes()
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
 
 
 class DuckDBWarehouseConfig(WarehouseConfig):
@@ -86,7 +162,21 @@ class DuckDBAdapter(WarehouseAdapter):
 
     @classmethod
     def capabilities(cls) -> frozenset[WarehouseCapability]:
-        return frozenset(WarehouseCapability)
+        return frozenset(
+            {
+                WarehouseCapability.ATOMIC_FULL_REPLACE,
+                WarehouseCapability.ATOMIC_KEYED_UPSERT,
+                WarehouseCapability.CHUNKED_WRITES,
+                WarehouseCapability.SCHEMA_EVOLUTION,
+                WarehouseCapability.SQL_QUERIES,
+                WarehouseCapability.SQL_SCHEMA_TESTS,
+                WarehouseCapability.STREAMING_TABULAR_READS,
+                WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
+                WarehouseCapability.TABULAR_READS,
+                WarehouseCapability.TRANSACTIONS,
+                WarehouseCapability.TYPED_EMPTY_RELATIONS,
+            }
+        )
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
@@ -461,6 +551,190 @@ class DuckDBAdapter(WarehouseAdapter):
         self.connection.execute(f"DROP TABLE IF EXISTS {self.table_ref(table)}")
 
     # ─── querying ────────────────────────────────────────────────────────
+
+    def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
+        cursor = self.connection.cursor()
+        reader: pa.RecordBatchReader | None = None
+        params: list[Any] = []
+        transaction_open = False
+        failure: AdapterError | None = None
+        snapshot_digest: str | None = None
+        snapshot_ref: TableReadSnapshot | None = None
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            transaction_open = True
+            table_ref = self.table_ref(request.table)
+            schema_reader = cursor.execute(
+                f"SELECT * FROM {table_ref} LIMIT 0"
+            ).to_arrow_reader(1)
+            try:
+                available_columns = frozenset(schema_reader.schema.names)
+            finally:
+                schema_reader.close()
+            missing = sorted(request.referenced_columns - available_columns)
+            if missing:
+                raise AdapterError(
+                    "Table snapshot references missing column(s): "
+                    + ", ".join(missing)
+                )
+
+            where_sql, params = _duckdb_read_predicates(self, request.predicates)
+            if request.key_column is not None:
+                key = self.quote_ident(request.key_column)
+                validation = cursor.execute(
+                    "SELECT COUNT(*) FILTER (WHERE "
+                    f"{key} IS NULL), COUNT({key}) - COUNT(DISTINCT {key}) "
+                    f"FROM {table_ref}{where_sql}",
+                    params,
+                ).fetchone()
+                null_count = int(validation[0]) if validation else 0
+                duplicate_count = int(validation[1]) if validation else 0
+                if null_count or duplicate_count:
+                    params.clear()
+                    raise AdapterError(
+                        "Table snapshot key domain is invalid: "
+                        f"{null_count} NULL and {duplicate_count} duplicate value(s)"
+                    )
+
+            projection = (
+                "*"
+                if request.columns is None
+                else ", ".join(self.quote_ident(column) for column in request.columns)
+            )
+            if params:
+                cursor.execute(
+                    f"SELECT {projection} FROM {table_ref}{where_sql}", params
+                )
+            else:
+                cursor.execute(f"SELECT {projection} FROM {table_ref}{where_sql}")
+            reader = cursor.to_arrow_reader(request.batch_size)
+            fingerprint = canonical_fingerprint(
+                {
+                    "adapter": self.adapter_type(),
+                    "catalog": self.catalog,
+                    "schema": self.schema,
+                    "request": request._fingerprint_payload(),
+                    "snapshot_nonce": uuid4().hex,
+                },
+                domain="dbt-ml-warehouse-table-snapshot",
+                version=1,
+            )
+
+            def complete(digest: str) -> None:
+                nonlocal snapshot_digest, snapshot_ref
+                snapshot_digest = digest
+                assert snapshot_ref is not None
+                snapshot_ref._set_generation_fingerprint(
+                    canonical_fingerprint(
+                        {
+                            "content_digest": digest,
+                            "request": request._fingerprint_payload(),
+                        },
+                        domain="dbt-ml-warehouse-table-generation",
+                        version=1,
+                    )
+                )
+
+            def validate_unchanged() -> None:
+                if not transaction_open:
+                    raise AdapterError(
+                        "DuckDB table snapshot transaction is no longer active"
+                    )
+                if snapshot_digest is None:
+                    raise AdapterError("DuckDB table snapshot was not fully consumed")
+                current_digest = self._current_table_digest(request)
+                if current_digest != snapshot_digest:
+                    raise AdapterError("DuckDB table changed during its snapshot read")
+
+            def close() -> None:
+                nonlocal transaction_open
+                try:
+                    if transaction_open:
+                        cursor.execute("ROLLBACK")
+                        transaction_open = False
+                finally:
+                    cursor.close()
+
+            snapshot_ref = TableReadSnapshot(
+                schema=reader.schema,
+                fingerprint=fingerprint,
+                batches=_duckdb_arrow_batches(reader, complete),
+                validate_unchanged=validate_unchanged,
+                close=close,
+            )
+            return snapshot_ref
+        except AdapterError:
+            params.clear()
+            if reader is not None:
+                reader.close()
+            if transaction_open:
+                cursor.execute("ROLLBACK")
+            cursor.close()
+            raise
+        except Exception:
+            params.clear()
+            if reader is not None:
+                reader.close()
+            if transaction_open:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
+            cursor.close()
+            failure = AdapterError("DuckDB table snapshot could not be opened")
+        if failure is not None:
+            raise failure
+        raise AssertionError("unreachable DuckDB table snapshot state")
+
+    def _current_table_digest(self, request: TableReadRequest) -> str:
+        cursor = self.connection.cursor()
+        params: list[Any] = []
+        reader: pa.RecordBatchReader | None = None
+        transaction_open = False
+        failure: AdapterError | None = None
+        result: str | None = None
+        batch: pa.RecordBatch | None = None
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            transaction_open = True
+            table_ref = self.table_ref(request.table)
+            where_sql, params = _duckdb_read_predicates(self, request.predicates)
+            projection = (
+                "*"
+                if request.columns is None
+                else ", ".join(self.quote_ident(column) for column in request.columns)
+            )
+            if params:
+                cursor.execute(
+                    f"SELECT {projection} FROM {table_ref}{where_sql}", params
+                )
+            else:
+                cursor.execute(f"SELECT {projection} FROM {table_ref}{where_sql}")
+            reader = cursor.to_arrow_reader(request.batch_size)
+            digest = _arrow_reader_digest(reader.schema)
+            for batch in reader:
+                _update_arrow_digest(digest, batch)
+                batch = None
+            result = digest.hexdigest()
+        except Exception:
+            batch = None
+            params.clear()
+            failure = AdapterError(
+                "DuckDB table snapshot generation could not be validated"
+            )
+        finally:
+            if reader is not None:
+                reader.close()
+            if transaction_open:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
+            cursor.close()
+        if failure is not None:
+            raise failure
+        assert result is not None
+        return result
 
     def execute(self, sql: str, params: list[Any] | None = None) -> Any:
         if params is None:

@@ -11,8 +11,8 @@ dbt-ml is a standalone CLI rather than a dbt package or dbt adapter.
 
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
 > and BigQuery warehouses, local and GCS sources, metadata-aware deterministic
-> chunk models, record-scoped incremental state, classic text ML, and six
-> extraction backends. See
+> chunk models, record-scoped incremental state, bounded projected warehouse
+> snapshots for serving sinks, classic text ML, and six extraction backends. See
 > [`dbt-ml/README.md`](dbt-ml/README.md) for the full reference.
 
 ## What a pipeline looks like

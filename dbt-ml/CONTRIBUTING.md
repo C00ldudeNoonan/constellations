@@ -84,6 +84,14 @@ The current implementation boundaries are:
 Extend these boundaries through the existing adapter/provider seams and include
 contract tests for every supported implementation.
 
+Warehouse consumers that can scale with relation size must use the typed
+`table_snapshot()` contract rather than assembling SQL or collecting
+`read_table()`. Keep projection, predicates, snapshot consistency, generation
+validation, and key-domain checks inside the adapter. Add explicit capabilities
+only after contract tests cover empty schemas, multi-batch reads, early close,
+mid-stream failure, and source-generation changes; never derive an adapter's
+capabilities from every enum member.
+
 ## Commit style
 
 Conventional commits not required, but tight subject lines please:

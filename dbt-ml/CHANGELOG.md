@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Bounded warehouse snapshot reads (issue #140)
+
+- DuckDB and BigQuery now expose an immutable `table_snapshot()` context with
+  projected Arrow batches, validated batch sizes, typed predicate pushdown,
+  same-snapshot NULL/uniqueness checks, safe generation fingerprints, and
+  deterministic cleanup on completion, failure, or early close.
+- DuckDB pins an MVCC transaction and compares a bounded second-scan content
+  digest, while BigQuery pages one uncached query result and checks table
+  metadata. Both reject generation changes before readiness. Predicate and row
+  payloads stay out of errors; BigQuery profile cost and timeout controls still
+  apply.
+- `streaming_tabular_reads` and `tabular_predicate_pushdown` are explicit
+  adapter capabilities with a reusable preflight helper. Eager `read_table()`
+  remains for small interactive and existing model-runner paths; this change
+  does not claim that every transform now streams.
+
 ### Protected credential references (issue #154)
 
 - BigQuery service-account JSON, OAuth tokens, refresh tokens, client secrets,

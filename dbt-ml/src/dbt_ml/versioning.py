@@ -13,6 +13,7 @@ from .config.model import (
     FieldConfig,
     MLConfig,
     ModelConfig,
+    SearchConfig,
     TransformConfig,
 )
 from .config.profile import DEFAULT_LLM_PROVIDER
@@ -52,6 +53,7 @@ def compute_code_version(
     transform: TransformConfig | None,
     ml: MLConfig | None = None,
     chunk: ChunkConfig | None = None,
+    search: SearchConfig | None = None,
     depends_on: list[str] | None = None,
     fields: list[FieldConfig] | None = None,
     effective_extraction: Mapping[str, Any] | None = None,
@@ -85,6 +87,7 @@ def compute_code_version(
         if ml
         else None,
         "chunk": chunk.model_dump() if chunk else None,
+        "search": search.model_dump(mode="python") if search else None,
         "depends_on": depends_on or None,
         "fields": [
             {"name": field.name, "data_type": field.data_type} for field in fields
@@ -152,6 +155,7 @@ def compute_model_code_version(
         transform=model.transform,
         ml=model.ml,
         chunk=model.chunk,
+        search=model.search,
         depends_on=(
             [parse_ref(dependency) for dependency in model.depends_on]
             if model.chunk is not None and model.depends_on

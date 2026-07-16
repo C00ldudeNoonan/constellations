@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: chunk_embeddings
+    description: "Chunks with deterministic fixture embeddings for the local PoC"
+    depends_on: [ref('document_chunks')]
+
+    transform:
+      type: python
+      module: transforms.fixture_embeddings
+
+    materialization: full
+
+    tests:
+      - not_null: [chunk_id, document_id, text, embedding]
+      - unique: chunk_id

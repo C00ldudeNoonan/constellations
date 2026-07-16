@@ -240,6 +240,161 @@ class MLConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class SearchEmbeddingIdentityConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    provider_contract_version: int = Field(gt=0)
+    provider_implementation: str = Field(min_length=1)
+    semantic_config_fingerprint: str = Field(min_length=1)
+    dimensions: int = Field(gt=0)
+
+
+class SearchVectorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field: str
+    dimensions: int = Field(gt=0)
+    metric: Literal["cosine", "euclidean", "dot"] = "cosine"
+    search: Literal["exact", "approximate"] = "exact"
+    embedding: Literal["inherit"] | SearchEmbeddingIdentityConfig
+
+    @model_validator(mode="after")
+    def _validate_embedding_dimensions(self) -> SearchVectorConfig:
+        if (
+            isinstance(self.embedding, SearchEmbeddingIdentityConfig)
+            and self.embedding.dimensions != self.dimensions
+        ):
+            raise ValueError(
+                "search.vector embedding identity dimensions must match vector dimensions"
+            )
+        return self
+
+
+class SearchFullTextConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fields: tuple[str, ...]
+
+    @field_validator("fields")
+    @classmethod
+    def _validate_fields(cls, fields: tuple[str, ...]) -> tuple[str, ...]:
+        if not fields:
+            raise ValueError("search.full_text.fields must not be empty")
+        if len(fields) != len(set(fields)):
+            raise ValueError("search.full_text.fields must not contain duplicates")
+        return fields
+
+
+class SearchAttributeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str
+    data_type: Literal[
+        "string",
+        "integer",
+        "float",
+        "boolean",
+        "date",
+        "timestamp",
+        "array[string]",
+    ]
+    nullable: bool = False
+    filter_role: Literal["none", "user", "policy", "user_and_policy"] = "none"
+    sortable: bool = False
+    returned: bool = False
+
+
+class SearchQueryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    modes: frozenset[Literal["vector", "text", "hybrid", "filter"]]
+    consistency: Literal["strong"] = "strong"
+
+    @field_validator("modes")
+    @classmethod
+    def _validate_modes(
+        cls, modes: frozenset[str]
+    ) -> frozenset[str]:
+        if not modes:
+            raise ValueError("search.query.modes must not be empty")
+        return modes
+
+
+class SearchConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    access: Literal["governed", "public"] = "public"
+    store: str | None = None
+    collection: str | None = None
+    id_field: str
+    document_id_field: str | None = "document_id"
+    chunk_id_field: str | None = None
+    text_fields: tuple[str, ...]
+    return_text_fields: tuple[str, ...] = ()
+    vector: SearchVectorConfig | None = None
+    full_text: SearchFullTextConfig | None = None
+    attributes: tuple[SearchAttributeConfig, ...] = ()
+    display_fields: tuple[str, ...] = ()
+    query: SearchQueryConfig
+    on_index_change: Literal["fail", "rebuild", "online"] = "fail"
+    batch_size: int = Field(default=1000, ge=1, le=100_000)
+    index_options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> SearchConfig:
+        if not self.text_fields:
+            raise ValueError("search.text_fields must not be empty")
+        for label, values in (
+            ("text_fields", self.text_fields),
+            ("return_text_fields", self.return_text_fields),
+            ("display_fields", self.display_fields),
+        ):
+            if any(not value for value in values):
+                raise ValueError(f"search.{label} must contain non-empty field names")
+            if len(values) != len(set(values)):
+                raise ValueError(f"search.{label} must not contain duplicates")
+        if not set(self.return_text_fields).issubset(self.text_fields):
+            raise ValueError("search.return_text_fields must be a subset of text_fields")
+        if self.full_text is not None and not set(self.full_text.fields).issubset(
+            self.text_fields
+        ):
+            raise ValueError("search.full_text.fields must be a subset of text_fields")
+        if {"vector", "hybrid"} & self.query.modes and self.vector is None:
+            raise ValueError("vector and hybrid query modes require search.vector")
+        if {"text", "hybrid"} & self.query.modes and self.full_text is None:
+            raise ValueError("text and hybrid query modes require search.full_text")
+        attribute_names = [attribute.name for attribute in self.attributes]
+        if len(attribute_names) != len(set(attribute_names)):
+            raise ValueError("search.attributes must not contain duplicate names")
+        if self.access == "public" and any(
+            attribute.filter_role in {"policy", "user_and_policy"}
+            for attribute in self.attributes
+        ):
+            raise ValueError("public search resources cannot declare policy attributes")
+        if self.access == "governed" and not any(
+            attribute.filter_role in {"policy", "user_and_policy"}
+            for attribute in self.attributes
+        ):
+            raise ValueError("governed search resources require a policy attribute")
+        return self
+
+    def projected_fields(self) -> tuple[str, ...]:
+        fields: list[str] = [self.id_field]
+        for field in (
+            self.document_id_field,
+            self.chunk_id_field,
+            *self.text_fields,
+            self.vector.field if self.vector is not None else None,
+            *(attribute.name for attribute in self.attributes),
+            *self.display_fields,
+        ):
+            if field is not None and field not in fields:
+                fields.append(field)
+        return tuple(fields)
+
+
 class FieldConfig(BaseModel):
     model_config = _STRICT_CONFIG
 
@@ -292,6 +447,7 @@ class ModelConfig(BaseModel):
     transform: TransformConfig | None = None
     ml: MLConfig | None = None
     chunk: ChunkConfig | None = None
+    search: SearchConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
     on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
@@ -356,6 +512,7 @@ class ModelConfig(BaseModel):
                 ("transform", self.transform),
                 ("ml", self.ml),
                 ("chunk", self.chunk),
+                ("search", self.search),
             )
             if block is not None
         ]
@@ -363,7 +520,11 @@ class ModelConfig(BaseModel):
             raise ValueError(
                 f"Model '{self.name}' declares multiple kind blocks "
                 f"({', '.join(kinds)}); exactly one of "
-                "extraction/transform/ml/chunk is allowed"
+                "extraction/transform/ml/chunk/search is allowed"
+            )
+        if self.search is not None and "materialization" not in self.model_fields_set:
+            raise ValueError(
+                f"Search resource '{self.name}' must explicitly declare materialization"
             )
         return self
 
@@ -371,7 +532,7 @@ class ModelConfig(BaseModel):
     def kind_block_count(self) -> int:
         return sum(
             b is not None
-            for b in (self.extraction, self.transform, self.ml, self.chunk)
+            for b in (self.extraction, self.transform, self.ml, self.chunk, self.search)
         )
 
     @property
@@ -421,7 +582,7 @@ class ModelFile(BaseModel):
         missing = [m.name for m in self.models if m.kind_block_count == 0]
         if missing:
             raise ValueError(
-                f"Models missing an extraction/transform/ml/chunk block: "
+                f"Models missing an extraction/transform/ml/chunk block or search block: "
                 f"{', '.join(sorted(missing))}"
             )
         return self

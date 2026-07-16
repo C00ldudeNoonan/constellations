@@ -14,10 +14,17 @@ from .config.yaml_diagnostics import ConfigPath
 from .dag import DAGError, ProjectDAG, parse_ref
 from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
+from .profile import ResolvedProfile
 from .providers import (
     ProviderConfigurationError,
     ProviderNotFoundError,
     get_inference_provider,
+)
+from .retrieval import (
+    RetrievalCapabilityError,
+    RetrievalFeature,
+    create_store,
+    store_class,
 )
 from .test_specs import TestSpecError, parse_test_spec
 from .transforms import load_transform, transform_call_arity
@@ -39,6 +46,7 @@ def validate_project_contract(
 
     source_names = {source.name for source in sources}
     model_names = {model.name for model in models}
+    search_names = {model.name for model in models if model.search is not None}
     duplicates = source_names & model_names
     if duplicates:
         duplicate_model = next(model for model in models if model.name in duplicates)
@@ -60,7 +68,7 @@ def validate_project_contract(
 
     for model in models:
         _validate_tests(model, source_names, model_names, project_dir)
-        _validate_model_edges(model, source_names, model_names)
+        _validate_model_edges(model, source_names, model_names, search_names)
         _validate_materialization(model)
         if model.extraction is not None:
             backend = model.extraction.backend or default_backend
@@ -140,9 +148,18 @@ def validate_project_contract(
         raise _model_error(implicated, str(e), e.path) from e
 
     try:
-        return ProjectDAG(sources, models)
+        dag = ProjectDAG(sources, models)
     except DAGError as e:
         raise ConfigError(f"Invalid project DAG: {e}") from e
+    for name in search_names:
+        if dag.successors[name]:
+            model = next(item for item in models if item.name == name)
+            raise _model_error(
+                model,
+                f"Search resource '{name}' must be a leaf serving sink",
+                ("depends_on",),
+            )
+    return dag
 
 
 def validate_warehouse_capabilities(
@@ -151,7 +168,11 @@ def validate_warehouse_capabilities(
     available = adapter_capabilities(adapter_type)
     for model in models:
         required: dict[WarehouseCapability, str] = {}
-        if model.materialization == "full":
+        if model.search is not None:
+            required[WarehouseCapability.STREAMING_TABULAR_READS] = (
+                "bounded search-index publication reads"
+            )
+        elif model.materialization == "full":
             required[WarehouseCapability.ATOMIC_FULL_REPLACE] = (
                 "full materialization"
             )
@@ -170,7 +191,7 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
             )
-        if model.tests:
+        if model.tests and model.search is None:
             required[WarehouseCapability.SQL_SCHEMA_TESTS] = "model tests"
         if (
             model.materialization == "incremental"
@@ -192,6 +213,136 @@ def validate_warehouse_capabilities(
             f"Warehouse adapter '{adapter_type}' cannot execute model "
             f"'{model.name}'; missing capabilities: {details}",
         )
+
+
+def validate_retrieval_capabilities(
+    models: list[ModelConfig],
+    project: ProjectConfig,
+    resolved: ResolvedProfile,
+) -> None:
+    search_models = [model for model in models if model.search is not None]
+    if not search_models:
+        return
+    if resolved.retrieval is None:
+        raise ConfigError(
+            "Selected search resources require a `retrieval:` block in the active profile"
+        )
+    seen_collections: dict[tuple[str, str], str] = {}
+    for model in search_models:
+        search = model.search
+        assert search is not None
+        alias = search.store or resolved.retrieval.default
+        config = resolved.retrieval.stores.get(alias)
+        if config is None:
+            raise _model_error(
+                model,
+                f"Search resource '{model.name}' selects unknown retrieval store "
+                f"'{alias}'. Available: {sorted(resolved.retrieval.stores)}",
+                ("search", "store"),
+            )
+        if search.access == "public" and not resolved.retrieval.allow_public_indexes:
+            raise _model_error(
+                model,
+                f"Search resource '{model.name}' is public but the active profile does "
+                "not set retrieval.allow_public_indexes: true",
+                ("search", "access"),
+            )
+        if search.access == "governed":
+            raise _model_error(
+                model,
+                "Governed search publication requires generation-fenced readiness and "
+                "a trusted authorization resolver from #152; use `access: public` only "
+                "for this local proof-of-concept target",
+                ("search", "access"),
+            )
+        if search.index_options:
+            raise _model_error(
+                model,
+                f"Retrieval store '{config.type}' does not accept index_options in the "
+                "reference implementation",
+                ("search", "index_options"),
+            )
+        if search.vector is not None and search.vector.embedding == "inherit":
+            raise _model_error(
+                model,
+                "search.vector.embedding: inherit requires the canonical upstream "
+                "embed resource from #138; external vectors must declare a complete "
+                "embedding identity",
+                ("search", "vector", "embedding"),
+            )
+        if "hybrid" in search.query.modes:
+            raise _model_error(
+                model,
+                "Portable hybrid retrieval and score normalization are delivered by "
+                "the #135 query contract; use vector, text, or filter modes in this slice",
+                ("search", "query", "modes"),
+            )
+        cls = store_class(config.type)
+        capabilities = cls.capabilities()
+        required: dict[RetrievalFeature, str] = {
+            RetrievalFeature.KEYED_UPSERT: "incremental publication",
+            RetrievalFeature.KEYED_DELETE: "stale-record deletion",
+            RetrievalFeature.DURABLE_WRITE_ACK: "receipt-gated warehouse state",
+            RetrievalFeature.ATOMIC_BATCH_MUTATION: "exact whole-batch receipts",
+            RetrievalFeature.INDEX_READINESS: "post-publication index validation",
+        }
+        if search.vector is not None:
+            required[
+                RetrievalFeature.APPROXIMATE_VECTOR_SEARCH
+                if search.vector.search == "approximate"
+                else RetrievalFeature.EXACT_VECTOR_SEARCH
+            ] = f"{search.vector.search} vector search"
+            if search.vector.metric not in capabilities.distance_metrics:
+                raise _model_error(
+                    model,
+                    f"Retrieval store '{config.type}' does not support distance metric "
+                    f"'{search.vector.metric}'",
+                    ("search", "vector", "metric"),
+                )
+        if search.full_text is not None:
+            required[RetrievalFeature.FULL_TEXT_SEARCH] = "full-text index"
+        if any(attribute.filter_role != "none" for attribute in search.attributes):
+            required[RetrievalFeature.METADATA_FILTERING] = "typed metadata filtering"
+        try:
+            capabilities.require(required, store_type=config.type)
+        except RetrievalCapabilityError as error:
+            raise _model_error(model, str(error), ("search",)) from None
+        if search.batch_size > capabilities.max_batch_size:
+            raise _model_error(
+                model,
+                f"Search batch_size exceeds retrieval store '{config.type}' limit of "
+                f"{capabilities.max_batch_size}",
+                ("search", "batch_size"),
+            )
+        if (
+            search.vector is not None
+            and capabilities.max_dimensions is not None
+            and search.vector.dimensions > capabilities.max_dimensions
+        ):
+            raise _model_error(
+                model,
+                f"Search vector dimensions exceed retrieval store '{config.type}' "
+                f"limit of {capabilities.max_dimensions}",
+                ("search", "vector", "dimensions"),
+            )
+        store = create_store(
+            config,
+            project_name=project.name,
+            target_name=resolved.target_name,
+            alias=alias,
+        )
+        logical = search.collection or model.name
+        physical = store.physical_collection(logical)
+        key = (store.safe_descriptor().safe_target_identity, physical)
+        previous = seen_collections.get(key)
+        if previous is not None:
+            raise _model_error(
+                model,
+                f"Search resources '{previous}' and '{model.name}' resolve to the same "
+                "retrieval collection",
+                ("search", "collection"),
+            )
+        seen_collections[key] = model.name
 
 
 def validate_warehouse_operation_capabilities(
@@ -221,6 +372,13 @@ def _validate_tests(
     model_names: set[str],
     project_dir: Path,
 ) -> None:
+    if model.search is not None and model.tests:
+        raise _model_error(
+            model,
+            "Search resources do not run warehouse schema tests; portable retrieval "
+            "tests are delivered with the #135 query contract",
+            ("tests",),
+        )
     for index, spec in enumerate(model.tests):
         try:
             parsed = parse_test_spec(spec)
@@ -278,13 +436,16 @@ def _validate_python_test(
 
 
 def _validate_model_edges(
-    model: ModelConfig, source_names: set[str], model_names: set[str]
+    model: ModelConfig,
+    source_names: set[str],
+    model_names: set[str],
+    search_names: set[str],
 ) -> None:
     if model.kind_block_count != 1:
         raise _model_error(
             model,
             f"Model '{model.name}' must declare exactly one of "
-            "extraction/transform/ml/chunk",
+            "extraction/transform/ml/chunk/search",
         )
 
     if model.extraction is not None:
@@ -325,6 +486,12 @@ def _validate_model_edges(
         )
 
     dependencies = model.depends_on or []
+    if model.search is not None and len(dependencies) != 1:
+        raise _model_error(
+            model,
+            f"Search resource '{model.name}' must declare exactly one `depends_on:` model",
+            ("depends_on",),
+        )
     if model.transform is not None and not dependencies:
         raise _model_error(
             model,
@@ -371,9 +538,43 @@ def _validate_model_edges(
                 f"'{target}'",
                 ("depends_on", index),
             )
+        if model.search is not None and target in search_names:
+            raise _model_error(
+                model,
+                f"Search resource '{model.name}' cannot depend on search resource '{target}'",
+                ("depends_on", index),
+            )
+        if model.search is None and target in search_names:
+            raise _model_error(
+                model,
+                f"Warehouse model '{model.name}' cannot depend on search resource '{target}'",
+                ("depends_on", index),
+            )
 
 
 def _validate_materialization(model: ModelConfig) -> None:
+    if model.search is not None:
+        if model.materialization != "incremental":
+            raise _model_error(
+                model,
+                "Search resources support only `materialization: incremental` in the "
+                "local proof-of-concept; atomic full replacement is deferred to #153",
+                ("materialization",),
+            )
+        if model.search.on_index_change != "fail":
+            raise _model_error(
+                model,
+                "Search resources support only `on_index_change: fail` until atomic "
+                "replacement and fenced online evolution are implemented",
+                ("search", "on_index_change"),
+            )
+        if model.warehouse_options:
+            raise _model_error(
+                model,
+                "Search resources cannot declare warehouse_options",
+                ("warehouse_options",),
+            )
+        return
     if model.transform is not None and model.materialization != "full":
         raise _model_error(
             model,
@@ -439,4 +640,6 @@ def _kind_label(model: ModelConfig) -> str:
         return "ML"
     if model.chunk is not None:
         return "Chunk"
+    if model.search is not None:
+        return "Search"
     return "Unknown"

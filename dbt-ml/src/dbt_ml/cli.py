@@ -338,7 +338,14 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    project, _, _ = _load(project_dir)
+    project, _, models = _load(project_dir)
+    selected_model = next((model for model in models if model.name == model_name), None)
+    if selected_model is not None and selected_model.search is not None:
+        raise click.ClickException(
+            f"Search resource '{model_name}' has no warehouse relation. Inspect its "
+            "serving_resource descriptor in target/manifest.json; portable search is "
+            "delivered by issue #135."
+        )
     try:
         resolved = resolve_profile(
             project, project_dir, target=target, profiles_dir=profiles_dir
@@ -469,7 +476,9 @@ def graph(ctx: click.Context) -> None:
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
 @click.option(
     "--resource-type",
-    type=click.Choice(["model", "source", "all"], case_sensitive=False),
+    type=click.Choice(
+        ["model", "search_index", "source", "all"], case_sensitive=False
+    ),
     default="model",
     show_default=True,
     help="Which resources to list. Selectors apply to models.",
@@ -497,17 +506,22 @@ def ls(
     models_by_name = {m.name: m for m in models}
 
     rows: list[dict[str, object]] = []
-    if resource_type in ("model", "all"):
+    if resource_type in ("model", "search_index", "all"):
         try:
             selected = dag.select_models(select=select, exclude=exclude)
         except SelectionError as e:
             raise click.ClickException(str(e)) from e
         for name in selected:
             model = models_by_name[name]
+            is_search = model.search is not None
+            if resource_type == "model" and is_search:
+                continue
+            if resource_type == "search_index" and not is_search:
+                continue
             rows.append(
                 {
                     "name": name,
-                    "resource_type": "model",
+                    "resource_type": "search_index" if is_search else "model",
                     "kind": _model_kind(model),
                     "tags": sorted(model.tags),
                 }
@@ -544,6 +558,8 @@ def _model_kind(model: ModelConfig) -> str:
         return "transform"
     if model.chunk is not None:
         return "chunk"
+    if model.search is not None:
+        return "search"
     return "unknown"
 
 

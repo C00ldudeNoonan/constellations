@@ -1,7 +1,9 @@
 # Semantic retrieval architecture
 
-Status: accepted design for issue #133. This document defines a future
-contract; it does not describe a retrieval store that is already shipped.
+Status: accepted design for issue #133; the bounded local public LanceDB slice
+was implemented in issue #134. Sections covering governed authorization,
+portable query serving, replacement, and coordinated readiness remain the
+target contract for follow-up issues and are not current guarantees.
 
 This decision builds on the accepted
 [warehouse adapter capability boundary](adapter-capabilities.md) and the
@@ -19,7 +21,8 @@ index lifecycle plus vector, text, filtered, and hybrid retrieval. It never
 implements `WarehouseAdapter`, exposes arbitrary SQL, or becomes the only copy
 of a row.
 
-The first proving implementations are LanceDB and turbopuffer. Features are
+The first proving implementation is local LanceDB; turbopuffer remains planned.
+Features are
 capabilities, not assumptions: a vector-only store can implement this contract
 without pretending to support BM25, hybrid search, online schema evolution, or
 atomic replacement.
@@ -1721,13 +1724,11 @@ guarantee.
 
 ## Implementation and acceptance map
 
-The design divides follow-on work without reopening its core choices. Issue
-#134 remains the delivery umbrella but should land as separately reviewable
-slices rather than one monolithic change:
+Issue #134 delivered the core contract, artifacts, incremental publication,
+optional LanceDB adapter, integration tests, and local example as one bounded
+proof-of-concept slice. The remaining production-serving guarantees stay in
+their owning follow-ups:
 
-- core resource/config/registry contracts, fake-store publication lifecycle,
-  artifact/docs/export routing, and unit tests;
-- the optional LanceDB adapter plus local integration fixtures and example; and
 - serving/publication coordination in #152, split from adapter delivery because
   #139 does not provide the ledger or query/publish lease contract.
 - #140 adds immutable projected snapshots and key-domain validation; #153 adds
@@ -1747,30 +1748,30 @@ slices rather than one monolithic change:
 - #28-#35 conform to this contract and common adapter test suite.
 
 Online schema evolution, enforced tenant isolation, optional string operators,
-and custom Python retrieval tests remain typed reserved capabilities. #134 must
-reject unimplemented requests but does not need to execute those features for
-the LanceDB proof of concept.
+and custom Python retrieval tests remain typed reserved capabilities. The
+implemented LanceDB proof of concept rejects those requests.
 
-Before #134 is complete, tests must cover:
+The bounded #134 slice covers:
 
 - strict config, one-upstream/leaf rules, collection collisions, and selectors;
 - capability aggregation without opening a store;
 - missing/null/duplicate/overlong IDs, non-finite/wrong-dimension vectors, and
   invalid text/attribute/display values before mutation;
-- filter AST typing/truth tables, bounds, compile-time policy config, mandatory
-  prefilter enforcement, and policy-field non-returnability;
-- full, no-op, changed-row, deleted-row, config-change, partial-receipt, crash
-  replay, and readiness failure;
-- mutation digests and governed ACL-change delete-before-upsert behavior;
+- typed scalar predicate translation with no raw predicate-string API;
+- initial, no-op, changed-row, deleted-row, config-change, empty-input,
+  failed-mutation, and idempotent retry behavior;
+- stable mutation digests and exact atomic-batch receipt rejection;
 - build/test routing with no SQL test against a serving store;
 - manifest/run-results v1 migration, v2 discriminators, no fabricated relation,
   safe docs, and credential/content/filter/vector redaction;
 - dbt export's all-selector upstream projection, deduplication, and exclusion.
 
-#152 owns shared/exclusive lease, concurrent
-publisher, abandoned-session, snapshot-generation, and readiness-race tests.
-#135 owns public/governed query authorization, identity-bearing query vectors,
-score normalization, cache isolation, and deterministic RRF/tie-breaking tests.
+#152 owns shared/exclusive leases, governed ACL delete-before-upsert,
+concurrent-publisher, abandoned-session, snapshot-generation, durable readiness,
+and readiness-race tests. #153 owns paged state reconciliation and atomic full
+state replacement. #135 owns the complete filter AST, public/governed query
+authorization, identity-bearing query vectors, score normalization, cache
+isolation, and deterministic RRF/tie-breaking tests.
 
 ## Rejected alternatives
 

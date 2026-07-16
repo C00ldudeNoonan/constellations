@@ -815,7 +815,8 @@ The project model declares the portable serving contract:
 
 `run` and `build` stream projected Arrow batches from the warehouse, validate
 the declared row contract before each mutation, upsert changed rows, delete
-stale rows, and advance warehouse state only after an exact durable receipt.
+stale rows, and advance warehouse state only after exact durable receipts,
+index validation, and the snapshot generation check all succeed.
 `ls --resource-type search_index` lists serving resources; `show` rejects them
 because they have no warehouse table. Manifest v2 exposes a non-secret
 `serving_resource` descriptor. Until #135 lands, applications query through the

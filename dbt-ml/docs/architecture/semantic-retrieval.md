@@ -1177,12 +1177,13 @@ The runner sequence is:
 6. Diff paged warehouse state against projected upstream batches. Validate all
    row values in a batch before mutating that batch.
 7. Mutate the store first using a digest containing the snapshot/generation and
-   input fingerprints. Advance state only for IDs in an exact durable receipt.
-8. Delete stale store IDs, then delete their state after acknowledgement.
+   input fingerprints. Buffer state changes only for IDs in an exact durable
+   receipt.
+8. Delete stale store IDs and buffer their state deletions after acknowledgement.
 9. Wait for every required index to be ready and validate safe schema/count
    invariants. Verify the upstream materialization generation has not changed.
-10. Mark the publication ledger `ready` with the physical generation, release
-    the lease/snapshot, close resources, and return counts.
+10. Apply the buffered warehouse state changes, mark the publication ledger
+    `ready` with the physical generation, release resources, and return counts.
 
 A no-op run still verifies the physical collection metadata and ready ledger;
 state alone cannot prove that a collection exists.

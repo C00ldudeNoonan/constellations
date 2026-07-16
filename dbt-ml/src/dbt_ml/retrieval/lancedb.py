@@ -162,7 +162,6 @@ class LanceDBStore(RetrievalStore):
             {
                 "store_type": self.store_type(),
                 "path": self._config.path.as_posix(),
-                "alias": self.alias,
             },
             domain="dbt-ml-safe-retrieval-target",
         )

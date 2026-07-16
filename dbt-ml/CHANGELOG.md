@@ -12,7 +12,9 @@
 - Added an optional local LanceDB store with owned typed collections, exact or
   approximate vector indexes, full-text and scalar indexes, bounded incremental
   keyed publication, stale-row deletion, and state updates only after durable
-  store acknowledgements.
+  store acknowledgements plus successful index, count, schema, and source-
+  generation validation. Physical target identity is alias-independent, so two
+  aliases cannot evade collection-collision or state-scope checks.
 - Public indexes require operator opt-in in `profiles.yml`. Governed access,
   portable query CLI/API, online replacement, full refresh, and concurrent
   publish/read coordination fail closed or remain follow-up work in #135 and

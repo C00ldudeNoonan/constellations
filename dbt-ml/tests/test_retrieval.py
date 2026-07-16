@@ -12,7 +12,7 @@ import pyarrow as pa
 import pytest
 from click.testing import CliRunner
 
-from dbt_ml.adapters import StateScope, create_adapter
+from dbt_ml.adapters import AdapterError, StateScope, TableReadSnapshot, create_adapter
 from dbt_ml.cli import cli
 from dbt_ml.compiler import (
     validate_project_contract,
@@ -394,6 +394,84 @@ def test_failed_store_mutation_does_not_advance_state(
         assert metadata.row_count == 2
 
 
+def test_failed_index_validation_does_not_advance_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+
+    def fail_indexes(*args: object, **kwargs: object) -> object:
+        raise RetrievalError("safe injected index failure")
+
+    monkeypatch.setattr(LanceDBStore, "ensure_indexes", fail_indexes)
+    with pytest.raises(RunError, match="safe injected index failure"):
+        run_project(tmp_path, select="context_search")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.retrieval is not None
+    store = create_store(
+        resolved.retrieval.stores["primary"],
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias="primary",
+    )
+    scope = StateScope.for_target_descriptor(
+        "context_search",
+        stage="retrieval_publish",
+        descriptor=store.state_descriptor("context").descriptor(),
+    )
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        assert adapter.fetch_state(scope) == {}
+    with store:
+        metadata = store.inspect_collection("retrieval_demo__dev__context")
+        assert metadata is not None
+        assert metadata.row_count == 2
+
+    monkeypatch.undo()
+    retry = run_project(tmp_path, select="context_search")
+    assert retry[0].rows_inserted == 2
+
+
+def test_failed_snapshot_validation_does_not_advance_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+
+    def fail_snapshot_validation(self: TableReadSnapshot) -> None:
+        raise AdapterError("safe injected generation failure")
+
+    monkeypatch.setattr(
+        TableReadSnapshot,
+        "validate_unchanged",
+        fail_snapshot_validation,
+    )
+    with pytest.raises(RunError, match="safe injected generation failure"):
+        run_project(tmp_path, select="context_search")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.retrieval is not None
+    store = create_store(
+        resolved.retrieval.stores["primary"],
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias="primary",
+    )
+    scope = StateScope.for_target_descriptor(
+        "context_search",
+        stage="retrieval_publish",
+        descriptor=store.state_descriptor("context").descriptor(),
+    )
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        assert adapter.fetch_state(scope) == {}
+
+    monkeypatch.undo()
+    retry = run_project(tmp_path, select="context_search")
+    assert retry[0].rows_inserted == 2
+
+
 def test_invalid_vector_fails_without_content_or_id_in_error(tmp_path: Path) -> None:
     _write_project(tmp_path)
     rows = _rows().with_columns(pl.Series("embedding", [[float("nan"), 0.0], [0.0, 1.0]]))
@@ -569,6 +647,50 @@ def test_search_collection_collisions_fail_before_store_io(tmp_path: Path) -> No
             "    search:",
             "      access: public",
             "      store: primary",
+            "      collection: context",
+            "      id_field: chunk_id",
+            "      text_fields: [text]",
+            "      full_text:",
+            "        fields: [text]",
+            "      query:",
+            "        modes: [text]",
+        ]
+    )
+    model_path.write_text(model_path.read_text() + "\n" + duplicate + "\n")
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    with pytest.raises(ConfigError, match="same retrieval collection"):
+        validate_retrieval_capabilities(models, project, resolved)
+    assert not (tmp_path / "target" / "lancedb").exists()
+
+
+def test_search_collection_collisions_ignore_profile_aliases(tmp_path: Path) -> None:
+    _write_project(tmp_path)
+    profiles_path = tmp_path / "profiles.yml"
+    profiles_path.write_text(
+        profiles_path.read_text()
+        + "\n"
+        + "\n".join(
+            [
+                "          mirror:",
+                "            type: lancedb",
+                "            path: target/lancedb",
+                "            collection_template: '{project}__{target}__{collection}'",
+                "",
+            ]
+        )
+    )
+    model_path = tmp_path / "models" / "retrieval.yml"
+    duplicate = "\n".join(
+        [
+            "  - name: duplicate_search",
+            "    depends_on: [ref('embedding_rows')]",
+            "    materialization: incremental",
+            "    search:",
+            "      access: public",
+            "      store: mirror",
             "      collection: context",
             "      id_field: chunk_id",
             "      text_fields: [text]",

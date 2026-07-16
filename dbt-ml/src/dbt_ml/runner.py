@@ -1375,6 +1375,9 @@ def _run_search_model(
     deleted = 0
     rows_written = 0
     spec: CollectionSpec | None = None
+    state_scope: StateScope | None = None
+    pending_state_records: list[StateRecord] = []
+    pending_state_deletes: list[list[str]] = []
 
     try:
         with adapter.table_snapshot(
@@ -1468,11 +1471,7 @@ def _run_search_model(
                         StateRecord(row.record_id, row.input_fingerprint, code_version)
                         for row in pending
                     ]
-                    adapter.upsert_state(state_scope, state_records)
-                    for record in state_records:
-                        prior_state[record.record_key] = StateValue(
-                            record.input_fingerprint, record.code_version
-                        )
+                    pending_state_records.extend(state_records)
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
@@ -1502,7 +1501,7 @@ def _run_search_model(
                         raise RunError(
                             "Retrieval store did not return an exact durable delete receipt"
                         )
-                    adapter.delete_state(state_scope, record_ids)
+                    pending_state_deletes.append(record_ids)
                     deleted += len(record_ids)
 
                 if not collection_exists:
@@ -1517,6 +1516,12 @@ def _run_search_model(
                     raise RunError(
                         "Retrieval collection failed post-publication row-count validation"
                     )
+
+        assert state_scope is not None
+        if pending_state_records:
+            adapter.upsert_state(state_scope, pending_state_records)
+        for record_ids in pending_state_deletes:
+            adapter.delete_state(state_scope, record_ids)
     except (AdapterError, RetrievalError) as error:
         raise RunError(str(error)) from None
 

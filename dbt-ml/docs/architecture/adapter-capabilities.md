@@ -129,7 +129,7 @@ failure can temporarily leave the target unavailable.
 
 ## Unsupported workflows
 
-- Transform, chunk, and classic ML models require `tabular_reads`.
+- Transform, chunk, embed, and classic ML models require `tabular_reads`.
 - Model tests require `sql_schema_tests` while the test engine remains SQL-based.
 - Full and incremental models require their corresponding atomic publication
   capability.

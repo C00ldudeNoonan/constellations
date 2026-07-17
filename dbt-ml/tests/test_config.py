@@ -155,7 +155,10 @@ def test_multiple_kind_blocks_rejected() -> None:
 
 
 def test_model_file_requires_kind_block() -> None:
-    with pytest.raises(ValueError, match="missing an extraction/transform/ml/chunk block"):
+    with pytest.raises(
+        ValueError,
+        match="missing an extraction/transform/ml/chunk/embed block",
+    ):
         ModelFile.model_validate(
             {"version": 2, "models": [{"name": "kindless"}]}
         )

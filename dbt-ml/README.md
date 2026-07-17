@@ -7,9 +7,10 @@ and a manifest artifact you can wire into other tools.
 
 The current v0.2 preview is pure Python and supports DuckDB and BigQuery
 warehouses, local and GCS sources, document chunk models, and executable
-classic text-ML providers. Additional warehouse adapters, embeddings, and
-retrieval stores remain roadmap work; Rust and PyO3 are explicitly out of scope
-through v0.2.
+classic text-ML providers. Native warehouse-materialized embedding models are
+available with a deterministic offline provider; production embedding providers,
+additional warehouse adapters, and retrieval stores remain roadmap work. Rust
+and PyO3 are explicitly out of scope through v0.2.
 
 ## Where dbt-ml fits
 
@@ -79,6 +80,8 @@ installation command.
 | **Source**         | A glob over a folder. `*.pdf`, `*.json`, `*.html`, `*.md` — your choice.        |
 | **Extraction model** | One row per source file, produced by a backend (JSON, Markdown, PDF, HTML, email, or LLM). |
 | **Transform model**  | A Python module returning a Polars DataFrame, depends on other models via `ref()`. |
+| **Chunk model**      | An executable `chunk:` model producing stable, lineage-carrying retrieval units. |
+| **Embed model**      | An executable `embed:` model producing canonical, provider-identified vectors in the warehouse. |
 | **Classic ML model** | An executable `ml:` model for deterministic features and classifiers, with persisted artifacts. |
 | **Materialization**  | `full` (always replace) or `incremental` (skip unchanged input on re-runs).      |
 | **Tests**          | `not_null`, `unique`, `min_rows`, custom Python — with `severity: warn` if you want.|
@@ -739,8 +742,52 @@ The recommended document-layer shape (GCS raw files → BigQuery tables):
 | `document_extractions` | one row per structured field set | `extraction` (llm) or `transform` |
 
 See `examples/rag_chunks_pipeline/` for a runnable registry → chunks project.
-Domain keys (symbol, filing date, …) and embeddings belong in transforms /
-downstream dbt models layered on top — the chunk grain stays generic.
+Domain keys (symbol, filing date, …) belong in transforms or downstream dbt
+models layered on top — the chunk grain stays generic.
+
+## Embedding models
+
+An `embed:` model batches one upstream text field through an
+`EmbeddingProvider` and materializes one canonical row per stable upstream ID.
+It preserves upstream text, document/chunk lineage, and filter metadata while
+adding the vector and its safe provider identity.
+
+```yaml
+- name: document_embeddings
+  depends_on: [ref('document_chunks')]
+  embed:
+    provider: deterministic
+    model: contract-v1
+    text_field: text
+    id_field: chunk_id
+    vector_field: embedding
+    dimensions: 8
+    batch_size: 128
+  materialization: incremental
+```
+
+The built-in `deterministic` provider is offline and reproducible. It exists for
+tests, examples, and pipeline integration—not semantic similarity quality. A
+production provider implements the same `EmbeddingProvider` contract.
+
+Canonical output adds `embedding_provider`, `embedding_model`,
+`embedding_dimensions`, `embedding_provider_implementation`,
+`embedding_input_hash`, `embedding_config_hash`, and `embedded_at`. Vectors are
+portable numeric list values. Manifest and run-results artifacts expose only
+safe identity and aggregate usage metadata; input text and credentials are not
+copied into artifacts.
+
+Incremental runs distinguish three cases:
+
+- unchanged rows are skipped;
+- metadata-only changes reuse the existing vector and refresh the warehouse row;
+- text, model, provider, dimensions, or implementation changes recompute it.
+
+Removed upstream IDs are deleted downstream. Provider results are validated for
+cardinality, dimensions, and finite numbers before any rows or state are
+published. `dbt_ml.embedding.embed_query()` accepts the identity recorded in
+the manifest so query-time vectors cannot silently use a different provider
+implementation or configuration.
 
 ## Built-in text preprocessing
 

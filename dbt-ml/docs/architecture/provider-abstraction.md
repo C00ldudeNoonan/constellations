@@ -40,7 +40,9 @@ a native batch API can override it and advertise `supports_native_batch`.
 `EmbeddingProvider.embed()` is separately registered; its request is already
 multi-input, so it is the embedding batch primitive. Implementations provide
 `_embed()`, while the public wrapper validates that every input has exactly one
-finite vector with the requested dimensions.
+finite vector with the requested dimensions. Native embed-model batches also
+carry stable input IDs; providers must return those IDs in the original order
+before vectors can enter a cache or warehouse relation.
 
 ## Registry and selection
 

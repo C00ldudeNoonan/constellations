@@ -33,6 +33,16 @@
 <p>Module: <code>{{ model.transform.module }}</code></p>
 {% endif %}
 
+{% if model.embed %}
+<h2>Embedding</h2>
+<p>
+  Provider: <code>{{ model.embedding.provider }}</code> ·
+  Model: <code>{{ model.embedding.model }}</code> ·
+  Dimensions: <code>{{ model.embedding.dimensions }}</code>
+</p>
+<pre><code>{{ model.embed | tojson(indent=2) }}</code></pre>
+{% endif %}
+
 {% if model.fields %}
 <h2>Fields</h2>
 <table>

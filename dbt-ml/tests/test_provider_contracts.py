@@ -504,6 +504,36 @@ def test_embedding_provider_rejects_misaligned_results() -> None:
         )
 
 
+def test_embedding_provider_rejects_reordered_result_ids() -> None:
+    class ReorderedEmbeddingProvider(_EchoEmbeddingProvider):
+        def _embed(
+            self,
+            request: EmbeddingRequest,
+            *,
+            credential: ProviderCredential | None,
+            runtime: ProviderRuntimeOptions,
+        ) -> EmbeddingResult:
+            del credential, runtime
+            assert request.input_ids is not None
+            return EmbeddingResult(
+                vectors=((1.0, 2.0), (3.0, 4.0)),
+                model=request.model,
+                dimensions=2,
+                input_ids=tuple(reversed(request.input_ids)),
+            )
+
+    with pytest.raises(ProviderResponseError, match="IDs do not align"):
+        ReorderedEmbeddingProvider().embed(
+            EmbeddingRequest(
+                model="embed-test",
+                texts=("one", "two"),
+                input_ids=("row-1", "row-2"),
+            ),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+
+
 def test_embedding_error_drops_native_exception_and_credential_locals() -> None:
     sentinel = "distinctive-embedding-credential-secret"
 

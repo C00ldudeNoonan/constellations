@@ -1,6 +1,7 @@
 from .loader import ConfigError, load_project
 from .model import (
     ChunkConfig,
+    EmbedConfig,
     ExtractionConfig,
     FieldConfig,
     ModelConfig,
@@ -14,6 +15,7 @@ __all__ = [
     "ChunkConfig",
     "ConfigError",
     "DuckDBConfig",
+    "EmbedConfig",
     "ExtractionConfig",
     "ExtractionDefaults",
     "FieldConfig",

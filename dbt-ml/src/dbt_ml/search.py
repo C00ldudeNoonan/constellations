@@ -53,6 +53,8 @@ class SearchFilterOperator(StrEnum):
 
 
 SearchScalar = str | int | float | bool | date | datetime
+_SCORE_COLUMNS = ("_distance", "_score", "_relevance_score")
+_RESERVED_SCORE_COLUMNS = frozenset(_SCORE_COLUMNS)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -594,7 +596,7 @@ def _rank_table(table: pa.Table, id_field: str) -> list[_RankedRow]:
         seen.add(record_id)
         raw_score: float | None = None
         raw_score_kind: str | None = None
-        for name in ("_distance", "_score", "_relevance_score"):
+        for name in _SCORE_COLUMNS:
             candidate = raw.get(name)
             if isinstance(candidate, int | float) and not isinstance(candidate, bool):
                 converted = float(candidate)
@@ -605,7 +607,11 @@ def _rank_table(table: pa.Table, id_field: str) -> list[_RankedRow]:
         rows.append(
             _RankedRow(
                 record_id=record_id,
-                values={key: value for key, value in raw.items() if not key.startswith("_")},
+                values={
+                    key: value
+                    for key, value in raw.items()
+                    if key not in _RESERVED_SCORE_COLUMNS
+                },
                 raw_score=raw_score,
                 raw_score_kind=raw_score_kind,
             )

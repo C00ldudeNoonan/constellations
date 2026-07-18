@@ -194,18 +194,20 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
             [1.0, 0.0],
             vector_field="embedding",
             limit=1,
-            columns=["chunk_id", "text"],
+            columns=["chunk_id", "text", "_distance"],
             predicates=[RetrievalPredicate("category", RetrievalPredicateOperator.EQUAL, "prices")],
         )
         assert vector.column("chunk_id").to_pylist() == ["c1"]
+        assert vector.column_names.count("_distance") == 1
         text = store.text_search(
             metadata.physical_name,
             "employment",
             text_field="text",
             limit=1,
-            columns=["chunk_id", "text"],
+            columns=["chunk_id", "text", "_score"],
         )
         assert text.column("chunk_id").to_pylist() == ["c2"]
+        assert text.column_names.count("_score") == 1
         generation = metadata.physical_generation
 
     second = run_project(tmp_path, select="context_search")

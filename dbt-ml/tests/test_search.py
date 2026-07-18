@@ -21,6 +21,7 @@ from dbt_ml.search import (
     SearchFilterOperator,
     SearchMode,
     SearchRequest,
+    _rank_table,
     search,
 )
 
@@ -199,6 +200,16 @@ def test_search_contract_repr_and_reserved_columns_are_safe() -> None:
                 "query": {"modes": ["text"]},
             }
         )
+
+    ranked = _rank_table(
+        pa.Table.from_pylist(
+            [{"_id": "record-1", "_source": "archive", "_score": 0.75}]
+        ),
+        "_id",
+    )
+    assert ranked[0].record_id == "record-1"
+    assert ranked[0].values == {"_id": "record-1", "_source": "archive"}
+    assert ranked[0].raw_score == 0.75
 
 
 def test_search_filters_are_typed_and_authorized(published_project: Path) -> None:

@@ -401,7 +401,7 @@ class LanceDBStore(RetrievalStore):
             if where is not None:
                 query = query.where(where, prefilter=True)
             if columns is not None:
-                query = query.select(list(columns))
+                query = query.select(_include_score_column(columns, "_distance"))
             return cast(pa.Table, query.limit(limit).to_arrow())
         except Exception:
             raise RetrievalError(
@@ -431,7 +431,7 @@ class LanceDBStore(RetrievalStore):
             if where is not None:
                 builder = builder.where(where, prefilter=True)
             if columns is not None:
-                builder = builder.select(list(columns))
+                builder = builder.select(_include_score_column(columns, "_score"))
             return cast(pa.Table, builder.limit(limit).to_arrow())
         except Exception:
             raise RetrievalError(
@@ -468,6 +468,13 @@ def _validate_query_projection(columns: Sequence[str] | None) -> None:
         not columns or any(not _COLLECTION_RE.fullmatch(column) for column in columns)
     ):
         raise RetrievalError("LanceDB query projection is invalid")
+
+
+def _include_score_column(columns: Sequence[str], score_column: str) -> list[str]:
+    projection = list(columns)
+    if score_column not in projection:
+        projection.append(score_column)
+    return projection
 
 
 def _compile_predicates(predicates: Sequence[RetrievalPredicate]) -> str | None:

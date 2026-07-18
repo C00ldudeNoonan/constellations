@@ -51,7 +51,7 @@ from .config.profile import DEFAULT_LLM_PROVIDER, PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
-from .embedding import EmbeddingIdentity, embed_texts
+from .embedding import EmbeddingIdentity, effective_search_config, embed_texts
 from .hashing import canonical_fingerprint
 from .paths import resolve_within_project
 from .profile import (
@@ -393,6 +393,7 @@ def run_project(
     def _run(name: str, adapter: WarehouseAdapter) -> ModelRunResult:
         return _run_model(
             model=models_by_name[name],
+            models_by_name=models_by_name,
             project=project,
             project_dir=project_dir,
             source_docs=source_docs,
@@ -477,6 +478,7 @@ def build_project(
             try:
                 result = _run_model(
                     model=model,
+                    models_by_name=models_by_name,
                     project=project,
                     project_dir=project_dir,
                     source_docs=source_docs,
@@ -560,6 +562,7 @@ def _discover_sources(
 def _run_model(
     *,
     model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
     project: ProjectConfig,
     project_dir: Path,
     source_docs: dict[str, DiscoveredSource],
@@ -612,6 +615,7 @@ def _run_model(
     elif model.search is not None:
         result = _run_search_model(
             model=model,
+            models_by_name=models_by_name,
             project=project,
             project_dir=project_dir,
             adapter=adapter,
@@ -1722,6 +1726,7 @@ def _add_provider_usage(
 def _run_search_model(
     *,
     model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
     project: ProjectConfig,
     project_dir: Path,
     adapter: WarehouseAdapter,
@@ -1770,6 +1775,7 @@ def _run_search_model(
             physical = store.physical_collection(logical_collection)
             spec = _search_collection_spec(
                 model=model,
+                models_by_name=models_by_name,
                 physical_collection=physical,
                 upstream_schema=snapshot.schema,
                 store_type=store_config.type,
@@ -1934,6 +1940,7 @@ def _run_search_model(
 def _search_collection_spec(
     *,
     model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
     physical_collection: str,
     upstream_schema: pa.Schema,
     store_type: str,
@@ -1966,7 +1973,7 @@ def _search_collection_spec(
     schema = pa.schema(fields)
     _validate_search_schema(model, schema=schema)
     config_fingerprint = collection_config_fingerprint(
-        search.model_dump(mode="python"), store_type=store_type
+        effective_search_config(model, models_by_name), store_type=store_type
     )
     return CollectionSpec(
         logical_name=search.collection or model.name,

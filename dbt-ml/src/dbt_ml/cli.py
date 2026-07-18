@@ -43,6 +43,17 @@ from .runner import (
     clean_project,
     run_project,
 )
+from .search import (
+    SearchError,
+    SearchFilter,
+    SearchFilterOperator,
+    SearchMode,
+    SearchRequest,
+    SearchResult,
+)
+from .search import (
+    search as run_search,
+)
 from .sources import SourceError
 from .synth import (
     generate_arxiv_papers,
@@ -343,8 +354,8 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
     if selected_model is not None and selected_model.search is not None:
         raise click.ClickException(
             f"Search resource '{model_name}' has no warehouse relation. Inspect its "
-            "serving_resource descriptor in target/manifest.json; portable search is "
-            "delivered by issue #135."
+            "serving_resource descriptor in target/manifest.json or query it with "
+            "`dbt-ml search`."
         )
     try:
         resolved = resolve_profile(
@@ -368,6 +379,184 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
 
     stdout = click.get_text_stream("stdout")
     click.echo(_safe_console_text(str(df), stdout), file=stdout)
+
+
+@cli.command("search")
+@click.option("--model", "model_name", required=True, help="Search-index model name.")
+@click.option("--query", default=None, help="Query text for text or embedded search.")
+@click.option(
+    "--mode",
+    type=click.Choice([mode.value for mode in SearchMode], case_sensitive=False),
+    default=SearchMode.HYBRID.value,
+    show_default=True,
+)
+@click.option("--limit", type=click.IntRange(1, 1000), default=10, show_default=True)
+@click.option(
+    "--candidate-limit",
+    type=click.IntRange(1, 1000),
+    default=None,
+    help="Candidates requested per retrieval mode before fusion.",
+)
+@click.option(
+    "--filter",
+    "filter_values",
+    type=(
+        str,
+        click.Choice([operator.value for operator in SearchFilterOperator]),
+        str,
+    ),
+    multiple=True,
+    help="Repeatable FIELD OP VALUE filter. Use a JSON array with the 'in' operator.",
+)
+@click.option(
+    "--field",
+    "fields",
+    multiple=True,
+    help="Declared return field to include. Repeat for multiple fields.",
+)
+@click.option(
+    "--vector",
+    "vector_json",
+    default=None,
+    help="Precomputed query vector as a JSON array.",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    show_default=True,
+)
+@_project_context_options
+@click.pass_context
+def search_command(
+    ctx: click.Context,
+    model_name: str,
+    query: str | None,
+    mode: str,
+    limit: int,
+    candidate_limit: int | None,
+    filter_values: tuple[tuple[str, str, str], ...],
+    fields: tuple[str, ...],
+    vector_json: str | None,
+    output_format: str,
+) -> None:
+    """Query a published retrieval index without provider-specific request shapes."""
+    project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    try:
+        vector = _parse_search_vector(vector_json)
+        filters = tuple(
+            _parse_search_filter(field, operator, value)
+            for field, operator, value in filter_values
+        )
+        request = SearchRequest(
+            model=model_name,
+            query=query,
+            vector=vector,
+            mode=SearchMode(mode),
+            limit=limit,
+            candidate_limit=candidate_limit,
+            filters=filters,
+            fields=fields,
+        )
+        results = run_search(
+            project_dir,
+            request,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+    except (*_CONFIG_ERRORS, ValueError) as error:
+        raise ConfigClickError(str(error)) from error
+    except SearchError as error:
+        raise click.ClickException(str(error)) from error
+
+    if output_format == "json":
+        click.echo(json.dumps([result.to_dict() for result in results], indent=2))
+        return
+    _echo_search_table(results)
+
+
+def _parse_search_vector(value: str | None) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(value)
+        if (
+            not isinstance(decoded, list)
+            or not decoded
+            or any(isinstance(item, bool) or not isinstance(item, int | float) for item in decoded)
+        ):
+            raise ValueError
+        return tuple(float(item) for item in decoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("--vector must be a non-empty JSON array of numbers") from None
+
+
+def _parse_search_filter(field: str, operator: str, value: str) -> SearchFilter:
+    resolved_operator = SearchFilterOperator(operator)
+    if resolved_operator != SearchFilterOperator.IN:
+        return SearchFilter(field, resolved_operator, value)
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError("Search filter 'in' values must be a JSON array") from None
+    if not isinstance(decoded, list) or not decoded:
+        raise ValueError("Search filter 'in' values must be a non-empty JSON array")
+    return SearchFilter(field, resolved_operator, tuple(decoded))
+
+
+def _echo_search_table(results: list[SearchResult]) -> None:
+    if not results:
+        click.echo("No results.")
+        return
+    provenance = results[0].provenance
+    click.echo(
+        f"Index: {provenance.unique_id}  Target: {provenance.target}  "
+        f"Store: {provenance.store_type}  Collection: {provenance.logical_collection}"
+    )
+    dynamic_fields: list[str] = []
+    for result in results:
+        for values in (result.text, result.metadata, result.display):
+            for field in values:
+                if field not in dynamic_fields:
+                    dynamic_fields.append(field)
+    headers = ["rank", "score", "record_id", "document_id", "chunk_id", *dynamic_fields]
+    rows: list[list[str]] = []
+    for result in results:
+        values = {**result.text, **result.metadata, **result.display}
+        rows.append(
+            [
+                str(result.rank),
+                f"{result.score:.6f}",
+                result.record_id,
+                result.document_id or "",
+                result.chunk_id or "",
+                *[_display_search_value(values.get(field)) for field in dynamic_fields],
+            ]
+        )
+    widths = [
+        min(80, max(len(headers[index]), *(len(row[index]) for row in rows)))
+        for index in range(len(headers))
+    ]
+    click.echo("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    click.echo("  ".join("-" * width for width in widths))
+    for row in rows:
+        click.echo(
+            "  ".join(
+                value[: widths[index]].ljust(widths[index])
+                for index, value in enumerate(row)
+            )
+        )
+
+
+def _display_search_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict | list | tuple):
+        return json.dumps(value, default=str, sort_keys=True)
+    return str(value).replace("\n", " ")
 
 
 def _safe_console_text(text: str, stream: object | None = None) -> str:

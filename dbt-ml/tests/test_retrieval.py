@@ -194,18 +194,20 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
             [1.0, 0.0],
             vector_field="embedding",
             limit=1,
-            columns=["chunk_id", "text"],
+            columns=["chunk_id", "text", "_distance"],
             predicates=[RetrievalPredicate("category", RetrievalPredicateOperator.EQUAL, "prices")],
         )
         assert vector.column("chunk_id").to_pylist() == ["c1"]
+        assert vector.column_names.count("_distance") == 1
         text = store.text_search(
             metadata.physical_name,
             "employment",
             text_field="text",
             limit=1,
-            columns=["chunk_id", "text"],
+            columns=["chunk_id", "text", "_score"],
         )
         assert text.column("chunk_id").to_pylist() == ["c2"]
+        assert text.column_names.count("_score") == 1
         generation = metadata.physical_generation
 
     second = run_project(tmp_path, select="context_search")
@@ -267,7 +269,7 @@ def test_public_search_requires_operator_profile_opt_in(tmp_path: Path) -> None:
         validate_retrieval_capabilities(models, project, resolved)
 
 
-def test_inherited_embedding_identity_fails_until_embed_resource_exists(
+def test_inherited_embedding_identity_requires_an_upstream_embed_resource(
     tmp_path: Path,
 ) -> None:
     _write_project(tmp_path)
@@ -285,14 +287,12 @@ def test_inherited_embedding_identity_fails_until_embed_resource_exists(
     )
     model_path.write_text(model_path.read_text().replace(identity, "        embedding: inherit"))
     project, sources, models = load_project(tmp_path)
-    validate_project_contract(project, sources, models, tmp_path)
-    resolved = resolve_profile(project, tmp_path)
 
-    with pytest.raises(ConfigError, match="#138"):
-        validate_retrieval_capabilities(models, project, resolved)
+    with pytest.raises(ConfigError, match="direct upstream embed model"):
+        validate_project_contract(project, sources, models, tmp_path)
 
 
-def test_hybrid_mode_fails_until_portable_query_contract_exists(tmp_path: Path) -> None:
+def test_hybrid_mode_is_validated_against_store_capabilities(tmp_path: Path) -> None:
     _write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
@@ -304,8 +304,7 @@ def test_hybrid_mode_fails_until_portable_query_contract_exists(tmp_path: Path) 
     validate_project_contract(project, sources, models, tmp_path)
     resolved = resolve_profile(project, tmp_path)
 
-    with pytest.raises(ConfigError, match="#135"):
-        validate_retrieval_capabilities(models, project, resolved)
+    validate_retrieval_capabilities(models, project, resolved)
 
 
 def test_search_predicate_repr_redacts_value() -> None:
@@ -734,7 +733,7 @@ def test_search_cli_lists_resource_and_show_rejects_relation_access(
     shown = runner.invoke(cli, ["--project-dir", str(tmp_path), "show", "context_search"])
     assert shown.exit_code == 1
     assert "no warehouse relation" in shown.output
-    assert "issue #135" in shown.output
+    assert "dbt-ml search" in shown.output
 
 
 def test_build_routes_search_without_warehouse_schema_tests(tmp_path: Path) -> None:

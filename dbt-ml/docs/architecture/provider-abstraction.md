@@ -35,8 +35,15 @@ must be non-empty and unique. A malformed provider response therefore cannot
 silently enter a materialized relation.
 
 `InferenceProvider.complete()` is the synchronous inference primitive.
-`complete_batch()` has a safe sequential implementation, while providers with
-a native batch API can override it and advertise `supports_native_batch`.
+Native batching (issue #149) is a set of resumable primitives: providers that
+advertise `supports_native_batch` implement `submit_batch()` (returning a
+validated provider job identifier), `poll_batch()` (returning an artifact-safe
+`BatchJobStatus`), `fetch_batch_results()`, and `cancel_batch()`. The LLM
+backend drives submit/poll/fetch itself so it can persist the job identifier
+before polling, resume after an interrupt without resubmitting, bound polling
+with exponential backoff, and cancel on timeout. `complete_batch()` remains as
+a one-shot convenience driver over those primitives, with a sequential
+per-request fallback for providers without a native batch API.
 `EmbeddingProvider.embed()` is separately registered; its request is already
 multi-input, so it is the embedding batch primitive. Implementations provide
 `_embed()`, while the public wrapper validates that every input has exactly one
@@ -184,8 +191,10 @@ An inference integration should:
    object.
 4. Convert upstream failures to sanitized `ProviderError` values with exception
    chaining suppressed.
-5. If native batching is supported, validate IDs and limits, forward runtime
-   retries, and return results in request order.
+5. If native batching is supported, implement `submit_batch`, `poll_batch`,
+   `fetch_batch_results`, and `cancel_batch`; validate IDs and limits, forward
+   runtime retries, and return results in request order. Job identifiers are
+   persisted for resume, so they must be plain provider-issued tokens.
 6. Register the class and add contract tests using a fake SDK client. Tests must
    include credential redaction, malformed responses, usage validation, and
    partial batch failures.
@@ -201,7 +210,11 @@ incremental state, caching, warehouse writes, pricing tables, or run budgets.
 Those policies remain in the runner and backend, consuming only normalized
 provider results and metadata.
 
-Token, API-call, and cost budget enforcement can build on this contract, but is
-not implemented by the provider registry itself. Likewise, LangChain can be an
+Token, API-call, and cost budgets build on this contract but live outside the
+provider layer: `dbt_ml.budget` defines strictly typed per-model
+(`extraction.options.budget`) and per-run (profiles.yml `llm.budget`) caps for
+documents, per-file and total bytes, tokens, provider calls, and spend. The
+runner and LLM backend check them before every provider call — exhaustion has
+the distinct `budget_exceeded` run status and never bills further work. Likewise, LangChain can be an
 integration surface later; it is not the core provider contract and provider
 implementations do not expose LangChain-specific types.

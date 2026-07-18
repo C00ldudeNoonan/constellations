@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -36,7 +36,9 @@ from .backends import (
     get_backend,
     validate_backend_options,
 )
+from .backends.llm_backend import BatchCancelledError
 from .backends.options import LLMBackendOptions
+from .budget import BudgetExceededError, BudgetGuard, BudgetLedger
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
@@ -308,6 +310,9 @@ class ModelRunResult:
     model_name: str
     materialization: str
     kind: str  # "extraction" | "transform"
+    # None derives success/error from `errors`; set explicitly for the
+    # distinct budget_exceeded / cancelled outcomes (issue #149).
+    status: str | None = None
     backend: str | None = None
     provider: str | None = None
     provider_model: str | None = None
@@ -390,6 +395,8 @@ def run_project(
 
     models_by_name = {m.name: m for m in models}
 
+    run_budget = _run_budget_ledger(resolved)
+
     def _run(name: str, adapter: WarehouseAdapter) -> ModelRunResult:
         return _run_model(
             model=models_by_name[name],
@@ -400,6 +407,7 @@ def run_project(
             resolved=resolved,
             full_refresh=full_refresh,
             threads=threads,
+            run_budget=run_budget,
         )
 
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
@@ -465,6 +473,7 @@ def build_project(
     )
     models_by_name = {m.name: m for m in models}
 
+    run_budget = _run_budget_ledger(resolved)
     out = BuildResult()
     blocked: set[str] = set()
 
@@ -484,6 +493,7 @@ def build_project(
                     resolved=resolved,
                     full_refresh=full_refresh,
                     threads=threads,
+                    run_budget=run_budget,
                 )
             except RunError as e:
                 out.run_results.append(
@@ -557,6 +567,14 @@ def _discover_sources(
     return out
 
 
+
+def _run_budget_ledger(resolved: ResolvedProfile) -> BudgetLedger | None:
+    """One shared run-scope ledger; every LLM extraction model charges it."""
+    if resolved.llm is None or resolved.llm.budget is None:
+        return None
+    return BudgetLedger(resolved.llm.budget, scope="run")
+
+
 def _run_model(
     *,
     model: ModelConfig,
@@ -567,6 +585,7 @@ def _run_model(
     resolved: ResolvedProfile,
     full_refresh: bool,
     threads: int = 1,
+    run_budget: BudgetLedger | None = None,
 ) -> ModelRunResult:
     start = time.monotonic()
     if model.extraction is not None:
@@ -579,6 +598,7 @@ def _run_model(
             resolved=resolved,
             full_refresh=full_refresh,
             threads=threads,
+            run_budget=run_budget,
         )
     elif model.ml is not None:
         result = _run_ml_model(
@@ -648,6 +668,7 @@ def _run_extraction_model(
     resolved: ResolvedProfile,
     full_refresh: bool,
     threads: int = 1,
+    run_budget: BudgetLedger | None = None,
 ) -> ModelRunResult:
     assert model.extraction is not None
     backend_name = model.extraction.backend or project.extraction.default_backend
@@ -690,6 +711,24 @@ def _run_extraction_model(
             )
         provider_model = llm_options.model
         provider_implementation = inference_provider.implementation_identity()
+
+    budget_guard: BudgetGuard | None = None
+    if backend_name == "llm":
+        model_ledger = (
+            BudgetLedger(llm_options.budget, scope=f"model '{model.name}'")
+            if llm_options.budget is not None
+            else None
+        )
+        if model_ledger is not None or run_budget is not None:
+            budget_guard = BudgetGuard(
+                model_ledger,
+                run_budget,
+                cost_estimator=_budget_cost_estimator(
+                    resolved,
+                    batch=bool(options.get("batch")),
+                    provider=inference_provider,
+                ),
+            )
 
     if not model.source:
         raise RunError(f"Extraction model '{model.name}' must declare a `source:`")
@@ -792,143 +831,191 @@ def _run_extraction_model(
             )
         return chunk_rows, chunk_records
 
-    # Sources snapshot into a per-model scratch dir, lazily and only for
-    # documents that actually need processing. Extraction streams through in
-    # `flush_every`-sized chunks (issue #77): rows never accumulate beyond
-    # one chunk, so corpus size is bounded by the flush size, not memory.
-    with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
-        work_dir = Path(scratch)
+    run_status: str | None = None
+    try:
+        if budget_guard is not None and docs_to_process:
+            budget_guard.charge_documents(len(docs_to_process))
+        # Sources snapshot into a per-model scratch dir, lazily and only for
+        # documents that actually need processing. Extraction streams through in
+        # `flush_every`-sized chunks (issue #77): rows never accumulate beyond
+        # one chunk, so corpus size is bounded by the flush size, not memory.
+        with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
+            work_dir = Path(scratch)
 
-        def _one(
-            doc: DocumentRef,
-        ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
-            try:
-                local_path = source_backend.fetch(doc, work_dir)
-                return doc, backend.extract(local_path, options), None
-            except Exception as e:
-                # Provider errors reach here already sanitized with their
-                # chains severed; redacted SDK diagnostics were logged at the
-                # provider boundary. Safe to log in full.
-                log.debug(
-                    "extraction failed for %s", doc.relative_path, exc_info=True
-                )
-                return doc, None, _artifact_error_text(e)
+            def _one(
+                doc: DocumentRef,
+            ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
+                try:
+                    if budget_guard is not None:
+                        budget_guard.ensure_headroom()
+                    local_path = source_backend.fetch(doc, work_dir)
+                    if budget_guard is not None:
+                        size = local_path.stat().st_size
+                        budget_guard.check_file_bytes(size)
+                        budget_guard.charge_bytes(size)
+                    result = backend.extract(local_path, options)
+                    if budget_guard is not None:
+                        budget_guard.charge_metrics(result.metrics)
+                    return doc, result, None
+                except BudgetExceededError:
+                    raise
+                except Exception as e:
+                    # Provider errors reach here already sanitized with their
+                    # chains severed; redacted SDK diagnostics were logged at the
+                    # provider boundary. Safe to log in full.
+                    log.debug(
+                        "extraction failed for %s", doc.relative_path, exc_info=True
+                    )
+                    return doc, None, _artifact_error_text(e)
 
-        def _iter_extracted() -> (
-            Iterator[list[tuple[DocumentRef, ExtractionResult | None, str | None]]]
-        ):
-            if options.get("batch") and docs_to_process:
-                # One Batches API submission for the whole model (#75); only
-                # the materialization of its results is chunked.
-                all_extracted, batch_metrics = _extract_batched(
-                    docs_to_process,
-                    source_backend,
-                    backend,
-                    options,
-                    work_dir,
-                    model.name,
-                )
-                for key, value in batch_metrics.items():
-                    if isinstance(value, int | float):
-                        usage_totals[key] = usage_totals.get(key, 0) + value
-                for i in range(0, len(all_extracted), flush_every):
-                    yield all_extracted[i : i + flush_every]
-                return
-            for i in range(0, total_docs, flush_every):
-                chunk = docs_to_process[i : i + flush_every]
-                if threads > 1 and len(chunk) > 1:
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=threads
-                    ) as ex:
-                        yield list(ex.map(_one, chunk))
-                else:
-                    yield [_one(d) for d in chunk]
+            def _iter_extracted() -> (
+                Iterator[list[tuple[DocumentRef, ExtractionResult | None, str | None]]]
+            ):
+                if options.get("batch") and docs_to_process:
+                    # Deterministic windows bound fetch, text, and result memory
+                    # (issue #149); each window is one or more resumable native
+                    # batch submissions inside the backend.
+                    on_partial = str(options.get("on_partial_batch", "fail"))
+                    window_size = max(int(options.get("batch_size", 1000)), 1)
+                    for start in range(0, total_docs, window_size):
+                        window = docs_to_process[start : start + window_size]
+                        extracted_window, batch_metrics = _extract_batched(
+                            window,
+                            source_backend,
+                            backend,
+                            options,
+                            work_dir,
+                            model.name,
+                            budget=budget_guard,
+                        )
+                        for key, value in batch_metrics.items():
+                            if isinstance(value, int | float):
+                                usage_totals[key] = usage_totals.get(key, 0) + value
+                        if on_partial == "fail":
+                            failed = [
+                                (doc, err)
+                                for doc, _res, err in extracted_window
+                                if err is not None
+                            ]
+                            if failed:
+                                for doc, err in failed:
+                                    errors.append(f"{doc.relative_path}: {err}")
+                                raise RunError(
+                                    f"Batch for model '{model.name}' returned "
+                                    f"{len(failed)} failed document(s); "
+                                    "on_partial_batch=fail publishes nothing "
+                                    "further from this run. Set on_partial_batch: "
+                                    "publish_successful to record per-document "
+                                    "failures and keep successes instead."
+                                )
+                        for i in range(0, len(extracted_window), flush_every):
+                            yield extracted_window[i : i + flush_every]
+                    return
+                for i in range(0, total_docs, flush_every):
+                    chunk = docs_to_process[i : i + flush_every]
+                    if threads > 1 and len(chunk) > 1:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=threads
+                        ) as ex:
+                            yield list(ex.map(_one, chunk))
+                    else:
+                        yield [_one(d) for d in chunk]
 
-        if use_full:
-            # Chunks stream into a staging table that atomically replaces the
-            # target at the end; state upserts once, after the swap.
-            def _frames() -> Iterator[pl.DataFrame]:
-                nonlocal docs_flushed
-                yielded = False
+            if use_full:
+                # Chunks stream into a staging table that atomically replaces the
+                # target at the end; state upserts once, after the swap.
+                def _frames() -> Iterator[pl.DataFrame]:
+                    nonlocal docs_flushed
+                    yielded = False
+                    for extracted in _iter_extracted():
+                        chunk_rows, chunk_records = _rows_for_chunk(extracted)
+                        full_state_records.extend(chunk_records)
+                        docs_flushed += len(extracted)
+                        if chunk_rows:
+                            log.info(
+                                "staged %d rows (%d/%d docs) for %s",
+                                len(chunk_rows),
+                                docs_flushed,
+                                total_docs,
+                                model.name,
+                            )
+                            yielded = True
+                            yield _apply_extraction_contract(
+                                pl.DataFrame(chunk_rows), model
+                            )
+                    if errors:
+                        raise _FullExtractionFailed
+                    if not yielded:
+                        yield _empty_extraction_frame(model)
+
+                try:
+                    rows_written = adapter.materialize_full_chunks(
+                        model.name, _frames(), options=warehouse_opts
+                    )
+                    full_committed = True
+                except _FullExtractionFailed:
+                    rows_written = 0
+                except AdapterError as e:
+                    raise RunError(str(e)) from e
+            else:
+                # Incremental: each flush upserts rows and its state immediately —
+                # a killed run keeps completed chunks, and the re-run skips them.
+                first_flush = True
                 for extracted in _iter_extracted():
                     chunk_rows, chunk_records = _rows_for_chunk(extracted)
-                    full_state_records.extend(chunk_records)
                     docs_flushed += len(extracted)
-                    if chunk_rows:
-                        log.info(
-                            "staged %d rows (%d/%d docs) for %s",
-                            len(chunk_rows),
-                            docs_flushed,
-                            total_docs,
+                    if not chunk_rows:
+                        continue
+                    try:
+                        rows_written += adapter.materialize_incremental(
                             model.name,
+                            _apply_extraction_contract(pl.DataFrame(chunk_rows), model),
+                            key_col="document_id",
+                            # The model's policy governs run-over-run drift on the
+                            # first flush; later flushes union within-run drift,
+                            # matching what one whole-run DataFrame did.
+                            on_schema_change=(
+                                "append_new_columns"
+                                if first_flush and empty_incremental_target
+                                else model.on_schema_change
+                                if first_flush
+                                else "append_new_columns"
+                            ),
+                            options=warehouse_opts,
                         )
-                        yielded = True
-                        yield _apply_extraction_contract(
-                            pl.DataFrame(chunk_rows), model
+                    except AdapterError as e:
+                        # RunError so `build` fails this model and blocks
+                        # descendants instead of aborting the whole invocation.
+                        raise RunError(str(e)) from e
+                    first_flush = False
+                    adapter.upsert_state(state_scope, chunk_records)
+                    log.info(
+                        "flushed %d rows (%d/%d docs) for %s",
+                        len(chunk_rows),
+                        docs_flushed,
+                        total_docs,
+                        model.name,
+                    )
+
+                if not docs and model.name not in existing_tables:
+                    try:
+                        adapter.materialize_full(
+                            model.name,
+                            _empty_extraction_frame(model),
+                            options=warehouse_opts,
                         )
-                if errors:
-                    raise _FullExtractionFailed
-                if not yielded:
-                    yield _empty_extraction_frame(model)
+                    except AdapterError as e:
+                        raise RunError(str(e)) from e
 
-            try:
-                rows_written = adapter.materialize_full_chunks(
-                    model.name, _frames(), options=warehouse_opts
-                )
-                full_committed = True
-            except _FullExtractionFailed:
-                rows_written = 0
-            except AdapterError as e:
-                raise RunError(str(e)) from e
-        else:
-            # Incremental: each flush upserts rows and its state immediately —
-            # a killed run keeps completed chunks, and the re-run skips them.
-            first_flush = True
-            for extracted in _iter_extracted():
-                chunk_rows, chunk_records = _rows_for_chunk(extracted)
-                docs_flushed += len(extracted)
-                if not chunk_rows:
-                    continue
-                try:
-                    rows_written += adapter.materialize_incremental(
-                        model.name,
-                        _apply_extraction_contract(pl.DataFrame(chunk_rows), model),
-                        key_col="document_id",
-                        # The model's policy governs run-over-run drift on the
-                        # first flush; later flushes union within-run drift,
-                        # matching what one whole-run DataFrame did.
-                        on_schema_change=(
-                            "append_new_columns"
-                            if first_flush and empty_incremental_target
-                            else model.on_schema_change
-                            if first_flush
-                            else "append_new_columns"
-                        ),
-                        options=warehouse_opts,
-                    )
-                except AdapterError as e:
-                    # RunError so `build` fails this model and blocks
-                    # descendants instead of aborting the whole invocation.
-                    raise RunError(str(e)) from e
-                first_flush = False
-                adapter.upsert_state(state_scope, chunk_records)
-                log.info(
-                    "flushed %d rows (%d/%d docs) for %s",
-                    len(chunk_rows),
-                    docs_flushed,
-                    total_docs,
-                    model.name,
-                )
-
-            if not docs and model.name not in existing_tables:
-                try:
-                    adapter.materialize_full(
-                        model.name,
-                        _empty_extraction_frame(model),
-                        options=warehouse_opts,
-                    )
-                except AdapterError as e:
-                    raise RunError(str(e)) from e
+    except BudgetExceededError as e:
+        # Exhaustion fires before the next provider call. Chunks already
+        # committed stay (state advanced only for published IDs, #139);
+        # everything else is unpublished.
+        run_status = "budget_exceeded"
+        errors.append(f"BudgetExceededError: {e}")
+    except BatchCancelledError as e:
+        run_status = "cancelled"
+        errors.append(f"BatchCancelledError: {e}")
 
     if usage_totals and options.get("batch"):
         usage_totals["batch"] = True
@@ -945,6 +1032,7 @@ def _run_extraction_model(
         model_name=model.name,
         materialization=model.materialization,
         kind="extraction",
+        status=run_status,
         backend=backend_name,
         provider=provider_name,
         provider_model=provider_model,
@@ -974,6 +1062,27 @@ def _estimate_cost(totals: dict[str, Any], pricing: PricingConfig) -> float:
     return round(cost / 1_000_000, 6)
 
 
+def _budget_cost_estimator(
+    resolved: ResolvedProfile,
+    *,
+    batch: bool,
+    provider: InferenceProvider | None,
+) -> Callable[[Mapping[str, Any]], float] | None:
+    """Per-response USD estimate for spend budgets, honoring the provider's
+    native-batch discount. Provider-reported cost wins when present."""
+    if resolved.llm is None or resolved.llm.pricing is None:
+        return None
+    pricing = resolved.llm.pricing
+    multiplier = (
+        provider.batch_cost_multiplier if batch and provider is not None else 1.0
+    )
+
+    def _estimate(metrics: Mapping[str, Any]) -> float:
+        return round(_estimate_cost(dict(metrics), pricing) * multiplier, 6)
+
+    return _estimate
+
+
 def _extract_batched(
     docs: list[DocumentRef],
     source_backend: DocumentSource,
@@ -981,6 +1090,8 @@ def _extract_batched(
     options: dict[str, Any],
     work_dir: Path,
     model_name: str,
+    *,
+    budget: BudgetGuard | None = None,
 ) -> tuple[
     list[tuple[DocumentRef, ExtractionResult | None, str | None]],
     dict[str, Any],
@@ -1000,10 +1111,14 @@ def _extract_batched(
     fetched = [(doc, path) for doc, path, err in entries if path is not None]
     try:
         batch_output = (
-            backend.extract_batch_with_metrics([p for _, p in fetched], options)
+            backend.extract_batch_with_metrics(
+                [p for _, p in fetched], options, budget=budget
+            )
             if fetched
             else None
         )
+    except (BudgetExceededError, BatchCancelledError):
+        raise
     except Exception as e:
         raise RunError(
             f"Batch extraction failed for model '{model_name}': {e}"

@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from ..budget import LLMBudgetConfig
 from ..credentials import CredentialReference
 from ..optional_dependencies import import_optional_dependency
 
@@ -302,6 +303,20 @@ class LLMBackendOptions(_BackendOptions):
     batch_poll_seconds: float = Field(
         default=30.0, ge=0.1, le=3600.0, allow_inf_nan=False
     )
+    # Deterministic native-batch partition size; the effective size is
+    # min(batch_size, provider.max_batch_requests).
+    batch_size: int = Field(default=1000, ge=1, le=100_000)
+    batch_poll_max_seconds: float = Field(
+        default=300.0, ge=0.1, le=3600.0, allow_inf_nan=False
+    )
+    batch_timeout_seconds: float = Field(
+        default=86_400.0, gt=0.0, le=604_800.0, allow_inf_nan=False
+    )
+    # Explicit partial-success policy (issue #149): "fail" publishes nothing
+    # from a partition containing a failed item; "publish_successful" keeps
+    # per-document errors and publishes (and state-advances) only successes.
+    on_partial_batch: Literal["fail", "publish_successful"] = "fail"
+    budget: LLMBudgetConfig | None = None
 
     @field_validator("fields")
     @classmethod
@@ -310,6 +325,14 @@ class LLMBackendOptions(_BackendOptions):
         if len(names) != len(set(names)):
             raise ValueError("LLM field names must be unique (case-insensitive)")
         return fields
+
+    @model_validator(mode="after")
+    def _validate_poll_bounds(self) -> LLMBackendOptions:
+        if self.batch_poll_max_seconds < self.batch_poll_seconds:
+            raise ValueError(
+                "batch_poll_max_seconds must be >= batch_poll_seconds"
+            )
+        return self
 
 
 @dataclass(frozen=True)

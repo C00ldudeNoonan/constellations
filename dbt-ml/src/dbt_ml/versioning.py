@@ -31,10 +31,15 @@ _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
     {
         "api_key_env",
         "batch",
+        "batch_poll_max_seconds",
         "batch_poll_seconds",
+        "batch_size",
+        "batch_timeout_seconds",
+        "budget",
         "cache_path",
         "max_concurrent",
         "max_retries",
+        "on_partial_batch",
     }
 )
 

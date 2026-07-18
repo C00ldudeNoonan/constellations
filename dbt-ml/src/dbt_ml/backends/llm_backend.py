@@ -6,6 +6,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import partial
@@ -14,6 +15,7 @@ from typing import Any
 
 import duckdb
 
+from ..budget import BudgetExceededError, BudgetGuard
 from ..config.profile import DEFAULT_LLM_PROVIDER
 from ..credentials import CredentialReference, CredentialReferenceError
 from ..hashing import HASH_DIGEST_SIZE
@@ -25,6 +27,7 @@ from ..providers import (
     InferenceProvider,
     InferenceRequest,
     InferenceResult,
+    ProviderBatchError,
     ProviderCredential,
     ProviderError,
     ProviderRequestError,
@@ -36,6 +39,7 @@ from ..providers import (
     redacted_exception_text,
     resolve_provider_model,
     sanitized_provider_error,
+    validate_batch_job_id,
 )
 from .base import BaseBackend, BatchExtractionOutput, ExtractionResult
 from .options import LLMBackendOptions, validate_llm_numeric_options
@@ -54,6 +58,20 @@ _DEFAULT_MAX_TOKENS = 2048
 _DEFAULT_MAX_RETRIES = 4
 _DEFAULT_MAX_CONCURRENT = 4
 _DEFAULT_BATCH_POLL_SECONDS = 30.0
+_DEFAULT_BATCH_POLL_MAX_SECONDS = 300.0
+_DEFAULT_BATCH_TIMEOUT_SECONDS = 86_400.0
+_DEFAULT_BATCH_SIZE = 1000
+_POLL_BACKOFF_FACTOR = 1.5
+# Submitted-job records older than this are unrecoverable provider-side and
+# only accumulate; prune on the next job write.
+_STALE_JOB_DAYS = 30
+
+
+class BatchCancelledError(RuntimeError):
+    """A native batch job hit batch_timeout_seconds and was cancelled.
+
+    Message is artifact-safe: it names the timeout, never job contents.
+    """
 
 # DuckDB cache writes can race when extraction is parallelized; serialize them.
 _CACHE_WRITE_LOCK = threading.Lock()
@@ -170,13 +188,22 @@ class LLMBackend(BaseBackend):
         return self.extract_batch_with_metrics(paths, options).items
 
     def extract_batch_with_metrics(
-        self, paths: list[Path], options: dict[str, Any]
+        self,
+        paths: list[Path],
+        options: dict[str, Any],
+        *,
+        budget: BudgetGuard | None = None,
     ) -> BatchExtractionOutput:
-        """One native batch submission for every uncached document (issue #75
-        part 2): cache hits resolve locally, the rest go up as a single batch,
-        results come back keyed by request ID, and every response is cached so
-        re-runs are free. Per-document failures come back as Exception entries;
-        only submission itself can fail the whole batch."""
+        """Native batch extraction in deterministic bounded partitions.
+
+        Cache hits resolve locally; uncached documents stream into
+        partitions of min(batch_size, provider limit) and each partition is
+        one resumable native batch submission (issue #149): the provider job
+        id is persisted in the cache database before polling, so an
+        interrupted run resumes the job instead of resubmitting it. Document
+        text is held only for the partition in flight, bounding memory
+        independently of corpus size. Budgets are checked before each
+        submission and charged from each partition's results."""
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
@@ -200,6 +227,20 @@ class LLMBackend(BaseBackend):
         poll_seconds = float(
             options.get("batch_poll_seconds", _DEFAULT_BATCH_POLL_SECONDS)
         )
+        poll_max_seconds = max(
+            float(
+                options.get(
+                    "batch_poll_max_seconds", _DEFAULT_BATCH_POLL_MAX_SECONDS
+                )
+            ),
+            poll_seconds,
+        )
+        timeout_seconds = float(
+            options.get("batch_timeout_seconds", _DEFAULT_BATCH_TIMEOUT_SECONDS)
+        )
+        partition_size = _effective_batch_size(
+            provider, int(options.get("batch_size", _DEFAULT_BATCH_SIZE))
+        )
         cache_path = options.get("cache_path")
         cache_path_obj = Path(cache_path) if cache_path is not None else None
         schema_hash = _hash_schema(system, fields_spec, temperature)
@@ -207,11 +248,77 @@ class LLMBackend(BaseBackend):
         max_retries = int(options.get("max_retries", _DEFAULT_MAX_RETRIES))
 
         by_index: dict[int, ExtractionResult | Exception] = {}
-        batch_metrics: dict[str, Any] = {}
+        batch_metrics: dict[str, Any] = {
+            "batch_submissions": 0,
+            "batches_resumed": 0,
+            "batches_completed": 0,
+        }
         pending: list[tuple[int, str, str, str]] = []
+
+        def _flush_partition() -> None:
+            nonlocal pending
+            if not pending:
+                return
+            if budget is not None:
+                budget.ensure_headroom(next_calls=len(pending))
+            requests = [
+                BatchInferenceRequest(
+                    f"req-{j}",
+                    _inference_request(
+                        content=text,
+                        model=model,
+                        system=system,
+                        fields_spec=fields_spec,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    ),
+                )
+                for j, (_, text, _, _) in enumerate(pending)
+            ]
+            job_key = _batch_job_key(
+                provider=provider_name,
+                provider_identity=provider_identity,
+                model=model,
+                schema_hash=schema_hash,
+                max_tokens=max_tokens,
+                cache_keys=[cache_key for *_rest, cache_key in pending],
+            )
+            batch_result, resumed = _run_message_batch(
+                requests,
+                provider=provider_name,
+                poll_seconds=poll_seconds,
+                api_key_env=api_key_env,
+                max_retries=max_retries,
+                poll_max_seconds=poll_max_seconds,
+                timeout_seconds=timeout_seconds,
+                cache_path=cache_path_obj,
+                job_key=job_key,
+            )
+            batch_metrics["batch_submissions"] += batch_result.batch_submissions
+            batch_metrics["batches_resumed"] += 1 if resumed else 0
+            batch_metrics["batches_completed"] += 1
+            items = {item.request_id: item for item in batch_result.items}
+            for j, (i, _, content_hash, cache_key) in enumerate(pending):
+                resolved = self._resolve_batch_item(
+                    items.get(f"req-{j}"),
+                    cache_path=cache_path_obj,
+                    cache_key=cache_key,
+                    model=model,
+                    content_hash=content_hash,
+                    schema_hash=schema_hash,
+                )
+                if budget is not None and isinstance(resolved, ExtractionResult):
+                    budget.charge_metrics(resolved.metrics)
+                by_index[i] = resolved
+            pending = []
+
         for i, path in enumerate(paths):
             try:
+                if budget is not None:
+                    budget.check_file_bytes(path.stat().st_size)
                 text = path.read_text()
+            except BudgetExceededError:
+                raise
             except Exception as e:
                 by_index[i] = e
                 continue
@@ -237,41 +344,12 @@ class LLMBackend(BaseBackend):
                     metrics={"api_calls": 0, "cache_hits": 1, **_ZERO_USAGE},
                 )
                 continue
+            if budget is not None:
+                budget.charge_bytes(path.stat().st_size)
             pending.append((i, text, content_hash, cache_key))
-
-        if pending:
-            requests = [
-                BatchInferenceRequest(
-                    f"req-{j}",
-                    _inference_request(
-                        content=text,
-                        model=model,
-                        system=system,
-                        fields_spec=fields_spec,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    ),
-                )
-                for j, (_, text, _, _) in enumerate(pending)
-            ]
-            batch_result = _run_message_batch(
-                requests,
-                provider=provider_name,
-                poll_seconds=poll_seconds,
-                api_key_env=api_key_env,
-                max_retries=max_retries,
-            )
-            batch_metrics["batch_submissions"] = batch_result.batch_submissions
-            items = {item.request_id: item for item in batch_result.items}
-            for j, (i, _, content_hash, cache_key) in enumerate(pending):
-                by_index[i] = self._resolve_batch_item(
-                    items.get(f"req-{j}"),
-                    cache_path=cache_path_obj,
-                    cache_key=cache_key,
-                    model=model,
-                    content_hash=content_hash,
-                    schema_hash=schema_hash,
-                )
+            if len(pending) >= partition_size:
+                _flush_partition()
+        _flush_partition()
 
         return BatchExtractionOutput(
             [by_index[i] for i in range(len(paths))],
@@ -539,7 +617,19 @@ def _run_message_batch(
     poll_seconds: float,
     api_key_env: CredentialSelector = None,
     max_retries: int = _DEFAULT_MAX_RETRIES,
-) -> BatchInferenceResult:
+    poll_max_seconds: float = _DEFAULT_BATCH_POLL_MAX_SECONDS,
+    timeout_seconds: float = _DEFAULT_BATCH_TIMEOUT_SECONDS,
+    cache_path: Path | None = None,
+    job_key: str | None = None,
+) -> tuple[BatchInferenceResult, bool]:
+    """Run one native batch partition: submit (or resume), poll with bounded
+    backoff, fetch, and clear the persisted job record.
+
+    The provider job id is persisted before the first poll, so a crash or
+    interrupt leaves a record that the next run resumes instead of
+    resubmitting — the submitted work is billed exactly once. On timeout the
+    job is cancelled and the record removed. Returns the result plus whether
+    an existing job was resumed."""
     provider_instance = get_inference_provider(provider)
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
@@ -551,16 +641,62 @@ def _run_message_batch(
             code="invalid_credential_reference",
         )
     credential = _resolve_provider_credential(provider_instance, api_key_env)
-    failure: ProviderError | None = None
+    runtime = ProviderRuntimeOptions(max_retries=max_retries)
+    resumed = False
+    failure: Exception | None = None
     result: BatchInferenceResult | None = None
     try:
-        result = provider_instance.complete_batch(
-            requests,
-            credential=credential,
-            runtime=ProviderRuntimeOptions(max_retries=max_retries),
-            poll_seconds=poll_seconds,
+        batch_id = (
+            _job_get(cache_path, job_key)
+            if cache_path is not None and job_key is not None
+            else None
         )
-        result = provider_instance.validate_batch_result(requests, result)
+        if batch_id is not None:
+            resumed = True
+            log.info("resuming provider batch %s", batch_id)
+        else:
+            batch_id = validate_batch_job_id(
+                provider_instance.submit_batch(
+                    requests, credential=credential, runtime=runtime
+                )
+            )
+            if cache_path is not None and job_key is not None:
+                _job_put(cache_path, job_key, provider=provider, batch_id=batch_id)
+        deadline = time.monotonic() + timeout_seconds
+        interval = poll_seconds
+        while True:
+            status = provider_instance.poll_batch(
+                batch_id, credential=credential, runtime=runtime
+            )
+            if status.done:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                _cancel_batch_job(
+                    provider_instance,
+                    batch_id,
+                    credential=credential,
+                    runtime=runtime,
+                )
+                if cache_path is not None and job_key is not None:
+                    _job_delete(cache_path, job_key)
+                raise BatchCancelledError(
+                    f"provider batch exceeded batch_timeout_seconds="
+                    f"{timeout_seconds:g} and was cancelled"
+                )
+            time.sleep(min(interval, max(deadline - now, 0.0)))
+            interval = min(interval * _POLL_BACKOFF_FACTOR, poll_max_seconds)
+        fetched = provider_instance.fetch_batch_results(
+            batch_id, requests, credential=credential, runtime=runtime
+        )
+        validated = provider_instance.validate_batch_result(requests, fetched)
+        if cache_path is not None and job_key is not None:
+            _job_delete(cache_path, job_key)
+        result = BatchInferenceResult(
+            validated.items, batch_submissions=0 if resumed else 1
+        )
+    except BatchCancelledError:
+        raise
     except ProviderError as error:
         failure = sanitized_provider_error(
             provider, "batch inference", error
@@ -579,7 +715,58 @@ def _run_message_batch(
         raise failure
     if result is None:
         raise AssertionError("provider batch inference did not produce a result")
-    return result
+    return result, resumed
+
+
+def _cancel_batch_job(
+    provider_instance: InferenceProvider,
+    batch_id: str,
+    *,
+    credential: Any,
+    runtime: ProviderRuntimeOptions,
+) -> None:
+    """Best-effort cancel on timeout; the timeout error is raised regardless."""
+    try:
+        provider_instance.cancel_batch(
+            batch_id, credential=credential, runtime=runtime
+        )
+    except Exception:
+        log.debug("batch cancel failed for %s", batch_id)
+
+
+def _effective_batch_size(provider: InferenceProvider, batch_size: int) -> int:
+    limit = provider.max_batch_requests
+    size = batch_size if limit is None else min(batch_size, limit)
+    return max(size, 1)
+
+
+def _batch_job_key(
+    *,
+    provider: str,
+    provider_identity: str,
+    model: str,
+    schema_hash: str,
+    max_tokens: int,
+    cache_keys: list[str],
+) -> str:
+    """Deterministic identity of one submitted partition, built from hashes
+    only — resumable without persisting any document content."""
+    canonical = json.dumps(
+        {
+            "contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": provider,
+            "provider_identity": provider_identity,
+            "model": model,
+            "schema_hash": schema_hash,
+            "max_tokens": max_tokens,
+            "cache_keys": cache_keys,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.blake2b(
+        canonical.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
 
 
 def _inference_request(
@@ -721,6 +908,90 @@ def _cache_key(
         canonical.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
     return f"provider-v{PROVIDER_CONTRACT_VERSION}|{provider}|{model}|{digest}"
+
+
+_JOB_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS llm_batch_jobs (
+    job_key VARCHAR PRIMARY KEY,
+    provider VARCHAR NOT NULL,
+    batch_id VARCHAR NOT NULL,
+    created_at TIMESTAMP NOT NULL
+)
+"""
+
+
+def _job_get(path: Path, job_key: str) -> str | None:
+    """Provider batch id persisted for this partition identity, if any.
+
+    Rows hold only the job-key hash, provider name, provider job id, and a
+    timestamp — no document content, prompt, credential, or response data.
+    """
+    if os.name == "nt":
+        if not path.exists():
+            return None
+    elif not _harden_cache_files(path, require_main=True):
+        return None
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        row = con.execute(
+            "SELECT batch_id FROM llm_batch_jobs WHERE job_key = ?", [job_key]
+        ).fetchone()
+    except duckdb.CatalogException:
+        return None
+    finally:
+        con.close()
+    if row is None:
+        return None
+    try:
+        return validate_batch_job_id(row[0])
+    except ProviderBatchError:
+        return None
+
+
+def _job_put(path: Path, job_key: str, *, provider: str, batch_id: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _CACHE_WRITE_LOCK:
+        if os.name != "nt":
+            _harden_cache_files(path, require_main=False)
+        with _private_cache_umask():
+            con = duckdb.connect(str(path))
+            try:
+                con.execute(_JOB_TABLE_DDL)
+                con.execute(
+                    "DELETE FROM llm_batch_jobs WHERE created_at < "
+                    f"current_timestamp - INTERVAL {_STALE_JOB_DAYS} DAY"
+                )
+                con.execute(
+                    """
+                    INSERT INTO llm_batch_jobs
+                        (job_key, provider, batch_id, created_at)
+                    VALUES (?, ?, ?, current_timestamp)
+                    ON CONFLICT (job_key) DO UPDATE SET
+                        provider   = excluded.provider,
+                        batch_id   = excluded.batch_id,
+                        created_at = excluded.created_at
+                    """,
+                    [job_key, provider, batch_id],
+                )
+            finally:
+                con.close()
+        if os.name != "nt":
+            _harden_cache_files(path, require_main=True)
+
+
+def _job_delete(path: Path, job_key: str) -> None:
+    if not path.exists():
+        return
+    with _CACHE_WRITE_LOCK:
+        con = duckdb.connect(str(path))
+        try:
+            con.execute(
+                "DELETE FROM llm_batch_jobs WHERE job_key = ?", [job_key]
+            )
+        except duckdb.CatalogException:
+            pass
+        finally:
+            con.close()
 
 
 def _cache_get(path: Path, key: str) -> dict[str, Any] | None:

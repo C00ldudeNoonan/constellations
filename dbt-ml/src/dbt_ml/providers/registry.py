@@ -195,14 +195,22 @@ def _validate_inference_metadata(cls: type[InferenceProvider]) -> None:
         raise ProviderRegistrationError(
             "inference provider supports_native_batch must be boolean"
         )
-    if (
-        cls.supports_native_batch
-        and cls.complete_batch is InferenceProvider.complete_batch
-    ):
-        raise ProviderRegistrationError(
-            "inference provider advertising native batch support must override "
-            "complete_batch"
-        )
+    if cls.supports_native_batch:
+        unimplemented = [
+            name
+            for name in (
+                "submit_batch",
+                "poll_batch",
+                "fetch_batch_results",
+                "cancel_batch",
+            )
+            if getattr(cls, name) is getattr(InferenceProvider, name)
+        ]
+        if unimplemented:
+            raise ProviderRegistrationError(
+                "inference provider advertising native batch support must "
+                f"override {', '.join(unimplemented)}"
+            )
     limit = cls.max_batch_requests
     if limit is not None and (
         isinstance(limit, bool) or not isinstance(limit, int) or limit < 1

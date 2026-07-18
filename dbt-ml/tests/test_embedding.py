@@ -302,6 +302,56 @@ def test_incremental_embed_recomputes_text_and_removes_deleted_rows(
     ) == [(0,)]
 
 
+def test_embed_rejects_generated_columns_case_insensitively(tmp_path: Path) -> None:
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    _query(
+        project,
+        'ALTER TABLE "db".docs.document_chunks ADD COLUMN "Embedding_Model" VARCHAR',
+        [],
+    )
+
+    with pytest.raises(RunError, match="Embedding_Model"):
+        run_project(project, select="document_embeddings")
+
+
+def test_incremental_embed_deletes_rows_with_typed_keys(tmp_path: Path) -> None:
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    _query(
+        project,
+        'ALTER TABLE "db".docs.document_chunks ADD COLUMN numeric_id BIGINT',
+        [],
+    )
+    _query(
+        project,
+        'UPDATE "db".docs.document_chunks SET numeric_id = '
+        "CASE WHEN title = 'Release A' THEN 1 ELSE 2 END",
+        [],
+    )
+    model_path = project / "models" / "documents.yml"
+    model_path.write_text(
+        model_path.read_text().replace(
+            "      id_field: chunk_id\n",
+            "      id_field: numeric_id\n",
+        )
+    )
+    run_project(project, select="document_embeddings", full_refresh=True)
+    _query(
+        project,
+        'DELETE FROM "db".docs.document_chunks WHERE numeric_id = ?',
+        [1],
+    )
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_deleted == 1
+    assert _query(
+        project,
+        'SELECT numeric_id FROM "db".docs.document_embeddings ORDER BY numeric_id',
+    ) == [(2,)]
+
+
 def test_incremental_embed_handles_an_empty_upstream_relation(tmp_path: Path) -> None:
     project = _embedding_project(tmp_path)
     run_project(project)

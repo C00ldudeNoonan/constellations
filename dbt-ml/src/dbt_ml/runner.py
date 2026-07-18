@@ -1331,7 +1331,10 @@ def _run_embed_model(
             f"{sorted(source.columns)}"
         )
     generated = set(EMBED_METADATA_FIELDS) | {config.vector_field}
-    collisions = sorted(generated & set(source.columns))
+    generated_names = {name.casefold() for name in generated}
+    collisions = sorted(
+        column for column in source.columns if column.casefold() in generated_names
+    )
     if collisions:
         raise RunError(
             f"Embed model '{model.name}': upstream '{upstream}' already contains "
@@ -1367,6 +1370,11 @@ def _run_embed_model(
 
     current_ids = set(record_ids)
     removed = sorted(set(processed_state) - current_ids)
+    removed_target_keys = [
+        existing_rows[record_id][config.id_field]
+        for record_id in removed
+        if record_id in existing_rows
+    ]
     work: list[_EmbedWork] = []
     skipped = 0
     cache_hits = 0
@@ -1487,8 +1495,9 @@ def _run_embed_model(
                 adapter.delete_rows_and_state(
                     model.name,
                     key_col=config.id_field,
-                    keys=removed,
+                    keys=removed_target_keys,
                     state_scope=state_scope,
+                    state_record_keys=removed,
                 )
             if state_records:
                 adapter.upsert_state(state_scope, state_records)

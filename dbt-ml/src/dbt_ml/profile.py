@@ -156,7 +156,10 @@ def resolve_profile(
         try:
             provider = get_inference_provider(llm.provider)
             llm = llm.model_copy(
-                update={"model": resolve_provider_model(provider, llm.model)}
+                update={
+                    "model": resolve_provider_model(provider, llm.model),
+                    "base_url": provider.resolve_base_url(llm.base_url),
+                }
             )
         except (ProviderNotFoundError, ProviderConfigurationError) as e:
             raise ProfileError(
@@ -482,6 +485,13 @@ def resolve_llm_options(
         )
         options = {}
         raise credential_ownership_error
+    if "base_url" in options:
+        endpoint_ownership_error = ProfileError(
+            "llm option 'base_url' is operator-owned configuration; set it "
+            "under `llm:` in profiles.yml, not in model extraction options"
+        )
+        options = {}
+        raise endpoint_ownership_error
     merged = dict(options)
     profile_provider = (
         resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER
@@ -505,6 +515,15 @@ def resolve_llm_options(
         merged["model"] = resolve_provider_model(provider, requested_model)
     except ProviderConfigurationError as e:
         raise ProfileError(str(e)) from e
+    profile_base_url = (
+        resolved.llm.base_url if resolved.llm is not None else None
+    )
+    try:
+        base_url = provider.resolve_base_url(profile_base_url)
+    except ProviderConfigurationError as e:
+        raise ProfileError(str(e)) from e
+    if base_url is not None:
+        merged["base_url"] = base_url
     if merged.get("batch") and not provider.supports_native_batch:
         raise ProfileError(
             f"Inference provider '{provider_name}' does not support native "
@@ -522,6 +541,8 @@ def resolve_llm_options(
 
     if resolved.llm.cache_path is not None:
         merged.setdefault("cache_path", str(resolved.llm.cache_path))
+    if "timeout_seconds" in resolved.llm.model_fields_set:
+        merged.setdefault("timeout_seconds", resolved.llm.timeout_seconds)
     if resolved.llm.system_prompt is not None:
         merged.setdefault("system_prompt", resolved.llm.system_prompt)
     return merged

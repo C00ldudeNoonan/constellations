@@ -6,9 +6,9 @@ translates that provider-neutral request into an SDK call. This boundary keeps
 model compilation, caching, materialization, lineage, and usage accounting
 independent from Anthropic or any future inference service.
 
-The first built-in implementation is Anthropic. The contracts deliberately
-cover inference and embeddings separately so a target can eventually select
-different providers for generation and vectorization.
+The built-in inference implementations are Anthropic and vLLM. The contracts
+deliberately cover inference and embeddings separately so a target can
+eventually select different providers for generation and vectorization.
 
 ## Contract surface
 
@@ -23,8 +23,10 @@ different providers for generation and vectorization.
   and rejects duplicate IDs.
 - `EmbeddingRequest` accepts one or more texts. `EmbeddingResult` validates the
   shape and finiteness of every vector.
-- `ProviderRuntimeOptions` carries execution policy such as retry count without
-  putting it in the semantic model request.
+- `ProviderRuntimeOptions` carries endpoint routing and execution policy such
+  as request timeout and retry count without putting them in the semantic model
+  request. Endpoint routing is still included separately in cache and model
+  identity.
 - `ProviderUsage` normalizes input, output, cache-read, and cache-creation token
   counts. A provider-reported cost may be included when the service supplies
   one.
@@ -115,12 +117,14 @@ invalidate model state.
 
 The LLM response cache also includes the provider name, model, contract version,
 provider implementation identity, schema, content, temperature, and output-token
-limit. Legacy pre-contract entries can never be read under the versioned key
-format, so they are pruned from the cache file on the next write.
+limit. Custom endpoint deployments add the normalized base URL before the key
+is hashed. Legacy pre-contract entries can never be read under the versioned
+key format, so they are pruned from the cache file on the next write.
 
-Manifest model entries and per-model run results expose only the effective
-provider, model, and hashed implementation identity. Credential names and values
-are excluded from artifacts.
+Manifest model entries expose only the effective provider, model, hashed
+implementation identity, and, when configured, a one-way endpoint fingerprint.
+Per-model run results omit endpoint routing. Credential names and values are
+excluded from artifacts.
 
 Python transforms that call an inference helper declare `uses_llm: true` under
 their `transform:` block. That contract adds the profile-selected provider,
@@ -176,6 +180,16 @@ are normalized back into input order. Missing, errored, duplicate, and unknown
 result IDs are surfaced as safe provider errors rather than associated with the
 wrong document. The provider advertises the native batch cost multiplier as
 metadata so accounting code does not need an Anthropic-specific branch.
+
+## vLLM mapping
+
+`VLLMInferenceProvider` sends JSON-schema Chat Completions to an explicitly
+configured OpenAI-compatible base URL. Local endpoints may omit authentication;
+when `api_key_env` is configured, the provider sends the resolved value as a
+bearer token. It normalizes usage, rejects truncated or malformed JSON, limits
+response size, and retries only transport and transient HTTP failures. Native
+vLLM batch submission is not advertised; normal concurrent requests let the
+server own scheduling and continuous batching.
 
 ## Adding a provider
 

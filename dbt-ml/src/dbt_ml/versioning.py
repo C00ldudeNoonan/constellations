@@ -40,6 +40,7 @@ _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
         "max_concurrent",
         "max_retries",
         "on_partial_batch",
+        "timeout_seconds",
     }
 )
 
@@ -230,7 +231,11 @@ def _resolve_extraction_options(
 
 def _inference_descriptor(options: Mapping[str, Any]) -> dict[str, str]:
     effective = LLMBackendOptions.model_validate(options)
-    return _provider_descriptor(effective.provider, effective.model)
+    return _provider_descriptor(
+        effective.provider,
+        effective.model,
+        base_url=effective.base_url,
+    )
 
 
 def _profile_inference_descriptor(
@@ -246,7 +251,12 @@ def _profile_inference_descriptor(
         if resolved is not None and resolved.llm is not None
         else None
     )
-    return _provider_descriptor(provider_name, model)
+    base_url = (
+        resolved.llm.base_url
+        if resolved is not None and resolved.llm is not None
+        else None
+    )
+    return _provider_descriptor(provider_name, model, base_url=base_url)
 
 
 def _profile_system_prompt_fingerprint(
@@ -264,14 +274,24 @@ def _profile_system_prompt_fingerprint(
 
 
 def _provider_descriptor(
-    provider_name: str, model: str | None
+    provider_name: str,
+    model: str | None,
+    *,
+    base_url: str | None = None,
 ) -> dict[str, str]:
     provider = get_inference_provider(provider_name)
-    return {
+    descriptor = {
         "provider": provider_name,
         "model": resolve_provider_model(provider, model),
         "implementation": provider.implementation_identity(),
     }
+    resolved_base_url = provider.resolve_base_url(base_url)
+    if resolved_base_url is not None:
+        descriptor["endpoint_identity"] = hashlib.blake2b(
+            canonical_json({"base_url": resolved_base_url}).encode(),
+            digest_size=HASH_DIGEST_SIZE,
+        ).hexdigest()
+    return descriptor
 
 
 def resolve_module_file(module: str, project_dir: Path) -> Path:

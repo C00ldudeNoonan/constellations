@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from typing import overload
 
+from ..endpoints import EndpointUrlError, OpenAICompatibleBaseUrl
 from .base import (
     BaseProvider,
     EmbeddingProvider,
@@ -195,6 +196,29 @@ def _validate_inference_metadata(cls: type[InferenceProvider]) -> None:
         raise ProviderRegistrationError(
             "inference provider supports_native_batch must be boolean"
         )
+    if not isinstance(cls.supports_custom_base_url, bool):
+        raise ProviderRegistrationError(
+            "inference provider supports_custom_base_url must be boolean"
+        )
+    if not isinstance(cls.requires_base_url, bool):
+        raise ProviderRegistrationError(
+            "inference provider requires_base_url must be boolean"
+        )
+    if cls.requires_base_url and not cls.supports_custom_base_url:
+        raise ProviderRegistrationError(
+            "inference provider requiring base_url must support custom base URLs"
+        )
+    if cls.default_base_url is not None:
+        if not cls.supports_custom_base_url:
+            raise ProviderRegistrationError(
+                "inference provider with default_base_url must support custom base URLs"
+            )
+        try:
+            OpenAICompatibleBaseUrl(cls.default_base_url)
+        except EndpointUrlError as error:
+            raise ProviderRegistrationError(
+                "inference provider default_base_url is invalid"
+            ) from error
     if cls.supports_native_batch:
         unimplemented = [
             name

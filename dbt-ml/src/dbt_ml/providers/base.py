@@ -23,6 +23,7 @@ from ..credentials import (
     CredentialResolutionError,
     ProtectedCredential,
 )
+from ..endpoints import EndpointUrlError, OpenAICompatibleBaseUrl
 from ..hashing import HASH_DIGEST_SIZE
 
 log = logging.getLogger(__name__)
@@ -219,6 +220,8 @@ ProviderCredential = ProtectedCredential
 @dataclass(frozen=True, slots=True)
 class ProviderRuntimeOptions:
     max_retries: int = 4
+    base_url: str | None = None
+    timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if (
@@ -227,6 +230,19 @@ class ProviderRuntimeOptions:
             or self.max_retries < 0
         ):
             raise ValueError("max_retries must be a non-negative integer")
+        if self.base_url is not None:
+            try:
+                normalized = OpenAICompatibleBaseUrl(self.base_url)
+            except EndpointUrlError as error:
+                raise ValueError(str(error)) from None
+            object.__setattr__(self, "base_url", normalized)
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
+            or not 0.1 <= self.timeout_seconds <= 3600.0
+        ):
+            raise ValueError("timeout_seconds must be between 0.1 and 3600")
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,6 +584,9 @@ class BaseProvider(ABC):
 
 class InferenceProvider(BaseProvider):
     default_model: ClassVar[str | None] = None
+    supports_custom_base_url: ClassVar[bool] = False
+    requires_base_url: ClassVar[bool] = False
+    default_base_url: ClassVar[OpenAICompatibleBaseUrl | None] = None
     supports_native_batch: ClassVar[bool] = False
     max_batch_requests: ClassVar[int | None] = None
     batch_cost_multiplier: ClassVar[float] = 1.0
@@ -594,6 +613,31 @@ class InferenceProvider(BaseProvider):
                 safe_for_display=True,
             )
         return selected
+
+    def resolve_base_url(
+        self, base_url: str | OpenAICompatibleBaseUrl | None
+    ) -> OpenAICompatibleBaseUrl | None:
+        selected = self.default_base_url if base_url is None else base_url
+        if selected is None:
+            if self.requires_base_url:
+                raise ProviderConfigurationError(
+                    f"Inference provider '{self.name()}' requires base_url in "
+                    "the active profile",
+                    safe_for_display=True,
+                )
+            return None
+        if not self.supports_custom_base_url:
+            raise ProviderConfigurationError(
+                f"Inference provider '{self.name()}' does not support base_url",
+                safe_for_display=True,
+            )
+        try:
+            return OpenAICompatibleBaseUrl(selected)
+        except EndpointUrlError as error:
+            raise ProviderConfigurationError(
+                f"Inference provider '{self.name()}' {error}",
+                safe_for_display=True,
+            ) from None
 
     def validate_result(self, result: object) -> InferenceResult:
         if not isinstance(result, InferenceResult):

@@ -253,7 +253,11 @@ def test_message_batch_uses_custom_api_key_env(
     assert result.items[0].error is not None
     assert "missing_result" in str(result.items[0].error)
     assert result.batch_submissions == 1
-    assert init_kwargs == {"api_key": secret, "max_retries": 4}
+    assert init_kwargs == {
+        "api_key": secret,
+        "max_retries": 4,
+        "timeout": 60.0,
+    }
     assert len(submitted) == 1
     assert secret not in caplog.text
 

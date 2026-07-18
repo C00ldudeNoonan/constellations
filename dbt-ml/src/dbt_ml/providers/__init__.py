@@ -1,5 +1,6 @@
 from . import anthropic as anthropic
 from . import deterministic as deterministic
+from . import vllm as vllm
 from .base import (
     PROVIDER_CONTRACT_VERSION,
     BaseProvider,

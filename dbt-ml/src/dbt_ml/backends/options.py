@@ -20,6 +20,7 @@ from pydantic import (
 
 from ..budget import LLMBudgetConfig
 from ..credentials import CredentialReference
+from ..endpoints import OpenAICompatibleBaseUrl
 from ..optional_dependencies import import_optional_dependency
 
 _STRICT_OPTIONS = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
@@ -46,6 +47,7 @@ _LLM_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
 _LLM_NUMBER_BOUNDS: dict[str, tuple[float, float]] = {
     "temperature": (0.0, 1.0),
     "batch_poll_seconds": (0.1, 3600.0),
+    "timeout_seconds": (0.1, 3600.0),
 }
 
 
@@ -298,6 +300,13 @@ class LLMBackendOptions(_BackendOptions):
         default=None,
         repr=False,
         exclude=True,
+    )
+    base_url: OpenAICompatibleBaseUrl | None = None
+    timeout_seconds: float = Field(
+        default=60.0,
+        ge=0.1,
+        le=3600.0,
+        allow_inf_nan=False,
     )
     batch: bool = False
     batch_poll_seconds: float = Field(

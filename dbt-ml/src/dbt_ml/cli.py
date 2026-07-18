@@ -243,10 +243,10 @@ def _compile_warnings(
                     "llm.cache_path; interrupted batch jobs cannot be resumed "
                     "and completed responses are not cached."
                 )
-            if not provider.requires_credentials:
-                continue
             env_value = options.get("api_key_env") or provider.default_credential_env
             if env_value is None:
+                if not provider.requires_credentials:
+                    continue
                 out.append(
                     f"Inference provider '{provider.name()}' requires credentials; "
                     "configure llm.api_key_env in profiles.yml."

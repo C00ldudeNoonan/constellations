@@ -32,6 +32,8 @@ def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
     model = llm_cfg.model if llm_cfg else None
     cache_path = str(llm_cfg.cache_path) if llm_cfg and llm_cfg.cache_path else None
     api_key_env = llm_cfg.api_key_env if llm_cfg else None
+    base_url = str(llm_cfg.base_url) if llm_cfg and llm_cfg.base_url else None
+    timeout_seconds = llm_cfg.timeout_seconds if llm_cfg else 60.0
     system_options = (
         {"system": llm_cfg.system_prompt}
         if llm_cfg and llm_cfg.system_prompt is not None
@@ -47,6 +49,8 @@ def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
             model=model,
             cache_path=cache_path,
             api_key_env=api_key_env,
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
             **system_options,
         )
         rows.append({"document_id": row["document_id"], **fields})

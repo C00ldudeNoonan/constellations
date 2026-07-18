@@ -522,7 +522,7 @@ class DuckDBAdapter(WarehouseAdapter):
         table: str,
         *,
         key_col: str,
-        keys: Sequence[str],
+        keys: Sequence[Any],
         state_scope: StateScope,
         state_record_keys: Sequence[str] | None = None,
     ) -> int:
@@ -530,7 +530,6 @@ class DuckDBAdapter(WarehouseAdapter):
         scoped_keys = (
             target_keys if state_record_keys is None else list(state_record_keys)
         )
-        validate_state_keys(target_keys)
         validate_state_keys(scoped_keys)
 
         deleted_count = 0

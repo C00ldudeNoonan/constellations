@@ -9,6 +9,7 @@ from .backends import get_backend, validate_backend_options
 from .backends.options import LLMBackendOptions
 from .config.model import (
     ChunkConfig,
+    EmbedConfig,
     ExtractionConfig,
     FieldConfig,
     MLConfig,
@@ -19,6 +20,7 @@ from .config.model import (
 from .config.profile import DEFAULT_LLM_PROVIDER
 from .config.project import ProjectConfig
 from .dag import parse_ref
+from .embedding import EmbeddingIdentity
 from .hashing import HASH_DIGEST_SIZE, canonical_json
 from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options
@@ -53,6 +55,7 @@ def compute_code_version(
     transform: TransformConfig | None,
     ml: MLConfig | None = None,
     chunk: ChunkConfig | None = None,
+    embed: EmbedConfig | None = None,
     search: SearchConfig | None = None,
     depends_on: list[str] | None = None,
     fields: list[FieldConfig] | None = None,
@@ -87,6 +90,14 @@ def compute_code_version(
         if ml
         else None,
         "chunk": chunk.model_dump() if chunk else None,
+        "embed": (
+            {
+                **embed.model_dump(exclude={"batch_size", "max_retries"}),
+                "identity": EmbeddingIdentity.from_config(embed).to_dict(),
+            }
+            if embed
+            else None
+        ),
         "search": search.model_dump(mode="python") if search else None,
         "depends_on": depends_on or None,
         "fields": [
@@ -155,10 +166,15 @@ def compute_model_code_version(
         transform=model.transform,
         ml=model.ml,
         chunk=model.chunk,
+        embed=model.embed,
         search=model.search,
         depends_on=(
             [parse_ref(dependency) for dependency in model.depends_on]
-            if (model.chunk is not None or model.search is not None)
+            if (
+                model.chunk is not None
+                or model.embed is not None
+                or model.search is not None
+            )
             and model.depends_on
             else None
         ),
@@ -185,6 +201,12 @@ def describe_model_inference(
     if backend_name != "llm":
         return None
     return _inference_descriptor(canonical_options)
+
+
+def describe_model_embedding(model: ModelConfig) -> dict[str, str | int] | None:
+    if model.embed is None:
+        return None
+    return EmbeddingIdentity.from_config(model.embed).to_dict()
 
 
 def _resolve_extraction_options(

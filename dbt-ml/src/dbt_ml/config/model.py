@@ -36,6 +36,17 @@ INTERNAL_LINEAGE_FIELDS = frozenset(
         "extracted_at",
     }
 )
+EMBED_METADATA_FIELDS = frozenset(
+    {
+        "embedding_provider",
+        "embedding_model",
+        "embedding_dimensions",
+        "embedding_provider_implementation",
+        "embedding_input_hash",
+        "embedding_config_hash",
+        "embedded_at",
+    }
+)
 
 
 class _RedactedConfigInput:
@@ -203,6 +214,37 @@ class ChunkConfig(BaseModel):
             raise ValueError("chunk.chunk_overlap must be non-negative")
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk.chunk_overlap must be smaller than chunk_size")
+        return self
+
+
+class EmbedConfig(BaseModel):
+    model_config = _STRICT_CONFIG
+
+    provider: str = Field(
+        min_length=1,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    model: str = Field(min_length=1)
+    text_field: str = Field(default="text", min_length=1)
+    id_field: str = Field(default="chunk_id", min_length=1)
+    vector_field: str = Field(default="embedding", min_length=1)
+    dimensions: int = Field(gt=0, le=65_536)
+    batch_size: int = Field(default=128, gt=0, le=10_000)
+    max_retries: int = Field(default=4, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_fields(self) -> EmbedConfig:
+        fields = (self.id_field, self.text_field, self.vector_field)
+        if len(set(fields)) != len(fields):
+            raise ValueError(
+                "embed.id_field, text_field, and vector_field must be distinct"
+            )
+        conflicts = sorted(set(fields) & EMBED_METADATA_FIELDS)
+        if conflicts:
+            raise ValueError(
+                "embed fields are reserved for embedding metadata: "
+                f"{', '.join(conflicts)}"
+            )
         return self
 
 
@@ -447,6 +489,7 @@ class ModelConfig(BaseModel):
     transform: TransformConfig | None = None
     ml: MLConfig | None = None
     chunk: ChunkConfig | None = None
+    embed: EmbedConfig | None = None
     search: SearchConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
@@ -512,6 +555,7 @@ class ModelConfig(BaseModel):
                 ("transform", self.transform),
                 ("ml", self.ml),
                 ("chunk", self.chunk),
+                ("embed", self.embed),
                 ("search", self.search),
             )
             if block is not None
@@ -520,7 +564,7 @@ class ModelConfig(BaseModel):
             raise ValueError(
                 f"Model '{self.name}' declares multiple kind blocks "
                 f"({', '.join(kinds)}); exactly one of "
-                "extraction/transform/ml/chunk/search is allowed"
+                "extraction/transform/ml/chunk/embed/search is allowed"
             )
         if self.search is not None and "materialization" not in self.model_fields_set:
             raise ValueError(
@@ -532,7 +576,14 @@ class ModelConfig(BaseModel):
     def kind_block_count(self) -> int:
         return sum(
             b is not None
-            for b in (self.extraction, self.transform, self.ml, self.chunk, self.search)
+            for b in (
+                self.extraction,
+                self.transform,
+                self.ml,
+                self.chunk,
+                self.embed,
+                self.search,
+            )
         )
 
     @property
@@ -582,7 +633,8 @@ class ModelFile(BaseModel):
         missing = [m.name for m in self.models if m.kind_block_count == 0]
         if missing:
             raise ValueError(
-                f"Models missing an extraction/transform/ml/chunk block or search block: "
+                f"Models missing an extraction/transform/ml/chunk/embed block or "
+                f"search block: "
                 f"{', '.join(sorted(missing))}"
             )
         return self

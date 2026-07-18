@@ -558,6 +558,8 @@ def _model_kind(model: ModelConfig) -> str:
         return "transform"
     if model.chunk is not None:
         return "chunk"
+    if model.embed is not None:
+        return "embed"
     if model.search is not None:
         return "search"
     return "unknown"
@@ -687,7 +689,7 @@ def run(
         f"{r.model_name:<22}"
         f"{_usage_summary(r.metrics, provider=r.provider, model=r.provider_model)}"
         for r in results
-        if "api_calls" in r.metrics
+        if "api_calls" in r.metrics or "provider_calls" in r.metrics
     ]
     if usage_lines:
         click.echo("")
@@ -723,7 +725,16 @@ def _usage_summary(
     model: str | None = None,
 ) -> str:
     """One-line provider usage: calls, cache hits, tokens, and optional cost."""
-    parts = [f"llm: {m.get('api_calls', 0)} calls, {m.get('cache_hits', 0)} cache hits"]
+    if "provider_calls" in m:
+        parts = [
+            f"embedding: {m.get('provider_calls', 0)} calls, "
+            f"{m.get('cache_hits', 0)} cache hits"
+        ]
+    else:
+        parts = [
+            f"llm: {m.get('api_calls', 0)} calls, "
+            f"{m.get('cache_hits', 0)} cache hits"
+        ]
     if provider is not None:
         identity = f"provider={provider}"
         if model is not None:

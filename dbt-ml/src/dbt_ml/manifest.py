@@ -23,7 +23,11 @@ from .profile import (
 )
 from .retrieval import collection_config_fingerprint, create_store, store_class
 from .runner import ModelRunResult
-from .versioning import compute_model_code_version, describe_model_inference
+from .versioning import (
+    compute_model_code_version,
+    describe_model_embedding,
+    describe_model_inference,
+)
 
 MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
@@ -283,6 +287,8 @@ def _model_dict(
         kind = "transform"
     elif model.chunk is not None:
         kind = "chunk"
+    elif model.embed is not None:
+        kind = "embed"
     else:
         kind = "unknown"
 
@@ -298,6 +304,7 @@ def _model_dict(
         "transform": model.transform.model_dump() if model.transform else None,
         "ml": model.ml.model_dump(mode="json") if model.ml else None,
         "chunk": model.chunk.model_dump() if model.chunk else None,
+        "embed": model.embed.model_dump() if model.embed else None,
         "fields": [f.model_dump() for f in model.fields],
         "tests": model.tests,
         "code_version": compute_model_code_version(
@@ -310,6 +317,9 @@ def _model_dict(
     inference = describe_model_inference(model, project, resolved=resolved)
     if inference is not None:
         model_dict["inference"] = inference
+    embedding = describe_model_embedding(model)
+    if embedding is not None:
+        model_dict["embedding"] = embedding
     return model_dict
 
 

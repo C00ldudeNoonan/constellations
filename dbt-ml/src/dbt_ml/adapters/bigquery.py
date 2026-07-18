@@ -1728,13 +1728,12 @@ class BigQueryAdapter(WarehouseAdapter):
         table: str,
         *,
         key_col: str,
-        keys: Sequence[str],
+        keys: Sequence[Any],
         state_scope: StateScope,
         state_record_keys: Sequence[str] | None = None,
     ) -> int:
         target_keys = list(keys)
         scoped_keys = target_keys if state_record_keys is None else list(state_record_keys)
-        validate_state_keys(target_keys)
         validate_state_keys(scoped_keys)
         target_exists = bool(target_keys) and self._table_columns(table) is not None
         if not target_exists and not scoped_keys:

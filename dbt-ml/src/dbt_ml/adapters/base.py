@@ -611,7 +611,7 @@ class WarehouseAdapter(ABC):
         table: str,
         *,
         key_col: str,
-        keys: Sequence[str],
+        keys: Sequence[Any],
         state_scope: StateScope,
         state_record_keys: Sequence[str] | None = None,
     ) -> int:

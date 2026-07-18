@@ -18,6 +18,7 @@ from .profile import ResolvedProfile
 from .providers import (
     ProviderConfigurationError,
     ProviderNotFoundError,
+    get_embedding_provider,
     get_inference_provider,
 )
 from .retrieval import (
@@ -136,6 +137,15 @@ def validate_project_contract(
                     ) from e
         if model.transform is not None:
             _validate_transform(model, project_dir)
+        if model.embed is not None:
+            try:
+                get_embedding_provider(model.embed.provider)
+            except (ProviderNotFoundError, ProviderConfigurationError) as e:
+                raise _model_error(
+                    model,
+                    str(e),
+                    ("embed", "provider"),
+                ) from e
     try:
         validate_ml_project_contracts(models, project, project_dir)
     except MLContractError as e:
@@ -187,7 +197,12 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.CHUNKED_WRITES] = (
                 "bounded extraction writes"
             )
-        if model.transform is not None or model.ml is not None or model.chunk is not None:
+        if (
+            model.transform is not None
+            or model.ml is not None
+            or model.chunk is not None
+            or model.embed is not None
+        ):
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
             )
@@ -445,7 +460,7 @@ def _validate_model_edges(
         raise _model_error(
             model,
             f"Model '{model.name}' must declare exactly one of "
-            "extraction/transform/ml/chunk/search",
+            "extraction/transform/ml/chunk/embed/search",
         )
 
     if model.extraction is not None:
@@ -508,6 +523,12 @@ def _validate_model_edges(
         raise _model_error(
             model,
             f"Chunk model '{model.name}' must declare exactly one `depends_on:` model",
+            ("depends_on",),
+        )
+    if model.embed is not None and len(dependencies) != 1:
+        raise _model_error(
+            model,
+            f"Embed model '{model.name}' must declare exactly one `depends_on:` model",
             ("depends_on",),
         )
 
@@ -640,6 +661,8 @@ def _kind_label(model: ModelConfig) -> str:
         return "ML"
     if model.chunk is not None:
         return "Chunk"
+    if model.embed is not None:
+        return "Embed"
     if model.search is not None:
         return "Search"
     return "Unknown"

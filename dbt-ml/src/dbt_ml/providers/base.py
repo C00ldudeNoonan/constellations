@@ -394,6 +394,7 @@ class EmbeddingRequest:
     model: str
     texts: tuple[str, ...] = field(repr=False)
     dimensions: int | None = None
+    input_ids: tuple[str, ...] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -408,6 +409,18 @@ class EmbeddingRequest:
             or self.dimensions < 1
         ):
             raise ValueError("embedding dimensions must be a positive integer")
+        if self.input_ids is not None and (
+            not isinstance(self.input_ids, tuple)
+            or len(self.input_ids) != len(self.texts)
+            or any(
+                not isinstance(input_id, str) or not input_id
+                for input_id in self.input_ids
+            )
+            or len(self.input_ids) != len(set(self.input_ids))
+        ):
+            raise ValueError(
+                "embedding input_ids must align one-to-one with texts and be unique"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +428,7 @@ class EmbeddingResult:
     vectors: tuple[tuple[float, ...], ...] = field(repr=False)
     model: str
     dimensions: int
+    input_ids: tuple[str, ...] | None = field(default=None, repr=False)
     usage: ProviderUsage = field(default_factory=ProviderUsage)
 
     def __post_init__(self) -> None:
@@ -440,6 +454,19 @@ class EmbeddingResult:
             for value in vector
         ):
             raise ValueError("embedding vectors must contain finite numbers")
+        if self.input_ids is not None and (
+            not isinstance(self.input_ids, tuple)
+            or len(self.input_ids) != len(self.vectors)
+            or any(
+                not isinstance(input_id, str) or not input_id
+                for input_id in self.input_ids
+            )
+            or len(self.input_ids) != len(set(self.input_ids))
+        ):
+            raise ValueError(
+                "embedding result input_ids must align one-to-one with vectors "
+                "and be unique"
+            )
         if not isinstance(self.usage, ProviderUsage):
             raise ValueError("embedding usage must be ProviderUsage")
 
@@ -753,6 +780,11 @@ class EmbeddingProvider(BaseProvider):
         if request.dimensions is not None and result.dimensions != request.dimensions:
             raise ProviderResponseError(
                 "provider embedding dimensions do not match the request",
+                safe_for_display=True,
+            )
+        if request.input_ids is not None and result.input_ids != request.input_ids:
+            raise ProviderResponseError(
+                "provider embedding result IDs do not align with the request",
                 safe_for_display=True,
             )
         return result

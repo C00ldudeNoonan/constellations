@@ -10,6 +10,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from math import isfinite
@@ -24,6 +25,7 @@ from .adapters import (
     StateRecord,
     StateScope,
     StateValue,
+    TableReadSnapshot,
     WarehouseAdapter,
     create_adapter,
 )
@@ -260,6 +262,26 @@ class _SerializedAdapter:
     def __init__(self, adapter: WarehouseAdapter, lock: threading.Lock) -> None:
         self._adapter = adapter
         self._lock = lock
+
+    @contextmanager
+    def table_snapshot(
+        self,
+        table: str,
+        *,
+        columns: Sequence[str] | None = None,
+        batch_size: int = 10_000,
+        predicate: Any = None,
+        key_column: str | None = None,
+    ) -> Iterator[TableReadSnapshot]:
+        with self._lock:
+            with self._adapter.table_snapshot(
+                table,
+                columns=columns,
+                batch_size=batch_size,
+                predicate=predicate,
+                key_column=key_column,
+            ) as snapshot:
+                yield snapshot
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._adapter, name)

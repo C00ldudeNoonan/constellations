@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
 import pytest
@@ -10,7 +14,13 @@ import pytest
 from dbt_ml.config import ConfigError
 from dbt_ml.config.source import SourceConfig
 from dbt_ml.manifest import write_run_results
-from dbt_ml.runner import RunError, build_project, clean_project, run_project
+from dbt_ml.runner import (
+    RunError,
+    _SerializedAdapter,
+    build_project,
+    clean_project,
+    run_project,
+)
 from dbt_ml.sources import LocalDocumentSource
 from dbt_ml.synth import generate_invoices, generate_support_tickets
 from dbt_ml.versioning import compute_document_id
@@ -389,6 +399,40 @@ def test_threaded_run_parallelizes_independent_branches(fresh_project: Path) -> 
     monthly = _query(db, 'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.monthly_totals')
     assert summary[0][0] > 0
     assert monthly[0][0] > 0
+
+
+def test_serialized_adapter_holds_lock_for_snapshot_lifetime() -> None:
+    snapshot_entered = threading.Event()
+    release_snapshot = threading.Event()
+    second_call_finished = threading.Event()
+
+    class Adapter:
+        @contextmanager
+        def table_snapshot(self, table: str, **kwargs: Any) -> Iterator[object]:
+            del table, kwargs
+            snapshot_entered.set()
+            yield object()
+
+        def list_tables(self) -> list[str]:
+            second_call_finished.set()
+            return []
+
+    guarded = _SerializedAdapter(cast(Any, Adapter()), threading.Lock())
+
+    def hold_snapshot() -> None:
+        with guarded.table_snapshot("upstream"):
+            release_snapshot.wait(timeout=2)
+
+    first = threading.Thread(target=hold_snapshot)
+    second = threading.Thread(target=guarded.list_tables)
+    first.start()
+    assert snapshot_entered.wait(timeout=2)
+    second.start()
+    assert not second_call_finished.wait(timeout=0.05)
+    release_snapshot.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    assert second_call_finished.is_set()
 
 
 def test_clean_preserves_duckdb(fresh_project: Path) -> None:

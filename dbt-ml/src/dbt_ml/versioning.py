@@ -158,7 +158,8 @@ def compute_model_code_version(
         search=model.search,
         depends_on=(
             [parse_ref(dependency) for dependency in model.depends_on]
-            if model.chunk is not None and model.depends_on
+            if (model.chunk is not None or model.search is not None)
+            and model.depends_on
             else None
         ),
         fields=model.fields,

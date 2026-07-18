@@ -20,6 +20,8 @@ from dbt_ml.config.model import (
     ExtractionConfig,
     FieldConfig,
     ModelConfig,
+    SearchConfig,
+    SearchQueryConfig,
     TransformConfig,
 )
 from dbt_ml.config.profile import LLMConfig
@@ -322,6 +324,27 @@ def test_provider_and_model_change_model_code_version(
     )
     assert baseline != compute_model_code_version(
         _llm_model(provider="provider-a", model="model-b"), project, tmp_path
+    )
+
+
+def test_search_dependency_changes_model_code_version(tmp_path: Path) -> None:
+    project = ProjectConfig(name="p")
+    first = ModelConfig(
+        name="search_index",
+        depends_on=["ref('first_embeddings')"],
+        materialization="incremental",
+        search=SearchConfig(
+            id_field="record_id",
+            text_fields=("text",),
+            query=SearchQueryConfig(modes=frozenset({"filter"})),
+        ),
+    )
+    second = first.model_copy(
+        update={"depends_on": ["ref('second_embeddings')"]},
+    )
+
+    assert compute_model_code_version(first, project, tmp_path) != (
+        compute_model_code_version(second, project, tmp_path)
     )
 
 

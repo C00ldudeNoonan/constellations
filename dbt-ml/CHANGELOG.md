@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Incremental LanceDB search indexes (issue #134)
+
+- Added a distinct `search:` DAG resource and independent `RetrievalStore`
+  contract with strict capability preflight, typed predicates, safe target
+  descriptors, exact mutation receipts, and manifest v2 serving-resource
+  artifacts. Search indexes never masquerade as warehouse relations or appear
+  as dbt source tables.
+- Added an optional local LanceDB store with owned typed collections, exact or
+  approximate vector indexes, full-text and scalar indexes, bounded incremental
+  keyed publication, stale-row deletion, and state updates only after durable
+  store acknowledgements plus successful index, count, schema, and source-
+  generation validation. Physical target identity is alias-independent, so two
+  aliases cannot evade collection-collision or state-scope checks.
+- Public indexes require operator opt-in in `profiles.yml`. Governed access,
+  portable query CLI/API, online replacement, full refresh, and concurrent
+  publish/read coordination fail closed or remain follow-up work in #135 and
+  #152. The RAG chunks example now provides an offline end-to-end PoC.
+
 ### Bounded warehouse snapshot reads (issue #140)
 
 - DuckDB and BigQuery now expose an immutable `table_snapshot()` context with

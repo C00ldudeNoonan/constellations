@@ -259,6 +259,14 @@ class ProtectedWarehouseConfig(dict[str, Any]):
         return cls(prepared)
 
 
+class RetrievalProfileConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    default: str
+    allow_public_indexes: bool = False
+    stores: dict[str, dict[str, Any]]
+
+
 class TargetConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -270,6 +278,7 @@ class TargetConfig(BaseModel):
     # time, once `type:` is known (the adapter registry owns that lookup).
     warehouse: ProtectedWarehouseConfig
     llm: LLMConfig | None = None
+    retrieval: RetrievalProfileConfig | None = None
     # Operator-owned source roots for this target. Keys are source names from
     # project YAML; values replace SourceConfig.path after target resolution.
     source_paths: dict[str, str] = Field(default_factory=dict, alias="source-paths")

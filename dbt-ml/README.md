@@ -6,10 +6,11 @@ tables. Incremental processing, schema tests, dbt-style selectors, profiles,
 and a manifest artifact you can wire into other tools.
 
 The current v0.2 preview is pure Python and supports DuckDB and BigQuery
-warehouses, local and GCS sources, document chunk models, and executable
-classic text-ML providers. Additional warehouse adapters, embeddings, and
-retrieval stores remain roadmap work; Rust and PyO3 are explicitly out of scope
-through v0.2.
+warehouses, local and GCS sources, document chunk models, executable classic
+text-ML providers, and an incremental local LanceDB search-index proof of
+concept. Additional warehouse and hosted retrieval adapters and production
+embedding providers remain roadmap work; Rust and PyO3 are explicitly out of
+scope through v0.2.
 
 ## Where dbt-ml fits
 
@@ -65,6 +66,7 @@ The core install stays lean. Add only the feature groups a project uses:
 | `pii` | Presidio PII detection and redaction; a spaCy language model is still installed separately |
 | `bigquery` | BigQuery warehouse adapter |
 | `gcs` | Google Cloud Storage document sources |
+| `lancedb` | Local LanceDB search-index publication and queries |
 | `all` | Every optional feature above |
 
 For example, `uv add 'dbt-ml[pdf,text]'` installs PDF and text processing,
@@ -122,6 +124,13 @@ mode (`0600`), but the files still contain extracted document data and must be
 handled as sensitive. Use
 deterministic local backends for sensitive documents unless remote processing is
 intended.
+
+Local LanceDB collections contain the projected chunk text, embeddings, and
+returned/filter attributes in plaintext beneath the operator-configured profile
+path. The first slice supports only `access: public`, and only when the active
+profile explicitly sets `retrieval.allow_public_indexes: true`. Do not use it
+for tenant- or ACL-governed data; governed publication is rejected until the
+trusted policy and publish/read coordination work in #152 lands.
 
 ### Trust model & filesystem boundaries
 
@@ -228,7 +237,7 @@ dbt-ml graph                                               # Mermaid DAG to stdo
 dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR]
 dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR]
-dbt-ml ls [--select EXPR] [--resource-type {model,source,all}] [--output {name,json}]
+dbt-ml ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table
 dbt-ml source freshness                                    # mtime vs warn_after/error_after
 dbt-ml docs generate [--output DIR]                        # static HTML site from manifest.json
@@ -742,6 +751,86 @@ See `examples/rag_chunks_pipeline/` for a runnable registry → chunks project.
 Domain keys (symbol, filing date, …) and embeddings belong in transforms /
 downstream dbt models layered on top — the chunk grain stays generic.
 
+## Search indexes (local proof of concept)
+
+A `search:` resource publishes exactly one upstream warehouse model to an
+independently configured retrieval store. It is a leaf serving resource, not a
+warehouse relation. Install `dbt-ml[lancedb]`, configure the operator-owned
+store in `profiles.yml`, and explicitly opt in to public indexes:
+
+```yaml
+my_project:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/dbt_ml.duckdb
+        schema: my_project
+      retrieval:
+        default: local
+        allow_public_indexes: true
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb
+```
+
+The project model declares the portable serving contract:
+
+```yaml
+- name: chunk_search
+  depends_on: [ref('chunk_embeddings')]
+  materialization: incremental
+  search:
+    access: public
+    store: local
+    collection: document_chunks
+    id_field: chunk_id
+    text_fields: [text]
+    return_text_fields: [text]
+    vector:
+      field: embedding
+      dimensions: 768
+      metric: cosine
+      search: exact
+      embedding:
+        provider: external
+        model: my-embedding-model
+        provider_contract_version: 2
+        provider_implementation: my-pipeline:v1
+        semantic_config_fingerprint: preprocessing-and-model-config-v1
+        dimensions: 768
+    full_text:
+      fields: [text]
+    attributes:
+      - name: source_uri
+        data_type: string
+        filter_role: user
+        returned: true
+    query:
+      modes: [vector, text, filter]
+      consistency: strong
+```
+
+`run` and `build` stream projected Arrow batches from the warehouse, validate
+the declared row contract before each mutation, upsert changed rows, delete
+stale rows, and advance warehouse state only after exact durable receipts,
+index validation, and the snapshot generation check all succeed.
+`ls --resource-type search_index` lists serving resources; `show` rejects them
+because they have no warehouse table. Manifest v2 exposes a non-secret
+`serving_resource` descriptor. Until #135 lands, applications query through the
+typed Python `RetrievalStore` API; the runnable
+`examples/rag_chunks_pipeline/search_demo.py` shows that boundary.
+
+This first slice deliberately rejects governed indexes, search-resource tests,
+full refresh, online/rebuild schema changes, arbitrary predicate strings, and
+adapter-specific index options. Externally generated vectors must declare a
+complete embedding identity; `embedding: inherit` remains blocked on the native
+`embed:` resource in #138. Hybrid query scoring remains #135. Publication/read
+leases and a readiness ledger remain #152; bounded state paging remains #153.
+These are unsupported guarantees, not silent best-effort behavior.
+
 ## Built-in text preprocessing
 
 Reference any of these as a Python transform module — no project-local code
@@ -997,15 +1086,17 @@ The live plan is maintained in GitHub issues tagged
 [`roadmap`](https://github.com/C00ldudeNoonan/dbt-ml/issues?q=is%3Aissue+label%3Aroadmap).
 Already shipped in the v0.2 preview: the warehouse adapter seam, DuckDB and
 BigQuery, GCS sources, recursive/token chunk models, layout-preserving HTML/PDF
-metadata, PII redaction, and the first classic-ML providers.
+metadata, PII redaction, the first classic-ML providers, and the local LanceDB
+search-index proof of concept.
 
 Next adapter work follows dbt-core's warehouse set over time: Postgres first,
-then Snowflake, Databricks, and Redshift. Embeddings/vector storage, more parser
-providers, and evaluation/reranking remain roadmap items. Incremental state
-stays adapter-owned. Rust, PyO3, and Metaxy remain explicitly deferred.
+then Snowflake, Databricks, and Redshift. Production embeddings, hosted
+retrieval stores, more parser providers, and evaluation/reranking remain
+roadmap items. Incremental state stays adapter-owned. Rust, PyO3, and Metaxy
+remain explicitly deferred.
 
 The accepted [semantic retrieval architecture](docs/architecture/semantic-retrieval.md)
-defines the planned `search:` DAG resource, `RetrievalStore` boundary, typed
-filters and mandatory policy prefilters, incremental publication state, and
-serving-resource artifacts. It is an implementation contract for roadmap work,
-not a claim that a retrieval store or `dbt-ml search` already ships.
+defines the `search:` DAG resource, `RetrievalStore` boundary, typed filters,
+incremental publication state, and serving-resource artifacts. The local public
+LanceDB slice ships; mandatory policy prefilters, the portable `dbt-ml search`
+surface, and coordinated readiness remain roadmap work and fail closed.

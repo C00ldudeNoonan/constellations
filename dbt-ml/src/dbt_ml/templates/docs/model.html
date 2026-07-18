@@ -33,6 +33,19 @@
 <p>Module: <code>{{ model.transform.module }}</code></p>
 {% endif %}
 
+{% if model.resource_type == 'search_index' %}
+<h2>Serving resource</h2>
+<p>
+  Store: <code>{{ model.output.serving_resource.store_type }}</code> ·
+  Collection: <code>{{ model.output.serving_resource.physical_collection }}</code> ·
+  Access: <code>{{ model.access }}</code>
+</p>
+<p>Upstream: <code>{{ model.output.serving_resource.upstream }}</code></p>
+<p class="muted">
+  config_fingerprint: <code>{{ model.output.serving_resource.config_fingerprint }}</code>
+</p>
+{% endif %}
+
 {% if model.fields %}
 <h2>Fields</h2>
 <table>

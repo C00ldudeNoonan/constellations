@@ -46,6 +46,12 @@ from .providers import (
     get_inference_provider,
     resolve_provider_model,
 )
+from .retrieval import (
+    RetrievalConfigError,
+    RetrievalStoreConfig,
+    absolutize_store_config,
+    parse_store_config,
+)
 
 PROFILES_FILENAME = "profiles.yml"
 PROFILES_DIR_ENV = "DBT_ML_PROFILES_DIR"
@@ -54,6 +60,13 @@ LEGACY_PROFILES_DIR_ENV = "DOCBT_PROFILES_DIR"
 
 class ProfileError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ResolvedRetrievalConfig:
+    default: str
+    allow_public_indexes: bool
+    stores: dict[str, RetrievalStoreConfig]
 
 
 @dataclass(frozen=True)
@@ -66,6 +79,7 @@ class ResolvedProfile:
     llm: LLMConfig | None
     source_paths: dict[str, str]
     profiles_path: Path | None  # None when using inline-legacy fallback
+    retrieval: ResolvedRetrievalConfig | None = None
 
 
 def resolve_profile(
@@ -149,11 +163,13 @@ def resolve_profile(
                 f"{profiles_path}: profile '{project.profile}' target "
                 f"'{target_name}' selects {e}"
             ) from e
+    retrieval = _resolve_retrieval(selected.retrieval, project_dir, profiles_path)
     return ResolvedProfile(
         profile_name=project.profile,
         target_name=target_name,
         warehouse=warehouse.absolutize(project_dir),
         llm=llm,
+        retrieval=retrieval,
         source_paths=selected.source_paths,
         profiles_path=profiles_path,
     )
@@ -187,8 +203,39 @@ def _legacy_resolved(project: ProjectConfig) -> ResolvedProfile:
         target_name="<inline>",
         warehouse=warehouse,
         llm=None,
+        retrieval=None,
         source_paths={},
         profiles_path=None,
+    )
+
+
+def _resolve_retrieval(
+    retrieval: Any,
+    project_dir: Path,
+    profiles_path: Path,
+) -> ResolvedRetrievalConfig | None:
+    if retrieval is None:
+        return None
+    if retrieval.default not in retrieval.stores:
+        raise ProfileError(
+            f"{profiles_path}: retrieval.default '{retrieval.default}' is not in "
+            f"retrieval.stores. Available: {sorted(retrieval.stores)}"
+        )
+    stores: dict[str, RetrievalStoreConfig] = {}
+    for alias, raw in retrieval.stores.items():
+        if not alias:
+            raise ProfileError(f"{profiles_path}: retrieval store aliases must not be empty")
+        try:
+            parsed = parse_store_config(raw)
+            stores[alias] = absolutize_store_config(parsed, project_dir)
+        except RetrievalConfigError as error:
+            raise ProfileError(
+                f"{profiles_path}: retrieval store '{alias}': {error}"
+            ) from None
+    return ResolvedRetrievalConfig(
+        default=retrieval.default,
+        allow_public_indexes=retrieval.allow_public_indexes,
+        stores=stores,
     )
 
 

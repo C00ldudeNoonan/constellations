@@ -3,10 +3,17 @@
 {% block content %}
 <h1>{{ project.name }} <span class="muted">v{{ project.version }}</span></h1>
 <p class="muted">
+  {% if target %}
+  Warehouse: <code>{{ target.warehouse.adapter_type }}</code> ·
+  Schema: <code>{{ target.warehouse.schema }}</code> ·
+  Profile: <code>{{ target.profile }}</code> ·
+  Target: <code>{{ target.name }}</code>
+  {% else %}
   Warehouse: <code>{{ project.duckdb_path }}</code> ·
   Schema: <code>{{ project.duckdb_schema }}</code> ·
   Profile: <code>{{ project.profile }}</code> ·
   Target: <code>{{ project.target }}</code>
+  {% endif %}
 </p>
 
 <h2>Sources <span class="muted">({{ sources|length }})</span></h2>
@@ -44,7 +51,7 @@
 
 <h2>Execution order</h2>
 <ol>
-  {% for name in dag.execution_order %}<li><a href="model_{{ name }}.html">{{ name }}</a></li>{% endfor %}
+  {% for name in dag.execution_order %}<li><a href="model_{{ name.split('.')[-1] }}.html">{{ name }}</a></li>{% endfor %}
 </ol>
 
 <h2>DAG (Mermaid)</h2>

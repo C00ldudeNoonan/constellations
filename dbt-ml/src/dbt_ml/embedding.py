@@ -4,8 +4,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Self
 
-from .config.model import EmbedConfig
+from .config.model import EmbedConfig, ModelConfig
 from .credentials import CredentialReference
+from .dag import parse_ref
 from .hashing import canonical_fingerprint
 from .providers import (
     EmbeddingRequest,
@@ -102,6 +103,52 @@ class EmbeddingIdentity:
 class EmbeddedTexts:
     vectors: tuple[tuple[float, ...], ...]
     usage: ProviderUsage
+
+
+def resolve_search_embedding_identity(
+    model: ModelConfig,
+    models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
+) -> EmbeddingIdentity | None:
+    search = model.search
+    if search is None or search.vector is None or search.vector.embedding != "inherit":
+        return None
+    models_by_name = (
+        models if isinstance(models, Mapping) else {item.name: item for item in models}
+    )
+    dependencies = model.depends_on or []
+    if len(dependencies) != 1:
+        raise ValueError("inherited search embeddings require exactly one upstream model")
+    upstream_name = parse_ref(dependencies[0])
+    upstream = models_by_name.get(upstream_name)
+    if upstream is None or upstream.embed is None:
+        raise ValueError(
+            "inherited search embeddings require a direct upstream embed model"
+        )
+    if search.vector.field != upstream.embed.vector_field:
+        raise ValueError(
+            "inherited search vector field must match the upstream embed vector field"
+        )
+    if search.vector.dimensions != upstream.embed.dimensions:
+        raise ValueError(
+            "inherited search dimensions must match the upstream embed dimensions"
+        )
+    return EmbeddingIdentity.from_config(upstream.embed)
+
+
+def effective_search_config(
+    model: ModelConfig,
+    models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
+) -> dict[str, Any]:
+    search = model.search
+    if search is None:
+        raise ValueError("effective search configuration requires a search model")
+    payload = search.model_dump(mode="python")
+    identity = resolve_search_embedding_identity(model, models)
+    if identity is not None:
+        vector = dict(payload["vector"])
+        vector["embedding"] = identity.to_dict()
+        payload["vector"] = vector
+    return payload
 
 
 def _embedding_config_hash(

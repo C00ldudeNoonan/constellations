@@ -12,6 +12,7 @@ from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .config.yaml_diagnostics import ConfigPath
 from .dag import DAGError, ProjectDAG, parse_ref
+from .embedding import resolve_search_embedding_identity
 from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
 from .profile import ResolvedProfile
@@ -47,6 +48,7 @@ def validate_project_contract(
 
     source_names = {source.name for source in sources}
     model_names = {model.name for model in models}
+    models_by_name = {model.name: model for model in models}
     search_names = {model.name for model in models if model.search is not None}
     duplicates = source_names & model_names
     if duplicates:
@@ -71,6 +73,23 @@ def validate_project_contract(
         _validate_tests(model, source_names, model_names, project_dir)
         _validate_model_edges(model, source_names, model_names, search_names)
         _validate_materialization(model)
+        if (
+            model.search is not None
+            and model.search.vector is not None
+            and model.search.vector.embedding == "inherit"
+        ):
+            try:
+                resolve_search_embedding_identity(model, models_by_name)
+            except (
+                ValueError,
+                ProviderNotFoundError,
+                ProviderConfigurationError,
+            ) as error:
+                raise _model_error(
+                    model,
+                    str(error),
+                    ("search", "vector", "embedding"),
+                ) from error
         if model.extraction is not None:
             backend = model.extraction.backend or default_backend
             if backend not in available_backends:
@@ -276,21 +295,6 @@ def validate_retrieval_capabilities(
                 f"Retrieval store '{config.type}' does not accept index_options in the "
                 "reference implementation",
                 ("search", "index_options"),
-            )
-        if search.vector is not None and search.vector.embedding == "inherit":
-            raise _model_error(
-                model,
-                "search.vector.embedding: inherit requires the canonical upstream "
-                "embed resource from #138; external vectors must declare a complete "
-                "embedding identity",
-                ("search", "vector", "embedding"),
-            )
-        if "hybrid" in search.query.modes:
-            raise _model_error(
-                model,
-                "Portable hybrid retrieval and score normalization are delivered by "
-                "the #135 query contract; use vector, text, or filter modes in this slice",
-                ("search", "query", "modes"),
             )
         cls = store_class(config.type)
         capabilities = cls.capabilities()

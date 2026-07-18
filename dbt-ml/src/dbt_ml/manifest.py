@@ -14,6 +14,7 @@ from .config import load_project
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .dag import NodeKind, ProjectDAG, parse_ref
+from .embedding import effective_search_config
 from .hashing import canonical_fingerprint
 from .profile import (
     ProfileError,
@@ -331,6 +332,7 @@ def _build_manifest_v2(
     project_dir: Path,
     resolved: ResolvedProfile,
 ) -> dict[str, Any]:
+    models_by_name = {model.name: model for model in models}
     used_aliases = {
         (model.search.store or resolved.retrieval.default)
         for model in models
@@ -392,7 +394,14 @@ def _build_manifest_v2(
             for source in sources
         ],
         "models": [
-            _model_dict_v2(model, project, project_dir, resolved) for model in models
+            _model_dict_v2(
+                model,
+                project,
+                project_dir,
+                resolved,
+                models_by_name,
+            )
+            for model in models
         ],
         "dag": {
             "execution_order": [
@@ -424,6 +433,7 @@ def _model_dict_v2(
     project: ProjectConfig,
     project_dir: Path,
     resolved: ResolvedProfile,
+    models_by_name: dict[str, ModelConfig],
 ) -> dict[str, Any]:
     if model.search is None:
         row = _model_dict(model, project, project_dir, resolved)
@@ -457,6 +467,7 @@ def _model_dict_v2(
         descriptor=state_target.descriptor(),
     )
     capabilities = store_class(config.type).capabilities()
+    effective_search = effective_search_config(model, models_by_name)
     required = [
         "keyed_upsert",
         "keyed_delete",
@@ -498,7 +509,7 @@ def _model_dict_v2(
                 "materialization": model.materialization,
                 "schema_version": 1,
                 "config_fingerprint": collection_config_fingerprint(
-                    search.model_dump(mode="python"), store_type=config.type
+                    effective_search, store_type=config.type
                 ),
                 "id_field": search.id_field,
                 "text_fields": list(search.text_fields),
@@ -508,7 +519,7 @@ def _model_dict_v2(
                     if search.full_text is not None
                     else None
                 ),
-                "vector": search.vector.model_dump(mode="json") if search.vector else None,
+                "vector": effective_search.get("vector"),
                 "attributes": [
                     attribute.model_dump(mode="json") for attribute in search.attributes
                 ],

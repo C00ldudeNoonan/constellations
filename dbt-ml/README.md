@@ -242,6 +242,7 @@ dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR]
 dbt-ml ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table
+dbt-ml search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
 dbt-ml source freshness                                    # mtime vs warn_after/error_after
 dbt-ml docs generate [--output DIR]                        # static HTML site from manifest.json
 dbt-ml docs serve [--port N]                               # local http.server over target/docs/
@@ -841,13 +842,7 @@ The project model declares the portable serving contract:
       dimensions: 768
       metric: cosine
       search: exact
-      embedding:
-        provider: external
-        model: my-embedding-model
-        provider_contract_version: 2
-        provider_implementation: my-pipeline:v1
-        semantic_config_fingerprint: preprocessing-and-model-config-v1
-        dimensions: 768
+      embedding: inherit
     full_text:
       fields: [text]
     attributes:
@@ -856,7 +851,7 @@ The project model declares the portable serving contract:
         filter_role: user
         returned: true
     query:
-      modes: [vector, text, filter]
+      modes: [vector, text, hybrid]
       consistency: strong
 ```
 
@@ -866,17 +861,51 @@ stale rows, and advance warehouse state only after exact durable receipts,
 index validation, and the snapshot generation check all succeed.
 `ls --resource-type search_index` lists serving resources; `show` rejects them
 because they have no warehouse table. Manifest v2 exposes a non-secret
-`serving_resource` descriptor. Until #135 lands, applications query through the
-typed Python `RetrievalStore` API; the runnable
-`examples/rag_chunks_pipeline/search_demo.py` shows that boundary.
+`serving_resource` descriptor with the resolved embedding identity.
+
+Query the index from the CLI:
+
+```bash
+dbt-ml search --model chunk_search --query "latest inflation release" --mode hybrid
+dbt-ml search --model chunk_search --query "inflation" \
+  --filter source_uri eq reports/cpi.md --output json
+dbt-ml search --model chunk_search --query "labor market" \
+  --filter category in '["employment", "wages"]'
+```
+
+Filters are repeatable `FIELD OP VALUE` triples. Operators are `eq`, `ne`,
+`lt`, `le`, `gt`, `ge`, and `in`; `in` takes a JSON array. Values are parsed
+against the attribute's declared type, and only attributes with
+`filter_role: user` can be supplied by a caller. Multiple filters are combined
+with AND.
+
+The same request is available as a provider-neutral Python API:
+
+```python
+from dbt_ml.search import SearchMode, SearchRequest, search
+
+results = search(
+    ".",
+    SearchRequest(
+        model="chunk_search",
+        query="latest inflation release",
+        mode=SearchMode.HYBRID,
+        limit=10,
+    ),
+)
+```
+
+Vector queries can provide a precomputed `vector=` instead of query text. When
+`embedding: inherit` points directly to a native `embed:` model, dbt-ml reuses
+that model's exact provider identity for query-time embedding and rejects stale
+or dimension-incompatible indexes. Externally generated vectors still declare
+a complete embedding identity and require a precomputed query vector.
 
 This first slice deliberately rejects governed indexes, search-resource tests,
 full refresh, online/rebuild schema changes, arbitrary predicate strings, and
-adapter-specific index options. Externally generated vectors must declare a
-complete embedding identity; `embedding: inherit` remains blocked on the native
-`embed:` resource in #138. Hybrid query scoring remains #135. Publication/read
-leases and a readiness ledger remain #152; bounded state paging remains #153.
-These are unsupported guarantees, not silent best-effort behavior.
+adapter-specific index options. Publication/read leases, mandatory policy
+filters, and a readiness ledger remain #152; bounded state paging remains
+#153. These are unsupported guarantees, not silent best-effort behavior.
 
 ## Built-in text preprocessing
 
@@ -1145,5 +1174,6 @@ remain explicitly deferred.
 The accepted [semantic retrieval architecture](docs/architecture/semantic-retrieval.md)
 defines the `search:` DAG resource, `RetrievalStore` boundary, typed filters,
 incremental publication state, and serving-resource artifacts. The local public
-LanceDB slice ships; mandatory policy prefilters, the portable `dbt-ml search`
-surface, and coordinated readiness remain roadmap work and fail closed.
+LanceDB publication and portable Python/`dbt-ml search` query surfaces ship;
+mandatory policy prefilters and coordinated readiness remain roadmap work and
+fail closed.

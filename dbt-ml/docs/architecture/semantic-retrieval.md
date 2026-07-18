@@ -1735,9 +1735,9 @@ their owning follow-ups:
 - #140 adds immutable projected snapshots and key-domain validation; #153 adds
   bounded state reconciliation and atomic scope-state replacement before
   production-scale publication is claimed.
-- #135 builds the portable query service, Python API, and `dbt-ml search` over
-  the authorization factory, read-lease, request/result/filter, score, and
-  core-RRF contracts here.
+- #135 delivers the portable request/result/filter types, Python API,
+  `dbt-ml search`, score normalization, and core RRF for public indexes. The
+  authorization factory and read lease remain fail-closed on #152.
 - #136 implements turbopuffer without changing resource grammar or core request
   types.
 - #154 supplies the protected profile-credential representation before #136 or
@@ -1767,12 +1767,12 @@ The bounded #134 slice covers:
   safe docs, and credential/content/filter/vector redaction;
 - dbt export's all-selector upstream projection, deduplication, and exclusion.
 
-#152 owns shared/exclusive leases, governed ACL delete-before-upsert,
+#152 owns shared/exclusive leases, governed query authorization and mandatory
+policy-filter composition, governed ACL delete-before-upsert,
 concurrent-publisher, abandoned-session, snapshot-generation, durable readiness,
 and readiness-race tests. #153 owns paged state reconciliation and atomic full
-state replacement. #135 owns the complete filter AST, public/governed query
-authorization, identity-bearing query vectors, score normalization, cache
-isolation, and deterministic RRF/tie-breaking tests.
+state replacement. #135 owns the public-index filter contract, identity-bearing
+query vectors, score normalization, and deterministic RRF/tie-breaking tests.
 
 ## Rejected alternatives
 

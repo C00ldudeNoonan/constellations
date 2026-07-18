@@ -401,7 +401,7 @@ class LanceDBStore(RetrievalStore):
             if where is not None:
                 query = query.where(where, prefilter=True)
             if columns is not None:
-                query = query.select(list(columns))
+                query = query.select([*columns, "_distance"])
             return cast(pa.Table, query.limit(limit).to_arrow())
         except Exception:
             raise RetrievalError(
@@ -431,7 +431,7 @@ class LanceDBStore(RetrievalStore):
             if where is not None:
                 builder = builder.where(where, prefilter=True)
             if columns is not None:
-                builder = builder.select(list(columns))
+                builder = builder.select([*columns, "_score"])
             return cast(pa.Table, builder.limit(limit).to_arrow())
         except Exception:
             raise RetrievalError(

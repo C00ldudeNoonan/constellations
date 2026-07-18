@@ -388,6 +388,20 @@ class SearchConfig(BaseModel):
     def _validate_contract(self) -> SearchConfig:
         if not self.text_fields:
             raise ValueError("search.text_fields must not be empty")
+        declared_fields = {
+            self.id_field,
+            self.document_id_field,
+            self.chunk_id_field,
+            *self.text_fields,
+            self.vector.field if self.vector is not None else None,
+            *(attribute.name for attribute in self.attributes),
+            *self.display_fields,
+        }
+        reserved = {"_distance", "_score", "_relevance_score"}
+        if declared_fields & reserved:
+            raise ValueError(
+                "search fields cannot use reserved retrieval score column names"
+            )
         for label, values in (
             ("text_fields", self.text_fields),
             ("return_text_fields", self.return_text_fields),

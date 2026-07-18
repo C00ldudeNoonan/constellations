@@ -12,7 +12,8 @@ dbt-ml is a standalone CLI rather than a dbt package or dbt adapter.
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
 > and BigQuery warehouses, local and GCS sources, metadata-aware deterministic
 > chunk models, record-scoped incremental state, bounded projected warehouse
-> snapshots for serving sinks, classic text ML, and six extraction backends. See
+> snapshots, an incremental local LanceDB search sink, classic text ML, and six
+> extraction backends. See
 > [`dbt-ml/README.md`](dbt-ml/README.md) for the full reference.
 
 ## What a pipeline looks like
@@ -176,8 +177,8 @@ third-party projects or sensitive documents.
 - **[Contributing](dbt-ml/CONTRIBUTING.md)** — how to add a backend, test, or
   command.
 - **[Semantic retrieval architecture](dbt-ml/docs/architecture/semantic-retrieval.md)**
-  — the accepted, not-yet-implemented `search:` resource and retrieval-store
-  contract.
+  — the `search:` resource and retrieval-store contract, including the shipped
+  local LanceDB proof of concept and its fail-closed boundaries.
 - **[Changelog](dbt-ml/CHANGELOG.md)**
 
 ## License

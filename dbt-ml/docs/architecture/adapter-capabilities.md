@@ -1,7 +1,7 @@
 # Adapter capability architecture
 
 Status: accepted for issue #70; bounded snapshot reads implemented in issue
-#140.
+#140 and the first independent retrieval-store implementation in issue #134.
 
 ## Decision
 
@@ -11,7 +11,7 @@ A warehouse is the tabular system of record for model outputs, lineage columns,
 incremental state, tests, transforms, and artifacts consumed by dbt. A retrieval
 store owns serving-collection/index lifecycle and the typed vector, text,
 filtered, and hybrid query modes it advertises. LanceDB therefore implements the
-future `RetrievalStore` contract; it does not implement `WarehouseAdapter` or
+`RetrievalStore` contract; it does not implement `WarehouseAdapter` or
 emulate SQL.
 
 Search-index models will read their canonical rows and lineage from the

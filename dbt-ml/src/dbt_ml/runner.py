@@ -9,20 +9,23 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
+import pyarrow as pa
 
 from .adapters import (
     AdapterError,
     StateRecord,
     StateScope,
     StateValue,
+    TableReadSnapshot,
     WarehouseAdapter,
     create_adapter,
 )
@@ -37,7 +40,11 @@ from .backends.options import LLMBackendOptions
 from .checks import TestResult, run_model_tests
 from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
-from .compiler import validate_project_contract, validate_warehouse_capabilities
+from .compiler import (
+    validate_project_contract,
+    validate_retrieval_capabilities,
+    validate_warehouse_capabilities,
+)
 from .config import load_project
 from .config.model import EMBED_METADATA_FIELDS, INTERNAL_LINEAGE_FIELDS, ModelConfig
 from .config.profile import DEFAULT_LLM_PROVIDER, PricingConfig
@@ -63,6 +70,13 @@ from .providers import (
     get_inference_provider,
     resolve_provider_model,
     sanitized_provider_error,
+)
+from .retrieval import (
+    CollectionSpec,
+    IndexedRow,
+    RetrievalError,
+    collection_config_fingerprint,
+    create_store,
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
 from .transforms import TransformContext, load_transform, transform_call_arity
@@ -249,6 +263,26 @@ class _SerializedAdapter:
         self._adapter = adapter
         self._lock = lock
 
+    @contextmanager
+    def table_snapshot(
+        self,
+        table: str,
+        *,
+        columns: Sequence[str] | None = None,
+        batch_size: int = 10_000,
+        predicate: Any = None,
+        key_column: str | None = None,
+    ) -> Iterator[TableReadSnapshot]:
+        with self._lock:
+            with self._adapter.table_snapshot(
+                table,
+                columns=columns,
+                batch_size=batch_size,
+                predicate=predicate,
+                key_column=key_column,
+            ) as snapshot:
+                yield snapshot
+
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._adapter, name)
         if not callable(attr):
@@ -282,6 +316,9 @@ class ModelRunResult:
     documents_skipped: int = 0
     documents_deleted: int = 0
     rows_written: int = 0
+    rows_inserted: int = 0
+    rows_updated: int = 0
+    rows_failed: int = 0
     duration_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
     # Non-fatal backend warnings, aggregated: distinct message -> number of
@@ -292,6 +329,7 @@ class ModelRunResult:
     training_input: dict[str, Any] | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     artifact_metadata: dict[str, Any] | None = None
+    serving_resource: dict[str, Any] | None = None
 
 
 @dataclass
@@ -333,6 +371,16 @@ def run_project(
         [model for model in models if model.name in set(selected)],
         resolved.warehouse.type,
     )
+    validate_retrieval_capabilities(
+        [model for model in models if model.name in set(selected)], project, resolved
+    )
+    if full_refresh and any(
+        model.search is not None and model.name in set(selected) for model in models
+    ):
+        raise RunError(
+            "--full-refresh is unavailable for search resources until atomic store "
+            "activation and state replacement are implemented by #153"
+        )
 
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
@@ -399,6 +447,16 @@ def build_project(
         [model for model in models if model.name in set(selected)],
         resolved.warehouse.type,
     )
+    validate_retrieval_capabilities(
+        [model for model in models if model.name in set(selected)], project, resolved
+    )
+    if full_refresh and any(
+        model.search is not None and model.name in set(selected) for model in models
+    ):
+        raise RunError(
+            "--full-refresh is unavailable for search resources until atomic store "
+            "activation and state replacement are implemented by #153"
+        )
 
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
@@ -444,8 +502,15 @@ def build_project(
                 blocked |= dag.descendants(name)
                 continue
 
-            model_tests = run_model_tests(
-                model, adapter, project_dir=project_dir, store_failures=store_failures
+            model_tests = (
+                []
+                if model.search is not None
+                else run_model_tests(
+                    model,
+                    adapter,
+                    project_dir=project_dir,
+                    store_failures=store_failures,
+                )
             )
             out.test_results.extend(model_tests)
             if any(t.is_hard_failure for t in model_tests):
@@ -544,9 +609,18 @@ def _run_model(
             adapter=adapter,
             full_refresh=full_refresh,
         )
+    elif model.search is not None:
+        result = _run_search_model(
+            model=model,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+        )
     else:
         raise RunError(
-            f"Model '{model.name}' has no extraction, transform, ml, chunk, or embed "
+            f"Model '{model.name}' has no extraction, transform, ml, chunk, embed, "
+            "or search "
             "block configured"
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
@@ -1643,6 +1717,461 @@ def _add_provider_usage(
 ) -> None:
     for key, value in usage.items():
         totals[key] = totals.get(key, 0) + value
+
+
+def _run_search_model(
+    *,
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+) -> ModelRunResult:
+    search = model.search
+    assert search is not None
+    if resolved.retrieval is None:
+        raise RunError("Search publication requires a configured retrieval target")
+    alias = search.store or resolved.retrieval.default
+    store_config = resolved.retrieval.stores.get(alias)
+    if store_config is None:
+        raise RunError("Search publication selected an unknown retrieval target")
+    upstream = parse_ref((model.depends_on or [""])[0])
+    logical_collection = search.collection or model.name
+    code_version = compute_model_code_version(
+        model,
+        project,
+        project_dir,
+        resolved=resolved,
+    )
+    store = create_store(
+        store_config,
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias=alias,
+    )
+    projected = search.projected_fields()
+    inserted = 0
+    updated = 0
+    skipped = 0
+    deleted = 0
+    rows_written = 0
+    spec: CollectionSpec | None = None
+    state_scope: StateScope | None = None
+    pending_state_records: list[StateRecord] = []
+    pending_state_deletes: list[list[str]] = []
+
+    try:
+        with adapter.table_snapshot(
+            upstream,
+            columns=projected,
+            batch_size=search.batch_size,
+            key_column=search.id_field,
+        ) as snapshot:
+            physical = store.physical_collection(logical_collection)
+            spec = _search_collection_spec(
+                model=model,
+                physical_collection=physical,
+                upstream_schema=snapshot.schema,
+                store_type=store_config.type,
+            )
+            state_target = store.state_descriptor(logical_collection)
+            state_scope = StateScope.for_target_descriptor(
+                model.name,
+                stage="retrieval_publish",
+                descriptor=state_target.descriptor(),
+            )
+            prior_state = adapter.fetch_state(state_scope)
+            seen: set[str] = set()
+
+            with store:
+                existing = store.inspect_collection(physical)
+                force_publish = existing is None
+                collection_exists = existing is not None
+                if existing is not None:
+                    if existing.config_fingerprint != spec.config_fingerprint:
+                        raise RunError(
+                            "Search index configuration changed; choose a new collection "
+                            "or wait for atomic rebuild support"
+                        )
+                    if not existing.schema.equals(spec.arrow_schema, check_metadata=False):
+                        raise RunError(
+                            "Search index schema does not match the declared collection contract"
+                        )
+
+                for ordinal, batch in enumerate(snapshot):
+                    indexed = _indexed_rows(
+                        batch,
+                        model,
+                        spec.config_fingerprint,
+                        max_id_bytes=store.capabilities().max_id_bytes,
+                    )
+                    seen.update(row.record_id for row in indexed)
+                    pending: list[IndexedRow] = []
+                    pending_inserted = 0
+                    pending_updated = 0
+                    for row in indexed:
+                        previous = prior_state.get(row.record_id)
+                        if (
+                            not force_publish
+                            and previous is not None
+                            and previous.input_fingerprint == row.input_fingerprint
+                            and previous.code_version == code_version
+                        ):
+                            skipped += 1
+                            continue
+                        pending.append(row)
+                        if previous is None:
+                            pending_inserted += 1
+                        else:
+                            pending_updated += 1
+                    if not pending:
+                        continue
+                    if not collection_exists:
+                        store.create_collection(spec)
+                        collection_exists = True
+                    digest = canonical_fingerprint(
+                        {
+                            "snapshot": snapshot.fingerprint,
+                            "config": spec.config_fingerprint,
+                            "ordinal": ordinal,
+                            "rows": [row.input_fingerprint for row in pending],
+                        },
+                        domain="dbt-ml-search-upsert-batch",
+                    )
+                    receipt = store.upsert(
+                        physical,
+                        pending,
+                        id_field=search.id_field,
+                        mutation_digest=digest,
+                    )
+                    if not receipt.acknowledged or len(receipt.outcomes) != len(pending):
+                        raise RunError(
+                            "Retrieval store did not return an exact durable upsert receipt"
+                        )
+                    state_records = [
+                        StateRecord(row.record_id, row.input_fingerprint, code_version)
+                        for row in pending
+                    ]
+                    pending_state_records.extend(state_records)
+                    inserted += pending_inserted
+                    updated += pending_updated
+                    rows_written += len(pending)
+
+                stale = sorted(set(prior_state) - seen)
+                for ordinal, offset in enumerate(range(0, len(stale), search.batch_size)):
+                    record_ids = stale[offset : offset + search.batch_size]
+                    digest = canonical_fingerprint(
+                        {
+                            "snapshot": snapshot.fingerprint,
+                            "config": spec.config_fingerprint,
+                            "ordinal": ordinal,
+                            "state": [
+                                prior_state[record_id].input_fingerprint
+                                for record_id in record_ids
+                            ],
+                        },
+                        domain="dbt-ml-search-delete-batch",
+                    )
+                    receipt = store.delete(
+                        physical,
+                        record_ids,
+                        id_field=search.id_field,
+                        mutation_digest=digest,
+                    )
+                    if not receipt.acknowledged or len(receipt.outcomes) != len(record_ids):
+                        raise RunError(
+                            "Retrieval store did not return an exact durable delete receipt"
+                        )
+                    pending_state_deletes.append(record_ids)
+                    deleted += len(record_ids)
+
+                if not collection_exists:
+                    store.create_collection(spec)
+                metadata = store.ensure_indexes(spec)
+                if metadata.config_fingerprint != spec.config_fingerprint:
+                    raise RunError(
+                        "Retrieval collection failed post-publication configuration validation"
+                    )
+                expected_rows = len(seen)
+                if metadata.row_count != expected_rows:
+                    raise RunError(
+                        "Retrieval collection failed post-publication row-count validation"
+                    )
+
+        assert state_scope is not None
+        if pending_state_records:
+            adapter.upsert_state(state_scope, pending_state_records)
+        for record_ids in pending_state_deletes:
+            adapter.delete_state(state_scope, record_ids)
+    except (AdapterError, RetrievalError) as error:
+        raise RunError(str(error)) from None
+
+    assert spec is not None
+    safe_target = store.safe_descriptor()
+    return ModelRunResult(
+        model_name=model.name,
+        materialization=model.materialization,
+        kind="search",
+        backend=store_config.type,
+        documents_processed=inserted + updated,
+        documents_skipped=skipped,
+        documents_deleted=deleted,
+        rows_written=rows_written,
+        rows_inserted=inserted,
+        rows_updated=updated,
+        serving_resource={
+            "type": "retrieval_index",
+            "store_type": store_config.type,
+            "safe_target_identity": safe_target.safe_target_identity,
+            "logical_collection": logical_collection,
+            "physical_collection": store.physical_collection(logical_collection),
+            "config_fingerprint": spec.config_fingerprint,
+            "status": "published",
+        },
+    )
+
+
+def _search_collection_spec(
+    *,
+    model: ModelConfig,
+    physical_collection: str,
+    upstream_schema: pa.Schema,
+    store_type: str,
+) -> CollectionSpec:
+    search = model.search
+    assert search is not None
+    projected = search.projected_fields()
+    missing = [field for field in projected if field not in upstream_schema.names]
+    if missing:
+        raise RunError(
+            f"Search resource '{model.name}' upstream schema is missing declared fields: "
+            f"{', '.join(missing)}"
+        )
+    fields: list[pa.Field] = []
+    for name in projected:
+        upstream = upstream_schema.field(name)
+        if search.vector is not None and name == search.vector.field:
+            if not _is_numeric_list_type(upstream.type):
+                raise RunError("Search vector field must use a numeric list warehouse type")
+            if (
+                pa.types.is_fixed_size_list(upstream.type)
+                and upstream.type.list_size != search.vector.dimensions
+            ):
+                raise RunError(
+                    "Search vector warehouse type does not match configured dimensions"
+                )
+            fields.append(pa.field(name, pa.list_(pa.float32(), search.vector.dimensions)))
+        else:
+            fields.append(pa.field(name, upstream.type, nullable=upstream.nullable))
+    schema = pa.schema(fields)
+    _validate_search_schema(model, schema=schema)
+    config_fingerprint = collection_config_fingerprint(
+        search.model_dump(mode="python"), store_type=store_type
+    )
+    return CollectionSpec(
+        logical_name=search.collection or model.name,
+        physical_name=physical_collection,
+        id_field=search.id_field,
+        text_fields=search.text_fields,
+        full_text_fields=search.full_text.fields if search.full_text else (),
+        attribute_fields=tuple(attribute.name for attribute in search.attributes),
+        scalar_index_fields=tuple(
+            attribute.name
+            for attribute in search.attributes
+            if attribute.filter_role != "none" or attribute.sortable
+        ),
+        display_fields=search.display_fields,
+        vector_field=search.vector.field if search.vector else None,
+        vector_dimensions=search.vector.dimensions if search.vector else None,
+        distance_metric=search.vector.metric if search.vector else None,
+        vector_search=search.vector.search if search.vector else None,
+        config_fingerprint=config_fingerprint,
+        arrow_schema=schema,
+    )
+
+
+def _indexed_rows(
+    batch: pa.RecordBatch,
+    model: ModelConfig,
+    config_fingerprint: str,
+    *,
+    max_id_bytes: int | None,
+) -> list[IndexedRow]:
+    search = model.search
+    assert search is not None
+    rows: list[IndexedRow] = []
+    for raw in batch.to_pylist():
+        record_id = raw.get(search.id_field)
+        if (
+            not isinstance(record_id, str)
+            or not record_id
+            or "\x00" in record_id
+            or (max_id_bytes is not None and len(record_id.encode()) > max_id_bytes)
+        ):
+            raise RunError(
+                "Search input IDs must be non-empty, NUL-free strings within the "
+                "retrieval store byte limit"
+            )
+        values = dict(raw)
+        for optional_id_field in (search.document_id_field, search.chunk_id_field):
+            if optional_id_field is None:
+                continue
+            optional_id = values.get(optional_id_field)
+            if optional_id is not None and (
+                not isinstance(optional_id, str)
+                or not optional_id
+                or "\x00" in optional_id
+                or (max_id_bytes is not None and len(optional_id.encode()) > max_id_bytes)
+            ):
+                raise RunError("Search document and chunk IDs must be valid strings")
+        for text_field in search.text_fields:
+            if not isinstance(values.get(text_field), str):
+                raise RunError("Search text fields must contain non-null strings")
+        if not any(values[text_field] for text_field in search.text_fields):
+            raise RunError("Search input must contain at least one non-empty text field")
+        if search.vector is not None:
+            vector = values.get(search.vector.field)
+            if not isinstance(vector, Sequence) or isinstance(vector, str | bytes):
+                raise RunError("Search vectors must be finite numeric sequences")
+            if any(isinstance(item, bool) for item in vector):
+                raise RunError("Search vectors must be finite numeric sequences")
+            try:
+                normalized = [float(item) for item in vector]
+            except (TypeError, ValueError):
+                raise RunError("Search vectors must be finite numeric sequences") from None
+            if len(normalized) != search.vector.dimensions or any(
+                not isfinite(item) for item in normalized
+            ):
+                raise RunError(
+                    "Search vectors must match the configured dimensions and be finite"
+                )
+            values[search.vector.field] = normalized
+        for attribute in search.attributes:
+            _validate_search_attribute(values.get(attribute.name), attribute)
+        for display_field in search.display_fields:
+            if not _is_json_safe(values.get(display_field)):
+                raise RunError("Search display fields must contain JSON-safe values")
+        input_fingerprint = canonical_fingerprint(
+            {"config": config_fingerprint, "row": values},
+            domain="dbt-ml-search-indexed-row",
+        )
+        rows.append(IndexedRow(record_id, values, input_fingerprint))
+    return rows
+
+
+def _validate_search_attribute(value: Any, attribute: Any) -> None:
+    if value is None:
+        if attribute.nullable:
+            return
+        raise RunError("Search attributes declared non-nullable must not contain NULL")
+    expected: dict[str, type[Any] | tuple[type[Any], ...]] = {
+        "string": str,
+        "integer": int,
+        "float": (int, float),
+        "boolean": bool,
+        "date": (date, str),
+        "timestamp": (datetime, str),
+    }
+    if attribute.data_type == "array[string]":
+        if not isinstance(value, list | tuple) or any(
+            not isinstance(item, str) for item in value
+        ):
+            raise RunError("Search array attributes must contain only strings")
+        return
+    required = expected[attribute.data_type]
+    if attribute.data_type == "integer" and isinstance(value, bool):
+        raise RunError("Search attribute type does not match its declaration")
+    if attribute.data_type == "float" and isinstance(value, bool):
+        raise RunError("Search attribute type does not match its declaration")
+    if not isinstance(value, required):
+        raise RunError("Search attribute type does not match its declaration")
+    if attribute.data_type == "integer" and not -(2**63) <= value < 2**63:
+        raise RunError("Search integer attributes must fit signed 64-bit values")
+    if attribute.data_type == "float" and not isfinite(float(value)):
+        raise RunError("Search float attributes must be finite")
+    if attribute.data_type == "date" and isinstance(value, str):
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            raise RunError("Search date attributes must be ISO-8601 dates") from None
+    if attribute.data_type == "timestamp":
+        parsed = value
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                raise RunError(
+                    "Search timestamp attributes must be ISO-8601 timestamps"
+                ) from None
+        if parsed.utcoffset() != timedelta(0):
+            raise RunError("Search timestamp attributes must be UTC")
+
+
+def _validate_search_schema(model: ModelConfig, *, schema: pa.Schema) -> None:
+    search = model.search
+    assert search is not None
+    for field_name in (search.id_field, search.document_id_field, search.chunk_id_field):
+        if field_name is not None and not _is_string_type(schema.field(field_name).type):
+            raise RunError("Search ID fields must use a string warehouse type")
+    for field_name in search.text_fields:
+        if not _is_string_type(schema.field(field_name).type):
+            raise RunError("Search text fields must use a string warehouse type")
+    for attribute in search.attributes:
+        if not _attribute_type_matches(
+            attribute.data_type, schema.field(attribute.name).type
+        ):
+            raise RunError("Search attribute warehouse type does not match its declaration")
+
+
+def _is_string_type(value: pa.DataType) -> bool:
+    return cast(bool, pa.types.is_string(value) or pa.types.is_large_string(value))
+
+
+def _is_numeric_list_type(value: pa.DataType) -> bool:
+    if not (
+        pa.types.is_list(value)
+        or pa.types.is_large_list(value)
+        or pa.types.is_fixed_size_list(value)
+    ):
+        return False
+    return cast(
+        bool,
+        pa.types.is_integer(value.value_type) or pa.types.is_floating(value.value_type),
+    )
+
+
+def _attribute_type_matches(data_type: str, value: pa.DataType) -> bool:
+    if data_type == "string":
+        return _is_string_type(value)
+    if data_type == "integer":
+        return cast(bool, pa.types.is_integer(value))
+    if data_type == "float":
+        return cast(bool, pa.types.is_floating(value))
+    if data_type == "boolean":
+        return cast(bool, pa.types.is_boolean(value))
+    if data_type == "date":
+        return cast(bool, pa.types.is_date(value))
+    if data_type == "timestamp":
+        return cast(bool, pa.types.is_timestamp(value))
+    if not (
+        pa.types.is_list(value)
+        or pa.types.is_large_list(value)
+        or pa.types.is_fixed_size_list(value)
+    ):
+        return False
+    return _is_string_type(value.value_type)
+
+
+def _is_json_safe(value: Any) -> bool:
+    if value is None or isinstance(value, str | bool | int):
+        return True
+    if isinstance(value, float):
+        return isfinite(value)
+    if isinstance(value, list | tuple):
+        return all(_is_json_safe(item) for item in value)
+    if isinstance(value, Mapping):
+        return all(isinstance(key, str) and _is_json_safe(item) for key, item in value.items())
+    return False
 
 
 def _run_ml_model(

@@ -15,6 +15,7 @@ _REF_PATTERN = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
 class NodeKind(StrEnum):
     SOURCE = "source"
     MODEL = "model"
+    SEARCH_INDEX = "search_index"
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,8 @@ class ProjectDAG:
             self._add_node(Node(source.name, NodeKind.SOURCE, frozenset(source.tags)))
 
         for model in models:
-            self._add_node(Node(model.name, NodeKind.MODEL, frozenset(model.tags)))
+            kind = NodeKind.SEARCH_INDEX if model.search is not None else NodeKind.MODEL
+            self._add_node(Node(model.name, kind, frozenset(model.tags)))
             preds: set[str] = set()
             if model.source:
                 preds.add(parse_ref(model.source))
@@ -98,7 +100,11 @@ class ProjectDAG:
         self.successors.setdefault(node.name, set())
 
     def execution_order(self) -> list[str]:
-        return [name for name in self._sorted if self.nodes[name].kind == NodeKind.MODEL]
+        return [
+            name
+            for name in self._sorted
+            if self.nodes[name].kind in {NodeKind.MODEL, NodeKind.SEARCH_INDEX}
+        ]
 
     def descendants(self, name: str) -> set[str]:
         """All nodes transitively downstream of `name` (excluding `name`)."""
@@ -174,7 +180,8 @@ class ProjectDAG:
         return [
             n
             for n in self._sorted
-            if n in selected and self.nodes[n].kind == NodeKind.MODEL
+            if n in selected
+            and self.nodes[n].kind in {NodeKind.MODEL, NodeKind.SEARCH_INDEX}
         ]
 
     def _apply(self, expression: str, modified: set[str] | None = None) -> set[str]:

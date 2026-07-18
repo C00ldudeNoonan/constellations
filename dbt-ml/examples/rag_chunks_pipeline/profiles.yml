@@ -6,3 +6,10 @@ rag_chunks_pipeline:
         type: duckdb
         path: ./target/dbt_ml.duckdb
         schema: rag
+      retrieval:
+        default: local
+        allow_public_indexes: true
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb

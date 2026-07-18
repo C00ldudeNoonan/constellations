@@ -14,7 +14,7 @@ import yaml
 from .config import load_project
 from .config.model import ModelConfig
 from .config.profile import WarehouseConfig
-from .dag import ProjectDAG
+from .dag import ProjectDAG, parse_ref
 from .profile import resolve_profile
 
 DEFAULT_OUTPUT_FILENAME = "sources.yml"
@@ -35,8 +35,24 @@ def build_dbt_sources(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     dag = ProjectDAG(sources_cfg, models)
-    selected_names = set(dag.select_models(select=select, exclude=exclude))
-    selected_models = [m for m in models if m.name in selected_names]
+    selected_names = set(dag.select_models(select=select))
+    excluded_names = set(dag.select_models(select=exclude)) if exclude else set()
+    selected_names -= excluded_names
+    models_by_name = {model.name: model for model in models}
+    projected_names: set[str] = set()
+    for selected_name in selected_names:
+        selected_model = models_by_name[selected_name]
+        if selected_model.search is None:
+            projected_names.add(selected_name)
+            continue
+        upstream = parse_ref((selected_model.depends_on or [""])[0])
+        if upstream not in excluded_names:
+            projected_names.add(upstream)
+    selected_models = [
+        model
+        for model in models
+        if model.name in projected_names and model.search is None
+    ]
 
     name = source_name or f"dbt_ml_{project.name}"
     catalog = _derive_catalog(resolved.warehouse)

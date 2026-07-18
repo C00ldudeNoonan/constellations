@@ -8,16 +8,20 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
+from .adapters import StateScope
+from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
-from .dag import ProjectDAG
+from .dag import NodeKind, ProjectDAG, parse_ref
+from .hashing import canonical_fingerprint
 from .profile import (
     ProfileError,
     ResolvedProfile,
     apply_source_path_overrides,
     resolve_profile,
 )
+from .retrieval import collection_config_fingerprint, create_store, store_class
 from .runner import ModelRunResult
 from .versioning import (
     compute_model_code_version,
@@ -41,7 +45,15 @@ def build_manifest(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
     sources = apply_source_path_overrides(sources, resolved)
-    dag = ProjectDAG(sources, models)
+    has_search = any(model.search is not None for model in models)
+    dag = (
+        validate_project_contract(project, sources, models, project_dir)
+        if has_search
+        else ProjectDAG(sources, models)
+    )
+    if has_search:
+        validate_retrieval_capabilities(models, project, resolved)
+        return _build_manifest_v2(project, sources, models, dag, project_dir, resolved)
 
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -147,14 +159,24 @@ def build_run_results(
         row = asdict(r)
         row["status"] = status
         row["test_failures"] = failed
-        row["relation"] = _relation(catalog, schema, r.model_name)
+        model = next((item for item in models if item.name == r.model_name), None)
+        row["relation"] = (
+            None
+            if model is not None and model.search is not None
+            else _relation(catalog, schema, r.model_name)
+        )
         result_rows.append(row)
 
     for name in skipped:
         row = asdict(ModelRunResult(model_name=name, materialization="", kind="skipped"))
         row["status"] = "skipped"
         row["test_failures"] = []
-        row["relation"] = _relation(catalog, schema, name)
+        model = next((item for item in models if item.name == name), None)
+        row["relation"] = (
+            None
+            if model is not None and model.search is not None
+            else _relation(catalog, schema, name)
+        )
         result_rows.append(row)
 
     overall = "error" if (n_error or skipped) else "success"
@@ -299,6 +321,222 @@ def _model_dict(
     if embedding is not None:
         model_dict["embedding"] = embedding
     return model_dict
+
+
+def _build_manifest_v2(
+    project: ProjectConfig,
+    sources: list[Any],
+    models: list[ModelConfig],
+    dag: ProjectDAG,
+    project_dir: Path,
+    resolved: ResolvedProfile,
+) -> dict[str, Any]:
+    used_aliases = {
+        (model.search.store or resolved.retrieval.default)
+        for model in models
+        if model.search is not None and resolved.retrieval is not None
+    }
+    warehouse_identity = canonical_fingerprint(
+        {
+            "type": resolved.warehouse.type,
+            "catalog": resolved.warehouse.catalog_name(),
+            "schema": resolved.warehouse.schema_name,
+            "location": resolved.warehouse.storage_location(),
+        },
+        domain="dbt-ml-safe-warehouse-target",
+    )
+    retrieval_targets: list[dict[str, Any]] = []
+    if resolved.retrieval is not None:
+        for alias in sorted(used_aliases):
+            config = resolved.retrieval.stores[alias]
+            store = create_store(
+                config,
+                project_name=project.name,
+                target_name=resolved.target_name,
+                alias=alias,
+            )
+            safe = store.safe_descriptor()
+            retrieval_targets.append(
+                {
+                    "alias": alias,
+                    "store_type": config.type,
+                    "safe_target_identity": safe.safe_target_identity,
+                }
+            )
+    return {
+        "manifest_version": 2,
+        "generated_at": _now(),
+        "project": {"name": project.name, "version": project.version},
+        "target": {
+            "profile": resolved.profile_name,
+            "name": resolved.target_name,
+            "warehouse": {
+                "adapter_type": resolved.warehouse.type,
+                "safe_target_identity": warehouse_identity,
+                "catalog": resolved.warehouse.catalog_name(),
+                "schema": resolved.warehouse.schema_name,
+            },
+            "retrieval": retrieval_targets,
+        },
+        "sources": [
+            {
+                "name": source.name,
+                "unique_id": f"source.{project.name}.{source.name}",
+                "description": source.description,
+                "path": source.path,
+                "file_pattern": source.file_pattern,
+                "recursive": source.recursive,
+                "external": source.external,
+                "tags": source.tags,
+            }
+            for source in sources
+        ],
+        "models": [
+            _model_dict_v2(model, project, project_dir, resolved) for model in models
+        ],
+        "dag": {
+            "execution_order": [
+                _unique_id(dag.nodes[name].kind, project.name, name)
+                for name in dag.execution_order()
+            ],
+            "nodes": [
+                {
+                    "name": node.name,
+                    "kind": node.kind.value,
+                    "unique_id": _unique_id(node.kind, project.name, node.name),
+                }
+                for node in dag.all_nodes_in_order()
+            ],
+            "edges": [
+                [
+                    _unique_id(dag.nodes[pred].kind, project.name, pred),
+                    _unique_id(dag.nodes[succ].kind, project.name, succ),
+                ]
+                for succ, predecessors in dag.predecessors.items()
+                for pred in predecessors
+            ],
+        },
+    }
+
+
+def _model_dict_v2(
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    resolved: ResolvedProfile,
+) -> dict[str, Any]:
+    if model.search is None:
+        row = _model_dict(model, project, project_dir, resolved)
+        row["unique_id"] = f"model.{project.name}.{model.name}"
+        row["resource_type"] = "model"
+        row["output"] = {
+            "type": "warehouse_relation",
+            "relation": _relation(
+                resolved.warehouse.catalog_name(),
+                resolved.warehouse.schema_name,
+                model.name,
+            ),
+        }
+        return row
+
+    assert resolved.retrieval is not None
+    search = model.search
+    alias = search.store or resolved.retrieval.default
+    config = resolved.retrieval.stores[alias]
+    store = create_store(
+        config,
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias=alias,
+    )
+    logical = search.collection or model.name
+    state_target = store.state_descriptor(logical)
+    scope = StateScope.for_target_descriptor(
+        model.name,
+        stage="retrieval_publish",
+        descriptor=state_target.descriptor(),
+    )
+    capabilities = store_class(config.type).capabilities()
+    required = [
+        "keyed_upsert",
+        "keyed_delete",
+        "index_readiness",
+        "durable_write_ack",
+        "atomic_batch_mutation",
+    ]
+    if search.vector is not None:
+        required.append(f"{search.vector.search}_vector_search")
+    if search.full_text is not None:
+        required.append("full_text_search")
+    if any(attribute.filter_role != "none" for attribute in search.attributes):
+        required.append("metadata_filtering")
+    upstream = parse_ref((model.depends_on or [""])[0])
+    return {
+        "name": model.name,
+        "unique_id": f"search_index.{project.name}.{model.name}",
+        "resource_type": "search_index",
+        "kind": "search",
+        "description": model.description,
+        "access": search.access,
+        "materialization": model.materialization,
+        "tags": model.tags,
+        "depends_on": [f"model.{project.name}.{upstream}"],
+        "code_version": compute_model_code_version(
+            model, project, project_dir, resolved=resolved
+        ),
+        "tests": [],
+        "output": {
+            "type": "serving_resource",
+            "serving_resource": {
+                "kind": "retrieval_index",
+                "store_type": config.type,
+                "store_implementation": store_class(config.type).implementation_identity(),
+                "safe_target_identity": store.safe_descriptor().safe_target_identity,
+                "logical_collection": logical,
+                "physical_collection": state_target.physical_collection,
+                "scope_fingerprint": scope.target_identity,
+                "materialization": model.materialization,
+                "schema_version": 1,
+                "config_fingerprint": collection_config_fingerprint(
+                    search.model_dump(mode="python"), store_type=config.type
+                ),
+                "id_field": search.id_field,
+                "text_fields": list(search.text_fields),
+                "return_text_fields": list(search.return_text_fields),
+                "full_text": (
+                    {"fields": list(search.full_text.fields)}
+                    if search.full_text is not None
+                    else None
+                ),
+                "vector": search.vector.model_dump(mode="json") if search.vector else None,
+                "attributes": [
+                    attribute.model_dump(mode="json") for attribute in search.attributes
+                ],
+                "display_fields": list(search.display_fields),
+                "query": {
+                    "modes": sorted(search.query.modes),
+                    "consistency": search.query.consistency,
+                },
+                "capabilities": {
+                    "required": sorted(required),
+                    "available": sorted(feature.value for feature in capabilities.features),
+                    "consistency_modes": sorted(capabilities.consistency_modes),
+                    "distance_metrics": sorted(capabilities.distance_metrics),
+                    "max_batch_size": capabilities.max_batch_size,
+                },
+                "upstream": f"model.{project.name}.{upstream}",
+            },
+        },
+    }
+
+
+def _unique_id(kind: NodeKind, project_name: str, name: str) -> str:
+    prefix = {
+        NodeKind.SOURCE: "source",
+        NodeKind.MODEL: "model",
+        NodeKind.SEARCH_INDEX: "search_index",
+    }[kind]
+    return f"{prefix}.{project_name}.{name}"
 
 
 class StateError(Exception):

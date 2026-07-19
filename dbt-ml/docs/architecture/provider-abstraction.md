@@ -95,10 +95,10 @@ entry-point groups, so the stock `dbt-ml` CLI can load them without a wrapper
 import:
 
 ```toml
-[project.entry-points."dbt_ml.inference_providers.v2"]
+[project.entry-points."dbt_ml.inference_providers.v3"]
 acme = "acme_dbt_ml.provider:AcmeInferenceProvider"
 
-[project.entry-points."dbt_ml.embedding_providers.v2"]
+[project.entry-points."dbt_ml.embedding_providers.v3"]
 acme = "acme_dbt_ml.provider:AcmeEmbeddingProvider"
 ```
 

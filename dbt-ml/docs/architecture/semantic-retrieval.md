@@ -1,9 +1,13 @@
 # Semantic retrieval architecture
 
 Status: accepted design for issue #133; the bounded local public LanceDB slice
-was implemented in issue #134. Sections covering governed authorization,
-portable query serving, replacement, and coordinated readiness remain the
-target contract for follow-up issues and are not current guarantees.
+was implemented in issue #134, and issue #152 implemented warehouse-owned
+publication readiness, generation-fenced publish/query coordination, explicit
+administrative recovery (`dbt-ml serving`), and governed policy-prefilter
+queries for the local DuckDB + LanceDB proving pair within its documented
+single-host boundary. Full replacement/atomic rebuild (#153), distributed
+store fencing (#136), and portable-serving follow-ups remain target contract,
+not current guarantees.
 
 This decision builds on the accepted
 [warehouse adapter capability boundary](adapter-capabilities.md) and the
@@ -1150,15 +1154,20 @@ time-based lease stealing: a paused publisher must not resume after a newer
 one. Locks are released by the owning warehouse session/transaction. Explicit
 administrative recovery requires the operator to terminate the old owner first.
 
-The LanceDB proof of concept can implement session ownership with an enforced
-local reader/writer file lock. A warehouse fencing token alone cannot prevent a
-partitioned process from continuing to call an independent remote SDK. A
-distributed warehouse/store pair must therefore implement provider-enforced
-fencing or write only to an immutable per-publication generation followed by
-conditional atomic activation. Losing the publish session aborts before any
-further store I/O; administrative recovery terminates the old process as well
-as its warehouse session. #152 owns this follow-on contract. v0.2 does not claim
-fault-tolerant multi-writer publication merely because a ledger exists.
+The implemented LanceDB proof enforces publisher exclusion with a non-blocking
+OS file lock per collection (`RetrievalStore.publisher_fence`), advertised as
+the `single_host_publisher_lock` capability. A warehouse fencing token alone
+cannot prevent a partitioned process from continuing to call an independent
+remote SDK, so compile rejects publication to any store that declares no
+fencing proof. A distributed warehouse/store pair must implement
+provider-enforced fencing or write only to an immutable per-publication
+generation followed by conditional atomic activation — both are declared,
+reserved capabilities that no shipped adapter claims yet. Losing the publish
+claim aborts before any further store I/O; `dbt-ml serving recover` refuses to
+reassign authority until the operator confirms the old owner is terminated,
+and it advances the fence so a surviving zombie fails its next verification.
+v0.2 does not claim fault-tolerant multi-writer publication beyond this
+documented single-host boundary.
 
 ### Initial and incremental publication
 

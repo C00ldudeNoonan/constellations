@@ -10,7 +10,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from math import isfinite
@@ -76,7 +76,10 @@ from .providers import (
 from .retrieval import (
     CollectionSpec,
     IndexedRow,
+    PublishLease,
     RetrievalError,
+    ServingCoordinationError,
+    ServingCoordinator,
     collection_config_fingerprint,
     create_store,
 )
@@ -1879,6 +1882,9 @@ def _run_search_model(
     state_scope: StateScope | None = None
     pending_state_records: list[StateRecord] = []
     pending_state_deletes: list[list[str]] = []
+    coordinator = ServingCoordinator(adapter)
+    publish_lease: PublishLease | None = None
+    active_generation: str | None = None
 
     try:
         with adapter.table_snapshot(
@@ -1904,7 +1910,12 @@ def _run_search_model(
             prior_state = adapter.fetch_state(state_scope)
             seen: set[str] = set()
 
-            with store:
+            publish_lease = coordinator.acquire_publish(
+                state_scope,
+                expected_code_version=code_version,
+                config_fingerprint=spec.config_fingerprint,
+            )
+            with store.publisher_fence(physical), store:
                 existing = store.inspect_collection(physical)
                 force_publish = existing is None
                 collection_exists = existing is not None
@@ -1947,9 +1958,42 @@ def _run_search_model(
                             pending_updated += 1
                     if not pending:
                         continue
+                    coordinator.verify_publish(publish_lease)
                     if not collection_exists:
                         store.create_collection(spec)
                         collection_exists = True
+                    if search.access == "governed":
+                        # Revoke-before-upsert: a changed governed record is
+                        # removed first, so a failed publish leaves the old,
+                        # possibly more permissive row absent, not queryable.
+                        changed_ids = [
+                            row.record_id
+                            for row in pending
+                            if row.record_id in prior_state
+                        ]
+                        if changed_ids:
+                            revoke_digest = canonical_fingerprint(
+                                {
+                                    "snapshot": snapshot.fingerprint,
+                                    "config": spec.config_fingerprint,
+                                    "ordinal": ordinal,
+                                    "revoked": changed_ids,
+                                },
+                                domain="dbt-ml-search-governed-revoke-batch",
+                            )
+                            receipt = store.delete(
+                                physical,
+                                changed_ids,
+                                id_field=search.id_field,
+                                mutation_digest=revoke_digest,
+                            )
+                            if not receipt.acknowledged or len(receipt.outcomes) != len(
+                                changed_ids
+                            ):
+                                raise RunError(
+                                    "Retrieval store did not return an exact durable "
+                                    "governed-revoke receipt"
+                                )
                     digest = canonical_fingerprint(
                         {
                             "snapshot": snapshot.fingerprint,
@@ -1981,6 +2025,7 @@ def _run_search_model(
                 stale = sorted(set(prior_state) - seen)
                 for ordinal, offset in enumerate(range(0, len(stale), search.batch_size)):
                     record_ids = stale[offset : offset + search.batch_size]
+                    coordinator.verify_publish(publish_lease)
                     digest = canonical_fingerprint(
                         {
                             "snapshot": snapshot.fingerprint,
@@ -2007,6 +2052,7 @@ def _run_search_model(
                     deleted += len(record_ids)
 
                 if not collection_exists:
+                    coordinator.verify_publish(publish_lease)
                     store.create_collection(spec)
                 metadata = store.ensure_indexes(spec)
                 if metadata.config_fingerprint != spec.config_fingerprint:
@@ -2018,13 +2064,32 @@ def _run_search_model(
                     raise RunError(
                         "Retrieval collection failed post-publication row-count validation"
                     )
+                active_generation = metadata.physical_generation
 
         assert state_scope is not None
+        coordinator.verify_publish(publish_lease)
         if pending_state_records:
             adapter.upsert_state(state_scope, pending_state_records)
         for record_ids in pending_state_deletes:
             adapter.delete_state(state_scope, record_ids)
-    except (AdapterError, RetrievalError) as error:
+        assert active_generation is not None
+        assert spec is not None
+        coordinator.mark_ready(
+            publish_lease,
+            active_generation=active_generation,
+            config_fingerprint=spec.config_fingerprint,
+            counts=(inserted, updated, skipped, deleted),
+        )
+    except (AdapterError, RetrievalError, RunError) as error:
+        if publish_lease is not None:
+            _mark_search_publication_failed(
+                coordinator,
+                publish_lease,
+                error,
+                counts=(inserted, updated, skipped, deleted),
+            )
+        if isinstance(error, RunError):
+            raise
         raise RunError(str(error)) from None
 
     assert spec is not None
@@ -2047,9 +2112,31 @@ def _run_search_model(
             "logical_collection": logical_collection,
             "physical_collection": store.physical_collection(logical_collection),
             "config_fingerprint": spec.config_fingerprint,
-            "status": "published",
+            "status": "ready",
+            "active_generation": active_generation,
+            "fencing_token": publish_lease.fencing_token if publish_lease else None,
         },
     )
+
+
+def _mark_search_publication_failed(
+    coordinator: ServingCoordinator,
+    lease: PublishLease,
+    error: Exception,
+    *,
+    counts: tuple[int, int, int, int],
+) -> None:
+    """Record the failure under a safe code; a stale fence has nothing to record."""
+    if isinstance(error, ServingCoordinationError):
+        code = "coordination_error"
+    elif isinstance(error, RetrievalError):
+        code = "store_error"
+    elif isinstance(error, AdapterError):
+        code = "warehouse_error"
+    else:
+        code = "publication_failed"
+    with suppress(ServingCoordinationError):
+        coordinator.mark_failed(lease, safe_error_code=code, counts=counts)
 
 
 def _search_collection_spec(

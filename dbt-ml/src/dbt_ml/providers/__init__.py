@@ -6,6 +6,7 @@ from .base import (
     BatchInferenceItem,
     BatchInferenceRequest,
     BatchInferenceResult,
+    BatchJobStatus,
     EmbeddingProvider,
     EmbeddingRequest,
     EmbeddingResult,
@@ -26,6 +27,7 @@ from .base import (
     redacted_exception_text,
     resolve_provider_model,
     sanitized_provider_error,
+    validate_batch_job_id,
 )
 from .registry import (
     get_embedding_provider,
@@ -42,6 +44,7 @@ __all__ = [
     "BatchInferenceItem",
     "BatchInferenceRequest",
     "BatchInferenceResult",
+    "BatchJobStatus",
     "EmbeddingProvider",
     "EmbeddingRequest",
     "EmbeddingResult",
@@ -68,4 +71,5 @@ __all__ = [
     "register_inference_provider",
     "resolve_provider_model",
     "sanitized_provider_error",
+    "validate_batch_job_id",
 ]

@@ -5,7 +5,9 @@ import json
 import logging
 import math
 import os
+import re
 import sys
+import time
 import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -25,7 +27,7 @@ from ..hashing import HASH_DIGEST_SIZE
 
 log = logging.getLogger(__name__)
 
-PROVIDER_CONTRACT_VERSION = 2
+PROVIDER_CONTRACT_VERSION = 3
 
 
 class ProviderError(RuntimeError):
@@ -390,6 +392,37 @@ class BatchInferenceResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchJobStatus:
+    """Progress of a submitted native batch job, artifact-safe."""
+
+    done: bool
+    processing: int = 0
+    succeeded: int = 0
+    errored: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.done, bool):
+            raise ValueError("batch job done must be boolean")
+        for name in ("processing", "succeeded", "errored"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"batch job {name} must be a non-negative integer")
+
+
+_BATCH_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
+
+
+def validate_batch_job_id(value: object) -> str:
+    """Provider job identifiers are persisted for resume; keep them boring."""
+    if not isinstance(value, str) or not _BATCH_JOB_ID.fullmatch(value):
+        raise ProviderBatchError(
+            "provider returned an invalid batch job identifier",
+            safe_for_display=True,
+        )
+    return value
+
+
+@dataclass(frozen=True, slots=True)
 class EmbeddingRequest:
     model: str
     texts: tuple[str, ...] = field(repr=False)
@@ -570,6 +603,60 @@ class InferenceProvider(BaseProvider):
             )
         return result
 
+    def submit_batch(
+        self,
+        requests: Sequence[BatchInferenceRequest],
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> str:
+        """Submit one native batch and return the provider's job identifier.
+
+        Native-batch providers must override; the identifier is persisted so
+        an interrupted run resumes the job instead of resubmitting it.
+        """
+        raise ProviderBatchError(
+            f"{self.name()} does not support resumable native batches",
+            safe_for_display=True,
+        )
+
+    def poll_batch(
+        self,
+        batch_id: str,
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> BatchJobStatus:
+        raise ProviderBatchError(
+            f"{self.name()} does not support resumable native batches",
+            safe_for_display=True,
+        )
+
+    def fetch_batch_results(
+        self,
+        batch_id: str,
+        requests: Sequence[BatchInferenceRequest],
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> BatchInferenceResult:
+        raise ProviderBatchError(
+            f"{self.name()} does not support resumable native batches",
+            safe_for_display=True,
+        )
+
+    def cancel_batch(
+        self,
+        batch_id: str,
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> None:
+        raise ProviderBatchError(
+            f"{self.name()} does not support resumable native batches",
+            safe_for_display=True,
+        )
+
     def complete_batch(
         self,
         requests: Sequence[BatchInferenceRequest],
@@ -579,6 +666,23 @@ class InferenceProvider(BaseProvider):
         poll_seconds: float,
     ) -> BatchInferenceResult:
         self._validate_batch_inputs(requests, poll_seconds=poll_seconds)
+        if not requests:
+            return BatchInferenceResult(())
+        if self.supports_native_batch:
+            # Convenience one-shot driver over the resumable primitives.
+            # Callers needing persistence, timeout, or cancellation drive
+            # submit/poll/fetch themselves (the LLM backend does).
+            batch_id = validate_batch_job_id(
+                self.submit_batch(requests, credential=credential, runtime=runtime)
+            )
+            while not self.poll_batch(
+                batch_id, credential=credential, runtime=runtime
+            ).done:
+                time.sleep(poll_seconds)
+            fetched = self.fetch_batch_results(
+                batch_id, requests, credential=credential, runtime=runtime
+            )
+            return BatchInferenceResult(fetched.items, batch_submissions=1)
         items: list[BatchInferenceItem] = []
         for item in requests:
             try:

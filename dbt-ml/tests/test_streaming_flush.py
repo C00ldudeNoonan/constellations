@@ -394,7 +394,8 @@ def test_batch_mode_single_submission_chunked_flushes(
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
+        **_kwargs: object,
+    ) -> tuple[BatchInferenceResult, bool]:
         batch_calls["n"] += 1
         out: list[BatchInferenceItem] = []
         for i, req in enumerate(requests):
@@ -416,7 +417,7 @@ def test_batch_mode_single_submission_chunked_flushes(
                     ),
                 ),
             )
-        return BatchInferenceResult(tuple(out), batch_submissions=1)
+        return BatchInferenceResult(tuple(out), batch_submissions=1), False
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake_batch)
 

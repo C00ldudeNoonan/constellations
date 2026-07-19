@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -9,6 +8,7 @@ from .base import (
     BatchInferenceItem,
     BatchInferenceRequest,
     BatchInferenceResult,
+    BatchJobStatus,
     InferenceProvider,
     InferenceRequest,
     InferenceResult,
@@ -22,6 +22,7 @@ from .base import (
     provider_error_debug_enabled,
     redacted_exception_text,
     sanitized_provider_error,
+    validate_batch_job_id,
 )
 from .registry import register_inference_provider
 
@@ -69,48 +70,125 @@ class AnthropicInferenceProvider(InferenceProvider):
             raise failure
         raise AssertionError("anthropic inference did not produce a result")
 
-    def complete_batch(
+    def submit_batch(
         self,
         requests: Sequence[BatchInferenceRequest],
         *,
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
-        poll_seconds: float,
-    ) -> BatchInferenceResult:
-        result: BatchInferenceResult | None = None
+    ) -> str:
+        batch_id: str | None = None
         failure: Exception | None = None
         try:
-            self._validate_batch_inputs(requests, poll_seconds=poll_seconds)
+            self._validate_batch_inputs(requests, poll_seconds=0.0)
             if not requests:
-                return BatchInferenceResult(())
-            result = _complete_batch_with_sdk(
-                requests,
-                credential=credential,
-                runtime=runtime,
-                poll_seconds=poll_seconds,
+                raise ProviderBatchError(
+                    "anthropic batch submission requires at least one request",
+                    safe_for_display=True,
+                )
+            batch_id = _submit_batch_with_sdk(
+                requests, credential=credential, runtime=runtime
             )
         except ValueError as error:
             failure = ValueError(str(error))
         except ProviderError as error:
             failure = sanitized_provider_error(
-                self.name(), "batch inference", error
+                self.name(), "batch submission", error
             )
         except Exception as error:
-            if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
-                log.debug(
-                    "anthropic native batch failed:\n%s",
-                    redacted_exception_text(error),
-                )
-            failure = ProviderBatchError(
-                f"{self.name()} native batch failed [{type(error).__name__}]",
-                safe_for_display=True,
+            failure = self._sanitized_sdk_batch_failure("batch submission", error)
+        if failure is not None:
+            requests = ()
+            raise failure
+        if batch_id is None:
+            raise AssertionError("anthropic batch submission produced no job id")
+        return batch_id
+
+    def poll_batch(
+        self,
+        batch_id: str,
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> BatchJobStatus:
+        status: BatchJobStatus | None = None
+        failure: Exception | None = None
+        try:
+            validate_batch_job_id(batch_id)
+            status = _poll_batch_with_sdk(
+                batch_id, credential=credential, runtime=runtime
             )
+        except ProviderError as error:
+            failure = sanitized_provider_error(self.name(), "batch poll", error)
+        except Exception as error:
+            failure = self._sanitized_sdk_batch_failure("batch poll", error)
+        if failure is not None:
+            raise failure
+        if status is None:
+            raise AssertionError("anthropic batch poll produced no status")
+        return status
+
+    def fetch_batch_results(
+        self,
+        batch_id: str,
+        requests: Sequence[BatchInferenceRequest],
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> BatchInferenceResult:
+        result: BatchInferenceResult | None = None
+        failure: Exception | None = None
+        try:
+            validate_batch_job_id(batch_id)
+            result = _fetch_batch_results_with_sdk(
+                batch_id, requests, credential=credential, runtime=runtime
+            )
+        except ProviderError as error:
+            failure = sanitized_provider_error(
+                self.name(), "batch results", error
+            )
+        except Exception as error:
+            failure = self._sanitized_sdk_batch_failure("batch results", error)
         if failure is not None:
             requests = ()
             raise failure
         if result is None:
-            raise AssertionError("anthropic batch did not produce results")
+            raise AssertionError("anthropic batch fetch produced no result")
         return result
+
+    def cancel_batch(
+        self,
+        batch_id: str,
+        *,
+        credential: ProviderCredential | None,
+        runtime: ProviderRuntimeOptions,
+    ) -> None:
+        failure: Exception | None = None
+        try:
+            validate_batch_job_id(batch_id)
+            _cancel_batch_with_sdk(
+                batch_id, credential=credential, runtime=runtime
+            )
+        except ProviderError as error:
+            failure = sanitized_provider_error(self.name(), "batch cancel", error)
+        except Exception as error:
+            failure = self._sanitized_sdk_batch_failure("batch cancel", error)
+        if failure is not None:
+            raise failure
+
+    def _sanitized_sdk_batch_failure(
+        self, operation: str, error: Exception
+    ) -> ProviderBatchError:
+        if provider_error_debug_enabled() and log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "anthropic %s failed:\n%s",
+                operation,
+                redacted_exception_text(error),
+            )
+        return ProviderBatchError(
+            f"{self.name()} {operation} failed [{type(error).__name__}]",
+            safe_for_display=True,
+        )
 
 
 def _complete_with_sdk(
@@ -135,16 +213,22 @@ def _complete_with_sdk(
     return _parse_response_safely(response, request)
 
 
-def _complete_batch_with_sdk(
+def _batch_client(
+    credential: ProviderCredential | None,
+    runtime: ProviderRuntimeOptions,
+) -> Any:
+    from anthropic import Anthropic
+
+    api_key = _credential_value(credential)
+    return Anthropic(api_key=api_key, max_retries=runtime.max_retries)
+
+
+def _submit_batch_with_sdk(
     requests: Sequence[BatchInferenceRequest],
     *,
     credential: ProviderCredential | None,
     runtime: ProviderRuntimeOptions,
-    poll_seconds: float,
-) -> BatchInferenceResult:
-    from anthropic import Anthropic
-
-    api_key = _credential_value(credential)
+) -> str:
     payload = [
         {
             "custom_id": item.request_id,
@@ -163,25 +247,66 @@ def _complete_batch_with_sdk(
         }
         for item in requests
     ]
-    client = Anthropic(api_key=api_key, max_retries=runtime.max_retries)
-    batch = client.messages.batches.create(requests=payload)  # type: ignore[arg-type]
-    log.info("submitted message batch %s (%d requests)", batch.id, len(payload))
-    while True:
-        batch = client.messages.batches.retrieve(batch.id)
-        if batch.processing_status == "ended":
-            break
-        counts = batch.request_counts
-        log.info(
-            "batch %s: %s (processing=%d succeeded=%d errored=%d)",
-            batch.id,
-            batch.processing_status,
-            counts.processing,
-            counts.succeeded,
-            counts.errored,
-        )
-        time.sleep(poll_seconds)
-    raw_items = list(client.messages.batches.results(batch.id))
+    client = _batch_client(credential, runtime)
+    batch = client.messages.batches.create(requests=payload)
+    batch_id = validate_batch_job_id(getattr(batch, "id", None))
+    log.info("submitted message batch %s (%d requests)", batch_id, len(payload))
+    return batch_id
+
+
+def _poll_batch_with_sdk(
+    batch_id: str,
+    *,
+    credential: ProviderCredential | None,
+    runtime: ProviderRuntimeOptions,
+) -> BatchJobStatus:
+    client = _batch_client(credential, runtime)
+    batch = client.messages.batches.retrieve(batch_id)
+    counts = getattr(batch, "request_counts", None)
+
+    def _count(name: str) -> int:
+        value = getattr(counts, name, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    status = BatchJobStatus(
+        done=getattr(batch, "processing_status", None) == "ended",
+        processing=_count("processing"),
+        succeeded=_count("succeeded"),
+        errored=_count("errored"),
+    )
+    log.info(
+        "batch %s: %s (processing=%d succeeded=%d errored=%d)",
+        batch_id,
+        "ended" if status.done else "in_progress",
+        status.processing,
+        status.succeeded,
+        status.errored,
+    )
+    return status
+
+
+def _fetch_batch_results_with_sdk(
+    batch_id: str,
+    requests: Sequence[BatchInferenceRequest],
+    *,
+    credential: ProviderCredential | None,
+    runtime: ProviderRuntimeOptions,
+) -> BatchInferenceResult:
+    client = _batch_client(credential, runtime)
+    raw_items = list(client.messages.batches.results(batch_id))
     return _normalize_batch_results(requests, raw_items)
+
+
+def _cancel_batch_with_sdk(
+    batch_id: str,
+    *,
+    credential: ProviderCredential | None,
+    runtime: ProviderRuntimeOptions,
+) -> None:
+    client = _batch_client(credential, runtime)
+    client.messages.batches.cancel(batch_id)
 
 
 def _normalize_batch_results(

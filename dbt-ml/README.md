@@ -194,9 +194,54 @@ Keep it off for dev loops:
 extraction:
   backend: llm
   options:
-    batch: true            # provider-native batch; higher latency, often cheaper
-    batch_poll_seconds: 30 # optional poll interval
+    batch: true                  # provider-native batch; higher latency, often cheaper
+    batch_size: 1000             # deterministic partition size (capped by the provider)
+    batch_poll_seconds: 30       # initial poll interval; backs off toward the max
+    batch_poll_max_seconds: 300  # poll backoff ceiling
+    batch_timeout_seconds: 86400 # cancel the provider job past this deadline
+    on_partial_batch: fail       # or publish_successful (per-doc errors, successes kept)
 ```
+
+Uncached documents stream through deterministic partitions of at most
+`batch_size` requests (never above the provider's own limit), so memory stays
+bounded regardless of corpus size. Each partition's provider job identifier is
+persisted in the response cache database before polling: a crashed or
+interrupted run resumes the submitted job on the next invocation instead of
+resubmitting it, so the work is billed exactly once. Batch mode without
+`cache_path` still runs, but cannot resume — `compile` warns about it. By
+default a partition containing a failed document publishes nothing further
+(`on_partial_batch: fail`); opt into `publish_successful` to record
+per-document failures and keep the successes, advancing state only for
+published documents.
+
+Execution budgets cap what a run may consume before the next provider call is
+made. Per-model caps live in the model's extraction options; run-wide caps are
+operator policy in profiles.yml:
+
+```yaml
+# model YAML
+extraction:
+  backend: llm
+  options:
+    budget:
+      max_documents: 5000
+      max_api_calls: 5000
+      max_cost_usd: 25.0
+
+# profiles.yml
+llm:
+  budget:               # shared by every model in one invocation
+    max_total_bytes: 500000000
+    max_cost_usd: 100.0
+```
+
+Available caps: `max_documents`, `max_file_bytes`, `max_total_bytes`,
+`max_input_tokens`, `max_output_tokens`, `max_api_calls`, and `max_cost_usd`
+(provider-reported spend wins over the pricing-table estimate). A tripped
+budget stops the model with the distinct `budget_exceeded` status: `full`
+materializations publish nothing, and incremental runs keep only chunks that
+already committed with their state. Token and spend caps are measured from
+responses, so the stopping call may overshoot the cap by at most one response.
 
 ### LLM credentials
 

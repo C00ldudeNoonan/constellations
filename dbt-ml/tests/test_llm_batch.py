@@ -78,7 +78,8 @@ class _FakeBatchAPI:
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
+        **_kwargs: Any,
+    ) -> tuple[BatchInferenceResult, bool]:
         self.calls += 1
         self.submitted.append(requests)
         out: list[BatchInferenceItem] = []
@@ -96,7 +97,7 @@ class _FakeBatchAPI:
                     ),
                 )
             )
-        return BatchInferenceResult(tuple(out), batch_submissions=1)
+        return BatchInferenceResult(tuple(out), batch_submissions=1), False
 
 
 @pytest.fixture
@@ -240,11 +241,12 @@ def test_message_batch_uses_custom_api_key_env(
             output_schema={"type": "object", "properties": {}},
         ),
     )
-    result = llm_backend._run_message_batch(
+    result, resumed = llm_backend._run_message_batch(
         [request],
         poll_seconds=0,
         api_key_env="DBT_ML_BATCH_KEY",
     )
+    assert resumed is False
 
     assert len(result.items) == 1
     assert result.items[0].request_id == "req-0"
@@ -313,6 +315,18 @@ def batch_project(tmp_path: Path) -> Path:
     return dst
 
 
+
+def _allow_partial_batch(project: Path) -> None:
+    model = project / "models" / "raw_invoices_llm.yml"
+    model.write_text(
+        model.read_text().replace(
+            "        batch: true",
+            "        batch: true\n        on_partial_batch: publish_successful",
+            1,
+        )
+    )
+
+
 def _invoice_result(n: int) -> InferenceResult:
     return _succeeded_result(
         {
@@ -339,14 +353,18 @@ def test_runner_batch_mode_end_to_end(
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
+        **_kwargs: Any,
+    ) -> tuple[BatchInferenceResult, bool]:
         calls["n"] += 1
-        return BatchInferenceResult(
-            tuple(
-                BatchInferenceItem(req.request_id, result=_invoice_result(i))
-                for i, req in enumerate(requests)
+        return (
+            BatchInferenceResult(
+                tuple(
+                    BatchInferenceItem(req.request_id, result=_invoice_result(i))
+                    for i, req in enumerate(requests)
+                ),
+                batch_submissions=1,
             ),
-            batch_submissions=1,
+            False,
         )
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
@@ -389,13 +407,17 @@ def test_runner_batch_cost_estimate_halved(
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
-        return BatchInferenceResult(
-            tuple(
-                BatchInferenceItem(req.request_id, result=_invoice_result(i))
-                for i, req in enumerate(requests)
+        **_kwargs: Any,
+    ) -> tuple[BatchInferenceResult, bool]:
+        return (
+            BatchInferenceResult(
+                tuple(
+                    BatchInferenceItem(req.request_id, result=_invoice_result(i))
+                    for i, req in enumerate(requests)
+                ),
+                batch_submissions=1,
             ),
-            batch_submissions=1,
+            False,
         )
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
@@ -409,6 +431,8 @@ def test_runner_batch_cost_estimate_halved(
 def test_runner_batch_isolates_per_document_errors(
     monkeypatch: pytest.MonkeyPatch, batch_project: Path
 ) -> None:
+    _allow_partial_batch(batch_project)
+
     def fake(
         requests: list[BatchInferenceRequest],
         *,
@@ -416,13 +440,14 @@ def test_runner_batch_isolates_per_document_errors(
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
+        **_kwargs: Any,
+    ) -> tuple[BatchInferenceResult, bool]:
         out = [
             BatchInferenceItem(req.request_id, result=_invoice_result(i))
             for i, req in enumerate(requests)
         ]
         out[1] = _errored_item()
-        return BatchInferenceResult(tuple(out), batch_submissions=1)
+        return BatchInferenceResult(tuple(out), batch_submissions=1), False
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)
 
@@ -436,6 +461,8 @@ def test_runner_batch_isolates_per_document_errors(
 def test_runner_records_batch_submission_when_every_item_fails(
     monkeypatch: pytest.MonkeyPatch, batch_project: Path
 ) -> None:
+    _allow_partial_batch(batch_project)
+
     def fake(
         requests: list[BatchInferenceRequest],
         *,
@@ -443,11 +470,15 @@ def test_runner_records_batch_submission_when_every_item_fails(
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
+        **_kwargs: Any,
+    ) -> tuple[BatchInferenceResult, bool]:
         del provider, poll_seconds, api_key_env, max_retries
-        return BatchInferenceResult(
-            tuple(_errored_item(request.request_id) for request in requests),
-            batch_submissions=1,
+        return (
+            BatchInferenceResult(
+                tuple(_errored_item(request.request_id) for request in requests),
+                batch_submissions=1,
+            ),
+            False,
         )
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake)

@@ -14,6 +14,7 @@ from pydantic import (
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 
+from ..budget import LLMBudgetConfig
 from ..credentials import (
     CredentialReference,
     CredentialReferenceError,
@@ -168,6 +169,9 @@ class LLMConfig(BaseModel):
     cache_path: Path | None = None
     system_prompt: str | None = None
     pricing: PricingConfig | None = None
+    # Run-level execution caps shared by every model in one invocation;
+    # operator-owned policy, like the credential reference.
+    budget: LLMBudgetConfig | None = None
 
 
 class _RedactedWarehouseInput:

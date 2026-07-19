@@ -155,8 +155,11 @@ def build_run_results(
     n_error = 0
     for r in results:
         failed = test_failures.get(r.model_name, [])
-        status = "error" if (r.errors or failed) else "success"
-        n_error += status == "error"
+        # Distinct terminal outcomes (budget_exceeded, cancelled) win over
+        # the derived error/success so operators can tell a stopped run
+        # from a broken one; both still count as errors.
+        status = r.status or ("error" if (r.errors or failed) else "success")
+        n_error += status != "success"
         row = asdict(r)
         row["status"] = status
         row["test_failures"] = failed

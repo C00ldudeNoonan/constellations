@@ -240,7 +240,7 @@ def test_registry_rejects_duplicate_and_invalid_providers() -> None:
         provider_name = "missing-native-batch"
         supports_native_batch = True
 
-    with pytest.raises(ProviderRegistrationError, match="must override complete_batch"):
+    with pytest.raises(ProviderRegistrationError, match="must override submit_batch"):
         register_inference_provider(MissingNativeBatchImplementation)
 
     class InvalidImplementationPackages(_EchoInferenceProvider):
@@ -658,7 +658,7 @@ def test_credentials_are_explicit_and_redacted(
     with pytest.raises(TypeError):
         ProviderCredential("LEGACY_ENV_NAME", secret)
     assert not hasattr(credential, "env_var")
-    assert PROVIDER_CONTRACT_VERSION == 2
+    assert PROVIDER_CONTRACT_VERSION == 3
 
 
 def test_llm_credential_helper_drops_reference_names_from_traceback_locals(

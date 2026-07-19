@@ -152,20 +152,24 @@ def test_batch_cost_uses_selected_provider_multiplier(
         poll_seconds: float,
         api_key_env: str,
         max_retries: int,
-    ) -> BatchInferenceResult:
+        **_kwargs: object,
+    ) -> tuple[BatchInferenceResult, bool]:
         del provider, poll_seconds, api_key_env, max_retries
-        return BatchInferenceResult(
-            tuple(
-                BatchInferenceItem(
-                    request.request_id,
-                    result=InferenceResult(
-                        output={**_FIELDS, "invoice_id": f"INV-{index}"},
-                        usage=ProviderUsage(**_CALL_USAGE),
-                    ),
-                )
-                for index, request in enumerate(requests)
+        return (
+            BatchInferenceResult(
+                tuple(
+                    BatchInferenceItem(
+                        request.request_id,
+                        result=InferenceResult(
+                            output={**_FIELDS, "invoice_id": f"INV-{index}"},
+                            usage=ProviderUsage(**_CALL_USAGE),
+                        ),
+                    )
+                    for index, request in enumerate(requests)
+                ),
+                batch_submissions=1,
             ),
-            batch_submissions=1,
+            False,
         )
 
     class DiscountProvider:

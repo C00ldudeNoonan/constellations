@@ -237,6 +237,12 @@ def _compile_warnings(
             else:
                 continue
             provider = get_inference_provider(str(options["provider"]))
+            if options.get("batch") and not options.get("cache_path"):
+                out.append(
+                    f"Model '{model.name}' uses batch extraction without "
+                    "llm.cache_path; interrupted batch jobs cannot be resumed "
+                    "and completed responses are not cached."
+                )
             if not provider.requires_credentials:
                 continue
             env_value = options.get("api_key_env") or provider.default_credential_env
@@ -870,6 +876,8 @@ def run(
             f"{r.documents_processed:>10}{r.documents_skipped:>10}"
             f"{r.documents_deleted:>9}{r.rows_written:>8}{r.duration_seconds:>10.3f}"
         )
+        if r.status is not None:
+            click.echo(f"  STATUS: {r.status}", err=True)
         for err in r.errors:
             click.echo(f"  ERROR: {err}", err=True)
         _echo_warnings(r)
@@ -1046,7 +1054,7 @@ def _echo_build(result: BuildResult) -> None:
     click.echo(rheader)
     click.echo("-" * len(rheader))
     for r in result.run_results:
-        status = "ERROR" if r.errors else "ok"
+        status = r.status.upper() if r.status else ("ERROR" if r.errors else "ok")
         click.echo(
             f"{r.model_name:<22}{r.kind:<12}{r.rows_written:>8}"
             f"{r.duration_seconds:>10.3f}  {status}"

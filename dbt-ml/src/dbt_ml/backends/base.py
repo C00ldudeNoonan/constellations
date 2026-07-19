@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..budget import BudgetGuard
 from ..hashing import HASH_DIGEST_SIZE
 
 
@@ -66,8 +67,13 @@ class BaseBackend(ABC):
         return out
 
     def extract_batch_with_metrics(
-        self, paths: list[Path], options: dict[str, Any]
+        self,
+        paths: list[Path],
+        options: dict[str, Any],
+        *,
+        budget: BudgetGuard | None = None,
     ) -> BatchExtractionOutput:
+        del budget
         return BatchExtractionOutput(self.extract_batch(paths, options))
 
     def version(self) -> str:

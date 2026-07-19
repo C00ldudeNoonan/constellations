@@ -179,6 +179,10 @@ third-party projects or sensitive documents.
 - **[Semantic retrieval architecture](dbt-ml/docs/architecture/semantic-retrieval.md)**
   — the `search:` resource and retrieval-store contract, including the shipped
   local LanceDB proof of concept and its fail-closed boundaries.
+- **[Provider abstraction](dbt-ml/docs/architecture/provider-abstraction.md)**
+  — the inference/embedding provider contract, plus the accepted plugin
+  discovery, provider-owned configuration, and failed-outcome accounting
+  design (issue #71).
 - **[Changelog](dbt-ml/CHANGELOG.md)**
 
 ## License

@@ -169,6 +169,86 @@ def test_ready_activation_requires_claimed_config_and_generation(
         )
 
 
+def _insert_ledger_row(
+    coordinator: Any,
+    scope: StateScope,
+    *,
+    row_id: str,
+    fencing_token: int = 0,
+    status: str = STATUS_UNPUBLISHED,
+    publication_id: str | None = None,
+) -> None:
+    adapter = coordinator._adapter
+    ledger = f"{adapter.schema_ref}.{adapter.quote_ident('dbt_ml_serving_ledger')}"
+    adapter.execute(
+        f"""
+        INSERT INTO {ledger} (
+            model_name, stage, target_identity, row_id, fencing_token, status,
+            publication_id, rows_inserted, rows_updated, rows_skipped, rows_deleted
+        )
+        SELECT ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0 FROM (SELECT 1) AS seed
+        """,
+        [
+            scope.model_name,
+            scope.stage,
+            scope.target_identity,
+            row_id,
+            fencing_token,
+            status,
+            publication_id,
+        ],
+    )
+
+
+def test_duplicate_creation_race_self_heals_on_next_claim(coordinator: Any) -> None:
+    # Simulate the benign race: two sessions both inserted the initial,
+    # unclaimed ledger row because no warehouse-enforced unique key exists.
+    scope = _scope()
+    _insert_ledger_row(coordinator, scope, row_id="aaa")
+    _insert_ledger_row(coordinator, scope, row_id="bbb")
+
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    assert lease.fencing_token == 1
+    coordinator.mark_ready(
+        lease, active_generation="gen1", config_fingerprint="cfg1", counts=(1, 0, 0, 0)
+    )
+    assert coordinator.status(scope).status == STATUS_READY
+
+
+def test_claim_refuses_duplicated_scope_and_recover_rebuilds_it(
+    coordinator: Any,
+) -> None:
+    # A corrupted scope with two claimed rows must never elect a publisher;
+    # explicit recovery rebuilds exactly one row above every observed fence.
+    scope = _scope()
+    _insert_ledger_row(
+        coordinator, scope, row_id="aaa", fencing_token=3, publication_id="p-aaa",
+        status=STATUS_PUBLISHING,
+    )
+    _insert_ledger_row(
+        coordinator, scope, row_id="bbb", fencing_token=4, publication_id="p-bbb",
+        status=STATUS_PUBLISHING,
+    )
+
+    with pytest.raises(ServingCoordinationError, match="conflicting rows"):
+        coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg1"
+        )
+    with pytest.raises(ServingCoordinationError, match="conflicting rows"):
+        coordinator.status(scope)
+
+    entry = coordinator.recover(scope, owner_terminated=True)
+    assert entry.status == STATUS_FAILED
+    assert entry.fencing_token == 5
+
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    assert lease.fencing_token == 6
+
+
 # ─── query leases ───────────────────────────────────────────────────────────
 
 

@@ -135,6 +135,7 @@ class ServingCoordinator:
                 model_name STRING NOT NULL,
                 stage STRING NOT NULL,
                 target_identity STRING NOT NULL,
+                row_id STRING NOT NULL,
                 fencing_token BIGINT NOT NULL,
                 status STRING NOT NULL,
                 publication_id STRING,
@@ -167,14 +168,23 @@ class ServingCoordinator:
         )
 
     def _ensure_row(self, scope: StateScope) -> None:
+        """Create the scope's ledger row, healing benign creation races.
+
+        The ledger has no enforceable unique constraint on every warehouse
+        (BigQuery cannot enforce one), so two sessions racing the very first
+        publication of a scope can both insert. Duplicates from that race are
+        always unclaimed `unpublished` rows: the claim statement refuses to
+        run against a duplicated scope, so no duplicate can ever advance.
+        Collapsing to the smallest `row_id` is therefore a safe, deterministic
+        election."""
         ledger = self._ref(LEDGER_TABLE)
         self._adapter.execute(
             f"""
             INSERT INTO {ledger} (
-                model_name, stage, target_identity, fencing_token, status,
-                rows_inserted, rows_updated, rows_skipped, rows_deleted
+                model_name, stage, target_identity, row_id, fencing_token,
+                status, rows_inserted, rows_updated, rows_skipped, rows_deleted
             )
-            SELECT ?, ?, ?, 0, ?, 0, 0, 0, 0 FROM (SELECT 1) AS seed
+            SELECT ?, ?, ?, ?, 0, ?, 0, 0, 0, 0 FROM (SELECT 1) AS seed
             WHERE NOT EXISTS (
                 SELECT 1 FROM {ledger}
                 WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -184,10 +194,27 @@ class ServingCoordinator:
                 scope.model_name,
                 scope.stage,
                 scope.target_identity,
+                uuid4().hex,
                 STATUS_UNPUBLISHED,
                 scope.model_name,
                 scope.stage,
                 scope.target_identity,
+            ],
+        )
+        self._adapter.execute(
+            f"""
+            DELETE FROM {ledger}
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND status = ? AND publication_id IS NULL
+              AND row_id <> (
+                  SELECT MIN(row_id) FROM {ledger}
+                  WHERE model_name = ? AND stage = ? AND target_identity = ?
+              )
+            """,
+            [
+                *self._scope_params(scope),
+                STATUS_UNPUBLISHED,
+                *self._scope_params(scope),
             ],
         )
 
@@ -290,12 +317,17 @@ class ServingCoordinator:
                   SELECT 1 FROM {leases}
                   WHERE model_name = ? AND stage = ? AND target_identity = ?
               )
+              AND (
+                  SELECT COUNT(*) FROM {ledger}
+                  WHERE model_name = ? AND stage = ? AND target_identity = ?
+              ) = 1
             """,
             [
                 publication_id,
                 STATUS_PUBLISHING,
                 expected_code_version,
                 config_fingerprint,
+                *self._scope_params(scope),
                 *self._scope_params(scope),
                 *self._scope_params(scope),
             ],
@@ -537,7 +569,7 @@ class ServingCoordinator:
                 "Serving recovery requires terminating the previous owner first; "
                 "re-run with the owner-terminated confirmation"
             )
-        self._ensure_row(scope)
+        ledger = self._ref(LEDGER_TABLE)
         self._adapter.execute(
             f"""
             DELETE FROM {self._ref(LEASE_TABLE)}
@@ -545,14 +577,39 @@ class ServingCoordinator:
             """,
             self._scope_params(scope),
         )
-        self._adapter.execute(
+        # Rebuild the scope as exactly one row above every observed fence, so
+        # recovery also repairs a ledger corrupted by duplicate creation races.
+        rows = self._adapter.rows(
             f"""
-            UPDATE {self._ref(LEDGER_TABLE)}
-            SET publication_id = NULL, fencing_token = fencing_token + 1,
-                status = ?, safe_error_code = ?, active_generation = NULL,
-                completed_at = CURRENT_TIMESTAMP
+            SELECT COALESCE(MAX(fencing_token), 0) FROM {ledger}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
-            [STATUS_FAILED, RECOVERY_ERROR_CODE, *self._scope_params(scope)],
+            self._scope_params(scope),
+        )
+        next_fence = int(rows[0][0]) + 1 if rows else 1
+        self._adapter.execute(
+            f"""
+            DELETE FROM {ledger}
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+            """,
+            self._scope_params(scope),
+        )
+        self._adapter.execute(
+            f"""
+            INSERT INTO {ledger} (
+                model_name, stage, target_identity, row_id, fencing_token,
+                status, safe_error_code, rows_inserted, rows_updated,
+                rows_skipped, rows_deleted, completed_at
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP
+            FROM (SELECT 1) AS seed
+            """,
+            [
+                *self._scope_params(scope),
+                uuid4().hex,
+                next_fence,
+                STATUS_FAILED,
+                RECOVERY_ERROR_CODE,
+            ],
         )
         return self.status(scope)

@@ -253,6 +253,36 @@ def test_compile_warning_uses_configured_api_key_env(
     assert "wrong-default-secret" not in result.output
 
 
+def test_compile_warns_for_missing_optional_vllm_credential(
+    monkeypatch: pytest.MonkeyPatch, llm_project: Path
+) -> None:
+    profiles = llm_project / "profiles.yml"
+    profile_text = profiles.read_text()
+    profile_text = profile_text.replace(
+        "        provider: anthropic",
+        "        provider: vllm\n"
+        "        base_url: https://inference.example.test/v1",
+    )
+    profile_text = profile_text.replace(
+        "        model: claude-haiku-4-5",
+        "        model: invoice-extractor",
+    )
+    profile_text = profile_text.replace(
+        "        api_key_env: ANTHROPIC_API_KEY",
+        "        api_key_env: VLLM_MISSING_KEY",
+    )
+    profiles.write_text(profile_text)
+    monkeypatch.delenv("VLLM_MISSING_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(llm_project), "compile"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "warning: Inference provider 'vllm' credential" in result.output
+    assert "VLLM_MISSING_KEY" not in result.output
+
+
 def test_compile_warns_for_llm_transform_without_llm_extraction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

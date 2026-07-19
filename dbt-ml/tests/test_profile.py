@@ -236,6 +236,72 @@ def test_llm_options_merged_from_profile(tmp_path: Path) -> None:
     assert options["fields"] == [{"name": "x"}]
 
 
+def test_vllm_endpoint_options_are_resolved_from_profile(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "d",
+                },
+                "llm": {
+                    "provider": "vllm",
+                    "model": "invoice-extractor",
+                    "base_url": "HTTPS://INFERENCE.EXAMPLE.TEST:443/v1/",
+                    "timeout_seconds": 120,
+                },
+            }
+        },
+    )
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.llm is not None
+    assert resolved.llm.base_url == "https://inference.example.test/v1"
+    options = resolve_llm_options({"fields": [{"name": "x"}]}, resolved)
+
+    assert options["provider"] == "vllm"
+    assert options["model"] == "invoice-extractor"
+    assert options["base_url"] == "https://inference.example.test/v1"
+    assert options["timeout_seconds"] == 120
+    assert "api_key_env" not in options
+
+
+def test_model_base_url_cannot_override_profile(tmp_path: Path) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles(
+        tmp_path,
+        targets={
+            "dev": {
+                "warehouse": {
+                    "type": "duckdb",
+                    "path": "./d.duckdb",
+                    "schema": "d",
+                },
+                "llm": {
+                    "provider": "vllm",
+                    "model": "invoice-extractor",
+                    "base_url": "https://profile.example.test/v1",
+                },
+            }
+        },
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    with pytest.raises(ProfileError, match=r"base_url.*operator-owned"):
+        resolve_llm_options(
+            {
+                "base_url": "https://model.example.test/v1",
+                "fields": [{"name": "x"}],
+            },
+            resolved,
+        )
+
+
 def test_model_option_overrides_profile(tmp_path: Path) -> None:
     _write_project(tmp_path, profile="test_proj")
     _write_profiles(
@@ -349,6 +415,7 @@ def test_profile_selected_provider_enforces_native_batch_capability(
         default_credential_env=None,
         supports_native_batch=False,
         resolve_model=lambda model: model or "sync-model",
+        resolve_base_url=lambda base_url: base_url,
     )
     monkeypatch.setattr("dbt_ml.profile.get_inference_provider", lambda _name: provider)
     _write_project(tmp_path, profile="test_proj")

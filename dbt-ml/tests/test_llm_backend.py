@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from pathlib import Path
@@ -286,8 +287,8 @@ def test_custom_api_key_env_wins_for_sync_and_reusable_clients(
     )
     assert helper_fields == {"vendor": "Acme"}
     assert init_kwargs == [
-        {"api_key": secret, "max_retries": 4},
-        {"api_key": secret, "max_retries": 4},
+        {"api_key": secret, "max_retries": 4, "timeout": 60.0},
+        {"api_key": secret, "max_retries": 4, "timeout": 60.0},
     ]
     assert secret not in caplog.text
 
@@ -370,6 +371,70 @@ def test_max_tokens_is_part_of_cache_key(
     backend.extract(doc, {**opts, "max_tokens": 4096})
 
     assert counter.calls == 2
+
+
+def test_vllm_base_url_is_part_of_cache_key(
+    tmp_path: Path, schema: list[dict[str, Any]]
+) -> None:
+    calls = 0
+
+    def fake_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        return {"vendor": "v", "invoice_id": "i", "total": 1.0}
+
+    common = {
+        "fields_spec": schema,
+        "provider": "vllm",
+        "model": "invoice-extractor",
+        "cache_path": tmp_path / "cache.duckdb",
+        "call_api": fake_call,
+    }
+    extract_fields_from_text(
+        "invoice",
+        base_url="https://first.example.test/v1",
+        **common,
+    )
+    extract_fields_from_text(
+        "invoice",
+        base_url="https://second.example.test/v1/",
+        **common,
+    )
+    extract_fields_from_text(
+        "invoice",
+        base_url="HTTPS://SECOND.EXAMPLE.TEST:443/v1",
+        **common,
+    )
+
+    assert calls == 2
+
+
+def test_no_endpoint_preserves_legacy_cache_key() -> None:
+    values = {
+        "provider": "anthropic",
+        "provider_identity": "anthropic/1",
+        "model": "claude-test",
+        "content_hash": "content",
+        "schema_hash": "schema",
+        "max_tokens": 2048,
+    }
+    canonical = json.dumps(
+        {
+            "contract_version": provider_base.PROVIDER_CONTRACT_VERSION,
+            **values,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.blake2b(
+        canonical.encode(), digest_size=HASH_DIGEST_SIZE
+    ).hexdigest()
+
+    assert llm_backend._cache_key(**values, base_url=None) == (
+        f"provider-v{provider_base.PROVIDER_CONTRACT_VERSION}|anthropic|"
+        f"claude-test|{digest}"
+    )
 
 
 def test_cache_key_separates_provider_implementations() -> None:
@@ -634,7 +699,11 @@ def test_truncated_response_is_an_error(
     with pytest.raises(RuntimeError, match="max_tokens"):
         backend.extract(doc, {"fields": schema})
 
-    assert init_kwargs == {"api_key": "test-key", "max_retries": 4}
+    assert init_kwargs == {
+        "api_key": "test-key",
+        "max_retries": 4,
+        "timeout": 60.0,
+    }
     assert create_kwargs["temperature"] == 0.0
     assert create_kwargs["max_tokens"] == 2048
     assert isinstance(create_kwargs["system"], str)

@@ -243,6 +243,11 @@ materializations publish nothing, and incremental runs keep only chunks that
 already committed with their state. Token and spend caps are measured from
 responses, so the stopping call may overshoot the cap by at most one response.
 
+The built-in `vllm` provider supports local, Docker, Kubernetes, and remote
+OpenAI-compatible endpoints. See the [vLLM provider guide](docs/vllm.md) for
+server startup, profile configuration, authentication, timeout, model-name,
+and concurrency recommendations.
+
 ### LLM credentials
 
 `api_key_env` selects an environment-variable reference, never a secret.
@@ -269,11 +274,11 @@ transform:
   uses_llm: true
 ```
 
-Pass the effective `ctx.llm.provider`, `model`, and `api_key_env` to
-`extract_fields_from_text()`; when `ctx.llm.system_prompt` is set, pass it as
-the helper's `system=` argument. This keeps provider selection and credentials
-operator-governed. LLM extraction models preflight credentials even if their
-response cache is warm.
+Pass the effective `ctx.llm.provider`, `model`, `api_key_env`, `base_url`, and
+`timeout_seconds` to `extract_fields_from_text()`; when
+`ctx.llm.system_prompt` is set, pass it as the helper's `system=` argument.
+This keeps provider selection, routing, and credentials operator-governed. LLM
+extraction models preflight credentials even if their response cache is warm.
 
 ## The CLI
 

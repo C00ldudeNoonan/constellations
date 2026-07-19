@@ -20,6 +20,7 @@ from ..credentials import (
     CredentialReferenceError,
     ProtectedCredential,
 )
+from ..endpoints import OpenAICompatibleBaseUrl
 
 DEFAULT_LLM_API_KEY_ENV = "ANTHROPIC_API_KEY"
 DEFAULT_LLM_PROVIDER = "anthropic"
@@ -61,7 +62,7 @@ def resolve_llm_credential(
         raise failure
 
     provider = get_inference_provider(provider_name)
-    if not provider.requires_credentials:
+    if not provider.requires_credentials and reference is None:
         return None
     if reference is None:
         default_reference = provider.default_credential_env
@@ -165,6 +166,13 @@ class LLMConfig(BaseModel):
         default=None,
         repr=False,
         exclude=True,
+    )
+    base_url: OpenAICompatibleBaseUrl | None = None
+    timeout_seconds: float = Field(
+        default=60.0,
+        ge=0.1,
+        le=3600.0,
+        allow_inf_nan=False,
     )
     cache_path: Path | None = None
     system_prompt: str | None = None

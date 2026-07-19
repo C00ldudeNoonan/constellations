@@ -33,6 +33,7 @@ from dbt_ml.versioning import (
     compute_content_hash,
     compute_document_id,
     compute_model_code_version,
+    describe_model_inference,
     resolve_module_file,
 )
 
@@ -253,6 +254,57 @@ def test_profile_llm_semantics_change_model_code_version(tmp_path: Path) -> None
     )
 
 
+def test_vllm_endpoint_changes_model_code_version_but_timeout_does_not(
+    tmp_path: Path,
+) -> None:
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction=ExtractionConfig(
+            backend="llm",
+            options={"fields": [{"name": "title", "type": "string"}]},
+        ),
+    )
+    project = ProjectConfig(name="p")
+    first = _resolved_llm(
+        tmp_path,
+        provider="vllm",
+        model="invoice-extractor",
+        base_url="https://first.example.test/v1",
+        timeout_seconds=30,
+    )
+    same_endpoint = _resolved_llm(
+        tmp_path,
+        provider="vllm",
+        model="invoice-extractor",
+        base_url="HTTPS://FIRST.EXAMPLE.TEST:443/v1/",
+        timeout_seconds=300,
+    )
+    second = _resolved_llm(
+        tmp_path,
+        provider="vllm",
+        model="invoice-extractor",
+        base_url="https://second.example.test/v1",
+        timeout_seconds=30,
+    )
+
+    first_version = compute_model_code_version(
+        model, project, tmp_path, resolved=first
+    )
+    assert first_version == compute_model_code_version(
+        model, project, tmp_path, resolved=same_endpoint
+    )
+    assert first_version != compute_model_code_version(
+        model, project, tmp_path, resolved=second
+    )
+    descriptor = describe_model_inference(model, project, resolved=first)
+    assert descriptor is not None
+    assert descriptor["provider"] == "vllm"
+    assert descriptor["model"] == "invoice-extractor"
+    assert len(descriptor["endpoint_identity"]) == HASH_DIGEST_SIZE * 2
+    assert "first.example.test" not in repr(descriptor)
+
+
 def test_llm_dependent_transform_versions_profile_inference(tmp_path: Path) -> None:
     model = ModelConfig(
         name="derived",
@@ -312,6 +364,7 @@ def test_provider_and_model_change_model_code_version(
         lambda name: SimpleNamespace(
             implementation_identity=lambda: f"implementation/{name}",
             resolve_model=lambda model: model,
+            resolve_base_url=lambda base_url: base_url,
         ),
     )
     project = ProjectConfig(name="p")
@@ -358,6 +411,7 @@ def test_provider_implementation_changes_model_code_version(
         lambda name: SimpleNamespace(
             implementation_identity=lambda: "implementation/one",
             resolve_model=lambda selected: selected,
+            resolve_base_url=lambda base_url: base_url,
         ),
     )
     first = compute_model_code_version(model, project, tmp_path)
@@ -366,6 +420,7 @@ def test_provider_implementation_changes_model_code_version(
         lambda name: SimpleNamespace(
             implementation_identity=lambda: "implementation/two",
             resolve_model=lambda selected: selected,
+            resolve_base_url=lambda base_url: base_url,
         ),
     )
 

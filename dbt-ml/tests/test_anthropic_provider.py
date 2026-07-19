@@ -79,10 +79,14 @@ def test_anthropic_complete_maps_request_and_normalizes_response(
     result = provider.complete(
         _request(),
         credential=ProviderCredential("top-secret"),
-        runtime=ProviderRuntimeOptions(max_retries=6),
+        runtime=ProviderRuntimeOptions(max_retries=6, timeout_seconds=12.5),
     )
 
-    assert captured["client"] == {"api_key": "top-secret", "max_retries": 6}
+    assert captured["client"] == {
+        "api_key": "top-secret",
+        "max_retries": 6,
+        "timeout": 12.5,
+    }
     request = captured["request"]
     assert request["model"] == "claude-test"
     assert request["max_tokens"] == 321
@@ -220,11 +224,15 @@ def test_anthropic_batch_is_ordered_and_reports_item_failures(
     result = AnthropicInferenceProvider().complete_batch(
         requests,
         credential=ProviderCredential("api-key"),
-        runtime=ProviderRuntimeOptions(max_retries=8),
+        runtime=ProviderRuntimeOptions(max_retries=8, timeout_seconds=45),
         poll_seconds=0,
     )
 
-    assert captured["client"] == {"api_key": "api-key", "max_retries": 8}
+    assert captured["client"] == {
+        "api_key": "api-key",
+        "max_retries": 8,
+        "timeout": 45,
+    }
     assert [item["custom_id"] for item in captured["requests"]] == ["a", "b", "c"]
     assert [item.request_id for item in result.items] == ["a", "b", "c"]
     assert result.items[0].result is not None

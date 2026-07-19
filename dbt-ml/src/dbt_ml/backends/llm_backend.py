@@ -73,6 +73,9 @@ class BatchCancelledError(RuntimeError):
     Message is artifact-safe: it names the timeout, never job contents.
     """
 
+
+_DEFAULT_TIMEOUT_SECONDS = 60.0
+
 # DuckDB cache writes can race when extraction is parallelized; serialize them.
 _CACHE_WRITE_LOCK = threading.Lock()
 
@@ -129,6 +132,8 @@ class LLMBackend(BaseBackend):
                         (default 4, exponential backoff)
         max_concurrent: Max in-flight API calls process-wide (default 4)
         api_key_env:    Operator-owned credential environment variable
+        base_url:       Operator-owned custom provider endpoint
+        timeout_seconds: Per-request timeout (default 60 seconds)
         batch:          Use the provider's native batch API (default false)
         batch_poll_seconds: Poll interval while a batch runs (default 30)
     """
@@ -145,6 +150,7 @@ class LLMBackend(BaseBackend):
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
         provider = get_inference_provider(provider_name)
         model = resolve_provider_model(provider, options.get("model"))
+        base_url = provider.resolve_base_url(options.get("base_url"))
         api_key_env = _provider_api_key_env(options, provider)
         _resolve_provider_credential(provider, api_key_env)
         fields_spec = options.get("fields")
@@ -153,6 +159,15 @@ class LLMBackend(BaseBackend):
                 "llm backend requires `options.fields: [{name, type, ...}]`"
             )
 
+        call_options: dict[str, Any] = {
+            "provider": provider_name,
+            "api_key_env": api_key_env,
+        }
+        if base_url is not None:
+            call_options["base_url"] = base_url
+        if "timeout_seconds" in options:
+            call_options["timeout_seconds"] = options["timeout_seconds"]
+
         fields, usage = extract_fields_with_usage(
             path.read_text(),
             fields_spec=fields_spec,
@@ -160,10 +175,10 @@ class LLMBackend(BaseBackend):
             model=model,
             system=options.get("system_prompt", _DEFAULT_SYSTEM),
             cache_path=options.get("cache_path"),
-            call_api=partial(
-                self._call_api,
-                provider=provider_name,
-                api_key_env=api_key_env,
+            call_api=partial(self._call_api, **call_options),
+            base_url=base_url,
+            timeout_seconds=float(
+                options.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
             ),
             temperature=float(options.get("temperature", _DEFAULT_TEMPERATURE)),
             max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
@@ -209,6 +224,7 @@ class LLMBackend(BaseBackend):
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
         provider = get_inference_provider(provider_name)
         model = resolve_provider_model(provider, options.get("model"))
+        base_url = provider.resolve_base_url(options.get("base_url"))
         api_key_env = _provider_api_key_env(options, provider)
         _resolve_provider_credential(provider, api_key_env)
         if not provider.supports_native_batch:
@@ -237,6 +253,9 @@ class LLMBackend(BaseBackend):
         )
         timeout_seconds = float(
             options.get("batch_timeout_seconds", _DEFAULT_BATCH_TIMEOUT_SECONDS)
+        )
+        request_timeout_seconds = float(
+            options.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
         )
         partition_size = _effective_batch_size(
             provider, int(options.get("batch_size", _DEFAULT_BATCH_SIZE))
@@ -290,7 +309,9 @@ class LLMBackend(BaseBackend):
                 api_key_env=api_key_env,
                 max_retries=max_retries,
                 poll_max_seconds=poll_max_seconds,
-                timeout_seconds=timeout_seconds,
+                batch_timeout_seconds=timeout_seconds,
+                base_url=base_url,
+                request_timeout_seconds=request_timeout_seconds,
                 cache_path=cache_path_obj,
                 job_key=job_key,
             )
@@ -332,6 +353,7 @@ class LLMBackend(BaseBackend):
                 content_hash=content_hash,
                 schema_hash=schema_hash,
                 max_tokens=max_tokens,
+                base_url=base_url,
             )
             cached = (
                 _cache_get(cache_path_obj, cache_key)
@@ -411,6 +433,8 @@ def extract_fields_from_text(
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     api_key_env: CredentialSelector = None,
+    base_url: str | None = None,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Extract structured fields from text with a registered provider.
 
@@ -440,6 +464,8 @@ def extract_fields_from_text(
         max_retries=max_retries,
         max_concurrent=max_concurrent,
         api_key_env=api_key_env,
+        base_url=base_url,
+        timeout_seconds=timeout_seconds,
     )
     return fields
 
@@ -458,6 +484,8 @@ def extract_fields_with_usage(
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     api_key_env: CredentialSelector = None,
+    base_url: str | None = None,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
@@ -476,10 +504,12 @@ def extract_fields_with_usage(
             "max_tokens": max_tokens,
             "max_retries": max_retries,
             "max_concurrent": max_concurrent,
+            "timeout_seconds": timeout_seconds,
         }
     )
     provider_instance = get_inference_provider(provider)
     resolved_model = resolve_provider_model(provider_instance, model)
+    resolved_base_url = provider_instance.resolve_base_url(base_url)
     content_hash = hashlib.blake2b(
         text.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
@@ -491,6 +521,7 @@ def extract_fields_with_usage(
         content_hash=content_hash,
         schema_hash=schema_hash,
         max_tokens=max_tokens,
+        base_url=resolved_base_url,
     )
 
     cache_path_obj = Path(cache_path) if cache_path is not None else None
@@ -505,6 +536,8 @@ def extract_fields_with_usage(
             _default_call_api,
             provider=provider,
             api_key_env=api_key_env,
+            base_url=resolved_base_url,
+            timeout_seconds=timeout_seconds,
         )
     with _gate(max_concurrent):
         raw = fn(
@@ -559,6 +592,8 @@ def _default_call_api(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     api_key_env: CredentialSelector = None,
+    base_url: str | None = None,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     provider_instance = get_inference_provider(provider)
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
@@ -586,7 +621,11 @@ def _default_call_api(
             provider_instance.complete(
                 request,
                 credential=credential,
-                runtime=ProviderRuntimeOptions(max_retries=max_retries),
+                runtime=ProviderRuntimeOptions(
+                    max_retries=max_retries,
+                    base_url=base_url,
+                    timeout_seconds=timeout_seconds,
+                ),
             )
         )
     except ProviderError as error:
@@ -618,7 +657,9 @@ def _run_message_batch(
     api_key_env: CredentialSelector = None,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     poll_max_seconds: float = _DEFAULT_BATCH_POLL_MAX_SECONDS,
-    timeout_seconds: float = _DEFAULT_BATCH_TIMEOUT_SECONDS,
+    batch_timeout_seconds: float = _DEFAULT_BATCH_TIMEOUT_SECONDS,
+    base_url: str | None = None,
+    request_timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     cache_path: Path | None = None,
     job_key: str | None = None,
 ) -> tuple[BatchInferenceResult, bool]:
@@ -641,7 +682,11 @@ def _run_message_batch(
             code="invalid_credential_reference",
         )
     credential = _resolve_provider_credential(provider_instance, api_key_env)
-    runtime = ProviderRuntimeOptions(max_retries=max_retries)
+    runtime = ProviderRuntimeOptions(
+        max_retries=max_retries,
+        base_url=base_url,
+        timeout_seconds=request_timeout_seconds,
+    )
     resumed = False
     failure: Exception | None = None
     result: BatchInferenceResult | None = None
@@ -662,7 +707,7 @@ def _run_message_batch(
             )
             if cache_path is not None and job_key is not None:
                 _job_put(cache_path, job_key, provider=provider, batch_id=batch_id)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = time.monotonic() + batch_timeout_seconds
         interval = poll_seconds
         while True:
             status = provider_instance.poll_batch(
@@ -682,7 +727,7 @@ def _run_message_batch(
                     _job_delete(cache_path, job_key)
                 raise BatchCancelledError(
                     f"provider batch exceeded batch_timeout_seconds="
-                    f"{timeout_seconds:g} and was cancelled"
+                    f"{batch_timeout_seconds:g} and was cancelled"
                 )
             time.sleep(min(interval, max(deadline - now, 0.0)))
             interval = min(interval * _POLL_BACKOFF_FACTOR, poll_max_seconds)
@@ -886,21 +931,25 @@ def _cache_key(
     content_hash: str,
     schema_hash: str,
     max_tokens: int,
+    base_url: str | None = None,
 ) -> str:
     # Keyed on the semantic request plus the provider's contract identity —
     # not the backend implementation or dbt-ml release, so cached responses
     # survive routine upgrades. Row-shaping changes invalidate incremental
     # state through the model code version instead.
+    payload = {
+        "contract_version": PROVIDER_CONTRACT_VERSION,
+        "provider": provider,
+        "provider_identity": provider_identity,
+        "model": model,
+        "content_hash": content_hash,
+        "schema_hash": schema_hash,
+        "max_tokens": max_tokens,
+    }
+    if base_url is not None:
+        payload["base_url"] = base_url
     canonical = json.dumps(
-        {
-            "contract_version": PROVIDER_CONTRACT_VERSION,
-            "provider": provider,
-            "provider_identity": provider_identity,
-            "model": model,
-            "content_hash": content_hash,
-            "schema_hash": schema_hash,
-            "max_tokens": max_tokens,
-        },
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )

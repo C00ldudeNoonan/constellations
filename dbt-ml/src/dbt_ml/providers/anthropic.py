@@ -200,7 +200,11 @@ def _complete_with_sdk(
     from anthropic import Anthropic
 
     api_key = _credential_value(credential)
-    client = Anthropic(api_key=api_key, max_retries=runtime.max_retries)
+    client = Anthropic(
+        api_key=api_key,
+        max_retries=runtime.max_retries,
+        timeout=runtime.timeout_seconds,
+    )
     response = client.messages.create(  # type: ignore[call-overload]
         model=request.model,
         max_tokens=request.max_tokens,
@@ -220,7 +224,11 @@ def _batch_client(
     from anthropic import Anthropic
 
     api_key = _credential_value(credential)
-    return Anthropic(api_key=api_key, max_retries=runtime.max_retries)
+    return Anthropic(
+        api_key=api_key,
+        max_retries=runtime.max_retries,
+        timeout=runtime.timeout_seconds,
+    )
 
 
 def _submit_batch_with_sdk(

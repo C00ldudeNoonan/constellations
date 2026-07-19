@@ -1,5 +1,10 @@
 # Provider abstraction
 
+Status: the contract surface, registry, credential handling, and the Anthropic
+and vLLM mappings below are implemented. The sections marked "target contract
+(issue #71)" — plugin discovery, provider-owned profile configuration, and
+failed-outcome accounting — are accepted design, not current guarantees.
+
 dbt-ml treats hosted inference as an execution capability, not as a property of
 the LLM backend. Models describe the transformation they need; a provider
 translates that provider-neutral request into an SDK call. This boundary keeps
@@ -78,9 +83,143 @@ underscores, or hyphens. Registration rejects abstract implementations,
 duplicate names within one capability, and invalid batch metadata. The same
 name may intentionally exist in both registries.
 
-Importing `dbt_ml.providers` registers built-in providers. Automatic discovery
-of third-party packages is not part of this contract yet; an integration must
-import its provider module before profile resolution.
+Importing `dbt_ml.providers` registers built-in providers. Separately packaged
+providers load through the entry-point discovery contract below; until that
+lands, an integration must import its provider module before profile
+resolution.
+
+## Plugin discovery — target contract (issue #71)
+
+Separately packaged providers are discovered through versioned Python
+entry-point groups, so the stock `dbt-ml` CLI can load them without a wrapper
+import:
+
+```toml
+[project.entry-points."dbt_ml.inference_providers.v3"]
+acme = "acme_dbt_ml.provider:AcmeInferenceProvider"
+
+[project.entry-points."dbt_ml.embedding_providers.v3"]
+acme = "acme_dbt_ml.provider:AcmeEmbeddingProvider"
+```
+
+The group suffix is the provider contract major version
+(`PROVIDER_CONTRACT_VERSION`). A plugin advertises the contract it was built
+against by choosing the group; it never advertises a class under a contract it
+does not implement.
+
+Discovery rules, all enforced before any source, credential, or provider I/O:
+
+- Discovery runs exactly once, at profile resolution, after built-in
+  registration. Extraction and materialization never trigger imports.
+- Entry points are processed in a deterministic order: sorted by entry-point
+  name, then distribution name. Ordering never decides a conflict — it only
+  makes error output stable.
+- The entry-point name must equal the loaded class's `provider_name`. A
+  mismatch is a registration error naming the distribution.
+- Duplicate provider names — two distributions claiming one name, or a plugin
+  claiming a built-in name — fail the run with both distribution names. There
+  is no shadowing and no first-wins.
+- A plugin that only advertises groups for a different contract version fails
+  with a version-mismatch error naming the distribution and both versions,
+  not with "provider not found".
+- An entry point that raises on load fails the run with the distribution name
+  and exception type, sanitized like every provider error. Broken plugins are
+  never skipped silently.
+- Loaded classes pass the same registration validation as built-ins
+  (metadata, batch surface, constructor shape). `dbt-ml providers list` shows
+  every discovered provider with its capability, distribution, and
+  implementation identity, and is the supported way to debug discovery.
+
+Discovery failures are configuration errors: they carry no retryability, and
+they surface before a manifest is written, so a run can never bill provider
+work under a misconfigured plugin set.
+
+## Provider-owned profile configuration — target contract (issue #71)
+
+The shared `llm:` block stays small and provider-neutral: provider selection,
+model, credential reference, endpoint routing, timeout, cache, system prompt,
+pricing, and budget. Everything else a provider needs is declared by the
+provider itself, mirroring the model-level `warehouse_options` pattern the
+warehouse adapters already use:
+
+```yaml
+llm:
+  provider: acme
+  model: acme-small
+  api_key_env: ACME_API_KEY
+  provider_options:        # opaque to core; validated by the selected provider
+    region: eu-west-1
+    tenant: research
+```
+
+- A provider may publish a strict Pydantic model
+  (`profile_options_model()`, `extra="forbid"`,
+  `hide_input_in_errors=True`). Core validates `provider_options:` against the
+  selected provider's model at profile resolution; unknown keys are a profile
+  error when a model is published, and any `provider_options:` content is a
+  profile error when none is.
+- The parsed options are delivered once, at instantiation, as a frozen model
+  instance. Providers receive typed configuration at the boundary; they never
+  read profile YAML, environment variables (other than through
+  `resolve_credential`), or mutable dictionaries.
+- Every declared field carries exactly one classification:
+  - `credential` — must be typed as a `CredentialReference`; resolved to a
+    `ProviderCredential` only at the provider boundary, and excluded from
+    typed config repr, artifacts, hashes, logs, and errors like `api_key_env`.
+  - `semantic` — changes what the provider returns for a request. Semantic
+    fields enter the response-cache key and model identity, so tuning them
+    reprocesses exactly what they affect.
+  - `execution` — concurrency, timeouts, retry shaping. Excluded from
+    identity; changing them never invalidates state or cache.
+  - `artifact-safe` — non-secret descriptive fields that may additionally
+    appear verbatim in manifest provider descriptors. `semantic` and
+    `execution` fields stay out of artifacts unless also marked artifact-safe;
+    `credential` fields never qualify.
+- Classification is part of the field's declaration, and validation rejects a
+  published model with an unclassified or doubly classified field at
+  registration time, not at first use.
+
+## Failed outcomes and usage accounting — target contract (issue #71)
+
+Providers bill for work that does not produce a usable result: truncated
+responses, schema-invalid tool output, and partially failed native batches all
+consume tokens. The contract therefore lets a safe error and normalized usage
+coexist instead of forcing a choice between raising and accounting:
+
+- A frozen `InferenceFailure` envelope carries the sanitized `ProviderError`,
+  a `ProviderUsage`, the request count actually billed, and provenance:
+  provider name, effective model, and implementation identity.
+- `BatchInferenceItem` keeps exactly-one-of `result`/`error` semantics, and
+  the error side may carry the item's billed usage. Batch-level submissions
+  and polling overhead stay on `BatchInferenceResult`.
+- Synchronous failures still raise, and the raised `ProviderError` may carry
+  an attached `InferenceFailure` for the backend to consume. Nothing about
+  error control flow changes; only the accounting payload rides along.
+- Budgets treat billed failures as spend: token, call, and cost budgets
+  consume from failed work exactly as from successes, so a model that fails
+  repeatedly cannot bill unbounded retries under an "only successes count"
+  loophole.
+- Failed `run_results` rows preserve provenance without payloads: provider,
+  model, implementation identity, safe error code, retryability, and usage
+  with estimated cost when pricing is configured — never prompts, responses,
+  headers, SDK message text, or credential names.
+
+## Conformance proof — target contract (issue #71)
+
+The three contracts above are proven by fixtures, not by a live vendor:
+
+- A separately packaged fake provider — a real distribution with entry points,
+  a published profile-options model with all four field classifications, and
+  deterministic responses — is installed in CI and driven through the stock
+  CLI end to end.
+- Deterministic malicious and faulty plugins (duplicate names, built-in name
+  claims, wrong-contract groups, import-time failures, metadata violations,
+  contract-violating results, secret-leaking errors) run without network
+  access and must each produce their specified failure before any provider
+  I/O.
+- Vendor integrations (#15–#22) must be expressible as provider packages with
+  no runner or backend branches; a vendor issue that needs a core change is a
+  contract gap to fix here first.
 
 Profiles select the default provider and model without storing credentials:
 

@@ -1294,10 +1294,14 @@ relation. Implementation branches by DAG resource type:
 - A search index requires the warehouse's typed read capability for its one
   upstream relation and retrieval-store capabilities for its sink.
 - The #140 warehouse contract provides immutable snapshot reads, projected
-  typed batches, predicate pushdown, and a typed key-domain check. #153 provides
-  ordered/paged state iteration, bounded
-  state/upstream diffing, and atomic scope-state replacement; the current #139
-  `fetch_state()` full dictionary is not sufficient.
+  typed batches, predicate pushdown, and a typed key-domain check. The
+  implemented #153 contract provides ordered/paged state iteration
+  (`state_page_reader()` with snapshot-scoped opaque cursors), bounded
+  state/upstream diffing (`fetch_state_subset()` classification plus
+  absence-filtered stale pages), and fenced atomic scope-state replacement
+  (`replace_state_scope()`); the #139 `fetch_state()` full dictionary remains
+  only for materialization-scale callers and is rejected by preflight for
+  search publication.
 - The runner lifecycle-manages one warehouse and only the selected retrieval
   stores. It does not put store-specific branches in the general orchestration
   path.
@@ -1741,9 +1745,11 @@ their owning follow-ups:
 
 - serving/publication coordination in #152, split from adapter delivery because
   #139 does not provide the ledger or query/publish lease contract.
-- #140 adds immutable projected snapshots and key-domain validation; #153 adds
-  bounded state reconciliation and atomic scope-state replacement before
-  production-scale publication is claimed.
+- #140 adds immutable projected snapshots and key-domain validation; #153
+  (implemented) adds bounded state reconciliation and atomic scope-state
+  replacement, the warehouse-side prerequisites for production-scale
+  publication. Full-refresh search rebuilds additionally require store-side
+  atomic generation activation and stay rejected until that ships.
 - #135 delivers the portable request/result/filter types, Python API,
   `dbt-ml search`, score normalization, and core RRF for public indexes. The
   authorization factory and read lease remain fail-closed on #152.

@@ -27,6 +27,7 @@ from .adapters import (
     StateValue,
     TableReadSnapshot,
     WarehouseAdapter,
+    WarehouseCapability,
     create_adapter,
 )
 from .agent_context import (
@@ -89,6 +90,7 @@ from .retrieval import (
     create_store,
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
+from .state_reconciliation import BoundedReconciler, UpstreamRecord
 from .transforms import TransformContext, load_transform, transform_call_arity
 from .versioning import compute_code_version, compute_model_code_version
 
@@ -1899,15 +1901,21 @@ def _run_search_model(
     skipped = 0
     deleted = 0
     rows_written = 0
+    rows_seen = 0
     spec: CollectionSpec | None = None
     state_scope: StateScope | None = None
-    pending_state_records: list[StateRecord] = []
-    pending_state_deletes: list[list[str]] = []
     coordinator = ServingCoordinator(adapter)
     publish_lease: PublishLease | None = None
     active_generation: str | None = None
 
     try:
+        # Publication-state residency is bounded (issue #153): reconciliation
+        # never loads the full scope, so the adapter must provide ordered
+        # paged state access before any store I/O begins.
+        adapter.require_capability(
+            WarehouseCapability.PAGED_STATE_RECONCILIATION,
+            operation="bounded publication-state reconciliation",
+        )
         with adapter.table_snapshot(
             upstream,
             columns=projected,
@@ -1928,8 +1936,12 @@ def _run_search_model(
                 stage="retrieval_publish",
                 descriptor=state_target.descriptor(),
             )
-            prior_state = adapter.fetch_state(state_scope)
-            seen: set[str] = set()
+            reconciler = BoundedReconciler(
+                adapter,
+                state_scope,
+                code_version=code_version,
+                page_size=search.batch_size,
+            )
 
             publish_lease = coordinator.acquire_publish(
                 state_scope,
@@ -1958,25 +1970,31 @@ def _run_search_model(
                         spec.config_fingerprint,
                         max_id_bytes=store.capabilities().max_id_bytes,
                     )
-                    seen.update(row.record_id for row in indexed)
-                    pending: list[IndexedRow] = []
-                    pending_inserted = 0
-                    pending_updated = 0
-                    for row in indexed:
-                        previous = prior_state.get(row.record_id)
-                        if (
-                            not force_publish
-                            and previous is not None
-                            and previous.input_fingerprint == row.input_fingerprint
-                            and previous.code_version == code_version
-                        ):
-                            skipped += 1
-                            continue
-                        pending.append(row)
-                        if previous is None:
-                            pending_inserted += 1
-                        else:
-                            pending_updated += 1
+                    rows_seen += len(indexed)
+                    upstream_records = [
+                        UpstreamRecord(row.record_id, row.input_fingerprint)
+                        for row in indexed
+                    ]
+                    prior_state = (
+                        reconciler.prior_state_for(upstream_records)
+                        if upstream_records
+                        else {}
+                    )
+                    outcome = reconciler.classify(
+                        upstream_records,
+                        prior=prior_state,
+                        force_publish=force_publish,
+                    )
+                    skipped += len(outcome.unchanged)
+                    pending_keys = {
+                        record.record_key
+                        for record in (*outcome.new, *outcome.changed)
+                    }
+                    pending: list[IndexedRow] = [
+                        row for row in indexed if row.record_id in pending_keys
+                    ]
+                    pending_inserted = len(outcome.new)
+                    pending_updated = len(outcome.changed)
                     if not pending:
                         continue
                     coordinator.verify_publish(publish_lease)
@@ -2034,43 +2052,64 @@ def _run_search_model(
                         raise RunError(
                             "Retrieval store did not return an exact durable upsert receipt"
                         )
-                    state_records = [
-                        StateRecord(row.record_id, row.input_fingerprint, code_version)
-                        for row in pending
-                    ]
-                    pending_state_records.extend(state_records)
+                    # Advance state per batch, only for receipt-acknowledged
+                    # rows: a later failure leaves those rows durably
+                    # published and correctly recorded, while readiness stays
+                    # gated by the serving ledger.
+                    coordinator.verify_publish(publish_lease)
+                    adapter.upsert_state(
+                        state_scope,
+                        [
+                            StateRecord(
+                                row.record_id, row.input_fingerprint, code_version
+                            )
+                            for row in pending
+                        ],
+                    )
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
 
-                stale = sorted(set(prior_state) - seen)
-                for ordinal, offset in enumerate(range(0, len(stale), search.batch_size)):
-                    record_ids = stale[offset : offset + search.batch_size]
-                    coordinator.verify_publish(publish_lease)
-                    digest = canonical_fingerprint(
-                        {
-                            "snapshot": snapshot.fingerprint,
-                            "config": spec.config_fingerprint,
-                            "ordinal": ordinal,
-                            "state": [
-                                prior_state[record_id].input_fingerprint
-                                for record_id in record_ids
-                            ],
-                        },
-                        domain="dbt-ml-search-delete-batch",
-                    )
-                    receipt = store.delete(
-                        physical,
-                        record_ids,
-                        id_field=search.id_field,
-                        mutation_digest=digest,
-                    )
-                    if not receipt.acknowledged or len(receipt.outcomes) != len(record_ids):
-                        raise RunError(
-                            "Retrieval store did not return an exact durable delete receipt"
+                # Stale discovery streams state pages whose keys no longer
+                # exist upstream, in ascending key order — complete even for
+                # an empty upstream, with residency bounded by one page.
+                stale_pages = reconciler.iter_stale_pages(
+                    upstream_table=upstream,
+                    key_column=search.id_field,
+                )
+                try:
+                    for ordinal, stale_page in enumerate(stale_pages):
+                        record_ids = [record.record_key for record in stale_page]
+                        coordinator.verify_publish(publish_lease)
+                        digest = canonical_fingerprint(
+                            {
+                                "snapshot": snapshot.fingerprint,
+                                "config": spec.config_fingerprint,
+                                "ordinal": ordinal,
+                                "state": [
+                                    record.input_fingerprint
+                                    for record in stale_page
+                                ],
+                            },
+                            domain="dbt-ml-search-delete-batch",
                         )
-                    pending_state_deletes.append(record_ids)
-                    deleted += len(record_ids)
+                        receipt = store.delete(
+                            physical,
+                            record_ids,
+                            id_field=search.id_field,
+                            mutation_digest=digest,
+                        )
+                        if not receipt.acknowledged or len(receipt.outcomes) != len(
+                            record_ids
+                        ):
+                            raise RunError(
+                                "Retrieval store did not return an exact durable "
+                                "delete receipt"
+                            )
+                        adapter.delete_state(state_scope, record_ids)
+                        deleted += len(record_ids)
+                finally:
+                    stale_pages.close()
 
                 if not collection_exists:
                     coordinator.verify_publish(publish_lease)
@@ -2080,8 +2119,7 @@ def _run_search_model(
                     raise RunError(
                         "Retrieval collection failed post-publication configuration validation"
                     )
-                expected_rows = len(seen)
-                if metadata.row_count != expected_rows:
+                if metadata.row_count != rows_seen:
                     raise RunError(
                         "Retrieval collection failed post-publication row-count validation"
                     )
@@ -2089,10 +2127,6 @@ def _run_search_model(
 
         assert state_scope is not None
         coordinator.verify_publish(publish_lease)
-        if pending_state_records:
-            adapter.upsert_state(state_scope, pending_state_records)
-        for record_ids in pending_state_deletes:
-            adapter.delete_state(state_scope, record_ids)
         assert active_generation is not None
         assert spec is not None
         coordinator.mark_ready(

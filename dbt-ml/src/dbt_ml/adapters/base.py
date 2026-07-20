@@ -12,6 +12,7 @@ Vector stores such as LanceDB are a separate role and do not emulate this API.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -137,6 +138,183 @@ def validate_state_keys(record_keys: Sequence[str]) -> None:
         raise AdapterError("State record keys contain duplicate values")
 
 
+# Serving-ledger table name shared with retrieval.coordination: fenced state
+# replacement must verify a publication claim in the same warehouse that owns
+# the state rows, without adapters importing retrieval code.
+SERVING_LEDGER_TABLE = "dbt_ml_serving_ledger"
+
+_MAX_STATE_CURSOR_CHARS = 8192
+_MAX_STATE_PAGE_SIZE = 100_000
+_MAX_STATE_SUBSET_KEYS = 100_000
+
+
+class StaleStateFenceError(AdapterError):
+    """A fenced state mutation observed a reassigned serving-ledger claim."""
+
+
+@dataclass(frozen=True)
+class StateScopeFence:
+    """Serving-ledger claim a fenced state replacement must still hold.
+
+    Values come from an acquired `PublishLease`; the adapter refuses the
+    replacement unless the ledger row for the scope still carries exactly
+    this publication id and fencing token.
+    """
+
+    publication_id: str
+    fencing_token: int
+
+    def __post_init__(self) -> None:
+        if not self.publication_id:
+            raise AdapterError("State scope fence publication_id must not be empty")
+        if self.fencing_token < 1:
+            raise AdapterError("State scope fence fencing_token must be positive")
+
+
+@dataclass(frozen=True)
+class StateAbsenceProbe:
+    """Restrict ordered state iteration to keys absent from one relation.
+
+    The probe relation lives in the same warehouse as the state table, so the
+    adapter can evaluate absence without materializing either key domain.
+    """
+
+    table: str
+    key_column: str
+
+    def __post_init__(self) -> None:
+        if not self.table:
+            raise AdapterError("State absence probe table must not be empty")
+        if not self.key_column:
+            raise AdapterError("State absence probe key_column must not be empty")
+
+
+@dataclass(frozen=True)
+class StatePageRecord:
+    """Projected state row surfaced by ordered paged iteration."""
+
+    record_key: str
+    input_fingerprint: str
+    code_version: str
+    committed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.record_key:
+            raise AdapterError("State page record_key must not be empty")
+        if not self.input_fingerprint:
+            raise AdapterError("State page input_fingerprint must not be empty")
+        if not self.code_version:
+            raise AdapterError("State page code_version must not be empty")
+
+
+@dataclass(frozen=True)
+class StatePage:
+    """One bounded, key-ordered page of scoped state records.
+
+    `next_cursor` is an opaque adapter value scoped to the open reader's
+    snapshot; None marks the final page.
+    """
+
+    records: tuple[StatePageRecord, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class StatePageRequest:
+    scope: StateScope
+    page_size: int
+    absent_from: StateAbsenceProbe | None
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.page_size <= _MAX_STATE_PAGE_SIZE:
+            raise AdapterError(
+                f"State page_size must be between 1 and {_MAX_STATE_PAGE_SIZE}"
+            )
+
+
+def validate_state_cursor(cursor: str | None) -> None:
+    if cursor is None:
+        return
+    if not cursor or len(cursor) > _MAX_STATE_CURSOR_CHARS:
+        raise AdapterError("State page cursor is invalid for this reader")
+
+
+def encode_state_cursor(nonce: str, last_key: str) -> str:
+    """Build an opaque keyset cursor bound to one reader snapshot."""
+    payload = urlsafe_b64encode(last_key.encode("utf-8")).decode("ascii")
+    cursor = f"{nonce}:{payload}"
+    validate_state_cursor(cursor)
+    return cursor
+
+
+def decode_state_cursor(cursor: str | None, nonce: str) -> str | None:
+    """Recover the keyset position, rejecting foreign or malformed cursors."""
+    if cursor is None:
+        return None
+    validate_state_cursor(cursor)
+    prefix, sep, payload = cursor.partition(":")
+    if not sep or prefix != nonce:
+        raise AdapterError(
+            "State page cursor does not belong to this reader snapshot"
+        )
+    try:
+        return urlsafe_b64decode(payload.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        raise AdapterError("State page cursor is malformed") from None
+
+
+class StatePageReader:
+    """Ordered, snapshot-consistent paged access to one state scope.
+
+    Ordering is strict ascending Unicode code-point order on `record_key`,
+    which both DuckDB (binary collation) and BigQuery (code-point STRING
+    comparison) provide natively and Python `str` comparison matches, so core
+    merge logic can validate it. Each page is deterministic for its cursor:
+    retrying a cursor within the open reader returns the same page, and a
+    cursor from another reader or snapshot is rejected rather than silently
+    skipping or repeating records.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_size: int,
+        fetch: Callable[[str | None], StatePage],
+        close: Callable[[], None],
+    ) -> None:
+        self._page_size = page_size
+        self._fetch = fetch
+        self._close_callback = close
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def fetch_page(self, cursor: str | None = None) -> StatePage:
+        if self._closed:
+            raise AdapterError("State page reader is closed")
+        validate_state_cursor(cursor)
+        page = self._fetch(cursor)
+        if len(page.records) > self._page_size:
+            raise AdapterError("State page exceeded the requested page size")
+        validate_state_cursor(page.next_cursor)
+        previous_key: str | None = None
+        for record in page.records:
+            if previous_key is not None and record.record_key <= previous_key:
+                raise AdapterError(
+                    "State page records are not strictly ordered by record_key"
+                )
+            previous_key = record.record_key
+        return page
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close_callback()
+
+
 class WarehouseCapability(StrEnum):
     SQL_QUERIES = "sql_queries"
     TABULAR_READS = "tabular_reads"
@@ -149,6 +327,8 @@ class WarehouseCapability(StrEnum):
     SCHEMA_EVOLUTION = "schema_evolution"
     STREAMING_TABULAR_READS = "streaming_tabular_reads"
     TABULAR_PREDICATE_PUSHDOWN = "tabular_predicate_pushdown"
+    PAGED_STATE_RECONCILIATION = "paged_state_reconciliation"
+    ATOMIC_STATE_SCOPE_REPLACE = "atomic_state_scope_replace"
 
 
 class ReadPredicateOperator(StrEnum):
@@ -775,3 +955,114 @@ class WarehouseAdapter(ABC):
     @abstractmethod
     def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
         """Remove state rows for `record_keys` within exactly `scope`."""
+
+    # ─── paged state reconciliation (issue #153) ──────────────────────────
+
+    def fetch_state_subset(
+        self, scope: StateScope, record_keys: Sequence[str]
+    ) -> dict[str, StateValue]:
+        """Return state values for exactly `record_keys` within `scope`.
+
+        Bounded point lookups for one publication batch; memory residency is
+        proportional to `record_keys`, never to the total scope size."""
+        self.require_capability(
+            WarehouseCapability.PAGED_STATE_RECONCILIATION,
+            operation="bounded state key lookups",
+        )
+        validate_state_keys(record_keys)
+        if len(record_keys) > _MAX_STATE_SUBSET_KEYS:
+            raise AdapterError(
+                f"State subset lookups are bounded to {_MAX_STATE_SUBSET_KEYS} keys"
+            )
+        if not record_keys:
+            return {}
+        return self._fetch_state_subset(scope, record_keys)
+
+    def _fetch_state_subset(
+        self, scope: StateScope, record_keys: Sequence[str]
+    ) -> dict[str, StateValue]:
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement "
+            "bounded state key lookups"
+        )
+
+    @contextmanager
+    def state_page_reader(
+        self,
+        scope: StateScope,
+        *,
+        page_size: int,
+        absent_from: StateAbsenceProbe | None = None,
+    ) -> Iterator[StatePageReader]:
+        """Open ordered, snapshot-consistent paged iteration over `scope`.
+
+        Records stream in strict ascending `record_key` order across pages.
+        All pages observe one immutable snapshot of the state scope (and of
+        the `absent_from` relation when given), so interleaved mutations —
+        including the caller's own deletions — cannot skip or repeat records.
+        A snapshot that cannot be maintained fails the read; it never
+        degrades silently."""
+        self.require_capability(
+            WarehouseCapability.PAGED_STATE_RECONCILIATION,
+            operation="ordered paged state reads",
+        )
+        request = StatePageRequest(
+            scope=scope, page_size=page_size, absent_from=absent_from
+        )
+        reader = self._open_state_page_reader(request)
+        try:
+            yield reader
+        finally:
+            reader.close()
+
+    def _open_state_page_reader(self, request: StatePageRequest) -> StatePageReader:
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement "
+            "ordered paged state reads"
+        )
+
+    def replace_state_scope(
+        self,
+        scope: StateScope,
+        record_batches: Iterable[Sequence[StateRecord]],
+        *,
+        fence: StateScopeFence | None = None,
+    ) -> int:
+        """Atomically replace every state row in `scope` with the streamed
+        batches, returning rows written.
+
+        Input is bounded: batches are validated and written incrementally,
+        never held together in memory. The replacement commits atomically —
+        on any failure (including cross-batch duplicate keys, detected
+        warehouse-side) the prior scope state is fully retained. With a
+        `fence`, the replacement succeeds only while the serving ledger row
+        for this scope still carries the fenced publication claim; a
+        reassigned claim raises StaleStateFenceError without mutating
+        state."""
+        self.require_capability(
+            WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
+            operation="atomic state scope replacement",
+        )
+        return self._replace_state_scope(
+            scope, _validated_state_batches(record_batches), fence
+        )
+
+    def _replace_state_scope(
+        self,
+        scope: StateScope,
+        record_batches: Iterator[Sequence[StateRecord]],
+        fence: StateScopeFence | None,
+    ) -> int:
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement "
+            "atomic state scope replacement"
+        )
+
+
+def _validated_state_batches(
+    record_batches: Iterable[Sequence[StateRecord]],
+) -> Iterator[Sequence[StateRecord]]:
+    for batch in record_batches:
+        validate_state_records(batch)
+        if batch:
+            yield batch

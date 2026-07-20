@@ -98,6 +98,39 @@ def test_operation_preflight_rejects_missing_streaming_reads(
         )
 
 
+def test_capability_preflight_rejects_search_without_paged_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = ModelConfig(
+        name="idx",
+        depends_on=["ref('chunks')"],
+        materialization="incremental",
+        search={
+            "access": "public",
+            "id_field": "chunk_id",
+            "document_id_field": "document_id",
+            "chunk_id_field": "chunk_id",
+            "text_fields": ["text"],
+            "return_text_fields": ["text"],
+            "full_text": {"fields": ["text"]},
+            "query": {"modes": ["text"]},
+        },
+    )
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.PAGED_STATE_RECONCILIATION,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"paged_state_reconciliation.*publication-state reconciliation",
+    ):
+        validate_warehouse_capabilities([model], "eager_only")
+
+
 def test_bigquery_full_preflight_rejects_non_atomic_replacement() -> None:
     with pytest.raises(ConfigError, match=r"atomic_full_replace.*full materialization"):
         validate_warehouse_capabilities([_extraction("raw")], "bigquery")

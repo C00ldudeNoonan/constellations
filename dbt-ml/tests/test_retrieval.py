@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import lancedb
@@ -13,6 +14,7 @@ import pytest
 from click.testing import CliRunner
 
 from dbt_ml.adapters import AdapterError, StateScope, TableReadSnapshot, create_adapter
+from dbt_ml.adapters.duckdb import DuckDBAdapter
 from dbt_ml.cli import cli
 from dbt_ml.compiler import (
     validate_project_contract,
@@ -27,6 +29,7 @@ from dbt_ml.retrieval import (
     RetrievalError,
     RetrievalPredicate,
     RetrievalPredicateOperator,
+    ServingCoordinator,
     collection_config_fingerprint,
     create_store,
 )
@@ -393,9 +396,12 @@ def test_failed_store_mutation_does_not_advance_state(
         assert metadata.row_count == 2
 
 
-def test_failed_index_validation_does_not_advance_state(
+def test_failed_index_validation_keeps_receipted_state_and_blocks_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A failure after durable receipts keeps acknowledged state (issue #153):
+    per-batch advancement records exactly what the store acknowledged, while
+    the serving ledger keeps the failed publication unqueryable."""
     _write_project(tmp_path)
     _materialize_upstream(tmp_path, _rows())
 
@@ -421,7 +427,8 @@ def test_failed_index_validation_does_not_advance_state(
         descriptor=store.state_descriptor("context").descriptor(),
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        assert adapter.fetch_state(scope) == {}
+        assert sorted(adapter.fetch_state(scope)) == ["c1", "c2"]
+        assert ServingCoordinator(adapter).status(scope).status == "failed"
     with store:
         metadata = store.inspect_collection("retrieval_demo__dev__context")
         assert metadata is not None
@@ -429,12 +436,18 @@ def test_failed_index_validation_does_not_advance_state(
 
     monkeypatch.undo()
     retry = run_project(tmp_path, select="context_search")
-    assert retry[0].rows_inserted == 2
+    assert retry[0].rows_inserted == 0
+    assert retry[0].documents_skipped == 2
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        assert ServingCoordinator(adapter).status(scope).status == "ready"
 
 
-def test_failed_snapshot_validation_does_not_advance_state(
+def test_failed_snapshot_validation_keeps_receipted_state_and_blocks_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Snapshot invalidation after publication keeps receipt-acknowledged
+    state (issue #153) but never activates readiness; the retry reconciles
+    from recorded state instead of republishing acknowledged rows."""
     _write_project(tmp_path)
     _materialize_upstream(tmp_path, _rows())
 
@@ -464,11 +477,71 @@ def test_failed_snapshot_validation_does_not_advance_state(
         descriptor=store.state_descriptor("context").descriptor(),
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        assert adapter.fetch_state(scope) == {}
+        assert sorted(adapter.fetch_state(scope)) == ["c1", "c2"]
+        assert ServingCoordinator(adapter).status(scope).status == "failed"
 
     monkeypatch.undo()
     retry = run_project(tmp_path, select="context_search")
-    assert retry[0].rows_inserted == 2
+    assert retry[0].rows_inserted == 0
+    assert retry[0].documents_skipped == 2
+
+
+def test_search_publication_never_fetches_the_full_state_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance for issue #153: the production publication path reconciles
+    through bounded subset lookups and paged stale discovery only."""
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    first = run_project(tmp_path, select="context_search")
+    assert first[0].rows_inserted == 2
+
+    def forbid_full_scope(self: object, scope: object) -> dict[str, object]:
+        raise AssertionError(
+            "search publication must not fetch the full state scope"
+        )
+
+    monkeypatch.setattr(DuckDBAdapter, "fetch_state", forbid_full_scope)
+    # Re-publication with prior state exercises classification, per-batch
+    # advancement, and the stale pass without the eager escape hatch.
+    retry = run_project(tmp_path, select="context_search")
+    assert retry[0].documents_skipped == 2
+    assert retry[0].rows_inserted == 0
+
+
+def test_unacknowledged_receipt_advances_no_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """State advances only behind exact durable receipts (issue #153): an
+    unacknowledged upsert fails the run before any state row is written."""
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+
+    original_upsert = LanceDBStore.upsert
+
+    def unacknowledged(self: LanceDBStore, *args: object, **kwargs: object) -> object:
+        receipt = original_upsert(self, *args, **kwargs)
+        return replace(receipt, atomic=False)
+
+    monkeypatch.setattr(LanceDBStore, "upsert", unacknowledged)
+    with pytest.raises(RunError, match="durable upsert receipt"):
+        run_project(tmp_path, select="context_search")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        scope = StateScope.for_target_descriptor(
+            "context_search",
+            stage="retrieval_publish",
+            descriptor=create_store(
+                resolved.retrieval.stores["primary"],
+                project_name=project.name,
+                target_name=resolved.target_name,
+                alias="primary",
+            ).state_descriptor("context").descriptor(),
+        )
+        assert adapter.fetch_state(scope) == {}
+        assert ServingCoordinator(adapter).status(scope).status == "failed"
 
 
 def test_invalid_vector_fails_without_content_or_id_in_error(tmp_path: Path) -> None:

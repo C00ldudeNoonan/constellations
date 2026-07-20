@@ -202,6 +202,9 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.STREAMING_TABULAR_READS] = (
                 "bounded search-index publication reads"
             )
+            required[WarehouseCapability.PAGED_STATE_RECONCILIATION] = (
+                "bounded publication-state reconciliation"
+            )
         elif model.materialization == "full":
             required[WarehouseCapability.ATOMIC_FULL_REPLACE] = (
                 "full materialization"

@@ -17,8 +17,11 @@ from pydantic import ValidationError
 
 from dbt_ml.adapters import (
     AdapterError,
+    StaleStateFenceError,
+    StateAbsenceProbe,
     StateRecord,
     StateScope,
+    StateScopeFence,
     StateValue,
     WarehouseCapability,
     adapter_capabilities,
@@ -1916,3 +1919,213 @@ def test_list_tables_excludes_staging() -> None:
     client.listing = ["docs", "dbt_ml_staging__docs", "dbt_ml_state"]
     adapter = _adapter(client)
     assert adapter.list_tables() == ["docs"]
+# ─── paged state reconciliation (issue #153) ────────────────────────────────
+
+
+class _MessageFailingJob(_FakeJob):
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def result(self, timeout: Any = None) -> list[_FakeRow]:
+        raise RuntimeError(self._message)
+
+
+def _param_values(job_config: Any) -> list[Any]:
+    return [
+        parameter.values
+        if hasattr(parameter, "values")
+        else parameter.value
+        for parameter in job_config.query_parameters
+    ]
+
+
+def test_fetch_state_subset_is_a_bounded_array_lookup() -> None:
+    client = _FakeClient()
+    client.query_results = [_FakeJob(rows=[("a", "fp-a", "v1")])]
+    adapter = _adapter(client)
+    subset = adapter.fetch_state_subset(StateScope("m"), ["a", "b"])
+    assert subset == {"a": StateValue("fp-a", "v1")}
+    sql, job_config = client.queries[0]
+    assert "record_key IN UNNEST(?)" in sql
+    assert _param_values(job_config)[-1] == ["a", "b"]
+
+
+def test_state_page_reader_pins_one_system_time_snapshot() -> None:
+    ts = datetime.now(UTC)
+    client = _FakeClient()
+    client.query_results = [
+        _FakeJob(rows=[(ts,)]),
+        _FakeJob(rows=[("a", "fp-a", "v1", ts), ("b", "fp-b", "v1", ts)]),
+        _FakeJob(rows=[("c", "fp-c", "v1", ts)]),
+    ]
+    adapter = _adapter(client)
+    with adapter.state_page_reader(StateScope("m"), page_size=2) as reader:
+        first = reader.fetch_page(None)
+        assert [record.record_key for record in first.records] == ["a", "b"]
+        assert first.next_cursor is not None
+        second = reader.fetch_page(first.next_cursor)
+        assert [record.record_key for record in second.records] == ["c"]
+        assert second.next_cursor is None
+
+    assert client.queries[0][0] == "SELECT CURRENT_TIMESTAMP()"
+    page_sql, page_config = client.queries[1]
+    assert "FOR SYSTEM_TIME AS OF ?" in page_sql
+    assert "ORDER BY state.record_key" in page_sql
+    assert "LIMIT ?" in page_sql
+    assert _param_values(page_config)[0] == ts
+    keyset_sql, keyset_config = client.queries[2]
+    assert "state.record_key > ?" in keyset_sql
+    # Same pinned timestamp plus the keyset position from page one.
+    values = _param_values(keyset_config)
+    assert values[0] == ts
+    assert "b" in values
+
+
+def test_state_page_reader_rejects_foreign_cursors() -> None:
+    ts = datetime.now(UTC)
+    client = _FakeClient()
+    client.query_results = [_FakeJob(rows=[(ts,)])]
+    adapter = _adapter(client)
+    with adapter.state_page_reader(StateScope("m"), page_size=2) as reader:
+        with pytest.raises(AdapterError, match="does not belong"):
+            reader.fetch_page("deadbeef:aGVsbG8=")
+
+
+def test_state_page_reader_absence_probe_time_travels_both_relations() -> None:
+    ts = datetime.now(UTC)
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "text"]
+    client.query_results = [_FakeJob(rows=[(ts,)]), _FakeJob(rows=[])]
+    adapter = _adapter(client)
+    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id")
+    with adapter.state_page_reader(
+        StateScope("m"), page_size=5, absent_from=probe
+    ) as reader:
+        page = reader.fetch_page(None)
+    assert page.records == ()
+    assert page.next_cursor is None
+    sql, _ = client.queries[1]
+    assert sql.count("FOR SYSTEM_TIME AS OF ?") == 2
+    assert "NOT EXISTS" in sql
+    assert "`chunk_id` = state.record_key" in sql
+
+
+def test_state_page_reader_missing_probe_relation_fails() -> None:
+    ts = datetime.now(UTC)
+    client = _FakeClient()
+    client.query_results = [_FakeJob(rows=[(ts,)])]
+    adapter = _adapter(client)
+    probe = StateAbsenceProbe(table="missing", key_column="chunk_id")
+    with pytest.raises(AdapterError, match="absence probe"):
+        with adapter.state_page_reader(
+            StateScope("m"), page_size=5, absent_from=probe
+        ):
+            pass
+
+    client.query_results = [_FakeJob(rows=[(ts,)])]
+    client.tables["proj.ds.chunks"] = ["other_column"]
+    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id")
+    with pytest.raises(AdapterError, match="absence probe"):
+        with adapter.state_page_reader(
+            StateScope("m"), page_size=5, absent_from=probe
+        ):
+            pass
+
+
+def test_replace_state_scope_stages_batches_and_merges_once() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    written = adapter.replace_state_scope(
+        StateScope("m"),
+        iter(
+            [
+                [StateRecord("a", "fp-a", "v1")],
+                [StateRecord("b", "fp-b", "v1")],
+            ]
+        ),
+    )
+    assert written == 2
+    assert len(client.loads) == 2
+    staging_id = client.loads[0][1]
+    assert staging_id.startswith("proj.ds.dbt_ml_staging__state_replace__")
+    assert client.loads[1][1] == staging_id
+    assert all(
+        load[2].write_disposition == "WRITE_APPEND" for load in client.loads
+    )
+    sql, _ = client.queries[0]
+    assert sql.strip().startswith("MERGE `proj`.`ds`.`dbt_ml_state` AS target")
+    assert "UNION ALL" in sql and "is_sentinel" in sql
+    assert "WHEN NOT MATCHED BY SOURCE" in sql
+    assert "dbt-ml-state-replace-invalid" in sql
+    # Unfenced replacement must not consult the serving ledger.
+    assert "dbt_ml_serving_ledger" not in sql
+    assert client.dropped == [staging_id]
+
+
+def test_replace_state_scope_empty_input_still_replaces_atomically() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    assert adapter.replace_state_scope(StateScope("m"), iter([])) == 0
+    assert client.loads == []
+    create_sql, _ = client.queries[0]
+    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`dbt_ml_staging__")
+    merge_sql, _ = client.queries[1]
+    assert "WHEN NOT MATCHED BY SOURCE" in merge_sql
+    assert len(client.dropped) == 1
+
+
+def test_fenced_replace_conditions_on_the_serving_ledger() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    fence = StateScopeFence("pub123", 7)
+    adapter.replace_state_scope(
+        StateScope("m"),
+        iter([[StateRecord("a", "fp-a", "v1")]]),
+        fence=fence,
+    )
+    sql, job_config = client.queries[0]
+    assert "`proj`.`ds`.`dbt_ml_serving_ledger`" in sql
+    assert "publication_id = ? AND fencing_token = ?" in sql
+    assert "dbt-ml-stale-state-fence" in sql
+    values = _param_values(job_config)
+    assert "pub123" in values
+    assert 7 in values
+
+
+def test_fenced_replace_maps_gate_errors_without_leaking() -> None:
+    scope = StateScope("m")
+    fence = StateScopeFence("pub123", 7)
+
+    client = _FakeClient()
+    client.query_results = [
+        _MessageFailingJob("400 dbt-ml-stale-state-fence: publication reassigned")
+    ]
+    adapter = _adapter(client)
+    with pytest.raises(StaleStateFenceError, match="reassigned"):
+        adapter.replace_state_scope(
+            scope, iter([[StateRecord("a", "fp", "v1")]]), fence=fence
+        )
+    assert len(client.dropped) == 1
+
+    client = _FakeClient()
+    client.query_results = [
+        _MessageFailingJob("400 dbt-ml-state-replace-invalid: duplicate keys")
+    ]
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match="duplicate record keys"):
+        adapter.replace_state_scope(
+            scope, iter([[StateRecord("a", "fp", "v1")]]), fence=fence
+        )
+    assert len(client.dropped) == 1
+
+    client = _FakeClient()
+    client.query_results = [
+        _MessageFailingJob("404 Not found: Table proj:ds.dbt_ml_serving_ledger")
+    ]
+    adapter = _adapter(client)
+    with pytest.raises(StaleStateFenceError, match="serving ledger"):
+        adapter.replace_state_scope(
+            scope, iter([[StateRecord("a", "fp", "v1")]]), fence=fence
+        )
+    assert len(client.dropped) == 1

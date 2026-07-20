@@ -313,6 +313,7 @@ def test_contract_is_discoverable_in_manifest_dbt_sources_and_docs(
     )
 
     manifest = build_manifest(tmp_path)
+    assert manifest["manifest_version"] == 2
     model = manifest["models"][0]
     descriptor = model["agent_context"]
     assert descriptor["contract"] == AGENT_CONTEXT_CONTRACT
@@ -466,6 +467,13 @@ def test_invalid_ids_intervals_citations_and_provenance_are_rejected() -> None:
     with pytest.raises(AgentContextValidationError, match="offsets must be paired"):
         validate_agent_context_frame(
             pl.DataFrame([invalid_citation]), AgentContextGrain.DOCUMENT_CHUNKS
+        )
+
+    invalid_document_id = dict(chunk, document_id="not-a-v1-id")
+    with pytest.raises(AgentContextValidationError, match="document_id"):
+        validate_agent_context_frame(
+            pl.DataFrame([invalid_document_id]),
+            AgentContextGrain.DOCUMENT_CHUNKS,
         )
 
     missing_provenance = dict(document, provenance_fingerprint=None)

@@ -48,6 +48,7 @@ def build_manifest(
     )
     sources = apply_source_path_overrides(sources, resolved)
     has_search = any(model.search is not None for model in models)
+    has_agent_context = any(model.agent_context is not None for model in models)
     dag = (
         validate_project_contract(project, sources, models, project_dir)
         if has_search
@@ -55,6 +56,7 @@ def build_manifest(
     )
     if has_search:
         validate_retrieval_capabilities(models, project, resolved)
+    if has_search or has_agent_context:
         return _build_manifest_v2(project, sources, models, dag, project_dir, resolved)
 
     return {

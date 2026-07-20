@@ -102,10 +102,17 @@ def test_chunks_contain_only_source_characters() -> None:
 
 
 def test_chunk_id_is_content_addressed() -> None:
-    assert chunk_id("doc", 0, "hello") == chunk_id("doc", 0, "hello")
-    assert chunk_id("doc", 0, "hello") != chunk_id("doc", 1, "hello")
-    assert chunk_id("doc", 0, "hello") != chunk_id("doc", 0, "world")
-    assert chunk_id("doc", 0, "hello") != chunk_id("other", 0, "hello")
+    document_id = "0" * 32
+    other_document_id = "1" * 32
+    assert chunk_id(document_id, 0, "hello") == chunk_id(document_id, 0, "hello")
+    assert chunk_id(document_id, 0, "hello") != chunk_id(document_id, 1, "hello")
+    assert chunk_id(document_id, 0, "hello") != chunk_id(document_id, 0, "world")
+    assert chunk_id(document_id, 0, "hello") != chunk_id(other_document_id, 0, "hello")
+
+
+def test_chunk_id_rejects_non_contract_document_id() -> None:
+    with pytest.raises(ValueError, match="document_id"):
+        chunk_id("doc", 0, "hello")
 
 
 def test_chunk_config_validation() -> None:

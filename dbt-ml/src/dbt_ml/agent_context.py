@@ -546,7 +546,7 @@ def make_document_version_id(
 
 
 def make_chunk_id(document_id: str, chunk_index: int, text: str) -> str:
-    _non_empty(document_id, "document_id")
+    document_id = _stable_id(document_id, "document_id")
     if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
         raise ValueError("chunk_index must be a non-negative integer")
     if not isinstance(text, str) or not text:
@@ -835,6 +835,8 @@ def _validate_row_semantics(
         _expect_id(row, "document_id", expected_document_id, position, grain)
         _expect_id(row, "document_version_id", expected_version_id, position, grain)
     elif grain is AgentContextGrain.DOCUMENT_CHUNKS:
+        _validate_stable_id(row, "document_id", position, grain)
+        _validate_stable_id(row, "document_version_id", position, grain)
         _validate_stable_id(row, "chunk_content_hash", position, grain)
         _validate_stable_id(row, "provenance_fingerprint", position, grain)
         expected_chunk_id = make_chunk_id(row["document_id"], row["chunk_index"], row["text"])

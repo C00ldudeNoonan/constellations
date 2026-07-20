@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -45,6 +46,24 @@ class RetrievalFeature(StrEnum):
     INDEX_READINESS = "index_readiness"
     DURABLE_WRITE_ACK = "durable_write_ack"
     ATOMIC_BATCH_MUTATION = "atomic_batch_mutation"
+    # Store-side publisher fencing proofs (issue #152). A warehouse fencing
+    # token cannot stop a partitioned process from calling an independent
+    # store SDK, so publication requires the store to advertise exactly how
+    # stale writers are excluded: an OS-enforced single-host lock, provider
+    # conditional writes, or immutable generations with conditional
+    # activation. The latter two are reserved for distributed adapters.
+    SINGLE_HOST_PUBLISHER_LOCK = "single_host_publisher_lock"
+    PROVIDER_ENFORCED_FENCING = "provider_enforced_fencing"
+    IMMUTABLE_GENERATION_ACTIVATION = "immutable_generation_activation"
+
+
+PUBLISHER_FENCING_FEATURES = frozenset(
+    {
+        RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
+        RetrievalFeature.PROVIDER_ENFORCED_FENCING,
+        RetrievalFeature.IMMUTABLE_GENERATION_ACTIVATION,
+    }
+)
 
 
 class RetrievalPredicateOperator(StrEnum):
@@ -243,6 +262,24 @@ class RetrievalStore(ABC):
 
     @abstractmethod
     def safe_descriptor(self) -> SafeRetrievalTarget: ...
+
+    def publisher_fence(self, collection: str) -> AbstractContextManager[None]:
+        """Store-enforced exclusive publisher fence for one collection.
+
+        Adapters advertising SINGLE_HOST_PUBLISHER_LOCK must return a context
+        manager that excludes every other publisher process for the fence's
+        lifetime and raises RetrievalError when the fence is already held.
+        Adapters relying on PROVIDER_ENFORCED_FENCING or
+        IMMUTABLE_GENERATION_ACTIVATION enforce their proof inside mutation
+        and activation instead and may keep this default."""
+        del collection
+        capabilities = self.capabilities()
+        if RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK in capabilities.features:
+            raise RetrievalError(
+                "Retrieval store advertises single_host_publisher_lock but does "
+                "not implement publisher_fence()"
+            )
+        return nullcontext()
 
     @abstractmethod
     def state_descriptor(self, collection: str) -> StateRetrievalTarget: ...

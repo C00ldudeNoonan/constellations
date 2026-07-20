@@ -11,6 +11,8 @@ from typing import Any
 
 import pyarrow as pa
 
+from .adapters import create_adapter
+from .adapters.base import AdapterError, StateScope
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
 from .config.model import ModelConfig, SearchAttributeConfig
@@ -27,6 +29,7 @@ from .retrieval import (
     RetrievalFeature,
     RetrievalPredicate,
     RetrievalPredicateOperator,
+    ServingCoordinator,
     collection_config_fingerprint,
     create_store,
 )
@@ -242,7 +245,15 @@ def search(
     *,
     target: str | None = None,
     profiles_dir: Path | None = None,
+    policy_filters: Sequence[SearchFilter] = (),
 ) -> list[SearchResult]:
+    """Query a published search index through a generation-pinned read lease.
+
+    `policy_filters` is the trusted authorization context for governed
+    indexes: the calling service — not the end user — supplies predicates
+    that must constrain every policy-role attribute. They are composed with
+    user filters as mandatory prefilters inside the store; a governed query
+    without them fails closed. Public indexes reject the argument."""
     project_dir = Path(project).resolve()
     project_config, sources, models = load_project(project_dir)
     validate_project_contract(project_config, sources, models, project_dir)
@@ -257,11 +268,6 @@ def search(
     )
     validate_retrieval_capabilities([model], project_config, resolved)
     search_config = model.search
-    if search_config.access != "public":
-        raise SearchError(
-            "Governed search indexes require the trusted authorization and read-lease "
-            "runtime from #152"
-        )
     if resolved.retrieval is None:
         raise SearchError("The active profile has no retrieval configuration")
     alias = search_config.store or resolved.retrieval.default
@@ -284,7 +290,20 @@ def search(
         store.capabilities(),
         store_type=store_config.type,
     )
-    predicates = _resolve_predicates(model, request.filters)
+    if search_config.access == "governed":
+        if request.consistency != "strong":
+            raise SearchError("Governed search indexes require strong consistency")
+        if not policy_filters:
+            raise SearchError(
+                "Governed search indexes fail closed without trusted policy filters; "
+                "the calling service must supply the authorization context"
+            )
+        policy_predicates = _resolve_policy_predicates(model, policy_filters)
+    else:
+        if policy_filters:
+            raise SearchError("Public search indexes do not accept policy filters")
+        policy_predicates = ()
+    predicates = policy_predicates + _resolve_predicates(model, request.filters)
     included_fields = _resolve_result_fields(model, request.fields)
     models_by_name = {item.name: item for item in models}
     effective_config = effective_search_config(model, models_by_name)
@@ -292,35 +311,61 @@ def search(
         effective_config,
         store_type=store_config.type,
     )
-    query_vector = _resolve_query_vector(model, models_by_name, request)
     logical_collection = search_config.collection or model.name
     physical_collection = store.physical_collection(logical_collection)
+    state_scope = StateScope.for_target_descriptor(
+        model.name,
+        stage="retrieval_publish",
+        descriptor=store.state_descriptor(logical_collection).descriptor(),
+    )
     candidate_limit = request.candidate_limit or min(max(request.limit * 4, 50), 1000)
 
     try:
-        with store:
-            metadata = store.inspect_collection(physical_collection)
-            if metadata is None:
-                raise SearchError(
-                    f"Search index '{model.name}' has not been published; run `dbt-ml run`"
-                )
-            if metadata.config_fingerprint != expected_fingerprint:
-                raise SearchError(
-                    f"Search index '{model.name}' is stale or incompatible; republish it"
-                )
-            ranked = _execute_query(
-                model,
-                store,
-                physical_collection,
-                request,
-                query_vector,
-                predicates,
-                candidate_limit,
-                included_fields,
-            )
+        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+            coordinator = ServingCoordinator(adapter)
+            lease = coordinator.acquire_query(state_scope)
+            try:
+                if lease.config_fingerprint != expected_fingerprint:
+                    raise SearchError(
+                        f"Search index '{model.name}' was published under a different "
+                        "configuration; republish it"
+                    )
+                # The shared lease pins the ready generation through query
+                # embedding, store search, and result validation.
+                query_vector = _resolve_query_vector(model, models_by_name, request)
+                with store:
+                    metadata = store.inspect_collection(physical_collection)
+                    if metadata is None:
+                        raise SearchError(
+                            f"Search index '{model.name}' has not been published; "
+                            "run `dbt-ml run`"
+                        )
+                    if metadata.config_fingerprint != expected_fingerprint:
+                        raise SearchError(
+                            f"Search index '{model.name}' is stale or incompatible; "
+                            "republish it"
+                        )
+                    if metadata.physical_generation != lease.pinned_generation:
+                        raise SearchError(
+                            f"Search index '{model.name}' does not match its ready "
+                            "generation; recover or republish the serving scope"
+                        )
+                    ranked = _execute_query(
+                        model,
+                        store,
+                        physical_collection,
+                        request,
+                        query_vector,
+                        predicates,
+                        candidate_limit,
+                        included_fields,
+                    )
+                coordinator.validate_query(lease)
+            finally:
+                coordinator.release_query(lease)
     except SearchError:
         raise
-    except RetrievalError as error:
+    except (AdapterError, RetrievalError) as error:
         raise SearchError(str(error)) from None
 
     vector_config = effective_config.get("vector")
@@ -376,6 +421,8 @@ def _validate_capabilities(
         required[RetrievalFeature.FULL_TEXT_SEARCH] = f"{request.mode.value} query"
     if request.filters:
         required[RetrievalFeature.METADATA_FILTERING] = "query filters"
+    if search_config.access == "governed":
+        required[RetrievalFeature.METADATA_FILTERING] = "mandatory policy prefilters"
     try:
         capabilities.require(required, store_type=store_type)
     except RetrievalCapabilityError as error:
@@ -416,6 +463,49 @@ def _resolve_query_vector(
     if len(vector) != search_config.vector.dimensions:
         raise SearchError("Query vector dimensions do not match the search index")
     return vector
+
+
+def _resolve_policy_predicates(
+    model: ModelConfig,
+    policy_filters: Sequence[SearchFilter],
+) -> tuple[RetrievalPredicate, ...]:
+    """Validate the trusted authorization context for a governed query.
+
+    Every policy filter must target a policy-role attribute, and every
+    policy-role attribute must be constrained by at least one policy filter —
+    partial authorization coverage fails closed rather than widening access."""
+    search_config = model.search
+    assert search_config is not None
+    attributes = {attribute.name: attribute for attribute in search_config.attributes}
+    policy_fields = {
+        attribute.name
+        for attribute in search_config.attributes
+        if attribute.filter_role in {"policy", "user_and_policy"}
+    }
+    predicates: list[RetrievalPredicate] = []
+    covered: set[str] = set()
+    for item in policy_filters:
+        attribute = attributes.get(item.field)
+        if attribute is None or item.field not in policy_fields:
+            raise SearchError(
+                f"Field '{item.field}' is not a policy attribute of this search index"
+            )
+        value = _coerce_filter_value(item.value, attribute)
+        predicates.append(
+            RetrievalPredicate(
+                item.field,
+                RetrievalPredicateOperator(item.operator.value),
+                value,
+            )
+        )
+        covered.add(item.field)
+    missing = sorted(policy_fields - covered)
+    if missing:
+        raise SearchError(
+            "Governed queries must constrain every policy attribute; missing: "
+            + ", ".join(missing)
+        )
+    return tuple(predicates)
 
 
 def _resolve_predicates(

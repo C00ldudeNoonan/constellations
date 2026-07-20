@@ -362,6 +362,9 @@ def test_same_request_runs_against_mocked_remote_store(
         def physical_collection(self, _logical: str) -> str:
             return physical
 
+        def state_descriptor(self, collection: str) -> Any:
+            return real_store.state_descriptor(collection)
+
         def inspect_collection(self, _physical: str) -> Any:
             return metadata
 

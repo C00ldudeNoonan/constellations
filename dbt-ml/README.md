@@ -293,6 +293,8 @@ dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--
 dbt-ml ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table
 dbt-ml search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
+dbt-ml serving status <search-index>                       # publication ledger: status, fence, counts, leases
+dbt-ml serving recover <search-index> --owner-terminated   # explicit authority reassignment after a crash
 dbt-ml source freshness                                    # mtime vs warn_after/error_after
 dbt-ml docs generate [--output DIR]                        # static HTML site from manifest.json
 dbt-ml docs serve [--port N]                               # local http.server over target/docs/
@@ -951,11 +953,49 @@ that model's exact provider identity for query-time embedding and rejects stale
 or dimension-incompatible indexes. Externally generated vectors still declare
 a complete embedding identity and require a precomputed query vector.
 
-This first slice deliberately rejects governed indexes, search-resource tests,
-full refresh, online/rebuild schema changes, arbitrary predicate strings, and
-adapter-specific index options. Publication/read leases, mandatory policy
-filters, and a readiness ledger remain #152; bounded state paging remains
-#153. These are unsupported guarantees, not silent best-effort behavior.
+### Serving readiness and coordination
+
+Publication is generation-fenced (issue #152). The active warehouse owns a
+per-index serving ledger plus publish/query leases: a publisher acquires an
+exclusive fenced claim (and an OS-enforced per-collection lock on the LanceDB
+store) before any store mutation, and marks the scope `ready` only after
+receipts, index validation, the snapshot generation check, and state
+advancement all succeed. A failed or interrupted publish leaves the scope
+unavailable to queries until a later publish succeeds. Queries take a shared
+lease that pins the ready physical generation through query embedding, store
+search, and result validation; they are rejected while a publisher is active,
+and publication is rejected while query leases are held.
+
+There is no timeout-based lease stealing. If a publisher crashes, terminate
+it, then explicitly reassign authority:
+
+```bash
+dbt-ml serving status chunk_search     # ledger status, fence, counts, leases
+dbt-ml serving recover chunk_search --owner-terminated
+```
+
+Recovery advances the fencing token (so a surviving zombie fails its next
+check), clears leases, and leaves the scope failed until the next `dbt-ml run`
+republishes it. After upgrading to this contract, run `dbt-ml run` once per
+search index to establish its ledger before querying.
+
+Governed indexes (`access: governed`) are supported on stores that declare
+strong read-after-write consistency and metadata filtering. Changed governed
+records are deleted before their replacement is upserted, so a failed policy
+revocation leaves the old row absent rather than queryable. Governed queries
+fail closed unless the calling service supplies trusted `policy_filters=` that
+constrain every policy-role attribute; they are composed with user filters as
+mandatory in-store prefilters and are rejected on public indexes. The
+`dbt-ml search` CLI serves public indexes only — an interactive flag is not a
+trusted authorization context.
+
+This slice still deliberately rejects search-resource tests, full refresh,
+online/rebuild schema changes, arbitrary predicate strings, and
+adapter-specific index options. Bounded state paging and atomic full
+replacement remain #153; distributed-store fencing (provider-enforced fencing
+or immutable-generation activation) remains declared-but-unclaimed until a
+hosted adapter (#136) implements it. These are unsupported guarantees, not
+silent best-effort behavior.
 
 ## Built-in text preprocessing
 
@@ -1223,7 +1263,9 @@ remain explicitly deferred.
 
 The accepted [semantic retrieval architecture](docs/architecture/semantic-retrieval.md)
 defines the `search:` DAG resource, `RetrievalStore` boundary, typed filters,
-incremental publication state, and serving-resource artifacts. The local public
-LanceDB publication and portable Python/`dbt-ml search` query surfaces ship;
-mandatory policy prefilters and coordinated readiness remain roadmap work and
-fail closed.
+incremental publication state, and serving-resource artifacts. The local
+LanceDB publication and portable Python/`dbt-ml search` query surfaces ship
+with generation-fenced readiness, publish/query leases, explicit recovery, and
+governed policy-prefilter queries (issue #152) inside their documented
+single-host boundary; bounded state paging (#153) and distributed-store
+fencing (#136) remain roadmap work and fail closed.

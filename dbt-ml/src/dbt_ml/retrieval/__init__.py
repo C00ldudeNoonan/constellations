@@ -1,4 +1,5 @@
 from .base import (
+    PUBLISHER_FENCING_FEATURES,
     CollectionMetadata,
     CollectionSpec,
     IndexedRow,
@@ -16,6 +17,16 @@ from .base import (
     SafeRetrievalTarget,
     StateRetrievalTarget,
 )
+from .coordination import (
+    PublishLease,
+    QueryLease,
+    ServingBusyError,
+    ServingCoordinationError,
+    ServingCoordinator,
+    ServingLedgerEntry,
+    ServingNotReadyError,
+    StaleServingLeaseError,
+)
 from .lancedb import LanceDBConfig, LanceDBStore
 from .registry import (
     absolutize_store_config,
@@ -27,6 +38,7 @@ from .registry import (
 )
 
 __all__ = [
+    "PUBLISHER_FENCING_FEATURES",
     "CollectionMetadata",
     "CollectionSpec",
     "IndexedRow",
@@ -34,6 +46,8 @@ __all__ = [
     "LanceDBStore",
     "MutationOutcome",
     "MutationReceipt",
+    "PublishLease",
+    "QueryLease",
     "RetrievalCapabilities",
     "RetrievalCapabilityError",
     "RetrievalConfigError",
@@ -44,6 +58,12 @@ __all__ = [
     "RetrievalStore",
     "RetrievalStoreConfig",
     "SafeRetrievalTarget",
+    "ServingBusyError",
+    "ServingCoordinationError",
+    "ServingCoordinator",
+    "ServingLedgerEntry",
+    "ServingNotReadyError",
+    "StaleServingLeaseError",
     "StateRetrievalTarget",
     "absolutize_store_config",
     "collection_config_fingerprint",

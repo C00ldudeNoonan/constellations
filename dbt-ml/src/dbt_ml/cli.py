@@ -1311,6 +1311,122 @@ def source_freshness(ctx: click.Context) -> None:
         ctx.exit(1)
 
 
+@cli.group()
+@_project_context_options
+def serving() -> None:
+    """Inspect and recover serving-readiness state for search indexes."""
+
+
+def _serving_scope(
+    ctx: click.Context, model_name: str
+) -> tuple[Any, Any, Path]:
+    from .adapters.base import StateScope
+    from .retrieval import create_store
+
+    project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    project_config, sources, models = load_project(project_dir)
+    validate_project_contract(project_config, sources, models, project_dir)
+    model = next((item for item in models if item.name == model_name), None)
+    if model is None or model.search is None:
+        raise ConfigClickError(f"Search index '{model_name}' was not found")
+    resolved = resolve_profile(
+        project_config, project_dir, target=target, profiles_dir=profiles_dir
+    )
+    if resolved.retrieval is None:
+        raise ConfigClickError(
+            "The active profile has no retrieval configuration"
+        )
+    alias = model.search.store or resolved.retrieval.default
+    store_config = resolved.retrieval.stores.get(alias)
+    if store_config is None:
+        raise ConfigClickError(
+            f"Search index '{model_name}' selects an unavailable retrieval store"
+        )
+    store = create_store(
+        store_config,
+        project_name=project_config.name,
+        target_name=resolved.target_name,
+        alias=alias,
+    )
+    logical = model.search.collection or model.name
+    scope = StateScope.for_target_descriptor(
+        model.name,
+        stage="retrieval_publish",
+        descriptor=store.state_descriptor(logical).descriptor(),
+    )
+    return scope, resolved, project_dir
+
+
+@serving.command("status")
+@click.argument("model_name")
+@_project_context_options
+@click.pass_context
+def serving_status(ctx: click.Context, model_name: str) -> None:
+    """Show the publication ledger for one search index."""
+    from .retrieval import ServingCoordinationError, ServingCoordinator
+
+    try:
+        scope, resolved, project_dir = _serving_scope(ctx, model_name)
+        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+            entry = ServingCoordinator(adapter).status(scope)
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, ServingCoordinationError) as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"status:            {entry.status}")
+    click.echo(f"fencing_token:     {entry.fencing_token}")
+    click.echo(f"active_generation: {entry.active_generation or '-'}")
+    click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
+    click.echo(f"query_leases:      {entry.query_leases}")
+    click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")
+    click.echo(
+        "rows:              "
+        f"inserted={entry.rows_inserted} updated={entry.rows_updated} "
+        f"skipped={entry.rows_skipped} deleted={entry.rows_deleted}"
+    )
+
+
+@serving.command("recover")
+@click.argument("model_name")
+@click.option(
+    "--owner-terminated",
+    is_flag=True,
+    help=(
+        "Confirm every previous publisher and query process for this scope "
+        "has been terminated. Recovery is refused without this confirmation."
+    ),
+)
+@_project_context_options
+@click.pass_context
+def serving_recover(
+    ctx: click.Context, model_name: str, owner_terminated: bool
+) -> None:
+    """Explicitly reassign serving authority after terminating the old owner.
+
+    There is no timeout-based lease stealing: recovery advances the fencing
+    token so any surviving process fails its next verification, clears all
+    leases, and leaves the scope failed until the next successful publish.
+    """
+    from .retrieval import ServingCoordinationError, ServingCoordinator
+
+    try:
+        scope, resolved, project_dir = _serving_scope(ctx, model_name)
+        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+            entry = ServingCoordinator(adapter).recover(
+                scope, owner_terminated=owner_terminated
+            )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, ServingCoordinationError) as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(
+        f"Recovered serving scope for '{model_name}': status={entry.status}, "
+        f"fencing_token={entry.fencing_token}. Re-run `dbt-ml run` to publish."
+    )
+
+
 @cli.command()
 @_project_context_options
 @click.pass_context

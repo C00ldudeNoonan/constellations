@@ -23,6 +23,7 @@ from .providers import (
     get_inference_provider,
 )
 from .retrieval import (
+    PUBLISHER_FENCING_FEATURES,
     RetrievalCapabilityError,
     RetrievalFeature,
     create_store,
@@ -281,14 +282,6 @@ def validate_retrieval_capabilities(
                 "not set retrieval.allow_public_indexes: true",
                 ("search", "access"),
             )
-        if search.access == "governed":
-            raise _model_error(
-                model,
-                "Governed search publication requires generation-fenced readiness and "
-                "a trusted authorization resolver from #152; use `access: public` only "
-                "for this local proof-of-concept target",
-                ("search", "access"),
-            )
         if search.index_options:
             raise _model_error(
                 model,
@@ -298,6 +291,30 @@ def validate_retrieval_capabilities(
             )
         cls = store_class(config.type)
         capabilities = cls.capabilities()
+        if not capabilities.features & PUBLISHER_FENCING_FEATURES:
+            raise _model_error(
+                model,
+                f"Retrieval store '{config.type}' declares no publisher fencing "
+                "proof; a warehouse fencing token alone cannot exclude a stale "
+                "writer from an independent store (issue #152)",
+                ("search", "store"),
+            )
+        if search.access == "governed":
+            if "strong" not in capabilities.consistency_modes:
+                raise _model_error(
+                    model,
+                    f"Governed search publication requires strong read-after-write "
+                    f"consistency, which retrieval store '{config.type}' does not "
+                    "declare",
+                    ("search", "access"),
+                )
+            if RetrievalFeature.METADATA_FILTERING not in capabilities.features:
+                raise _model_error(
+                    model,
+                    f"Governed search indexes require mandatory policy prefilters, "
+                    f"which retrieval store '{config.type}' cannot execute",
+                    ("search", "access"),
+                )
         required: dict[RetrievalFeature, str] = {
             RetrievalFeature.KEYED_UPSERT: "incremental publication",
             RetrievalFeature.KEYED_DELETE: "stale-record deletion",

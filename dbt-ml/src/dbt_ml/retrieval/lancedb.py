@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -116,6 +118,7 @@ class LanceDBStore(RetrievalStore):
                     RetrievalFeature.INDEX_READINESS,
                     RetrievalFeature.DURABLE_WRITE_ACK,
                     RetrievalFeature.ATOMIC_BATCH_MUTATION,
+                    RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                 }
             ),
             distance_metrics=frozenset({"cosine", "euclidean", "dot"}),
@@ -156,6 +159,19 @@ class LanceDBStore(RetrievalStore):
                 "(code=lancedb_external_collection)"
             )
         return table
+
+    def publisher_fence(self, collection: str) -> AbstractContextManager[None]:
+        """OS-enforced exclusive publisher lock, valid on one host only.
+
+        The lock file lives next to the LanceDB data, so every dbt-ml
+        publisher on the host contends on the same inode/handle. This is the
+        documented single-host safety boundary from #152: it cannot fence a
+        publisher on another machine sharing the directory over a network
+        filesystem."""
+        if not _COLLECTION_RE.fullmatch(collection):
+            raise RetrievalError("LanceDB collection name is invalid")
+        self._config.path.mkdir(parents=True, exist_ok=True)
+        return _PublisherLock(self._config.path / f"{collection}.dbt-ml-publisher.lock")
 
     def safe_descriptor(self) -> SafeRetrievalTarget:
         identity = canonical_fingerprint(
@@ -515,3 +531,51 @@ def _sql_literal(value: Any) -> str:
     if isinstance(value, int | float):
         return str(value)
     raise RetrievalError("Retrieval predicate contains an unsupported value")
+
+
+class _PublisherLock(AbstractContextManager[None]):
+    """Non-blocking OS file lock excluding concurrent publisher processes."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: Any | None = None
+
+    def __enter__(self) -> None:
+        handle = self._path.open("a+b")
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise RetrievalError(
+                "Another publisher holds the LanceDB collection lock "
+                "(code=lancedb_publisher_lock_held); terminate it before "
+                "recovering the serving scope"
+            ) from None
+        self._handle = handle
+        return None
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()

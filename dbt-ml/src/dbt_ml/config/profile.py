@@ -168,6 +168,15 @@ class LLMConfig(BaseModel):
         exclude=True,
     )
     base_url: OpenAICompatibleBaseUrl | None = None
+    # Opaque to core: validated by the selected provider's published
+    # profile-options model at profile resolution (issue #71). Excluded from
+    # repr/serialization like api_key_env — the raw mapping may hold
+    # credential environment-variable names.
+    provider_options: dict[str, Any] = Field(
+        default_factory=dict,
+        repr=False,
+        exclude=True,
+    )
     timeout_seconds: float = Field(
         default=60.0,
         ge=0.1,

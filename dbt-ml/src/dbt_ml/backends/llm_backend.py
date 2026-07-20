@@ -7,7 +7,7 @@ import os
 import stat
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -24,6 +24,7 @@ from ..providers import (
     BatchInferenceItem,
     BatchInferenceRequest,
     BatchInferenceResult,
+    InferenceFailure,
     InferenceProvider,
     InferenceRequest,
     InferenceResult,
@@ -35,6 +36,7 @@ from ..providers import (
     ProviderRuntimeOptions,
     ProviderUsage,
     get_inference_provider,
+    profile_options_fingerprint,
     provider_error_debug_enabled,
     redacted_exception_text,
     resolve_provider_model,
@@ -148,7 +150,12 @@ class LLMBackend(BaseBackend):
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
-        provider = get_inference_provider(provider_name)
+        provider_options = options.get("provider_options") or None
+        provider = (
+            get_inference_provider(provider_name, profile_options=provider_options)
+            if provider_options
+            else get_inference_provider(provider_name)
+        )
         model = resolve_provider_model(provider, options.get("model"))
         base_url = provider.resolve_base_url(options.get("base_url"))
         api_key_env = _provider_api_key_env(options, provider)
@@ -163,6 +170,8 @@ class LLMBackend(BaseBackend):
             "provider": provider_name,
             "api_key_env": api_key_env,
         }
+        if provider_options:
+            call_options["provider_options"] = provider_options
         if base_url is not None:
             call_options["base_url"] = base_url
         if "timeout_seconds" in options:
@@ -177,6 +186,7 @@ class LLMBackend(BaseBackend):
             cache_path=options.get("cache_path"),
             call_api=partial(self._call_api, **call_options),
             base_url=base_url,
+            provider_options=provider_options,
             timeout_seconds=float(
                 options.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
             ),
@@ -222,7 +232,12 @@ class LLMBackend(BaseBackend):
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
-        provider = get_inference_provider(provider_name)
+        provider_options = options.get("provider_options") or None
+        provider = (
+            get_inference_provider(provider_name, profile_options=provider_options)
+            if provider_options
+            else get_inference_provider(provider_name)
+        )
         model = resolve_provider_model(provider, options.get("model"))
         base_url = provider.resolve_base_url(options.get("base_url"))
         api_key_env = _provider_api_key_env(options, provider)
@@ -264,6 +279,9 @@ class LLMBackend(BaseBackend):
         cache_path_obj = Path(cache_path) if cache_path is not None else None
         schema_hash = _hash_schema(system, fields_spec, temperature)
         provider_identity = provider.implementation_identity()
+        options_fingerprint = profile_options_fingerprint(
+            getattr(provider, "profile_options", None)
+        )
         max_retries = int(options.get("max_retries", _DEFAULT_MAX_RETRIES))
 
         by_index: dict[int, ExtractionResult | Exception] = {}
@@ -272,6 +290,7 @@ class LLMBackend(BaseBackend):
             "batches_resumed": 0,
             "batches_completed": 0,
         }
+        failed_totals: dict[str, int | float] = {}
         pending: list[tuple[int, str, str, str]] = []
 
         def _flush_partition() -> None:
@@ -314,6 +333,7 @@ class LLMBackend(BaseBackend):
                 request_timeout_seconds=request_timeout_seconds,
                 cache_path=cache_path_obj,
                 job_key=job_key,
+                provider_options=provider_options,
             )
             batch_metrics["batch_submissions"] += batch_result.batch_submissions
             batch_metrics["batches_resumed"] += 1 if resumed else 0
@@ -327,11 +347,30 @@ class LLMBackend(BaseBackend):
                     model=model,
                     content_hash=content_hash,
                     schema_hash=schema_hash,
+                    provider_name=provider_name,
+                    provider_identity=provider_identity,
                 )
                 if budget is not None and isinstance(resolved, ExtractionResult):
                     budget.charge_metrics(resolved.metrics)
+                elif isinstance(resolved, ProviderError) and resolved.failure is not None:
+                    # Billed failures consume budget and are reported like
+                    # billed successes (issue #71).
+                    failure = resolved.failure
+                    billed = {
+                        "api_calls": failure.billed_requests,
+                        **failure.usage.to_metrics(),
+                    }
+                    for key, value in billed.items():
+                        failed_totals[key] = failed_totals.get(key, 0) + value
+                    if budget is not None:
+                        budget.charge_metrics(billed)
                 by_index[i] = resolved
             pending = []
+
+        def _flush_and_record() -> None:
+            _flush_partition()
+            for key, value in failed_totals.items():
+                batch_metrics[f"failed_{key}"] = value
 
         for i, path in enumerate(paths):
             try:
@@ -354,6 +393,7 @@ class LLMBackend(BaseBackend):
                 schema_hash=schema_hash,
                 max_tokens=max_tokens,
                 base_url=base_url,
+                options_fingerprint=options_fingerprint,
             )
             cached = (
                 _cache_get(cache_path_obj, cache_key)
@@ -371,7 +411,7 @@ class LLMBackend(BaseBackend):
             pending.append((i, text, content_hash, cache_key))
             if len(pending) >= partition_size:
                 _flush_partition()
-        _flush_partition()
+        _flush_and_record()
 
         return BatchExtractionOutput(
             [by_index[i] for i in range(len(paths))],
@@ -387,10 +427,26 @@ class LLMBackend(BaseBackend):
         model: str,
         content_hash: str,
         schema_hash: str,
+        provider_name: str,
+        provider_identity: str,
     ) -> ExtractionResult | Exception:
         if item is None:
             return RuntimeError("Provider batch returned no result for document")
         if item.error is not None:
+            # Providers may report billed usage on the item instead of
+            # attaching an InferenceFailure themselves; synthesize the
+            # envelope so budgets and failed_* metrics account for it.
+            if item.usage is not None and item.error.failure is None:
+                item.error.attach_failure(
+                    InferenceFailure(
+                        error_code="batch_item_failed",
+                        usage=item.usage,
+                        billed_requests=1,
+                        provider=provider_name,
+                        model=model,
+                        implementation_identity=provider_identity,
+                    )
+                )
             return item.error
         if item.result is None:
             return RuntimeError("Provider batch returned an empty result")
@@ -486,6 +542,7 @@ def extract_fields_with_usage(
     api_key_env: CredentialSelector = None,
     base_url: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    provider_options: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
@@ -507,7 +564,11 @@ def extract_fields_with_usage(
             "timeout_seconds": timeout_seconds,
         }
     )
-    provider_instance = get_inference_provider(provider)
+    provider_instance = (
+        get_inference_provider(provider, profile_options=provider_options)
+        if provider_options
+        else get_inference_provider(provider)
+    )
     resolved_model = resolve_provider_model(provider_instance, model)
     resolved_base_url = provider_instance.resolve_base_url(base_url)
     content_hash = hashlib.blake2b(
@@ -522,6 +583,9 @@ def extract_fields_with_usage(
         schema_hash=schema_hash,
         max_tokens=max_tokens,
         base_url=resolved_base_url,
+        options_fingerprint=profile_options_fingerprint(
+            getattr(provider_instance, "profile_options", None)
+        ),
     )
 
     cache_path_obj = Path(cache_path) if cache_path is not None else None
@@ -538,6 +602,7 @@ def extract_fields_with_usage(
             api_key_env=api_key_env,
             base_url=resolved_base_url,
             timeout_seconds=timeout_seconds,
+            provider_options=provider_options,
         )
     with _gate(max_concurrent):
         raw = fn(
@@ -594,8 +659,13 @@ def _default_call_api(
     api_key_env: CredentialSelector = None,
     base_url: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    provider_options: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    provider_instance = get_inference_provider(provider)
+    provider_instance = (
+        get_inference_provider(provider, profile_options=provider_options)
+        if provider_options
+        else get_inference_provider(provider)
+    )
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )
@@ -662,6 +732,7 @@ def _run_message_batch(
     request_timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     cache_path: Path | None = None,
     job_key: str | None = None,
+    provider_options: Mapping[str, Any] | None = None,
 ) -> tuple[BatchInferenceResult, bool]:
     """Run one native batch partition: submit (or resume), poll with bounded
     backoff, fetch, and clear the persisted job record.
@@ -671,7 +742,11 @@ def _run_message_batch(
     resubmitting — the submitted work is billed exactly once. On timeout the
     job is cancelled and the record removed. Returns the result plus whether
     an existing job was resumed."""
-    provider_instance = get_inference_provider(provider)
+    provider_instance = (
+        get_inference_provider(provider, profile_options=provider_options)
+        if provider_options
+        else get_inference_provider(provider)
+    )
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )
@@ -932,6 +1007,7 @@ def _cache_key(
     schema_hash: str,
     max_tokens: int,
     base_url: str | None = None,
+    options_fingerprint: str | None = None,
 ) -> str:
     # Keyed on the semantic request plus the provider's contract identity —
     # not the backend implementation or dbt-ml release, so cached responses
@@ -948,6 +1024,11 @@ def _cache_key(
     }
     if base_url is not None:
         payload["base_url"] = base_url
+    if options_fingerprint is not None:
+        # Semantic provider_options change what the provider returns, so
+        # they isolate cache entries; execution/credential fields never
+        # reach this fingerprint.
+        payload["provider_options"] = options_fingerprint
     canonical = json.dumps(
         payload,
         sort_keys=True,

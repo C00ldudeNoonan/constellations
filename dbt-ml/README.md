@@ -295,6 +295,7 @@ dbt-ml show <model> [--limit N]                            # peek at a materiali
 dbt-ml search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
 dbt-ml serving status <search-index>                       # publication ledger: status, fence, counts, leases
 dbt-ml serving recover <search-index> --owner-terminated   # explicit authority reassignment after a crash
+dbt-ml providers list [--output {table,json}]              # built-in + entry-point providers, incompatible plugins flagged
 dbt-ml source freshness                                    # mtime vs warn_after/error_after
 dbt-ml docs generate [--output DIR]                        # static HTML site from manifest.json
 dbt-ml docs serve [--port N]                               # local http.server over target/docs/
@@ -398,6 +399,27 @@ Set `api_key_env` to the name of the credential variable itself, as above; do
 not wrap it in `env_var()`. dbt-ml deliberately rejects secret-value
 interpolation in this field so validation errors and resolved configuration
 cannot contain the key.
+
+### Provider plugins and provider options
+
+Separately packaged inference/embedding providers install as normal Python
+distributions and are discovered through versioned entry-point groups
+(`dbt_ml.inference_providers.v3` / `dbt_ml.embedding_providers.v3`) — no
+wrapper import needed. Discovery is deterministic and fails closed before any
+source or provider I/O: duplicate or built-in-shadowing names, broken plugins,
+and name mismatches are configuration errors, and a plugin built against a
+different provider contract version is reported as incompatible rather than
+"not found". `dbt-ml providers list` shows every provider with its
+distribution and implementation identity.
+
+A provider may publish a strict options model; operators configure it under
+`llm.provider_options:` in the profile (opaque to core, validated by the
+selected provider, rejected in model YAML). Every provider option field is
+classified: `credential` fields are protected references that never enter
+artifacts or fingerprints, `semantic` fields join the response-cache key and
+model identity, `execution` fields never invalidate state, and
+`artifact-safe` fields may appear in manifest descriptors. See
+[docs/architecture/provider-abstraction.md](docs/architecture/provider-abstraction.md).
 
 ### BigQuery
 

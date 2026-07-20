@@ -1427,6 +1427,58 @@ def serving_recover(
     )
 
 
+@cli.group()
+def providers() -> None:
+    """Inspect registered and discovered inference/embedding providers."""
+
+
+@providers.command("list")
+@click.option(
+    "--output",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    show_default=True,
+)
+def providers_list(output: str) -> None:
+    """List built-in and entry-point-discovered providers.
+
+    Separately packaged providers load from the versioned entry-point groups
+    (issue #71); plugins built against another provider contract version are
+    shown as incompatible instead of being silently ignored.
+    """
+    from .providers import ProviderRegistrationError, provider_inventory
+
+    try:
+        entries = provider_inventory()
+    except ProviderRegistrationError as e:
+        raise click.ClickException(f"Provider plugin discovery failed: {e}") from e
+    if output == "json":
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "capability": entry.capability,
+                        "name": entry.name,
+                        "distribution": entry.distribution,
+                        "status": entry.status,
+                        "detail": entry.detail,
+                    }
+                    for entry in entries
+                ],
+                indent=2,
+            )
+        )
+        return
+    header = f"{'capability':<12}{'name':<20}{'distribution':<28}{'status':<14}detail"
+    click.echo(header)
+    click.echo("-" * 110)
+    for entry in entries:
+        click.echo(
+            f"{entry.capability:<12}{entry.name:<20}{entry.distribution:<28}"
+            f"{entry.status:<14}{entry.detail}"
+        )
+
+
 @cli.command()
 @_project_context_options
 @click.pass_context

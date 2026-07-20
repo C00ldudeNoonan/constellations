@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from functools import cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
-from typing import Any, ClassVar
+from types import UnionType
+from typing import Any, ClassVar, Self, Union, get_args, get_origin
+
+from pydantic import BaseModel, Field, ValidationError
+from pydantic.fields import FieldInfo
 
 from ..credentials import (
     CredentialReference,
@@ -24,7 +28,7 @@ from ..credentials import (
     ProtectedCredential,
 )
 from ..endpoints import EndpointUrlError, OpenAICompatibleBaseUrl
-from ..hashing import HASH_DIGEST_SIZE
+from ..hashing import HASH_DIGEST_SIZE, canonical_fingerprint
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +48,15 @@ class ProviderError(RuntimeError):
             raise ValueError("safe_for_display must be boolean")
         super().__init__(message)
         self.safe_for_display = safe_for_display
+        # Billed-failure accounting (issue #71): a safe error may carry the
+        # usage the provider charged for the failed work.
+        self.failure: InferenceFailure | None = None
+
+    def attach_failure(self, failure: InferenceFailure) -> Self:
+        if not isinstance(failure, InferenceFailure):
+            raise ValueError("attached failure must be InferenceFailure")
+        self.failure = failure
+        return self
 
 
 class ProviderRegistrationError(ProviderError):
@@ -175,6 +188,19 @@ def sanitized_provider_error(
     error: ProviderError,
 ) -> ProviderError:
     """Replace provider-authored text and exception chains at the boundary."""
+    sanitized = _sanitized_provider_error(provider, operation, error)
+    # Billed-failure accounting survives sanitization: the envelope holds
+    # only a safe error code, normalized usage, and provenance (issue #71).
+    if error.failure is not None:
+        sanitized.attach_failure(error.failure)
+    return sanitized
+
+
+def _sanitized_provider_error(
+    provider: str,
+    operation: str,
+    error: ProviderError,
+) -> ProviderError:
     safe_provider = _safe_error_label(provider, fallback="provider")
     safe_operation = _safe_error_label(operation, fallback="request")
     if isinstance(error, ProviderRequestError):
@@ -302,6 +328,40 @@ class ProviderUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceFailure:
+    """Billing and provenance for provider work that produced no usable result.
+
+    Truncated responses, schema-invalid tool output, and partially failed
+    native batches still consume tokens. This envelope lets a sanitized error
+    and normalized usage coexist so budgets and run results account for billed
+    failures; it never carries prompts, response bodies, or credential data.
+    """
+
+    error_code: str
+    usage: ProviderUsage
+    billed_requests: int
+    provider: str
+    model: str
+    implementation_identity: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error_code, str) or not self.error_code:
+            raise ValueError("failure error_code must be a non-empty string")
+        if not isinstance(self.usage, ProviderUsage):
+            raise ValueError("failure usage must be ProviderUsage")
+        if (
+            isinstance(self.billed_requests, bool)
+            or not isinstance(self.billed_requests, int)
+            or self.billed_requests < 0
+        ):
+            raise ValueError("failure billed_requests must be a non-negative integer")
+        for name in ("provider", "model", "implementation_identity"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"failure {name} must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
 class InferenceRequest:
     model: str
     content: str = field(repr=False)
@@ -374,6 +434,10 @@ class BatchInferenceItem:
     request_id: str
     result: InferenceResult | None = None
     error: ProviderError | None = None
+    # Billed usage for a failed item (issue #71). Successful items carry
+    # usage inside their result; the error side may carry what the provider
+    # charged for the failure.
+    usage: ProviderUsage | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_id, str) or not self.request_id:
@@ -384,6 +448,14 @@ class BatchInferenceItem:
             raise ValueError("batch item result must be InferenceResult")
         if self.error is not None and not isinstance(self.error, ProviderError):
             raise ValueError("batch item error must be ProviderError")
+        if self.usage is not None:
+            if self.error is None:
+                raise ValueError(
+                    "batch item usage accompanies a failed item; successful "
+                    "items carry usage inside their result"
+                )
+            if not isinstance(self.usage, ProviderUsage):
+                raise ValueError("batch item usage must be ProviderUsage")
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,12 +592,169 @@ class EmbeddingResult:
             raise ValueError("embedding usage must be ProviderUsage")
 
 
+OPTION_CLASSIFICATIONS = frozenset(
+    {"credential", "semantic", "execution", "artifact-safe"}
+)
+_CLASSIFICATION_KEY = "dbt_ml_classification"
+
+
+def provider_option(classification: str, **field_kwargs: Any) -> Any:
+    """Declare a provider profile-option field with exactly one classification.
+
+    `credential` fields must be typed `CredentialReference` and stay out of
+    repr, serialization, artifacts, and fingerprints; `semantic` fields enter
+    the response-cache key and model identity; `execution` fields never
+    invalidate state; `artifact-safe` fields may additionally appear verbatim
+    in manifest provider descriptors."""
+    if classification not in OPTION_CLASSIFICATIONS:
+        raise ValueError(
+            f"provider option classification must be one of "
+            f"{sorted(OPTION_CLASSIFICATIONS)}"
+        )
+    if "json_schema_extra" in field_kwargs:
+        raise ValueError("provider_option owns json_schema_extra")
+    if classification == "credential":
+        field_kwargs.setdefault("repr", False)
+        field_kwargs.setdefault("exclude", True)
+    return Field(json_schema_extra={_CLASSIFICATION_KEY: classification}, **field_kwargs)
+
+
+def option_classification(field: FieldInfo) -> str | None:
+    extra = field.json_schema_extra
+    if not isinstance(extra, dict):
+        return None
+    value = extra.get(_CLASSIFICATION_KEY)
+    return value if isinstance(value, str) else None
+
+
+def _is_credential_annotation(annotation: Any) -> bool:
+    if annotation is CredentialReference:
+        return True
+    return get_origin(annotation) in {Union, UnionType} and all(
+        arg is CredentialReference or arg is type(None)
+        for arg in get_args(annotation)
+    )
+
+
+def validate_profile_options_model(
+    provider_name: str, model: type[BaseModel]
+) -> None:
+    """Registration-time validation of a provider's published options model."""
+    config = model.model_config
+    if not (
+        config.get("extra") == "forbid"
+        and config.get("frozen") is True
+        and config.get("hide_input_in_errors") is True
+    ):
+        raise ProviderRegistrationError(
+            f"provider '{provider_name}' profile options model must set "
+            "extra='forbid', frozen=True, and hide_input_in_errors=True"
+        )
+    for field_name, field_info in model.model_fields.items():
+        classification = option_classification(field_info)
+        if classification is None or classification not in OPTION_CLASSIFICATIONS:
+            raise ProviderRegistrationError(
+                f"provider '{provider_name}' profile option '{field_name}' must "
+                "declare exactly one classification via provider_option(...)"
+            )
+        if classification == "credential":
+            if not _is_credential_annotation(field_info.annotation):
+                raise ProviderRegistrationError(
+                    f"provider '{provider_name}' credential option '{field_name}' "
+                    "must be typed CredentialReference"
+                )
+            if field_info.repr or not field_info.exclude:
+                raise ProviderRegistrationError(
+                    f"provider '{provider_name}' credential option '{field_name}' "
+                    "must be excluded from repr and serialization"
+                )
+        elif _is_credential_annotation(field_info.annotation):
+            raise ProviderRegistrationError(
+                f"provider '{provider_name}' option '{field_name}' holds a "
+                "credential reference and must be classified credential"
+            )
+
+
+def parse_profile_options(
+    provider_cls: type[BaseProvider],
+    options: Mapping[str, Any] | None,
+) -> BaseModel | None:
+    """Validate operator-supplied `provider_options:` for the selected provider."""
+    model_factory = getattr(provider_cls, "profile_options_model", None)
+    model_candidate = model_factory() if callable(model_factory) else None
+    model: type[BaseModel] | None = (
+        model_candidate
+        if isinstance(model_candidate, type) and issubclass(model_candidate, BaseModel)
+        else None
+    )
+    if model is None:
+        if options:
+            raise ProviderConfigurationError(
+                f"provider '{provider_cls.provider_name}' does not accept "
+                "provider_options",
+                safe_for_display=True,
+            )
+        return None
+    try:
+        return model.model_validate(dict(options or {}))
+    except ValidationError:
+        raise ProviderConfigurationError(
+            f"provider '{provider_cls.provider_name}' rejected provider_options; "
+            "run with the provider's documented option schema",
+            safe_for_display=True,
+        ) from None
+
+
+def _classified_option_values(
+    instance: BaseModel, classifications: frozenset[str]
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for field_name, field_info in type(instance).model_fields.items():
+        if option_classification(field_info) in classifications:
+            values[field_name] = getattr(instance, field_name)
+    return values
+
+
+def profile_options_fingerprint(instance: BaseModel | None) -> str | None:
+    """Semantic-option fingerprint for cache keys and model identity.
+
+    Credential and execution fields never enter it; tuning them cannot
+    invalidate state or caches."""
+    if not isinstance(instance, BaseModel):
+        return None
+    semantic = _classified_option_values(
+        instance, frozenset({"semantic", "artifact-safe"})
+    )
+    if not semantic:
+        return None
+    return canonical_fingerprint(
+        semantic, domain="dbt-ml-provider-profile-options", version=1
+    )
+
+
+def artifact_safe_options(instance: BaseModel | None) -> dict[str, Any]:
+    if not isinstance(instance, BaseModel):
+        return {}
+    return _classified_option_values(instance, frozenset({"artifact-safe"}))
+
+
 class BaseProvider(ABC):
     provider_name: ClassVar[str]
     implementation_version: ClassVar[str]
     requires_credentials: ClassVar[bool] = True
     default_credential_env: ClassVar[str | None] = None
     implementation_packages: ClassVar[tuple[str, ...]] = ()
+
+    def __init__(self, *, profile_options: BaseModel | None = None) -> None:
+        # Immutable typed configuration delivered once at the provider
+        # boundary (issue #71); None when the provider publishes no model.
+        self.profile_options = profile_options
+
+    @classmethod
+    def profile_options_model(cls) -> type[BaseModel] | None:
+        """Strict Pydantic model validating profile `provider_options:`,
+        or None when the provider accepts none."""
+        return None
 
     @classmethod
     def name(cls) -> str:
@@ -945,6 +1174,11 @@ class EmbeddingProvider(BaseProvider):
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
     ) -> EmbeddingResult: ...
+
+
+def implementation_identity_for(provider_type: type[BaseProvider]) -> str:
+    """Class-level implementation identity, without running the constructor."""
+    return _implementation_identity(provider_type)
 
 
 @cache

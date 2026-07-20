@@ -56,6 +56,43 @@
 </p>
 {% endif %}
 
+{% if model.agent_context %}
+<h2>Agent context contract</h2>
+<p>
+  Contract: <code>{{ model.agent_context.contract }}</code> &middot;
+  Grain: <code>{{ model.agent_context.grain }}</code> &middot;
+  Relation: <code>{{ model.agent_context.relation.fully_qualified }}</code>
+</p>
+<p>
+  Primary key:
+  {% for key in model.agent_context.primary_key %}<code>{{ key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+</p>
+{% if model.agent_context.foreign_keys %}
+<h3>Foreign keys</h3>
+<table>
+  <thead><tr><th>Field</th><th>References</th></tr></thead>
+  <tbody>
+  {% for field, target in model.agent_context.foreign_keys.items() %}
+    <tr><td><code>{{ field }}</code></td><td><code>{{ target }}</code></td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Nullable</th><th>Description</th></tr></thead>
+  <tbody>
+  {% for field in model.agent_context.fields %}
+    <tr>
+      <td><code>{{ field.name }}</code></td>
+      <td><code>{{ field.data_type }}</code></td>
+      <td>{{ 'yes' if field.nullable else 'no' }}</td>
+      <td>{{ field.description }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 {% if model.fields %}
 <h2>Fields</h2>
 <table>

@@ -1753,8 +1753,9 @@ their owning follow-ups:
   any other hosted retrieval adapter accepts secrets.
 - #137 adds deterministic golden-query evaluation through the portable query
   surface.
-- #145 specializes provenance, entity/time, permissions, and citation fields;
-  it may add typed fields but must preserve mandatory prefilter separation.
+- The accepted [agent context v1 contract](agent-context-v1.md) specializes
+  provenance, entity/time, permissions, freshness, and citation fields while
+  preserving mandatory prefilter separation.
 - #28-#35 conform to this contract and common adapter test suite.
 
 Online schema evolution, enforced tenant isolation, optional string operators,

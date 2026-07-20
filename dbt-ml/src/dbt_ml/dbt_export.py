@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from .agent_context import contract_relation
 from .config import load_project
 from .config.model import ModelConfig
 from .config.profile import WarehouseConfig
@@ -119,14 +120,38 @@ def _table_for_model(
 ) -> dict[str, Any]:
     columns_by_name: dict[str, dict[str, Any]] = {}
 
-    for field in model.fields:
-        columns_by_name[field.name] = {"name": field.name}
-        if field.description:
-            columns_by_name[field.name]["description"] = field.description
-        if field.data_type:
+    if model.agent_context is not None:
+        relation = contract_relation(model.agent_context.grain)
+        for contract_field in relation.fields:
+            column = columns_by_name.setdefault(
+                contract_field.name, {"name": contract_field.name}
+            )
+            column["description"] = contract_field.description
+            column["data_type"] = (
+                "string"
+                if contract_field.data_type in {"json", "array[string]"}
+                else contract_field.data_type
+            )
+            column["meta"] = {
+                "dbt_ml": {
+                    "agent_context": {
+                        "nullable": contract_field.nullable,
+                    }
+                }
+            }
+
+    for model_field in model.fields:
+        column = columns_by_name.setdefault(
+            model_field.name, {"name": model_field.name}
+        )
+        if model_field.description:
+            column["description"] = model_field.description
+        if model_field.data_type:
             # Adapters receive nested values after they are flattened to JSON text.
-            columns_by_name[field.name]["data_type"] = (
-                "string" if field.data_type == "json" else field.data_type
+            column["data_type"] = (
+                "string"
+                if model_field.data_type == "json"
+                else model_field.data_type
             )
 
     table_tests: list[Any] = []
@@ -139,12 +164,25 @@ def _table_for_model(
     if model.tags:
         table["tags"] = model.tags
 
+    meta: dict[str, Any] = {}
+    if model.agent_context is not None:
+        relation = contract_relation(model.agent_context.grain)
+        meta["dbt_ml"] = {
+            "agent_context": {
+                "contract": model.agent_context.contract,
+                "grain": relation.grain.value,
+                "primary_key": list(relation.primary_key),
+                "foreign_keys": dict(relation.foreign_keys),
+            }
+        }
     if dagster_meta:
         # Pin the Dagster asset key to dagster-dbt's default source key
         # ([source, table]) so a dbt-ml producer asset and the dbt models that
         # {{ source(...) }} it agree on one key without hand-copying. dbt itself
         # ignores unknown `meta`, so pure-dbt consumers are unaffected.
-        table["meta"] = {"dagster": {"asset_key": [source_name, model.name]}}
+        meta["dagster"] = {"asset_key": [source_name, model.name]}
+    if meta:
+        table["meta"] = meta
 
     if columns_by_name:
         table["columns"] = list(columns_by_name.values())

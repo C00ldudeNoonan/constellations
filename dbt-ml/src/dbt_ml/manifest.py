@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import StateScope
+from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
 from .config.model import ModelConfig
@@ -324,6 +325,16 @@ def _model_dict(
     embedding = describe_model_embedding(model)
     if embedding is not None:
         model_dict["embedding"] = embedding
+    if model.agent_context is not None:
+        model_dict["agent_context"] = {
+            **contract_descriptor(model.agent_context.grain),
+            "relation": _relation(
+                resolved.warehouse.catalog_name(),
+                resolved.warehouse.schema_name,
+                model.name,
+            ),
+            "unique_id": f"model.{project.name}.{model.name}",
+        }
     return model_dict
 
 

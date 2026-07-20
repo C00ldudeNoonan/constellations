@@ -304,8 +304,15 @@ class LLMBackendOptions(_BackendOptions):
     base_url: OpenAICompatibleBaseUrl | None = None
     # Operator-owned provider profile options (issue #71): opaque to core,
     # injected from the profile by resolve_llm_options, and validated by the
-    # selected provider's published model at the provider boundary.
-    provider_options: dict[str, Any] = Field(default_factory=dict)
+    # selected provider's published model at the provider boundary. Excluded
+    # from repr/serialization like api_key_env because the raw mapping may
+    # hold credential environment-variable names; validate_backend_options
+    # re-adds it to the trusted in-process mapping.
+    provider_options: dict[str, Any] = Field(
+        default_factory=dict,
+        repr=False,
+        exclude=True,
+    )
     timeout_seconds: float = Field(
         default=60.0,
         ge=0.1,
@@ -434,6 +441,9 @@ def validate_backend_options(
         exclude_none=True,
         exclude_unset=True,
     )
-    if isinstance(parsed, LLMBackendOptions) and parsed.api_key_env is not None:
-        validated["api_key_env"] = parsed.api_key_env
+    if isinstance(parsed, LLMBackendOptions):
+        if parsed.api_key_env is not None:
+            validated["api_key_env"] = parsed.api_key_env
+        if parsed.provider_options:
+            validated["provider_options"] = dict(parsed.provider_options)
     return validated

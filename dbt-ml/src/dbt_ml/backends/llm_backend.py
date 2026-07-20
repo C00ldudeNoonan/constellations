@@ -24,6 +24,7 @@ from ..providers import (
     BatchInferenceItem,
     BatchInferenceRequest,
     BatchInferenceResult,
+    InferenceFailure,
     InferenceProvider,
     InferenceRequest,
     InferenceResult,
@@ -169,6 +170,8 @@ class LLMBackend(BaseBackend):
             "provider": provider_name,
             "api_key_env": api_key_env,
         }
+        if provider_options:
+            call_options["provider_options"] = provider_options
         if base_url is not None:
             call_options["base_url"] = base_url
         if "timeout_seconds" in options:
@@ -330,6 +333,7 @@ class LLMBackend(BaseBackend):
                 request_timeout_seconds=request_timeout_seconds,
                 cache_path=cache_path_obj,
                 job_key=job_key,
+                provider_options=provider_options,
             )
             batch_metrics["batch_submissions"] += batch_result.batch_submissions
             batch_metrics["batches_resumed"] += 1 if resumed else 0
@@ -343,6 +347,8 @@ class LLMBackend(BaseBackend):
                     model=model,
                     content_hash=content_hash,
                     schema_hash=schema_hash,
+                    provider_name=provider_name,
+                    provider_identity=provider_identity,
                 )
                 if budget is not None and isinstance(resolved, ExtractionResult):
                     budget.charge_metrics(resolved.metrics)
@@ -421,10 +427,26 @@ class LLMBackend(BaseBackend):
         model: str,
         content_hash: str,
         schema_hash: str,
+        provider_name: str,
+        provider_identity: str,
     ) -> ExtractionResult | Exception:
         if item is None:
             return RuntimeError("Provider batch returned no result for document")
         if item.error is not None:
+            # Providers may report billed usage on the item instead of
+            # attaching an InferenceFailure themselves; synthesize the
+            # envelope so budgets and failed_* metrics account for it.
+            if item.usage is not None and item.error.failure is None:
+                item.error.attach_failure(
+                    InferenceFailure(
+                        error_code="batch_item_failed",
+                        usage=item.usage,
+                        billed_requests=1,
+                        provider=provider_name,
+                        model=model,
+                        implementation_identity=provider_identity,
+                    )
+                )
             return item.error
         if item.result is None:
             return RuntimeError("Provider batch returned an empty result")
@@ -580,6 +602,7 @@ def extract_fields_with_usage(
             api_key_env=api_key_env,
             base_url=resolved_base_url,
             timeout_seconds=timeout_seconds,
+            provider_options=provider_options,
         )
     with _gate(max_concurrent):
         raw = fn(
@@ -636,8 +659,13 @@ def _default_call_api(
     api_key_env: CredentialSelector = None,
     base_url: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    provider_options: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    provider_instance = get_inference_provider(provider)
+    provider_instance = (
+        get_inference_provider(provider, profile_options=provider_options)
+        if provider_options
+        else get_inference_provider(provider)
+    )
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )
@@ -704,6 +732,7 @@ def _run_message_batch(
     request_timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     cache_path: Path | None = None,
     job_key: str | None = None,
+    provider_options: Mapping[str, Any] | None = None,
 ) -> tuple[BatchInferenceResult, bool]:
     """Run one native batch partition: submit (or resume), poll with bounded
     backoff, fetch, and clear the persisted job record.
@@ -713,7 +742,11 @@ def _run_message_batch(
     resubmitting — the submitted work is billed exactly once. On timeout the
     job is cancelled and the record removed. Returns the result plus whether
     an existing job was resumed."""
-    provider_instance = get_inference_provider(provider)
+    provider_instance = (
+        get_inference_provider(provider, profile_options=provider_options)
+        if provider_options
+        else get_inference_provider(provider)
+    )
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )

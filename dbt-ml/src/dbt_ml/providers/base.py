@@ -188,6 +188,19 @@ def sanitized_provider_error(
     error: ProviderError,
 ) -> ProviderError:
     """Replace provider-authored text and exception chains at the boundary."""
+    sanitized = _sanitized_provider_error(provider, operation, error)
+    # Billed-failure accounting survives sanitization: the envelope holds
+    # only a safe error code, normalized usage, and provenance (issue #71).
+    if error.failure is not None:
+        sanitized.attach_failure(error.failure)
+    return sanitized
+
+
+def _sanitized_provider_error(
+    provider: str,
+    operation: str,
+    error: ProviderError,
+) -> ProviderError:
     safe_provider = _safe_error_label(provider, fallback="provider")
     safe_operation = _safe_error_label(operation, fallback="request")
     if isinstance(error, ProviderRequestError):

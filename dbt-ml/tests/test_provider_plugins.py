@@ -534,3 +534,178 @@ def test_anthropic_truncated_response_keeps_billed_usage() -> None:
     assert failure.usage.input_tokens == 17
     assert failure.billed_requests == 1
     assert failure.provider == "anthropic"
+
+
+# ─── review follow-ups: redaction, call-path delivery, billed accounting ────
+
+
+def test_provider_options_are_redacted_from_config_surfaces() -> None:
+    from dbt_ml.backends.options import LLMBackendOptions, validate_backend_options
+    from dbt_ml.config.profile import LLMConfig
+
+    secret_name = "SECRET_ADMIN_ENV"
+    llm = LLMConfig(provider="anthropic", provider_options={"admin_key_env": secret_name})
+    assert secret_name not in repr(llm)
+    assert "provider_options" not in llm.model_dump()
+
+    raw = {
+        "fields": [{"name": "a", "type": "string"}],
+        "provider_options": {"admin_key_env": secret_name},
+    }
+    parsed = LLMBackendOptions.model_validate(raw)
+    assert secret_name not in repr(parsed)
+    assert "provider_options" not in parsed.model_dump()
+    # The trusted in-process mapping still carries the options forward.
+    validated = validate_backend_options("llm", raw)
+    assert validated["provider_options"] == {"admin_key_env": secret_name}
+
+
+def test_sync_call_path_delivers_profile_options_to_provider(
+    clean_registry: None,
+) -> None:
+    from dbt_ml.backends.llm_backend import extract_fields_with_usage
+
+    received: list[Any] = []
+
+    @register_inference_provider
+    class RecordingProvider(InferenceProviderStub):
+        provider_name = "recorder"
+
+        @classmethod
+        def profile_options_model(cls) -> type[BaseModel] | None:
+            return _StrictOptions
+
+        def complete(self, request: Any, *, credential: Any, runtime: Any) -> Any:
+            received.append(self.profile_options)
+            return InferenceResult(
+                {}, usage=ProviderUsage(input_tokens=1, output_tokens=1)
+            )
+
+    _fields, usage = extract_fields_with_usage(
+        "document text",
+        fields_spec=[{"name": "a", "type": "string"}],
+        provider="recorder",
+        provider_options={"region": "eu-west"},
+    )
+    assert usage["api_calls"] == 1
+    assert received and isinstance(received[-1], _StrictOptions)
+    assert received[-1].region == "eu-west"
+
+
+def test_batch_execution_delivers_profile_options_to_provider(
+    clean_registry: None,
+) -> None:
+    from dbt_ml.backends.llm_backend import _run_message_batch
+    from dbt_ml.providers import (
+        BatchInferenceRequest,
+        BatchInferenceResult,
+        BatchJobStatus,
+        InferenceRequest,
+    )
+
+    received: list[Any] = []
+
+    @register_inference_provider
+    class BatchRecorder(InferenceProviderStub):
+        provider_name = "batchrecorder"
+        supports_native_batch = True
+
+        @classmethod
+        def profile_options_model(cls) -> type[BaseModel] | None:
+            return _StrictOptions
+
+        def submit_batch(
+            self, requests: Any, *, credential: Any, runtime: Any
+        ) -> str:
+            received.append(self.profile_options)
+            return "job-1"
+
+        def poll_batch(self, batch_id: str, *, credential: Any, runtime: Any) -> Any:
+            return BatchJobStatus(done=True, succeeded=1)
+
+        def fetch_batch_results(
+            self, batch_id: str, requests: Any, *, credential: Any, runtime: Any
+        ) -> Any:
+            return BatchInferenceResult(
+                tuple(
+                    BatchInferenceItem(
+                        item.request_id,
+                        result=InferenceResult(
+                            {}, usage=ProviderUsage(input_tokens=1, output_tokens=1)
+                        ),
+                    )
+                    for item in requests
+                ),
+                batch_submissions=1,
+            )
+
+        def cancel_batch(
+            self, batch_id: str, *, credential: Any, runtime: Any
+        ) -> None:
+            return None
+
+    request = BatchInferenceRequest(
+        "req-0",
+        InferenceRequest(
+            model="stub-small",
+            content="doc",
+            system_prompt="sys",
+            output_schema={"type": "object", "properties": {}},
+        ),
+    )
+    result, resumed = _run_message_batch(
+        [request],
+        provider="batchrecorder",
+        poll_seconds=0.1,
+        provider_options={"region": "eu-west"},
+    )
+    assert not resumed
+    assert len(result.items) == 1 and result.items[0].result is not None
+    assert received and isinstance(received[-1], _StrictOptions)
+    assert received[-1].region == "eu-west"
+
+
+def test_sanitized_provider_error_preserves_billed_failure() -> None:
+    from dbt_ml.providers import ProviderResponseError, sanitized_provider_error
+
+    failure = InferenceFailure(
+        error_code="invalid_response",
+        usage=ProviderUsage(input_tokens=11, output_tokens=4),
+        billed_requests=1,
+        provider="anthropic",
+        model="claude-test",
+        implementation_identity="ident",
+    )
+    original = ProviderResponseError(
+        "raw provider text with /internal/path", safe_for_display=False
+    ).attach_failure(failure)
+    sanitized = sanitized_provider_error("anthropic", "inference", original)
+    assert sanitized is not original
+    assert sanitized.failure is failure
+    assert "raw provider text" not in str(sanitized)
+
+
+def test_resolve_batch_item_synthesizes_failure_from_item_usage() -> None:
+    from dbt_ml.backends.llm_backend import LLMBackend
+
+    usage = ProviderUsage(input_tokens=7, output_tokens=3)
+    item = BatchInferenceItem(
+        "req-0",
+        error=ProviderError("failed item", safe_for_display=True),
+        usage=usage,
+    )
+    resolved = LLMBackend._resolve_batch_item(
+        item,
+        cache_path=None,
+        cache_key="key",
+        model="stub-small",
+        content_hash="content",
+        schema_hash="schema",
+        provider_name="acme",
+        provider_identity="ident",
+    )
+    assert isinstance(resolved, ProviderError)
+    assert resolved.failure is not None
+    assert resolved.failure.usage == usage
+    assert resolved.failure.provider == "acme"
+    assert resolved.failure.billed_requests == 1

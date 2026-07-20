@@ -1,9 +1,8 @@
 # Provider abstraction
 
-Status: the contract surface, registry, credential handling, and the Anthropic
-and vLLM mappings below are implemented. The sections marked "target contract
-(issue #71)" — plugin discovery, provider-owned profile configuration, and
-failed-outcome accounting — are accepted design, not current guarantees.
+Status: implemented, including entry-point plugin discovery, provider-owned
+profile configuration, and failed-outcome accounting (issue #71). Vendor
+integrations beyond Anthropic and vLLM remain their own issues.
 
 dbt-ml treats hosted inference as an execution capability, not as a property of
 the LLM backend. Models describe the transformation they need; a provider
@@ -84,11 +83,9 @@ duplicate names within one capability, and invalid batch metadata. The same
 name may intentionally exist in both registries.
 
 Importing `dbt_ml.providers` registers built-in providers. Separately packaged
-providers load through the entry-point discovery contract below; until that
-lands, an integration must import its provider module before profile
-resolution.
+providers load through the entry-point discovery contract below.
 
-## Plugin discovery — target contract (issue #71)
+## Plugin discovery (issue #71)
 
 Separately packaged providers are discovered through versioned Python
 entry-point groups, so the stock `dbt-ml` CLI can load them without a wrapper
@@ -134,7 +131,7 @@ Discovery failures are configuration errors: they carry no retryability, and
 they surface before a manifest is written, so a run can never bill provider
 work under a misconfigured plugin set.
 
-## Provider-owned profile configuration — target contract (issue #71)
+## Provider-owned profile configuration (issue #71)
 
 The shared `llm:` block stays small and provider-neutral: provider selection,
 model, credential reference, endpoint routing, timeout, cache, system prompt,
@@ -179,16 +176,18 @@ llm:
   published model with an unclassified or doubly classified field at
   registration time, not at first use.
 
-## Failed outcomes and usage accounting — target contract (issue #71)
+## Failed outcomes and usage accounting (issue #71)
 
 Providers bill for work that does not produce a usable result: truncated
 responses, schema-invalid tool output, and partially failed native batches all
 consume tokens. The contract therefore lets a safe error and normalized usage
 coexist instead of forcing a choice between raising and accounting:
 
-- A frozen `InferenceFailure` envelope carries the sanitized `ProviderError`,
-  a `ProviderUsage`, the request count actually billed, and provenance:
-  provider name, effective model, and implementation identity.
+- A frozen `InferenceFailure` envelope carries a safe error code, a
+  `ProviderUsage`, the request count actually billed, and provenance:
+  provider name, effective model, and implementation identity. It rides on
+  the sanitized `ProviderError` (`error.failure`) so error control flow is
+  unchanged.
 - `BatchInferenceItem` keeps exactly-one-of `result`/`error` semantics, and
   the error side may carry the item's billed usage. Batch-level submissions
   and polling overhead stay on `BatchInferenceResult`.
@@ -199,19 +198,20 @@ coexist instead of forcing a choice between raising and accounting:
   consume from failed work exactly as from successes, so a model that fails
   repeatedly cannot bill unbounded retries under an "only successes count"
   loophole.
-- Failed `run_results` rows preserve provenance without payloads: provider,
-  model, implementation identity, safe error code, retryability, and usage
-  with estimated cost when pricing is configured — never prompts, responses,
-  headers, SDK message text, or credential names.
+- Failed work stays visible without payloads: billed-failure usage
+  aggregates into run-result metrics (`failed_api_calls`, `failed_*` token
+  and cost totals) beside the model's provider/model/implementation
+  descriptor — never prompts, responses, headers, SDK message text, or
+  credential names.
 
-## Conformance proof — target contract (issue #71)
+## Conformance proof (issue #71)
 
 The three contracts above are proven by fixtures, not by a live vendor:
 
-- A separately packaged fake provider — a real distribution with entry points,
-  a published profile-options model with all four field classifications, and
-  deterministic responses — is installed in CI and driven through the stock
-  CLI end to end.
+- A separately packaged fake provider — a real distribution (`dist-info`
+  metadata plus entry points) with a published profile-options model covering
+  all four field classifications — is materialized on the import path during
+  tests and driven through discovery and the stock CLI.
 - Deterministic malicious and faulty plugins (duplicate names, built-in name
   claims, wrong-contract groups, import-time failures, metadata violations,
   contract-violating results, secret-leaking errors) run without network

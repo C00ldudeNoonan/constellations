@@ -24,7 +24,11 @@ from .embedding import EmbeddingIdentity
 from .hashing import HASH_DIGEST_SIZE, canonical_json
 from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options
-from .providers import get_inference_provider, resolve_provider_model
+from .providers import (
+    get_inference_provider,
+    profile_options_fingerprint,
+    resolve_provider_model,
+)
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
@@ -40,6 +44,10 @@ _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
         "max_concurrent",
         "max_retries",
         "on_partial_batch",
+        # The raw mapping may hold execution/credential fields that must not
+        # invalidate state; the semantic subset re-enters identity through the
+        # inference descriptor's provider_options_identity (issue #71).
+        "provider_options",
         "timeout_seconds",
     }
 )
@@ -235,6 +243,7 @@ def _inference_descriptor(options: Mapping[str, Any]) -> dict[str, str]:
         effective.provider,
         effective.model,
         base_url=effective.base_url,
+        provider_options=effective.provider_options,
     )
 
 
@@ -256,7 +265,14 @@ def _profile_inference_descriptor(
         if resolved is not None and resolved.llm is not None
         else None
     )
-    return _provider_descriptor(provider_name, model, base_url=base_url)
+    provider_options = (
+        resolved.llm.provider_options
+        if resolved is not None and resolved.llm is not None
+        else {}
+    )
+    return _provider_descriptor(
+        provider_name, model, base_url=base_url, provider_options=provider_options
+    )
 
 
 def _profile_system_prompt_fingerprint(
@@ -278,8 +294,14 @@ def _provider_descriptor(
     model: str | None,
     *,
     base_url: str | None = None,
+    provider_options: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
-    provider = get_inference_provider(provider_name)
+    if provider_options:
+        provider = get_inference_provider(
+            provider_name, profile_options=provider_options
+        )
+    else:
+        provider = get_inference_provider(provider_name)
     descriptor = {
         "provider": provider_name,
         "model": resolve_provider_model(provider, model),
@@ -291,6 +313,14 @@ def _provider_descriptor(
             canonical_json({"base_url": resolved_base_url}).encode(),
             digest_size=HASH_DIGEST_SIZE,
         ).hexdigest()
+    # Semantic provider_options change provider behavior, so they are part
+    # of the transformation's identity; execution and credential fields
+    # never reach this fingerprint.
+    options_fingerprint = profile_options_fingerprint(
+        getattr(provider, "profile_options", None)
+    )
+    if options_fingerprint is not None:
+        descriptor["provider_options_identity"] = options_fingerprint
     return descriptor
 
 

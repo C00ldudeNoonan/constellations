@@ -302,6 +302,10 @@ class LLMBackendOptions(_BackendOptions):
         exclude=True,
     )
     base_url: OpenAICompatibleBaseUrl | None = None
+    # Operator-owned provider profile options (issue #71): opaque to core,
+    # injected from the profile by resolve_llm_options, and validated by the
+    # selected provider's published model at the provider boundary.
+    provider_options: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = Field(
         default=60.0,
         ge=0.1,

@@ -168,6 +168,9 @@ class LLMConfig(BaseModel):
         exclude=True,
     )
     base_url: OpenAICompatibleBaseUrl | None = None
+    # Opaque to core: validated by the selected provider's published
+    # profile-options model at profile resolution (issue #71).
+    provider_options: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = Field(
         default=60.0,
         ge=0.1,

@@ -43,7 +43,10 @@ from .config.yaml_diagnostics import (
 from .providers import (
     ProviderConfigurationError,
     ProviderNotFoundError,
+    ProviderRegistrationError,
+    discover_providers,
     get_inference_provider,
+    parse_profile_options,
     resolve_provider_model,
 )
 from .retrieval import (
@@ -151,10 +154,20 @@ def resolve_profile(
         del selected, profile
         profiles = {}
         raise warehouse_error from None
+    # Third-party providers load exactly once, here, before any source,
+    # credential, or provider I/O; discovery failures are profile errors.
+    try:
+        discover_providers()
+    except ProviderRegistrationError as e:
+        raise ProfileError(f"Provider plugin discovery failed: {e}") from e
     llm = _absolutize_llm(selected.llm, project_dir)
     if llm is not None:
         try:
             provider = get_inference_provider(llm.provider)
+            # Validate operator-supplied provider_options against the
+            # selected provider's published model; the raw mapping stays on
+            # the resolved profile and is re-parsed at the provider boundary.
+            parse_profile_options(type(provider), llm.provider_options)
             llm = llm.model_copy(
                 update={
                     "model": resolve_provider_model(provider, llm.model),
@@ -492,6 +505,13 @@ def resolve_llm_options(
         )
         options = {}
         raise endpoint_ownership_error
+    if "provider_options" in options:
+        provider_options_ownership_error = ProfileError(
+            "llm option 'provider_options' is operator-owned configuration; "
+            "set it under `llm:` in profiles.yml, not in model extraction options"
+        )
+        options = {}
+        raise provider_options_ownership_error
     merged = dict(options)
     profile_provider = (
         resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER
@@ -524,6 +544,15 @@ def resolve_llm_options(
         raise ProfileError(str(e)) from e
     if base_url is not None:
         merged["base_url"] = base_url
+    profile_provider_options = (
+        resolved.llm.provider_options if resolved.llm is not None else {}
+    )
+    if profile_provider_options:
+        try:
+            parse_profile_options(type(provider), profile_provider_options)
+        except ProviderConfigurationError as e:
+            raise ProfileError(str(e)) from e
+        merged["provider_options"] = dict(profile_provider_options)
     if merged.get("batch") and not provider.supports_native_batch:
         raise ProfileError(
             f"Inference provider '{provider_name}' does not support native "

@@ -9,6 +9,7 @@ from .base import (
     BatchInferenceRequest,
     BatchInferenceResult,
     BatchJobStatus,
+    InferenceFailure,
     InferenceProvider,
     InferenceRequest,
     InferenceResult,
@@ -214,7 +215,10 @@ def _complete_with_sdk(
         tool_choice={"type": "tool", "name": request.output_name},
         messages=[{"role": "user", "content": request.content}],
     )
-    return _parse_response_safely(response, request)
+    try:
+        return _parse_response_safely(response, request)
+    except ProviderResponseError as error:
+        raise _with_billed_failure(error, response, request) from None
 
 
 def _batch_client(
@@ -371,18 +375,29 @@ def _normalize_batch_results(
                 )
             )
             continue
+        message = getattr(raw_result, "message", None)
         try:
-            parsed = _parse_response_safely(
-                getattr(raw_result, "message", None), item.request
-            )
+            parsed = _parse_response_safely(message, item.request)
         except ProviderError as error:
-            items.append(
-                BatchInferenceItem(
-                    request_id,
-                    error=sanitized_provider_error(
-                        "anthropic", "batch item", error
-                    ),
+            safe_error = sanitized_provider_error("anthropic", "batch item", error)
+            # A rejected-but-billed response keeps its usage on the error
+            # side so budgets and run results account for it (issue #71).
+            usage = _best_effort_usage(message)
+            if usage is not None:
+                safe_error.attach_failure(
+                    InferenceFailure(
+                        error_code="invalid_response",
+                        usage=usage,
+                        billed_requests=1,
+                        provider="anthropic",
+                        model=item.request.model,
+                        implementation_identity=(
+                            AnthropicInferenceProvider().implementation_identity()
+                        ),
+                    )
                 )
+            items.append(
+                BatchInferenceItem(request_id, error=safe_error, usage=usage)
             )
         else:
             items.append(BatchInferenceItem(request_id, result=parsed))
@@ -475,6 +490,50 @@ def _parse_response_safely(
             "anthropic returned a malformed inference response",
             safe_for_display=True,
         ) from None
+
+
+def _best_effort_usage(response: Any) -> ProviderUsage | None:
+    """Usage reported alongside a rejected response, for billed-failure
+    accounting only; None when the response carries no valid usage."""
+    raw_usage = getattr(response, "usage", None)
+    if raw_usage is None:
+        return None
+    try:
+        return ProviderUsage(
+            input_tokens=_usage_value(raw_usage, "input_tokens", required=True),
+            output_tokens=_usage_value(raw_usage, "output_tokens", required=True),
+            cache_read_input_tokens=_usage_value(
+                raw_usage, "cache_read_input_tokens"
+            ),
+            cache_creation_input_tokens=_usage_value(
+                raw_usage, "cache_creation_input_tokens"
+            ),
+        )
+    except (ProviderResponseError, ValueError):
+        return None
+
+
+def _with_billed_failure(
+    error: ProviderResponseError,
+    response: Any,
+    request: InferenceRequest,
+) -> ProviderResponseError:
+    """Attach billed usage to a rejected-response error (issue #71)."""
+    usage = _best_effort_usage(response)
+    if usage is None:
+        return error
+    return error.attach_failure(
+        InferenceFailure(
+            error_code="invalid_response",
+            usage=usage,
+            billed_requests=1,
+            provider="anthropic",
+            model=request.model,
+            implementation_identity=(
+                AnthropicInferenceProvider().implementation_identity()
+            ),
+        )
+    )
 
 
 def _usage_value(usage: Any, name: str, *, required: bool = False) -> int:

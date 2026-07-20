@@ -17,6 +17,7 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 
+from ..agent_context import AgentContextGrain
 from ..credentials import CredentialReference, CredentialReferenceError
 from .identifiers import validate_node_name
 from .yaml_diagnostics import ConfigPath, YamlProvenance
@@ -183,6 +184,13 @@ class TransformConfig(BaseModel):
     module: str | None = None
     uses_llm: bool = False
     options: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentContextConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    contract: Literal["agent_context/v1"] = "agent_context/v1"
+    grain: AgentContextGrain
 
 
 class ChunkConfig(BaseModel):
@@ -505,6 +513,7 @@ class ModelConfig(BaseModel):
     chunk: ChunkConfig | None = None
     embed: EmbedConfig | None = None
     search: SearchConfig | None = None
+    agent_context: AgentContextConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
     on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
@@ -583,6 +592,16 @@ class ModelConfig(BaseModel):
         if self.search is not None and "materialization" not in self.model_fields_set:
             raise ValueError(
                 f"Search resource '{self.name}' must explicitly declare materialization"
+            )
+        if self.agent_context is not None and self.search is not None:
+            raise ValueError(
+                f"Search resource '{self.name}' cannot declare agent_context; "
+                "declare it on the upstream warehouse model"
+            )
+        if self.agent_context is not None and self.transform is None:
+            raise ValueError(
+                f"Model '{self.name}' can declare agent_context only on a "
+                "warehouse transform model"
             )
         return self
 

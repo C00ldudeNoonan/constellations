@@ -8,6 +8,7 @@ from typing import Any
 from .backends import get_backend, validate_backend_options
 from .backends.options import LLMBackendOptions
 from .config.model import (
+    AgentContextConfig,
     ChunkConfig,
     EmbedConfig,
     ExtractionConfig,
@@ -76,6 +77,7 @@ def compute_code_version(
     effective_extraction: Mapping[str, Any] | None = None,
     effective_transform: Mapping[str, Any] | None = None,
     project_dir: Path,
+    agent_context: AgentContextConfig | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         # flush_every shapes execution (memory/flush cadence), never output
@@ -113,6 +115,9 @@ def compute_code_version(
             else None
         ),
         "search": search.model_dump(mode="python") if search else None,
+        "agent_context": (
+            agent_context.model_dump(mode="json") if agent_context else None
+        ),
         "depends_on": depends_on or None,
         "fields": [
             {"name": field.name, "data_type": field.data_type} for field in fields
@@ -182,6 +187,7 @@ def compute_model_code_version(
         chunk=model.chunk,
         embed=model.embed,
         search=model.search,
+        agent_context=model.agent_context,
         depends_on=(
             [parse_ref(dependency) for dependency in model.depends_on]
             if (

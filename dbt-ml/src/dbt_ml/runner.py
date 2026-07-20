@@ -29,6 +29,11 @@ from .adapters import (
     WarehouseAdapter,
     create_adapter,
 )
+from .agent_context import (
+    AgentContextValidationError,
+    empty_agent_context_frame,
+    validate_agent_context_frame,
+)
 from .backends import (
     BackendOptionsError,
     BaseBackend,
@@ -130,6 +135,20 @@ _CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
 
 class RunError(Exception):
     pass
+
+
+def _validate_agent_context_output(
+    frame: pl.DataFrame, model: ModelConfig
+) -> pl.DataFrame:
+    if model.agent_context is None:
+        return frame
+    if frame.is_empty() and not frame.columns:
+        frame = empty_agent_context_frame(model.agent_context.grain)
+    try:
+        validate_agent_context_frame(frame, model.agent_context.grain)
+    except AgentContextValidationError as error:
+        raise RunError(f"Model '{model.name}' produced invalid {error}") from error
+    return frame
 
 
 def _artifact_error_text(error: Exception) -> str:
@@ -1272,7 +1291,9 @@ def _run_transform_model(
         )
 
     adapter.materialize_full(
-        model.name, output, options=_warehouse_options(adapter, model)
+        model.name,
+        _validate_agent_context_output(output, model),
+        options=_warehouse_options(adapter, model),
     )
 
     return ModelRunResult(

@@ -1291,3 +1291,8 @@ with generation-fenced readiness, publish/query leases, explicit recovery, and
 governed policy-prefilter queries (issue #152) inside their documented
 single-host boundary; bounded state paging (#153) and distributed-store
 fencing (#136) remain roadmap work and fail closed.
+
+The versioned [agent context contract](docs/architecture/agent-context-v1.md)
+defines the document registry, chunk, and dbt-entity link grains used to carry
+bitemporal validity, policy, freshness, provenance, and exact citations from
+warehouse models into governed retrieval projections.

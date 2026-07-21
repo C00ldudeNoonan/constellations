@@ -695,6 +695,11 @@ class BigQueryAdapter(WarehouseAdapter):
     def capabilities(cls) -> frozenset[WarehouseCapability]:
         return frozenset(
             {
+                # Full replacement is one atomic truncating load or CREATE OR
+                # REPLACE whenever the target's partitioning spec is unchanged;
+                # only a partitioning-spec migration (which BigQuery cannot
+                # replace atomically) falls back to a staged drop-and-rename.
+                WarehouseCapability.ATOMIC_FULL_REPLACE,
                 WarehouseCapability.ATOMIC_KEYED_UPSERT,
                 WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
@@ -1494,13 +1499,29 @@ class BigQueryAdapter(WarehouseAdapter):
         # clustering spec, and dropping the target up front would make a bad
         # layout declaration destructive. Build the replacement in a staging
         # table — the load validates partition/cluster columns against the
-        # data — then swap. The target only drops after the replacement is
-        # fully created and configured.
+        # data — then swap.
         self._apply_layout_to_load(job_config, options)
         staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
         target_dropped = False
         try:
             self._load_parquet(staging, df, job_config)
+            if self._partition_spec_matches(table, layout):
+                # One CREATE OR REPLACE swaps the replacement in atomically;
+                # BigQuery permits it whenever the partitioning spec is
+                # unchanged (clustering and table options may differ), and a
+                # failed statement leaves the target untouched.
+                self._run_query(
+                    f"CREATE OR REPLACE TABLE {self.table_ref(table)}"
+                    f"{self._ddl_layout_clauses(options)} "
+                    f"AS SELECT * FROM {self.table_ref(staging)}",
+                    job_labels=layout.labels or None,
+                )
+                self.drop_table(staging)
+                return df.height
+            # A partitioning-spec migration cannot replace atomically:
+            # configure the replacement, then drop and rename. The target
+            # only drops after the replacement is fully created and
+            # configured, so a bad layout never destroys the last good table.
             self._apply_post_create_options(staging, options)
             self.drop_table(table)
             target_dropped = True
@@ -1518,6 +1539,40 @@ class BigQueryAdapter(WarehouseAdapter):
                     error.add_note(f"Failed to clean staging table: {cleanup_error}")
             raise
         return df.height
+
+    def _partition_spec_matches(
+        self, table: str, layout: BigQueryWarehouseOptions | None
+    ) -> bool:
+        """Whether `table`'s partitioning spec already matches the declared
+        layout (a missing target trivially matches), making CREATE OR REPLACE
+        a valid — and atomic — full replacement. BigQuery rejects replacing a
+        table under a different partitioning spec; clustering and table
+        options are free to change."""
+        try:
+            existing = self.client.get_table(self._table_id(table))
+        except _not_found_error():
+            return True
+        time_part = getattr(existing, "time_partitioning", None)
+        range_part = getattr(existing, "range_partitioning", None)
+        pb = layout.partition_by if layout is not None else None
+        if pb is None:
+            return time_part is None and range_part is None
+        if pb.data_type == "int64":
+            assert pb.range is not None
+            if range_part is None:
+                return False
+            existing_range = range_part.range_
+            return bool(
+                range_part.field == pb.field
+                and existing_range.start == pb.range.start
+                and existing_range.end == pb.range.end
+                and existing_range.interval == pb.range.interval
+            )
+        return bool(
+            time_part is not None
+            and time_part.type_ == pb.granularity.upper()
+            and getattr(time_part, "field", None) == pb.field
+        )
 
     def _rename_table(
         self, current: str, new_name: str, *, job_labels: dict[str, str] | None = None
@@ -1677,12 +1732,24 @@ class BigQueryAdapter(WarehouseAdapter):
             if first:
                 return self.materialize_full(table, pl.DataFrame())
             layout_clauses = self._ddl_layout_clauses(options)
-            if layout_clauses:
-                # CREATE OR REPLACE cannot change an existing table's
-                # partitioning spec, and dropping the target before the CTAS
-                # is validated would make a bad layout declaration
-                # destructive. Materialize the replacement (validating the
-                # declared layout against real columns), then swap.
+            if not layout_clauses or self._partition_spec_matches(table, layout):
+                # One CREATE OR REPLACE swaps the staged rows in atomically;
+                # BigQuery permits it whenever the partitioning spec is
+                # unchanged (clustering and table options may differ). The
+                # statement validates the declared layout against real columns
+                # and leaves the target untouched if it fails.
+                self._run_query(
+                    f"CREATE OR REPLACE TABLE {self.table_ref(table)}"
+                    f"{layout_clauses} "
+                    f"AS SELECT * FROM {self.table_ref(staging)}",
+                    job_labels=job_labels,
+                )
+            else:
+                # A partitioning-spec migration cannot replace atomically:
+                # materialize the replacement (validating the declared layout
+                # against real columns), then drop and rename. The target only
+                # drops after the replacement fully exists, so a bad layout
+                # never destroys the last good table.
                 replacement = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
                 self._run_query(
                     f"CREATE TABLE {self.table_ref(replacement)}{layout_clauses} "
@@ -1692,12 +1759,6 @@ class BigQueryAdapter(WarehouseAdapter):
                 self.drop_table(table)
                 target_dropped = True
                 self._rename_table(replacement, table, job_labels=job_labels)
-            else:
-                self._run_query(
-                    f"CREATE OR REPLACE TABLE {self.table_ref(table)} "
-                    f"AS SELECT * FROM {self.table_ref(staging)}",
-                    job_labels=job_labels,
-                )
         except BaseException as error:
             if target_dropped:
                 error.add_note(

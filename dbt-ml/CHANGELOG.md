@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Atomic full replacement on BigQuery (issue #171)
+
+- Fixes a v0.2.9 regression: the BigQuery adapter now declares the
+  `atomic_full_replace` capability, so full-materialization models (transforms,
+  classic ML, extraction) pass the capability preflight instead of being
+  rejected as non-atomic. Under the v0.2.9 capability contract (#130), every
+  full-materialization model on BigQuery failed to compile.
+- `materialize_full` and `materialize_full_chunks` now swap replacements in with
+  a single `CREATE OR REPLACE TABLE ... AS SELECT`, which BigQuery executes
+  atomically and leaves the target untouched on failure. A staged
+  drop-and-rename is used only when the declared layout changes an existing
+  table's partitioning spec — the one case BigQuery cannot replace atomically —
+  so a bad layout still never destroys the last good table.
+
 ## v0.2.9 - 2026-07-20
 
 ### Incremental LanceDB search indexes (issue #134)

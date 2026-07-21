@@ -131,9 +131,24 @@ def test_capability_preflight_rejects_search_without_paged_state(
         validate_warehouse_capabilities([model], "eager_only")
 
 
-def test_bigquery_full_preflight_rejects_non_atomic_replacement() -> None:
+def test_bigquery_full_preflight_accepts_atomic_replacement() -> None:
+    # BigQuery declares atomic_full_replace (CREATE OR REPLACE), so a
+    # full-materialization model passes preflight without monkeypatching.
+    validate_warehouse_capabilities([_extraction("raw")], "bigquery")
+
+
+def test_full_preflight_rejects_missing_atomic_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ATOMIC_FULL_REPLACE,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
     with pytest.raises(ConfigError, match=r"atomic_full_replace.*full materialization"):
-        validate_warehouse_capabilities([_extraction("raw")], "bigquery")
+        validate_warehouse_capabilities([_extraction("raw")], "no_full_replace")
 
 
 @pytest.mark.parametrize("command", ["compile", "run", "build", "test"])

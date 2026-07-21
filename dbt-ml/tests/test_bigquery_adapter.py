@@ -51,7 +51,7 @@ def test_bigquery_declares_only_implemented_guarantees() -> None:
     assert WarehouseCapability.SQL_SCHEMA_TESTS in capabilities
     assert WarehouseCapability.STREAMING_TABULAR_READS in capabilities
     assert WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN in capabilities
-    assert WarehouseCapability.ATOMIC_FULL_REPLACE not in capabilities
+    assert WarehouseCapability.ATOMIC_FULL_REPLACE in capabilities
     assert WarehouseCapability.ATOMIC_KEYED_UPSERT in capabilities
     assert WarehouseCapability.TRANSACTIONS not in capabilities
 
@@ -216,6 +216,7 @@ class _FakeClient:
         self.query_kwargs: list[dict[str, Any]] = []
         self.loads: list[tuple[bytes, str, Any]] = []
         self.tables: dict[str, list[Any]] = {}
+        self.table_meta: dict[str, dict[str, Any]] = {}
         self.listing: list[str] = []
         self.dropped: list[str] = []
         self.query_results: list[_FakeJob] = []
@@ -242,7 +243,7 @@ class _FakeClient:
             else SimpleNamespace(name=field, field_type="STRING", mode="NULLABLE")
             for field in self.tables[table_id]
         ]
-        return SimpleNamespace(schema=schema)
+        return SimpleNamespace(schema=schema, **self.table_meta.get(table_id, {}))
 
     def list_tables(self, dataset_id: str) -> list[Any]:
         return [SimpleNamespace(table_id=n) for n in self.listing]
@@ -804,7 +805,7 @@ def test_partition_expression_ddl_forms() -> None:
     )
 
 
-def test_materialize_full_applies_layout_and_recreates() -> None:
+def test_materialize_full_applies_layout_and_replaces_atomically() -> None:
     from google.cloud import bigquery
 
     client = _FakeClient()
@@ -818,17 +819,54 @@ def test_materialize_full_applies_layout_and_recreates() -> None:
     df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
     adapter.materialize_full("docs", df, options=opts)
 
-    # Replacement is staged with the layout (validating it), THEN the target
-    # drops and the staging table renames in — a bad layout never destroys
-    # the last good table.
+    # Replacement is staged with the layout (validating it), then one
+    # CREATE OR REPLACE swaps it in atomically — the target never disappears.
     _, staging_id, job_config = client.loads[0]
     assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
     assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
     assert job_config.time_partitioning.type_ == "DAY"
     assert job_config.time_partitioning.field == "filing_date"
     assert job_config.clustering_fields == ["cik"]
+    swap_sql = client.queries[-1][0]
+    staging_table = staging_id.removeprefix("proj.ds.")
+    assert swap_sql == (
+        "CREATE OR REPLACE TABLE `proj`.`ds`.`docs` "
+        "PARTITION BY `filing_date` CLUSTER BY `cik` "
+        f"AS SELECT * FROM `proj`.`ds`.`{staging_table}`"
+    )
+    assert client.dropped == [staging_id]  # only staging cleans up
+
+
+def test_materialize_full_matching_partition_spec_replaces_atomically() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    client.table_meta["proj.ds.docs"] = {
+        "time_partitioning": SimpleNamespace(type_="DAY", field="filing_date")
+    }
+    adapter = _adapter(client)
+    opts = _parse_options({"partition_by": {"field": "filing_date"}})
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_full("docs", df, options=opts)
+
+    swap_sql = client.queries[-1][0]
+    assert swap_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`docs` ")
+    assert "proj.ds.docs" not in client.dropped
+
+
+def test_materialize_full_partition_migration_falls_back_to_staged_swap() -> None:
+    client = _FakeClient()
+    # existing target is unpartitioned; the declared layout partitions it
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    adapter = _adapter(client)
+    opts = _parse_options({"partition_by": {"field": "filing_date"}})
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_full("docs", df, options=opts)
+
+    # BigQuery cannot replace a table under a different partitioning spec:
+    # the configured replacement renames in after the target drops.
     assert client.dropped == ["proj.ds.docs"]
     rename_sql = client.queries[-1][0]
+    _, staging_id, _ = client.loads[0]
     staging_table = staging_id.removeprefix("proj.ds.")
     assert rename_sql == (
         f"ALTER TABLE `proj`.`ds`.`{staging_table}` RENAME TO `docs`"
@@ -912,12 +950,30 @@ def test_full_chunks_ctas_carries_partition_and_cluster_clauses() -> None:
     )
     assert total == 1
     create_sql = client.queries[0][0]
-    # the replacement is created (validating the layout) before any drop
-    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
+    # the layout validates inside the atomic CREATE OR REPLACE — no staged swap
+    assert create_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`docs` ")
     assert (
         "PARTITION BY DATE_TRUNC(`filing_date`, MONTH) "
         "CLUSTER BY `cik`, `form_type` AS SELECT" in create_sql
     )
+    assert len(client.queries) == 1
+    assert all(d.startswith("proj.ds.dbt_ml_staging__docs__") for d in client.dropped)
+
+
+def test_full_chunks_partition_migration_falls_back_to_staged_swap() -> None:
+    client = _FakeClient()
+    # existing target is unpartitioned; the declared layout partitions it
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    adapter = _adapter(client)
+    opts = _parse_options({"partition_by": {"field": "filing_date"}})
+    adapter.materialize_full_chunks(
+        "docs",
+        iter([pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})]),
+        options=opts,
+    )
+    create_sql = client.queries[0][0]
+    # the replacement is created (validating the layout) before any drop
+    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
     assert client.dropped[0] == "proj.ds.docs"
     assert "RENAME TO `docs`" in client.queries[1][0]
 
@@ -932,9 +988,10 @@ def test_full_chunks_bad_layout_keeps_target() -> None:
             "docs", iter([pl.DataFrame({"document_id": ["a"]})]), options=opts
         )
     assert "proj.ds.docs" not in client.dropped  # last good table survives
-    # both staging tables are cleaned up
+    # the staging table is cleaned up; the failed CREATE OR REPLACE never
+    # touched the target
     assert all(d.startswith("proj.ds.dbt_ml_staging__docs__") for d in client.dropped)
-    assert len(client.dropped) == 2
+    assert len(client.dropped) == 1
 
 
 def test_table_options_require_partitioning_where_relevant() -> None:
@@ -974,19 +1031,46 @@ def test_materialize_full_applies_table_options_and_kms() -> None:
     )
     assert job_config.labels == {"team": "econ", "env": "prod"}
 
-    alter_sql, alter_config = client.queries[0]
+    swap_sql, swap_config = client.queries[0]
+    # every table option — kms included — rides the atomic CREATE OR REPLACE
+    assert swap_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`docs` ")
+    assert " OPTIONS (" in swap_sql
+    assert "require_partition_filter = TRUE" in swap_sql
+    assert "partition_expiration_days = 90" in swap_sql
+    assert (
+        "expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+        "INTERVAL 48 HOUR)" in swap_sql
+    )
+    assert "labels = [('env', 'prod'), ('team', 'econ')]" in swap_sql
+    assert (
+        "kms_key_name = 'projects/p/locations/us/keyRings/r/cryptoKeys/k'"
+        in swap_sql
+    )
+    assert swap_config.labels == {"team": "econ", "env": "prod"}
+
+
+def test_partition_migration_configures_staging_before_swap() -> None:
+    client = _FakeClient()
+    # existing target is unpartitioned; the declared layout partitions it
+    client.tables["proj.ds.docs"] = ["document_id", "filing_date"]
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            "partition_by": {"field": "filing_date"},
+            "require_partition_filter": True,
+            "kms_key_name": "projects/p/locations/us/keyRings/r/cryptoKeys/k",
+        }
+    )
+    df = pl.DataFrame({"document_id": ["a"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_full("docs", df, options=opts)
+
+    alter_sql, _ = client.queries[0]
     # options are configured on the staging replacement before the swap
     assert alter_sql.startswith("ALTER TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
     assert " SET OPTIONS (" in alter_sql
     assert "require_partition_filter = TRUE" in alter_sql
-    assert "partition_expiration_days = 90" in alter_sql
-    assert (
-        "expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
-        "INTERVAL 48 HOUR)" in alter_sql
-    )
-    assert "labels = [('env', 'prod'), ('team', 'econ')]" in alter_sql
     assert "kms_key_name" not in alter_sql  # set at create, never re-keyed
-    assert alter_config.labels == {"team": "econ", "env": "prod"}
+    assert client.dropped == ["proj.ds.docs"]
 
 
 def test_incremental_create_applies_post_create_options() -> None:

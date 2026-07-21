@@ -27,12 +27,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from ..adapters.base import SERVING_LEDGER_TABLE
 from .base import RetrievalError
 
 if TYPE_CHECKING:
     from ..adapters.base import StateScope, WarehouseAdapter
 
-LEDGER_TABLE = "dbt_ml_serving_ledger"
+# Fenced state replacement (WarehouseAdapter.replace_state_scope) verifies
+# claims against this same ledger, so the name is owned by adapters.base.
+LEDGER_TABLE = SERVING_LEDGER_TABLE
 LEASE_TABLE = "dbt_ml_serving_leases"
 
 STATUS_PUBLISHING = "publishing"

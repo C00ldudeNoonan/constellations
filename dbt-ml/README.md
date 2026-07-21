@@ -762,6 +762,21 @@ forces publication without persisting the descriptor itself. Target rows and
 their scoped state are deleted together, and new state is recorded only after
 the corresponding materialization succeeds.
 
+Search publication reconciles its state scope in bounded memory (issue #153),
+complementing the bounded upstream reads above: these are two separate memory
+ceilings. Each upstream batch is classified new/changed/unchanged through
+bounded state key lookups, state advances per batch only behind exact durable
+store receipts, and stale IDs stream back in strict record-key order through
+snapshot-consistent state pages filtered to keys absent upstream — so delete
+discovery is complete even for an empty upstream, and publication memory does
+not grow with total state size. DuckDB pins pages to one MVCC read
+transaction; BigQuery pins them to one `FOR SYSTEM_TIME AS OF` timestamp.
+Adapters advertise `paged_state_reconciliation` for this contract and
+`atomic_state_scope_replace` for fenced, atomic replacement of a scope's
+complete state snapshot; the eager `fetch_state()` remains for
+materialization-scale callers. Warehouses without these capabilities are
+rejected at compile preflight for search resources.
+
 Existing state upgrades automatically on the first adapter connection. The
 legacy `(model_name, document_id)` rows are preserved under the
 `materialization` / `warehouse-v1` scope. DuckDB migrates in one transaction;
@@ -1287,10 +1302,11 @@ The accepted [semantic retrieval architecture](docs/architecture/semantic-retrie
 defines the `search:` DAG resource, `RetrievalStore` boundary, typed filters,
 incremental publication state, and serving-resource artifacts. The local
 LanceDB publication and portable Python/`dbt-ml search` query surfaces ship
-with generation-fenced readiness, publish/query leases, explicit recovery, and
-governed policy-prefilter queries (issue #152) inside their documented
-single-host boundary; bounded state paging (#153) and distributed-store
-fencing (#136) remain roadmap work and fail closed.
+with generation-fenced readiness, publish/query leases, explicit recovery,
+governed policy-prefilter queries (issue #152), and bounded paged
+publication-state reconciliation (issue #153) inside their documented
+single-host boundary; distributed-store fencing (#136) remains roadmap work
+and fails closed.
 
 The versioned [agent context contract](docs/architecture/agent-context-v1.md)
 defines the document registry, chunk, and dbt-entity link grains used to carry

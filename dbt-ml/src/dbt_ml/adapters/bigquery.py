@@ -48,16 +48,25 @@ from ..credentials import (
 )
 from ..hashing import canonical_fingerprint
 from .base import (
+    SERVING_LEDGER_TABLE,
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
+    StaleStateFenceError,
+    StatePage,
+    StatePageReader,
+    StatePageRecord,
+    StatePageRequest,
     StateRecord,
     StateScope,
+    StateScopeFence,
     StateValue,
     TableReadRequest,
     TableReadSnapshot,
     WarehouseAdapter,
     WarehouseCapability,
+    decode_state_cursor,
+    encode_state_cursor,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
@@ -687,7 +696,9 @@ class BigQueryAdapter(WarehouseAdapter):
         return frozenset(
             {
                 WarehouseCapability.ATOMIC_KEYED_UPSERT,
+                WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
+                WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
                 WarehouseCapability.SQL_SCHEMA_TESTS,
@@ -1898,3 +1909,258 @@ class BigQueryAdapter(WarehouseAdapter):
                 list(record_keys),
             ],
         )
+
+    # ─── paged state reconciliation (issue #153) ─────────────────────────
+
+    def _fetch_state_subset(
+        self, scope: StateScope, record_keys: Sequence[str]
+    ) -> dict[str, StateValue]:
+        result = self.rows(
+            f"SELECT record_key, input_fingerprint, code_version FROM {self._state_ref} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+            "AND record_key IN UNNEST(?)",
+            [
+                scope.model_name,
+                scope.stage,
+                scope.target_identity,
+                list(record_keys),
+            ],
+        )
+        state: dict[str, StateValue] = {}
+        for row in result:
+            record_key = str(row[0])
+            if record_key in state:
+                raise AdapterError(
+                    "BigQuery state contains duplicate record keys in the requested "
+                    "scope; repair the state table before retrying."
+                )
+            state[record_key] = StateValue(str(row[1]), str(row[2]))
+        return state
+
+    def _open_state_page_reader(self, request: StatePageRequest) -> StatePageReader:
+        # BigQuery has no cross-statement transactions here; pinning every
+        # page (and the absence probe) to one server-side timestamp via
+        # `FOR SYSTEM_TIME AS OF` gives the same immutable-snapshot guarantee:
+        # interleaved mutations, including the caller's own state deletions,
+        # cannot skip or repeat records between pages.
+        snapshot_at = self.scalar("SELECT CURRENT_TIMESTAMP()")
+        if not isinstance(snapshot_at, datetime):
+            raise AdapterError(
+                "BigQuery did not return a snapshot timestamp for state paging"
+            )
+        absence_sql = ""
+        probe = request.absent_from
+        if probe is not None:
+            try:
+                probe_table = self.client.get_table(self._table_id(probe.table))
+            except Exception:
+                raise AdapterError(
+                    "State absence probe relation "
+                    f"'{probe.table}.{probe.key_column}' is unavailable"
+                ) from None
+            if probe.key_column not in {field.name for field in probe_table.schema}:
+                raise AdapterError(
+                    "State absence probe relation "
+                    f"'{probe.table}.{probe.key_column}' is unavailable"
+                )
+            absence_sql = (
+                " AND NOT EXISTS (SELECT 1 FROM "
+                f"{self.table_ref(probe.table)} FOR SYSTEM_TIME AS OF ? AS probe "
+                f"WHERE probe.{self.quote_ident(probe.key_column)} = "
+                "state.record_key)"
+            )
+        nonce = uuid4().hex
+        scope = request.scope
+
+        def fetch(cursor_value: str | None) -> StatePage:
+            last_key = decode_state_cursor(cursor_value, nonce)
+            key_sql = " AND state.record_key > ?" if last_key is not None else ""
+            params: list[Any] = [
+                snapshot_at,
+                scope.model_name,
+                scope.stage,
+                scope.target_identity,
+            ]
+            if last_key is not None:
+                params.append(last_key)
+            if probe is not None:
+                params.append(snapshot_at)
+            try:
+                rows = self.rows(
+                    "SELECT state.record_key, state.input_fingerprint, "
+                    "state.code_version, state.last_run_at "
+                    f"FROM {self._state_ref} FOR SYSTEM_TIME AS OF ? AS state "
+                    "WHERE state.model_name = ? AND state.state_scope = ? "
+                    f"AND state.target_identity = ?{key_sql}{absence_sql} "
+                    "ORDER BY state.record_key LIMIT ?",
+                    [*params, request.page_size],
+                )
+            except AdapterError:
+                raise
+            except Exception:
+                raise AdapterError("BigQuery state page read failed") from None
+            records = tuple(
+                StatePageRecord(
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    row[3] if isinstance(row[3], datetime) else None,
+                )
+                for row in rows
+            )
+            next_cursor = (
+                encode_state_cursor(nonce, records[-1].record_key)
+                if len(records) == request.page_size
+                else None
+            )
+            return StatePage(records=records, next_cursor=next_cursor)
+
+        return StatePageReader(
+            page_size=request.page_size, fetch=fetch, close=lambda: None
+        )
+
+    def _replace_state_scope(
+        self,
+        scope: StateScope,
+        record_batches: Iterator[Sequence[StateRecord]],
+        fence: StateScopeFence | None,
+    ) -> int:
+        bigquery = _bigquery()
+        staging = f"dbt_ml_staging__state_replace__{uuid4().hex[:12]}"
+        append_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        total = 0
+        try:
+            for batch in record_batches:
+                df = pl.DataFrame(
+                    {
+                        "record_key": [r.record_key for r in batch],
+                        "input_fingerprint": [r.input_fingerprint for r in batch],
+                        "code_version": [r.code_version for r in batch],
+                    },
+                    schema={
+                        "record_key": pl.String,
+                        "input_fingerprint": pl.String,
+                        "code_version": pl.String,
+                    },
+                )
+                self._load_parquet(staging, df, append_config)
+                total += len(batch)
+            if total == 0:
+                self._run_query(
+                    f"CREATE TABLE {self.table_ref(staging)} (record_key STRING, "
+                    "input_fingerprint STRING, code_version STRING)"
+                )
+            self._run_state_replace_merge(scope, staging, fence)
+        finally:
+            self.client.delete_table(self._table_id(staging), not_found_ok=True)
+        return total
+
+    def _run_state_replace_merge(
+        self, scope: StateScope, staging: str, fence: StateScopeFence | None
+    ) -> None:
+        """One fence-gated MERGE makes the staged snapshot the scope's state.
+
+        BigQuery DML is atomic per statement but merge search conditions
+        cannot hold subqueries, so the fence ride along in the source query:
+        every source row's join key evaluates a gate that ERROR()s the whole
+        statement on a stale fence or duplicated staging keys. A sentinel
+        source row keeps the gate evaluated even when staging is empty, so a
+        pure delete-all replacement is fenced too."""
+        staging_ref = self.table_ref(staging)
+        params: list[Any] = []
+        if fence is None:
+            fence_check = "TRUE"
+        else:
+            fence_check = (
+                "(SELECT COUNT(*) FROM "
+                f"{self.table_ref(SERVING_LEDGER_TABLE)} "
+                "WHERE model_name = ? AND stage = ? AND target_identity = ? "
+                "AND publication_id = ? AND fencing_token = ?) = 1"
+            )
+            params.extend(
+                [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                    fence.publication_id,
+                    fence.fencing_token,
+                ]
+            )
+        params.extend([scope.model_name, scope.stage, scope.target_identity])
+        params.extend([scope.model_name, scope.stage, scope.target_identity])
+        params.extend([scope.model_name, scope.stage, scope.target_identity])
+        sql = f"""
+            MERGE {self._state_ref} AS target
+            USING (
+                SELECT
+                    IF(gate.ok, source_rows.record_key, NULL) AS record_key,
+                    source_rows.input_fingerprint,
+                    source_rows.code_version,
+                    source_rows.is_sentinel
+                FROM (
+                    SELECT record_key, input_fingerprint, code_version,
+                        0 AS is_sentinel
+                    FROM {staging_ref}
+                    UNION ALL
+                    SELECT CAST(NULL AS STRING), CAST(NULL AS STRING),
+                        CAST(NULL AS STRING), 1
+                ) AS source_rows
+                CROSS JOIN (
+                    SELECT IF(
+                        {fence_check},
+                        TRUE,
+                        ERROR('dbt-ml-stale-state-fence: publication reassigned')
+                    ) AND IF(
+                        (SELECT COUNT(*) - COUNT(DISTINCT record_key)
+                         FROM {staging_ref}) = 0,
+                        TRUE,
+                        ERROR('dbt-ml-state-replace-invalid: duplicate keys')
+                    ) AS ok
+                ) AS gate
+            ) AS source
+            ON target.model_name = ? AND target.state_scope = ?
+                AND target.target_identity = ?
+                AND target.record_key = source.record_key
+                AND source.is_sentinel = 0
+            WHEN MATCHED THEN UPDATE SET
+                input_fingerprint = source.input_fingerprint,
+                code_version = source.code_version,
+                last_run_at = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED AND source.is_sentinel = 0 THEN INSERT
+                (model_name, state_scope, target_identity, record_key,
+                 input_fingerprint, code_version, last_run_at)
+                VALUES (?, ?, ?, source.record_key, source.input_fingerprint,
+                        source.code_version, CURRENT_TIMESTAMP())
+            WHEN NOT MATCHED BY SOURCE
+                AND target.model_name = ?
+                AND target.state_scope = ?
+                AND target.target_identity = ?
+            THEN DELETE
+            """
+        try:
+            self._run_query(sql, params)
+        except Exception as error:
+            message = str(error)
+            if "dbt-ml-stale-state-fence" in message:
+                raise StaleStateFenceError(
+                    "Serving publication authority was reassigned; state scope "
+                    "replacement aborted without mutation"
+                ) from None
+            if "dbt-ml-state-replace-invalid" in message:
+                raise AdapterError(
+                    "State scope replacement contains duplicate record keys "
+                    "across batches"
+                ) from None
+            if (
+                fence is not None
+                and SERVING_LEDGER_TABLE in message
+                and "Not found" in message
+            ):
+                raise StaleStateFenceError(
+                    "Fenced state replacement requires a serving ledger, and "
+                    "this dataset has none"
+                ) from None
+            raise

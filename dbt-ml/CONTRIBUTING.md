@@ -92,6 +92,15 @@ only after contract tests cover empty schemas, multi-batch reads, early close,
 mid-stream failure, and source-generation changes; never derive an adapter's
 capabilities from every enum member.
 
+Publication-state consumers that can scale with scope size must use the
+bounded reconciliation contract (`fetch_state_subset()`, `state_page_reader()`,
+`replace_state_scope()`) rather than `fetch_state()`. Keep key ordering,
+snapshot consistency across pages, opaque cursor validation, and fence
+verification inside the adapter, and advertise
+`paged_state_reconciliation` / `atomic_state_scope_replace` only after
+contract tests cover multi-page domains, empty scopes, cursor misuse,
+interleaved deletions, and fenced-replacement rollback.
+
 ## Commit style
 
 Conventional commits not required, but tight subject lines please:

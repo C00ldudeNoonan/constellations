@@ -15,16 +15,25 @@ from pydantic import BaseModel
 from ..config.profile import WarehouseConfig
 from ..hashing import canonical_fingerprint
 from .base import (
+    SERVING_LEDGER_TABLE,
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
+    StaleStateFenceError,
+    StatePage,
+    StatePageReader,
+    StatePageRecord,
+    StatePageRequest,
     StateRecord,
     StateScope,
+    StateScopeFence,
     StateValue,
     TableReadRequest,
     TableReadSnapshot,
     WarehouseAdapter,
     WarehouseCapability,
+    decode_state_cursor,
+    encode_state_cursor,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
@@ -166,7 +175,9 @@ class DuckDBAdapter(WarehouseAdapter):
             {
                 WarehouseCapability.ATOMIC_FULL_REPLACE,
                 WarehouseCapability.ATOMIC_KEYED_UPSERT,
+                WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
+                WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
                 WarehouseCapability.SQL_SCHEMA_TESTS,
@@ -888,6 +899,156 @@ class DuckDBAdapter(WarehouseAdapter):
             f"AND record_key IN ({placeholders})",
             [scope.model_name, scope.stage, scope.target_identity, *record_keys],
         )
+
+    # ─── paged state reconciliation (issue #153) ─────────────────────────
+
+    def _fetch_state_subset(
+        self, scope: StateScope, record_keys: Sequence[str]
+    ) -> dict[str, StateValue]:
+        placeholders = ", ".join("?" for _ in record_keys)
+        rows = self.connection.execute(
+            f"SELECT record_key, input_fingerprint, code_version "
+            f"FROM {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} "
+            "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+            f"AND record_key IN ({placeholders})",
+            [scope.model_name, scope.stage, scope.target_identity, *record_keys],
+        ).fetchall()
+        return {str(r[0]): StateValue(str(r[1]), str(r[2])) for r in rows}
+
+    def _open_state_page_reader(self, request: StatePageRequest) -> StatePageReader:
+        # A dedicated cursor holds one read transaction open for the reader's
+        # lifetime, so every page observes the same MVCC snapshot even while
+        # the main connection mutates state between pages.
+        cursor_conn = self.connection.cursor()
+        transaction_open = False
+        try:
+            cursor_conn.execute("BEGIN TRANSACTION")
+            transaction_open = True
+            state_ref = f"{self.schema_ref}.{self.quote_ident(_STATE_TABLE)}"
+            absence_sql = ""
+            if request.absent_from is not None:
+                probe_ref = self.table_ref(request.absent_from.table)
+                probe_key = self.quote_ident(request.absent_from.key_column)
+                try:
+                    cursor_conn.execute(f"SELECT {probe_key} FROM {probe_ref} LIMIT 0")
+                except duckdb.Error:
+                    raise AdapterError(
+                        "State absence probe relation "
+                        f"'{request.absent_from.table}."
+                        f"{request.absent_from.key_column}' is unavailable"
+                    ) from None
+                absence_sql = (
+                    f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
+                    f"WHERE probe.{probe_key} = state.record_key)"
+                )
+            nonce = uuid4().hex
+            scope = request.scope
+
+            def fetch(cursor_value: str | None) -> StatePage:
+                last_key = decode_state_cursor(cursor_value, nonce)
+                key_sql = " AND state.record_key > ?" if last_key is not None else ""
+                params: list[Any] = [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                ]
+                if last_key is not None:
+                    params.append(last_key)
+                try:
+                    rows = cursor_conn.execute(
+                        "SELECT state.record_key, state.input_fingerprint, "
+                        "state.code_version, state.last_run_at "
+                        f"FROM {state_ref} AS state "
+                        "WHERE state.model_name = ? AND state.state_scope = ? "
+                        f"AND state.target_identity = ?{key_sql}{absence_sql} "
+                        "ORDER BY state.record_key LIMIT ?",
+                        [*params, request.page_size],
+                    ).fetchall()
+                except duckdb.Error:
+                    raise AdapterError("DuckDB state page read failed") from None
+                records = tuple(
+                    StatePageRecord(str(r[0]), str(r[1]), str(r[2]), r[3])
+                    for r in rows
+                )
+                next_cursor = (
+                    encode_state_cursor(nonce, records[-1].record_key)
+                    if len(records) == request.page_size
+                    else None
+                )
+                return StatePage(records=records, next_cursor=next_cursor)
+
+            def close() -> None:
+                nonlocal transaction_open
+                try:
+                    if transaction_open:
+                        cursor_conn.execute("ROLLBACK")
+                        transaction_open = False
+                finally:
+                    cursor_conn.close()
+
+            return StatePageReader(
+                page_size=request.page_size, fetch=fetch, close=close
+            )
+        except BaseException:
+            if transaction_open:
+                try:
+                    cursor_conn.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+            cursor_conn.close()
+            raise
+
+    def _replace_state_scope(
+        self,
+        scope: StateScope,
+        record_batches: Iterator[Sequence[StateRecord]],
+        fence: StateScopeFence | None,
+    ) -> int:
+        total = 0
+        try:
+            with self._transaction():
+                if fence is not None:
+                    self._verify_state_fence(scope, fence)
+                self._clear_state_rows(scope)
+                for batch in record_batches:
+                    self._insert_state_rows(scope, batch)
+                    total += len(batch)
+        except duckdb.ConstraintException:
+            raise AdapterError(
+                "State scope replacement contains duplicate record keys "
+                "across batches"
+            ) from None
+        return total
+
+    def _verify_state_fence(self, scope: StateScope, fence: StateScopeFence) -> None:
+        # Self-assignment write instead of a plain read: touching the ledger
+        # row makes this transaction conflict with any concurrent authority
+        # reassignment, so a stale fence cannot commit alongside recovery.
+        ledger_ref = f"{self.schema_ref}.{self.quote_ident(SERVING_LEDGER_TABLE)}"
+        try:
+            row = self.connection.execute(
+                f"UPDATE {ledger_ref} SET fencing_token = fencing_token "
+                "WHERE model_name = ? AND stage = ? AND target_identity = ? "
+                "AND publication_id = ? AND fencing_token = ?",
+                [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                    fence.publication_id,
+                    fence.fencing_token,
+                ],
+            ).fetchone()
+        except duckdb.CatalogException:
+            raise StaleStateFenceError(
+                "Fenced state replacement requires a serving ledger, and this "
+                "schema has none"
+            ) from None
+        changed = int(row[0]) if row else 0
+        if changed != 1:
+            raise StaleStateFenceError(
+                "Serving publication authority was reassigned; state scope "
+                "replacement aborted without mutation"
+            )
 
     # ─── internals ───────────────────────────────────────────────────────
 

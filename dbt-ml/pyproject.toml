@@ -1,6 +1,6 @@
 [project]
 name = "dbt-ml"
-version = "0.2.8"
+version = "0.2.9"
 description = "dbt for unstructured data — declarative pipelines for documents, text, and ML preprocessing"
 readme = "README.md"
 license = { text = "MIT" }

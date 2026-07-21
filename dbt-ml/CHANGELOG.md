@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.9 - 2026-07-20
 
 ### Incremental LanceDB search indexes (issue #134)
 
@@ -99,6 +99,106 @@
 - `fit_transform` and `fit` for all providers; `predict`/`load_pretrained`
   (assigning new documents to a persisted model) for `builtin.kmeans` and
   `builtin.nmf`. Density-based clustering and `builtin.lda` are fit-only.
+
+### Provider abstraction, plugin discovery, and billed failures (issue #71)
+
+- Added typed, separately registered `InferenceProvider` and `EmbeddingProvider`
+  contracts and moved Anthropic synchronous and native-batch execution behind
+  the provider boundary. Profile resolution, compilation, caching, state
+  identity, manifests, run results, usage, and cost accounting are
+  provider-neutral, and semantic identity includes an explicit provider
+  `implementation_version` so integration changes invalidate caches and state.
+- Added entry-point provider plugin discovery that scans installed
+  distributions directly (so same-named entry points cannot shadow each
+  other), provider-owned `llm.provider_options:` with per-field secret/identity
+  classification, and a `dbt-ml providers list` inspection command.
+- Failed provider outcomes are first-class: billed failures carry typed
+  `InferenceFailure` provenance and cost accounting instead of being retried
+  into silent spend.
+
+### Native warehouse embedding models (issue #138)
+
+- Added executable `embed:` models that materialize canonical,
+  provider-identified vectors in the warehouse, with embedding identity
+  (provider, model, dimensions, implementation, config hash) recorded per row
+  and folded into incremental state so identity changes re-embed.
+- A deterministic offline embedding provider supports credential-free local
+  development and testing.
+
+### Portable search API and CLI (issue #135)
+
+- Added the provider-neutral `dbt_ml.search()` Python API and `dbt-ml search`
+  CLI with portable request/result/filter types, typed scalar predicates,
+  score normalization, and core reciprocal-rank-fusion hybrid queries.
+- Requests preflight declared store capabilities and fail with explicit
+  capability errors instead of silently degrading.
+
+### Bounded, resumable native batches and run budgets (issue #149)
+
+- Native LLM batch execution is bounded and resumable: interrupted batches
+  resume across runs by provider job identifier instead of resubmitting paid
+  work.
+- Enforceable run budgets stop execution before overspend, with ledger-backed
+  usage and cost accounting.
+
+### vLLM OpenAI-compatible provider (issue #24)
+
+- Added a vLLM inference provider speaking the OpenAI-compatible API for
+  self-hosted open-weight models, registered through the standard provider
+  contract.
+
+### Generation-fenced retrieval publication and query readiness (issue #152)
+
+- The warehouse that owns publication state now also owns a per-scope serving
+  ledger and shared-lease table: publication acquires an exclusive fenced
+  claim, queries pin the active ready generation, and every transition
+  re-verifies the fence so a stale publisher cannot advance state or
+  readiness after administrative recovery.
+- Added `dbt-ml serving status` and `dbt-ml serving recover`; recovery is
+  explicit (no timeout-based lease stealing) and requires operator
+  confirmation that the previous owner was terminated.
+- LanceDB publication adds an OS-level publisher lock, and governed
+  (non-public) indexes are now accepted end to end.
+
+### agent_context/v1 contract (issue #145)
+
+- Added the versioned `agent_context/v1` warehouse contract for document
+  registries, chunks, and dbt entity links: stable identity, bitemporal
+  validity, policy attributes, freshness, provenance, and exact citation
+  locators, with cross-relation validation helpers.
+- Contract metadata flows through manifests, generated docs, and
+  `emit-dbt-sources`; contract-bearing transform output is validated before
+  materialization and the declaration participates in model code identity.
+
+### Paged publication-state reconciliation (issue #153)
+
+- Search publication now reconciles its state scope in bounded memory:
+  per-batch classification through bounded state key lookups, state
+  advancement per batch strictly after exact durable store receipts, and
+  complete, deterministic stale discovery streamed in record-key order from
+  snapshot-consistent state pages (DuckDB MVCC read transaction; BigQuery
+  `FOR SYSTEM_TIME AS OF`).
+- Added the `paged_state_reconciliation` and `atomic_state_scope_replace`
+  warehouse capabilities, including fence-checked atomic replacement of a
+  scope's complete state snapshot against the serving ledger. Compile
+  preflight rejects search resources on adapters without paged
+  reconciliation; eager `fetch_state()` remains for materialization-scale
+  callers.
+
+### Read-only governed context MCP server (issue #146)
+
+- Added `dbt-ml mcp serve` (optional `mcp` extra): a framework-neutral MCP
+  stdio server exposing exactly four read-only tools —
+  `list_context_models`, `search_context`, `get_document`, and
+  `get_context_lineage` — over the `agent_context/v1` contract and portable
+  search API.
+- Authorization derives from an injectable principal/authorization interface,
+  never from tool arguments; policy filters compile server-side, rows are
+  independently rechecked on every fetch, and unauthorized or nonexistent
+  resources return one indistinguishable `not_found_or_denied` error.
+- Responses carry stable IDs, entity links, intervals, freshness, citations,
+  and compact lineage, under configurable size, pagination, timeout,
+  concurrency, and request-rate limits with structured retryable error codes.
 
 ## v0.2.8 - 2026-07-13
 

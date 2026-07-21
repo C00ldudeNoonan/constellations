@@ -78,7 +78,7 @@ import builtins
 
 blocked = {
     'bs4', 'datasketch', 'fpdf', 'ftfy', 'langdetect', 'presidio_analyzer',
-    'presidio_anonymizer', 'pypdf', 'tiktoken',
+    'presidio_anonymizer', 'pypdf', 'tiktoken', 'mcp',
 }
 real_import = builtins.__import__
 
@@ -319,6 +319,7 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "fpdf2",
         "ftfy",
         "langdetect",
+        "mcp",
         "presidio-analyzer",
         "presidio-anonymizer",
         "pypdf",
@@ -326,4 +327,13 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
     ):
         assert package not in core
 
-    assert set(extras) >= {"all", "bigquery", "gcs", "html", "pdf", "pii", "text"}
+    assert set(extras) >= {
+        "all",
+        "bigquery",
+        "gcs",
+        "html",
+        "mcp",
+        "pdf",
+        "pii",
+        "text",
+    }

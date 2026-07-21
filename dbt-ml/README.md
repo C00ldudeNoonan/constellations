@@ -68,6 +68,7 @@ The core install stays lean. Add only the feature groups a project uses:
 | `bigquery` | BigQuery warehouse adapter |
 | `gcs` | Google Cloud Storage document sources |
 | `lancedb` | Local LanceDB search-index publication and queries |
+| [`mcp`](docs/mcp.md) | Read-only governed context server over MCP stdio |
 | `all` | Every optional feature above |
 
 For example, `uv add 'dbt-ml[pdf,text]'` installs PDF and text processing,

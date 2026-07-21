@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.10 - 2026-07-21
 
 ### Atomic full replacement on BigQuery (issue #171)
 

@@ -1212,6 +1212,76 @@ def emit_dbt_sources(
 
 @cli.group()
 @_project_context_options
+def mcp() -> None:
+    """Serve governed document context to MCP clients."""
+
+
+@mcp.command("serve")
+@click.option(
+    "--timeout-seconds",
+    type=click.FloatRange(min=0.1),
+    default=30.0,
+    show_default=True,
+)
+@click.option(
+    "--max-concurrency",
+    type=click.IntRange(1, 64),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--max-requests-per-minute",
+    type=click.IntRange(1, 100_000),
+    default=120,
+    show_default=True,
+)
+@click.option(
+    "--max-response-bytes",
+    type=click.IntRange(1024, 10_000_000),
+    default=256_000,
+    show_default=True,
+)
+@click.option(
+    "--max-scan-rows",
+    type=click.IntRange(1, 1_000_000),
+    default=10_000,
+    show_default=True,
+)
+@_project_context_options
+@click.pass_context
+def mcp_serve(
+    ctx: click.Context,
+    timeout_seconds: float,
+    max_concurrency: int,
+    max_requests_per_minute: int,
+    max_response_bytes: int,
+    max_scan_rows: int,
+) -> None:
+    """Run the read-only dbt-ml MCP server over stdio."""
+    from .mcp_server.authorization import AuthorizationError
+    from .mcp_server.catalog import ArtifactCatalogError
+    from .mcp_server.server import serve_stdio
+    from .mcp_server.service import ContextServerSettings
+
+    try:
+        serve_stdio(
+            ctx.obj["project_dir"],
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            settings=ContextServerSettings(
+                timeout_seconds=timeout_seconds,
+                max_concurrency=max_concurrency,
+                max_requests_per_minute=max_requests_per_minute,
+                max_response_bytes=max_response_bytes,
+                max_scan_rows=max_scan_rows,
+            ),
+        )
+    except (ArtifactCatalogError, AuthorizationError, *_CONFIG_ERRORS) as error:
+        raise ConfigClickError(str(error)) from error
+
+
+@cli.group()
+@_project_context_options
 def docs() -> None:
     """Generate or serve a static docs site for the project."""
 

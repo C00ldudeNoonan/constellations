@@ -2,13 +2,13 @@
 
 ## Unreleased
 
-### Atomic full replacement on BigQuery (issue #143 follow-up)
+### Atomic full replacement on BigQuery (issue #171)
 
-- The BigQuery adapter now declares the `atomic_full_replace` capability, so
-  full-materialization models (transforms, classic ML, extraction) pass the
-  v0.2.9 capability preflight instead of being rejected as non-atomic. Without
-  this, any full-materialization model on BigQuery failed to compile after the
-  v0.2.9 capability contract landed.
+- Fixes a v0.2.9 regression: the BigQuery adapter now declares the
+  `atomic_full_replace` capability, so full-materialization models (transforms,
+  classic ML, extraction) pass the capability preflight instead of being
+  rejected as non-atomic. Under the v0.2.9 capability contract (#130), every
+  full-materialization model on BigQuery failed to compile.
 - `materialize_full` and `materialize_full_chunks` now swap replacements in with
   a single `CREATE OR REPLACE TABLE ... AS SELECT`, which BigQuery executes
   atomically and leaves the target untouched on failure. A staged

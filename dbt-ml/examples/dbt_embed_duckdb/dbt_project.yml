@@ -1,0 +1,16 @@
+name: dbt_embed_duckdb
+version: "0.1.0"
+config-version: 2
+
+profile: dbt_embed_duckdb
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  dbt_embed_duckdb:
+    marts:
+      +materialized: table

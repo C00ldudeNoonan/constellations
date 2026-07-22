@@ -1,0 +1,22 @@
+version: 2
+
+# Under A1 this file is generated from the dbt-ml model's fields + tests
+# (reusing the same translation as `dbt-ml emit-dbt-sources`). Checked in here
+# so `dbt build` runs the tests without the codegen step.
+models:
+  - name: raw_invoices
+    description: "Invoice records extracted from JSON documents by dbt-ml (embedded)."
+    columns:
+      - name: invoice_id
+        description: "Unique invoice identifier."
+        tests:
+          - not_null
+          - unique
+      - name: vendor
+        description: "Vendor name."
+        tests:
+          - not_null
+      - name: total
+        description: "Invoice total."
+        tests:
+          - not_null

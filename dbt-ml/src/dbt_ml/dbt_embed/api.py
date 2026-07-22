@@ -26,6 +26,7 @@ def materialize(
     *,
     project_dir: str | Path,
     session: Any | None = None,
+    upstreams: dict[str, pl.DataFrame] | None = None,
     target: str | None = None,
     profiles_dir: str | Path | None = None,
 ) -> pl.DataFrame:
@@ -33,9 +34,11 @@ def materialize(
 
     Parameters mirror what a dbt Python model can supply: `project_dir` points at
     the colocated dbt-ml project; `session` is the dbt-duckdb connection (reserved
-    for the bidirectional `dbt_ref` path — unused for extraction-only models in
-    this prototype). `target`/`profiles_dir` select the dbt-ml profile that
-    carries backend/LLM configuration.
+    for the bidirectional `dbt_ref` path). `upstreams` maps each dbt-ml dependency
+    name to the frame the dbt Python model read from `dbt.ref(...)` — transform
+    models read their inputs from here instead of a dbt-ml warehouse.
+    `target`/`profiles_dir` select the dbt-ml profile that carries backend/LLM
+    configuration.
     """
     project_path = Path(project_dir)
     project, sources, models = load_project(project_path)
@@ -62,7 +65,9 @@ def materialize(
         project_path,
     )
 
-    with CaptureAdapter(schema=resolved.warehouse.schema_name) as adapter:
+    with CaptureAdapter(
+        schema=resolved.warehouse.schema_name, upstreams=upstreams
+    ) as adapter:
         _run_model(
             model=models_by_name[model],
             models_by_name=models_by_name,

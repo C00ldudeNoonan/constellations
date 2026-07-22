@@ -35,7 +35,9 @@ class CaptureAdapter(DuckDBAdapter):
     to dbt.
     """
 
-    def __init__(self, *, schema: str = "main") -> None:
+    def __init__(
+        self, *, schema: str = "main", upstreams: dict[str, pl.DataFrame] | None = None
+    ) -> None:
         # An absolute temp path resolves to itself (no project_dir join) and is
         # deleted on close; nothing dbt-ml-owned is persisted to the dbt database.
         self._scratch_dir = tempfile.TemporaryDirectory(prefix="dbt_ml_embed_")
@@ -43,10 +45,25 @@ class CaptureAdapter(DuckDBAdapter):
         config = DuckDBWarehouseConfig(path=scratch_db, schema_name=schema)
         super().__init__(config, project_dir=None)
         self._captured: pl.DataFrame | None = None
+        # Upstream models are dbt-managed relations in embedded mode; the API
+        # layer reads them from the dbt session and injects them here so a
+        # transform model's `adapter.read_table(dep)` resolves without touching
+        # a real dbt-ml warehouse.
+        self._upstreams = upstreams or {}
 
     def _close(self) -> None:
         super()._close()
         self._scratch_dir.cleanup()
+
+    def read_table(self, table: str, *, limit: int | None = None) -> pl.DataFrame:
+        if table in self._upstreams:
+            frame = self._upstreams[table]
+            return frame.head(limit) if limit is not None else frame
+        raise RuntimeError(
+            f"Embedded mode has no upstream frame for '{table}'. The dbt Python "
+            f"model must pass it in via `upstreams={{'{table}': ...}}` "
+            "(read from dbt.ref in the shim)."
+        )
 
     @property
     def captured(self) -> pl.DataFrame:

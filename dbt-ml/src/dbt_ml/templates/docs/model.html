@@ -43,6 +43,16 @@
 <pre><code>{{ model.embed | tojson(indent=2) }}</code></pre>
 {% endif %}
 
+{% if model.llm %}
+<h2>LLM transform</h2>
+<p>
+  Provider: <code>{{ model.llm_identity.provider }}</code> ·
+  Model: <code>{{ model.llm_identity.model }}</code> ·
+  Cardinality: <code>{{ model.llm.output_cardinality }}</code>
+</p>
+<pre><code>{{ model.llm | tojson(indent=2) }}</code></pre>
+{% endif %}
+
 {% if model.resource_type == 'search_index' %}
 <h2>Serving resource</h2>
 <p>

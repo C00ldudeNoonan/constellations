@@ -1,0 +1,38 @@
+version: 2
+
+# Native `llm:` map model (issue #144): one governed provider call per chunk
+# turns unstructured text into typed, agent-ready rows. The model's `fields:`
+# are the structured output schema; the prompt is inline. Provenance columns
+# (llm_provider, llm_model, llm_input_hash, generated_at, ...) are appended to
+# every row for lineage.
+#
+# This example uses the offline `deterministic` provider so it runs with no
+# credentials; swap `provider: anthropic` (and set an `llm:` block in
+# profiles.yml) for real extractions.
+models:
+  - name: chunk_facts
+    description: "One extracted claim + topic per chunk (output_cardinality: one)"
+    depends_on: [ref('document_chunks')]
+
+    llm:
+      mode: map
+      input_field: text
+      id_field: chunk_id
+      output_cardinality: one
+      prompt: >
+        Extract the single most important factual claim in this passage and the
+        topic it concerns. Be concise and faithful to the text.
+      provider: deterministic
+      model: deterministic-v1
+
+    fields:
+      - name: claim
+        data_type: string
+      - name: topic
+        data_type: string
+
+    materialization: incremental
+
+    tests:
+      - not_null: [chunk_id]
+      - unique: chunk_id

@@ -543,11 +543,23 @@ def extract_fields_with_usage(
     base_url: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     provider_options: Mapping[str, Any] | None = None,
+    output_cardinality: str = "one",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
     hit is zero tokens and zero API calls — the cache stores only fields, and
-    cached responses cost nothing."""
+    cached responses cost nothing.
+
+    This is the shared structured-completion core (issue #144): both the
+    document-oriented ``backend: llm`` extraction path (via
+    :meth:`LLMBackend.extract`) and native ``llm:`` map models (via
+    :func:`dbt_ml.llm_map.execute_map_item`) route through it, so provider
+    resolution, caching, retries, and usage accounting exist in one place.
+
+    `output_cardinality` (issue #144) controls the requested output shape:
+    ``one`` returns a single object; ``many`` returns ``{"items": [...]}`` for
+    the caller to unwrap. The default preserves the single-object extraction
+    contract and its cache keys unchanged."""
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )
@@ -574,7 +586,7 @@ def extract_fields_with_usage(
     content_hash = hashlib.blake2b(
         text.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
-    schema_hash = _hash_schema(system, fields_spec, temperature)
+    schema_hash = _hash_schema(system, fields_spec, temperature, output_cardinality)
     cache_key = _cache_key(
         provider=provider,
         provider_identity=provider_instance.implementation_identity(),
@@ -603,6 +615,7 @@ def extract_fields_with_usage(
             base_url=resolved_base_url,
             timeout_seconds=timeout_seconds,
             provider_options=provider_options,
+            output_cardinality=output_cardinality,
         )
     with _gate(max_concurrent):
         raw = fn(
@@ -660,6 +673,7 @@ def _default_call_api(
     base_url: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     provider_options: Mapping[str, Any] | None = None,
+    output_cardinality: str = "one",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     provider_instance = (
         get_inference_provider(provider, profile_options=provider_options)
@@ -683,6 +697,7 @@ def _default_call_api(
         fields_spec=fields_spec,
         temperature=temperature,
         max_tokens=max_tokens,
+        output_cardinality=output_cardinality,
     )
     failure: ProviderError | None = None
     result: InferenceResult | None = None
@@ -897,16 +912,24 @@ def _inference_request(
     fields_spec: list[dict[str, Any]],
     temperature: float,
     max_tokens: int,
+    output_cardinality: str = "one",
 ) -> InferenceRequest:
+    if output_cardinality == "many":
+        output_description = (
+            "Return a list of objects under `items`, one per distinct result "
+            "extracted from the input."
+        )
+    else:
+        output_description = (
+            "Return the extracted structured fields from the document."
+        )
     return InferenceRequest(
         model=model,
         content=content,
         system_prompt=system,
-        output_schema=_input_schema(fields_spec),
+        output_schema=_input_schema(fields_spec, output_cardinality),
         output_name="extract",
-        output_description=(
-            "Return the extracted structured fields from the document."
-        ),
+        output_description=output_description,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -971,7 +994,10 @@ def _provider_api_key_env(
     return CredentialReference.from_env_name(default)
 
 
-def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:
+def _input_schema(
+    fields_spec: list[dict[str, Any]],
+    output_cardinality: str = "one",
+) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     for f in fields_spec:
         name = f["name"]
@@ -982,14 +1008,35 @@ def _input_schema(fields_spec: list[dict[str, Any]]) -> dict[str, Any]:
         if ftype == "array":
             prop["items"] = f.get("items", {"type": "string"})
         properties[name] = prop
-    return {"type": "object", "properties": properties}
+    object_schema = {"type": "object", "properties": properties}
+    if output_cardinality == "many":
+        # Fan-out models ask the provider for a list of objects; the caller
+        # unwraps `items`. `one` keeps the flat object schema unchanged.
+        return {
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": object_schema}},
+            "required": ["items"],
+        }
+    return object_schema
 
 
 def _hash_schema(
-    system: str, fields_spec: list[dict[str, Any]], temperature: float
+    system: str,
+    fields_spec: list[dict[str, Any]],
+    temperature: float,
+    output_cardinality: str = "one",
 ) -> str:
+    payload: dict[str, Any] = {
+        "system": system,
+        "fields": fields_spec,
+        "temperature": temperature,
+    }
+    # Preserve existing cache keys for the default (single-object) path; only
+    # fan-out requests fold the cardinality into the schema hash.
+    if output_cardinality != "one":
+        payload["output_cardinality"] = output_cardinality
     canonical = json.dumps(
-        {"system": system, "fields": fields_spec, "temperature": temperature},
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )

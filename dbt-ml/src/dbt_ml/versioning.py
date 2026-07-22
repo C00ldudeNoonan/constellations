@@ -13,6 +13,7 @@ from .config.model import (
     EmbedConfig,
     ExtractionConfig,
     FieldConfig,
+    LLMTransformConfig,
     MLConfig,
     ModelConfig,
     SearchConfig,
@@ -23,6 +24,7 @@ from .config.project import ProjectConfig
 from .dag import parse_ref
 from .embedding import EmbeddingIdentity
 from .hashing import HASH_DIGEST_SIZE, canonical_json
+from .llm_map import LLMMapError, resolve_llm_runtime
 from .paths import resolve_within_project
 from .profile import ResolvedProfile, resolve_llm_options
 from .providers import (
@@ -71,11 +73,13 @@ def compute_code_version(
     ml: MLConfig | None = None,
     chunk: ChunkConfig | None = None,
     embed: EmbedConfig | None = None,
+    llm: LLMTransformConfig | None = None,
     search: SearchConfig | None = None,
     depends_on: list[str] | None = None,
     fields: list[FieldConfig] | None = None,
     effective_extraction: Mapping[str, Any] | None = None,
     effective_transform: Mapping[str, Any] | None = None,
+    effective_llm: Mapping[str, Any] | None = None,
     project_dir: Path,
     agent_context: AgentContextConfig | None = None,
 ) -> str:
@@ -112,6 +116,17 @@ def compute_code_version(
                 "identity": EmbeddingIdentity.from_config(embed).to_dict(),
             }
             if embed
+            else None
+        ),
+        # For llm map models the resolved runtime identity (provider
+        # implementation, model, prompt, schema, and sampling parameters, folded
+        # into config_hash) is the code identity; execution-only tuning like
+        # concurrency/retries is excluded, matching how embed folds its identity.
+        "llm": (
+            dict(effective_llm)
+            if effective_llm is not None
+            else llm.model_dump(exclude={"max_concurrent", "max_retries"})
+            if llm
             else None
         ),
         "search": search.model_dump(mode="python") if search else None,
@@ -180,12 +195,24 @@ def compute_model_code_version(
             _profile_system_prompt_fingerprint(resolved)
         )
 
+    effective_llm: dict[str, Any] | None = None
+    if model.llm is not None:
+        try:
+            effective_llm = resolve_llm_runtime(
+                model.llm, model.fields, resolved
+            ).identity()
+        except LLMMapError:
+            # Provider unresolved (e.g. offline docs tooling) — fall back to the
+            # raw block so the version still computes deterministically.
+            effective_llm = None
+
     return compute_code_version(
         extraction=model.extraction,
         transform=model.transform,
         ml=model.ml,
         chunk=model.chunk,
         embed=model.embed,
+        llm=model.llm,
         search=model.search,
         agent_context=model.agent_context,
         depends_on=(
@@ -193,6 +220,7 @@ def compute_model_code_version(
             if (
                 model.chunk is not None
                 or model.embed is not None
+                or model.llm is not None
                 or model.search is not None
             )
             and model.depends_on
@@ -201,6 +229,7 @@ def compute_model_code_version(
         fields=model.fields,
         effective_extraction=effective_extraction,
         effective_transform=effective_transform,
+        effective_llm=effective_llm,
         project_dir=project_dir,
     )
 
@@ -227,6 +256,20 @@ def describe_model_embedding(model: ModelConfig) -> dict[str, str | int] | None:
     if model.embed is None:
         return None
     return EmbeddingIdentity.from_config(model.embed).to_dict()
+
+
+def describe_model_llm(
+    model: ModelConfig,
+    *,
+    resolved: ResolvedProfile | None = None,
+) -> dict[str, str] | None:
+    """Artifact-safe resolved-inference descriptor for a native `llm:` model."""
+    if model.llm is None:
+        return None
+    try:
+        return resolve_llm_runtime(model.llm, model.fields, resolved).identity()
+    except LLMMapError:
+        return None
 
 
 def _resolve_extraction_options(

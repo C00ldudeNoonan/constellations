@@ -48,6 +48,19 @@ EMBED_METADATA_FIELDS = frozenset(
         "embedded_at",
     }
 )
+# Columns a native `llm:` map model generates for lineage/provenance (issue
+# #144). Reserved like the extraction lineage columns: user `fields` and the
+# configured id/input columns must not collide with them.
+LLM_METADATA_FIELDS = frozenset(
+    {
+        "llm_provider",
+        "llm_model",
+        "llm_provider_implementation",
+        "llm_input_hash",
+        "llm_config_hash",
+        "generated_at",
+    }
+)
 
 
 class _RedactedConfigInput:
@@ -251,6 +264,56 @@ class EmbedConfig(BaseModel):
         if conflicts:
             raise ValueError(
                 "embed fields are reserved for embedding metadata: "
+                f"{', '.join(conflicts)}"
+            )
+        return self
+
+
+class LLMTransformConfig(BaseModel):
+    """Map an LLM prompt over an upstream warehouse relation (issue #144).
+
+    The model's `fields:` list is the structured output schema; the prompt is an
+    inline instruction. One provider call per unprocessed input row produces one
+    validated object (`output_cardinality: one`) or a list of objects
+    (`output_cardinality: many`, fanned out to one row each with a deterministic
+    id). Credentials stay operator-owned in profiles/env — the `llm:` block never
+    carries an api key.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    mode: Literal["map"] = "map"
+    input_field: str = Field(min_length=1)
+    id_field: str = Field(default="id", min_length=1)
+    output_cardinality: Literal["one", "many"] = "one"
+    prompt: str = Field(min_length=1)
+    provider: str = Field(default="default", min_length=1)
+    model: str = Field(default="default", min_length=1)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=2048, gt=0, le=1_000_000)
+    max_concurrent: int = Field(default=8, gt=0, le=1_000)
+    max_retries: int = Field(default=4, ge=0)
+    # For output_cardinality: many — the fan-out row's stable primary key
+    # (f"{id_value}__{ordinal}") and its position within the parent's output.
+    row_id_field: str = Field(default="llm_row_id", min_length=1)
+    ordinal_field: str = Field(default="ordinal", min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_reserved_fields(self) -> LLMTransformConfig:
+        configured = {
+            "input_field": self.input_field,
+            "id_field": self.id_field,
+            "row_id_field": self.row_id_field,
+            "ordinal_field": self.ordinal_field,
+        }
+        conflicts = sorted(
+            f"{label}={value}"
+            for label, value in configured.items()
+            if value.casefold() in LLM_METADATA_FIELDS
+        )
+        if conflicts:
+            raise ValueError(
+                "llm fields are reserved for generation metadata: "
                 f"{', '.join(conflicts)}"
             )
         return self
@@ -512,6 +575,7 @@ class ModelConfig(BaseModel):
     ml: MLConfig | None = None
     chunk: ChunkConfig | None = None
     embed: EmbedConfig | None = None
+    llm: LLMTransformConfig | None = None
     search: SearchConfig | None = None
     agent_context: AgentContextConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
@@ -579,6 +643,7 @@ class ModelConfig(BaseModel):
                 ("ml", self.ml),
                 ("chunk", self.chunk),
                 ("embed", self.embed),
+                ("llm", self.llm),
                 ("search", self.search),
             )
             if block is not None
@@ -587,7 +652,7 @@ class ModelConfig(BaseModel):
             raise ValueError(
                 f"Model '{self.name}' declares multiple kind blocks "
                 f"({', '.join(kinds)}); exactly one of "
-                "extraction/transform/ml/chunk/embed/search is allowed"
+                "extraction/transform/ml/chunk/embed/llm/search is allowed"
             )
         if self.search is not None and "materialization" not in self.model_fields_set:
             raise ValueError(
@@ -603,7 +668,32 @@ class ModelConfig(BaseModel):
                 f"Model '{self.name}' can declare agent_context only on a "
                 "warehouse transform model"
             )
+        if self.llm is not None:
+            self._validate_llm_fields()
         return self
+
+    def _validate_llm_fields(self) -> None:
+        assert self.llm is not None
+        if not self.fields:
+            raise ValueError(
+                f"llm model '{self.name}' requires `fields:` to define its "
+                "structured output schema"
+            )
+        field_names = [field.name for field in self.fields]
+        duplicates = sorted({n for n in field_names if field_names.count(n) > 1})
+        if duplicates:
+            raise ValueError(
+                f"llm model '{self.name}' declares duplicate output fields: "
+                f"{', '.join(duplicates)}"
+            )
+        reserved = {n for n in field_names if n.casefold() in LLM_METADATA_FIELDS}
+        generated = {self.llm.id_field, self.llm.row_id_field, self.llm.ordinal_field}
+        reserved |= {n for n in field_names if n in generated}
+        if reserved:
+            raise ValueError(
+                f"llm model '{self.name}' output fields collide with generated "
+                f"columns: {', '.join(sorted(reserved))}"
+            )
 
     @property
     def kind_block_count(self) -> int:
@@ -615,6 +705,7 @@ class ModelConfig(BaseModel):
                 self.ml,
                 self.chunk,
                 self.embed,
+                self.llm,
                 self.search,
             )
         )
@@ -666,8 +757,8 @@ class ModelFile(BaseModel):
         missing = [m.name for m in self.models if m.kind_block_count == 0]
         if missing:
             raise ValueError(
-                f"Models missing an extraction/transform/ml/chunk/embed block or "
-                f"search block: "
+                f"Models missing an extraction/transform/ml/chunk/embed/llm block "
+                f"or search block: "
                 f"{', '.join(sorted(missing))}"
             )
         return self

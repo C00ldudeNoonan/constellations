@@ -166,6 +166,17 @@ def validate_project_contract(
                     str(e),
                     ("embed", "provider"),
                 ) from e
+        if model.llm is not None and model.llm.provider != "default":
+            # `default` defers to the profile's LLM provider, resolved at run
+            # time; a concrete name must resolve to a registered provider now.
+            try:
+                get_inference_provider(model.llm.provider)
+            except (ProviderNotFoundError, ProviderConfigurationError) as e:
+                raise _model_error(
+                    model,
+                    str(e),
+                    ("llm", "provider"),
+                ) from e
     try:
         validate_ml_project_contracts(models, project, project_dir)
     except MLContractError as e:
@@ -225,6 +236,7 @@ def validate_warehouse_capabilities(
             or model.ml is not None
             or model.chunk is not None
             or model.embed is not None
+            or model.llm is not None
         ):
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
@@ -484,7 +496,7 @@ def _validate_model_edges(
         raise _model_error(
             model,
             f"Model '{model.name}' must declare exactly one of "
-            "extraction/transform/ml/chunk/embed/search",
+            "extraction/transform/ml/chunk/embed/llm/search",
         )
 
     if model.extraction is not None:
@@ -553,6 +565,12 @@ def _validate_model_edges(
         raise _model_error(
             model,
             f"Embed model '{model.name}' must declare exactly one `depends_on:` model",
+            ("depends_on",),
+        )
+    if model.llm is not None and len(dependencies) != 1:
+        raise _model_error(
+            model,
+            f"llm model '{model.name}' must declare exactly one `depends_on:` model",
             ("depends_on",),
         )
 
@@ -687,6 +705,8 @@ def _kind_label(model: ModelConfig) -> str:
         return "Chunk"
     if model.embed is not None:
         return "Embed"
+    if model.llm is not None:
+        return "llm"
     if model.search is not None:
         return "Search"
     return "Unknown"

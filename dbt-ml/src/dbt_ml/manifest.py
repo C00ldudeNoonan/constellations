@@ -29,6 +29,7 @@ from .versioning import (
     compute_model_code_version,
     describe_model_embedding,
     describe_model_inference,
+    describe_model_llm,
 )
 
 MANIFEST_VERSION = 1
@@ -296,6 +297,8 @@ def _model_dict(
         kind = "chunk"
     elif model.embed is not None:
         kind = "embed"
+    elif model.llm is not None:
+        kind = "llm"
     else:
         kind = "unknown"
 
@@ -312,6 +315,7 @@ def _model_dict(
         "ml": model.ml.model_dump(mode="json") if model.ml else None,
         "chunk": model.chunk.model_dump() if model.chunk else None,
         "embed": model.embed.model_dump() if model.embed else None,
+        "llm": model.llm.model_dump() if model.llm else None,
         "fields": [f.model_dump() for f in model.fields],
         "tests": model.tests,
         "code_version": compute_model_code_version(
@@ -327,6 +331,9 @@ def _model_dict(
     embedding = describe_model_embedding(model)
     if embedding is not None:
         model_dict["embedding"] = embedding
+    llm_identity = describe_model_llm(model, resolved=resolved)
+    if llm_identity is not None:
+        model_dict["llm_identity"] = llm_identity
     if model.agent_context is not None:
         model_dict["agent_context"] = {
             **contract_descriptor(model.agent_context.grain),

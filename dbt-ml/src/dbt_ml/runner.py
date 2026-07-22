@@ -2141,8 +2141,6 @@ def _run_llm_model(
     usage_totals: dict[str, int | float] = {}
     usage_lock = threading.Lock()
     provider_calls = 0
-    if work and budget_guard is not None:
-        budget_guard.charge_documents(len(work))
 
     def _one(item: _LLMWork) -> _LLMWork:
         if budget_guard is not None:
@@ -2157,7 +2155,11 @@ def _run_llm_model(
         item.rows = rows
         return item
 
+    run_status: str | None = None
+    errors: list[str] = []
     try:
+        if work and budget_guard is not None:
+            budget_guard.charge_documents(len(work))
         if work:
             max_workers = max(1, min(config.max_concurrent, len(work)))
             with concurrent.futures.ThreadPoolExecutor(
@@ -2166,69 +2168,79 @@ def _run_llm_model(
                 # Preserve input order; surface the first failure deterministically.
                 for completed in pool.map(_one, work):
                     del completed
-    except BudgetExceededError:
-        raise
+    except BudgetExceededError as e:
+        # Exhaustion fires before the next provider call. This model writes once
+        # at the end, so nothing is published and state is unchanged; return a
+        # budget_exceeded result (with partial usage) so run_project records the
+        # status and skips descendants instead of aborting the invocation.
+        run_status = "budget_exceeded"
+        errors.append(f"BudgetExceededError: {e}")
     except Exception as e:
         raise RunError(
             f"llm model '{model.name}' provider execution failed: "
             f"{_artifact_error_text(e)}"
         ) from e
 
-    now = datetime.now(UTC).isoformat()
-    output_schema = _llm_output_schema(model, config, source)
     output_rows: list[dict[str, Any]] = []
-    for item in work:
-        output_rows.extend(
-            _llm_output_rows(item, config=config, runtime=runtime, generated_at=now)
-        )
-    output = _llm_output_frame(output_rows, schema=output_schema, model=model)
-    state_records = [
-        StateRecord(item.record_id, item.input_fingerprint, code_version)
-        for item in work
-    ]
-    key_col = (
-        config.row_id_field if config.output_cardinality == "many" else config.id_field
-    )
-
     rows_written = 0
-    use_full = model.materialization == "full" or full_refresh or rebuild_target
-    try:
-        if use_full:
-            rows_written = adapter.materialize_full(
-                model.name,
-                output,
-                options=warehouse_opts,
-            )
-            adapter.replace_state(state_scope, state_records)
-        else:
-            if config.output_cardinality == "many" and work:
-                # Fan-out counts can change; clear each reprocessed parent's old
-                # rows before appending the fresh set (parent-scoped, by id).
-                adapter.delete_rows(
-                    model.name,
-                    key_col=config.id_field,
-                    keys=[item.id_value for item in work],
+    if run_status is None:
+        now = datetime.now(UTC).isoformat()
+        output_schema = _llm_output_schema(model, config, source)
+        for item in work:
+            output_rows.extend(
+                _llm_output_rows(
+                    item, config=config, runtime=runtime, generated_at=now
                 )
-            if output_rows:
-                rows_written = adapter.materialize_incremental(
+            )
+        output = _llm_output_frame(output_rows, schema=output_schema, model=model)
+        state_records = [
+            StateRecord(item.record_id, item.input_fingerprint, code_version)
+            for item in work
+        ]
+        key_col = (
+            config.row_id_field
+            if config.output_cardinality == "many"
+            else config.id_field
+        )
+
+        use_full = model.materialization == "full" or full_refresh or rebuild_target
+        try:
+            if use_full:
+                rows_written = adapter.materialize_full(
                     model.name,
                     output,
-                    key_col=key_col,
-                    on_schema_change=model.on_schema_change,
                     options=warehouse_opts,
                 )
-            if removed:
-                adapter.delete_rows_and_state(
-                    model.name,
-                    key_col=config.id_field,
-                    keys=removed_id_values,
-                    state_scope=state_scope,
-                    state_record_keys=removed,
-                )
-            if state_records:
-                adapter.upsert_state(state_scope, state_records)
-    except AdapterError as e:
-        raise RunError(str(e)) from e
+                adapter.replace_state(state_scope, state_records)
+            else:
+                if config.output_cardinality == "many" and work:
+                    # Fan-out counts can change; clear each reprocessed parent's
+                    # old rows before appending the fresh set (parent-scoped).
+                    adapter.delete_rows(
+                        model.name,
+                        key_col=config.id_field,
+                        keys=[item.id_value for item in work],
+                    )
+                if output_rows:
+                    rows_written = adapter.materialize_incremental(
+                        model.name,
+                        output,
+                        key_col=key_col,
+                        on_schema_change=model.on_schema_change,
+                        options=warehouse_opts,
+                    )
+                if removed:
+                    adapter.delete_rows_and_state(
+                        model.name,
+                        key_col=config.id_field,
+                        keys=removed_id_values,
+                        state_scope=state_scope,
+                        state_record_keys=removed,
+                    )
+                if state_records:
+                    adapter.upsert_state(state_scope, state_records)
+        except AdapterError as e:
+            raise RunError(str(e)) from e
 
     metrics: dict[str, Any] = {
         "provider_calls": provider_calls,
@@ -2244,6 +2256,7 @@ def _run_llm_model(
         model_name=model.name,
         materialization=model.materialization,
         kind="llm",
+        status=run_status,
         provider=runtime.provider,
         provider_model=runtime.model,
         provider_implementation=runtime.implementation,
@@ -2251,6 +2264,7 @@ def _run_llm_model(
         documents_skipped=skipped,
         documents_deleted=len(removed),
         rows_written=rows_written,
+        errors=errors,
         metrics=metrics,
         artifact_metadata={"llm": runtime.identity()},
     )

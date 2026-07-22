@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -14,7 +15,7 @@ from dbt_ml.llm_map import (
     execute_map_item,
     resolve_llm_runtime,
 )
-from dbt_ml.profile import resolve_profile
+from dbt_ml.profile import ResolvedProfile, resolve_profile
 from dbt_ml.providers import InferenceResult, ProviderUsage
 from dbt_ml.providers.base import InferenceProvider
 from dbt_ml.providers.registry import _INFERENCE_PROVIDERS
@@ -115,6 +116,35 @@ def test_config_hash_changes_with_prompt() -> None:
 def test_config_hash_changes_with_cardinality() -> None:
     a = _runtime(output_cardinality="one")
     b = _runtime(output_cardinality="many")
+    assert a.config_hash != b.config_hash
+
+
+def _resolved_with_llm(**attrs: Any) -> ResolvedProfile:
+    # Minimal duck-typed resolved profile: resolve_llm_runtime only reads
+    # `resolved.llm`. Lets us vary endpoint/options without a full profile.
+    llm = SimpleNamespace(
+        provider="llmmap_fake",
+        model="fake-small",
+        base_url=None,
+        api_key_env=None,
+        provider_options={},
+        cache_path=None,
+        model_fields_set=set(),
+    )
+    for key, value in attrs.items():
+        setattr(llm, key, value)
+    return cast(ResolvedProfile, SimpleNamespace(llm=llm))
+
+
+def test_config_hash_includes_base_url() -> None:
+    # A profile endpoint change must invalidate incremental state (P2 review):
+    # provider: default resolves base_url from the profile and sends it to the
+    # provider + cache key, so it belongs in the output identity.
+    config = LLMTransformConfig(
+        input_field="text", prompt="p", provider="default", model="default"
+    )
+    a = resolve_llm_runtime(config, _FIELDS, _resolved_with_llm(base_url="http://a"))
+    b = resolve_llm_runtime(config, _FIELDS, _resolved_with_llm(base_url="http://b"))
     assert a.config_hash != b.config_hash
 
 

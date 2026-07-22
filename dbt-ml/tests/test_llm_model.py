@@ -217,6 +217,34 @@ def test_llm_model_manifest_records_kind_and_identity(tmp_path: Path) -> None:
     assert "api_key" not in json.dumps(node)
 
 
+def test_llm_model_run_budget_exceeded_returns_status(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    # A run-scope budget the 2-chunk llm model exceeds when it charges its work.
+    (project / "profiles.yml").write_text(
+        _PROFILES_YML.replace(
+            "        schema: docs\n",
+            "        schema: docs\n"
+            "      llm:\n"
+            "        provider: deterministic\n"
+            "        model: deterministic-v1\n"
+            "        budget:\n          max_documents: 1\n",
+        )
+    )
+    results = run_project(project)
+    result = next(r for r in results if r.model_name == "document_facts")
+    # Budget exhaustion becomes a model result, not an escaped exception.
+    assert result.status == "budget_exceeded"
+    assert result.errors
+    assert result.rows_written == 0
+    # Nothing published: the table was never created (this model writes once).
+    tables = _rows(
+        project,
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'docs' AND table_name = 'document_facts'",
+    )
+    assert tables == []
+
+
 def test_llm_model_missing_upstream_column(tmp_path: Path) -> None:
     project = _project(tmp_path)
     # Drop `body` from the extraction so the llm input_field is absent.

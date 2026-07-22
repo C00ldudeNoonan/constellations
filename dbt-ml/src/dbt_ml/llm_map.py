@@ -25,7 +25,11 @@ from .config.profile import DEFAULT_LLM_PROVIDER
 from .credentials import CredentialReference
 from .hashing import canonical_fingerprint
 from .profile import ResolvedProfile
-from .providers import get_inference_provider, resolve_provider_model
+from .providers import (
+    get_inference_provider,
+    profile_options_fingerprint,
+    resolve_provider_model,
+)
 
 # FieldConfig data types -> JSON-schema types requested from the provider. The
 # warehouse column dtype is handled separately by the runner; here we only need
@@ -183,6 +187,14 @@ def resolve_llm_runtime(
             "temperature": config.temperature,
             "max_tokens": config.max_tokens,
             "fields": fields_spec,
+            # Endpoint and semantic provider options resolve from the profile and
+            # reach the provider and cache key at execution time, so they are part
+            # of the output identity: a base_url or provider_options change must
+            # invalidate incremental state (mirrors the extraction cache key).
+            "base_url": base_url,
+            "provider_options": profile_options_fingerprint(
+                getattr(provider, "profile_options", None)
+            ),
         },
         domain="llm-map-config",
         version=1,

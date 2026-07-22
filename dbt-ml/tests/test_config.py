@@ -157,10 +157,68 @@ def test_multiple_kind_blocks_rejected() -> None:
 def test_model_file_requires_kind_block() -> None:
     with pytest.raises(
         ValueError,
-        match="missing an extraction/transform/ml/chunk/embed block",
+        match="missing an extraction/transform/ml/chunk/embed/llm block",
     ):
         ModelFile.model_validate(
             {"version": 2, "models": [{"name": "kindless"}]}
+        )
+
+
+def _llm_model(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "name": "obligations",
+        "depends_on": ['ref("chunks")'],
+        "llm": {"input_field": "text", "id_field": "chunk_id", "prompt": "extract"},
+        "fields": [{"name": "obligation", "type": "string"}],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_llm_model_validates() -> None:
+    model = ModelConfig.model_validate(_llm_model())
+    assert model.llm is not None
+    assert model.llm.mode == "map"
+    assert model.llm.output_cardinality == "one"
+    assert model.kind_block_count == 1
+
+
+def test_llm_model_requires_fields() -> None:
+    with pytest.raises(ValidationError, match="requires `fields:`"):
+        ModelConfig.model_validate(_llm_model(fields=[]))
+
+
+def test_llm_model_field_collides_with_metadata() -> None:
+    with pytest.raises(ValidationError, match="collide with generated columns"):
+        ModelConfig.model_validate(
+            _llm_model(fields=[{"name": "llm_provider", "type": "string"}])
+        )
+
+
+def test_llm_model_field_collides_with_id_field() -> None:
+    with pytest.raises(ValidationError, match="collide with generated columns"):
+        ModelConfig.model_validate(
+            _llm_model(fields=[{"name": "chunk_id", "type": "string"}])
+        )
+
+
+def test_llm_config_reserved_id_field() -> None:
+    with pytest.raises(ValidationError, match="reserved for generation metadata"):
+        ModelConfig.model_validate(
+            _llm_model(
+                llm={
+                    "input_field": "text",
+                    "id_field": "generated_at",
+                    "prompt": "extract",
+                }
+            )
+        )
+
+
+def test_llm_model_conflicts_with_other_kind() -> None:
+    with pytest.raises(ValidationError, match="multiple kind blocks"):
+        ModelConfig.model_validate(
+            _llm_model(transform={"type": "python", "module": "transforms.x"})
         )
 
 

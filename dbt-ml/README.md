@@ -889,6 +889,51 @@ published. `dbt_ml.embedding.embed_query()` accepts the identity recorded in
 the manifest so query-time vectors cannot silently use a different provider
 implementation or configuration.
 
+## LLM transformation models
+
+An `llm:` model maps a prompt over one upstream warehouse relation, turning
+unstructured text into typed, agent-ready rows — the first-class path for
+transformations that need semantic interpretation, while SQL and Python stay
+the deterministic surfaces. The model's `fields:` are the structured output
+schema; the prompt is inline. It shares one execution core with `backend: llm`
+extraction, so provider resolution, caching, retries, and usage accounting live
+in one place. Credentials stay operator-owned in `profiles.yml`/environment —
+the `llm:` block never carries an api key.
+
+```yaml
+- name: chunk_facts
+  depends_on: [ref('document_chunks')]
+  llm:
+    mode: map
+    input_field: text          # upstream column holding the content
+    id_field: chunk_id         # stable upstream key, carried to the output
+    output_cardinality: one    # one | many
+    prompt: "Extract the key factual claim and its topic."
+    provider: deterministic    # default -> the profile's LLM provider
+    model: deterministic-v1
+  fields:                      # the structured output schema (required)
+    - {name: claim, type: string}
+    - {name: topic, type: string}
+  materialization: incremental
+```
+
+`output_cardinality: one` produces one row per input, keyed by `id_field`.
+`output_cardinality: many` fans out a list of objects into one row each, keyed
+by a deterministic `llm_row_id` (`f"{id}__{ordinal}"`) with the parent
+`id_field` retained. Every output row gets provenance columns: `llm_provider`,
+`llm_model`, `llm_provider_implementation`, `llm_input_hash`, `llm_config_hash`,
+and `generated_at`.
+
+Incremental runs skip inputs whose content and configuration are unchanged,
+regenerate rows when the content or the prompt/schema/provider identity change,
+and delete an input's rows when it is removed upstream (parent-scoped for
+fan-out). The built-in `deterministic` provider runs offline for tests and
+examples; a production provider implements the same `InferenceProvider`
+contract. Manifest and run-results artifacts expose only the safe resolved
+identity and aggregate usage — prompts, input text, and credentials are never
+copied into artifacts. Native provider batch execution for `llm:` models is
+deferred (issue #149 covers the batch machinery `backend: llm` already uses).
+
 ## Search indexes (local proof of concept)
 
 A `search:` resource publishes exactly one upstream warehouse model to an

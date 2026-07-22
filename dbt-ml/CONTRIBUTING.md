@@ -37,6 +37,28 @@ the repository-level `.github/workflows/` directory.
 7. Add an init template under `src/dbt_ml/templates/<backend>/` if a fresh-
    project starter makes sense.
 
+## Adding a new model kind
+
+Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one
+(the native `llm:` map model, issue #144, is the reference):
+
+1. Add a strict Pydantic block to `src/dbt_ml/config/model.py`, wire it into
+   `ModelConfig`, `_validate_single_kind`, `kind_block_count`, and the
+   `ModelFile` missing-kind message.
+2. Add an execution function in `src/dbt_ml/runner.py` and a dispatch branch in
+   `_run_model`. Reuse warehouse-neutral adapter primitives (`read_table`,
+   `materialize_full`/`materialize_incremental`, `delete_rows`, state helpers);
+   advance state only after a successful publish.
+3. Preflight the kind in `src/dbt_ml/compiler.py` (`_kind_label`, dependency and
+   provider validation, warehouse capability requirements).
+4. Fold its code identity into `src/dbt_ml/versioning.py` and surface it in
+   `src/dbt_ml/manifest.py`, `src/dbt_ml/cli.py`, and the docs template.
+5. Keep provider/cache/retry logic in one shared core rather than duplicating it
+   — `llm:` and `backend: llm` both route through
+   `llm_backend.extract_fields_with_usage`.
+6. Add tests: config validation, the runner path (credential-free via the
+   `deterministic` provider), compiler failures, versioning, and manifest.
+
 ## Adding a new schema test
 
 1. Add the name to `SUPPORTED_TESTS` in `src/dbt_ml/checks/schema.py`.

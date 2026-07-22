@@ -755,6 +755,8 @@ def _model_kind(model: ModelConfig) -> str:
         return "chunk"
     if model.embed is not None:
         return "embed"
+    if model.llm is not None:
+        return "llm"
     if model.search is not None:
         return "search"
     return "unknown"
@@ -922,7 +924,14 @@ def _usage_summary(
     model: str | None = None,
 ) -> str:
     """One-line provider usage: calls, cache hits, tokens, and optional cost."""
-    if "provider_calls" in m:
+    if "api_calls" in m:
+        # Native `llm:` models and `backend: llm` extraction report api_calls;
+        # embed models report only provider_calls.
+        parts = [
+            f"llm: {m.get('api_calls', 0)} calls, "
+            f"{m.get('cache_hits', 0)} cache hits"
+        ]
+    elif "provider_calls" in m:
         parts = [
             f"embedding: {m.get('provider_calls', 0)} calls, "
             f"{m.get('cache_hits', 0)} cache hits"

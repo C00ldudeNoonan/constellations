@@ -104,6 +104,7 @@ def validate_project_contract(
                     str(error),
                     ("search", "vector", "embedding"),
                 ) from error
+        _validate_retrieval_tests(model, model_names)
         if model.extraction is not None:
             backend = model.extraction.backend or default_backend
             if backend not in available_backends:
@@ -625,6 +626,50 @@ def _validate_model_edges(
                 model,
                 f"Warehouse model '{model.name}' cannot depend on search resource '{target}'",
                 ("depends_on", index),
+            )
+
+
+def _validate_retrieval_tests(model: ModelConfig, model_names: set[str]) -> None:
+    if not model.retrieval_tests:
+        return
+    if model.search is None:
+        raise _model_error(
+            model,
+            f"Model '{model.name}' declares `retrieval_tests`, which only "
+            "applies to `search:` models (issue #137)",
+            ("retrieval_tests",),
+        )
+    names = [t.name for t in model.retrieval_tests]
+    if len(names) != len(set(names)):
+        raise _model_error(
+            model,
+            f"Search model '{model.name}' declares duplicate retrieval_tests "
+            f"names: {sorted({n for n in names if names.count(n) > 1})}",
+            ("retrieval_tests",),
+        )
+    for test in model.retrieval_tests:
+        golden = parse_ref(test.golden_set)
+        if golden not in model_names:
+            raise _model_error(
+                model,
+                f"Retrieval test '{test.name}' on '{model.name}' references "
+                f"unknown golden_set model '{golden}'",
+                ("retrieval_tests",),
+            )
+        if golden == model.name:
+            raise _model_error(
+                model,
+                f"Retrieval test '{test.name}' on '{model.name}' cannot use "
+                "the search model itself as its golden_set",
+                ("retrieval_tests",),
+            )
+        if test.mode is not None and test.mode not in model.search.query.modes:
+            raise _model_error(
+                model,
+                f"Retrieval test '{test.name}' on '{model.name}' sets "
+                f"`mode: {test.mode}`, which the search index does not declare "
+                f"in `query.modes` ({sorted(model.search.query.modes)})",
+                ("retrieval_tests",),
             )
 
 

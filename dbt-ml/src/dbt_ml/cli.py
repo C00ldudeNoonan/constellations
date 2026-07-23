@@ -35,6 +35,11 @@ from .providers import (
     ProviderNotFoundError,
     get_inference_provider,
 )
+from .retrieval_eval import (
+    RetrievalEvalError,
+    run_retrieval_evaluation,
+    write_retrieval_eval_artifact,
+)
 from .runner import (
     BuildResult,
     ModelRunResult,
@@ -1159,6 +1164,81 @@ def test(
         summary += f", {warned} warned"
     summary += f", {failed} failed (of {len(results)})"
     click.echo(summary)
+    if failed:
+        ctx.exit(1)
+
+
+@cli.command("eval")
+@click.option(
+    "--select", "select", default=None, help="Selector expression for search models to evaluate."
+)
+@click.option("--exclude", default=None, help="Selector expression for models to skip.")
+@click.option("--json", "as_json", is_flag=True, help="Print the eval artifact to stdout.")
+@_project_context_options
+@click.pass_context
+def eval_(
+    ctx: click.Context,
+    select: str | None,
+    exclude: str | None,
+    as_json: bool,
+) -> None:
+    """Run golden-set retrieval evaluations declared as `retrieval_tests:` on
+    search models (issue #137): recall/precision/hit-rate/MRR/NDCG@k against
+    labeled queries, plus hard policy-filter assertions. Writes
+    target-path/retrieval_eval.json."""
+    project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    try:
+        results = run_retrieval_evaluation(
+            project_dir,
+            select=select,
+            exclude=exclude,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except RetrievalEvalError as e:
+        raise click.ClickException(str(e)) from e
+
+    project, _sources, _models = load_project(project_dir)
+    artifact_path = write_retrieval_eval_artifact(project_dir, project, results)
+    failed = sum(1 for r in results if r.status == "fail")
+
+    if not results:
+        click.echo("No retrieval_tests defined.")
+        return
+
+    if as_json:
+        click.echo(artifact_path.read_text())
+        if failed:
+            ctx.exit(1)
+        return
+
+    header = f"{'model':<22}{'test':<26}{'status':<8}{'thresholds'}"
+    click.echo(header)
+    click.echo("-" * 90)
+    for r in results:
+        threshold_summary = ", ".join(
+            f"{t.key}={t.actual:.3f}(>={t.min:.3f}){'*' if t.status != 'pass' else ''}"
+            for t in r.thresholds
+        )
+        click.echo(f"{r.model_name:<22}{r.test_name:<26}{r.status:<8}{threshold_summary}")
+        for violation in r.policy_violations:
+            click.echo(
+                f"    POLICY VIOLATION [{violation.query_id}] {violation.kind}: "
+                f"{list(violation.ids)}"
+            )
+    click.echo("-" * 90)
+    passed = sum(1 for r in results if r.status == "pass")
+    warned = sum(1 for r in results if r.status == "warn")
+    summary = f"{passed} passed"
+    if warned:
+        summary += f", {warned} warned"
+    summary += f", {failed} failed (of {len(results)})"
+    click.echo(summary)
+    click.echo(f"Wrote {artifact_path}")
     if failed:
         ctx.exit(1)
 

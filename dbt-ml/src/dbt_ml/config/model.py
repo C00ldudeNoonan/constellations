@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -538,6 +539,65 @@ class SearchConfig(BaseModel):
         return tuple(fields)
 
 
+_RETRIEVAL_THRESHOLD_KEY = re.compile(
+    r"^(recall|precision|hit_rate|mrr|ndcg)_at_(\d+)$"
+)
+
+
+class RetrievalThresholdConfig(BaseModel):
+    """Minimum acceptable value for one `<metric>_at_<k>` aggregate (issue #137).
+
+    `severity: error` fails `dbt-ml eval` (exit 1); `severity: warn` reports
+    below-threshold without failing, mirroring schema-test severity."""
+
+    model_config = _STRICT_CONFIG
+
+    min: float = Field(ge=0.0, le=1.0)
+    severity: Literal["error", "warn"] = "error"
+
+
+class RetrievalTestConfig(BaseModel):
+    """A golden-set retrieval evaluation attached to a `search:` model
+    (issue #137). `golden_set` is a `ref('model')` expression naming an
+    ordinary dbt-ml model whose materialized rows carry the golden-query
+    contract (query_id, query_text/query_vector, relevant_ids, ...) — see
+    docs/architecture/semantic-retrieval.md."""
+
+    model_config = _STRICT_CONFIG
+
+    name: str
+    golden_set: str
+    mode: Literal["vector", "text", "hybrid"] | None = None
+    at: tuple[int, ...] = (10,)
+    thresholds: dict[str, RetrievalThresholdConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> RetrievalTestConfig:
+        if not self.golden_set.strip():
+            raise ValueError("retrieval_tests.golden_set must not be empty")
+        if not self.at:
+            raise ValueError("retrieval_tests.at must not be empty")
+        if any(isinstance(k, bool) or k <= 0 for k in self.at):
+            raise ValueError("retrieval_tests.at must contain positive integers")
+        if len(self.at) != len(set(self.at)):
+            raise ValueError("retrieval_tests.at must not contain duplicate cutoffs")
+        for key in self.thresholds:
+            match = _RETRIEVAL_THRESHOLD_KEY.match(key)
+            if not match:
+                raise ValueError(
+                    f"Unknown retrieval threshold '{key}'; expected "
+                    "'<metric>_at_<k>' where metric is one of recall, "
+                    "precision, hit_rate, mrr, ndcg"
+                )
+            cutoff = int(match.group(2))
+            if cutoff not in self.at:
+                raise ValueError(
+                    f"Threshold '{key}' references cutoff {cutoff}, which is "
+                    f"not declared in `at`: {list(self.at)}"
+                )
+        return self
+
+
 class FieldConfig(BaseModel):
     model_config = _STRICT_CONFIG
 
@@ -593,6 +653,9 @@ class ModelConfig(BaseModel):
     embed: EmbedConfig | None = None
     llm: LLMTransformConfig | None = None
     search: SearchConfig | None = None
+    # Golden-set retrieval evaluations over this search index (issue #137);
+    # only meaningful — and only allowed — when `search` is set.
+    retrieval_tests: list[RetrievalTestConfig] = Field(default_factory=list)
     agent_context: AgentContextConfig | None = None
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"

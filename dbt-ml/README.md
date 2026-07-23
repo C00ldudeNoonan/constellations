@@ -309,6 +309,7 @@ dbt-ml compile                                             # parse YAML, validat
 dbt-ml graph                                               # Mermaid DAG to stdout
 dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR]
 dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
+dbt-ml eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR]
 dbt-ml ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table

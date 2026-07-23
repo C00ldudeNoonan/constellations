@@ -61,3 +61,32 @@ embedding:
 Vertex uses Application Default Credentials, including service-account ADC;
 do not configure an API key. Keep `dimensions: 8` for a direct provider swap
 in this example, or choose a larger output dimensionality before benchmarking.
+
+## Golden-set retrieval evaluation (issue #137)
+
+`chunk_search` declares two `retrieval_tests:` — deterministic, CI-friendly
+checks over hand-labeled queries, run through the same `search()` API a real
+caller uses:
+
+```bash
+uv run dbt-ml --project-dir examples/rag_chunks_pipeline eval
+```
+
+- `chunk_search_quality` (`chunk_search_golden`) — three correctly labeled
+  queries ("paid time off", "password manager MFA", "remote work stipend")
+  against the two document chunks. **Passes**: `recall_at_2`, `mrr_at_1`, and
+  `ndcg_at_2` all hit 1.0, since full-text search correctly ranks each query's
+  genuinely relevant chunk first.
+- `chunk_search_quality_regression_demo` (`chunk_search_golden_degraded`) — one
+  **deliberately mislabeled** query: asserts the security-policy chunk is
+  relevant to a paid-time-off query. **Always fails** (`recall_at_1: 0.0`),
+  proving the mechanism catches a real mismatch between labeled and retrieved
+  relevance — this is the acceptance criterion for "an intentionally degraded
+  configuration that fails," not a bug in the example.
+
+`dbt-ml eval` therefore exits `1` on this project by design (both
+`retrieval_tests` entries run together — selection is per search model, like
+`dbt-ml test`, not per named test). Inspect `target/retrieval_eval.json` for
+the full per-query artifact (store provenance, embedding identity, aggregate
+metrics, threshold outcomes) to see both the passing and the intentionally
+failing result.

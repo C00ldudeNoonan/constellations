@@ -34,3 +34,23 @@ models:
         consistency: strong
       on_index_change: fail
       batch_size: 100
+
+    retrieval_tests:
+      - name: chunk_search_quality
+        golden_set: ref('chunk_search_golden')
+        mode: text
+        at: [1, 2]
+        thresholds:
+          recall_at_2: {min: 1.0, severity: error}
+          mrr_at_1: {min: 0.5, severity: error}
+          ndcg_at_2: {min: 0.5, severity: warn}
+      # Deliberately mislabeled golden query (#137 acceptance criterion: an
+      # intentionally degraded configuration that fails). `dbt-ml eval` on
+      # this project always reports one failing test here — see the example
+      # README for what that demonstrates.
+      - name: chunk_search_quality_regression_demo
+        golden_set: ref('chunk_search_golden_degraded')
+        mode: text
+        at: [1]
+        thresholds:
+          recall_at_1: {min: 1.0, severity: error}

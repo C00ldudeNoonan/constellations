@@ -24,10 +24,11 @@ flowchart LR
 
 ## Run it
 
-From the `dbt-ml/` package directory after `uv sync`:
+From the `dbt-ml/` package directory:
 
 ```bash
-uv run python examples/metric_evidence_agent/run_demo.py
+uv run --extra mcp --extra lancedb \
+  python examples/metric_evidence_agent/run_demo.py
 ```
 
 The command builds the offline dbt-ml project, starts both MCP servers over the
@@ -64,7 +65,8 @@ Streamable HTTP endpoint, and opt in:
 ```bash
 DBT_MCP_URL=https://your-dbt-mcp.example/mcp \
 DBT_MCP_ACCESS_TOKEN=... \
-uv run python examples/metric_evidence_agent/run_demo.py
+uv run --extra mcp --extra lancedb \
+  python examples/metric_evidence_agent/run_demo.py
 ```
 
 The access token is optional when the endpoint handles authentication by

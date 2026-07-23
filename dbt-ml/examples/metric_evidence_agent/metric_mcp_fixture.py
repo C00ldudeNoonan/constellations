@@ -50,8 +50,8 @@ def create_metric_mcp_server() -> Any:
             raise ValueError("The example requires both comparison quarters")
         return (
             "metric_time__quarter,customer_segment,refund_rate\n"
-            "2026-01-01,enterprise,0.04\n"
             "2026-04-01,enterprise,0.07\n"
+            "2026-01-01,enterprise,0.04\n"
         )
 
     return app

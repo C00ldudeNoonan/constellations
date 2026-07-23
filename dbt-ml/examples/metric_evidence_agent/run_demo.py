@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -88,7 +88,12 @@ async def _query_metric() -> tuple[dict[str, Any], dict[str, Any]]:
             raise_exceptions=True,
         ) as session:
             result = await session.call_tool("query_metrics", _METRIC_ARGUMENTS)
-    rows = list(csv.DictReader(io.StringIO(_tool_text(result))))
+    rows = sorted(
+        csv.DictReader(io.StringIO(_tool_text(result))),
+        key=lambda row: date.fromisoformat(row["metric_time__quarter"]),
+    )
+    if len(rows) != 2:
+        raise RuntimeError("query_metrics must return exactly two comparison quarters")
     baseline = float(rows[0]["refund_rate"])
     current = float(rows[1]["refund_rate"])
     entity_key = canonical_entity_key("enterprise")

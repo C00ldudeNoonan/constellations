@@ -81,6 +81,14 @@ def test_metric_evidence_agent_matches_reviewed_snapshots(tmp_path: Path) -> Non
 
     assert _answer_snapshot(result) == expected_answer
     assert _trace_snapshot(result) == expected_trace
+    assert result["tool_trace"][0]["arguments"]["group_by"] == [
+        {
+            "name": "metric_time",
+            "type": "time_dimension",
+            "grain": "quarter",
+        },
+        {"name": "customer_segment", "type": "dimension"},
+    ]
     assert result["authorized_answer"]["access_limited"] is False
     assert result["reduced_answer"]["access_limited"] is True
     for item in result["authorized_answer"]["evidence"]:

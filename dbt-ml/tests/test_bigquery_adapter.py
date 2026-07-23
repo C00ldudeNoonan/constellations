@@ -2212,4 +2212,89 @@ def test_fenced_replace_maps_gate_errors_without_leaking() -> None:
         adapter.replace_state_scope(
             scope, iter([[StateRecord("a", "fp", "v1")]]), fence=fence
         )
-    assert len(client.dropped) == 1
+
+
+# ─── SQL incremental materialization (issue #142) ──────────────────────────
+
+
+def _schema_job(columns: list[tuple[str, str]]) -> _FakeJob:
+    job = _FakeJob()
+    job.schema = [  # type: ignore[attr-defined]
+        SimpleNamespace(name=name, field_type=field_type) for name, field_type in columns
+    ]
+    return job
+
+
+def test_bigquery_relation_exists() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    assert adapter.relation_exists("missing") is False
+    client.tables["proj.ds.present"] = ["id"]
+    assert adapter.relation_exists("present") is True
+
+
+def test_bigquery_materialize_sql_incremental_builds_merge() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]
+    client.query_results = [
+        _FakeJob(rows=[(0, 0)]),  # unique-key check: 0 null, 0 duplicate
+        _schema_job([("id", "INTEGER"), ("v", "STRING")]),  # dry_run_sql
+        _FakeJob(affected=3),  # the MERGE itself
+    ]
+    adapter = _adapter(client)
+    result = adapter.materialize_sql_incremental(
+        "tgt", "SELECT id, v FROM src", unique_key="id"
+    )
+    assert result.rows_written == 3
+    merge_sql, _ = client.queries[-1]
+    assert merge_sql.startswith("MERGE `proj`.`ds`.`tgt` AS T USING (SELECT id, v FROM src) AS S")
+    assert "ON T.`id` = S.`id`" in merge_sql
+    assert "WHEN MATCHED THEN UPDATE SET T.`v` = S.`v`" in merge_sql
+    assert "WHEN NOT MATCHED THEN INSERT (`id`, `v`) VALUES (S.`id`, S.`v`)" in merge_sql
+
+
+def test_bigquery_materialize_sql_incremental_rejects_bad_key() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]
+    client.query_results = [_FakeJob(rows=[(1, 2)])]  # 1 null, 2 duplicates
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match="1 null and 2 duplicate"):
+        adapter.materialize_sql_incremental(
+            "tgt", "SELECT id, v FROM src", unique_key="id"
+        )
+
+
+def test_bigquery_materialize_sql_incremental_schema_change_fail() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]
+    client.query_results = [
+        _FakeJob(rows=[(0, 0)]),
+        _schema_job([("id", "INTEGER"), ("v", "STRING"), ("w", "STRING")]),
+    ]
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match="Schema change"):
+        adapter.materialize_sql_incremental(
+            "tgt", "SELECT id, v, w FROM src", unique_key="id"
+        )
+
+
+def test_bigquery_materialize_sql_incremental_appends_new_columns() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]
+    client.query_results = [
+        _FakeJob(rows=[(0, 0)]),
+        _schema_job([("id", "INTEGER"), ("v", "STRING"), ("w", "STRING")]),
+        _FakeJob(),  # ALTER TABLE ADD COLUMN
+        _FakeJob(affected=1),  # the MERGE
+    ]
+    adapter = _adapter(client)
+    adapter.materialize_sql_incremental(
+        "tgt",
+        "SELECT id, v, w FROM src",
+        unique_key="id",
+        on_schema_change="append_new_columns",
+    )
+    alter_sql, _ = client.queries[-2]
+    assert alter_sql == "ALTER TABLE `proj`.`ds`.`tgt` ADD COLUMN `w` STRING"
+    merge_sql, _ = client.queries[-1]
+    assert "`w`" in merge_sql

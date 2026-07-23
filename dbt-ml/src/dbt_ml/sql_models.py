@@ -1,8 +1,9 @@
-"""Compilation for warehouse-native SQL transform models (issue #143).
+"""Compilation for warehouse-native SQL transform models (issues #143, #142).
 
 See docs/architecture/sql-models.md for the accepted design. A SQL transform is
 `transform.type: sql` with an external `.sql` file whose only template surface is
-`ref('literal')` and a read-only `target`. Compilation is two-phase:
+`ref('literal')`, a read-only `target`, and — for `materialization: incremental`
+models only — `is_incremental()` and `this`. Compilation is two-phase:
 
 1. discover — statically read the `ref('…')` calls (AST, no execution) so the DAG
    can be built and validated before any warehouse access;
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from jinja2 import StrictUndefined, nodes
 from jinja2.sandbox import SandboxedEnvironment
@@ -24,6 +26,11 @@ from jinja2.sandbox import SandboxedEnvironment
 SQL_COMPILER_CONTRACT_VERSION = "sql/v1"
 
 _SQL_SUFFIX = ".sql"
+
+# Zero-arg template calls that are not refs but are still recognized by
+# discover_refs; presence/absence of their runtime value is enforced by
+# compile_sql's StrictUndefined rendering, not here.
+_INCREMENTAL_CALLS = frozenset({"is_incremental"})
 
 
 class SqlModelError(Exception):
@@ -71,14 +78,22 @@ def discover_refs(sql_text: str, *, model_name: str) -> list[str]:
     seen: set[str] = set()
     for call in ast.find_all(nodes.Call):
         func = call.node
+        if isinstance(func, nodes.Name) and func.name in _INCREMENTAL_CALLS:
+            if call.args or call.kwargs or call.dyn_args or call.dyn_kwargs:
+                raise SqlModelError(
+                    f"SQL model '{model_name}' calls '{func.name}(...)' with "
+                    "arguments; it takes none."
+                )
+            continue
         if not (isinstance(func, nodes.Name) and func.name == "ref"):
             # Any other callable in the template is unsupported (no macros/
-            # filters/functions beyond ref); flag it rather than ignoring it.
+            # filters/functions beyond ref/is_incremental); flag it rather than
+            # ignoring it.
             name = getattr(func, "name", None)
             if isinstance(func, nodes.Name) and name not in {"ref"}:
                 raise SqlModelError(
                     f"SQL model '{model_name}' calls unsupported '{name}(...)'; "
-                    "only ref('model') is available."
+                    "only ref('model') and is_incremental() are available."
                 )
             continue
         if (
@@ -150,10 +165,17 @@ def compile_sql(
     relations: dict[str, str],
     target_name: str,
     target_type: str,
+    this: str | None = None,
+    is_incremental: bool | None = None,
 ) -> str:
     """Render the SQL with `ref('m')` → `relations['m']` (an adapter-quoted
     relation) and a read-only `target`. `relations` must cover every discovered
-    ref. Returns the compiled single-statement SELECT."""
+    ref. Returns the compiled single-statement SELECT.
+
+    `this` (the target's own quoted relation) and `is_incremental` are only
+    meaningful for `materialization: incremental` SQL models — pass both or
+    neither. Left `None`, referencing either in the template raises (a `full`
+    model has no incremental branch to compile)."""
 
     def ref(name: str) -> str:
         try:
@@ -165,6 +187,27 @@ def compile_sql(
 
     env = _sandbox()
     template = env.from_string(sql_text)
-    compiled = template.render(ref=ref, target=_Target(target_name, target_type))
+    render_kwargs: dict[str, Any] = {
+        "ref": ref,
+        "target": _Target(target_name, target_type),
+    }
+    if this is not None:
+        render_kwargs["this"] = this
+    if is_incremental is not None:
+        render_kwargs["is_incremental"] = lambda: is_incremental
+    compiled = template.render(**render_kwargs)
     validate_single_select(compiled, model_name=model_name)
     return compiled.strip()
+
+
+def build_key_check_sql(select_sql: str, key_column: str) -> str:
+    """A portable, read-only diagnostic query: counts null and duplicate values
+    of `key_column` in `select_sql`'s result without materializing or returning
+    any row payload. `key_column` must already be adapter-quoted by the caller.
+    Used by adapters to validate the unique key before mutating the target."""
+    return (
+        "select "
+        f"sum(case when {key_column} is null then 1 else 0 end) as null_count, "
+        f"count(*) - count(distinct {key_column}) as duplicate_count "
+        f"from ({select_sql}) as _dbt_ml_key_check"
+    )

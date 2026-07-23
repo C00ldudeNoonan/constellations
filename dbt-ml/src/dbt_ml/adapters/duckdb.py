@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from ..config.profile import WarehouseConfig
 from ..hashing import canonical_fingerprint
+from ..sql_models import build_key_check_sql
 from .base import (
     SERVING_LEDGER_TABLE,
     AdapterError,
@@ -184,6 +185,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
                 WarehouseCapability.SQL_MODEL_MATERIALIZATION,
+                WarehouseCapability.SQL_INCREMENTAL_MATERIALIZATION,
                 WarehouseCapability.SQL_SCHEMA_TESTS,
                 WarehouseCapability.STREAMING_TABULAR_READS,
                 WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
@@ -384,6 +386,143 @@ class DuckDBAdapter(WarehouseAdapter):
         except duckdb.Error as e:
             raise AdapterError(f"SQL dry-run failed: {e}") from e
         return SqlRelationSchema(columns=columns)
+
+    def relation_exists(self, table: str) -> bool:
+        return self._table_columns(table) is not None
+
+    def materialize_sql_incremental(
+        self,
+        table: str,
+        select_sql: str,
+        *,
+        unique_key: str,
+        on_schema_change: str = "fail",
+        options: BaseModel | None = None,
+    ) -> SqlMaterializationResult:
+        full = self.table_ref(table)
+        key = self.quote_ident(unique_key)
+        staging = f"dbt_ml_sql_staging__{table}"
+        try:
+            # A session-scoped temp table: never persisted, never visible to
+            # list_tables()/tests, and dropped in `finally` even on failure.
+            self.connection.execute(
+                f"CREATE OR REPLACE TEMP TABLE {staging} AS {select_sql}"
+            )
+            check = self.connection.execute(
+                build_key_check_sql(f"SELECT * FROM {staging}", key)
+            ).fetchone()
+            null_count, duplicate_count = (check[0] or 0, check[1] or 0) if check else (0, 0)
+            if null_count or duplicate_count:
+                raise AdapterError(
+                    f"Incremental SQL model '{table}' unique_key '{unique_key}' "
+                    f"has {null_count} null and {duplicate_count} duplicate "
+                    "value(s) in the query result."
+                )
+
+            staging_cols = self._temp_table_columns(staging)
+            if unique_key not in staging_cols:
+                raise AdapterError(
+                    f"Incremental SQL model '{table}' query does not select its "
+                    f"unique_key column '{unique_key}'"
+                )
+            insert_cols = self._reconcile_sql_schema(
+                table, staging, staging_cols, on_schema_change
+            )
+
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                updated_row = self.connection.execute(
+                    f"SELECT COUNT(*) FROM {staging} AS s "
+                    f"JOIN {full} AS t ON t.{key} = s.{key}"
+                ).fetchone()
+                updated = int(updated_row[0]) if updated_row else 0
+                self.connection.execute(
+                    f"""
+                    DELETE FROM {full} AS target
+                    USING {staging} AS source
+                    WHERE target.{key} = source.{key}
+                    """
+                )
+                col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
+                self.connection.execute(
+                    f"INSERT INTO {full} BY NAME SELECT {col_list} FROM {staging}"
+                )
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
+
+            total_row = self.connection.execute(
+                f"SELECT COUNT(*) FROM {staging}"
+            ).fetchone()
+            total = int(total_row[0]) if total_row else 0
+        except duckdb.Error as e:
+            raise AdapterError(
+                f"Incremental SQL model materialization for '{table}' failed: {e}"
+            ) from e
+        finally:
+            self.connection.execute(f"DROP TABLE IF EXISTS {staging}")
+        return SqlMaterializationResult(
+            relation=full,
+            rows_written=total,
+            rows_inserted=total - updated,
+            rows_updated=updated,
+        )
+
+    def _temp_table_columns(self, table: str) -> list[str]:
+        rows = self.connection.execute(f"DESCRIBE {table}").fetchall()
+        return [row[0] for row in rows]
+
+    def _reconcile_sql_schema(
+        self,
+        table: str,
+        staging: str,
+        staging_cols: list[str],
+        on_schema_change: str,
+    ) -> list[str]:
+        """SQL-sourced analogue of `_reconcile_schema`: compares a staging
+        *table name*'s columns against the existing target instead of a
+        DataFrame's, since a SQL model's staged result has no Polars frame."""
+        target_cols = self._table_columns(table) or []
+        new = [c for c in staging_cols if c not in target_cols]
+        removed = [c for c in target_cols if c not in staging_cols]
+        if not new and not removed:
+            return list(staging_cols)
+
+        if on_schema_change == "fail":
+            drift = "; ".join(
+                part
+                for part in (
+                    f"new columns {new}" if new else "",
+                    f"removed columns {removed}" if removed else "",
+                )
+                if part
+            )
+            raise AdapterError(
+                f"Schema change on incremental table '{table}': {drift}. "
+                "Run with --full-refresh to rebuild it, or set "
+                "`on_schema_change: append_new_columns` (or `ignore`) on the model."
+            )
+        if on_schema_change == "append_new_columns":
+            if new:
+                staging_types = dict(
+                    self.connection.execute(
+                        f"SELECT column_name, column_type FROM (DESCRIBE {staging})"
+                    ).fetchall()
+                )
+                for col in new:
+                    self.connection.execute(
+                        f"ALTER TABLE {self.table_ref(table)} "
+                        f"ADD COLUMN {self.quote_ident(col)} {staging_types[col]}"
+                    )
+            return list(staging_cols)
+        if on_schema_change == "ignore":
+            return [c for c in staging_cols if c in target_cols]
+        raise AdapterError(
+            f"Unknown on_schema_change policy '{on_schema_change}'. "
+            "Allowed: fail, ignore, append_new_columns."
+        )
 
     def materialize_incremental(
         self,

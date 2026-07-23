@@ -318,6 +318,7 @@ class StatePageReader:
 class WarehouseCapability(StrEnum):
     SQL_QUERIES = "sql_queries"
     SQL_MODEL_MATERIALIZATION = "sql_model_materialization"
+    SQL_INCREMENTAL_MATERIALIZATION = "sql_incremental_materialization"
     TABULAR_READS = "tabular_reads"
     SQL_SCHEMA_TESTS = "sql_schema_tests"
     ATOMIC_FULL_REPLACE = "atomic_full_replace"
@@ -347,11 +348,17 @@ class SqlRelationSchema:
 
 @dataclass(frozen=True)
 class SqlMaterializationResult:
-    """Receipt from materializing a SQL model via CTAS/replace."""
+    """Receipt from materializing a SQL model via CTAS/replace, or a keyed
+    merge/upsert for `materialization: incremental` (issue #142). For a merge,
+    `rows_written` is the total staged/source row count; `rows_inserted` and
+    `rows_updated` are a best-effort split where the adapter can distinguish
+    them, else both stay `None`."""
 
     relation: str
     rows_written: int
     job_metadata: dict[str, Any] = field(default_factory=dict)
+    rows_inserted: int | None = None
+    rows_updated: int | None = None
 
 
 class ReadPredicateOperator(StrEnum):
@@ -779,6 +786,38 @@ class WarehouseAdapter(ABC):
         rows and return its output schema. Raises AdapterError on invalid SQL."""
         raise AdapterError(
             f"Adapter '{self.adapter_type()}' does not support SQL dry-run."
+        )
+
+    def relation_exists(self, table: str) -> bool:
+        """True if `table` currently exists in the target schema. Used to
+        decide, per run, whether an incremental SQL model's `is_incremental()`
+        branch is active (issue #142)."""
+        raise AdapterError(
+            f"Adapter '{self.adapter_type()}' cannot check relation existence."
+        )
+
+    def materialize_sql_incremental(
+        self,
+        table: str,
+        select_sql: str,
+        *,
+        unique_key: str,
+        on_schema_change: str = "fail",
+        options: BaseModel | None = None,
+    ) -> SqlMaterializationResult:
+        """Merge/upsert the result of `select_sql` into the existing `table`,
+        keyed on `unique_key`. Only called when `table` already exists and the
+        run is not a full refresh — the runner compiles `select_sql` from the
+        model's `is_incremental()` branch and calls `materialize_sql_full`
+        instead on first run or `--full-refresh`. The adapter validates
+        `unique_key` is non-null and unique in `select_sql`'s result via an
+        in-warehouse check (never pulling rows into Python) before mutating the
+        target, and applies `on_schema_change` exactly as
+        `materialize_incremental` does for DataFrame-sourced models. Availability
+        is gated on the `SQL_INCREMENTAL_MATERIALIZATION` capability."""
+        raise AdapterError(
+            f"Adapter '{self.adapter_type()}' does not support incremental SQL "
+            "model materialization (SQL_INCREMENTAL_MATERIALIZATION)."
         )
 
     # ─── materialization ──────────────────────────────────────────────────

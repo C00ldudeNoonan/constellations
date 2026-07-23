@@ -1,9 +1,8 @@
 # Warehouse-native SQL transform models
 
-Status: accepted design (issue #141). Not yet implemented — the first
-executable slice (full-refresh SQL models) lands in issue #143. This document is
-the architecture decision that #143 implements without reopening design
-questions. Incremental SQL models (#142) are a separate, later contract.
+Status: accepted design (issue #141), implemented for full-refresh (#143) and
+incremental (#142) SQL transforms. This document is the architecture decision
+those issues implement without reopening design questions.
 
 dbt-ml currently supports only `transform.type: python`: the runner reads each
 upstream relation into Polars via `adapter.read_table`, calls a Python module,
@@ -250,18 +249,74 @@ unchanged:
 - when the adapter declares atomic replacement, a query failure preserves the
   previous full target.
 
+## 8. Incremental materialization (#142)
+
+`materialization: incremental` extends the same `transform.type: sql` grammar
+with a required `unique_key:` (validated at compile time; forbidden on `full`
+SQL models and on python transforms, which have their own fixed-identity
+incremental path). `on_schema_change` is the existing model-level field, applied
+identically to the DataFrame-sourced incremental path.
+
+**Template surface:** `is_incremental()` (zero-arg) and `this` (the target's own
+quoted relation) are added to the sandbox, but only when the model is configured
+incremental — a `full` model that references either gets a `StrictUndefined`
+error, since neither is meaningful outside an incremental branch. Both are
+discovered by the same AST scan as `ref()`, so a dynamic/argument-taking
+`is_incremental(...)` is rejected before compilation.
+
+**Compile-time truth, not a runtime branch inside the query:** the runner
+decides, once per run, whether the model is *actually* running incrementally —
+`is_incremental()` renders `True` only when the target already exists **and**
+`--full-refresh` is not active — and compiles the `.sql` file accordingly. On
+the first run or under `--full-refresh`, it renders `False` and the model is
+materialized via the plain `materialize_sql_full` CTAS (the same path a `full`
+model uses); the compiled SQL for that run is simply whatever the template's
+non-incremental branch produces. Only when the target exists and the run isn't
+a full refresh does the runner compile the incremental branch and call
+`materialize_sql_incremental`. This keeps `is_incremental()` truthful — it never
+diverges from what the run actually did — at the cost of compiling the SQL text
+once per run rather than emitting both branches as separate artifacts (the
+"full" and "incremental" compiled SQL are both recoverable by running
+`dbt-ml compile` before and after the first materialization, so nothing is
+lost, just not simultaneously present in one manifest).
+
+**Adapter contract:** a new `SQL_INCREMENTAL_MATERIALIZATION` capability gates
+`materialize_sql_incremental(table, select_sql, *, unique_key, on_schema_change,
+options)`, called only when the target already exists (the adapter never needs
+an `IF NOT EXISTS` fallback — the runner's branch above guarantees that). Before
+mutating anything, the adapter validates `unique_key` is non-null and unique in
+`select_sql`'s result with a single portable aggregate query
+(`sql_models.build_key_check_sql`) that never returns row payloads to Python.
+DuckDB stages the compiled query into a session-scoped temp table, then runs a
+transactional delete-matching-keys + insert (the same idiom as the existing
+DataFrame `materialize_incremental`); BigQuery issues one `MERGE ... USING
+(select_sql) ...` statement, which is atomic as a single DML job. Both report a
+best-effort `rows_inserted`/`rows_updated` split — "matched" counts as "updated"
+even when column values happen to be unchanged, matching the existing
+DataFrame-incremental convention rather than claiming a true row-level diff.
+
+**Versioning:** `unique_key` and `on_schema_change` are folded into `code_version`
+(scoped to the SQL-transform payload block only, so no other model kind's state
+is affected) — changing either re-selects the model under `state:modified` even
+if the `.sql` file is untouched. `warehouse_options` stays excluded, unchanged
+from §6.
+
+**Deferred from this slice:** composite unique keys; a configured deletion
+strategy for source rows removed upstream (ordinary merge does not infer
+deletions); `insert_overwrite`/partition-replace strategies; concurrent-run
+serialization guarantees beyond each adapter's native transaction/DML atomicity.
+
 ## What this unblocks and what it defers
 
-Implemented by #143 (first slice): the grammar above, `ref()` compilation +
-lineage, the single-`SELECT` boundary, `materialize_sql_full` +
-`SQL_MODEL_MATERIALIZATION` on DuckDB and BigQuery, the raw/compiled artifacts,
-and `materialization: full` only.
+Implemented: the grammar in §1–§7 and full-refresh materialization (#143); the
+incremental grammar and materialization in §8 (#142); `materialize_sql_full` /
+`materialize_sql_incremental` and their capabilities on DuckDB and BigQuery.
 
 Explicitly deferred (unchanged from #141's scope):
 
-- Incremental `is_incremental()` / `this` semantics and merge/partition
-  strategies (#142).
 - Inline SQL, `source()`, `var()`, and any macro/package compatibility.
 - Executing SQL against a retrieval store (LanceDB, turbopuffer, …).
 - Warehouse-specific ML/embedding SQL functions.
 - Author-owned DDL/DML, multiple statements, and pre/post hooks.
+- Composite unique keys, CDC/deletion strategies, and partition-replace
+  incremental strategies (see §8).

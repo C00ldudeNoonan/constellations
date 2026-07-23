@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict
@@ -10,6 +10,7 @@ class GroupByParam(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    type: Literal["dimension", "time_dimension"]
     grain: str | None = None
 
 
@@ -37,8 +38,12 @@ def create_metric_mcp_server() -> Any:
         """Return the governed refund-rate metric fixture as CSV."""
         del order_by
         expected_grouping = [
-            GroupByParam(name="metric_time", grain="quarter"),
-            GroupByParam(name="customer_segment"),
+            GroupByParam(
+                name="metric_time",
+                type="time_dimension",
+                grain="quarter",
+            ),
+            GroupByParam(name="customer_segment", type="dimension"),
         ]
         if metrics != ["refund_rate"]:
             raise ValueError("This fixture only exposes the refund_rate metric")

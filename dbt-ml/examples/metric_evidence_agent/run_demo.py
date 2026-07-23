@@ -30,8 +30,12 @@ _MODEL = "context_search"
 _METRIC_ARGUMENTS = {
     "metrics": ["refund_rate"],
     "group_by": [
-        {"name": "metric_time", "grain": "quarter"},
-        {"name": "customer_segment"},
+        {
+            "name": "metric_time",
+            "type": "time_dimension",
+            "grain": "quarter",
+        },
+        {"name": "customer_segment", "type": "dimension"},
     ],
     "where": "customer_segment = 'enterprise'",
     "limit": 2,

@@ -56,6 +56,26 @@ tests, and the SQL mart all succeed, materializing `raw_invoices`,
 `invoice_summary`, `monthly_totals`, and `invoice_facts` into one
 `target/embedded.duckdb`.
 
+## Using this in your own dbt project
+
+dbt-ml is **not** a dbt package — `packages.yml` / `dbt deps` can't install a
+Python dependency, and the generated models `import dbt_ml`. It works through two
+surfaces instead:
+
+1. **Python package** — add `dbt-ml` (alongside `dbt-duckdb`) to your dbt
+   project's environment (`pip install dbt-ml` / add it to `pyproject.toml`).
+   This provides the `dbt-ml` CLI and the `dbt_ml.dbt_embed.materialize` engine
+   the generated models call in-process. No extra is needed — `materialize`
+   ships in the core install and has no dbt dependency.
+2. **Generated dbt resources** — run `dbt-ml codegen --output models/dbt_ml`
+   pointed at your dbt-ml project. It writes the Python-model shims + `schema.yml`
+   into your dbt repo; commit them like any other model and regenerate when the
+   dbt-ml YAML changes.
+
+Then `dbt build` as usual (with `DBT_ML_PROJECT_DIR` set). See the "Composing
+with dbt → Embedded" section of the [main README](../../README.md) for the full
+write-up.
+
 ## Prototype scope / caveats
 
 - **dbt-duckdb only.** Python models on warehouse-side runtimes (Snowpark,

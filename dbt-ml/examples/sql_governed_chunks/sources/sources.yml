@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: chunk_docs
+    description: "Document chunks (JSON, one chunk per file)"
+    path: "./fixtures/chunks/"
+    file_pattern: "*.json"
+  - name: permission_docs
+    description: "Per-document tenant/ACL metadata (JSON)"
+    path: "./fixtures/permissions/"
+    file_pattern: "*.json"

@@ -112,7 +112,44 @@ def load_project(
             )
         )
 
+    _populate_sql_depends_on(models, project_dir)
+
     return project, sources, models
+
+
+def _populate_sql_depends_on(
+    models: list[ModelConfig], project_dir: Path
+) -> None:
+    """Derive `depends_on` for SQL transforms from their `.sql` ref()s at load
+    time, so every DAG consumer — the compiler, manifest, run_results, and the
+    runner — sees the same lineage edges. Only fills an unset `depends_on`;
+    explicit declarations are preserved for the compiler's agreement check.
+    Unreadable/invalid SQL is left for the compiler to report with YAML context.
+    """
+    # Local imports avoid a cycle (paths imports ConfigError from here; sql_models
+    # is dependency-free beyond jinja2).
+    from ..paths import resolve_within_project
+    from ..sql_models import SqlModelError, discover_refs, read_sql_source
+
+    for model in models:
+        transform = model.transform
+        if (
+            transform is None
+            or transform.type != "sql"
+            or not transform.path
+            or model.depends_on
+        ):
+            continue
+        try:
+            resolved = resolve_within_project(
+                transform.path, project_dir, surface="transform.path"
+            )
+            sql_text = read_sql_source(resolved, model_name=model.name)
+            refs = discover_refs(sql_text, model_name=model.name)
+        except (ConfigError, SqlModelError):
+            continue
+        if refs:
+            model.depends_on = [f"ref('{name}')" for name in refs]
 
 
 def _parse_yaml_with_document[T](

@@ -19,6 +19,9 @@ from .base import (
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
+    SqlMaterializationResult,
+    SqlRelationColumn,
+    SqlRelationSchema,
     StaleStateFenceError,
     StatePage,
     StatePageReader,
@@ -180,6 +183,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
+                WarehouseCapability.SQL_MODEL_MATERIALIZATION,
                 WarehouseCapability.SQL_SCHEMA_TESTS,
                 WarehouseCapability.STREAMING_TABULAR_READS,
                 WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
@@ -346,6 +350,40 @@ class DuckDBAdapter(WarehouseAdapter):
         finally:
             self.connection.unregister("dbt_ml_staging")
         return df.height
+
+    def materialize_sql_full(
+        self,
+        table: str,
+        select_sql: str,
+        *,
+        options: BaseModel | None = None,
+    ) -> SqlMaterializationResult:
+        full = self.table_ref(table)
+        # DuckDB CREATE OR REPLACE is atomic (same guarantee materialize_full
+        # relies on) and leaves the prior table intact if the SELECT errors.
+        try:
+            self.connection.execute(f"CREATE OR REPLACE TABLE {full} AS {select_sql}")
+        except duckdb.Error as e:
+            raise AdapterError(
+                f"SQL model materialization for '{table}' failed: {e}"
+            ) from e
+        row = self.connection.execute(f"SELECT COUNT(*) FROM {full}").fetchone()
+        return SqlMaterializationResult(
+            relation=full, rows_written=int(row[0]) if row else 0
+        )
+
+    def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
+        try:
+            rel = self.connection.sql(
+                f"SELECT * FROM ({select_sql}) AS _dbt_ml_dry_run LIMIT 0"
+            )
+            columns = tuple(
+                SqlRelationColumn(name=name, data_type=str(dtype))
+                for name, dtype in zip(rel.columns, rel.types, strict=True)
+            )
+        except duckdb.Error as e:
+            raise AdapterError(f"SQL dry-run failed: {e}") from e
+        return SqlRelationSchema(columns=columns)
 
     def materialize_incremental(
         self,

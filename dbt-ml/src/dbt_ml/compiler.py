@@ -29,6 +29,12 @@ from .retrieval import (
     create_store,
     store_class,
 )
+from .sql_models import (
+    SqlModelError,
+    discover_refs,
+    read_sql_source,
+    validate_single_select,
+)
 from .test_specs import TestSpecError, parse_test_spec
 from .transforms import load_transform, transform_call_arity
 
@@ -69,6 +75,13 @@ def validate_project_contract(
                 relative_path=("extraction", "default_backend"),
             )
         )
+
+    # SQL transforms derive their `depends_on` from the `ref()` calls in the
+    # `.sql` file; populate it before edge validation and DAG construction so the
+    # existing lineage/selector/state machinery treats them like any transform.
+    for model in models:
+        if model.transform is not None and model.transform.type == "sql":
+            _prepare_sql_transform(model, project_dir)
 
     for model in models:
         _validate_tests(model, source_names, model_names, project_dir)
@@ -652,14 +665,74 @@ def _validate_materialization(model: ModelConfig) -> None:
         )
 
 
+def _prepare_sql_transform(model: ModelConfig, project_dir: Path) -> None:
+    """Resolve + read a SQL transform's `.sql` file, discover its literal refs,
+    and populate `depends_on` from them (validating agreement with any explicit
+    `depends_on`). Runs before edge validation and DAG construction."""
+    assert model.transform is not None
+    transform = model.transform
+    if not transform.path:
+        raise _model_error(
+            model,
+            f"SQL transform model '{model.name}' requires a `path:` to a .sql file",
+            ("transform", "path"),
+        )
+    if model.agent_context is not None:
+        # The Python transform path validates agent_context outputs
+        # (_validate_agent_context_output) before materializing; there is no
+        # warehouse-side equivalent yet, so a SQL model must not advertise an
+        # unverified agent_context contract. Reject until #145's contract check
+        # can run against the materialized relation.
+        raise _model_error(
+            model,
+            f"SQL transform model '{model.name}' does not support `agent_context` "
+            "yet: SQL outputs are not validated against the contract before "
+            "publication. Use a python transform, or drop agent_context.",
+            ("agent_context",),
+        )
+    try:
+        resolved = resolve_within_project(
+            transform.path, project_dir, surface=f"model '{model.name}' transform.path"
+        )
+        sql_text = read_sql_source(resolved, model_name=model.name)
+        validate_single_select(sql_text, model_name=model.name)
+        refs = discover_refs(sql_text, model_name=model.name)
+    except (SqlModelError, ConfigError) as e:
+        raise _model_error(model, str(e), ("transform", "path")) from e
+
+    if not refs:
+        raise _model_error(
+            model,
+            f"SQL transform model '{model.name}' must ref() at least one upstream "
+            "model",
+            ("transform", "path"),
+        )
+
+    if model.depends_on:
+        declared = {parse_ref(dep) for dep in model.depends_on}
+        if declared != set(refs):
+            raise _model_error(
+                model,
+                f"SQL transform model '{model.name}' declares depends_on "
+                f"{sorted(declared)} but its SQL ref()s {sorted(refs)}; they must "
+                "match (depends_on is optional for SQL models).",
+                ("depends_on",),
+            )
+    # Canonical ref() form so parse_ref and the DAG treat it uniformly.
+    model.depends_on = [f"ref('{name}')" for name in refs]
+
+
 def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
     assert model.transform is not None
     transform = model.transform
+    if transform.type == "sql":
+        # Source, refs, and depends_on were validated in _prepare_sql_transform.
+        return
     if transform.type != "python":
         raise _model_error(
             model,
             f"Transform model '{model.name}' has unsupported type '{transform.type}'; "
-            "supported: python",
+            "supported: python, sql",
             ("transform", "type"),
         )
     if not transform.module:

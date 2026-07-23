@@ -281,6 +281,26 @@ def test_incremental_schema_change_append_new_columns(duckdb_adapter) -> None:
     assert rows == [(1, "a", None), (2, "b", "extra")]
 
 
+def test_incremental_rejects_key_missing_from_target_even_with_append(
+    duckdb_adapter,
+) -> None:
+    # The target's unique_key changed (or never had this column); appending it
+    # as a schema-drift "new column" would leave existing rows with a NULL key,
+    # so this must fail under every on_schema_change policy, not only `fail`.
+    duckdb_adapter.connection.execute(
+        "CREATE TABLE main.tgt AS SELECT * FROM (VALUES ('x', 'a')) AS t(old_id, v)"
+    )
+    with pytest.raises(AdapterError, match="does not exist in the current target"):
+        duckdb_adapter.materialize_sql_incremental(
+            "tgt",
+            "SELECT * FROM (VALUES (1, 'b')) AS t(id, v)",
+            unique_key="id",
+            on_schema_change="append_new_columns",
+        )
+    rows = duckdb_adapter.connection.execute("SELECT * FROM main.tgt").fetchall()
+    assert rows == [("x", "a")]  # target untouched
+
+
 def test_relation_exists(duckdb_adapter) -> None:
     assert duckdb_adapter.relation_exists("nope") is False
     duckdb_adapter.connection.execute("CREATE TABLE main.yep AS SELECT 1 AS x")

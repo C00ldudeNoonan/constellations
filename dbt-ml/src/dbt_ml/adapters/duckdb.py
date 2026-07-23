@@ -426,7 +426,7 @@ class DuckDBAdapter(WarehouseAdapter):
                     f"unique_key column '{unique_key}'"
                 )
             insert_cols = self._reconcile_sql_schema(
-                table, staging, staging_cols, on_schema_change
+                table, staging, staging_cols, on_schema_change, unique_key=unique_key
             )
 
             self.connection.execute("BEGIN TRANSACTION")
@@ -480,11 +480,25 @@ class DuckDBAdapter(WarehouseAdapter):
         staging: str,
         staging_cols: list[str],
         on_schema_change: str,
+        *,
+        unique_key: str,
     ) -> list[str]:
         """SQL-sourced analogue of `_reconcile_schema`: compares a staging
         *table name*'s columns against the existing target instead of a
         DataFrame's, since a SQL model's staged result has no Polars frame."""
         target_cols = self._table_columns(table) or []
+        if unique_key not in target_cols:
+            # The key changed (or was never in this target). Appending it as
+            # "just another new column" would leave every existing row with a
+            # NULL key — silently breaking the incremental key invariant — so
+            # this is fatal under every on_schema_change policy, not only
+            # `fail`.
+            raise AdapterError(
+                f"Incremental SQL model '{table}' unique_key '{unique_key}' does "
+                "not exist in the current target table (the key may have "
+                "changed). Run with --full-refresh to rebuild the target under "
+                "the new key."
+            )
         new = [c for c in staging_cols if c not in target_cols]
         removed = [c for c in target_cols if c not in staging_cols]
         if not new and not removed:

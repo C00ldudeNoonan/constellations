@@ -2216,13 +2216,30 @@ def test_fenced_replace_maps_gate_errors_without_leaking() -> None:
 
 # ─── SQL incremental materialization (issue #142) ──────────────────────────
 
+# materialize_sql_incremental stages select_sql into a real table (named with a
+# uuid4 suffix) before validating/merging it, so the checked and merged rowsets
+# are always identical. Fixing uuid4 makes the staging table id predictable.
+_STAGING_SUFFIX = "0" * 12
+_STAGING_TABLE = f"dbt_ml_staging__tgt__{_STAGING_SUFFIX}"
+_STAGING_ID = f"proj.ds.{_STAGING_TABLE}"
 
-def _schema_job(columns: list[tuple[str, str]]) -> _FakeJob:
-    job = _FakeJob()
-    job.schema = [  # type: ignore[attr-defined]
+
+@pytest.fixture
+def _fixed_staging_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    import uuid as uuid_module
+
+    monkeypatch.setattr(
+        "dbt_ml.adapters.bigquery.uuid4", lambda: uuid_module.UUID(int=0)
+    )
+
+
+def _stage_schema(client: _FakeClient, columns: list[tuple[str, str]]) -> None:
+    # materialize_sql_incremental reads the staged table's schema via
+    # get_table(), not a dry-run query, so register it the same way as any
+    # other existing table.
+    client.tables[_STAGING_ID] = [
         SimpleNamespace(name=name, field_type=field_type) for name, field_type in columns
     ]
-    return job
 
 
 def test_bigquery_relation_exists() -> None:
@@ -2233,12 +2250,13 @@ def test_bigquery_relation_exists() -> None:
     assert adapter.relation_exists("present") is True
 
 
-def test_bigquery_materialize_sql_incremental_builds_merge() -> None:
+def test_bigquery_materialize_sql_incremental_builds_merge(_fixed_staging_uuid) -> None:
     client = _FakeClient()
     client.tables["proj.ds.tgt"] = ["id", "v"]
+    _stage_schema(client, [("id", "INTEGER"), ("v", "STRING")])
     client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging AS select_sql
         _FakeJob(rows=[(0, 0)]),  # unique-key check: 0 null, 0 duplicate
-        _schema_job([("id", "INTEGER"), ("v", "STRING")]),  # dry_run_sql
         _FakeJob(affected=3),  # the MERGE itself
     ]
     adapter = _adapter(client)
@@ -2246,44 +2264,90 @@ def test_bigquery_materialize_sql_incremental_builds_merge() -> None:
         "tgt", "SELECT id, v FROM src", unique_key="id"
     )
     assert result.rows_written == 3
+
+    create_sql, _ = client.queries[0]
+    assert create_sql == f"CREATE TABLE `proj`.`ds`.`{_STAGING_TABLE}` AS SELECT id, v FROM src"
+    check_sql, _ = client.queries[1]
+    # The key check reads the staged table, never select_sql a second time.
+    assert "SELECT id, v FROM src" not in check_sql
+    assert f"`proj`.`ds`.`{_STAGING_TABLE}`" in check_sql
     merge_sql, _ = client.queries[-1]
-    assert merge_sql.startswith("MERGE `proj`.`ds`.`tgt` AS T USING (SELECT id, v FROM src) AS S")
+    assert merge_sql.startswith(
+        f"MERGE `proj`.`ds`.`tgt` AS T USING `proj`.`ds`.`{_STAGING_TABLE}` AS S"
+    )
+    assert "SELECT id, v FROM src" not in merge_sql  # merged from staging, not re-run
     assert "ON T.`id` = S.`id`" in merge_sql
     assert "WHEN MATCHED THEN UPDATE SET T.`v` = S.`v`" in merge_sql
     assert "WHEN NOT MATCHED THEN INSERT (`id`, `v`) VALUES (S.`id`, S.`v`)" in merge_sql
+    # The staging table is always dropped, success or failure.
+    assert client.dropped == [_STAGING_ID]
 
 
-def test_bigquery_materialize_sql_incremental_rejects_bad_key() -> None:
+def test_bigquery_materialize_sql_incremental_rejects_bad_key(_fixed_staging_uuid) -> None:
     client = _FakeClient()
     client.tables["proj.ds.tgt"] = ["id", "v"]
-    client.query_results = [_FakeJob(rows=[(1, 2)])]  # 1 null, 2 duplicates
+    client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging
+        _FakeJob(rows=[(1, 2)]),  # 1 null, 2 duplicates
+    ]
     adapter = _adapter(client)
     with pytest.raises(AdapterError, match="1 null and 2 duplicate"):
         adapter.materialize_sql_incremental(
             "tgt", "SELECT id, v FROM src", unique_key="id"
         )
+    assert client.dropped == [_STAGING_ID]
 
 
-def test_bigquery_materialize_sql_incremental_schema_change_fail() -> None:
+def test_bigquery_materialize_sql_incremental_rejects_key_missing_from_target(
+    _fixed_staging_uuid,
+) -> None:
+    # The target's unique_key changed (or never had this column); appending it
+    # as a schema-drift "new column" would leave existing rows keyless.
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["old_id", "v"]
+    _stage_schema(client, [("id", "INTEGER"), ("v", "STRING")])
+    client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging
+        _FakeJob(rows=[(0, 0)]),  # key check passes
+    ]
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match="does not exist in the current target"):
+        adapter.materialize_sql_incremental(
+            "tgt",
+            "SELECT id, v FROM src",
+            unique_key="id",
+            on_schema_change="append_new_columns",
+        )
+    assert client.dropped == [_STAGING_ID]
+
+
+def test_bigquery_materialize_sql_incremental_schema_change_fail(
+    _fixed_staging_uuid,
+) -> None:
     client = _FakeClient()
     client.tables["proj.ds.tgt"] = ["id", "v"]
+    _stage_schema(client, [("id", "INTEGER"), ("v", "STRING"), ("w", "STRING")])
     client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging
         _FakeJob(rows=[(0, 0)]),
-        _schema_job([("id", "INTEGER"), ("v", "STRING"), ("w", "STRING")]),
     ]
     adapter = _adapter(client)
     with pytest.raises(AdapterError, match="Schema change"):
         adapter.materialize_sql_incremental(
             "tgt", "SELECT id, v, w FROM src", unique_key="id"
         )
+    assert client.dropped == [_STAGING_ID]
 
 
-def test_bigquery_materialize_sql_incremental_appends_new_columns() -> None:
+def test_bigquery_materialize_sql_incremental_appends_new_columns(
+    _fixed_staging_uuid,
+) -> None:
     client = _FakeClient()
     client.tables["proj.ds.tgt"] = ["id", "v"]
+    _stage_schema(client, [("id", "INTEGER"), ("v", "STRING"), ("w", "STRING")])
     client.query_results = [
-        _FakeJob(rows=[(0, 0)]),
-        _schema_job([("id", "INTEGER"), ("v", "STRING"), ("w", "STRING")]),
+        _FakeJob(),  # CREATE TABLE staging
+        _FakeJob(rows=[(0, 0)]),  # key check
         _FakeJob(),  # ALTER TABLE ADD COLUMN
         _FakeJob(affected=1),  # the MERGE
     ]
@@ -2298,3 +2362,4 @@ def test_bigquery_materialize_sql_incremental_appends_new_columns() -> None:
     assert alter_sql == "ALTER TABLE `proj`.`ds`.`tgt` ADD COLUMN `w` STRING"
     merge_sql, _ = client.queries[-1]
     assert "`w`" in merge_sql
+    assert client.dropped == [_STAGING_ID]

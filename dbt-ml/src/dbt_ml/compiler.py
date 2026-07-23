@@ -663,6 +663,14 @@ def _validate_retrieval_tests(model: ModelConfig, model_names: set[str]) -> None
                 "the search model itself as its golden_set",
                 ("retrieval_tests",),
             )
+        if test.mode is not None and test.mode not in model.search.query.modes:
+            raise _model_error(
+                model,
+                f"Retrieval test '{test.name}' on '{model.name}' sets "
+                f"`mode: {test.mode}`, which the search index does not declare "
+                f"in `query.modes` ({sorted(model.search.query.modes)})",
+                ("retrieval_tests",),
+            )
 
 
 def _validate_materialization(model: ModelConfig) -> None:

@@ -227,6 +227,15 @@ def test_cli_eval_exits_zero_on_pass(eval_project: Path) -> None:
     assert "1 passed" in res.output
 
 
+def test_cli_eval_json_exits_zero_on_pass(eval_project: Path) -> None:
+    runner = CliRunner()
+    res = runner.invoke(
+        cli, ["--project-dir", str(eval_project), "eval", "--json"], catch_exceptions=False
+    )
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.output)["results"][0]["status"] == "pass"
+
+
 # ── mislabeled query fails a threshold ───────────────────────────────────────
 
 def test_mislabeled_golden_query_fails_threshold(tmp_path: Path) -> None:
@@ -275,6 +284,32 @@ def test_cli_eval_exits_one_on_fail(tmp_path: Path) -> None:
     res = runner.invoke(cli, ["--project-dir", str(project), "eval"], catch_exceptions=False)
     assert res.exit_code == 1
     assert "1 failed" in res.output
+
+
+def test_cli_eval_json_still_exits_one_on_fail(tmp_path: Path) -> None:
+    # --json must preserve the same exit-code semantics as the table output —
+    # a CI job parsing the JSON artifact must not silently pass a regression.
+    project = _write_project(tmp_path, retrieval_tests_yaml=_RETRIEVAL_TESTS_YAML)
+    run_project(project)
+    inflation_chunk = _chunk_id(project, "inflation")
+    _write_golden_rows(
+        project,
+        [
+            {
+                "query_id": "q_bad",
+                "query_text": "employment payroll",
+                "relevant_ids": [inflation_chunk],
+            }
+        ],
+    )
+    run_project(project, select="search_golden")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        cli, ["--project-dir", str(project), "eval", "--json"], catch_exceptions=False
+    )
+    assert res.exit_code == 1
+    assert json.loads(res.output)["results"][0]["status"] == "fail"
 
 
 # ── policy hard-failures are independent of ranking-metric averaging ────────
@@ -404,6 +439,48 @@ def test_retrieval_tests_rejected_on_non_search_model() -> None:
         _validate_retrieval_tests(model, {"m", "up", "g"})
 
 
+def test_retrieval_test_mode_rejected_when_not_declared_on_index() -> None:
+    from dbt_ml.compiler import _validate_retrieval_tests
+
+    model = ModelConfig(
+        name="idx",
+        depends_on=["ref('up')"],
+        materialization="incremental",
+        search={
+            "id_field": "id",
+            "text_fields": ["text"],
+            "full_text": {"fields": ["text"]},
+            "query": {"modes": ["text"]},
+        },
+        retrieval_tests=[
+            RetrievalTestConfig(name="t", golden_set="ref('g')", mode="vector")
+        ],
+    )
+    with pytest.raises(ConfigError, match=r"does not declare in `query\.modes`"):
+        _validate_retrieval_tests(model, {"idx", "up", "g"})
+
+
+def test_retrieval_test_mode_allowed_when_declared_on_index() -> None:
+    from dbt_ml.compiler import _validate_retrieval_tests
+
+    model = ModelConfig(
+        name="idx",
+        depends_on=["ref('up')"],
+        materialization="incremental",
+        search={
+            "id_field": "id",
+            "text_fields": ["text"],
+            "full_text": {"fields": ["text"]},
+            "vector": {"field": "v", "dimensions": 8, "embedding": "inherit"},
+            "query": {"modes": ["text", "vector"]},
+        },
+        retrieval_tests=[
+            RetrievalTestConfig(name="t", golden_set="ref('g')", mode="vector")
+        ],
+    )
+    _validate_retrieval_tests(model, {"idx", "up", "g"})  # must not raise
+
+
 def test_retrieval_test_config_rejects_bad_threshold_key() -> None:
     with pytest.raises(ValueError, match="Unknown retrieval threshold"):
         RetrievalTestConfig(
@@ -432,3 +509,25 @@ def test_retrieval_eval_error_on_empty_golden_set(tmp_path: Path) -> None:
     run_project(project, select="search_golden")
     with pytest.raises(RetrievalEvalError, match="no rows"):
         run_retrieval_evaluation(project)
+
+
+def test_malformed_golden_json_field_raises_eval_error_with_context(
+    eval_project: Path,
+) -> None:
+    # A malformed JSON column must be reported as a data problem in the named
+    # golden set / row / field, not surface a bare JSONDecodeError traceback.
+    (eval_project / "golden").mkdir(exist_ok=True)
+    for f in (eval_project / "golden").glob("*.json"):
+        f.unlink()
+    (eval_project / "golden" / "q_broken.json").write_text(
+        json.dumps(
+            {
+                "query_id": "q_broken",
+                "query_text": "consumer prices",
+                "relevant_ids": "not-valid-json-[{",
+            }
+        )
+    )
+    run_project(eval_project, select="search_golden")
+    with pytest.raises(RetrievalEvalError, match=r"'q_broken'.*'relevant_ids'.*not valid JSON"):
+        run_retrieval_evaluation(eval_project)

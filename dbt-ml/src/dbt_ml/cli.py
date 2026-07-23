@@ -1204,6 +1204,7 @@ def eval_(
 
     project, _sources, _models = load_project(project_dir)
     artifact_path = write_retrieval_eval_artifact(project_dir, project, results)
+    failed = sum(1 for r in results if r.status == "fail")
 
     if not results:
         click.echo("No retrieval_tests defined.")
@@ -1211,6 +1212,8 @@ def eval_(
 
     if as_json:
         click.echo(artifact_path.read_text())
+        if failed:
+            ctx.exit(1)
         return
 
     header = f"{'model':<22}{'test':<26}{'status':<8}{'thresholds'}"
@@ -1230,7 +1233,6 @@ def eval_(
     click.echo("-" * 90)
     passed = sum(1 for r in results if r.status == "pass")
     warned = sum(1 for r in results if r.status == "warn")
-    failed = sum(1 for r in results if r.status == "fail")
     summary = f"{passed} passed"
     if warned:
         summary += f", {warned} warned"

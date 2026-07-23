@@ -301,6 +301,7 @@ dbt-ml source freshness                                    # mtime vs warn_after
 dbt-ml docs generate [--output DIR]                        # static HTML site from manifest.json
 dbt-ml docs serve [--port N]                               # local http.server over target/docs/
 dbt-ml emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
+dbt-ml codegen --output DIR                                # generate dbt Python-model shims + schema.yml (embedded path)
 dbt-ml clean                                               # remove known target artifacts; preserve warehouses
 
 # Global flags (work on every command):
@@ -1238,6 +1239,7 @@ stops before it pollutes everything downstream.
 | `examples/support_tickets_pipeline/`| JSON tickets → open queue + SLA breaches + per-team workload (no LLM)  |
 | `examples/arxiv_papers/`            | arXiv metadata → deterministic data-quality checks (incl. `grounded_in`) |
 | `examples/dbt_consumer/`            | dbt-duckdb project consuming dbt-ml-materialized tables                 |
+| `examples/dbt_embed_duckdb/`        | dbt-ml embedded in one `dbt build` via generated Python models (#177)   |
 | `examples/classic_text_ml/`         | deterministic sparse text features + Naive Bayes classification        |
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
 
@@ -1245,7 +1247,12 @@ Each example is runnable end-to-end with `uv run dbt-ml --project-dir examples/<
 
 ## Composing with dbt
 
-dbt-ml does the unstructured→structured "E" and dbt does the SQL "T".
+dbt-ml does the unstructured→structured "E" and dbt does the SQL "T". There are
+two ways to compose them, depending on whether you want a staged handoff or one
+`dbt build`.
+
+### Staged handoff — `emit-dbt-sources` (any adapter)
+
 `emit-dbt-sources` targets the matching adapter: dbt-duckdb can share the
 DuckDB file, and dbt-bigquery can read the configured BigQuery dataset. The
 DuckDB bridge:
@@ -1261,6 +1268,39 @@ cd examples/dbt_consumer && uv sync && uv run dbt build --profiles-dir .
 `emit-dbt-sources` translates dbt-ml tables into a dbt-compatible `sources.yml`.
 Column tests carry over (`not_null`, single-column `unique`); composite unique
 becomes a `dbt_utils.unique_combination_of_columns` macro test.
+
+### Embedded in one `dbt build` — `codegen` (dbt-duckdb)
+
+> Status: preview (issue #177). dbt-duckdb only; extraction and transform models.
+
+`dbt-ml codegen` turns each dbt-ml model into a native dbt **Python model** so a
+single `dbt build` runs dbt-ml and dbt in one DAG — dbt and dbt-ml models
+`ref()` each other and share one `dbt docs` lineage graph, no orchestrator.
+
+dbt-ml is **not** a dbt package (`packages.yml` / `dbt deps` can't install a
+Python dependency). Instead it works through two surfaces:
+
+1. **Python package** — `pip install dbt-ml` into the same environment as your
+   dbt-duckdb project. This provides the `dbt-ml` CLI and the
+   `dbt_ml.dbt_embed.materialize` engine the generated models call in-process.
+   (`materialize` has no dbt dependency and needs no extra — it ships in the
+   core install.)
+2. **Generated dbt resources** — `dbt-ml codegen` writes one Python-model shim
+   per model plus a `schema.yml` (fields + tests) **into** your dbt project's
+   `models/` tree. You commit these like any other model; the dbt-ml YAML stays
+   the source of truth and you regenerate when it changes.
+
+```bash
+# In your dbt project's environment (dbt-duckdb + dbt-ml installed):
+dbt-ml --project-dir path/to/dbt_ml_project codegen --output models/dbt_ml
+DBT_ML_PROJECT_DIR=path/to/dbt_ml_project dbt build
+```
+
+Each generated Python model imports `dbt_ml.dbt_embed.materialize` lazily at run
+time; dbt-duckdb executes it in-process, so extraction, LLM calls, and the LLM
+response cache all run locally. See
+[`examples/dbt_embed_duckdb`](examples/dbt_embed_duckdb) for a runnable
+three-level DAG (extraction → transforms → SQL mart).
 
 ## Artifacts
 

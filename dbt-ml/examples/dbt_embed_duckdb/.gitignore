@@ -1,0 +1,6 @@
+target/
+logs/
+dbt_packages/
+.venv/
+uv.lock
+.user.yml

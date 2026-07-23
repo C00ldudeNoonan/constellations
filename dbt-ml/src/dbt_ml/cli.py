@@ -1219,6 +1219,46 @@ def emit_dbt_sources(
     click.echo(f"Wrote {path}")
 
 
+@cli.command("codegen")
+@click.option(
+    "--output",
+    "output",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+    help="Directory in the dbt project to write the shims + schema.yml into "
+    "(e.g. <dbt-project>/models/dbt_ml).",
+)
+@click.option(
+    "--source-name",
+    default=None,
+    help="Name used in the generated schema.yml (default: dbt_ml_<project-name>).",
+)
+@_project_context_options
+@click.pass_context
+def codegen(
+    ctx: click.Context,
+    output: Path,
+    source_name: str | None,
+) -> None:
+    """Generate dbt Python-model shims + schema.yml from this dbt-ml project (#177).
+
+    Emits one dbt Python model per extraction/transform model — each calls
+    dbt-ml in-process via `dbt_ml.dbt_embed.materialize` — plus a schema.yml
+    carrying the models' fields and tests. Point --output at a directory under
+    your dbt project's model-paths so `dbt build` runs dbt-ml as native dbt
+    nodes. Set DBT_ML_PROJECT_DIR to this project when running dbt.
+    """
+    from .dbt_embed.codegen import generate_dbt_models
+
+    project_dir: Path = ctx.obj["project_dir"]
+    try:
+        written = generate_dbt_models(project_dir, output, source_name=source_name)
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    for path in written:
+        click.echo(f"Wrote {path}")
+
+
 @cli.group()
 @_project_context_options
 def mcp() -> None:

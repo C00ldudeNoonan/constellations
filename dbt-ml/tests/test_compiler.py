@@ -589,7 +589,7 @@ def test_non_incremental_model_kinds_reject_incremental_materialization(
 @pytest.mark.parametrize(
     ("transform", "module_source", "message"),
     [
-        ({"type": "sql", "module": "transforms.derived"}, None, "unsupported type"),
+        ({"type": "javascript", "module": "transforms.derived"}, None, "unsupported type"),
         ({"type": "python"}, None, "requires a `module:`"),
         (
             {"type": "python", "module": "transforms.missing"},

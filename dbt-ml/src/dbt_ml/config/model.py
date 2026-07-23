@@ -195,8 +195,24 @@ class TransformConfig(BaseModel):
 
     type: str
     module: str | None = None
+    path: str | None = None
     uses_llm: bool = False
     options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_implementation(self) -> TransformConfig:
+        # Exactly one implementation surface per type: python uses `module`,
+        # sql uses a `.sql` `path`. The compiler validates the file itself; this
+        # guards the config shape so a mismatched pair fails fast at load time.
+        if self.type == "python":
+            if self.path is not None:
+                raise ValueError("`transform.type: python` does not accept a `path`")
+        elif self.type == "sql":
+            if self.module is not None:
+                raise ValueError("`transform.type: sql` does not accept a `module`")
+            if self.uses_llm:
+                raise ValueError("`transform.type: sql` does not accept `uses_llm`")
+        return self
 
 
 class AgentContextConfig(BaseModel):

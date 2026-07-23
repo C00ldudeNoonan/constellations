@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
@@ -317,6 +317,7 @@ class StatePageReader:
 
 class WarehouseCapability(StrEnum):
     SQL_QUERIES = "sql_queries"
+    SQL_MODEL_MATERIALIZATION = "sql_model_materialization"
     TABULAR_READS = "tabular_reads"
     SQL_SCHEMA_TESTS = "sql_schema_tests"
     ATOMIC_FULL_REPLACE = "atomic_full_replace"
@@ -329,6 +330,28 @@ class WarehouseCapability(StrEnum):
     TABULAR_PREDICATE_PUSHDOWN = "tabular_predicate_pushdown"
     PAGED_STATE_RECONCILIATION = "paged_state_reconciliation"
     ATOMIC_STATE_SCOPE_REPLACE = "atomic_state_scope_replace"
+
+
+@dataclass(frozen=True)
+class SqlRelationColumn:
+    name: str
+    data_type: str
+
+
+@dataclass(frozen=True)
+class SqlRelationSchema:
+    """Output schema of a compiled SELECT, from an adapter dry-run."""
+
+    columns: tuple[SqlRelationColumn, ...]
+
+
+@dataclass(frozen=True)
+class SqlMaterializationResult:
+    """Receipt from materializing a SQL model via CTAS/replace."""
+
+    relation: str
+    rows_written: int
+    job_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ReadPredicateOperator(StrEnum):
@@ -730,6 +753,33 @@ class WarehouseAdapter(ABC):
             operation="SQL table references",
         )
         return f"{self.schema_ref}.{self.quote_ident(table)}"
+
+    # ─── SQL model materialization (#143) ─────────────────────────────────
+
+    def materialize_sql_full(
+        self,
+        table: str,
+        select_sql: str,
+        *,
+        options: BaseModel | None = None,
+    ) -> SqlMaterializationResult:
+        """Replace `table` with the result of the compiled `select_sql` via an
+        adapter-owned CTAS/replace — rows never leave the warehouse. `select_sql`
+        is a validated single SELECT with refs already compiled to quoted
+        relations; the adapter owns target quoting, staging, atomic replacement,
+        and physical layout from `options`. Availability is gated on the
+        `SQL_MODEL_MATERIALIZATION` capability."""
+        raise AdapterError(
+            f"Adapter '{self.adapter_type()}' does not support SQL model "
+            "materialization (SQL_MODEL_MATERIALIZATION)."
+        )
+
+    def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
+        """Validate `select_sql` against the real dialect without materializing
+        rows and return its output schema. Raises AdapterError on invalid SQL."""
+        raise AdapterError(
+            f"Adapter '{self.adapter_type()}' does not support SQL dry-run."
+        )
 
     # ─── materialization ──────────────────────────────────────────────────
 

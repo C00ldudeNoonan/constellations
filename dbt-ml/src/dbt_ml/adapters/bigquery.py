@@ -52,6 +52,9 @@ from .base import (
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
+    SqlMaterializationResult,
+    SqlRelationColumn,
+    SqlRelationSchema,
     StaleStateFenceError,
     StatePage,
     StatePageReader,
@@ -706,6 +709,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
+                WarehouseCapability.SQL_MODEL_MATERIALIZATION,
                 WarehouseCapability.SQL_SCHEMA_TESTS,
                 WarehouseCapability.STREAMING_TABULAR_READS,
                 WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
@@ -1478,6 +1482,54 @@ class BigQueryAdapter(WarehouseAdapter):
             buffer, self._table_id(table), job_config=job_config
         )
         job.result()
+
+    def materialize_sql_full(
+        self,
+        table: str,
+        select_sql: str,
+        *,
+        options: BaseModel | None = None,
+    ) -> SqlMaterializationResult:
+        # Pure DDL: a single CREATE OR REPLACE ... AS SELECT is atomic and,
+        # unlike a load job, may also change the partition/cluster spec — so no
+        # staging swap is needed. A failed statement leaves the target intact.
+        layout = self._layout(options)
+        try:
+            job = self._run_query(
+                f"CREATE OR REPLACE TABLE {self.table_ref(table)}"
+                f"{self._ddl_layout_clauses(options)} AS {select_sql}",
+                job_labels=(layout.labels or None) if layout is not None else None,
+            )
+        except Exception as e:
+            raise AdapterError(
+                f"SQL model materialization for '{table}' failed: {e}"
+            ) from e
+        num_rows = int(self.client.get_table(self._table_id(table)).num_rows or 0)
+        job_metadata: dict[str, Any] = {}
+        job_id = getattr(job, "job_id", None)
+        if job_id:
+            job_metadata["job_id"] = job_id
+        total_bytes = getattr(job, "total_bytes_processed", None)
+        if total_bytes is not None:
+            job_metadata["total_bytes_processed"] = total_bytes
+        return SqlMaterializationResult(
+            relation=self.table_ref(table),
+            rows_written=num_rows,
+            job_metadata=job_metadata,
+        )
+
+    def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
+        bigquery = _bigquery()
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        try:
+            job = self.client.query(select_sql, job_config=job_config)
+        except Exception as e:
+            raise AdapterError(f"SQL dry-run failed: {e}") from e
+        columns = tuple(
+            SqlRelationColumn(name=str(f.name), data_type=str(f.field_type))
+            for f in (job.schema or [])
+        )
+        return SqlRelationSchema(columns=columns)
 
     def materialize_full(
         self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None

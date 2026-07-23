@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: document_permissions
+    description: "Per-document tenant and access-group metadata"
+    source: ref('permission_docs')
+    extraction:
+      backend: json
+      options:
+        fields: [doc_ref, tenant_id, access_groups, is_public]
+    materialization: full
+    tags: [permissions]
+    fields:
+      - {name: doc_ref, data_type: string}
+      - {name: tenant_id, data_type: string}
+      - {name: access_groups, data_type: json}
+      - {name: is_public, data_type: boolean}
+    tests:
+      - not_null: [doc_ref, tenant_id]
+      - unique: doc_ref

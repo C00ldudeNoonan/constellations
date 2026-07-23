@@ -96,6 +96,7 @@ from .retrieval import (
     create_store,
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
+from .sql_models import compile_sql, discover_refs, read_sql_source
 from .state_reconciliation import BoundedReconciler, UpstreamRecord
 from .transforms import TransformContext, load_transform, transform_call_arity
 from .versioning import compute_code_version, compute_model_code_version
@@ -653,12 +654,20 @@ def _run_model(
             adapter=adapter,
         )
     elif model.transform is not None:
-        result = _run_transform_model(
-            model=model,
-            project_dir=project_dir,
-            adapter=adapter,
-            resolved=resolved,
-        )
+        if model.transform.type == "sql":
+            result = _run_sql_model(
+                model=model,
+                project_dir=project_dir,
+                adapter=adapter,
+                resolved=resolved,
+            )
+        else:
+            result = _run_transform_model(
+                model=model,
+                project_dir=project_dir,
+                adapter=adapter,
+                resolved=resolved,
+            )
     elif model.chunk is not None:
         result = _run_chunk_model(
             model=model,
@@ -1240,6 +1249,67 @@ def _scalarize(value: Any) -> Any:
     if isinstance(value, dict | list):
         return json.dumps(value, default=str)
     return value
+
+
+def _run_sql_model(
+    *,
+    model: ModelConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+) -> ModelRunResult:
+    """Compile a SQL transform's refs to warehouse relations and materialize it
+    with an adapter-owned CTAS — upstream rows never enter the dbt-ml process."""
+    assert model.transform is not None and model.transform.path is not None
+    if model.materialization != "full":
+        raise RunError(
+            f"SQL model '{model.name}' only supports `materialization: full` in this "
+            "slice (see #142 for incremental)."
+        )
+    if WarehouseCapability.SQL_MODEL_MATERIALIZATION not in adapter.capabilities():
+        raise RunError(
+            f"Adapter '{adapter.adapter_type()}' does not support SQL models "
+            "(SQL_MODEL_MATERIALIZATION)."
+        )
+
+    resolved_path = resolve_within_project(
+        model.transform.path,
+        project_dir,
+        surface=f"model '{model.name}' transform.path",
+    )
+    sql_text = read_sql_source(resolved_path, model_name=model.name)
+    refs = discover_refs(sql_text, model_name=model.name)
+    # Each ref resolves to the upstream model's adapter-quoted target relation.
+    relations = {name: adapter.table_ref(name) for name in refs}
+    select_sql = compile_sql(
+        sql_text,
+        model_name=model.name,
+        relations=relations,
+        target_name=resolved.target_name,
+        target_type=resolved.warehouse.type,
+    )
+
+    try:
+        result = adapter.materialize_sql_full(
+            model.name, select_sql, options=_warehouse_options(adapter, model)
+        )
+    except AdapterError as e:
+        raise RunError(f"SQL model '{model.name}' failed: {e}") from e
+
+    metrics: dict[str, Any] = {
+        "compiled_sql": select_sql,
+        "relation": result.relation,
+        "refs": list(refs),
+    }
+    if result.job_metadata:
+        metrics["job"] = result.job_metadata
+    return ModelRunResult(
+        model_name=model.name,
+        materialization=model.materialization,
+        kind="sql",
+        rows_written=result.rows_written,
+        metrics=metrics,
+    )
 
 
 def _run_transform_model(

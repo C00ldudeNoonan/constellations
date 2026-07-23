@@ -7,6 +7,7 @@ from typing import Any
 
 from .backends import get_backend, validate_backend_options
 from .backends.options import LLMBackendOptions
+from .config.loader import ConfigError
 from .config.model import (
     AgentContextConfig,
     ChunkConfig,
@@ -32,6 +33,7 @@ from .providers import (
     profile_options_fingerprint,
     resolve_provider_model,
 )
+from .sql_models import SQL_COMPILER_CONTRACT_VERSION
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
@@ -146,6 +148,22 @@ def compute_code_version(
             payload["transform_code_hash"] = _hash_file(module_file)
         else:
             payload["transform_code_hash"] = "missing"
+
+    if transform and transform.type == "sql" and transform.path:
+        # Raw source-SQL content + template contract version drive state
+        # selection; the compiled, target-specific SQL is recorded separately in
+        # the manifest so DuckDB vs BigQuery spelling never churns code_version.
+        payload["sql_contract"] = SQL_COMPILER_CONTRACT_VERSION
+        try:
+            sql_file = resolve_within_project(
+                transform.path, project_dir, surface="transform.path"
+            )
+        except ConfigError:
+            payload["transform_sql_hash"] = "missing"
+        else:
+            payload["transform_sql_hash"] = (
+                _hash_file(sql_file) if sql_file.exists() else "missing"
+            )
 
     canonical = canonical_json(payload)
     return hashlib.blake2b(

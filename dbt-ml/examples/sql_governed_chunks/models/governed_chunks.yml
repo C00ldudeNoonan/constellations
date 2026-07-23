@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: governed_chunks
+    description: "Chunks joined to tenant/access metadata — a SQL transform (#143)"
+    transform:
+      type: sql
+      path: sql/governed_chunks.sql
+    materialization: full
+    tags: [governed, sql]
+    # depends_on is derived from the SQL ref()s (document_chunks, document_permissions).
+    fields:
+      - {name: chunk_id, data_type: string}
+      - {name: doc_ref, data_type: string}
+      - {name: text, data_type: string}
+      - {name: tenant_id, data_type: string}
+      - {name: access_groups, data_type: json}
+      - {name: is_public, data_type: boolean}
+    tests:
+      - not_null: [chunk_id, doc_ref, is_public]
+      - unique: chunk_id

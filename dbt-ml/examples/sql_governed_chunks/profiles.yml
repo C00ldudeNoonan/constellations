@@ -1,0 +1,8 @@
+sql_governed_chunks:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/dbt_ml.duckdb
+        schema: dbt_ml

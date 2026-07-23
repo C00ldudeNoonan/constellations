@@ -16,7 +16,7 @@ import polars as pl
 from ..compiler import validate_project_contract
 from ..config import load_project
 from ..dag import ProjectDAG
-from ..profile import resolve_profile
+from ..profile import apply_source_path_overrides, resolve_profile
 from ..runner import _discover_sources, _run_model
 from .adapter import CaptureAdapter
 
@@ -58,6 +58,10 @@ def materialize(
         target=target,
         profiles_dir=Path(profiles_dir) if profiles_dir is not None else None,
     )
+
+    # Apply the selected target's source_paths overrides before discovery, so an
+    # embedded build scans the same dev/prod roots the standalone runner would.
+    sources = apply_source_path_overrides(sources, resolved)
 
     required_sources = set(dag.required_sources([model]))
     source_docs = _discover_sources(

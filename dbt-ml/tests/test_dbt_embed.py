@@ -7,8 +7,9 @@ import polars as pl
 import pytest
 import yaml
 
+from dbt_ml.config.model import ModelConfig
 from dbt_ml.dbt_embed import materialize
-from dbt_ml.dbt_embed.codegen import generate_dbt_models
+from dbt_ml.dbt_embed.codegen import _embeddable_models, generate_dbt_models
 
 
 @pytest.fixture
@@ -101,3 +102,33 @@ def test_materialize_transform_with_injected_upstream(fresh_project: Path) -> No
 def test_materialize_rejects_unknown_model(fresh_project: Path) -> None:
     with pytest.raises(ValueError, match="not defined"):
         materialize("does_not_exist", project_dir=fresh_project)
+
+
+def _fake_model(
+    name: str,
+    *,
+    extraction: bool = False,
+    transform: bool = False,
+    ml: bool = False,
+    deps: list[str] | None = None,
+) -> ModelConfig:
+    # model_construct skips validation so we can exercise the dependency-closure
+    # logic without building full extraction/transform/ml block schemas.
+    return ModelConfig.model_construct(
+        name=name,
+        extraction=object() if extraction else None,
+        transform=object() if transform else None,
+        ml=object() if ml else None,
+        depends_on=[f"ref('{d}')" for d in (deps or [])] or None,
+    )
+
+
+def test_embeddable_skips_transforms_that_depend_on_nonemittable_models() -> None:
+    models = [
+        _fake_model("ex", extraction=True),
+        _fake_model("mlmod", ml=True),  # non-emittable kind
+        _fake_model("good", transform=True, deps=["ex"]),
+        _fake_model("bad", transform=True, deps=["mlmod"]),  # dep not emitted
+        _fake_model("downstream", transform=True, deps=["bad"]),  # transitively
+    ]
+    assert {m.name for m in _embeddable_models(models)} == {"ex", "good"}

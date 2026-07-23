@@ -38,8 +38,9 @@ def generate_dbt_models(
     project_path = Path(project_dir)
     project, _sources, models = load_project(project_path)
 
-    embeddable = [m for m in models if m.extraction is not None or m.transform is not None]
-    skipped = [m.name for m in models if m not in embeddable]
+    embeddable = _embeddable_models(models)
+    embeddable_names = {m.name for m in embeddable}
+    skipped = [m.name for m in models if m.name not in embeddable_names]
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -64,15 +65,40 @@ def generate_dbt_models(
     written.append(schema_path)
 
     if skipped:
-        # Search/chunk/embed/ml/llm models aren't in the embedded prototype yet;
-        # name them so the operator knows they weren't emitted.
+        # Two reasons a model isn't emitted: its kind is unsupported by the
+        # embedded prototype (chunk/embed/llm/ml/search), or it's a transform
+        # that (transitively) depends on such a model — emitting it would write
+        # a dbt.ref() to a node that doesn't exist and break `dbt parse`.
         (out_path / "_SKIPPED.txt").write_text(
-            "Not emitted (embedded prototype supports extraction/transform only):\n"
+            "Not emitted (embedded prototype supports extraction/transform models\n"
+            "whose dependencies are all themselves emittable):\n"
             + "\n".join(f"  - {n}" for n in skipped)
             + "\n",
             encoding="utf-8",
         )
     return written
+
+
+def _embeddable_models(models: list[ModelConfig]) -> list[ModelConfig]:
+    """Models emittable as dbt nodes: extraction/transform kinds whose full
+    dependency closure is also emittable. A transform depending on a non-emitted
+    model (chunk/embed/llm/ml/search — or another skipped transform) is dropped
+    so the generated project never references a missing dbt node."""
+    by_name = {m.name: m for m in models}
+    keep = {m.name for m in models if m.extraction is not None or m.transform is not None}
+
+    # Fixed-point removal: drop any kept model with a dependency outside `keep`,
+    # repeating so a skip propagates to everything downstream of it.
+    changed = True
+    while changed:
+        changed = False
+        for name in list(keep):
+            deps = [parse_ref(d) for d in (by_name[name].depends_on or [])]
+            if any(dep not in keep for dep in deps):
+                keep.discard(name)
+                changed = True
+
+    return [m for m in models if m.name in keep]
 
 
 def _model_entry(table: dict[str, object]) -> dict[str, object]:

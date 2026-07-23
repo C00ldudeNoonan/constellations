@@ -28,6 +28,7 @@ DAG, docs, model-kind, and materialization behavior are inherited unchanged.
     type: sql
     path: sql/governed_chunks.sql
   materialization: incremental
+  unique_key: chunk_id
   fields:
     - {name: chunk_id, data_type: string}
     - {name: access_groups}

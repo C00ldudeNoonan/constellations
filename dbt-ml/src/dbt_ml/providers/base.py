@@ -16,7 +16,7 @@ from functools import cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from types import UnionType
-from typing import Any, ClassVar, Self, Union, get_args, get_origin
+from typing import Any, ClassVar, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.fields import FieldInfo
@@ -516,6 +516,7 @@ class EmbeddingRequest:
     texts: tuple[str, ...] = field(repr=False)
     dimensions: int | None = None
     input_ids: tuple[str, ...] | None = field(default=None, repr=False)
+    input_type: Literal["document", "query"] = "document"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -542,6 +543,8 @@ class EmbeddingRequest:
             raise ValueError(
                 "embedding input_ids must align one-to-one with texts and be unique"
             )
+        if self.input_type not in {"document", "query"}:
+            raise ValueError("embedding input_type must be document or query")
 
 
 @dataclass(frozen=True, slots=True)

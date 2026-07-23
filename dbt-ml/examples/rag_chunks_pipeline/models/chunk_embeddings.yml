@@ -2,14 +2,21 @@ version: 2
 
 models:
   - name: chunk_embeddings
-    description: "Chunks with deterministic fixture embeddings for the local PoC"
+    description: "Chunks with native deterministic embeddings for the local PoC"
     depends_on: [ref('document_chunks')]
 
-    transform:
-      type: python
-      module: transforms.fixture_embeddings
+    embed:
+      # Offline default. For Vertex, change these two values and add the
+      # `embedding:` block shown in the example README to profiles.yml.
+      provider: deterministic
+      model: deterministic-v1
+      text_field: text
+      id_field: chunk_id
+      vector_field: embedding
+      dimensions: 8
+      batch_size: 128
 
-    materialization: full
+    materialization: incremental
 
     tests:
       - not_null: [chunk_id, document_id, text, embedding]

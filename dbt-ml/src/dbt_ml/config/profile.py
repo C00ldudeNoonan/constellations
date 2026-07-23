@@ -191,6 +191,33 @@ class LLMConfig(BaseModel):
     budget: LLMBudgetConfig | None = None
 
 
+class EmbeddingProfileConfig(BaseModel):
+    """Operator-owned defaults for embedding-provider execution."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    provider: str = Field(
+        min_length=1,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    api_key_env: CredentialReference | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    provider_options: dict[str, Any] = Field(
+        default_factory=dict,
+        repr=False,
+        exclude=True,
+    )
+    timeout_seconds: float = Field(
+        default=60.0,
+        ge=0.1,
+        le=3600.0,
+        allow_inf_nan=False,
+    )
+
+
 class _RedactedWarehouseInput:
     __slots__ = ("value",)
 
@@ -299,6 +326,7 @@ class TargetConfig(BaseModel):
     # time, once `type:` is known (the adapter registry owns that lookup).
     warehouse: ProtectedWarehouseConfig
     llm: LLMConfig | None = None
+    embedding: EmbeddingProfileConfig | None = None
     retrieval: RetrievalProfileConfig | None = None
     # Operator-owned source roots for this target. Keys are source names from
     # project YAML; values replace SourceConfig.path after target resolution.

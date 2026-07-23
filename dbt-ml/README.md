@@ -8,10 +8,10 @@ and a manifest artifact you can wire into other tools.
 The current v0.2 preview is pure Python and supports DuckDB and BigQuery
 warehouses, local and GCS sources, document chunk models, executable classic
 text-ML providers, native warehouse-materialized embedding models with a
-deterministic offline provider, and an incremental local LanceDB search-index
-proof of concept. Additional warehouse and hosted retrieval adapters and
-production embedding providers remain roadmap work; Rust and PyO3 are
-explicitly out of scope through v0.2.
+deterministic offline provider plus Google Vertex AI, and an incremental local
+LanceDB search-index proof of concept. Additional warehouse, embedding, and
+hosted retrieval adapters remain roadmap work; Rust and PyO3 are explicitly
+out of scope through v0.2.
 
 ## Where dbt-ml fits
 
@@ -67,6 +67,7 @@ The core install stays lean. Add only the feature groups a project uses:
 | `pii` | Presidio PII detection and redaction; a spaCy language model is still installed separately |
 | `bigquery` | BigQuery warehouse adapter |
 | `gcs` | Google Cloud Storage document sources |
+| `vertex` | Google Vertex AI text embeddings (`google-genai`) |
 | `lancedb` | Local LanceDB search-index publication and queries |
 | [`mcp`](docs/mcp.md) | Read-only governed context server over MCP stdio |
 | `all` | Every optional feature above |
@@ -88,7 +89,7 @@ installation command.
 | **Classic ML model** | An executable `ml:` model for deterministic features and classifiers, with persisted artifacts. |
 | **Materialization**  | `full` (always replace) or `incremental` (skip unchanged input on re-runs).      |
 | **Tests**          | `not_null`, `unique`, `min_rows`, custom Python — with `severity: warn` if you want.|
-| **Profile**        | Warehouse + LLM config, swappable per `--target dev|prod`. No credentials in models. |
+| **Profile**        | Warehouse + LLM + embedding-provider config, swappable per `--target dev|prod`. No credentials in models. |
 | **Artifacts**      | `target/manifest.json`, `target/run_results.json`, `target/sources.yml` (for dbt). |
 
 ## Backends
@@ -121,8 +122,9 @@ Document parsers process local files with third-party libraries. Keep
 dependencies current before running dbt-ml over untrusted PDFs, HTML, email, or
 other documents, since malformed files can trigger parser CPU or memory bugs.
 
-The `llm` backend sends document text to the configured model provider and stores
-cached structured responses in plaintext in the configured cache database. New
+The `llm` backend and hosted embedding providers send document text to the
+configured model service. The LLM backend stores cached structured responses
+in plaintext in the configured cache database. New
 POSIX cache databases and transient write-ahead logs are forced to owner-only
 mode (`0600`), but the files still contain extracted document data and must be
 handled as sensitive. Use
@@ -415,13 +417,75 @@ different provider contract version is reported as incompatible rather than
 distribution and implementation identity.
 
 A provider may publish a strict options model; operators configure it under
-`llm.provider_options:` in the profile (opaque to core, validated by the
-selected provider, rejected in model YAML). Every provider option field is
+`llm.provider_options:` or `embedding.provider_options:` in the profile
+(opaque to core, validated by the selected provider, rejected in model YAML).
+Every provider option field is
 classified: `credential` fields are protected references that never enter
 artifacts or fingerprints, `semantic` fields join the response-cache key and
 model identity, `execution` fields never invalidate state, and
 `artifact-safe` fields may appear in manifest descriptors. See
 [docs/architecture/provider-abstraction.md](docs/architecture/provider-abstraction.md).
+
+### Vertex AI embeddings
+
+Install the extra and authenticate with
+[Application Default Credentials](https://cloud.google.com/docs/authentication/provide-credentials-adc).
+User ADC and service-account ADC follow the same path; the provider deliberately
+rejects `api_key_env`.
+
+```bash
+pip install 'dbt-ml[vertex]'
+gcloud auth application-default login
+```
+
+Bind the model's provider to operator-owned project and location settings in
+the active target:
+
+```yaml
+my_project:
+  target: prod
+  outputs:
+    prod:
+      warehouse:
+        type: bigquery
+        project: my-gcp-project
+        dataset: dbt_ml
+      embedding:
+        provider: vertex
+        timeout_seconds: 60
+        provider_options:
+          project: my-gcp-project       # optional if ADC can infer it
+          location: global             # use a model-supported Vertex location
+          task_type: RETRIEVAL_DOCUMENT
+          query_task_type: RETRIEVAL_QUERY
+          auto_truncate: false
+```
+
+The model ID and output dimensionality remain reviewable model semantics:
+
+```yaml
+- name: document_embeddings
+  depends_on: [ref('document_chunks')]
+  embed:
+    provider: vertex
+    model: gemini-embedding-001         # or text-embedding-005 /
+                                        # text-multilingual-embedding-002
+    text_field: text
+    id_field: chunk_id
+    dimensions: 768
+    batch_size: 128
+    max_retries: 4
+  materialization: incremental
+```
+
+dbt-ml passes `dimensions` as Vertex `output_dimensionality`, sends each runner
+batch as one SDK request, and configures the SDK with the model's retry count
+and the profile timeout. Document and query task types are separate so an
+inherited search identity uses `RETRIEVAL_QUERY` at query time. Vertex model
+availability, input limits, supported dimensions, and locations can change;
+check the current
+[Vertex text embeddings documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings)
+before choosing production settings.
 
 ### BigQuery
 
@@ -868,8 +932,11 @@ adding the vector and its safe provider identity.
 ```
 
 The built-in `deterministic` provider is offline and reproducible. It exists for
-tests, examples, and pipeline integration—not semantic similarity quality. A
-production provider implements the same `EmbeddingProvider` contract.
+tests, examples, and pipeline integration—not semantic similarity quality. The
+`vertex` provider implements the same contract for
+`gemini-embedding-001`, `text-embedding-005`, and
+`text-multilingual-embedding-002`; its project, location, task types, timeout,
+and ADC behavior live under profile `embedding:` configuration.
 
 Canonical output adds `embedding_provider`, `embedding_model`,
 `embedding_dimensions`, `embedding_provider_implementation`,

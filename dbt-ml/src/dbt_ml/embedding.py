@@ -2,18 +2,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from .config.model import EmbedConfig, ModelConfig
 from .credentials import CredentialReference
 from .dag import parse_ref
 from .hashing import canonical_fingerprint
+from .profile import (
+    ResolvedEmbeddingOptions,
+    ResolvedProfile,
+    resolve_embedding_options,
+)
 from .providers import (
     EmbeddingRequest,
     ProviderConfigurationError,
     ProviderRuntimeOptions,
     ProviderUsage,
     get_embedding_provider,
+    profile_options_fingerprint,
 )
 
 
@@ -24,6 +30,7 @@ class EmbeddingIdentity:
     dimensions: int
     implementation: str
     config_hash: str
+    provider_options_identity: str | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -42,18 +49,33 @@ class EmbeddingIdentity:
             or self.dimensions < 1
         ):
             raise ValueError("embedding identity is invalid")
+        if self.provider_options_identity is not None and (
+            not isinstance(self.provider_options_identity, str)
+            or not self.provider_options_identity
+        ):
+            raise ValueError("embedding identity is invalid")
         if self.config_hash != _embedding_config_hash(
             provider=self.provider,
             model=self.model,
             dimensions=self.dimensions,
             implementation=self.implementation,
+            provider_options_identity=self.provider_options_identity,
         ):
             raise ValueError("embedding identity config_hash does not match its fields")
 
     @classmethod
-    def from_config(cls, config: EmbedConfig) -> Self:
-        provider = get_embedding_provider(config.provider)
+    def from_config(
+        cls,
+        config: EmbedConfig,
+        *,
+        profile_options: Mapping[str, Any] | None = None,
+    ) -> Self:
+        provider = get_embedding_provider(
+            config.provider,
+            profile_options=profile_options,
+        )
         implementation = provider.implementation_identity()
+        options_identity = profile_options_fingerprint(provider.profile_options)
         return cls(
             provider=config.provider,
             model=config.model,
@@ -64,7 +86,9 @@ class EmbeddingIdentity:
                 model=config.model,
                 dimensions=config.dimensions,
                 implementation=implementation,
+                provider_options_identity=options_identity,
             ),
+            provider_options_identity=options_identity,
         )
 
     @classmethod
@@ -76,9 +100,17 @@ class EmbeddingIdentity:
             "implementation": str,
             "config_hash": str,
         }
-        if set(value) != set(required) or any(
+        optional = {"provider_options_identity": str}
+        if not set(value).issubset(set(required) | set(optional)) or not set(
+            required
+        ).issubset(value) or any(
             isinstance(value[name], bool) or not isinstance(value[name], expected)
             for name, expected in required.items()
+        ):
+            raise ValueError("embedding identity is invalid")
+        options_identity = value.get("provider_options_identity")
+        if options_identity is not None and (
+            not isinstance(options_identity, str) or not options_identity
         ):
             raise ValueError("embedding identity is invalid")
         return cls(
@@ -87,16 +119,20 @@ class EmbeddingIdentity:
             dimensions=value["dimensions"],
             implementation=value["implementation"],
             config_hash=value["config_hash"],
+            provider_options_identity=options_identity,
         )
 
     def to_dict(self) -> dict[str, str | int]:
-        return {
+        payload: dict[str, str | int] = {
             "provider": self.provider,
             "model": self.model,
             "dimensions": self.dimensions,
             "implementation": self.implementation,
             "config_hash": self.config_hash,
         }
+        if self.provider_options_identity is not None:
+            payload["provider_options_identity"] = self.provider_options_identity
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +144,8 @@ class EmbeddedTexts:
 def resolve_search_embedding_identity(
     model: ModelConfig,
     models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
+    *,
+    profile_options: Mapping[str, Any] | None = None,
 ) -> EmbeddingIdentity | None:
     search = model.search
     if search is None or search.vector is None or search.vector.embedding != "inherit":
@@ -132,23 +170,52 @@ def resolve_search_embedding_identity(
         raise ValueError(
             "inherited search dimensions must match the upstream embed dimensions"
         )
-    return EmbeddingIdentity.from_config(upstream.embed)
+    return EmbeddingIdentity.from_config(
+        upstream.embed,
+        profile_options=profile_options,
+    )
 
 
 def effective_search_config(
     model: ModelConfig,
     models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
+    *,
+    profile_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     search = model.search
     if search is None:
         raise ValueError("effective search configuration requires a search model")
     payload = search.model_dump(mode="python")
-    identity = resolve_search_embedding_identity(model, models)
+    identity = resolve_search_embedding_identity(
+        model,
+        models,
+        profile_options=profile_options,
+    )
     if identity is not None:
         vector = dict(payload["vector"])
         vector["embedding"] = identity.to_dict()
         payload["vector"] = vector
     return payload
+
+
+def resolve_search_embedding_options(
+    model: ModelConfig,
+    models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
+    resolved: ResolvedProfile,
+) -> ResolvedEmbeddingOptions | None:
+    search = model.search
+    if search is None or search.vector is None or search.vector.embedding != "inherit":
+        return None
+    dependencies = model.depends_on or []
+    if len(dependencies) != 1:
+        return None
+    models_by_name = (
+        models if isinstance(models, Mapping) else {item.name: item for item in models}
+    )
+    upstream = models_by_name.get(parse_ref(dependencies[0]))
+    if upstream is None or upstream.embed is None:
+        return None
+    return resolve_embedding_options(upstream.embed.provider, resolved)
 
 
 def _embedding_config_hash(
@@ -157,6 +224,7 @@ def _embedding_config_hash(
     model: str,
     dimensions: int,
     implementation: str,
+    provider_options_identity: str | None = None,
 ) -> str:
     return canonical_fingerprint(
         {
@@ -164,6 +232,7 @@ def _embedding_config_hash(
             "model": model,
             "dimensions": dimensions,
             "implementation": implementation,
+            "provider_options_identity": provider_options_identity,
         },
         domain="embedding-config",
         version=1,
@@ -176,13 +245,26 @@ def embed_texts(
     *,
     input_ids: Sequence[str] | None = None,
     credential_env: str | CredentialReference | None = None,
+    profile_options: Mapping[str, Any] | None = None,
     max_retries: int = 4,
+    timeout_seconds: float = 60.0,
+    input_type: Literal["document", "query"] = "document",
 ) -> EmbeddedTexts:
-    provider = get_embedding_provider(identity.provider)
+    provider = get_embedding_provider(
+        identity.provider,
+        profile_options=profile_options,
+    )
     if provider.implementation_identity() != identity.implementation:
         raise ProviderConfigurationError(
             f"Embedding provider '{identity.provider}' implementation no longer "
             "matches the recorded embedding identity",
+            safe_for_display=True,
+        )
+    options_identity = profile_options_fingerprint(provider.profile_options)
+    if options_identity != identity.provider_options_identity:
+        raise ProviderConfigurationError(
+            f"Embedding provider '{identity.provider}' profile options no longer "
+            "match the recorded embedding identity",
             safe_for_display=True,
         )
     credential = provider.resolve_credential(credential_env)
@@ -192,9 +274,13 @@ def embed_texts(
             texts=tuple(texts),
             dimensions=identity.dimensions,
             input_ids=tuple(input_ids) if input_ids is not None else None,
+            input_type=input_type,
         ),
         credential=credential,
-        runtime=ProviderRuntimeOptions(max_retries=max_retries),
+        runtime=ProviderRuntimeOptions(
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+        ),
     )
     return EmbeddedTexts(result.vectors, result.usage)
 
@@ -204,7 +290,9 @@ def embed_query(
     identity: EmbeddingIdentity | Mapping[str, Any],
     *,
     credential_env: str | CredentialReference | None = None,
+    profile_options: Mapping[str, Any] | None = None,
     max_retries: int = 4,
+    timeout_seconds: float = 60.0,
 ) -> tuple[float, ...]:
     resolved = (
         identity
@@ -215,5 +303,8 @@ def embed_query(
         (text,),
         resolved,
         credential_env=credential_env,
+        profile_options=profile_options,
         max_retries=max_retries,
+        timeout_seconds=timeout_seconds,
+        input_type="query",
     ).vectors[0]

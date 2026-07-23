@@ -16,6 +16,7 @@ from .model import (
     SearchVectorConfig,
     TransformConfig,
 )
+from .profile import EmbeddingProfileConfig
 from .project import DuckDBConfig, ExtractionDefaults, ProjectConfig
 from .source import SourceConfig, SourceFile
 
@@ -25,6 +26,7 @@ __all__ = [
     "ConfigError",
     "DuckDBConfig",
     "EmbedConfig",
+    "EmbeddingProfileConfig",
     "ExtractionConfig",
     "ExtractionDefaults",
     "FieldConfig",

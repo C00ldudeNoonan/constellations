@@ -1,0 +1,7 @@
+version: 2
+
+sources:
+  - name: policy_documents
+    description: "Synthetic dated refund-policy documents"
+    path: "./fixtures/policies/"
+    file_pattern: "*.json"

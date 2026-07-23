@@ -1,0 +1,22 @@
+version: 2
+
+models:
+  - name: document_registry
+    description: "Governed immutable policy-document versions"
+    depends_on: [ref('raw_policy_documents')]
+    transform:
+      type: python
+      module: transforms.document_registry
+    agent_context:
+      contract: agent_context/v1
+      grain: document_registry
+    materialization: full
+    fields:
+      - {name: title, data_type: string}
+      - {name: section, data_type: string}
+      - {name: customer_segment, data_type: string}
+      - {name: effective_date, data_type: string}
+      - {name: text, data_type: string}
+    tests:
+      - not_null: [document_id, document_version_id, customer_segment, text]
+      - unique: document_version_id

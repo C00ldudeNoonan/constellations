@@ -1,0 +1,10 @@
+name: metric_evidence_semantic
+version: 1.0.0
+config-version: 2
+profile: metric_evidence_semantic
+
+model-paths: ["models"]
+
+models:
+  metric_evidence_semantic:
+    +materialized: table

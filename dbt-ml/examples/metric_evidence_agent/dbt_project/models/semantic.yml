@@ -1,0 +1,41 @@
+version: 2
+
+semantic_models:
+  - name: refunds
+    model: ref('refund_quarterly')
+    defaults:
+      agg_time_dimension: metric_time
+    entities:
+      - name: refund_quarter
+        type: primary
+        expr: "metric_time || ':' || customer_segment"
+    dimensions:
+      - name: metric_time
+        type: time
+        type_params:
+          time_granularity: quarter
+      - name: customer_segment
+        type: categorical
+    measures:
+      - name: total_orders
+        agg: sum
+      - name: refunded_orders
+        agg: sum
+
+metrics:
+  - name: refunded_orders
+    label: Refunded orders
+    type: simple
+    type_params:
+      measure: refunded_orders
+  - name: total_orders
+    label: Total orders
+    type: simple
+    type_params:
+      measure: total_orders
+  - name: refund_rate
+    label: Refund rate
+    type: ratio
+    type_params:
+      numerator: refunded_orders
+      denominator: total_orders

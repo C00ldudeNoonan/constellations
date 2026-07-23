@@ -1,0 +1,14 @@
+metric_evidence_agent:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/context.duckdb
+        schema: context
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb

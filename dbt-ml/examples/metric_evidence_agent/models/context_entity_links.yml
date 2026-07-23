@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: context_entity_links
+    description: "Exact links from policy passages to dbt customer-segment entities"
+    depends_on: [ref('document_chunks')]
+    transform:
+      type: python
+      module: transforms.context_entity_links
+    agent_context:
+      contract: agent_context/v1
+      grain: context_entity_links
+    materialization: full
+    tests:
+      - not_null: [context_entity_link_id, context_id, entity_id]
+      - unique: context_entity_link_id

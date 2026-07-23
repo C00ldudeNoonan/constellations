@@ -1,0 +1,7 @@
+metric_evidence_semantic:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: target/semantic.duckdb
+      threads: 1

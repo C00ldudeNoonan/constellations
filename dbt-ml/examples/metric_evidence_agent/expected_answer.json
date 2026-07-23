@@ -1,0 +1,14 @@
+{
+  "question": "Why did the enterprise refund rate increase in Q2 2026, and what governed policy evidence was effective during that quarter?",
+  "finding": "Enterprise refund rate increased from 4.0% in Q1 2026 to 7.0% in Q2 2026, a 3.0 percentage-point increase.",
+  "interpretation": "The retrieved Q2 policy changes are consistent with the increase, but this evidence does not establish causation.",
+  "metric_data_as_of": "2026-06-30T23:59:59Z",
+  "metric_entity_id": "da9e30156fe0ad99415d7394792d2360",
+  "authorized_sources": [
+    "https://policies.example.test/refunds/enterprise/window",
+    "https://policies.example.test/refunds/enterprise/automatic-approval"
+  ],
+  "reduced_sources": [
+    "https://policies.example.test/refunds/enterprise/window"
+  ]
+}

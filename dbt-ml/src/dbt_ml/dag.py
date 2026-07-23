@@ -74,6 +74,9 @@ class ProjectDAG:
                 preds.update(relationship_test_targets(model.tests))
             except TestSpecError as e:
                 raise DAGError(f"Model '{model.name}' has invalid tests: {e}") from e
+            preds.update(
+                parse_ref(test.golden_set) for test in model.retrieval_tests
+            )
             self.predecessors[model.name] = preds
 
         for model_name, preds in self.predecessors.items():

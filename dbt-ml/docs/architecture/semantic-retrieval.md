@@ -1368,6 +1368,119 @@ record status and a core-owned safe error code without echoing the fixture.
 A failed/non-ready publication fails closed. Failure skips dependent retrieval
 tests, while already completed upstream warehouse results remain visible.
 
+## Golden-set retrieval evaluation (#137)
+
+Status: implemented. A search index can build successfully while ranking
+quality silently regresses — chunking, embedding model, filters, index
+settings, or fusion weights all change results without tripping a schema test.
+`dbt-ml eval` runs deterministic, CI-friendly retrieval tests over hand-labeled
+query/relevance sets through the same `search()` API a real caller uses,
+independent of the `index_ready`/`row_count`/`query_smoke` fixtures above (which
+prove an index is *reachable*, not that it *ranks well*). No LLM judge is
+involved or required.
+
+### Grammar
+
+`retrieval_tests:` is a new field on a `search:` model (not a `tests:` entry,
+and not a new top-level resource) — a retrieval test is intrinsically about
+*this* index's ranking quality, so it lives where the index is declared:
+
+```yaml
+models:
+  - name: support_knowledge
+    search: { ... }
+    retrieval_tests:
+      - name: support_search_quality
+        golden_set: ref('support_search_golden')
+        mode: hybrid          # optional; defaults to the richest mode the
+                               # index declares (hybrid > vector > text)
+        at: [5, 10]
+        thresholds:
+          recall_at_10: {min: 0.90, severity: error}
+          mrr_at_10: {min: 0.75, severity: warn}
+          ndcg_at_10: {min: 0.80, severity: error}
+```
+
+`golden_set` is a `ref()` to an ordinary dbt-ml model of any kind (most
+naturally a small `extraction: {backend: json}` model over a fixtures folder) —
+no new "seed" concept was introduced; this reuses `ref()`/DAG/selectors exactly
+as the issue asked. The DAG derives an edge from the search model to its
+golden-set model (mirroring how `relationships` schema tests already derive
+edges from `tests:`), so `dbt-ml run`/`build` always materialize the golden set
+before it can be evaluated. Threshold keys are validated at compile time
+against the pattern `<metric>_at_<k>` where metric is one of `recall`,
+`precision`, `hit_rate`, `mrr`, `ndcg` and `k` must be one of the declared `at`
+cutoffs. `retrieval_tests` is rejected on any non-`search:` model.
+
+### Golden-set row contract
+
+The referenced model's materialized rows carry:
+
+| column | required | meaning |
+| --- | --- | --- |
+| `query_id` | yes | stable identifier, unique per golden set |
+| `query_text` | for text/hybrid modes | query string |
+| `query_vector` | for vector/hybrid modes | precomputed vector (JSON array), bypassing the embedding provider so evaluation stays deterministic and offline-capable even for a real/hosted provider |
+| `relevant_ids` | no | JSON array of relevant record IDs (binary relevance). Absent/empty means "no ground truth for this query" — see below |
+| `graded_relevance` | no | JSON object mapping ID → non-negative grade, for NDCG. Defaults to grade 1 for each `relevant_ids` member when omitted |
+| `required_ids` | no | JSON array that must ALL appear in results — a hard policy assertion |
+| `excluded_ids` | no | JSON array that must NEVER appear — a hard policy assertion |
+| `filters` | no | JSON array of `{field, operator, value}`, composed as ordinary user filters |
+| `policy_filters` | no | JSON array of `{field, operator, value}`, threaded into `search()`'s trusted `policy_filters` — lets a golden case simulate an authorized principal against a governed index |
+| `mode` | no | per-query override of the retrieval test's `mode` |
+
+Array/object-typed columns are declared `data_type: json`; dbt-ml stores them as
+JSON text (the same representation used elsewhere for nested field data) and
+the evaluator parses them back on read.
+
+### Metrics and edge cases
+
+`recall@k`, `precision@k`, `hit_rate@k`, `mrr@k`, and `ndcg@k` (graded, standard
+DCG/IDCG formulation) are pure functions over a ranked ID list and the golden
+row's relevance — no I/O. Two edge cases are explicit, not silently folded into
+an ordinary score:
+
+- **No relevant labels** (`relevant_ids` empty): the query is diagnosed
+  `no_relevant_labels` and excluded from aggregate means rather than scored as
+  zero — averaging it in would understate quality on well-covered queries and
+  mask a labeling gap rather than surface it.
+- **Empty results**: diagnosed `empty_results` but still scored (a legitimate
+  zero across every metric), distinct from "no ground truth to score against."
+
+Aggregates are the mean of each `<metric>@k` across scored (non-excluded)
+queries. Tie-breaking within a ranking is `search()`'s responsibility (already
+deterministic per its own contract above); the metrics trust whatever order
+they're given.
+
+### Policy hard failures are not averaged away
+
+`required_ids`/`excluded_ids` violations are recorded as `PolicyViolation`s and
+force the whole retrieval test's status to `fail`, independent of every
+threshold's outcome — a query that leaks an excluded ID fails even if every
+ranking metric is perfect. This is deliberate: security exclusions are a
+correctness property, not a quality signal to average.
+
+### Command, exit codes, and artifact
+
+`dbt-ml eval [--select] [--exclude] [--json]` runs every `retrieval_tests` entry
+on the selected search models (selector semantics match `dbt-ml test`) and
+always writes `target-path/retrieval_eval.json`. A test's status is the worst
+of its threshold outcomes (`error`-severity below-threshold → `fail`,
+`warn`-severity below-threshold → `warn`), with any policy violation forcing
+`fail` regardless. `dbt-ml eval` exits 1 if any test's status is `fail`,
+matching `dbt-ml test`'s severity/exit-code convention; a `RetrievalEvalError`
+(golden set has zero rows, a query's `search()` call itself errors) is a setup
+failure, not a quality signal, and also exits 1 before any artifact write for
+that test.
+
+The artifact records project/model/test identity, the golden set's content hash
+(so a silently-edited golden set is visible in diffs even though `code_version`
+intentionally does not key off it — the golden set is data, not code), the safe
+store provenance and embedding identity `search()` already returns per query,
+per-query ranked IDs/diagnosis/metrics, aggregates, threshold outcomes, and
+policy violations. It never contains secrets, credential-bearing profile
+values, or raw embedding vectors.
+
 ### dbt export
 
 `emit-dbt-sources` never emits a search index or its retrieval tests as a dbt
@@ -1731,8 +1844,8 @@ their owning follow-ups:
   `dbt-ml search`, score normalization, and core RRF.
 - #154 delivered protected profile-credential representation before any future
   hosted retrieval adapter accepts secrets.
-- #137 adds deterministic golden-query evaluation through the portable query
-  surface.
+- #137 implements deterministic golden-query evaluation through the portable
+  query surface — see "Golden-set retrieval evaluation" below.
 - The accepted [agent context v1 contract](agent-context-v1.md) specializes
   provenance, entity/time, permissions, freshness, and citation fields while
   preserving mandatory prefilter separation.

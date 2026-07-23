@@ -46,7 +46,6 @@ from .backends.llm_backend import BatchCancelledError
 from .backends.options import LLMBackendOptions
 from .budget import BudgetExceededError, BudgetGuard, BudgetLedger
 from .checks import TestResult, run_model_tests
-from .chunking import chunk_id, split_text
 from .classic_ml import run_classic_ml_model
 from .compiler import (
     validate_project_contract,
@@ -70,8 +69,14 @@ from .embedding import (
     embed_texts,
     resolve_search_embedding_options,
 )
+from .execution import ModelRunResult as ModelRunResult
+from .execution import RunError as RunError
+from .execution import chunk as _chunk_execution
+from .execution import scalarize as _scalarize
+from .execution import warehouse_options as _warehouse_options
 from .hashing import canonical_fingerprint
 from .llm_map import LLMMapError, LLMMapRuntime, execute_map_item, resolve_llm_runtime
+from .manifest import compute_modified_models
 from .paths import resolve_within_project
 from .profile import (
     ResolvedProfile,
@@ -105,9 +110,15 @@ from .sources import DocumentRef, DocumentSource, SourceError, get_document_sour
 from .sql_models import compile_sql, discover_refs, read_sql_source
 from .state_reconciliation import BoundedReconciler, UpstreamRecord
 from .transforms import TransformContext, load_transform, transform_call_arity
-from .versioning import compute_code_version, compute_model_code_version
+from .versioning import compute_model_code_version
 
 log = logging.getLogger(__name__)
+
+_CHUNK_INPUT_EXCLUDED_FIELDS = _chunk_execution._CHUNK_INPUT_EXCLUDED_FIELDS
+_chunk_document_ids = _chunk_execution.chunk_document_ids
+_chunk_input_hash = _chunk_execution.chunk_input_hash
+_chunk_row = _chunk_execution.chunk_row
+_run_chunk_model = _chunk_execution.run_chunk_model
 
 _EXTRACTION_LINEAGE_SCHEMA: dict[str, Any] = {
     "document_id": pl.String,
@@ -131,23 +142,6 @@ _EXTRACTION_FIELD_DTYPES: dict[str, Any] = {
     "json": pl.String,
 }
 
-_CHUNK_GENERATED_FIELDS = frozenset(
-    {
-        "chunk_id",
-        "document_id",
-        "chunk_index",
-        "chunk_count",
-        "text",
-        "chunk_strategy",
-        "code_version",
-        "chunked_at",
-    }
-)
-# These upstream values are replaced by the chunk model rather than carried.
-# Everything else, including timestamps and ACL/filter metadata, participates
-# in row invalidation because it is materialized on every generated chunk.
-_CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
-
 # Deterministic column order for the generation-metadata columns a native
 # `llm:` model appends to every output row (issue #144). Same set as
 # LLM_METADATA_FIELDS; the tuple pins column order in the materialized table.
@@ -159,10 +153,6 @@ _LLM_METADATA_COLUMNS = (
     "llm_config_hash",
     "generated_at",
 )
-
-class RunError(Exception):
-    pass
-
 
 def _validate_agent_context_output(
     frame: pl.DataFrame, model: ModelConfig
@@ -292,9 +282,6 @@ def _modified_set(
     selection); otherwise the models whose code_version diverged from it."""
     if state is None:
         return None
-    # Local import: manifest.py imports ModelRunResult from this module.
-    from .manifest import compute_modified_models
-
     return compute_modified_models(
         models,
         project_dir,
@@ -352,38 +339,6 @@ class DiscoveredSource:
 
     backend: DocumentSource
     refs: list[DocumentRef]
-
-
-@dataclass
-class ModelRunResult:
-    model_name: str
-    materialization: str
-    kind: str  # "extraction" | "transform"
-    # None derives success/error from `errors`; set explicitly for the
-    # distinct budget_exceeded / cancelled outcomes (issue #149).
-    status: str | None = None
-    backend: str | None = None
-    provider: str | None = None
-    provider_model: str | None = None
-    provider_implementation: str | None = None
-    documents_processed: int = 0
-    documents_skipped: int = 0
-    documents_deleted: int = 0
-    rows_written: int = 0
-    rows_inserted: int = 0
-    rows_updated: int = 0
-    rows_failed: int = 0
-    duration_seconds: float = 0.0
-    errors: list[str] = field(default_factory=list)
-    # Non-fatal backend warnings, aggregated: distinct message -> number of
-    # documents that raised it. Never affects status or exit code.
-    warnings: dict[str, int] = field(default_factory=dict)
-    artifact_path: str | None = None
-    artifact_version: str | None = None
-    training_input: dict[str, Any] | None = None
-    metrics: dict[str, Any] = field(default_factory=dict)
-    artifact_metadata: dict[str, Any] | None = None
-    serving_resource: dict[str, Any] | None = None
 
 
 @dataclass
@@ -717,17 +672,6 @@ def _run_model(
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     return result
-
-
-def _warehouse_options(adapter: WarehouseAdapter, model: ModelConfig) -> Any:
-    """Parse model-level warehouse_options through the active adapter,
-    surfacing validation problems as a model config error."""
-    try:
-        return adapter.parse_warehouse_options(
-            model.warehouse_options, model_name=model.name
-        )
-    except AdapterError as e:
-        raise RunError(str(e)) from e
 
 
 def _run_extraction_model(
@@ -1252,13 +1196,6 @@ def _row_for_extraction(
     return row
 
 
-def _scalarize(value: Any) -> Any:
-    """Serialize nested types as JSON strings so DuckDB gets a flat schema."""
-    if isinstance(value, dict | list):
-        return json.dumps(value, default=str)
-    return value
-
-
 def _run_sql_model(
     *,
     model: ModelConfig,
@@ -1447,211 +1384,6 @@ def _run_transform_model(
         provider_implementation=provider_implementation,
         rows_written=output.height,
     )
-
-
-def _run_chunk_model(
-    *,
-    model: ModelConfig,
-    project_dir: Path,
-    adapter: WarehouseAdapter,
-    full_refresh: bool,
-) -> ModelRunResult:
-    assert model.chunk is not None
-    chunk_cfg = model.chunk
-    if not model.depends_on or len(model.depends_on) != 1:
-        raise RunError(
-            f"Chunk model '{model.name}' must declare exactly one upstream in "
-            "`depends_on:` (the extraction model to chunk)"
-        )
-    upstream = parse_ref(model.depends_on[0])
-    df = adapter.read_table(upstream)
-    if chunk_cfg.text_field not in df.columns:
-        raise RunError(
-            f"Chunk model '{model.name}': upstream '{upstream}' has no column "
-            f"'{chunk_cfg.text_field}'. Available: {sorted(df.columns)}"
-        )
-    if "document_id" not in df.columns:
-        raise RunError(
-            f"Chunk model '{model.name}': upstream '{upstream}' has no "
-            "`document_id`; chunk models read extraction outputs."
-        )
-    document_ids = _chunk_document_ids(df, model.name)
-
-    code_version = compute_code_version(
-        extraction=None,
-        transform=None,
-        chunk=chunk_cfg,
-        depends_on=[upstream],
-        project_dir=project_dir,
-    )
-    warehouse_opts = _warehouse_options(adapter, model)
-    state_scope = StateScope(model.name)
-    is_incremental = model.materialization == "incremental" and not full_refresh
-    processed_state = adapter.fetch_state(state_scope) if is_incremental else {}
-
-    # Carry every upstream column except the split text field (replaced by the
-    # per-chunk text), so lineage (document_id, source_uri, content_hash, …)
-    # flows onto every chunk row for free.
-    carry_cols = [
-        c
-        for c in df.columns
-        if c != chunk_cfg.text_field and c not in _CHUNK_GENERATED_FIELDS
-    ]
-    chunked_at = datetime.now(UTC).isoformat()
-
-    rows: list[dict[str, Any]] = []
-    state_records: list[StateRecord] = []
-    processed = 0
-    skipped = 0
-    current_ids: set[str] = set()
-    changed_ids: list[str] = []
-
-    for document_id, record in zip(
-        document_ids, df.iter_rows(named=True), strict=True
-    ):
-        current_ids.add(document_id)
-        raw_text = record[chunk_cfg.text_field]
-        text = "" if raw_text is None else str(raw_text)
-        doc_hash = _chunk_input_hash(record, text_field=chunk_cfg.text_field)
-        if is_incremental:
-            prior = processed_state.get(document_id)
-            if prior == StateValue(doc_hash, code_version):
-                skipped += 1
-                continue
-            if prior is not None:
-                changed_ids.append(document_id)
-        processed += 1
-        pieces = split_text(text, chunk_cfg)
-        carried = {c: record[c] for c in carry_cols}
-        for piece in pieces:
-            rows.append(
-                _chunk_row(
-                    carried=carried,
-                    document_id=document_id,
-                    piece_index=piece.index,
-                    chunk_count=len(pieces),
-                    text=piece.text,
-                    strategy=chunk_cfg.strategy,
-                    code_version=code_version,
-                    chunked_at=chunked_at,
-                )
-            )
-        state_records.append(StateRecord(document_id, doc_hash, code_version))
-
-    deleted = 0
-    if is_incremental:
-        removed = [d for d in processed_state if d not in current_ids]
-        # Re-chunked docs: clear their old chunks so shrinking a document
-        # doesn't leave orphan chunk rows (materialize_incremental keys on
-        # chunk_id, which differs for the new chunks).
-        stale = removed + changed_ids
-        if stale:
-            adapter.delete_rows_and_state(
-                model.name,
-                key_col="document_id",
-                keys=stale,
-                state_scope=state_scope,
-            )
-            deleted = len(removed)
-
-    rows_written = 0
-    if rows or full_refresh or model.materialization == "full":
-        chunk_df = pl.DataFrame(rows) if rows else pl.DataFrame()
-        if model.materialization == "full" or full_refresh:
-            rows_written = adapter.materialize_full(
-                model.name, chunk_df, options=warehouse_opts
-            )
-        else:
-            try:
-                rows_written = adapter.materialize_incremental(
-                    model.name,
-                    chunk_df,
-                    key_col="chunk_id",
-                    on_schema_change=model.on_schema_change,
-                    options=warehouse_opts,
-                )
-            except AdapterError as e:
-                raise RunError(str(e)) from e
-
-    if model.materialization == "full" or full_refresh:
-        adapter.replace_state(state_scope, state_records)
-    else:
-        adapter.upsert_state(state_scope, state_records)
-
-    return ModelRunResult(
-        model_name=model.name,
-        materialization=model.materialization,
-        kind="chunk",
-        documents_processed=processed,
-        documents_skipped=skipped,
-        documents_deleted=deleted,
-        rows_written=rows_written,
-    )
-
-
-def _chunk_document_ids(df: pl.DataFrame, model_name: str) -> list[str]:
-    raw_ids = df["document_id"].to_list()
-    null_count = sum(value is None for value in raw_ids)
-    if null_count:
-        raise RunError(
-            f"Chunk model '{model_name}': upstream `document_id` contains "
-            f"{null_count} NULL value(s)"
-        )
-    document_ids = [str(value) for value in raw_ids]
-    empty_count = sum(not value for value in document_ids)
-    if empty_count:
-        raise RunError(
-            f"Chunk model '{model_name}': upstream `document_id` contains "
-            f"{empty_count} empty value(s)"
-        )
-    duplicate_count = len(document_ids) - len(set(document_ids))
-    if duplicate_count:
-        raise RunError(
-            f"Chunk model '{model_name}': upstream `document_id` contains "
-            f"{duplicate_count} duplicate value(s)"
-        )
-    return document_ids
-
-
-def _chunk_input_hash(record: dict[str, Any], *, text_field: str) -> str:
-    raw_text = record[text_field]
-    effective_input = {
-        "document_id": str(record["document_id"]),
-        "text": "" if raw_text is None else str(raw_text),
-        "carried": {
-            key: value
-            for key, value in record.items()
-            if key != text_field and key not in _CHUNK_INPUT_EXCLUDED_FIELDS
-        },
-    }
-    return canonical_fingerprint(effective_input, domain="chunk-input", version=2)
-
-
-def _chunk_row(
-    *,
-    carried: dict[str, Any],
-    document_id: str,
-    piece_index: int,
-    chunk_count: int,
-    text: str,
-    strategy: str,
-    code_version: str,
-    chunked_at: str,
-) -> dict[str, Any]:
-    row: dict[str, Any] = {c: _scalarize(v) for c, v in carried.items()}
-    row.update(
-        {
-            "chunk_id": chunk_id(document_id, piece_index, text),
-            "document_id": document_id,
-            "chunk_index": piece_index,
-            "chunk_count": chunk_count,
-            "text": text,
-            "chunk_strategy": strategy,
-            "code_version": code_version,
-            "chunked_at": chunked_at,
-        }
-    )
-    return row
 
 
 @dataclass

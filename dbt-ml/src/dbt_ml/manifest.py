@@ -19,6 +19,7 @@ from .embedding import (
     effective_search_config,
     resolve_search_embedding_options,
 )
+from .execution.contracts import ModelRunResult
 from .hashing import canonical_fingerprint
 from .profile import (
     ProfileError,
@@ -27,7 +28,6 @@ from .profile import (
     resolve_profile,
 )
 from .retrieval import collection_config_fingerprint, create_store, store_class
-from .runner import ModelRunResult
 from .versioning import (
     compute_model_code_version,
     describe_model_embedding,

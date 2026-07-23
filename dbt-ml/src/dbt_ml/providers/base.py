@@ -554,6 +554,7 @@ class EmbeddingResult:
     dimensions: int
     input_ids: tuple[str, ...] | None = field(default=None, repr=False)
     usage: ProviderUsage = field(default_factory=ProviderUsage)
+    provider_requests: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -593,6 +594,12 @@ class EmbeddingResult:
             )
         if not isinstance(self.usage, ProviderUsage):
             raise ValueError("embedding usage must be ProviderUsage")
+        if (
+            isinstance(self.provider_requests, bool)
+            or not isinstance(self.provider_requests, int)
+            or self.provider_requests < 1
+        ):
+            raise ValueError("embedding provider_requests must be a positive integer")
 
 
 OPTION_CLASSIFICATIONS = frozenset(
@@ -745,6 +752,7 @@ class BaseProvider(ABC):
     provider_name: ClassVar[str]
     implementation_version: ClassVar[str]
     requires_credentials: ClassVar[bool] = True
+    accepts_api_key_env: ClassVar[bool] = True
     default_credential_env: ClassVar[str | None] = None
     implementation_packages: ClassVar[tuple[str, ...]] = ()
 
@@ -767,6 +775,7 @@ class BaseProvider(ABC):
         self,
         env_var: str | CredentialReference | None,
     ) -> ProviderCredential | None:
+        self.validate_credential_reference(env_var)
         if not self.requires_credentials:
             return None
         failure: ProviderConfigurationError | None = None
@@ -809,6 +818,17 @@ class BaseProvider(ABC):
         if failure is not None:
             raise failure
         raise AssertionError("provider credential resolution did not complete")
+
+    def validate_credential_reference(
+        self,
+        env_var: str | CredentialReference | None,
+    ) -> None:
+        """Validate whether a profile may supply `api_key_env`, without I/O."""
+        if env_var is not None and not self.accepts_api_key_env:
+            raise ProviderConfigurationError(
+                f"{self.name()} does not accept api_key_env",
+                safe_for_display=True,
+            )
 
     def implementation_identity(self) -> str:
         return _implementation_identity(type(self))

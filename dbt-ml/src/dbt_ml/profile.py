@@ -174,15 +174,15 @@ def resolve_profile(
     llm = _absolutize_llm(selected.llm, project_dir)
     if llm is not None:
         try:
-            provider = get_inference_provider(llm.provider)
+            inference_provider = get_inference_provider(llm.provider)
             # Validate operator-supplied provider_options against the
             # selected provider's published model; the raw mapping stays on
             # the resolved profile and is re-parsed at the provider boundary.
-            parse_profile_options(type(provider), llm.provider_options)
+            parse_profile_options(type(inference_provider), llm.provider_options)
             llm = llm.model_copy(
                 update={
-                    "model": resolve_provider_model(provider, llm.model),
-                    "base_url": provider.resolve_base_url(llm.base_url),
+                    "model": resolve_provider_model(inference_provider, llm.model),
+                    "base_url": inference_provider.resolve_base_url(llm.base_url),
                 }
             )
         except (ProviderNotFoundError, ProviderConfigurationError) as e:
@@ -193,10 +193,11 @@ def resolve_profile(
     embedding = selected.embedding
     if embedding is not None:
         try:
-            get_embedding_provider(
+            embedding_provider = get_embedding_provider(
                 embedding.provider,
                 profile_options=embedding.provider_options,
             )
+            embedding_provider.validate_credential_reference(embedding.api_key_env)
         except (ProviderNotFoundError, ProviderConfigurationError) as e:
             raise ProfileError(
                 f"{profiles_path}: profile '{project.profile}' target "
@@ -269,10 +270,11 @@ def resolve_embedding_options(
             "`embedding:` in profiles.yml"
         )
     try:
-        get_embedding_provider(
+        provider = get_embedding_provider(
             provider_name,
             profile_options=profile.provider_options,
         )
+        provider.validate_credential_reference(profile.api_key_env)
     except (ProviderNotFoundError, ProviderConfigurationError) as error:
         raise ProfileError(str(error)) from error
     return ResolvedEmbeddingOptions(

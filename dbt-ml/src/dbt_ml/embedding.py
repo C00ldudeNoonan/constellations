@@ -139,6 +139,7 @@ class EmbeddingIdentity:
 class EmbeddedTexts:
     vectors: tuple[tuple[float, ...], ...]
     usage: ProviderUsage
+    provider_requests: int
 
 
 def resolve_search_embedding_identity(
@@ -282,7 +283,7 @@ def embed_texts(
             timeout_seconds=timeout_seconds,
         ),
     )
-    return EmbeddedTexts(result.vectors, result.usage)
+    return EmbeddedTexts(result.vectors, result.usage, result.provider_requests)
 
 
 def embed_query(

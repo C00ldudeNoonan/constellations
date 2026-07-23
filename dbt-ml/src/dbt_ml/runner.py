@@ -1689,6 +1689,7 @@ def _run_embed_model(
     pending = [item for item in work if item.vector is None]
     usage_totals: dict[str, int | float] = {}
     provider_batches = 0
+    provider_calls = 0
     try:
         for offset in range(0, len(pending), config.batch_size):
             batch = pending[offset : offset + config.batch_size]
@@ -1702,6 +1703,7 @@ def _run_embed_model(
                 timeout_seconds=embedding_options.timeout_seconds,
             )
             provider_batches += 1
+            provider_calls += embedded.provider_requests
             _add_provider_usage(usage_totals, embedded.usage.to_metrics())
             for item, vector in zip(batch, embedded.vectors, strict=True):
                 item.vector = vector
@@ -1767,7 +1769,7 @@ def _run_embed_model(
         raise RunError(str(e)) from e
 
     metrics: dict[str, Any] = {
-        "provider_calls": provider_batches,
+        "provider_calls": provider_calls,
         "batches": provider_batches,
         "cache_hits": cache_hits,
         "cache_misses": len(pending),

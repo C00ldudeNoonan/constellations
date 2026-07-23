@@ -77,22 +77,22 @@ class VertexEmbeddingProvider(EmbeddingProvider):
     implementation_version = "1"
     implementation_packages = ("google-genai",)
     requires_credentials = False
+    accepts_api_key_env = False
 
     @classmethod
     def profile_options_model(cls) -> type[BaseModel] | None:
         return VertexEmbeddingOptions
 
-    def resolve_credential(
+    def validate_credential_reference(
         self,
         env_var: str | CredentialReference | None,
-    ) -> ProviderCredential | None:
+    ) -> None:
         if env_var is not None:
             raise ProviderConfigurationError(
                 "Vertex AI embeddings use Application Default Credentials and "
                 "do not accept api_key_env",
                 safe_for_display=True,
             )
-        return None
 
     def _embed(
         self,
@@ -135,26 +135,59 @@ class VertexEmbeddingProvider(EmbeddingProvider):
         if options.project is not None:
             client_options["project"] = options.project
         client = genai.Client(**client_options)
+        vectors: list[tuple[float, ...]] = []
+        usage = ProviderUsage()
+        provider_requests = _split_requests(request)
         try:
-            response = client.models.embed_content(
-                model=request.model,
-                contents=list(request.texts),
-                config={
-                    "task_type": (
-                        options.query_task_type
-                        if request.input_type == "query"
-                        else options.task_type
-                    ),
-                    "output_dimensionality": request.dimensions,
-                    "auto_truncate": options.auto_truncate,
-                },
-            )
+            for request_number, provider_request in enumerate(
+                provider_requests, start=1
+            ):
+                response = client.models.embed_content(
+                    model=provider_request.model,
+                    contents=list(provider_request.texts),
+                    config={
+                        "task_type": (
+                            options.query_task_type
+                            if provider_request.input_type == "query"
+                            else options.task_type
+                        ),
+                        "output_dimensionality": provider_request.dimensions,
+                        "auto_truncate": options.auto_truncate,
+                    },
+                )
+                try:
+                    parsed = _parse_response(
+                        response,
+                        provider_request,
+                        options=options,
+                    )
+                except ProviderResponseError as error:
+                    raise _with_billed_failure(
+                        error,
+                        response,
+                        request,
+                        self,
+                        prior_usage=usage,
+                        billed_requests=request_number,
+                    ) from None
+                vectors.extend(parsed.vectors)
+                usage = _add_usage(usage, parsed.usage)
         finally:
             client.close()
         try:
-            return _parse_response(response, request, options=options)
-        except ProviderResponseError as error:
-            raise _with_billed_failure(error, response, request, self) from None
+            return EmbeddingResult(
+                vectors=tuple(vectors),
+                model=request.model,
+                dimensions=len(vectors[0]),
+                input_ids=request.input_ids,
+                usage=usage,
+                provider_requests=len(provider_requests),
+            )
+        except (IndexError, ValueError):
+            raise ProviderResponseError(
+                "Vertex AI returned an invalid embedding response",
+                safe_for_display=True,
+            ) from None
 
 
 def _load_google_genai() -> Any:
@@ -163,6 +196,25 @@ def _load_google_genai() -> Any:
         distribution="google-genai",
         extra="vertex",
         feature=_VERTEX_FEATURE,
+    )
+
+
+def _split_requests(request: EmbeddingRequest) -> tuple[EmbeddingRequest, ...]:
+    if request.model.rsplit("/", maxsplit=1)[-1] != "gemini-embedding-001":
+        return (request,)
+    return tuple(
+        EmbeddingRequest(
+            model=request.model,
+            texts=(text,),
+            dimensions=request.dimensions,
+            input_ids=(
+                (request.input_ids[index],)
+                if request.input_ids is not None
+                else None
+            ),
+            input_type=request.input_type,
+        )
+        for index, text in enumerate(request.texts)
     )
 
 
@@ -256,18 +308,40 @@ def _with_billed_failure(
     response: Any,
     request: EmbeddingRequest,
     provider: VertexEmbeddingProvider,
+    prior_usage: ProviderUsage | None = None,
+    billed_requests: int = 1,
 ) -> ProviderResponseError:
+    prior_usage = prior_usage or ProviderUsage()
     try:
-        usage = _response_usage(response)
+        usage = _add_usage(prior_usage, _response_usage(response))
     except ProviderResponseError:
-        usage = ProviderUsage()
+        usage = prior_usage
     return error.attach_failure(
         InferenceFailure(
             error_code="invalid_embedding_response",
             usage=usage,
-            billed_requests=1,
+            billed_requests=billed_requests,
             provider=provider.name(),
             model=request.model,
             implementation_identity=provider.implementation_identity(),
         )
+    )
+
+
+def _add_usage(first: ProviderUsage, second: ProviderUsage) -> ProviderUsage:
+    reported_cost = (
+        None
+        if first.reported_cost_usd is None and second.reported_cost_usd is None
+        else (first.reported_cost_usd or 0.0) + (second.reported_cost_usd or 0.0)
+    )
+    return ProviderUsage(
+        input_tokens=first.input_tokens + second.input_tokens,
+        output_tokens=first.output_tokens + second.output_tokens,
+        cache_read_input_tokens=(
+            first.cache_read_input_tokens + second.cache_read_input_tokens
+        ),
+        cache_creation_input_tokens=(
+            first.cache_creation_input_tokens + second.cache_creation_input_tokens
+        ),
+        reported_cost_usd=reported_cost,
     )

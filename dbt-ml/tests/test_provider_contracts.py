@@ -257,6 +257,21 @@ def test_registry_rejects_duplicate_and_invalid_providers() -> None:
     with pytest.raises(ProviderRegistrationError, match="implementation_version"):
         register_inference_provider(InvalidImplementationVersion)
 
+    class InvalidCredentialMetadata(_EchoInferenceProvider):
+        provider_name = "invalid-credential-metadata"
+        accepts_api_key_env = "yes"
+
+    with pytest.raises(ProviderRegistrationError, match="accepts_api_key_env"):
+        register_inference_provider(InvalidCredentialMetadata)  # type: ignore[arg-type]
+
+    class ContradictoryCredentialMetadata(_EchoInferenceProvider):
+        provider_name = "contradictory-credential-metadata"
+        requires_credentials = True
+        accepts_api_key_env = False
+
+    with pytest.raises(ProviderRegistrationError, match="must accept api_key_env"):
+        register_inference_provider(ContradictoryCredentialMetadata)
+
 
 def test_registry_rejects_abstract_provider() -> None:
     class AbstractProvider(InferenceProvider):
@@ -605,6 +620,13 @@ def test_embedding_result_rejects_bad_dimensions_and_non_finite_values() -> None
             vectors=((float("nan"),),),
             model="embed",
             dimensions=1,
+        )
+    with pytest.raises(ValueError, match="provider_requests"):
+        EmbeddingResult(
+            vectors=((1.0,),),
+            model="embed",
+            dimensions=1,
+            provider_requests=0,
         )
 
 

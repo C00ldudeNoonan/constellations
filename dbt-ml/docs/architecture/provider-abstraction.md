@@ -28,7 +28,8 @@ for generation and vectorization.
   `BatchInferenceResult` returns exactly one success or safe error per request
   and rejects duplicate IDs.
 - `EmbeddingRequest` accepts one or more texts. `EmbeddingResult` validates the
-  shape and finiteness of every vector.
+  shape and finiteness of every vector and reports how many provider requests
+  were needed to satisfy the logical batch.
 - `ProviderRuntimeOptions` carries endpoint routing and execution policy such
   as request timeout and retry count without putting them in the semantic model
   request. Endpoint routing is still included separately in cache and model
@@ -354,13 +355,16 @@ location, document task type, query task type, and truncation policy. Project
 and location are execution routing and do not invalidate vectors; task types
 and truncation behavior are semantic and enter embedding identity.
 
-The provider forwards `EmbedConfig.dimensions` as `output_dimensionality`,
-forwards each runner batch as one `embed_content` call, and maps
-`max_retries`/profile timeout into SDK HTTP options. Responses must contain one
-finite vector per input in the original input-ID order. Token statistics are
-normalized into `ProviderUsage`; malformed billed responses carry sanitized
-failed-outcome usage. Query helpers mark requests as query inputs so inherited
-retrieval uses the separately configured query task type.
+The provider forwards `EmbedConfig.dimensions` as `output_dimensionality` and
+maps `max_retries`/profile timeout into SDK HTTP options. It forwards a runner
+batch as one `embed_content` call when the selected model supports that shape;
+`gemini-embedding-001` batches are split into one-input calls and reassembled
+in the original input-ID order. Run metrics distinguish logical batches from
+actual provider calls. Responses must contain one finite vector per input.
+Token statistics are normalized into `ProviderUsage`; malformed billed
+responses carry sanitized failed-outcome usage. Query helpers mark requests as
+query inputs so inherited retrieval uses the separately configured query task
+type.
 
 ## Adding a provider
 

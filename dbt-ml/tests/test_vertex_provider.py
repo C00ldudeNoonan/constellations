@@ -10,9 +10,11 @@ import pytest
 from click.testing import CliRunner
 
 from dbt_ml.cli import cli
+from dbt_ml.config import load_project
 from dbt_ml.config.model import EmbedConfig
 from dbt_ml.embedding import EmbeddingIdentity
 from dbt_ml.optional_dependencies import OptionalDependencyError
+from dbt_ml.profile import ProfileError, resolve_profile
 from dbt_ml.providers import (
     EmbeddingRequest,
     ProviderConfigurationError,
@@ -114,7 +116,7 @@ def test_vertex_provider_maps_batch_dimensions_ids_and_runtime(
     monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
     provider = _provider(project="economic-data-prod", location="global")
     request = EmbeddingRequest(
-        model="gemini-embedding-001",
+        model="text-embedding-005",
         texts=("employment increased", "inflation moderated"),
         dimensions=3,
         input_ids=("chunk-a", "chunk-b"),
@@ -148,7 +150,7 @@ def test_vertex_provider_maps_batch_dimensions_ids_and_runtime(
     ]
     assert fake.calls == [
         {
-            "model": "gemini-embedding-001",
+            "model": "text-embedding-005",
             "contents": ["employment increased", "inflation moderated"],
             "config": {
                 "task_type": "RETRIEVAL_DOCUMENT",
@@ -157,6 +159,35 @@ def test_vertex_provider_maps_batch_dimensions_ids_and_runtime(
             },
         }
     ]
+    assert fake.close_count == 1
+
+
+def test_vertex_gemini_model_splits_multi_input_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeGenAI()
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
+    request = EmbeddingRequest(
+        model="publishers/google/models/gemini-embedding-001",
+        texts=("employment increased", "inflation moderated"),
+        dimensions=3,
+        input_ids=("chunk-a", "chunk-b"),
+    )
+
+    result = _provider().embed(
+        request,
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+
+    assert [call["contents"] for call in fake.calls] == [
+        ["employment increased"],
+        ["inflation moderated"],
+    ]
+    assert result.input_ids == request.input_ids
+    assert len(result.vectors) == 2
+    assert result.usage.input_tokens == 4
+    assert result.provider_requests == 2
     assert fake.close_count == 1
 
 
@@ -205,6 +236,34 @@ def test_vertex_provider_rejects_api_keys_and_has_actionable_extra(
             credential=None,
             runtime=ProviderRuntimeOptions(),
         )
+
+
+def test_vertex_api_key_env_is_rejected_during_profile_resolution(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: vertex_project\nversion: '0.1.0'\nprofile: vertex_project\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "vertex_project:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        "        path: ./target/db.duckdb\n"
+        "        schema: docs\n"
+        "      embedding:\n"
+        "        provider: vertex\n"
+        "        api_key_env: GOOGLE_API_KEY\n"
+    )
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(
+        ProfileError,
+        match=r"Application Default Credentials.*do not accept api_key_env",
+    ):
+        resolve_profile(project, tmp_path)
 
 
 def test_vertex_malformed_response_is_sanitized_and_accounts_usage(
@@ -391,8 +450,17 @@ def test_build_runs_vertex_embed_model_with_mocked_responses(
     assert {row[1] for row in rows} == {"vertex"}
     assert {row[2] for row in rows} == {"gemini-embedding-001"}
     assert {row[3] for row in rows} == {3}
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["config"]["output_dimensionality"] == 3
+    assert len(fake.calls) == 2
+    assert all(len(call["contents"]) == 1 for call in fake.calls)
+    assert all(call["config"]["output_dimensionality"] == 3 for call in fake.calls)
+    run_results = json.loads((project / "target" / "run_results.json").read_text())
+    embed_result = next(
+        result
+        for result in run_results["results"]
+        if result["model_name"] == "document_embeddings"
+    )
+    assert embed_result["metrics"]["provider_calls"] == 2
+    assert embed_result["metrics"]["batches"] == 1
     manifest = json.loads((project / "target" / "manifest.json").read_text())
     serialized_manifest = json.dumps(manifest)
     assert "economic-data-dev" not in serialized_manifest

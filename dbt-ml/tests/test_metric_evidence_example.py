@@ -84,6 +84,8 @@ def test_metric_evidence_agent_matches_reviewed_snapshots(tmp_path: Path) -> Non
     assert result["authorized_answer"]["access_limited"] is False
     assert result["reduced_answer"]["access_limited"] is True
     for item in result["authorized_answer"]["evidence"]:
+        assert "text" not in item
+        assert item["claim"].endswith(f"on {item['valid_from'][:10]}.")
         assert len(item["document_id"]) == 32
         assert len(item["document_version_id"]) == 32
         assert len(item["context_id"]) == 32
@@ -94,6 +96,17 @@ def test_metric_evidence_agent_matches_reviewed_snapshots(tmp_path: Path) -> Non
         assert item["recorded_from"].endswith("Z")
         assert item["freshness"] == "fresh"
         assert item["provenance_fingerprint"]
+        assert {
+            entity["dbt_unique_id"] for entity in item["entities"]
+        } == {"semantic_model.metric_evidence_semantic.refunds"}
+
+    persisted_output = (
+        completed.stdout
+        + (project / "target" / "demo_result.json").read_text()
+    )
+    for fixture in (project / "fixtures" / "policies").glob("*.json"):
+        raw_text = json.loads(fixture.read_text())["text"]
+        assert raw_text not in persisted_output
 
     reduced_payload = json.dumps(
         {
@@ -110,7 +123,6 @@ def test_metric_evidence_agent_matches_reviewed_snapshots(tmp_path: Path) -> Non
         "context_id",
         "chunk_id",
         "source_uri",
-        "text",
         "provenance_fingerprint",
     ):
         assert restricted[field] not in reduced_payload

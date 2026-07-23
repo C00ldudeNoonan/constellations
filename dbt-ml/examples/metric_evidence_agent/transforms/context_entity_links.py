@@ -33,7 +33,7 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
                 "entity_name": "customer_segment",
                 "entity_id": entity_id,
                 "entity_key": entity_key,
-                "dbt_unique_id": "semantic_model.metric_evidence.refunds",
+                "dbt_unique_id": "semantic_model.metric_evidence_semantic.refunds",
                 "relationship_type": "applies_to",
                 "link_method": "exact_source_field:v1",
                 "confidence": None,

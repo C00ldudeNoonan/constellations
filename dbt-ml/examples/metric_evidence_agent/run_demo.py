@@ -213,6 +213,9 @@ async def _query_context(
                     raise RuntimeError(str(lineage["error"]))
                 chunk = document["chunks"][0]
                 record = lineage["record"]
+                valid_from = _utc_timestamp(document["interval"]["valid_from"])
+                section_path = chunk["citation"]["section_path"] or []
+                section = section_path[-1] if section_path else "Documented"
                 evidence.append(
                     {
                         "document_id": document["document_id"],
@@ -221,12 +224,15 @@ async def _query_context(
                         "chunk_id": chunk["chunk_id"],
                         "source_uri": document["source"]["source_uri"],
                         "source_version": document["source"]["source_version"],
-                        "valid_from": _utc_timestamp(document["interval"]["valid_from"]),
+                        "valid_from": valid_from,
                         "recorded_from": _utc_timestamp(
                             document["interval"]["recorded_from"]
                         ),
                         "freshness": document["freshness"]["status"],
-                        "text": chunk["text"],
+                        "claim": (
+                            f"{section} policy record became effective "
+                            f"on {valid_from[:10]}."
+                        ),
                         "citation": chunk["citation"],
                         "entities": chunk["entities"],
                         "provenance_fingerprint": record["lineage"]["provenance_fingerprint"],

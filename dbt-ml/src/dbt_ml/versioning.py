@@ -89,6 +89,8 @@ def compute_code_version(
     effective_llm: Mapping[str, Any] | None = None,
     project_dir: Path,
     agent_context: AgentContextConfig | None = None,
+    unique_key: str | None = None,
+    on_schema_change: str | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         # flush_every shapes execution (memory/flush cadence), never output
@@ -160,7 +162,13 @@ def compute_code_version(
         # Raw source-SQL content + template contract version drive state
         # selection; the compiled, target-specific SQL is recorded separately in
         # the manifest so DuckDB vs BigQuery spelling never churns code_version.
+        # unique_key/on_schema_change are ModelConfig-level (issue #142): scoped
+        # to this block only, so other model kinds' incremental state is
+        # untouched.
         payload["sql_contract"] = SQL_COMPILER_CONTRACT_VERSION
+        if unique_key is not None:
+            payload["sql_unique_key"] = unique_key
+            payload["sql_on_schema_change"] = on_schema_change
         try:
             sql_file = resolve_within_project(
                 transform.path, project_dir, surface="transform.path"
@@ -270,6 +278,8 @@ def compute_model_code_version(
         effective_embedding=effective_embedding,
         effective_llm=effective_llm,
         project_dir=project_dir,
+        unique_key=model.unique_key,
+        on_schema_change=model.on_schema_change,
     )
 
 

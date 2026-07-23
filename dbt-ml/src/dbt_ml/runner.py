@@ -666,6 +666,7 @@ def _run_model(
                 project_dir=project_dir,
                 adapter=adapter,
                 resolved=resolved,
+                full_refresh=full_refresh,
             )
         else:
             result = _run_transform_model(
@@ -1264,15 +1265,19 @@ def _run_sql_model(
     project_dir: Path,
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
+    full_refresh: bool = False,
 ) -> ModelRunResult:
     """Compile a SQL transform's refs to warehouse relations and materialize it
-    with an adapter-owned CTAS — upstream rows never enter the dbt-ml process."""
+    with an adapter-owned CTAS/merge — upstream rows never enter the dbt-ml
+    process.
+
+    For `materialization: incremental` (#142), the SQL is compiled twice
+    differently depending on whether the target already exists and
+    `--full-refresh` isn't active: `is_incremental()` renders False (and
+    `materialize_sql_full` runs a plain CTAS) on the first run or under
+    `--full-refresh`; otherwise it renders True and the compiled delta query is
+    merged into the existing target via `materialize_sql_incremental`."""
     assert model.transform is not None and model.transform.path is not None
-    if model.materialization != "full":
-        raise RunError(
-            f"SQL model '{model.name}' only supports `materialization: full` in this "
-            "slice (see #142 for incremental)."
-        )
     if WarehouseCapability.SQL_MODEL_MATERIALIZATION not in adapter.capabilities():
         raise RunError(
             f"Adapter '{adapter.adapter_type()}' does not support SQL models "
@@ -1288,18 +1293,45 @@ def _run_sql_model(
     refs = discover_refs(sql_text, model_name=model.name)
     # Each ref resolves to the upstream model's adapter-quoted target relation.
     relations = {name: adapter.table_ref(name) for name in refs}
+
+    is_incremental_model = model.materialization == "incremental"
+    target_exists = is_incremental_model and adapter.relation_exists(model.name)
+    # Compile-time is_incremental() reflects what will actually run: False on
+    # the first run or --full-refresh, even though the model is *configured*
+    # incremental, so the .sql file's own branch stays truthful.
+    run_incremental = is_incremental_model and target_exists and not full_refresh
     select_sql = compile_sql(
         sql_text,
         model_name=model.name,
         relations=relations,
         target_name=resolved.target_name,
         target_type=resolved.warehouse.type,
+        this=adapter.table_ref(model.name) if is_incremental_model else None,
+        is_incremental=run_incremental if is_incremental_model else None,
     )
 
     try:
-        result = adapter.materialize_sql_full(
-            model.name, select_sql, options=_warehouse_options(adapter, model)
-        )
+        if run_incremental:
+            assert model.unique_key is not None  # enforced at compile time
+            if (
+                WarehouseCapability.SQL_INCREMENTAL_MATERIALIZATION
+                not in adapter.capabilities()
+            ):
+                raise RunError(
+                    f"Adapter '{adapter.adapter_type()}' does not support "
+                    "incremental SQL models (SQL_INCREMENTAL_MATERIALIZATION)."
+                )
+            result = adapter.materialize_sql_incremental(
+                model.name,
+                select_sql,
+                unique_key=model.unique_key,
+                on_schema_change=model.on_schema_change,
+                options=_warehouse_options(adapter, model),
+            )
+        else:
+            result = adapter.materialize_sql_full(
+                model.name, select_sql, options=_warehouse_options(adapter, model)
+            )
     except AdapterError as e:
         raise RunError(f"SQL model '{model.name}' failed: {e}") from e
 
@@ -1308,6 +1340,8 @@ def _run_sql_model(
         "relation": result.relation,
         "refs": list(refs),
     }
+    if is_incremental_model:
+        metrics["is_incremental"] = run_incremental
     if result.job_metadata:
         metrics["job"] = result.job_metadata
     return ModelRunResult(
@@ -1315,6 +1349,8 @@ def _run_sql_model(
         materialization=model.materialization,
         kind="sql",
         rows_written=result.rows_written,
+        rows_inserted=result.rows_inserted or 0,
+        rows_updated=result.rows_updated or 0,
         metrics=metrics,
     )
 

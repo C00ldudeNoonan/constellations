@@ -651,11 +651,32 @@ def _validate_materialization(model: ModelConfig) -> None:
                 ("warehouse_options",),
             )
         return
-    if model.transform is not None and model.materialization != "full":
+    is_incremental_sql_transform = (
+        model.transform is not None
+        and model.transform.type == "sql"
+        and model.materialization == "incremental"
+    )
+    if (
+        model.transform is not None
+        and model.materialization != "full"
+        and not is_incremental_sql_transform
+    ):
         raise _model_error(
             model,
-            f"Transform model '{model.name}' only supports `materialization: full`",
+            f"Transform model '{model.name}' only supports `materialization: full`"
+            + (
+                ", or `incremental` for `type: sql` (#142)"
+                if model.transform.type == "sql"
+                else ""
+            ),
             ("materialization",),
+        )
+    if model.unique_key is not None and not is_incremental_sql_transform:
+        raise _model_error(
+            model,
+            f"Model '{model.name}' declares `unique_key`, which only applies to "
+            "`transform: {type: sql}` with `materialization: incremental` (#142)",
+            ("unique_key",),
         )
     if model.ml is not None and model.materialization != "full":
         raise _model_error(
@@ -689,6 +710,13 @@ def _prepare_sql_transform(model: ModelConfig, project_dir: Path) -> None:
             "yet: SQL outputs are not validated against the contract before "
             "publication. Use a python transform, or drop agent_context.",
             ("agent_context",),
+        )
+    if model.materialization == "incremental" and not model.unique_key:
+        raise _model_error(
+            model,
+            f"SQL transform model '{model.name}' declares `materialization: "
+            "incremental` and requires a `unique_key:` column (#142)",
+            ("unique_key",),
         )
     try:
         resolved = resolve_within_project(

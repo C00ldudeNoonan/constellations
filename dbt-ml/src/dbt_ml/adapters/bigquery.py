@@ -47,6 +47,7 @@ from ..credentials import (
     CredentialResolutionError,
 )
 from ..hashing import canonical_fingerprint
+from ..sql_models import build_key_check_sql
 from .base import (
     SERVING_LEDGER_TABLE,
     AdapterError,
@@ -710,6 +711,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
                 WarehouseCapability.SQL_MODEL_MATERIALIZATION,
+                WarehouseCapability.SQL_INCREMENTAL_MATERIALIZATION,
                 WarehouseCapability.SQL_SCHEMA_TESTS,
                 WarehouseCapability.STREAMING_TABULAR_READS,
                 WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
@@ -1530,6 +1532,177 @@ class BigQueryAdapter(WarehouseAdapter):
             for f in (job.schema or [])
         )
         return SqlRelationSchema(columns=columns)
+
+    def relation_exists(self, table: str) -> bool:
+        return self._table_columns(table) is not None
+
+    def materialize_sql_incremental(
+        self,
+        table: str,
+        select_sql: str,
+        *,
+        unique_key: str,
+        on_schema_change: str = "fail",
+        options: BaseModel | None = None,
+    ) -> SqlMaterializationResult:
+        key = self.quote_ident(unique_key)
+        # Materialize select_sql exactly once into a staging table, then
+        # validate and merge that SAME rowset. Re-executing select_sql for the
+        # key check and again inside the MERGE would let a nondeterministic
+        # query — or an upstream table that changed between the two jobs —
+        # merge a different, unvalidated rowset than the one that passed
+        # validation (issue #142 review).
+        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+        staging_ref = self.table_ref(staging)
+        try:
+            try:
+                self._run_query(f"CREATE TABLE {staging_ref} AS {select_sql}")
+            except Exception as e:
+                raise AdapterError(
+                    f"Incremental SQL model staging for '{table}' failed: {e}"
+                ) from e
+
+            check_rows = list(
+                self._run_query(
+                    build_key_check_sql(f"SELECT * FROM {staging_ref}", key)
+                ).result()
+            )
+            null_count, duplicate_count = (
+                tuple(check_rows[0].values()) if check_rows else (0, 0)
+            )
+            null_count = int(null_count or 0)
+            duplicate_count = int(duplicate_count or 0)
+            if null_count or duplicate_count:
+                raise AdapterError(
+                    f"Incremental SQL model '{table}' unique_key '{unique_key}' "
+                    f"has {null_count} null and {duplicate_count} duplicate "
+                    "value(s) in the query result."
+                )
+
+            staging_schema = self._relation_schema(staging)
+            source_cols = [c.name for c in staging_schema.columns]
+            if unique_key not in source_cols:
+                raise AdapterError(
+                    f"Incremental SQL model '{table}' query does not select its "
+                    f"unique_key column '{unique_key}'"
+                )
+            target_cols = self._table_columns(table) or []
+            if unique_key not in target_cols:
+                # The key changed (or was never in this target). Appending it
+                # as "just another new column" would leave every existing row
+                # with a NULL key, so this is fatal under every
+                # on_schema_change policy, not only `fail`.
+                raise AdapterError(
+                    f"Incremental SQL model '{table}' unique_key '{unique_key}' "
+                    "does not exist in the current target table (the key may "
+                    "have changed). Run with --full-refresh to rebuild the "
+                    "target under the new key."
+                )
+            insert_cols = self._reconcile_sql_schema(
+                table, staging_schema, target_cols, on_schema_change
+            )
+
+            other_cols = [c for c in insert_cols if c != unique_key]
+            update_set = ", ".join(
+                f"T.{self.quote_ident(c)} = S.{self.quote_ident(c)}"
+                for c in other_cols
+            )
+            insert_col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
+            insert_val_list = ", ".join(
+                f"S.{self.quote_ident(c)}" for c in insert_cols
+            )
+            # A single MERGE is one atomic DML statement — it either fully
+            # commits or fails, so a failed merge never leaves the target
+            # partially updated. USING references the staged table directly
+            # (not the original select_sql), so the merged rowset is exactly
+            # what was validated above.
+            merge_sql = (
+                f"MERGE {self.table_ref(table)} AS T "
+                f"USING {staging_ref} AS S "
+                f"ON T.{key} = S.{key} "
+                + (
+                    f"WHEN MATCHED THEN UPDATE SET {update_set} "
+                    if update_set
+                    else ""
+                )
+                + f"WHEN NOT MATCHED THEN INSERT ({insert_col_list}) "
+                f"VALUES ({insert_val_list})"
+            )
+            try:
+                job = self._run_query(merge_sql)
+            except Exception as e:
+                raise AdapterError(
+                    f"Incremental SQL model materialization for '{table}' "
+                    f"failed: {e}"
+                ) from e
+            affected = int(job.num_dml_affected_rows or 0)
+            job_metadata: dict[str, Any] = {}
+            job_id = getattr(job, "job_id", None)
+            if job_id:
+                job_metadata["job_id"] = job_id
+            return SqlMaterializationResult(
+                relation=self.table_ref(table),
+                rows_written=affected,
+                job_metadata=job_metadata,
+            )
+        finally:
+            self.drop_table(staging)
+
+    def _relation_schema(self, table: str) -> SqlRelationSchema:
+        """Full column name + type schema of an existing table (unlike
+        `_table_columns`, which discards types)."""
+        bq_table = self.client.get_table(self._table_id(table))
+        columns = tuple(
+            SqlRelationColumn(name=str(f.name), data_type=str(f.field_type))
+            for f in bq_table.schema
+        )
+        return SqlRelationSchema(columns=columns)
+
+    def _reconcile_sql_schema(
+        self,
+        table: str,
+        source_schema: SqlRelationSchema,
+        target_cols: list[str],
+        on_schema_change: str,
+    ) -> list[str]:
+        """Compares the compiled query's schema against the existing target's
+        columns and applies the on_schema_change policy — the BigQuery analogue
+        of DuckDB's `_reconcile_sql_schema`."""
+        source_cols = [c.name for c in source_schema.columns]
+        new = [c for c in source_cols if c not in target_cols]
+        removed = [c for c in target_cols if c not in source_cols]
+        if not new and not removed:
+            return list(source_cols)
+
+        if on_schema_change == "fail":
+            drift = "; ".join(
+                part
+                for part in (
+                    f"new columns {new}" if new else "",
+                    f"removed columns {removed}" if removed else "",
+                )
+                if part
+            )
+            raise AdapterError(
+                f"Schema change on incremental table '{table}': {drift}. "
+                "Run with --full-refresh to rebuild it, or set "
+                "`on_schema_change: append_new_columns` (or `ignore`) on the model."
+            )
+        if on_schema_change == "append_new_columns":
+            if new:
+                types_by_name = {c.name: c.data_type for c in source_schema.columns}
+                for col in new:
+                    self._run_query(
+                        f"ALTER TABLE {self.table_ref(table)} "
+                        f"ADD COLUMN {self.quote_ident(col)} {types_by_name[col]}"
+                    )
+            return list(source_cols)
+        if on_schema_change == "ignore":
+            return [c for c in source_cols if c in target_cols]
+        raise AdapterError(
+            f"Unknown on_schema_change policy '{on_schema_change}'. "
+            "Allowed: fail, ignore, append_new_columns."
+        )
 
     def materialize_full(
         self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None

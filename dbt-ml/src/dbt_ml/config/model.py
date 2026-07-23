@@ -597,6 +597,10 @@ class ModelConfig(BaseModel):
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
     on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
+    # Required for `materialization: incremental` SQL transforms (issue #142);
+    # other incremental model kinds key on a fixed identity column instead
+    # (document_id, chunk_id, ...) and must leave this unset.
+    unique_key: str | None = None
     # Adapter-specific physical-layout knobs (issue #91), opaque to core:
     # the active adapter validates its own keys (e.g. BigQuery partition_by /
     # cluster_by); adapters that support none ignore the block so one project

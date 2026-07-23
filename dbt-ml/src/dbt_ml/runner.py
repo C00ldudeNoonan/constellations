@@ -30,11 +30,6 @@ from .adapters import (
     WarehouseCapability,
     create_adapter,
 )
-from .agent_context import (
-    AgentContextValidationError,
-    empty_agent_context_frame,
-    validate_agent_context_frame,
-)
 from .backends import (
     BackendOptionsError,
     BaseBackend,
@@ -59,7 +54,7 @@ from .config.model import (
     LLMTransformConfig,
     ModelConfig,
 )
-from .config.profile import DEFAULT_LLM_PROVIDER, PricingConfig
+from .config.profile import PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
@@ -72,7 +67,9 @@ from .embedding import (
 from .execution import ModelRunResult as ModelRunResult
 from .execution import RunError as RunError
 from .execution import chunk as _chunk_execution
+from .execution import errors as _errors_execution
 from .execution import scalarize as _scalarize
+from .execution import transform as _transform_execution
 from .execution import warehouse_options as _warehouse_options
 from .hashing import canonical_fingerprint
 from .llm_map import LLMMapError, LLMMapRuntime, execute_map_item, resolve_llm_runtime
@@ -87,14 +84,7 @@ from .profile import (
 )
 from .providers import (
     InferenceProvider,
-    ProviderBatchError,
-    ProviderConfigurationError,
-    ProviderError,
-    ProviderRequestError,
-    ProviderResponseError,
     get_inference_provider,
-    resolve_provider_model,
-    sanitized_provider_error,
 )
 from .retrieval import (
     CollectionSpec,
@@ -107,9 +97,7 @@ from .retrieval import (
     create_store,
 )
 from .sources import DocumentRef, DocumentSource, SourceError, get_document_source
-from .sql_models import compile_sql, discover_refs, read_sql_source
 from .state_reconciliation import BoundedReconciler, UpstreamRecord
-from .transforms import TransformContext, load_transform, transform_call_arity
 from .versioning import compute_model_code_version
 
 log = logging.getLogger(__name__)
@@ -119,6 +107,11 @@ _chunk_document_ids = _chunk_execution.chunk_document_ids
 _chunk_input_hash = _chunk_execution.chunk_input_hash
 _chunk_row = _chunk_execution.chunk_row
 _run_chunk_model = _chunk_execution.run_chunk_model
+
+_run_sql_model = _transform_execution.run_sql_model
+_run_transform_model = _transform_execution.run_transform_model
+_validate_agent_context_output = _transform_execution._validate_agent_context_output
+_artifact_error_text = _errors_execution.artifact_error_text
 
 _EXTRACTION_LINEAGE_SCHEMA: dict[str, Any] = {
     "document_id": pl.String,
@@ -153,49 +146,6 @@ _LLM_METADATA_COLUMNS = (
     "llm_config_hash",
     "generated_at",
 )
-
-def _validate_agent_context_output(
-    frame: pl.DataFrame, model: ModelConfig
-) -> pl.DataFrame:
-    if model.agent_context is None:
-        return frame
-    if frame.is_empty() and not frame.columns:
-        frame = empty_agent_context_frame(model.agent_context.grain)
-    try:
-        validate_agent_context_frame(frame, model.agent_context.grain)
-    except AgentContextValidationError as error:
-        raise RunError(f"Model '{model.name}' produced invalid {error}") from error
-    return frame
-
-
-def _artifact_error_text(error: Exception) -> str:
-    provider_error = _provider_error_in_chain(error)
-    if isinstance(provider_error, ProviderConfigurationError):
-        return "ProviderConfigurationError: provider configuration is invalid"
-    if isinstance(provider_error, ProviderRequestError):
-        safe = sanitized_provider_error(
-            provider_error.provider,
-            provider_error.operation,
-            provider_error,
-        )
-        return f"ProviderRequestError: {safe}"
-    if isinstance(provider_error, ProviderResponseError):
-        return "ProviderResponseError: provider response is invalid"
-    if isinstance(provider_error, ProviderBatchError):
-        return "ProviderBatchError: provider batch operation failed"
-    if isinstance(provider_error, ProviderError):
-        return "ProviderError: provider operation failed"
-    return f"{type(error).__name__}: {error}"
-
-
-def _provider_error_in_chain(error: BaseException) -> ProviderError | None:
-    current: BaseException | None = error
-    while current is not None:
-        if isinstance(current, ProviderError):
-            return current
-        current = current.__cause__
-    return None
-
 
 class _FullExtractionFailed(Exception):
     pass
@@ -1194,196 +1144,6 @@ def _row_for_extraction(
     for key, value in result.fields.items():
         row[key] = _scalarize(value)
     return row
-
-
-def _run_sql_model(
-    *,
-    model: ModelConfig,
-    project_dir: Path,
-    adapter: WarehouseAdapter,
-    resolved: ResolvedProfile,
-    full_refresh: bool = False,
-) -> ModelRunResult:
-    """Compile a SQL transform's refs to warehouse relations and materialize it
-    with an adapter-owned CTAS/merge — upstream rows never enter the dbt-ml
-    process.
-
-    For `materialization: incremental` (#142), the SQL is compiled twice
-    differently depending on whether the target already exists and
-    `--full-refresh` isn't active: `is_incremental()` renders False (and
-    `materialize_sql_full` runs a plain CTAS) on the first run or under
-    `--full-refresh`; otherwise it renders True and the compiled delta query is
-    merged into the existing target via `materialize_sql_incremental`."""
-    assert model.transform is not None and model.transform.path is not None
-    if WarehouseCapability.SQL_MODEL_MATERIALIZATION not in adapter.capabilities():
-        raise RunError(
-            f"Adapter '{adapter.adapter_type()}' does not support SQL models "
-            "(SQL_MODEL_MATERIALIZATION)."
-        )
-
-    resolved_path = resolve_within_project(
-        model.transform.path,
-        project_dir,
-        surface=f"model '{model.name}' transform.path",
-    )
-    sql_text = read_sql_source(resolved_path, model_name=model.name)
-    refs = discover_refs(sql_text, model_name=model.name)
-    # Each ref resolves to the upstream model's adapter-quoted target relation.
-    relations = {name: adapter.table_ref(name) for name in refs}
-
-    is_incremental_model = model.materialization == "incremental"
-    target_exists = is_incremental_model and adapter.relation_exists(model.name)
-    # Compile-time is_incremental() reflects what will actually run: False on
-    # the first run or --full-refresh, even though the model is *configured*
-    # incremental, so the .sql file's own branch stays truthful.
-    run_incremental = is_incremental_model and target_exists and not full_refresh
-    select_sql = compile_sql(
-        sql_text,
-        model_name=model.name,
-        relations=relations,
-        target_name=resolved.target_name,
-        target_type=resolved.warehouse.type,
-        this=adapter.table_ref(model.name) if is_incremental_model else None,
-        is_incremental=run_incremental if is_incremental_model else None,
-    )
-
-    try:
-        if run_incremental:
-            assert model.unique_key is not None  # enforced at compile time
-            if (
-                WarehouseCapability.SQL_INCREMENTAL_MATERIALIZATION
-                not in adapter.capabilities()
-            ):
-                raise RunError(
-                    f"Adapter '{adapter.adapter_type()}' does not support "
-                    "incremental SQL models (SQL_INCREMENTAL_MATERIALIZATION)."
-                )
-            result = adapter.materialize_sql_incremental(
-                model.name,
-                select_sql,
-                unique_key=model.unique_key,
-                on_schema_change=model.on_schema_change,
-                options=_warehouse_options(adapter, model),
-            )
-        else:
-            result = adapter.materialize_sql_full(
-                model.name, select_sql, options=_warehouse_options(adapter, model)
-            )
-    except AdapterError as e:
-        raise RunError(f"SQL model '{model.name}' failed: {e}") from e
-
-    metrics: dict[str, Any] = {
-        "compiled_sql": select_sql,
-        "relation": result.relation,
-        "refs": list(refs),
-    }
-    if is_incremental_model:
-        metrics["is_incremental"] = run_incremental
-    if result.job_metadata:
-        metrics["job"] = result.job_metadata
-    return ModelRunResult(
-        model_name=model.name,
-        materialization=model.materialization,
-        kind="sql",
-        rows_written=result.rows_written,
-        rows_inserted=result.rows_inserted or 0,
-        rows_updated=result.rows_updated or 0,
-        metrics=metrics,
-    )
-
-
-def _run_transform_model(
-    *,
-    model: ModelConfig,
-    project_dir: Path,
-    adapter: WarehouseAdapter,
-    resolved: ResolvedProfile,
-) -> ModelRunResult:
-    assert model.transform is not None
-    if model.materialization == "incremental":
-        raise RunError(
-            f"Transform model '{model.name}' declares `materialization: incremental`, "
-            "but transforms only support `full` today. Set `materialization: full` "
-            "(or omit it) — see issue #53."
-        )
-    if model.transform.type != "python":
-        raise RunError(
-            f"Model '{model.name}': only `type: python` transforms are supported in v1"
-        )
-    if not model.transform.module:
-        raise RunError(f"Model '{model.name}': transform requires a `module:`")
-    if not model.depends_on:
-        raise RunError(
-            f"Transform model '{model.name}' must declare `depends_on:` for v1"
-        )
-
-    provider_name: str | None = None
-    provider_model: str | None = None
-    provider_implementation: str | None = None
-    if model.transform.uses_llm:
-        provider_name = (
-            resolved.llm.provider
-            if resolved.llm is not None
-            else DEFAULT_LLM_PROVIDER
-        )
-        selected_model = resolved.llm.model if resolved.llm is not None else None
-        try:
-            provider = get_inference_provider(provider_name)
-            provider_model = resolve_provider_model(provider, selected_model)
-            provider_implementation = provider.implementation_identity()
-        except Exception as e:
-            raise RunError(
-                f"Transform model '{model.name}' could not initialize inference: "
-                f"{_artifact_error_text(e)}"
-            ) from e
-
-    transform_fn = load_transform(model.transform.module, project_dir)
-    deps: dict[str, pl.DataFrame] = {}
-    for dep_ref in model.depends_on:
-        dep_name = parse_ref(dep_ref)
-        deps[dep_name] = adapter.read_table(dep_name)
-
-    try:
-        if transform_call_arity(transform_fn) == 2:
-            ctx = TransformContext(
-                project_dir=project_dir,
-                profile_name=resolved.profile_name,
-                target_name=resolved.target_name,
-                warehouse=resolved.warehouse,
-                llm=resolved.llm,
-                options=dict(model.transform.options),
-            )
-            output = transform_fn(deps, ctx)
-        else:
-            output = transform_fn(deps)
-    except RunError:
-        raise
-    except Exception as e:
-        log.debug("transform failed for %s", model.name, exc_info=True)
-        raise RunError(
-            f"Transform model '{model.name}' failed: {_artifact_error_text(e)}"
-        ) from e
-
-    if not isinstance(output, pl.DataFrame):
-        raise RunError(
-            f"Transform '{model.transform.module}' must return a polars.DataFrame"
-        )
-
-    adapter.materialize_full(
-        model.name,
-        _validate_agent_context_output(output, model),
-        options=_warehouse_options(adapter, model),
-    )
-
-    return ModelRunResult(
-        model_name=model.name,
-        materialization=model.materialization,
-        kind="transform",
-        provider=provider_name,
-        provider_model=provider_model,
-        provider_implementation=provider_implementation,
-        rows_written=output.height,
-    )
 
 
 @dataclass

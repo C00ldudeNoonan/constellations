@@ -5,9 +5,9 @@ was implemented in issue #134, and issue #152 implemented warehouse-owned
 publication readiness, generation-fenced publish/query coordination, explicit
 administrative recovery (`dbt-ml serving`), and governed policy-prefilter
 queries for the local DuckDB + LanceDB proving pair within its documented
-single-host boundary. Full replacement/atomic rebuild (#153), distributed
-store fencing (#136), and portable-serving follow-ups remain target contract,
-not current guarantees.
+single-host boundary. Issue #153 added bounded state reconciliation; full
+replacement/atomic rebuild and distributed-store fencing remain reserved
+capabilities, not current guarantees.
 
 This decision builds on the accepted
 [warehouse adapter capability boundary](adapter-capabilities.md) and the
@@ -25,8 +25,8 @@ index lifecycle plus vector, text, filtered, and hybrid retrieval. It never
 implements `WarehouseAdapter`, exposes arbitrary SQL, or becomes the only copy
 of a row.
 
-The first proving implementation is local LanceDB; turbopuffer remains planned.
-Features are
+The supported proving implementation is local LanceDB. No additional retrieval
+store is currently on the roadmap. Features are
 capabilities, not assumptions: a vector-only store can implement this contract
 without pretending to support BM25, hybrid search, online schema evolution, or
 atomic replacement.
@@ -458,8 +458,7 @@ The constraints are:
 - `id` is a non-empty UTF-8 string. Optional `document_id` and `chunk_id` values
   are also non-empty when present. IDs containing NUL are rejected. A store
   advertises its byte limit; over-limit values fail with a safe row position,
-  never truncation or silent hashing. Projects intended for LanceDB and
-  turbopuffer portability should keep IDs at or below 64 UTF-8 bytes.
+  never truncation or silent hashing.
 - IDs are unique within a collection. The complete key domain is validated
   before the first store mutation through a typed warehouse key-domain check.
   The eager read in the local proof of concept may do this in memory;
@@ -1245,8 +1244,8 @@ Atomic replacement has these semantics:
 
 Step 4 requires an independently advertised warehouse capability for an atomic,
 fence-checked replacement of every state row in a scope. Per-record CRUD from
-#139 is insufficient. #153 owns that operation together with ordered/paged state
-reconciliation. Full replacement is rejected unless both the retrieval store's
+#139 is insufficient. #153 implemented that warehouse operation together with
+ordered/paged state reconciliation. Full replacement is rejected unless both the retrieval store's
 atomic activation and the warehouse's atomic state-snapshot replacement are
 available.
 
@@ -1314,6 +1313,10 @@ The implementation touchpoints are `config/model.py`, `config/profile.py`,
 `dbt_export.py`, test routing, and relevant CLI resource dispatch.
 
 ### Build and tests
+
+This subsection is the target retrieval-test contract. Configured
+search-resource tests remain rejected by the current implementation; #137 is
+the active evaluation follow-up.
 
 `build` preserves topological semantics:
 
@@ -1651,30 +1654,29 @@ status/counts. It never offers SQL or labels the index as a DuckDB/BigQuery
 relation. Existing warehouse pages and v1 manifests continue to render through
 the explicit version adapter.
 
-## Proving-store mappings
+## LanceDB mapping
 
-This mapping was checked against official documentation on 2026-07-15. It is
-implementation guidance, not a declaration of shipped capabilities. Each
-adapter must pin a supported SDK range and advertise only behavior covered by
-contract tests.
+This mapping was checked against official documentation on 2026-07-15. Each
+adapter version must pin a supported SDK range and advertise only behavior
+covered by contract tests.
 
-| Portable contract | LanceDB mapping | turbopuffer mapping |
-| --- | --- | --- |
-| collection | Lance table within the configured database/catalog | namespace |
-| inspect/create | table schema and index metadata; explicit Arrow schema | namespace metadata and explicit schema on write |
-| keyed upsert | `merge_insert(id)` with matched update + unmatched insert | whole-document upsert by `id` |
-| keyed delete | typed ID predicate translated by the adapter to `delete` | `deletes` by document ID |
-| exact vector | flat/kNN search | filtered `kNN` only; do not advertise general exact search |
-| approximate vector | Lance vector index/search | ANN/SPFresh |
-| distance metrics | `cosine`, `l2`, and `dot` when supported by chosen index | `cosine_distance` and `euclidean_squared`; dot is unsupported |
-| mandatory prefilter | translated typed AST with `prefilter=True`; scalar/list indexes as configured | native typed filters evaluated with vector/text queries |
-| full text | native FTS/BM25 indexes over declared string fields | schema `full_text_search` plus BM25 ranking |
-| optional native hybrid | use only when Lance RRF matches the core formula/component-rank contract; otherwise core calls both primitives | multi-query plus `rerank_by=RRF` only when compatible; otherwise core calls both primitives |
-| strong reads | connection configured to refresh every read; local adapter verifies read-after-write | strong consistency request, the documented default |
-| eventual reads | provider mode exists, but advertise only after the adapter proves an observed/pinned table version | provider mode exists, but advertise only after the adapter proves an observed/pinned namespace generation |
-| schema/index evolution | provider supports several operations, but only adapter-classified compatible changes may advertise online behavior | limited index-attribute changes are online; type/most schema changes require rebuild |
-| atomic full replace | not advertised until a tested atomic activation primitive exists | not advertised without a tested atomic namespace activation primitive |
-| readiness | index status/listing and a bounded wait | metadata plus handling for indexes that return not-ready/202 |
+| Portable contract | LanceDB mapping |
+| --- | --- |
+| collection | Lance table within the configured database/catalog |
+| inspect/create | table schema and index metadata; explicit Arrow schema |
+| keyed upsert | `merge_insert(id)` with matched update + unmatched insert |
+| keyed delete | typed ID predicate translated by the adapter to `delete` |
+| exact vector | flat/kNN search |
+| approximate vector | Lance vector index/search |
+| distance metrics | `cosine`, `l2`, and `dot` when supported by chosen index |
+| mandatory prefilter | translated typed AST with `prefilter=True`; scalar/list indexes as configured |
+| full text | native FTS/BM25 indexes over declared string fields |
+| optional native hybrid | use only when Lance RRF matches the core formula/component-rank contract; otherwise core calls both primitives |
+| strong reads | connection configured to refresh every read; local adapter verifies read-after-write |
+| eventual reads | advertise only after the adapter proves an observed/pinned table version |
+| schema/index evolution | only adapter-classified compatible changes may advertise online behavior |
+| atomic full replace | not advertised until a tested atomic activation primitive exists |
+| readiness | index status/listing and a bounded wait |
 
 Relevant official references:
 
@@ -1685,42 +1687,17 @@ Relevant official references:
   [indexing](https://docs.lancedb.com/indexing),
   [schema evolution](https://docs.lancedb.com/tables/schema), and
   [consistency](https://docs.lancedb.com/tables/consistency).
-- turbopuffer: [writes, schema, and mutation](https://turbopuffer.com/docs/write),
-  [vector/text/hybrid queries, filters, RRF, and consistency](https://turbopuffer.com/docs/query),
-  and [namespace metadata](https://turbopuffer.com/docs/metadata).
-
 LanceDB SQL-like predicates remain an adapter implementation detail. Core emits
 the typed AST and the adapter quotes/parameterizes or otherwise translates it;
 project/query callers never supply a predicate string. LanceDB's bad-vector
 drop/fill/null modes are forbidden by the canonical row contract.
 
-turbopuffer string IDs currently have a 64-byte limit, uses one distance metric
-for a namespace's vector fields, and does not support dot-product distance in
-the baseline mapping. Its native embedding feature is not used by this
-contract: dbt-ml publishes explicit, warehouse-recorded vectors so index- and
-query-time embedding identity remains governed outside the store.
+LanceDB is not treated as dbt-ml's identity provider. Authorization requires
+profile-controlled routing and mandatory prefilters.
 
-Logical namespaces and collections help isolation and cost management, but
-neither proving adapter is treated as dbt-ml's identity provider. Authorization
-still requires profile-controlled routing and mandatory prefilters.
+## Requirements for a future retrieval store
 
-## Migration for existing vector-store issues
-
-Issues #28-#35 should be re-estimated as `RetrievalStore` integrations rather
-than `WarehouseAdapter` implementations:
-
-| Issue | Store | Migration rule |
-| --- | --- | --- |
-| #28 | Pinecone | implement only proven vector/filter/lifecycle capabilities; no SQL emulation |
-| #29 | Qdrant | map collections, payload filters, keyed mutation, and supported query modes |
-| #30 | Weaviate | keep schema/client-native objects inside the adapter; disable unproven modes |
-| #31 | Milvus/Zilliz | map collection/index readiness and exact capability limits explicitly |
-| #32 | Postgres/pgvector | implement a separate retrieval role even when it shares a physical database with a warehouse |
-| #33 | Chroma | advertise the minimal tested local feature set; reject unsupported production guarantees |
-| #34 | OpenSearch/Elasticsearch | map vector/BM25/hybrid semantics without exposing Query DSL to core |
-| #35 | Redis vector search | map index lifecycle and typed filters without exposing Redis commands to core |
-
-Every integration must provide:
+Any future integration must provide:
 
 1. a strict profile config, strict semantic index-options model, safe/state
    descriptors, implementation identity, and sanitized errors;
@@ -1743,26 +1720,23 @@ optional LanceDB adapter, integration tests, and local example as one bounded
 proof-of-concept slice. The remaining production-serving guarantees stay in
 their owning follow-ups:
 
-- serving/publication coordination in #152, split from adapter delivery because
-  #139 does not provide the ledger or query/publish lease contract.
-- #140 adds immutable projected snapshots and key-domain validation; #153
-  (implemented) adds bounded state reconciliation and atomic scope-state
+- #152 delivered serving/publication coordination, the authorization factory,
+  governed policy-prefilter queries, and publish/read leases.
+- #140 delivered immutable projected snapshots and key-domain validation; #153
+  delivered bounded state reconciliation and atomic scope-state
   replacement, the warehouse-side prerequisites for production-scale
   publication. Full-refresh search rebuilds additionally require store-side
   atomic generation activation and stay rejected until that ships.
-- #135 delivers the portable request/result/filter types, Python API,
-  `dbt-ml search`, score normalization, and core RRF for public indexes. The
-  authorization factory and read lease remain fail-closed on #152.
-- #136 implements turbopuffer without changing resource grammar or core request
-  types.
-- #154 supplies the protected profile-credential representation before #136 or
-  any other hosted retrieval adapter accepts secrets.
+- #135 delivered the portable request/result/filter types, Python API,
+  `dbt-ml search`, score normalization, and core RRF.
+- #154 delivered protected profile-credential representation before any future
+  hosted retrieval adapter accepts secrets.
 - #137 adds deterministic golden-query evaluation through the portable query
   surface.
 - The accepted [agent context v1 contract](agent-context-v1.md) specializes
   provenance, entity/time, permissions, freshness, and citation fields while
   preserving mandatory prefilter separation.
-- #28-#35 conform to this contract and common adapter test suite.
+- Any future store must conform to this contract and common adapter test suite.
 
 Online schema evolution, enforced tenant isolation, optional string operators,
 and custom Python retrieval tests remain typed reserved capabilities. The
@@ -1783,12 +1757,13 @@ The bounded #134 slice covers:
   safe docs, and credential/content/filter/vector redaction;
 - dbt export's all-selector upstream projection, deduplication, and exclusion.
 
-#152 owns shared/exclusive leases, governed query authorization and mandatory
-policy-filter composition, governed ACL delete-before-upsert,
+#152 delivered shared/exclusive leases, governed query authorization and
+mandatory policy-filter composition, governed ACL delete-before-upsert,
 concurrent-publisher, abandoned-session, snapshot-generation, durable readiness,
-and readiness-race tests. #153 owns paged state reconciliation and atomic full
-state replacement. #135 owns the public-index filter contract, identity-bearing
-query vectors, score normalization, and deterministic RRF/tie-breaking tests.
+and readiness-race tests. #153 delivered paged state reconciliation and atomic
+full state replacement. #135 delivered the public-index filter contract,
+identity-bearing query vectors, score normalization, and deterministic
+RRF/tie-breaking tests.
 
 ## Rejected alternatives
 
@@ -1801,10 +1776,10 @@ SQL-shaped adapter problem resolved in #70.
 
 ### Extending `VectorStore`
 
-Rejected as the public role name because LanceDB, turbopuffer, OpenSearch, and
-similar targets can serve BM25, typed filters, and hybrid retrieval without a
-vector in every collection. `RetrievalStore` names the broader role while
-vector search remains an optional capability.
+Rejected as the public role name because retrieval targets can serve BM25,
+typed filters, and hybrid retrieval without a vector in every collection.
+`RetrievalStore` names the broader role while vector search remains an optional
+capability.
 
 ### Provider-native configuration and filters in core
 

@@ -31,9 +31,10 @@ uv run python examples/rag_chunks_pipeline/search_demo.py
   vector search, full-text search, and a typed `source_uri` filter.
 
 The public index is an explicit local-development opt-in in `profiles.yml`.
-Governed indexes, policy enforcement, online replacement, and the portable
-`dbt-ml search` command fail closed or remain follow-up work. The example query
-uses the same typed `RetrievalStore` API that a query service can wrap.
+The portable `dbt-ml search` command and governed indexes with trusted
+policy-prefilter enforcement are implemented. Full replacement and unsupported
+store capabilities still fail closed. This public example uses the same typed
+`RetrievalStore` API that a query service can wrap.
 
 To evaluate real retrieval quality with Vertex AI, install the provider extra,
 change `chunk_embeddings.embed.provider` to `vertex`, change its model to one

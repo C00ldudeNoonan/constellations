@@ -3,7 +3,8 @@
 Status: implemented, including entry-point plugin discovery, provider-owned
 profile configuration, and failed-outcome accounting (issue #71). Built-ins
 include Anthropic and vLLM inference plus deterministic and Vertex AI
-embeddings; other vendor integrations remain their own issues.
+embeddings. Additional vendor integrations are not on the current roadmap; the
+entry-point contract remains available for separately distributed plugins.
 
 dbt-ml treats hosted inference as an execution capability, not as a property of
 the LLM backend. Models describe the transformation they need; a provider

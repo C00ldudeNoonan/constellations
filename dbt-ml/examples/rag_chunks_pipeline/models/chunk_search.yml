@@ -21,13 +21,7 @@ models:
         dimensions: 8
         metric: cosine
         search: exact
-        embedding:
-          provider: fixture
-          model: sha256-token-buckets-v1
-          provider_contract_version: 2
-          provider_implementation: rag-chunks-example:v1
-          semantic_config_fingerprint: sha256-token-buckets-8-v1
-          dimensions: 8
+        embedding: inherit
       full_text:
         fields: [text]
       attributes:

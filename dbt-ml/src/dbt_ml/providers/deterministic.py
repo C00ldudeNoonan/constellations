@@ -26,6 +26,7 @@ class DeterministicEmbeddingProvider(EmbeddingProvider):
     provider_name = "deterministic"
     implementation_version = "1"
     requires_credentials = False
+    accepts_api_key_env = False
 
     def _embed(
         self,
@@ -61,6 +62,7 @@ class DeterministicInferenceProvider(InferenceProvider):
     provider_name = "deterministic"
     implementation_version = "1"
     requires_credentials = False
+    accepts_api_key_env = False
     default_model = "deterministic-v1"
 
     def complete(

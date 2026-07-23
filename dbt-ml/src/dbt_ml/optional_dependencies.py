@@ -21,11 +21,12 @@ def import_optional_dependency(
     *,
     extra: str,
     feature: str,
+    distribution: str | None = None,
 ) -> Any:
     try:
         return importlib.import_module(module)
     except ImportError as error:
-        package = module.split(".", maxsplit=1)[0]
+        package = distribution or module.split(".", maxsplit=1)[0]
         raise OptionalDependencyError(
             f"{feature} requires the optional dependency '{package}'. "
             f"Install it with: pip install 'dbt-ml[{extra}]'"

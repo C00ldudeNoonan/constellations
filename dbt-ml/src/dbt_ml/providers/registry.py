@@ -358,6 +358,14 @@ def _validate_provider_class(
         raise ProviderRegistrationError(
             f"{capability} provider requires_credentials must be boolean"
         )
+    if not isinstance(cls.accepts_api_key_env, bool):
+        raise ProviderRegistrationError(
+            f"{capability} provider accepts_api_key_env must be boolean"
+        )
+    if cls.requires_credentials and not cls.accepts_api_key_env:
+        raise ProviderRegistrationError(
+            f"{capability} provider requiring credentials must accept api_key_env"
+        )
     env_var = cls.default_credential_env
     if env_var is not None and (
         not isinstance(env_var, str) or not _ENV_VAR_NAME.fullmatch(env_var)

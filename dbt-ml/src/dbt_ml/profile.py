@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ from .adapters import (
 )
 from .config.profile import (
     DEFAULT_LLM_PROVIDER,
+    EmbeddingProfileConfig,
     LLMConfig,
     ProfileConfig,
     WarehouseConfig,
@@ -40,11 +41,13 @@ from .config.yaml_diagnostics import (
     format_yaml_parse_error,
     parse_yaml_document,
 )
+from .credentials import CredentialReference
 from .providers import (
     ProviderConfigurationError,
     ProviderNotFoundError,
     ProviderRegistrationError,
     discover_providers,
+    get_embedding_provider,
     get_inference_provider,
     parse_profile_options,
     resolve_provider_model,
@@ -83,6 +86,14 @@ class ResolvedProfile:
     source_paths: dict[str, str]
     profiles_path: Path | None  # None when using inline-legacy fallback
     retrieval: ResolvedRetrievalConfig | None = None
+    embedding: EmbeddingProfileConfig | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedEmbeddingOptions:
+    provider_options: dict[str, Any] = field(repr=False)
+    api_key_env: CredentialReference | None
+    timeout_seconds: float
 
 
 def resolve_profile(
@@ -163,17 +174,30 @@ def resolve_profile(
     llm = _absolutize_llm(selected.llm, project_dir)
     if llm is not None:
         try:
-            provider = get_inference_provider(llm.provider)
+            inference_provider = get_inference_provider(llm.provider)
             # Validate operator-supplied provider_options against the
             # selected provider's published model; the raw mapping stays on
             # the resolved profile and is re-parsed at the provider boundary.
-            parse_profile_options(type(provider), llm.provider_options)
+            parse_profile_options(type(inference_provider), llm.provider_options)
             llm = llm.model_copy(
                 update={
-                    "model": resolve_provider_model(provider, llm.model),
-                    "base_url": provider.resolve_base_url(llm.base_url),
+                    "model": resolve_provider_model(inference_provider, llm.model),
+                    "base_url": inference_provider.resolve_base_url(llm.base_url),
                 }
             )
+        except (ProviderNotFoundError, ProviderConfigurationError) as e:
+            raise ProfileError(
+                f"{profiles_path}: profile '{project.profile}' target "
+                f"'{target_name}' selects {e}"
+            ) from e
+    embedding = selected.embedding
+    if embedding is not None:
+        try:
+            embedding_provider = get_embedding_provider(
+                embedding.provider,
+                profile_options=embedding.provider_options,
+            )
+            embedding_provider.validate_credential_reference(embedding.api_key_env)
         except (ProviderNotFoundError, ProviderConfigurationError) as e:
             raise ProfileError(
                 f"{profiles_path}: profile '{project.profile}' target "
@@ -185,6 +209,7 @@ def resolve_profile(
         target_name=target_name,
         warehouse=warehouse.absolutize(project_dir),
         llm=llm,
+        embedding=embedding,
         retrieval=retrieval,
         source_paths=selected.source_paths,
         profiles_path=profiles_path,
@@ -219,9 +244,43 @@ def _legacy_resolved(project: ProjectConfig) -> ResolvedProfile:
         target_name="<inline>",
         warehouse=warehouse,
         llm=None,
+        embedding=None,
         retrieval=None,
         source_paths={},
         profiles_path=None,
+    )
+
+
+def resolve_embedding_options(
+    provider_name: str,
+    resolved: ResolvedProfile | None,
+) -> ResolvedEmbeddingOptions:
+    """Bind a model's embedding provider to operator-owned target settings."""
+    profile = resolved.embedding if resolved is not None else None
+    if profile is None:
+        try:
+            get_embedding_provider(provider_name)
+        except (ProviderNotFoundError, ProviderConfigurationError) as error:
+            raise ProfileError(str(error)) from error
+        return ResolvedEmbeddingOptions({}, None, 60.0)
+    if profile.provider != provider_name:
+        raise ProfileError(
+            f"Embed model provider '{provider_name}' cannot override profile "
+            f"embedding provider '{profile.provider}'; select the provider under "
+            "`embedding:` in profiles.yml"
+        )
+    try:
+        provider = get_embedding_provider(
+            provider_name,
+            profile_options=profile.provider_options,
+        )
+        provider.validate_credential_reference(profile.api_key_env)
+    except (ProviderNotFoundError, ProviderConfigurationError) as error:
+        raise ProfileError(str(error)) from error
+    return ResolvedEmbeddingOptions(
+        dict(profile.provider_options),
+        profile.api_key_env,
+        profile.timeout_seconds,
     )
 
 

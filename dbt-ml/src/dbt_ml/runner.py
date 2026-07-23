@@ -64,13 +64,19 @@ from .config.profile import DEFAULT_LLM_PROVIDER, PricingConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, parse_ref
-from .embedding import EmbeddingIdentity, effective_search_config, embed_texts
+from .embedding import (
+    EmbeddingIdentity,
+    effective_search_config,
+    embed_texts,
+    resolve_search_embedding_options,
+)
 from .hashing import canonical_fingerprint
 from .llm_map import LLMMapError, LLMMapRuntime, execute_map_item, resolve_llm_runtime
 from .paths import resolve_within_project
 from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
+    resolve_embedding_options,
     resolve_llm_options,
     resolve_profile,
 )
@@ -681,6 +687,7 @@ def _run_model(
             project=project,
             project_dir=project_dir,
             adapter=adapter,
+            resolved=resolved,
             full_refresh=full_refresh,
         )
     elif model.llm is not None:
@@ -1628,6 +1635,7 @@ def _run_embed_model(
     project: ProjectConfig,
     project_dir: Path,
     adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
     full_refresh: bool,
 ) -> ModelRunResult:
     assert model.embed is not None
@@ -1658,11 +1666,16 @@ def _run_embed_model(
         )
 
     record_ids = _embed_record_ids(source, config.id_field, model.name)
-    identity = EmbeddingIdentity.from_config(config)
+    embedding_options = resolve_embedding_options(config.provider, resolved)
+    identity = EmbeddingIdentity.from_config(
+        config,
+        profile_options=embedding_options.provider_options,
+    )
     code_version = compute_model_code_version(
         model,
         project,
         project_dir,
+        resolved=resolved,
     )
     warehouse_opts = _warehouse_options(adapter, model)
     state_scope = StateScope(model.name)
@@ -1746,6 +1759,7 @@ def _run_embed_model(
     pending = [item for item in work if item.vector is None]
     usage_totals: dict[str, int | float] = {}
     provider_batches = 0
+    provider_calls = 0
     try:
         for offset in range(0, len(pending), config.batch_size):
             batch = pending[offset : offset + config.batch_size]
@@ -1753,9 +1767,13 @@ def _run_embed_model(
                 [item.text for item in batch],
                 identity,
                 input_ids=[item.record_id for item in batch],
+                credential_env=embedding_options.api_key_env,
+                profile_options=embedding_options.provider_options,
                 max_retries=config.max_retries,
+                timeout_seconds=embedding_options.timeout_seconds,
             )
             provider_batches += 1
+            provider_calls += embedded.provider_requests
             _add_provider_usage(usage_totals, embedded.usage.to_metrics())
             for item, vector in zip(batch, embedded.vectors, strict=True):
                 item.vector = vector
@@ -1821,7 +1839,7 @@ def _run_embed_model(
         raise RunError(str(e)) from e
 
     metrics: dict[str, Any] = {
-        "provider_calls": provider_batches,
+        "provider_calls": provider_calls,
         "batches": provider_batches,
         "cache_hits": cache_hits,
         "cache_misses": len(pending),
@@ -2405,6 +2423,7 @@ def _run_search_model(
                 physical_collection=physical,
                 upstream_schema=snapshot.schema,
                 store_type=store_config.type,
+                resolved=resolved,
             )
             state_target = store.state_descriptor(logical_collection)
             state_scope = StateScope.for_target_descriptor(
@@ -2677,6 +2696,7 @@ def _search_collection_spec(
     physical_collection: str,
     upstream_schema: pa.Schema,
     store_type: str,
+    resolved: ResolvedProfile,
 ) -> CollectionSpec:
     search = model.search
     assert search is not None
@@ -2705,8 +2725,20 @@ def _search_collection_spec(
             fields.append(pa.field(name, upstream.type, nullable=upstream.nullable))
     schema = pa.schema(fields)
     _validate_search_schema(model, schema=schema)
+    embedding_runtime = resolve_search_embedding_options(
+        model,
+        models_by_name,
+        resolved,
+    )
     config_fingerprint = collection_config_fingerprint(
-        effective_search_config(model, models_by_name), store_type=store_type
+        effective_search_config(
+            model,
+            models_by_name,
+            profile_options=embedding_runtime.provider_options
+            if embedding_runtime is not None
+            else None,
+        ),
+        store_type=store_type,
     )
     return CollectionSpec(
         logical_name=search.collection or model.name,

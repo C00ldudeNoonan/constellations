@@ -15,7 +15,10 @@ from .config import load_project
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .dag import NodeKind, ProjectDAG, parse_ref
-from .embedding import effective_search_config
+from .embedding import (
+    effective_search_config,
+    resolve_search_embedding_options,
+)
 from .hashing import canonical_fingerprint
 from .profile import (
     ProfileError,
@@ -328,7 +331,7 @@ def _model_dict(
     inference = describe_model_inference(model, project, resolved=resolved)
     if inference is not None:
         model_dict["inference"] = inference
-    embedding = describe_model_embedding(model)
+    embedding = describe_model_embedding(model, resolved=resolved)
     if embedding is not None:
         model_dict["embedding"] = embedding
     llm_identity = describe_model_llm(model, resolved=resolved)
@@ -490,7 +493,18 @@ def _model_dict_v2(
         descriptor=state_target.descriptor(),
     )
     capabilities = store_class(config.type).capabilities()
-    effective_search = effective_search_config(model, models_by_name)
+    embedding_runtime = resolve_search_embedding_options(
+        model,
+        models_by_name,
+        resolved,
+    )
+    effective_search = effective_search_config(
+        model,
+        models_by_name,
+        profile_options=embedding_runtime.provider_options
+        if embedding_runtime is not None
+        else None,
+    )
     required = [
         "keyed_upsert",
         "keyed_delete",

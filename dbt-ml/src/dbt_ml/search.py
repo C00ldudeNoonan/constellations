@@ -20,8 +20,14 @@ from .embedding import (
     effective_search_config,
     embed_query,
     resolve_search_embedding_identity,
+    resolve_search_embedding_options,
 )
-from .profile import resolve_profile
+from .profile import (
+    ProfileError,
+    ResolvedEmbeddingOptions,
+    ResolvedProfile,
+    resolve_profile,
+)
 from .providers import ProviderError
 from .retrieval import (
     RetrievalCapabilityError,
@@ -306,7 +312,18 @@ def search(
     predicates = policy_predicates + _resolve_predicates(model, request.filters)
     included_fields = _resolve_result_fields(model, request.fields)
     models_by_name = {item.name: item for item in models}
-    effective_config = effective_search_config(model, models_by_name)
+    embedding_options = _search_embedding_options(
+        model,
+        models_by_name,
+        resolved,
+    )
+    effective_config = effective_search_config(
+        model,
+        models_by_name,
+        profile_options=embedding_options.provider_options
+        if embedding_options is not None
+        else None,
+    )
     expected_fingerprint = collection_config_fingerprint(
         effective_config,
         store_type=store_config.type,
@@ -332,7 +349,12 @@ def search(
                     )
                 # The shared lease pins the ready generation through query
                 # embedding, store search, and result validation.
-                query_vector = _resolve_query_vector(model, models_by_name, request)
+                query_vector = _resolve_query_vector(
+                    model,
+                    models_by_name,
+                    request,
+                    resolved=resolved,
+                )
                 with store:
                     metadata = store.inspect_collection(physical_collection)
                     if metadata is None:
@@ -437,6 +459,8 @@ def _resolve_query_vector(
     model: ModelConfig,
     models_by_name: Mapping[str, ModelConfig],
     request: SearchRequest,
+    *,
+    resolved: ResolvedProfile,
 ) -> tuple[float, ...] | None:
     if request.mode not in {SearchMode.VECTOR, SearchMode.HYBRID}:
         return None
@@ -448,7 +472,18 @@ def _resolve_query_vector(
         if request.query is None:
             raise SearchError("Vector queries require query text or a precomputed vector")
         try:
-            identity = resolve_search_embedding_identity(model, models_by_name)
+            embedding_options = _search_embedding_options(
+                model,
+                models_by_name,
+                resolved,
+            )
+            identity = resolve_search_embedding_identity(
+                model,
+                models_by_name,
+                profile_options=embedding_options.provider_options
+                if embedding_options is not None
+                else None,
+            )
         except (ValueError, ProviderError) as error:
             raise SearchError(str(error)) from None
         if identity is None:
@@ -457,12 +492,35 @@ def _resolve_query_vector(
                 "query vector"
             )
         try:
-            vector = embed_query(request.query, identity)
+            vector = embed_query(
+                request.query,
+                identity,
+                credential_env=embedding_options.api_key_env
+                if embedding_options is not None
+                else None,
+                profile_options=embedding_options.provider_options
+                if embedding_options is not None
+                else None,
+                timeout_seconds=embedding_options.timeout_seconds
+                if embedding_options is not None
+                else 60.0,
+            )
         except (ValueError, ProviderError) as error:
             raise SearchError(f"Query embedding failed: {error}") from None
     if len(vector) != search_config.vector.dimensions:
         raise SearchError("Query vector dimensions do not match the search index")
     return vector
+
+
+def _search_embedding_options(
+    model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
+    resolved: ResolvedProfile,
+) -> ResolvedEmbeddingOptions | None:
+    try:
+        return resolve_search_embedding_options(model, models_by_name, resolved)
+    except ProfileError as error:
+        raise SearchError(str(error)) from None
 
 
 def _resolve_policy_predicates(

@@ -27,7 +27,11 @@ from .embedding import EmbeddingIdentity
 from .hashing import HASH_DIGEST_SIZE, canonical_json
 from .llm_map import LLMMapError, resolve_llm_runtime
 from .paths import resolve_within_project
-from .profile import ResolvedProfile, resolve_llm_options
+from .profile import (
+    ResolvedProfile,
+    resolve_embedding_options,
+    resolve_llm_options,
+)
 from .providers import (
     get_inference_provider,
     profile_options_fingerprint,
@@ -81,6 +85,7 @@ def compute_code_version(
     fields: list[FieldConfig] | None = None,
     effective_extraction: Mapping[str, Any] | None = None,
     effective_transform: Mapping[str, Any] | None = None,
+    effective_embedding: Mapping[str, Any] | None = None,
     effective_llm: Mapping[str, Any] | None = None,
     project_dir: Path,
     agent_context: AgentContextConfig | None = None,
@@ -113,7 +118,9 @@ def compute_code_version(
         else None,
         "chunk": chunk.model_dump() if chunk else None,
         "embed": (
-            {
+            dict(effective_embedding)
+            if effective_embedding is not None
+            else {
                 **embed.model_dump(exclude={"batch_size", "max_retries"}),
                 "identity": EmbeddingIdentity.from_config(embed).to_dict(),
             }
@@ -223,6 +230,19 @@ def compute_model_code_version(
             # Provider unresolved (e.g. offline docs tooling) — fall back to the
             # raw block so the version still computes deterministically.
             effective_llm = None
+    effective_embedding: dict[str, Any] | None = None
+    if model.embed is not None:
+        embedding_options = resolve_embedding_options(
+            model.embed.provider,
+            resolved,
+        )
+        effective_embedding = {
+            **model.embed.model_dump(exclude={"batch_size", "max_retries"}),
+            "identity": EmbeddingIdentity.from_config(
+                model.embed,
+                profile_options=embedding_options.provider_options,
+            ).to_dict(),
+        }
 
     return compute_code_version(
         extraction=model.extraction,
@@ -247,6 +267,7 @@ def compute_model_code_version(
         fields=model.fields,
         effective_extraction=effective_extraction,
         effective_transform=effective_transform,
+        effective_embedding=effective_embedding,
         effective_llm=effective_llm,
         project_dir=project_dir,
     )
@@ -270,10 +291,18 @@ def describe_model_inference(
     return _inference_descriptor(canonical_options)
 
 
-def describe_model_embedding(model: ModelConfig) -> dict[str, str | int] | None:
+def describe_model_embedding(
+    model: ModelConfig,
+    *,
+    resolved: ResolvedProfile | None = None,
+) -> dict[str, str | int] | None:
     if model.embed is None:
         return None
-    return EmbeddingIdentity.from_config(model.embed).to_dict()
+    options = resolve_embedding_options(model.embed.provider, resolved)
+    return EmbeddingIdentity.from_config(
+        model.embed,
+        profile_options=options.provider_options,
+    ).to_dict()
 
 
 def describe_model_llm(

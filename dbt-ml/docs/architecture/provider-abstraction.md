@@ -1,8 +1,9 @@
 # Provider abstraction
 
 Status: implemented, including entry-point plugin discovery, provider-owned
-profile configuration, and failed-outcome accounting (issue #71). Vendor
-integrations beyond Anthropic and vLLM remain their own issues.
+profile configuration, and failed-outcome accounting (issue #71). Built-ins
+include Anthropic and vLLM inference plus deterministic and Vertex AI
+embeddings; other vendor integrations remain their own issues.
 
 dbt-ml treats hosted inference as an execution capability, not as a property of
 the LLM backend. Models describe the transformation they need; a provider
@@ -10,9 +11,10 @@ translates that provider-neutral request into an SDK call. This boundary keeps
 model compilation, caching, materialization, lineage, and usage accounting
 independent from Anthropic or any future inference service.
 
-The built-in inference implementations are Anthropic and vLLM. The contracts
-deliberately cover inference and embeddings separately so a target can
-eventually select different providers for generation and vectorization.
+The built-in inference implementations are Anthropic and vLLM. The built-in
+embedding implementations are deterministic and Vertex AI. The contracts cover
+inference and embeddings separately so a target can select different providers
+for generation and vectorization.
 
 ## Contract surface
 
@@ -26,7 +28,8 @@ eventually select different providers for generation and vectorization.
   `BatchInferenceResult` returns exactly one success or safe error per request
   and rejects duplicate IDs.
 - `EmbeddingRequest` accepts one or more texts. `EmbeddingResult` validates the
-  shape and finiteness of every vector.
+  shape and finiteness of every vector and reports how many provider requests
+  were needed to satisfy the logical batch.
 - `ProviderRuntimeOptions` carries endpoint routing and execution policy such
   as request timeout and retry count without putting them in the semantic model
   request. Endpoint routing is still included separately in cache and model
@@ -147,6 +150,19 @@ llm:
   provider_options:        # opaque to core; validated by the selected provider
     region: eu-west-1
     tenant: research
+```
+
+Embedding providers use the parallel `embedding:` target block. The model ID
+and dimensions remain in each `embed:` model; deployment routing, credentials,
+provider options, and timeout remain operator-owned:
+
+```yaml
+embedding:
+  provider: acme
+  api_key_env: ACME_EMBEDDING_KEY
+  timeout_seconds: 60
+  provider_options:
+    region: eu-west-1
 ```
 
 - A provider may publish a strict Pydantic model
@@ -329,6 +345,27 @@ bearer token. It normalizes usage, rejects truncated or malformed JSON, limits
 response size, and retries only transport and transient HTTP failures. Native
 vLLM batch submission is not advertised; normal concurrent requests let the
 server own scheduling and continuous batching.
+
+## Vertex AI embedding mapping
+
+`VertexEmbeddingProvider` uses the optional `google-genai` SDK in explicit
+Vertex mode with the stable `v1` API. Authentication is Application Default
+Credentials; `api_key_env` is rejected. Profile options select the GCP project,
+location, document task type, query task type, and truncation policy. Project
+and location are execution routing and do not invalidate vectors; task types
+and truncation behavior are semantic and enter embedding identity.
+
+The provider forwards `EmbedConfig.dimensions` as `output_dimensionality` and
+maps `max_retries`/profile timeout into SDK HTTP options. It forwards a runner
+batch as one `embed_content` call when it fits the selected model's limit.
+Gemini embedding batches are split into one-input calls; other Vertex text
+embedding batches are split into groups of at most five. Results are
+reassembled in the original input-ID order, and run metrics distinguish logical
+batches from actual provider calls. Responses must contain one finite vector
+per input. Token statistics are normalized into `ProviderUsage`; malformed
+billed responses carry sanitized failed-outcome usage. Query helpers mark
+requests as query inputs so inherited retrieval uses the separately configured
+query task type.
 
 ## Adding a provider
 

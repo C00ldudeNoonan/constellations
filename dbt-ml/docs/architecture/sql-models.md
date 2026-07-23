@@ -4,13 +4,12 @@ Status: accepted design (issue #141), implemented for full-refresh (#143) and
 incremental (#142) SQL transforms. This document is the architecture decision
 those issues implement without reopening design questions.
 
-dbt-ml currently supports only `transform.type: python`: the runner reads each
-upstream relation into Polars via `adapter.read_table`, calls a Python module,
-and writes the returned DataFrame back with `adapter.materialize_full`. That is
-the wrong shape for transformations that are naturally relational — joining
-chunks to registries, tenants, ACLs, and taxonomies; normalization,
-deduplication, effective dating, masking, aggregation; and processing large
-warehouse tables without pulling them through Python.
+dbt-ml supports both `transform.type: python` and `transform.type: sql`. Python
+transforms read upstream relations into Polars; SQL transforms keep relational
+work in the warehouse. The latter is the right shape for joining chunks to
+registries, tenants, ACLs, and taxonomies; normalization, deduplication,
+effective dating, masking, aggregation; and processing large tables without
+pulling them through Python.
 
 This document defines a first-class, dbt-shaped SQL transform that runs **inside
 the warehouse** and never moves rows through the dbt-ml process, without turning
@@ -28,7 +27,8 @@ DAG, docs, model-kind, and materialization behavior are inherited unchanged.
   transform:
     type: sql
     path: sql/governed_chunks.sql
-  materialization: full          # only `full` in this slice (#143); see #142
+  materialization: incremental
+  unique_key: chunk_id
   fields:
     - {name: chunk_id, data_type: string}
     - {name: access_groups}
@@ -315,7 +315,7 @@ incremental grammar and materialization in §8 (#142); `materialize_sql_full` /
 Explicitly deferred (unchanged from #141's scope):
 
 - Inline SQL, `source()`, `var()`, and any macro/package compatibility.
-- Executing SQL against a retrieval store (LanceDB, turbopuffer, …).
+- Executing SQL against a retrieval store such as LanceDB.
 - Warehouse-specific ML/embedding SQL functions.
 - Author-owned DDL/DML, multiple statements, and pre/post hooks.
 - Composite unique keys, CDC/deletion strategies, and partition-replace

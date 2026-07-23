@@ -88,8 +88,8 @@ predicates, and optional stable key column. It guarantees:
   or early close, and final generation validation after full consumption;
 - an opaque 16-byte handle fingerprint plus a 16-byte generation fingerprint
   safe for state, cache, and artifact identity; and
-- no ordering guarantee. Ordered state reconciliation is a separate capability
-  tracked by issue #153.
+- no ordering guarantee. Ordered state reconciliation is exposed separately
+  through the implemented state paging capability from issue #153.
 
 DuckDB opens an independent cursor transaction. MVCC pins the relation version
 through schema inspection, key validation, every Arrow batch, and the final

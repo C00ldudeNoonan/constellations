@@ -10,8 +10,23 @@ warehouses, local and GCS sources, document chunk models, executable classic
 text-ML providers, native warehouse-materialized embedding models with a
 deterministic offline provider plus Google Vertex AI, and an incremental local
 LanceDB search-index proof of concept. Additional warehouse, embedding, and
-hosted retrieval adapters remain roadmap work; Rust and PyO3 are explicitly
-out of scope through v0.2.
+retrieval work follows the focused platform scope below; Rust and PyO3 are
+explicitly out of scope through v0.2.
+
+### Supported and planned platforms
+
+| Role | Shipped | Active roadmap |
+|------|---------|----------------|
+| Warehouse | DuckDB, BigQuery | [MotherDuck compatibility](https://github.com/C00ldudeNoonan/dbt-ml/issues/186), [Snowflake](https://github.com/C00ldudeNoonan/dbt-ml/issues/187) |
+| Document source | local files, GCS | improvements within the same local/GCP scope |
+| Retrieval store | local LanceDB | production hardening of the portable LanceDB contract |
+| Embedded dbt execution | dbt-duckdb preview | remaining dbt-duckdb integration work |
+
+Additional warehouse, cloud, and hosted retrieval integrations are not on the
+current roadmap. Shipped inference providers and extraction backends remain
+supported; this table narrows new platform work rather than removing existing
+features. BigQuery and future Snowflake projects compose with dbt through the
+standalone CLI and `emit-dbt-sources`, not warehouse-hosted Python execution.
 
 ## Where dbt-ml fits
 
@@ -133,10 +148,12 @@ intended.
 
 Local LanceDB collections contain the projected chunk text, embeddings, and
 returned/filter attributes in plaintext beneath the operator-configured profile
-path. The first slice supports only `access: public`, and only when the active
-profile explicitly sets `retrieval.allow_public_indexes: true`. Do not use it
-for tenant- or ACL-governed data; governed publication is rejected until the
-trusted policy and publish/read coordination work in #152 lands.
+path. Public indexes require the active profile to set
+`retrieval.allow_public_indexes: true`. Governed indexes require a trusted
+calling service to supply complete mandatory `policy_filters`; the interactive
+CLI cannot manufacture that authorization context and serves public indexes
+only. Profiles select resources but are not an identity or authorization
+service.
 
 ### Trust model & filesystem boundaries
 
@@ -1145,11 +1162,10 @@ trusted authorization context.
 
 This slice still deliberately rejects search-resource tests, full refresh,
 online/rebuild schema changes, arbitrary predicate strings, and
-adapter-specific index options. Bounded state paging and atomic full
-replacement remain #153; distributed-store fencing (provider-enforced fencing
-or immutable-generation activation) remains declared-but-unclaimed until a
-hosted adapter (#136) implements it. These are unsupported guarantees, not
-silent best-effort behavior.
+adapter-specific index options. Bounded state paging is implemented. Atomic
+full replacement and distributed-store fencing remain declared-but-unclaimed
+capabilities for any future store that can prove them. These are unsupported
+guarantees, not silent best-effort behavior.
 
 ## Built-in text preprocessing
 
@@ -1311,10 +1327,14 @@ stops before it pollutes everything downstream.
 | `examples/dbt_consumer/`            | dbt-duckdb project consuming dbt-ml-materialized tables                 |
 | `examples/dbt_embed_duckdb/`        | dbt-ml embedded in one `dbt build` via generated Python models (#177)   |
 | `examples/classic_text_ml/`         | deterministic sparse text features + Naive Bayes classification        |
+| `examples/document_clustering/`     | deterministic TF-IDF, K-means clustering, and NMF topics                |
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
+| `examples/sql_governed_chunks/`     | warehouse-native SQL model applying document permissions               |
 | [`examples/metric_evidence_agent/`](examples/metric_evidence_agent/) | dbt metric + governed, cited dbt-ml evidence over two MCP servers |
 
-Each example is runnable end-to-end with `uv run dbt-ml --project-dir examples/<name> ...`.
+The dbt-ml-native examples run with
+`uv run dbt-ml --project-dir examples/<name> ...`. The two dbt composition
+examples and the agent example include their own commands in local READMEs.
 
 ## Composing with dbt
 
@@ -1449,11 +1469,11 @@ BigQuery, GCS sources, recursive/token chunk models, layout-preserving HTML/PDF
 metadata, PII redaction, the first classic-ML providers, and the local LanceDB
 search-index proof of concept.
 
-Next adapter work follows dbt-core's warehouse set over time: Postgres first,
-then Snowflake, Databricks, and Redshift. Production embeddings, hosted
-retrieval stores, more parser providers, and evaluation/reranking remain
-roadmap items. Incremental state stays adapter-owned. Rust, PyO3, and Metaxy
-remain explicitly deferred.
+Active platform work is limited to DuckDB/MotherDuck, BigQuery/GCP, and
+Snowflake. LanceDB remains the reference retrieval store; additional hosted
+retrieval adapters and unrelated warehouse/provider integrations are not on
+the current roadmap. Retrieval evaluation remains active work. Incremental
+state stays adapter-owned. Rust, PyO3, and Metaxy remain explicitly deferred.
 
 The accepted [semantic retrieval architecture](docs/architecture/semantic-retrieval.md)
 defines the `search:` DAG resource, `RetrievalStore` boundary, typed filters,
@@ -1462,8 +1482,9 @@ LanceDB publication and portable Python/`dbt-ml search` query surfaces ship
 with generation-fenced readiness, publish/query leases, explicit recovery,
 governed policy-prefilter queries (issue #152), and bounded paged
 publication-state reconciliation (issue #153) inside their documented
-single-host boundary; distributed-store fencing (#136) remains roadmap work
-and fails closed.
+single-host boundary. Atomic full replacement and distributed-store fencing
+remain unsupported and fail closed; no hosted retrieval adapter is currently
+planned.
 
 The versioned [agent context contract](docs/architecture/agent-context-v1.md)
 defines the document registry, chunk, and dbt-entity link grains used to carry

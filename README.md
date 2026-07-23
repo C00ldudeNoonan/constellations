@@ -16,6 +16,20 @@ dbt-ml is a standalone CLI rather than a dbt package or dbt adapter.
 > extraction backends. See
 > [`dbt-ml/README.md`](dbt-ml/README.md) for the full reference.
 
+## Platform scope
+
+The active platform roadmap is intentionally narrow:
+
+- **Warehouses:** DuckDB and BigQuery are shipped; MotherDuck compatibility
+  and Snowflake are planned.
+- **Retrieval:** LanceDB is the supported reference store. Additional hosted
+  retrieval-store integrations are not currently planned.
+- **Embedded dbt execution:** dbt-duckdb only. BigQuery and future Snowflake
+  support use the standalone CLI and dbt source handoff.
+
+Existing inference providers and extraction backends remain supported; this
+scope governs new platform work rather than removing shipped functionality.
+
 ## What a pipeline looks like
 
 A project that turns a folder of invoice PDFs into a structured, queryable
@@ -151,9 +165,10 @@ uv run dbt-ml --project-dir examples/invoice_pipeline run
 uv run dbt-ml --project-dir examples/invoice_pipeline test
 ```
 
-Nine runnable projects live in [`dbt-ml/examples/`](dbt-ml/examples/): invoices,
-blog posts, support tickets, arXiv quality checks, PDF-to-LLM extraction, direct
-LLM extraction, RAG chunks, classic text ML, and a dbt consumer project.
+Thirteen examples live in [`dbt-ml/examples/`](dbt-ml/examples/), covering
+invoices, blog posts, support tickets, arXiv quality checks, PDF and direct LLM
+extraction, classic text ML, document clustering, RAG chunks, governed SQL
+chunks, dbt handoff and embedded execution, and a metric-plus-evidence agent.
 
 ## Security model
 
@@ -184,9 +199,8 @@ third-party projects or sensitive documents.
   discovery, provider-owned configuration, and failed-outcome accounting
   design (issue #71).
 - **[Warehouse-native SQL models](dbt-ml/docs/architecture/sql-models.md)**
-  — accepted design for `transform.type: sql` (compiled `ref()`, the SQL/Jinja
-  trust boundary, and the adapter materialization contract). Implementation
-  tracked in issue #143.
+  — implemented `transform.type: sql` contract (compiled `ref()`, the SQL/Jinja
+  trust boundary, and full/incremental adapter materialization).
 - **[Changelog](dbt-ml/CHANGELOG.md)**
 
 ## License

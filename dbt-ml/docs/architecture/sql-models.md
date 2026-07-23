@@ -75,10 +75,16 @@ Decisions:
 ## 2. Compilation surface
 
 SQL is compiled with a **deliberately narrow, sandboxed** Jinja environment —
-`jinja2.Environment(undefined=StrictUndefined, autoescape=False)` with **no**
-globals, filters, macros, `include`/`import`, or Python attribute access beyond
-the functions listed below. This is not dbt's Jinja; broad dbt macro/package
-compatibility is an explicit non-goal (see Out of scope).
+`jinja2.sandbox.SandboxedEnvironment(undefined=StrictUndefined, autoescape=False)`.
+A plain `jinja2.Environment` is **not** sufficient: it ships default filters and
+permits attribute traversal, so `{{ target.__class__.__init__.__globals__ }}` (or
+similar) could reach Python internals from any exposed object. The
+`SandboxedEnvironment` blocks access to underscore/internal attributes and unsafe
+callables; on top of it the default globals and filters are cleared and only the
+API below is added, and `include`/`import`/macros are unavailable. This is not
+dbt's Jinja; broad dbt macro/package compatibility is an explicit non-goal (see
+Out of scope). The exposed `target` object is a frozen, string-only value with no
+methods, so even under the sandbox it carries nothing sensitive.
 
 Exposed template API (v1):
 
@@ -206,12 +212,16 @@ them.
 ## 6. Versioning and artifacts
 
 - **`code_version`** for a SQL model hashes the **raw source-SQL file content**
-  plus the model's semantic config (fields, tests, materialization, tags,
-  warehouse_options) — the SQL-model analogue of the Python module content hash.
-  The **compiled**, target-specific SQL does **not** enter `code_version`:
+  plus the model's semantic config (fields, tests, materialization, tags) — the
+  SQL-model analogue of the Python module content hash. It excludes
+  `warehouse_options`, matching the existing `compute_code_version` contract
+  (issue #91): partitioning/clustering/labels/TTL shape physical layout, not row
+  content, and a layout change is applied with `--full-refresh` regardless — so
+  including them would fire `state:modified` on layout-only edits. The
+  **compiled**, target-specific SQL also does **not** enter `code_version`:
   state/selection must not churn merely because the DuckDB vs BigQuery relation
-  spelling differs. Changing the `.sql` file or referenced config re-selects the
-  model under `--state`.
+  spelling differs. Changing the `.sql` file or referenced semantic config
+  re-selects the model under `--state`.
 - **Manifest** per SQL model adds: `implementation: sql`, raw `path`, source
   hash, the compiled SQL (or a pointer to a compiled artifact), `adapter_type`,
   the resolved `ref` list, and the safe fully-qualified target relation. No

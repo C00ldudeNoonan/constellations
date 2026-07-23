@@ -1312,6 +1312,7 @@ stops before it pollutes everything downstream.
 | `examples/dbt_embed_duckdb/`        | dbt-ml embedded in one `dbt build` via generated Python models (#177)   |
 | `examples/classic_text_ml/`         | deterministic sparse text features + Naive Bayes classification        |
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
+| [`examples/metric_evidence_agent/`](examples/metric_evidence_agent/) | dbt metric + governed, cited dbt-ml evidence over two MCP servers |
 
 Each example is runnable end-to-end with `uv run dbt-ml --project-dir examples/<name> ...`.
 

@@ -1,0 +1,13 @@
+{
+  "source_key": "refunds/enterprise/window",
+  "canonical_uri": "https://policies.example.test/refunds/enterprise/window",
+  "source_version": "2026-04-15",
+  "title": "Enterprise refund window update",
+  "section": "Refund eligibility",
+  "customer_segment": "enterprise",
+  "effective_date": "2026-04-15T00:00:00+00:00",
+  "is_public": true,
+  "access_groups": [],
+  "classification": "public",
+  "text": "Effective April 15, 2026, the enterprise refund request window expanded from 14 days to 30 days. The change made more completed orders eligible for refund review."
+}

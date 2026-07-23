@@ -1,0 +1,10 @@
+name: metric_evidence_agent
+version: "0.1.0"
+profile: metric_evidence_agent
+
+extraction:
+  default_backend: json
+
+source-paths: ["sources"]
+model-paths: ["models"]
+target-path: "target"

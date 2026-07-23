@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: policy_facts
+    description: "Native governed LLM extraction path, deterministic in CI"
+    depends_on: [ref('document_chunks')]
+    llm:
+      mode: map
+      input_field: text
+      id_field: context_id
+      output_cardinality: one
+      prompt: >
+        Extract the policy change and explain which governed customer segment
+        it applies to. Do not infer whether the policy caused a metric change.
+      provider: deterministic
+      model: deterministic-v1
+    fields:
+      - {name: policy_change, data_type: string}
+      - {name: applies_to_segment, data_type: string}
+    materialization: full
+    tests:
+      - not_null: [context_id, policy_change, applies_to_segment]
+      - unique: context_id

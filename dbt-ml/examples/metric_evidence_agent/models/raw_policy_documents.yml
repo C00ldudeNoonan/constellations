@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: raw_policy_documents
+    description: "Synthetic policy-document fixtures"
+    source: ref('policy_documents')
+    extraction:
+      backend: json
+      options:
+        fields:
+          - source_key
+          - canonical_uri
+          - source_version
+          - title
+          - section
+          - customer_segment
+          - effective_date
+          - is_public
+          - access_groups
+          - classification
+          - text
+    materialization: full
+    tests:
+      - not_null: [source_key, source_version, customer_segment, effective_date, text]
+      - unique: source_key

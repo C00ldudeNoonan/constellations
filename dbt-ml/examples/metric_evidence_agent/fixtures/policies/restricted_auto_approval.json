@@ -1,0 +1,13 @@
+{
+  "source_key": "refunds/enterprise/automatic-approval",
+  "canonical_uri": "https://policies.example.test/refunds/enterprise/automatic-approval",
+  "source_version": "2026-05-20",
+  "title": "Enterprise automatic refund approval",
+  "section": "Approval thresholds",
+  "customer_segment": "enterprise",
+  "effective_date": "2026-05-20T00:00:00+00:00",
+  "is_public": false,
+  "access_groups": ["policy-reviewers"],
+  "classification": "internal",
+  "text": "Effective May 20, 2026, enterprise refund requests below $500 became eligible for automatic approval. The prior policy required manual review for every enterprise refund."
+}

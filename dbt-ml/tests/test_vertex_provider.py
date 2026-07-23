@@ -191,6 +191,46 @@ def test_vertex_gemini_model_splits_multi_input_batches(
     assert fake.close_count == 1
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "text-embedding-005",
+        "publishers/google/models/text-multilingual-embedding-002",
+    ],
+)
+def test_vertex_text_models_split_batches_at_five_inputs(
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeGenAI()
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
+    texts = tuple(f"economic document {index}" for index in range(6))
+    input_ids = tuple(f"chunk-{index}" for index in range(6))
+
+    result = _provider().embed(
+        EmbeddingRequest(
+            model=model,
+            texts=texts,
+            dimensions=3,
+            input_ids=input_ids,
+        ),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+
+    assert [len(call["contents"]) for call in fake.calls] == [5, 1]
+    assert [
+        text
+        for call in fake.calls
+        for text in call["contents"]
+    ] == list(texts)
+    assert result.input_ids == input_ids
+    assert len(result.vectors) == 6
+    assert result.usage.input_tokens == 18
+    assert result.provider_requests == 2
+    assert fake.close_count == 1
+
+
 def test_vertex_provider_uses_query_task_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

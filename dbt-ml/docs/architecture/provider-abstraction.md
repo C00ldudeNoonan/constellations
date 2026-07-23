@@ -357,14 +357,15 @@ and truncation behavior are semantic and enter embedding identity.
 
 The provider forwards `EmbedConfig.dimensions` as `output_dimensionality` and
 maps `max_retries`/profile timeout into SDK HTTP options. It forwards a runner
-batch as one `embed_content` call when the selected model supports that shape;
-`gemini-embedding-001` batches are split into one-input calls and reassembled
-in the original input-ID order. Run metrics distinguish logical batches from
-actual provider calls. Responses must contain one finite vector per input.
-Token statistics are normalized into `ProviderUsage`; malformed billed
-responses carry sanitized failed-outcome usage. Query helpers mark requests as
-query inputs so inherited retrieval uses the separately configured query task
-type.
+batch as one `embed_content` call when it fits the selected model's limit.
+Gemini embedding batches are split into one-input calls; other Vertex text
+embedding batches are split into groups of at most five. Results are
+reassembled in the original input-ID order, and run metrics distinguish logical
+batches from actual provider calls. Responses must contain one finite vector
+per input. Token statistics are normalized into `ProviderUsage`; malformed
+billed responses carry sanitized failed-outcome usage. Query helpers mark
+requests as query inputs so inherited retrieval uses the separately configured
+query task type.
 
 ## Adding a provider
 

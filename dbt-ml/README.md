@@ -431,9 +431,10 @@ model identity, `execution` fields never invalidate state, and
 Install the extra and authenticate with
 [Application Default Credentials](https://cloud.google.com/docs/authentication/provide-credentials-adc).
 User ADC and service-account ADC follow the same path; the provider deliberately
-rejects `api_key_env` during profile resolution. Vertex currently accepts one
-input per `gemini-embedding-001` request, so dbt-ml splits runner batches for
-that model while preserving input order and reporting the actual API-call count.
+rejects `api_key_env` during profile resolution. dbt-ml splits runner batches at
+Vertex model limits—one input for Gemini embedding models and five for other
+text embedding models—while preserving input order and reporting the actual
+API-call count.
 
 ```bash
 pip install 'dbt-ml[vertex]'

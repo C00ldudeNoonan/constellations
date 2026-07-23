@@ -200,21 +200,21 @@ def _load_google_genai() -> Any:
 
 
 def _split_requests(request: EmbeddingRequest) -> tuple[EmbeddingRequest, ...]:
-    if request.model.rsplit("/", maxsplit=1)[-1] != "gemini-embedding-001":
-        return (request,)
+    model_name = request.model.rsplit("/", maxsplit=1)[-1]
+    request_limit = 1 if model_name.startswith("gemini-embedding") else 5
     return tuple(
         EmbeddingRequest(
             model=request.model,
-            texts=(text,),
+            texts=request.texts[offset : offset + request_limit],
             dimensions=request.dimensions,
             input_ids=(
-                (request.input_ids[index],)
+                request.input_ids[offset : offset + request_limit]
                 if request.input_ids is not None
                 else None
             ),
             input_type=request.input_type,
         )
-        for index, text in enumerate(request.texts)
+        for offset in range(0, len(request.texts), request_limit)
     )
 
 

@@ -186,3 +186,40 @@ def test_governed_chunks_example_builds_end_to_end(tmp_path: Path) -> None:
     assert result.test_results and all(
         t.status == "pass" for t in result.test_results
     )
+
+
+def test_load_project_populates_sql_depends_on_for_artifact_dag() -> None:
+    # Artifact writers (build_manifest/build_run_results) construct ProjectDAG
+    # directly without the compiler; load-time ref population keeps their lineage
+    # intact for SQL-only projects.
+    from dbt_ml.config import load_project
+    from dbt_ml.dag import ProjectDAG, parse_ref
+
+    example = Path(__file__).resolve().parents[1] / "examples" / "sql_governed_chunks"
+    _, sources, models = load_project(example)
+    governed = next(m for m in models if m.name == "governed_chunks")
+    assert {parse_ref(d) for d in (governed.depends_on or [])} == {
+        "document_chunks",
+        "document_permissions",
+    }
+    dag = ProjectDAG(sources, models)
+    assert dag.predecessors["governed_chunks"] == {
+        "document_chunks",
+        "document_permissions",
+    }
+
+
+def test_sql_transform_rejects_agent_context(tmp_path: Path) -> None:
+    from dbt_ml.agent_context import AgentContextGrain
+    from dbt_ml.compiler import _prepare_sql_transform
+    from dbt_ml.config.loader import ConfigError
+    from dbt_ml.config.model import AgentContextConfig, ModelConfig, TransformConfig
+
+    (tmp_path / "q.sql").write_text("select * from {{ ref('up') }}", encoding="utf-8")
+    model = ModelConfig(
+        name="gc",
+        transform=TransformConfig(type="sql", path="q.sql"),
+        agent_context=AgentContextConfig(grain=AgentContextGrain.DOCUMENT_CHUNKS),
+    )
+    with pytest.raises(ConfigError, match="agent_context"):
+        _prepare_sql_transform(model, tmp_path)

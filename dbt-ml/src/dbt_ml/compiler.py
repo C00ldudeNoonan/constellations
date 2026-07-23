@@ -677,6 +677,19 @@ def _prepare_sql_transform(model: ModelConfig, project_dir: Path) -> None:
             f"SQL transform model '{model.name}' requires a `path:` to a .sql file",
             ("transform", "path"),
         )
+    if model.agent_context is not None:
+        # The Python transform path validates agent_context outputs
+        # (_validate_agent_context_output) before materializing; there is no
+        # warehouse-side equivalent yet, so a SQL model must not advertise an
+        # unverified agent_context contract. Reject until #145's contract check
+        # can run against the materialized relation.
+        raise _model_error(
+            model,
+            f"SQL transform model '{model.name}' does not support `agent_context` "
+            "yet: SQL outputs are not validated against the contract before "
+            "publication. Use a python transform, or drop agent_context.",
+            ("agent_context",),
+        )
     try:
         resolved = resolve_within_project(
             transform.path, project_dir, surface=f"model '{model.name}' transform.path"

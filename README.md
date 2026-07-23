@@ -183,6 +183,10 @@ third-party projects or sensitive documents.
   — the inference/embedding provider contract, plus the accepted plugin
   discovery, provider-owned configuration, and failed-outcome accounting
   design (issue #71).
+- **[Warehouse-native SQL models](dbt-ml/docs/architecture/sql-models.md)**
+  — accepted design for `transform.type: sql` (compiled `ref()`, the SQL/Jinja
+  trust boundary, and the adapter materialization contract). Implementation
+  tracked in issue #143.
 - **[Changelog](dbt-ml/CHANGELOG.md)**
 
 ## License

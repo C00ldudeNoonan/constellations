@@ -12,6 +12,7 @@ import polars as pl
 import pytest
 
 import dbt_ml.classic_ml as classic_ml
+import dbt_ml.classic_ml.artifacts as classic_ml_artifacts
 from dbt_ml.adapters import WarehouseAdapter
 from dbt_ml.classic_ml import (
     ARTIFACT_SCHEMA_VERSION,
@@ -411,7 +412,7 @@ def test_registry_failure_rolls_back_replacement_artifact(
     def fail_registry(_path: Path, _registry: dict[str, object]) -> None:
         raise OSError("registry publish failed")
 
-    monkeypatch.setattr(classic_ml, "_publish_registry", fail_registry)
+    monkeypatch.setattr(classic_ml_artifacts, "_publish_registry", fail_registry)
 
     with pytest.raises(RunError, match="registry publish failed"):
         _run_ml_model(
@@ -436,7 +437,7 @@ def test_registry_failure_does_not_advertise_first_publication(
     def fail_registry(_path: Path, _registry: dict[str, object]) -> None:
         raise OSError("registry publish failed")
 
-    monkeypatch.setattr(classic_ml, "_publish_registry", fail_registry)
+    monkeypatch.setattr(classic_ml_artifacts, "_publish_registry", fail_registry)
 
     with pytest.raises(RunError, match="registry publish failed"):
         _run_ml_model(
@@ -466,7 +467,7 @@ def test_committed_journal_blocks_later_publication_until_cleanup_succeeds(
             raise OSError("backup is busy")
         original_remove_path(path)
 
-    monkeypatch.setattr(classic_ml, "_remove_path", fail_backup_cleanup)
+    monkeypatch.setattr(classic_ml_artifacts, "_remove_path", fail_backup_cleanup)
 
     with pytest.raises(RunError, match="cleanup remains pending"):
         _run_ml_model(

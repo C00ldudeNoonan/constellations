@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import dbt_ml.runner as runner_module
 from dbt_ml.backends import llm_backend
 from dbt_ml.cli import _usage_summary, cli
 from dbt_ml.manifest import write_manifest, write_run_results
@@ -179,9 +178,10 @@ def test_batch_cost_uses_selected_provider_multiplier(
             return "test/provider-implementation"
 
     monkeypatch.setattr(llm_backend, "_run_message_batch", fake_batch)
+    # raw_invoices_llm is an extraction model (backend: llm); its executor
+    # resolves the provider in dbt_ml.execution.extraction (issue #190).
     monkeypatch.setattr(
-        runner_module,
-        "get_inference_provider",
+        "dbt_ml.execution.extraction.get_inference_provider",
         lambda _name: DiscountProvider(),
     )
 

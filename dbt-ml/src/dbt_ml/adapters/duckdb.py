@@ -38,6 +38,7 @@ from .base import (
     WarehouseCapability,
     decode_state_cursor,
     encode_state_cursor,
+    plan_schema_change,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
@@ -499,44 +500,19 @@ class DuckDBAdapter(WarehouseAdapter):
                 "changed). Run with --full-refresh to rebuild the target under "
                 "the new key."
             )
-        new = [c for c in staging_cols if c not in target_cols]
-        removed = [c for c in target_cols if c not in staging_cols]
-        if not new and not removed:
-            return list(staging_cols)
-
-        if on_schema_change == "fail":
-            drift = "; ".join(
-                part
-                for part in (
-                    f"new columns {new}" if new else "",
-                    f"removed columns {removed}" if removed else "",
-                )
-                if part
+        plan = plan_schema_change(target_cols, staging_cols, on_schema_change, table)
+        if plan.columns_to_add:
+            staging_types = dict(
+                self.connection.execute(
+                    f"SELECT column_name, column_type FROM (DESCRIBE {staging})"
+                ).fetchall()
             )
-            raise AdapterError(
-                f"Schema change on incremental table '{table}': {drift}. "
-                "Run with --full-refresh to rebuild it, or set "
-                "`on_schema_change: append_new_columns` (or `ignore`) on the model."
-            )
-        if on_schema_change == "append_new_columns":
-            if new:
-                staging_types = dict(
-                    self.connection.execute(
-                        f"SELECT column_name, column_type FROM (DESCRIBE {staging})"
-                    ).fetchall()
+            for col in plan.columns_to_add:
+                self.connection.execute(
+                    f"ALTER TABLE {self.table_ref(table)} "
+                    f"ADD COLUMN {self.quote_ident(col)} {staging_types[col]}"
                 )
-                for col in new:
-                    self.connection.execute(
-                        f"ALTER TABLE {self.table_ref(table)} "
-                        f"ADD COLUMN {self.quote_ident(col)} {staging_types[col]}"
-                    )
-            return list(staging_cols)
-        if on_schema_change == "ignore":
-            return [c for c in staging_cols if c in target_cols]
-        raise AdapterError(
-            f"Unknown on_schema_change policy '{on_schema_change}'. "
-            "Allowed: fail, ignore, append_new_columns."
-        )
+        return plan.columns_to_load
 
     def materialize_incremental(
         self,
@@ -667,45 +643,20 @@ class DuckDBAdapter(WarehouseAdapter):
         """Compare staging columns against the existing table and apply the
         on_schema_change policy. Returns the staging columns to insert."""
         target_cols = self._table_columns(table) or []
-        new = [c for c in df.columns if c not in target_cols]
-        removed = [c for c in target_cols if c not in df.columns]
-        if not new and not removed:
-            return list(df.columns)
-
-        if on_schema_change == "fail":
-            drift = "; ".join(
-                part
-                for part in (
-                    f"new columns {new}" if new else "",
-                    f"removed columns {removed}" if removed else "",
-                )
-                if part
+        plan = plan_schema_change(target_cols, list(df.columns), on_schema_change, table)
+        if plan.columns_to_add:
+            staging_types = dict(
+                self.connection.execute(
+                    "SELECT column_name, column_type FROM "
+                    "(DESCRIBE SELECT * FROM dbt_ml_staging)"
+                ).fetchall()
             )
-            raise AdapterError(
-                f"Schema change on incremental table '{table}': {drift}. "
-                "Run with --full-refresh to rebuild it, or set "
-                "`on_schema_change: append_new_columns` (or `ignore`) on the model."
-            )
-        if on_schema_change == "append_new_columns":
-            if new:
-                staging_types = dict(
-                    self.connection.execute(
-                        "SELECT column_name, column_type FROM "
-                        "(DESCRIBE SELECT * FROM dbt_ml_staging)"
-                    ).fetchall()
+            for col in plan.columns_to_add:
+                self.connection.execute(
+                    f"ALTER TABLE {self.table_ref(table)} "
+                    f"ADD COLUMN {self.quote_ident(col)} {staging_types[col]}"
                 )
-                for col in new:
-                    self.connection.execute(
-                        f"ALTER TABLE {self.table_ref(table)} "
-                        f"ADD COLUMN {self.quote_ident(col)} {staging_types[col]}"
-                    )
-            return list(df.columns)
-        if on_schema_change == "ignore":
-            return [c for c in df.columns if c in target_cols]
-        raise AdapterError(
-            f"Unknown on_schema_change policy '{on_schema_change}'. "
-            "Allowed: fail, ignore, append_new_columns."
-        )
+        return plan.columns_to_load
 
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:
         if not keys or table not in self.list_tables():

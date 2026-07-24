@@ -623,6 +623,65 @@ def validate_incremental_keys(df: pl.DataFrame, key_col: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class SchemaChangePlan:
+    """The adapter-neutral outcome of comparing a staged rowset's columns
+    against an existing incremental target under an `on_schema_change` policy.
+
+    Column-set arithmetic and the policy decision are warehouse-independent and
+    live here; how new columns are actually added (ALTER DDL and type
+    translation, or a native load option) stays adapter-owned. `columns_to_add`
+    is the ordered list of new columns an adapter must materialize before the
+    load; `allow_field_addition` is the same signal as a boolean for adapters
+    whose load path adds columns natively rather than via explicit DDL."""
+
+    columns_to_load: list[str]
+    allow_field_addition: bool
+    columns_to_add: list[str]
+
+
+def plan_schema_change(
+    existing_cols: list[str],
+    staging_cols: list[str],
+    on_schema_change: str,
+    table: str,
+) -> SchemaChangePlan:
+    """Decide how an incremental load reconciles with an existing target.
+
+    Adapter-neutral: operates only on column-name lists. Raises AdapterError
+    with the same message every adapter surfaced inline, so schema-drift and
+    unknown-policy failures read identically across warehouses."""
+    new = [c for c in staging_cols if c not in existing_cols]
+    removed = [c for c in existing_cols if c not in staging_cols]
+    if not new and not removed:
+        return SchemaChangePlan(list(staging_cols), False, [])
+
+    if on_schema_change == "fail":
+        drift = "; ".join(
+            part
+            for part in (
+                f"new columns {new}" if new else "",
+                f"removed columns {removed}" if removed else "",
+            )
+            if part
+        )
+        raise AdapterError(
+            f"Schema change on incremental table '{table}': {drift}. "
+            "Run with --full-refresh to rebuild it, or set "
+            "`on_schema_change: append_new_columns` (or `ignore`) on the model."
+        )
+    if on_schema_change == "append_new_columns":
+        return SchemaChangePlan(list(staging_cols), bool(new), list(new))
+    if on_schema_change == "ignore":
+        return SchemaChangePlan(
+            [c for c in staging_cols if c in existing_cols], False, []
+        )
+    raise AdapterError(
+        f"Unknown on_schema_change policy '{on_schema_change}'. "
+        "Allowed: fail, ignore, append_new_columns."
+    )
+
+
 class WarehouseAdapter(ABC):
     """Lifecycle-managed warehouse driver."""
 

@@ -17,7 +17,7 @@ from .cli_services.context import build_dag_or_click as _build_dag
 from .cli_services.context import load_project_or_click as _load
 from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
-from .config import ConfigError, load_project
+from .config import ConfigError
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
@@ -1183,7 +1183,7 @@ def eval_(
     except RetrievalEvalError as e:
         raise click.ClickException(str(e)) from e
 
-    project, _sources, _models = load_project(project_dir)
+    project, _sources, _models = _load(project_dir)
     artifact_path = write_retrieval_eval_artifact(project_dir, project, results)
     failed = sum(1 for r in results if r.status == "fail")
 
@@ -1497,60 +1497,22 @@ def serving() -> None:
     """Inspect and recover serving-readiness state for search indexes."""
 
 
-def _serving_scope(
-    ctx: click.Context, model_name: str
-) -> tuple[Any, Any, Path]:
-    from .adapters.base import StateScope
-    from .retrieval import create_store
-
-    project_dir: Path = ctx.obj["project_dir"]
-    profiles_dir = ctx.obj["profiles_dir"]
-    target = ctx.obj["target"]
-    project_config, sources, models = load_project(project_dir)
-    validate_project_contract(project_config, sources, models, project_dir)
-    model = next((item for item in models if item.name == model_name), None)
-    if model is None or model.search is None:
-        raise ConfigClickError(f"Search index '{model_name}' was not found")
-    resolved = resolve_profile(
-        project_config, project_dir, target=target, profiles_dir=profiles_dir
-    )
-    if resolved.retrieval is None:
-        raise ConfigClickError(
-            "The active profile has no retrieval configuration"
-        )
-    alias = model.search.store or resolved.retrieval.default
-    store_config = resolved.retrieval.stores.get(alias)
-    if store_config is None:
-        raise ConfigClickError(
-            f"Search index '{model_name}' selects an unavailable retrieval store"
-        )
-    store = create_store(
-        store_config,
-        project_name=project_config.name,
-        target_name=resolved.target_name,
-        alias=alias,
-    )
-    logical = model.search.collection or model.name
-    scope = StateScope.for_target_descriptor(
-        model.name,
-        stage="retrieval_publish",
-        descriptor=store.state_descriptor(logical).descriptor(),
-    )
-    return scope, resolved, project_dir
-
-
 @serving.command("status")
 @click.argument("model_name")
 @_project_context_options
 @click.pass_context
 def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
-    from .retrieval import ServingCoordinationError, ServingCoordinator
+    from .cli_services.serving import serving_status as _serving_status
+    from .retrieval import ServingCoordinationError
 
     try:
-        scope, resolved, project_dir = _serving_scope(ctx, model_name)
-        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-            entry = ServingCoordinator(adapter).status(scope)
+        entry = _serving_status(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
     except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
     except (AdapterError, ServingCoordinationError) as e:
@@ -1589,14 +1551,17 @@ def serving_recover(
     token so any surviving process fails its next verification, clears all
     leases, and leaves the scope failed until the next successful publish.
     """
-    from .retrieval import ServingCoordinationError, ServingCoordinator
+    from .cli_services.serving import serving_recover as _serving_recover
+    from .retrieval import ServingCoordinationError
 
     try:
-        scope, resolved, project_dir = _serving_scope(ctx, model_name)
-        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-            entry = ServingCoordinator(adapter).recover(
-                scope, owner_terminated=owner_terminated
-            )
+        entry = _serving_recover(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+            owner_terminated=owner_terminated,
+        )
     except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
     except (AdapterError, ServingCoordinationError) as e:

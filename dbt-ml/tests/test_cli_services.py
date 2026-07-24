@@ -44,6 +44,30 @@ def test_load_project_or_click_wraps_config_error(tmp_path: Path) -> None:
         load_project_or_click(tmp_path)
 
 
+def test_serving_scope_rejects_unknown_index(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    import shutil
+
+    from dbt_ml.cli_services.serving import resolve_serving_scope
+
+    project = tmp_path / "proj"
+    shutil.copytree(
+        example_project_dir,
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    # An unknown search index is a domain failure the service reports as the
+    # exit-2 error — reachable now without invoking the CLI.
+    with pytest.raises(ConfigClickError, match="was not found"):
+        resolve_serving_scope(
+            project,
+            profiles_dir=None,
+            target=None,
+            model_name="not_a_real_index",
+        )
+
+
 def test_watch_reports_no_source_paths(
     tmp_path: Path, example_project_dir: Path
 ) -> None:

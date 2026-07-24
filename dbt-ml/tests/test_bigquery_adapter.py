@@ -32,7 +32,6 @@ from dbt_ml.adapters import (
 from dbt_ml.adapters.bigquery import (
     BigQueryAdapter,
     BigQueryWarehouseConfig,
-    plan_schema_change,
     to_query_parameters,
 )
 from dbt_ml.credentials import ProtectedCredential
@@ -127,39 +126,8 @@ def test_query_parameters_type_inference() -> None:
     assert params[5].values == ["a", "b"]
 
 
-# ─── schema change planning ─────────────────────────────────────────────────
-
-
-def test_plan_no_drift() -> None:
-    plan = plan_schema_change(["a", "b"], ["a", "b"], "fail", "t")
-    assert plan.columns_to_load == ["a", "b"]
-    assert not plan.allow_field_addition
-
-
-def test_plan_fail_on_new_and_removed() -> None:
-    with pytest.raises(AdapterError, match="full-refresh"):
-        plan_schema_change(["a"], ["a", "b"], "fail", "t")
-    with pytest.raises(AdapterError, match="removed columns"):
-        plan_schema_change(["a", "b"], ["a"], "fail", "t")
-
-
-def test_plan_append_new_columns() -> None:
-    plan = plan_schema_change(["a"], ["a", "b"], "append_new_columns", "t")
-    assert plan.columns_to_load == ["a", "b"]
-    assert plan.allow_field_addition
-    # removed-only drift needs no field addition
-    plan = plan_schema_change(["a", "b"], ["a"], "append_new_columns", "t")
-    assert not plan.allow_field_addition
-
-
-def test_plan_ignore_drops_new_columns() -> None:
-    plan = plan_schema_change(["a"], ["a", "b"], "ignore", "t")
-    assert plan.columns_to_load == ["a"]
-
-
-def test_plan_unknown_policy() -> None:
-    with pytest.raises(AdapterError, match="Unknown on_schema_change"):
-        plan_schema_change(["a"], ["a", "b"], "sync_all", "t")
+# The schema-change planner is warehouse-independent; its contract now lives in
+# tests/test_adapter_invariants.py (issue #190, Workstream C).
 
 
 # ─── client interactions against a fake ─────────────────────────────────────

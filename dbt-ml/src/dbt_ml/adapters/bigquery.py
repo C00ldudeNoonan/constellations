@@ -19,7 +19,6 @@ from __future__ import annotations
 import io
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -71,6 +70,7 @@ from .base import (
     WarehouseCapability,
     decode_state_cursor,
     encode_state_cursor,
+    plan_schema_change,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
@@ -549,48 +549,6 @@ def parse_keyfile_json(value: dict[str, Any] | str) -> dict[str, Any]:
         failure = AdapterError("keyfile_json must decode to a JSON object")
         raise failure
     return parsed
-
-
-@dataclass(frozen=True)
-class SchemaChangePlan:
-    columns_to_load: list[str]
-    allow_field_addition: bool
-
-
-def plan_schema_change(
-    existing_cols: list[str],
-    staging_cols: list[str],
-    on_schema_change: str,
-    table: str,
-) -> SchemaChangePlan:
-    """Pure decision logic for incremental loads against an existing table."""
-    new = [c for c in staging_cols if c not in existing_cols]
-    removed = [c for c in existing_cols if c not in staging_cols]
-    if not new and not removed:
-        return SchemaChangePlan(list(staging_cols), False)
-
-    if on_schema_change == "fail":
-        drift = "; ".join(
-            part
-            for part in (
-                f"new columns {new}" if new else "",
-                f"removed columns {removed}" if removed else "",
-            )
-            if part
-        )
-        raise AdapterError(
-            f"Schema change on incremental table '{table}': {drift}. "
-            "Run with --full-refresh to rebuild it, or set "
-            "`on_schema_change: append_new_columns` (or `ignore`) on the model."
-        )
-    if on_schema_change == "append_new_columns":
-        return SchemaChangePlan(list(staging_cols), bool(new))
-    if on_schema_change == "ignore":
-        return SchemaChangePlan([c for c in staging_cols if c in existing_cols], False)
-    raise AdapterError(
-        f"Unknown on_schema_change policy '{on_schema_change}'. "
-        "Allowed: fail, ignore, append_new_columns."
-    )
 
 
 def _bq_param_type(value: Any) -> str:
@@ -1669,40 +1627,15 @@ class BigQueryAdapter(WarehouseAdapter):
         columns and applies the on_schema_change policy — the BigQuery analogue
         of DuckDB's `_reconcile_sql_schema`."""
         source_cols = [c.name for c in source_schema.columns]
-        new = [c for c in source_cols if c not in target_cols]
-        removed = [c for c in target_cols if c not in source_cols]
-        if not new and not removed:
-            return list(source_cols)
-
-        if on_schema_change == "fail":
-            drift = "; ".join(
-                part
-                for part in (
-                    f"new columns {new}" if new else "",
-                    f"removed columns {removed}" if removed else "",
+        plan = plan_schema_change(target_cols, source_cols, on_schema_change, table)
+        if plan.columns_to_add:
+            types_by_name = {c.name: c.data_type for c in source_schema.columns}
+            for col in plan.columns_to_add:
+                self._run_query(
+                    f"ALTER TABLE {self.table_ref(table)} "
+                    f"ADD COLUMN {self.quote_ident(col)} {types_by_name[col]}"
                 )
-                if part
-            )
-            raise AdapterError(
-                f"Schema change on incremental table '{table}': {drift}. "
-                "Run with --full-refresh to rebuild it, or set "
-                "`on_schema_change: append_new_columns` (or `ignore`) on the model."
-            )
-        if on_schema_change == "append_new_columns":
-            if new:
-                types_by_name = {c.name: c.data_type for c in source_schema.columns}
-                for col in new:
-                    self._run_query(
-                        f"ALTER TABLE {self.table_ref(table)} "
-                        f"ADD COLUMN {self.quote_ident(col)} {types_by_name[col]}"
-                    )
-            return list(source_cols)
-        if on_schema_change == "ignore":
-            return [c for c in source_cols if c in target_cols]
-        raise AdapterError(
-            f"Unknown on_schema_change policy '{on_schema_change}'. "
-            "Allowed: fail, ignore, append_new_columns."
-        )
+        return plan.columns_to_load
 
     def materialize_full(
         self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None

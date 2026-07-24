@@ -8,22 +8,26 @@ from dbt_ml.execution import RunError as ExecutionRunError
 from dbt_ml.execution import artifact_error_text
 from dbt_ml.execution.chunk import chunk_document_ids, chunk_input_hash, run_chunk_model
 from dbt_ml.execution.cost import budget_cost_estimator, estimate_cost
+from dbt_ml.execution.embed import run_embed_model
 from dbt_ml.execution.extraction import (
     EXTRACTION_FIELD_DTYPES,
     DiscoveredSource,
     run_extraction_model,
 )
 from dbt_ml.execution.transform import run_sql_model, run_transform_model
+from dbt_ml.execution.usage import add_provider_usage
 from dbt_ml.runner import (
     _EXTRACTION_FIELD_DTYPES,
     ModelRunResult,
     RunError,
+    _add_provider_usage,
     _artifact_error_text,
     _budget_cost_estimator,
     _chunk_document_ids,
     _chunk_input_hash,
     _estimate_cost,
     _run_chunk_model,
+    _run_embed_model,
     _run_extraction_model,
     _run_sql_model,
     _run_transform_model,
@@ -51,6 +55,11 @@ def test_runner_preserves_extraction_executor_and_cost_imports() -> None:
     assert _EXTRACTION_FIELD_DTYPES is EXTRACTION_FIELD_DTYPES
     assert _estimate_cost is estimate_cost
     assert _budget_cost_estimator is budget_cost_estimator
+
+
+def test_runner_preserves_embed_executor_and_usage_imports() -> None:
+    assert _run_embed_model is run_embed_model
+    assert _add_provider_usage is add_provider_usage
 
 
 def test_manifest_import_does_not_load_runner() -> None:

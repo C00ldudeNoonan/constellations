@@ -29,6 +29,8 @@ from uuid import uuid4
 from ..config.model import MLConfig, ModelConfig
 from ..config.project import ProjectConfig
 from ..hashing import HASH_DIGEST_SIZE
+from ..ml_contracts import MLContractError, validate_persisted_ml_options
+from .contracts import ClassifierProvider, FeatureProvider
 
 ARTIFACT_SCHEMA_VERSION = 2
 
@@ -583,3 +585,18 @@ def _package_version(name: str) -> str:
 def _hash_json(value: Any) -> str:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(raw.encode(), digest_size=HASH_DIGEST_SIZE).hexdigest()
+
+
+def _validated_persisted_options(
+    provider: FeatureProvider | ClassifierProvider,
+    options: object,
+    path: Path,
+    *,
+    surface: str,
+) -> dict[str, Any]:
+    try:
+        return validate_persisted_ml_options(provider, options)
+    except MLContractError as e:
+        raise IncompatibleClassicMLArtifactError(
+            f"incompatible {surface} at {path}: {e}"
+        ) from e

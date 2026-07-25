@@ -29,5 +29,9 @@ jobs:
         run: uv run pip-audit --skip-editable
       - name: Ruff
         run: uv run ruff check
+      - name: Ty
+        run: uv run ty check
+      - name: Mypy (migration parity)
+        run: uv run mypy
       - name: Pytest
         run: uv run pytest -q

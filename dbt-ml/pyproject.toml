@@ -71,6 +71,7 @@ dev = [
     # the bigquery/gcs extras, so adapter unit tests run against real client types
     "google-cloud-bigquery>=3.25",
     "google-cloud-storage>=2.16",
+    "ty>=0.0.63",
 ]
 
 [tool.ruff]
@@ -78,10 +79,14 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "RUF"]
+select = ["E", "F", "I", "B", "UP", "RUF", "ANN", "PYI"]
 # Legitimate Unicode (right single quote, em dash, smart quotes) in docstrings,
 # tests, and examples isn't a typo — we deliberately use it for mojibake demos.
-ignore = ["RUF001", "RUF002", "RUF003"]
+ignore = ["RUF001", "RUF002", "RUF003", "ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**/*.py" = ["ANN", "PYI"]
+"tests/**/*.py" = ["ANN", "PYI"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -92,6 +97,12 @@ files = ["src/dbt_ml"]
 [[tool.mypy.overrides]]
 module = ["datasketch", "langdetect"]
 ignore_missing_imports = true
+
+[tool.ty.src]
+include = ["src/dbt_ml", "typecheck"]
+
+[tool.ty.rules]
+missing-type-argument = "error"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

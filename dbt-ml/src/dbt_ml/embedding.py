@@ -142,6 +142,19 @@ class EmbeddedTexts:
     provider_requests: int
 
 
+def _model_index(
+    models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
+) -> Mapping[str, ModelConfig]:
+    if isinstance(models, Mapping):
+        index: dict[str, ModelConfig] = {}
+        for name, model in models.items():
+            if not isinstance(name, str) or not isinstance(model, ModelConfig):
+                raise TypeError("model index must map names to ModelConfig values")
+            index[name] = model
+        return index
+    return {item.name: item for item in models}
+
+
 def resolve_search_embedding_identity(
     model: ModelConfig,
     models: Mapping[str, ModelConfig] | Sequence[ModelConfig],
@@ -151,28 +164,31 @@ def resolve_search_embedding_identity(
     search = model.search
     if search is None or search.vector is None or search.vector.embedding != "inherit":
         return None
-    models_by_name = (
-        models if isinstance(models, Mapping) else {item.name: item for item in models}
-    )
+    models_by_name = _model_index(models)
     dependencies = model.depends_on or []
     if len(dependencies) != 1:
         raise ValueError("inherited search embeddings require exactly one upstream model")
     upstream_name = parse_ref(dependencies[0])
-    upstream = models_by_name.get(upstream_name)
-    if upstream is None or upstream.embed is None:
+    upstream: ModelConfig | None = models_by_name.get(upstream_name)
+    if upstream is None:
         raise ValueError(
             "inherited search embeddings require a direct upstream embed model"
         )
-    if search.vector.field != upstream.embed.vector_field:
+    embed_config = upstream.embed
+    if embed_config is None:
+        raise ValueError(
+            "inherited search embeddings require a direct upstream embed model"
+        )
+    if search.vector.field != embed_config.vector_field:
         raise ValueError(
             "inherited search vector field must match the upstream embed vector field"
         )
-    if search.vector.dimensions != upstream.embed.dimensions:
+    if search.vector.dimensions != embed_config.dimensions:
         raise ValueError(
             "inherited search dimensions must match the upstream embed dimensions"
         )
     return EmbeddingIdentity.from_config(
-        upstream.embed,
+        embed_config,
         profile_options=profile_options,
     )
 
@@ -210,13 +226,14 @@ def resolve_search_embedding_options(
     dependencies = model.depends_on or []
     if len(dependencies) != 1:
         return None
-    models_by_name = (
-        models if isinstance(models, Mapping) else {item.name: item for item in models}
-    )
-    upstream = models_by_name.get(parse_ref(dependencies[0]))
-    if upstream is None or upstream.embed is None:
+    models_by_name = _model_index(models)
+    upstream: ModelConfig | None = models_by_name.get(parse_ref(dependencies[0]))
+    if upstream is None:
         return None
-    return resolve_embedding_options(upstream.embed.provider, resolved)
+    embed_config = upstream.embed
+    if embed_config is None:
+        return None
+    return resolve_embedding_options(embed_config.provider, resolved)
 
 
 def _embedding_config_hash(

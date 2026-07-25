@@ -5,7 +5,7 @@ import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, cast
 
 from pydantic import (
     BaseModel,
@@ -423,11 +423,14 @@ def validate_persisted_ml_options(
     provider: ExecutableMLProvider,
     options: object,
 ) -> dict[str, Any]:
-    if not isinstance(options, dict):
+    if not isinstance(options, dict) or any(
+        not isinstance(key, str) for key in options
+    ):
         raise MLContractError(
             f"persisted options for provider '{provider}' must be an object"
         )
-    normalized = _normalize_legacy_persisted_options(provider, options)
+    typed_options = cast(dict[str, Any], options)
+    normalized = _normalize_legacy_persisted_options(provider, typed_options)
     return _validate_provider_options(
         provider,
         normalized,

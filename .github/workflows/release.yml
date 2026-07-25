@@ -49,7 +49,10 @@ jobs:
       - name: Ruff
         run: uv run ruff check
 
-      - name: Mypy
+      - name: Ty
+        run: uv run ty check
+
+      - name: Mypy (migration parity)
         run: uv run mypy
 
       - name: Pytest

@@ -40,9 +40,15 @@ class OpenAICompatibleBaseUrl(str):
     @classmethod
     def _validate(cls, value: object) -> Self:
         try:
-            return cls(value)  # type: ignore[arg-type]
+            if not isinstance(value, str):
+                raise EndpointUrlError("base_url must be a valid HTTP(S) URL")
+            return cls(value)
         except EndpointUrlError as error:
-            raise PydanticCustomError("endpoint_url", str(error)) from None
+            raise PydanticCustomError(
+                "endpoint_url",
+                "{message}",
+                {"message": str(error)},
+            ) from None
 
 
 def _normalize_base_url(value: str) -> str:

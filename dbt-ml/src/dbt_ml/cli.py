@@ -5,7 +5,7 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import click
 
@@ -652,6 +652,13 @@ def graph(ctx: click.Context) -> None:
     click.echo(dag.to_mermaid())
 
 
+class _ResourceListRow(TypedDict):
+    name: str
+    resource_type: str
+    kind: str
+    tags: list[str]
+
+
 @cli.command(name="ls")
 @click.option("--select", "select", default=None, help="Selector expression for models.")
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
@@ -686,7 +693,7 @@ def ls(
     dag = _build_dag(sources, models)
     models_by_name = {m.name: m for m in models}
 
-    rows: list[dict[str, object]] = []
+    rows: list[_ResourceListRow] = []
     if resource_type in ("model", "search_index", "all"):
         try:
             selected = dag.select_models(select=select, exclude=exclude)
@@ -726,7 +733,7 @@ def ls(
         click.echo(json.dumps(rows, indent=2))
         return
     for row in rows:
-        tags = ",".join(row["tags"]) if row["tags"] else "-"  # type: ignore[arg-type]
+        tags = ",".join(row["tags"]) if row["tags"] else "-"
         click.echo(f"{row['name']:<24}{row['resource_type']:<10}{row['kind']:<12}{tags}")
 
 

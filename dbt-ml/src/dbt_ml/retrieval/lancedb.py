@@ -7,7 +7,8 @@ from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
-from typing import Any, Literal, Self, cast
+from types import TracebackType
+from typing import Any, Literal, Self
 
 import pyarrow as pa
 from pydantic import ConfigDict, Field, field_validator
@@ -141,7 +142,12 @@ class LanceDBStore(RetrievalStore):
             ) from None
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self._db = None
 
     def _connection(self) -> Any:
@@ -418,7 +424,10 @@ class LanceDBStore(RetrievalStore):
                 query = query.where(where, prefilter=True)
             if columns is not None:
                 query = query.select(_include_score_column(columns, "_distance"))
-            return cast(pa.Table, query.limit(limit).to_arrow())
+            result = query.limit(limit).to_arrow()
+            if not isinstance(result, pa.Table):
+                raise RetrievalError("LanceDB vector search result is invalid")
+            return result
         except Exception:
             raise RetrievalError(
                 "LanceDB operation 'vector search' failed (code=lancedb_vector_search_failed)"
@@ -448,7 +457,10 @@ class LanceDBStore(RetrievalStore):
                 builder = builder.where(where, prefilter=True)
             if columns is not None:
                 builder = builder.select(_include_score_column(columns, "_score"))
-            return cast(pa.Table, builder.limit(limit).to_arrow())
+            result = builder.limit(limit).to_arrow()
+            if not isinstance(result, pa.Table):
+                raise RetrievalError("LanceDB text search result is invalid")
+            return result
         except Exception:
             raise RetrievalError(
                 "LanceDB operation 'text search' failed (code=lancedb_text_search_failed)"
@@ -562,7 +574,12 @@ class _PublisherLock(AbstractContextManager[None]):
         self._handle = handle
         return None
 
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         handle = self._handle
         self._handle = None
         if handle is None:

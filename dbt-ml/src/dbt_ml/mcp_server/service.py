@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from time import monotonic
@@ -849,11 +850,17 @@ def _source(row: Mapping[str, Any]) -> DocumentSource:
 
 
 def _interval(row: Mapping[str, Any]) -> ContextInterval:
+    recorded_from = row.get("recorded_from")
+    if not isinstance(recorded_from, datetime):
+        raise ContextServiceError(
+            MCPErrorCode.INTERNAL,
+            "A governed context relation contains an invalid contract row",
+        )
     return ContextInterval(
         validity_known=row.get("validity_known") is True,
         valid_from=row.get("valid_from"),
         valid_to=row.get("valid_to"),
-        recorded_from=row.get("recorded_from"),
+        recorded_from=recorded_from,
         recorded_to=row.get("recorded_to"),
     )
 

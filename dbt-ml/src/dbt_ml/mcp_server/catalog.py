@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..config import load_project
 from .authorization import PolicyAttribute
@@ -23,12 +23,20 @@ class ArtifactCatalogError(Exception):
     pass
 
 
+def _access(value: object) -> Literal["public", "governed"]:
+    if value == "public":
+        return "public"
+    if value == "governed":
+        return "governed"
+    raise ArtifactCatalogError("context resource access must be public or governed")
+
+
 @dataclass(frozen=True, slots=True)
 class ContextResource:
     name: str
     unique_id: str
     description: str | None
-    access: str
+    access: Literal["public", "governed"]
     context_relation: str
     registry_relation: str
     entity_relations: tuple[str, ...]
@@ -193,7 +201,7 @@ class ArtifactCatalog:
                         if model.get("description") is not None
                         else None
                     ),
-                    access=str(model.get("access", "public")),
+                    access=_access(model.get("access", "public")),
                     context_relation=_relation_name(context_model),
                     registry_relation=_relation_name(registry_model),
                     entity_relations=tuple(

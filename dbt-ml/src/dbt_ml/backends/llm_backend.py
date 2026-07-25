@@ -91,6 +91,26 @@ _GATES_LOCK = threading.Lock()
 type CredentialSelector = str | CredentialReference | None
 
 
+def _fields_spec(options: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_fields = options.get("fields")
+    if not isinstance(raw_fields, list) or not raw_fields:
+        raise ValueError(
+            "llm backend requires `options.fields: [{name, type, ...}]`"
+        )
+    fields: list[dict[str, Any]] = []
+    for field in raw_fields:
+        if not isinstance(field, dict) or any(
+            not isinstance(key, str) for key in field
+        ):
+            raise ValueError(
+                "llm backend requires `options.fields: [{name, type, ...}]`"
+            )
+        fields.append(
+            {key: value for key, value in field.items() if isinstance(key, str)}
+        )
+    return fields
+
+
 def _protect_credential_selector(
     selector: CredentialSelector,
 ) -> tuple[CredentialReference | None, bool]:
@@ -160,11 +180,7 @@ class LLMBackend(BaseBackend):
         base_url = provider.resolve_base_url(options.get("base_url"))
         api_key_env = _provider_api_key_env(options, provider)
         _resolve_provider_credential(provider, api_key_env)
-        fields_spec = options.get("fields")
-        if not fields_spec or not isinstance(fields_spec, list):
-            raise ValueError(
-                "llm backend requires `options.fields: [{name, type, ...}]`"
-            )
+        fields_spec = _fields_spec(options)
 
         call_options: dict[str, Any] = {
             "provider": provider_name,
@@ -247,11 +263,7 @@ class LLMBackend(BaseBackend):
                 f"Inference provider '{provider_name}' does not support native "
                 "batch execution; disable `batch:`."
             )
-        fields_spec = options.get("fields")
-        if not fields_spec or not isinstance(fields_spec, list):
-            raise ValueError(
-                "llm backend requires `options.fields: [{name, type, ...}]`"
-            )
+        fields_spec = _fields_spec(options)
         system = options.get("system_prompt", _DEFAULT_SYSTEM)
         temperature = float(options.get("temperature", _DEFAULT_TEMPERATURE))
         max_tokens = int(options.get("max_tokens", _DEFAULT_MAX_TOKENS))
@@ -1301,6 +1313,8 @@ def _harden_existing_cache_file(path: Path) -> None:
             raise ValueError(
                 "LLM cache path must be a regular, non-symlink file"
             )
-        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
     finally:
         os.close(descriptor)

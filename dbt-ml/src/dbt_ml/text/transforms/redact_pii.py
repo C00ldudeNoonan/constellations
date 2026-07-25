@@ -98,7 +98,7 @@ def _field_list_option(value: object, name: str) -> list[str] | None:
         return None
     if not isinstance(value, list) or not all(isinstance(field, str) for field in value):
         raise ValueError(f"'{name}' must be a list of column names")
-    return value
+    return [field for field in value if isinstance(field, str)]
 
 
 def _require_known_fields(

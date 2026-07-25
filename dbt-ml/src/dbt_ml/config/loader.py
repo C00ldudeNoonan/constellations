@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .model import ModelConfig, ModelFile, protect_model_llm_credential_option
 from .project import ProjectConfig
@@ -152,7 +152,7 @@ def _populate_sql_depends_on(
             model.depends_on = [f"ref('{name}')" for name in refs]
 
 
-def _parse_yaml_with_document[T](
+def _parse_yaml_with_document[T: BaseModel](
     path: Path,
     model: type[T],
 ) -> tuple[T, YamlDocument]:
@@ -174,7 +174,7 @@ def _parse_yaml_with_document[T](
     document = document.without_data()
     validation_failure: ConfigError | None = None
     try:
-        parsed = model.model_validate(data)  # type: ignore[attr-defined]
+        parsed = model.model_validate(data)
     except ValidationError as e:
         diagnostics = document.format_validation_errors(path, e)
         validation_failure = ConfigError(
@@ -186,10 +186,10 @@ def _parse_yaml_with_document[T](
     return parsed, document
 
 
-def _load_yaml_dir[F, I](
+def _load_yaml_dir[F: BaseModel, I](
     directory: Path,
     file_model: type[F],
-    extract: Any,
+    extract: Callable[[F], Iterable[I]],
     *,
     description: str,
     attach_model_provenance: bool = False,

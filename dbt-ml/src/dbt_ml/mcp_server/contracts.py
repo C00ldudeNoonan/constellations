@@ -7,7 +7,7 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-MCP_CONTEXT_SCHEMA_VERSION: Final[Literal["mcp_context/v1"]] = "mcp_context/v1"
+MCP_CONTEXT_SCHEMA_VERSION: Final = "mcp_context/v1"
 _STABLE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _STRICT_CONFIG = ConfigDict(extra="forbid", frozen=True)
 

@@ -63,7 +63,7 @@ def load_project(
         resolve_within_project(
             project.duckdb.path,
             project_dir,
-            surface="Legacy inline `duckdb.path`",
+            surface="Inline `duckdb.path`",
             hint="Declare a profile and put external warehouse paths in profiles.yml.",
         )
 

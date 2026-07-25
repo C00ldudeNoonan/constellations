@@ -1240,7 +1240,6 @@ def _cache_put_locked(
                 )
                 """
             )
-            _prune_legacy_entries(con, path)
             con.execute(
                 """
                 INSERT INTO llm_cache
@@ -1319,21 +1318,3 @@ def _harden_existing_cache_file(path: Path) -> None:
             fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
     finally:
         os.close(descriptor)
-
-
-# Paths already swept this process; guarded by _CACHE_WRITE_LOCK.
-_PRUNED_CACHE_PATHS: set[str] = set()
-
-
-def _prune_legacy_entries(con: duckdb.DuckDBPyConnection, path: Path) -> None:
-    """Drop pre-provider-contract rows (`{model}|{content}|{schema}` keys).
-
-    They can never be read again — every current key carries the
-    `provider-v…|` prefix — so they only grow the cache file. Versioned
-    entries are kept even across contract bumps to keep downgrades cheap.
-    """
-    resolved = str(path.resolve())
-    if resolved in _PRUNED_CACHE_PATHS:
-        return
-    con.execute("DELETE FROM llm_cache WHERE cache_key NOT LIKE 'provider-v%'")
-    _PRUNED_CACHE_PATHS.add(resolved)

@@ -255,13 +255,6 @@ def _read_classifier_artifact(
         expected_files=("metadata.json", "model.json"),
     )
     metadata_options_payload = metadata.get("options")
-    if isinstance(metadata_options_payload, dict) and "alpha" not in metadata_options_payload:
-        legacy_classifier_options = metadata.get("classifier_options")
-        if isinstance(legacy_classifier_options, dict) and "alpha" in legacy_classifier_options:
-            metadata_options_payload = {
-                **metadata_options_payload,
-                "alpha": legacy_classifier_options["alpha"],
-            }
     metadata_options = _validated_persisted_options(
         provider,
         metadata_options_payload,

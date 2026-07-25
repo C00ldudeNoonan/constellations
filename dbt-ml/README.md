@@ -17,7 +17,7 @@ explicitly out of scope through v0.2.
 
 | Role | Shipped | Active roadmap |
 |------|---------|----------------|
-| Warehouse | DuckDB, BigQuery | [MotherDuck compatibility](https://github.com/C00ldudeNoonan/dbt-ml/issues/186), [Snowflake](https://github.com/C00ldudeNoonan/dbt-ml/issues/187) |
+| Warehouse | DuckDB, MotherDuck, BigQuery | [Snowflake](https://github.com/C00ldudeNoonan/dbt-ml/issues/187) |
 | Document source | local files, GCS | improvements within the same local/GCP scope |
 | Retrieval store | local LanceDB | production hardening of the portable LanceDB contract |
 | Embedded dbt execution | dbt-duckdb preview | remaining dbt-duckdb integration work |
@@ -421,6 +421,33 @@ Set `api_key_env` to the name of the credential variable itself, as above; do
 not wrap it in `env_var()`. dbt-ml deliberately rejects secret-value
 interpolation in this field so validation errors and resolved configuration
 cannot contain the key.
+
+### MotherDuck
+
+MotherDuck is the managed deployment of DuckDB — the same `type: duckdb`
+adapter and the same capability contract, reached over the network instead of a
+local file. Point `path:` at a `md:` database and supply the service token:
+
+```yaml
+      warehouse:
+        type: duckdb
+        path: md:economic_data            # or `md:` for the account default
+        token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+        schema: analytics
+```
+
+- `path` forms: `md:` (account-default database) or `md:<database>`.
+- `token` must be an exact `{{ env_var('NAME') }}` reference — literal tokens
+  are rejected. It is never written to `manifest.json`, `run_results.json`,
+  logs, or generated dbt sources, and is revealed only at connection. If you
+  omit it, DuckDB reads its own `motherduck_token` environment variable.
+- `token` is only valid on a `md:` path; a local DuckDB file needs none.
+
+Because MotherDuck runs the DuckDB engine, the full capability set
+(transactions, atomic replace, incremental merge, paged state, SQL models,
+bounded snapshots) is advertised unchanged. Behavior against the live service is
+exercised by a credential-gated integration test (`MOTHERDUCK_TOKEN`); the
+default suite covers it with deterministic unit tests.
 
 ### Provider plugins and provider options
 

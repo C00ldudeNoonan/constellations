@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from hashlib import blake2b
 from pathlib import Path
@@ -10,9 +10,10 @@ from uuid import uuid4
 import duckdb
 import polars as pl
 import pyarrow as pa
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from ..config.profile import WarehouseConfig
+from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
 from ..sql_models import build_key_check_sql
 from .base import (
@@ -136,20 +137,70 @@ def _update_arrow_digest(digest: Any, batch: pa.RecordBatch) -> None:
 
 
 class DuckDBWarehouseConfig(WarehouseConfig):
+    """DuckDB warehouse config, local or MotherDuck.
+
+    A `path:` of `md:<database>` targets MotherDuck — the managed deployment of
+    the same DuckDB engine, not a separate adapter (#186). MotherDuck reuses the
+    full DuckDB capability contract; only the connection differs. The `token:`
+    is an operator-owned MotherDuck service token; like every credential it must
+    be an exact `{{ env_var('NAME') }}` reference, is never serialized into
+    manifests or dbt sources, and is revealed only at `duckdb.connect`. When
+    omitted, MotherDuck falls back to its own `motherduck_token` env var.
+    """
+
     type: Literal["duckdb"] = "duckdb"
     path: Path
+    token: CredentialReference | None = Field(default=None, repr=False, exclude=True)
+
+    @classmethod
+    def prepare_profile_input(cls, raw: Mapping[str, Any]) -> dict[str, Any]:
+        prepared = dict(raw)
+        value = prepared.get("token")
+        if value is not None and not isinstance(value, CredentialReference):
+            try:
+                prepared["token"] = CredentialReference.from_env_var_expression(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "`token` must be an exact {{ env_var('NAME') }} reference with "
+                    "no default; move literal MotherDuck tokens to an environment "
+                    "variable"
+                ) from None
+        return prepared
+
+    @model_validator(mode="after")
+    def _token_requires_motherduck(self) -> DuckDBWarehouseConfig:
+        if self.token is not None and not self.is_motherduck:
+            raise ValueError(
+                "`token` is only valid for a MotherDuck `path: md:<database>`; a "
+                "local DuckDB file needs no token"
+            )
+        return self
+
+    @property
+    def is_motherduck(self) -> bool:
+        return str(self.path).startswith("md:")
+
+    def _motherduck_database(self) -> str:
+        # `md:`, `md:my_db`, `md:my_db?param=x` -> the database name (or "" for
+        # the account default).
+        remainder = str(self.path)[len("md:") :]
+        return remainder.split("?", 1)[0]
 
     def absolutize(self, project_dir: Path) -> DuckDBWarehouseConfig:
+        if self.is_motherduck:
+            return self
         return self.model_copy(update={"path": (project_dir / self.path).resolve()})
 
     def storage_location(self) -> str:
         return str(self.path)
 
     def catalog_name(self) -> str:
+        if self.is_motherduck:
+            return self._motherduck_database() or "my_db"
         return self.path.stem
 
     def local_path(self) -> Path | None:
-        return self.path
+        return None if self.is_motherduck else self.path
 
 
 @register
@@ -199,9 +250,24 @@ class DuckDBAdapter(WarehouseAdapter):
     # ─── lifecycle ────────────────────────────────────────────────────────
 
     def _connect(self) -> None:
-        db_path = self._resolved_path()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(db_path))
+        config = self.config
+        assert isinstance(config, DuckDBWarehouseConfig)
+        if config.is_motherduck:
+            # MotherDuck is the same engine reached over the network; the token
+            # (when supplied) is revealed only here, into the native connection
+            # config, and never logged or serialized. Without it, DuckDB reads
+            # its own `motherduck_token` env var.
+            if config.token is not None:
+                connect_config: dict[str, str | bool | int | float | list[str]] = {
+                    "motherduck_token": config.token.resolve().reveal()
+                }
+                self._con = duckdb.connect(str(config.path), config=connect_config)
+            else:
+                self._con = duckdb.connect(str(config.path))
+        else:
+            db_path = self._resolved_path()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._con = duckdb.connect(str(db_path))
         row = self._con.execute("SELECT current_database()").fetchone()
         self._catalog = row[0] if row else "memory"
 
@@ -1212,6 +1278,7 @@ class DuckDBAdapter(WarehouseAdapter):
     def _resolved_path(self) -> Path:
         config = self.config
         assert isinstance(config, DuckDBWarehouseConfig)
+        assert not config.is_motherduck, "MotherDuck targets have no local path"
         path = config.path
         if path.is_absolute() or self.project_dir is None:
             return path.resolve()

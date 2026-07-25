@@ -6,7 +6,6 @@ import pytest
 
 from dbt_ml.config import ConfigError, load_project
 from dbt_ml.profile import (
-    LEGACY_PROFILES_DIR_ENV,
     PROFILES_DIR_ENV,
     ProfileError,
     resolve_profile,
@@ -140,7 +139,6 @@ def test_implicit_project_profile_symlink_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(PROFILES_DIR_ENV, raising=False)
-    monkeypatch.delenv(LEGACY_PROFILES_DIR_ENV, raising=False)
     project = tmp_path / "project"
     _write_project(project, profile=True)
     outside = tmp_path / "outside_profiles.yml"
@@ -157,7 +155,6 @@ def test_explicit_profiles_symlink_remains_operator_trusted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(PROFILES_DIR_ENV, raising=False)
-    monkeypatch.delenv(LEGACY_PROFILES_DIR_ENV, raising=False)
     project = tmp_path / "project"
     _write_project(project, profile=True)
     untrusted = tmp_path / "untrusted_profiles.yml"
@@ -182,7 +179,6 @@ def test_global_profiles_symlink_remains_operator_trusted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(PROFILES_DIR_ENV, raising=False)
-    monkeypatch.delenv(LEGACY_PROFILES_DIR_ENV, raising=False)
     project = tmp_path / "project"
     _write_project(project, profile=True)
     trusted_file = tmp_path / "trusted_profiles.yml"

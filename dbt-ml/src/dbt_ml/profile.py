@@ -2,18 +2,17 @@
 
 Lookup order for the profiles file:
   1. The directory passed via `--profiles-dir` (CLI flag).
-  2. The directory named by the `DBT_ML_PROFILES_DIR` env var
-     (`DOCBT_PROFILES_DIR` is honored as a deprecated alias).
+  2. The directory named by the `DBT_ML_PROFILES_DIR` env var.
   3. `<project_dir>/profiles.yml` (project-local; dbt-ml addition for portability).
   4. `~/.dbt_ml/profiles.yml` (dbt-style user-global location).
 
-First hit wins.
+First hit wins. A project without a `profile:` uses an implicit local DuckDB
+target instead (see `_implicit_local_profile`).
 """
 from __future__ import annotations
 
 import os
 import re
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,7 +60,6 @@ from .retrieval import (
 
 PROFILES_FILENAME = "profiles.yml"
 PROFILES_DIR_ENV = "DBT_ML_PROFILES_DIR"
-LEGACY_PROFILES_DIR_ENV = "DOCBT_PROFILES_DIR"
 
 
 class ProfileError(Exception):
@@ -105,11 +103,11 @@ def resolve_profile(
 ) -> ResolvedProfile:
     """Resolve the active profile + target for this invocation.
 
-    Falls back to the legacy inline `duckdb:` block when no `profile:` is set
-    in the project file. Raises `ProfileError` on any structured problem.
+    A project without a `profile:` uses an implicit local DuckDB target from
+    its inline `duckdb:` block. Raises `ProfileError` on any structured problem.
     """
     if not project.profile:
-        return _legacy_resolved(project)
+        return _implicit_local_profile(project)
 
     profiles_path = _discover_profiles_file(project_dir, profiles_dir)
     if profiles_path is None:
@@ -224,14 +222,11 @@ def _absolutize_llm(llm: LLMConfig | None, project_dir: Path) -> LLMConfig | Non
     )
 
 
-def _legacy_resolved(project: ProjectConfig) -> ResolvedProfile:
-    warnings.warn(
-        f"Project '{project.name}' has no `profile:`, so dbt-ml is falling back to "
-        "the inline `duckdb:` block. This path is deprecated and will be removed in "
-        "v1.0.0; declare a `profile:` and a profiles.yml `warehouse:` instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+def _implicit_local_profile(project: ProjectConfig) -> ResolvedProfile:
+    """Zero-config local target: a project with no `profile:` runs against the
+    DuckDB database named by its inline `duckdb:` block. This is a supported
+    convenience for local and test projects; declare a `profile:` + profiles.yml
+    for warehouse targets, credentials, retrieval, or LLM configuration."""
     warehouse = parse_warehouse_config(
         {
             "type": "duckdb",
@@ -353,25 +348,13 @@ def _is_local_path(path: str) -> bool:
     return "://" not in path
 
 
-def _legacy_env_dir() -> str | None:
-    value = os.environ.get(LEGACY_PROFILES_DIR_ENV)
-    if value:
-        warnings.warn(
-            f"${LEGACY_PROFILES_DIR_ENV} is deprecated and will be removed in "
-            f"v1.0.0; use ${PROFILES_DIR_ENV}.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-    return value
-
-
 def _discover_profiles_file(
     project_dir: Path, profiles_dir: Path | None
 ) -> Path | None:
     trusted_candidates: list[Path] = []
     if profiles_dir is not None:
         trusted_candidates.append(profiles_dir / PROFILES_FILENAME)
-    env_dir = os.environ.get(PROFILES_DIR_ENV) or _legacy_env_dir()
+    env_dir = os.environ.get(PROFILES_DIR_ENV)
     if env_dir:
         trusted_candidates.append(Path(env_dir) / PROFILES_FILENAME)
 

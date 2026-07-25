@@ -1,0 +1,8 @@
+economic_nlp:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/dbt_ml.duckdb
+        schema: economic_nlp

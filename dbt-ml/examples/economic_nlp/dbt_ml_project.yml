@@ -1,0 +1,10 @@
+name: economic_nlp
+version: "0.1.0"
+profile: economic_nlp
+
+extraction:
+  default_backend: json
+
+source-paths: ["sources"]
+model-paths: ["models"]
+target-path: "target"

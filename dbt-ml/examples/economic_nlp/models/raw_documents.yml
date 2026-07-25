@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: raw_documents
+    description: "One typed row per economic-policy document"
+    source: ref('economic_documents')
+    extraction:
+      backend: json
+      options:
+        fields: [economic_id, title, publisher, published_at, text]
+    materialization: incremental
+    fields:
+      - name: economic_id
+        data_type: string
+      - name: title
+        data_type: string
+      - name: publisher
+        data_type: string
+      - name: published_at
+        data_type: string
+      - name: text
+        data_type: string
+    tests:
+      - not_null: [economic_id, text]
+      - unique: economic_id

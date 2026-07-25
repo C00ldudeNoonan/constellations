@@ -1170,6 +1170,14 @@ guarantees, not silent best-effort behavior.
 
 ## Built-in text preprocessing
 
+Install optional NLP support and a spaCy language model before running the NLP
+child-table transforms:
+
+```bash
+pip install 'dbt-ml[nlp]'
+python -m spacy download en_core_web_sm
+```
+
 Reference any of these as a Python transform module — no project-local code
 needed. Users can override by writing their own `transforms/<name>.py`
 (project-local files win over installed packages).
@@ -1193,9 +1201,42 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.count_tokens`      | Adds `token_count` for an OpenAI / Claude-style tokenizer (tiktoken)            |
 | `dbt_ml.text.transforms.find_duplicates`   | Flags near-duplicate rows via MinHash + LSH (Jaccard threshold configurable)    |
 | `dbt_ml.text.transforms.redact_pii`        | Detects + redacts PII via Microsoft Presidio (requires `en_core_web_sm` spaCy model) |
+| `dbt_ml.text.transforms.nlp_tokens`         | Emits one normalized child row per spaCy token                                 |
+| `dbt_ml.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
 
 All are pure functions importable via `from dbt_ml.text import …` if you'd
 rather wire them into your own transforms.
+
+The NLP transforms require one upstream table with unique, nonempty document
+IDs and a string text column. They use spaCy's batched `nlp.pipe` API and
+record provider, package, model, model-version, and language identity on every
+output row. Configuration is validated during `dbt-ml compile`, before spaCy
+or the configured model is loaded.
+
+```yaml
+- name: document_entities
+  depends_on: [ref('raw_documents')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.nlp_entities
+    options:
+      document_id_field: document_id
+      text_field: text
+      model: en_core_web_sm
+      language: en
+      batch_size: 32
+      include_fields: [publisher, published_at]
+      include_text: false
+```
+
+`nlp_tokens` emits stable `token_id`, document/token/sentence indexes, character
+offsets, token text, lemma, POS/tag values, and stop/alpha flags.
+`nlp_entities` emits stable `entity_id`, document/entity/sentence indexes,
+character offsets, label, and nullable confidence. Matched `entity_text` is
+excluded unless `include_text: true` is explicit. Source columns are also
+excluded unless named in `include_fields`, and the raw text and document-ID
+source fields cannot be repeated through that option. See
+`examples/economic_nlp/` for a complete economic-document pipeline.
 
 **PII setup** — `redact_pii` uses spaCy under the hood. First-time install:
 
@@ -1329,6 +1370,7 @@ stops before it pollutes everything downstream.
 | `examples/dbt_embed_duckdb/`        | dbt-ml embedded in one `dbt build` via generated Python models (#177)   |
 | `examples/classic_text_ml/`         | deterministic sparse text features + Naive Bayes classification        |
 | `examples/document_clustering/`     | deterministic TF-IDF, K-means clustering, and NMF topics                |
+| `examples/economic_nlp/`            | economic documents → normalized spaCy token and entity child tables    |
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
 | `examples/sql_governed_chunks/`     | warehouse-native SQL model applying document permissions               |
 | [`examples/metric_evidence_agent/`](examples/metric_evidence_agent/) | dbt metric + governed, cited dbt-ml evidence over two MCP servers |

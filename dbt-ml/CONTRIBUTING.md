@@ -16,13 +16,20 @@ uv run pytest -q
 ```bash
 uv run pip-audit --skip-editable  # dependency advisories
 uv run ruff check                 # lint
+uv run ty check                   # fast advisory type checking
 uv run mypy                       # strict type checking
 uv run pytest -q                  # tests
 ```
 
-CI runs the dependency audit, Ruff, and pytest on every push and PR. Release
-validation also runs mypy and builds the distributions; see the workflows in
-the repository-level `.github/workflows/` directory.
+ty checks `src/dbt_ml` only, matching the package scope of mypy. It is an
+advisory signal while its baseline is reduced: ty 0.0.63 currently reports 28
+diagnostics, primarily around third-party stubs and stricter inference than
+mypy. Do not add broad suppressions to make the command clean; fix findings in
+focused follow-up work. mypy remains the authoritative type-checking gate.
+
+CI runs the dependency audit, Ruff, advisory ty, and pytest on every push and
+PR. Release validation also runs mypy and builds the distributions; see the
+workflows in the repository-level `.github/workflows/` directory.
 
 ## Adding a new backend
 

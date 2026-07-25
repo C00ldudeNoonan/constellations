@@ -49,6 +49,10 @@ jobs:
       - name: Ruff
         run: uv run ruff check
 
+      - name: Ty (advisory)
+        continue-on-error: true
+        run: uv run ty check
+
       - name: Mypy
         run: uv run mypy
 

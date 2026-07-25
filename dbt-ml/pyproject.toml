@@ -71,6 +71,7 @@ dev = [
     # the bigquery/gcs extras, so adapter unit tests run against real client types
     "google-cloud-bigquery>=3.25",
     "google-cloud-storage>=2.16",
+    "ty>=0.0.63",
 ]
 
 [tool.ruff]
@@ -92,6 +93,9 @@ files = ["src/dbt_ml"]
 [[tool.mypy.overrides]]
 module = ["datasketch", "langdetect"]
 ignore_missing_imports = true
+
+[tool.ty.src]
+include = ["src/dbt_ml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

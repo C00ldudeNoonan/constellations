@@ -29,5 +29,8 @@ jobs:
         run: uv run pip-audit --skip-editable
       - name: Ruff
         run: uv run ruff check
+      - name: Ty (advisory)
+        continue-on-error: true
+        run: uv run ty check
       - name: Pytest
         run: uv run pytest -q

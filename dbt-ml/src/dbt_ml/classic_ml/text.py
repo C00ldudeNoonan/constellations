@@ -478,21 +478,17 @@ def _read_artifact(
     )
     if provider == "builtin.hashing":
         integrity = metadata.get("integrity")
-        if isinstance(integrity, dict) and "feature_count" in integrity:
-            feature_count = integrity["feature_count"]
-            if feature_count != metadata_options["n_features"]:
-                raise IncompatibleClassicMLArtifactError(
-                    f"incompatible artifact integrity at {path}: feature_count does "
-                    "not match persisted n_features"
-                )
-        else:
-            legacy_metrics = metadata.get("metrics")
-            if not isinstance(legacy_metrics, dict):
-                raise IncompatibleClassicMLArtifactError(
-                    f"incompatible hashing artifact integrity at {path}: missing "
-                    "feature_count"
-                )
-            feature_count = legacy_metrics.get("feature_count")
+        if not isinstance(integrity, dict) or "feature_count" not in integrity:
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible hashing artifact integrity at {path}: missing "
+                "feature_count"
+            )
+        feature_count = integrity["feature_count"]
+        if feature_count != metadata_options["n_features"]:
+            raise IncompatibleClassicMLArtifactError(
+                f"incompatible artifact integrity at {path}: feature_count does "
+                "not match persisted n_features"
+            )
         if isinstance(feature_count, bool) or not isinstance(feature_count, int):
             raise IncompatibleClassicMLArtifactError(
                 f"incompatible hashing artifact integrity at {path}: feature_count "

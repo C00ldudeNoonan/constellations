@@ -11,17 +11,22 @@ import click
 
 from .adapters import AdapterError, create_adapter
 from .checks import TestResult, run_project_tests
+from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
+from .cli_services.context import ConfigClickError
+from .cli_services.context import build_dag_or_click as _build_dag
+from .cli_services.context import load_project_or_click as _load
+from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
-from .config import ConfigError, load_project
+from .config import ConfigError
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .credentials import CredentialReference, CredentialReferenceError
-from .dag import DAGError, ProjectDAG, SelectionError, parse_ref
+from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
-from .manifest import StateError, write_manifest, write_run_results
+from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
 from .profile import (
@@ -31,8 +36,6 @@ from .profile import (
     resolve_profile,
 )
 from .providers import (
-    ProviderConfigurationError,
-    ProviderNotFoundError,
     get_inference_provider,
 )
 from .retrieval_eval import (
@@ -69,28 +72,6 @@ from .synth import (
     generate_product_pages,
     generate_support_emails,
     generate_support_tickets,
-)
-
-
-class ConfigClickError(click.ClickException):
-    """A configuration/usage error the run never got past. Exits 2 so an
-    orchestrator (issue #87) can tell a broken project apart from a run that
-    started but had a model fail (exit 1)."""
-
-    exit_code = 2
-
-
-# Errors that mean the project couldn't be coherently set up → exit 2. RunError
-# (a run that started but a model failed hard) stays a plain ClickException → 1.
-_CONFIG_ERRORS = (
-    ConfigError,
-    DAGError,
-    SelectionError,
-    ProfileError,
-    ProviderConfigurationError,
-    ProviderNotFoundError,
-    StateError,
-    OptionalDependencyError,
 )
 
 
@@ -1202,7 +1183,7 @@ def eval_(
     except RetrievalEvalError as e:
         raise click.ClickException(str(e)) from e
 
-    project, _sources, _models = load_project(project_dir)
+    project, _sources, _models = _load(project_dir)
     artifact_path = write_retrieval_eval_artifact(project_dir, project, results)
     failed = sum(1 for r in results if r.status == "fail")
 
@@ -1516,60 +1497,22 @@ def serving() -> None:
     """Inspect and recover serving-readiness state for search indexes."""
 
 
-def _serving_scope(
-    ctx: click.Context, model_name: str
-) -> tuple[Any, Any, Path]:
-    from .adapters.base import StateScope
-    from .retrieval import create_store
-
-    project_dir: Path = ctx.obj["project_dir"]
-    profiles_dir = ctx.obj["profiles_dir"]
-    target = ctx.obj["target"]
-    project_config, sources, models = load_project(project_dir)
-    validate_project_contract(project_config, sources, models, project_dir)
-    model = next((item for item in models if item.name == model_name), None)
-    if model is None or model.search is None:
-        raise ConfigClickError(f"Search index '{model_name}' was not found")
-    resolved = resolve_profile(
-        project_config, project_dir, target=target, profiles_dir=profiles_dir
-    )
-    if resolved.retrieval is None:
-        raise ConfigClickError(
-            "The active profile has no retrieval configuration"
-        )
-    alias = model.search.store or resolved.retrieval.default
-    store_config = resolved.retrieval.stores.get(alias)
-    if store_config is None:
-        raise ConfigClickError(
-            f"Search index '{model_name}' selects an unavailable retrieval store"
-        )
-    store = create_store(
-        store_config,
-        project_name=project_config.name,
-        target_name=resolved.target_name,
-        alias=alias,
-    )
-    logical = model.search.collection or model.name
-    scope = StateScope.for_target_descriptor(
-        model.name,
-        stage="retrieval_publish",
-        descriptor=store.state_descriptor(logical).descriptor(),
-    )
-    return scope, resolved, project_dir
-
-
 @serving.command("status")
 @click.argument("model_name")
 @_project_context_options
 @click.pass_context
 def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
-    from .retrieval import ServingCoordinationError, ServingCoordinator
+    from .cli_services.serving import serving_status as _serving_status
+    from .retrieval import ServingCoordinationError
 
     try:
-        scope, resolved, project_dir = _serving_scope(ctx, model_name)
-        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-            entry = ServingCoordinator(adapter).status(scope)
+        entry = _serving_status(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
     except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
     except (AdapterError, ServingCoordinationError) as e:
@@ -1608,14 +1551,17 @@ def serving_recover(
     token so any surviving process fails its next verification, clears all
     leases, and leaves the scope failed until the next successful publish.
     """
-    from .retrieval import ServingCoordinationError, ServingCoordinator
+    from .cli_services.serving import serving_recover as _serving_recover
+    from .retrieval import ServingCoordinationError
 
     try:
-        scope, resolved, project_dir = _serving_scope(ctx, model_name)
-        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-            entry = ServingCoordinator(adapter).recover(
-                scope, owner_terminated=owner_terminated
-            )
+        entry = _serving_recover(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+            owner_terminated=owner_terminated,
+        )
     except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
     except (AdapterError, ServingCoordinationError) as e:
@@ -1693,110 +1639,6 @@ def clean(ctx: click.Context) -> None:
     except (ConfigError, RunError) as e:
         raise ConfigClickError(str(e)) from e
     click.echo(f"Cleaned generated artifacts under {path}")
-
-
-def _load(project_dir: Path) -> tuple[ProjectConfig, list[SourceConfig], list[ModelConfig]]:
-    try:
-        return load_project(project_dir)
-    except ConfigError as e:
-        raise ConfigClickError(str(e)) from e
-
-
-def _build_dag(sources: list[SourceConfig], models: list[ModelConfig]) -> ProjectDAG:
-    try:
-        return ProjectDAG(sources, models)
-    except DAGError as e:
-        raise ConfigClickError(str(e)) from e
-
-
-def _run_watch(
-    project_dir: Path,
-    *,
-    profiles_dir: Path | None,
-    target: str | None,
-    full_refresh: bool,
-    select: str | None,
-    exclude: str | None,
-    threads: int = 1,
-) -> None:
-    """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
-    from watchfiles import watch
-
-    project, sources, models = _load(project_dir)
-    try:
-        dag = validate_project_contract(project, sources, models, project_dir)
-        selected = dag.select_models(select=select, exclude=exclude)
-        if not selected:
-            click.echo("No models selected.")
-            return
-        required_sources = set(dag.required_sources(selected))
-        resolved = resolve_profile(
-            project, project_dir, target=target, profiles_dir=profiles_dir
-        )
-        selected_names = set(selected)
-        validate_warehouse_capabilities(
-            [model for model in models if model.name in selected_names],
-            resolved.warehouse.type,
-        )
-        sources = apply_source_path_overrides(sources, resolved)
-    except _CONFIG_ERRORS as e:
-        raise ConfigClickError(str(e)) from e
-    watch_paths = []
-    for s in sources:
-        if s.name not in required_sources:
-            continue
-        try:
-            candidate = resolve_within_project(
-                s.path,
-                project_dir,
-                surface=f"Source '{s.name}' path",
-                external=s.external,
-                hint="Set `external: true` on the source to allow it.",
-            )
-        except ConfigError as e:
-            raise ConfigClickError(str(e)) from e
-        if candidate.exists():
-            watch_paths.append(candidate)
-    if not watch_paths:
-        raise click.ClickException(
-            "No source paths exist on disk yet. Create them (or run `dbt-ml seed`) "
-            "and try `dbt-ml run --watch` again."
-        )
-
-    click.echo(f"watching {len(watch_paths)} source path(s); Ctrl-C to stop")
-
-    def _do_run() -> None:
-        try:
-            results = run_project(
-                project_dir,
-                full_refresh=full_refresh,
-                select=select,
-                exclude=exclude,
-                target=target,
-                profiles_dir=profiles_dir,
-                threads=threads,
-            )
-        except (*_CONFIG_ERRORS, RunError) as e:
-            click.echo(f"error: {e}", err=True)
-            return
-        write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
-        write_run_results(
-            project_dir, results, target=target, profiles_dir=profiles_dir
-        )
-        for r in results:
-            click.echo(
-                f"  {r.model_name:<22} {r.kind:<12} "
-                f"processed={r.documents_processed:<5} skipped={r.documents_skipped:<5} "
-                f"rows={r.rows_written}"
-            )
-
-    _do_run()
-    try:
-        for _ in watch(*watch_paths, debounce=500, recursive=True):
-            click.echo("change detected, re-running...")
-            _do_run()
-    except KeyboardInterrupt:
-        click.echo("watch stopped.")
 
 
 def _backend_for_source(source: SourceConfig, models: list[ModelConfig]) -> str:

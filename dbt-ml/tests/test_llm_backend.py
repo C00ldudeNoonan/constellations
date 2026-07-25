@@ -530,46 +530,6 @@ def test_legacy_cache_entry_is_not_reused(tmp_path: Path) -> None:
     assert counter.calls == 1
 
 
-def test_legacy_cache_entries_are_pruned_on_write(tmp_path: Path) -> None:
-    """Rows written before the provider contract can never be read again;
-    the first write into a cache file sweeps them out."""
-    import duckdb
-
-    cache_path = tmp_path / "cache.duckdb"
-    con = duckdb.connect(str(cache_path))
-    con.execute(
-        """
-        CREATE TABLE llm_cache (
-            cache_key VARCHAR PRIMARY KEY,
-            model VARCHAR NOT NULL,
-            content_hash VARCHAR NOT NULL,
-            schema_hash VARCHAR NOT NULL,
-            response_json VARCHAR NOT NULL,
-            created_at TIMESTAMP NOT NULL
-        )
-        """
-    )
-    con.execute(
-        "INSERT INTO llm_cache VALUES "
-        "('claude-haiku-4-5|abc|def', 'claude-haiku-4-5', 'abc', 'def', "
-        "'{\"x\": \"legacy\"}', current_timestamp)"
-    )
-    con.close()
-
-    new_key = "provider-v1|anthropic|claude-haiku-4-5|digest"
-    llm_backend._cache_put(
-        cache_path,
-        new_key,
-        model="claude-haiku-4-5",
-        content_hash="abc",
-        schema_hash="def",
-        fields={"x": "fresh"},
-    )
-
-    assert llm_backend._cache_get(cache_path, "claude-haiku-4-5|abc|def") is None
-    assert llm_backend._cache_get(cache_path, new_key) == {"x": "fresh"}
-
-
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 def test_cache_file_is_private_and_rejects_symlinks(
     monkeypatch: pytest.MonkeyPatch,

@@ -227,8 +227,8 @@ def _absolutize_llm(llm: LLMConfig | None, project_dir: Path) -> LLMConfig | Non
 def _legacy_resolved(project: ProjectConfig) -> ResolvedProfile:
     warnings.warn(
         f"Project '{project.name}' has no `profile:`, so dbt-ml is falling back to "
-        "the inline `duckdb:` block. This path is deprecated and will be removed; "
-        "declare a `profile:` and a profiles.yml `warehouse:` instead.",
+        "the inline `duckdb:` block. This path is deprecated and will be removed in "
+        "v1.0.0; declare a `profile:` and a profiles.yml `warehouse:` instead.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -357,7 +357,8 @@ def _legacy_env_dir() -> str | None:
     value = os.environ.get(LEGACY_PROFILES_DIR_ENV)
     if value:
         warnings.warn(
-            f"${LEGACY_PROFILES_DIR_ENV} is deprecated; use ${PROFILES_DIR_ENV}.",
+            f"${LEGACY_PROFILES_DIR_ENV} is deprecated and will be removed in "
+            f"v1.0.0; use ${PROFILES_DIR_ENV}.",
             DeprecationWarning,
             stacklevel=3,
         )

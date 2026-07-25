@@ -13,6 +13,7 @@ from dbt_ml.hashing import canonical_fingerprint
 from dbt_ml.profile import (
     ProfileError,
     ResolvedProfile,
+    _legacy_env_dir,
     _load_profiles_file,
     apply_source_path_overrides,
     resolve_llm_options,
@@ -102,6 +103,24 @@ def test_legacy_fallback_when_no_profile(tmp_path: Path) -> None:
         resolved = resolve_profile(project, tmp_path)
     assert resolved.profile_name == "<inline>"
     assert resolved.warehouse.schema_name == "inline_schema"
+
+
+def test_inline_duckdb_warning_names_removal_version(tmp_path: Path) -> None:
+    # Workstream E (issue #190) commits the deprecated inline-`duckdb:` path to
+    # v1.0.0; pin that the user-facing warning names it so the promise can't
+    # silently drift. See docs/compatibility.md.
+    _write_project(tmp_path, inline_duckdb=True)
+    project, _, _ = load_project(tmp_path)
+    with pytest.warns(DeprecationWarning, match=r"removed in v1\.0\.0"):
+        resolve_profile(project, tmp_path)
+
+
+def test_legacy_profiles_dir_env_warning_names_removal_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DOCBT_PROFILES_DIR", str(tmp_path))
+    with pytest.warns(DeprecationWarning, match=r"removed in v1\.0\.0"):
+        _legacy_env_dir()
 
 
 def test_profile_resolves_warehouse(tmp_path: Path) -> None:

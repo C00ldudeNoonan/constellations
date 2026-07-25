@@ -202,7 +202,7 @@ def _select_terms(
 
 
 def _df_threshold(
-    value: int | float | None,
+    value: float | None,
     n_docs: int,
     *,
     default: int,

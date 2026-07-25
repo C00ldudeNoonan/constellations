@@ -285,7 +285,8 @@ class ProtectedWarehouseConfig(dict[str, Any]):
         except AdapterError as error:
             raise PydanticCustomError(
                 "warehouse_config",
-                str(error),
+                "{message}",
+                {"message": str(error)},
             ) from None
         for field_name in (
             "client_secret",

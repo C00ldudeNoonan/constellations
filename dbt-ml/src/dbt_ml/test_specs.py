@@ -203,14 +203,17 @@ def _options(
     non_string_keys = [key for key in value if not isinstance(key, str)]
     if non_string_keys:
         raise TestSpecError(f"Test '{name}' option names must be strings")
+    typed_value = {
+        key: item for key, item in value.items() if isinstance(key, str)
+    }
     allowed = required | (optional or set())
-    missing = sorted(required - set(value))
-    unknown = sorted(set(value) - allowed)
+    missing = sorted(required - set(typed_value))
+    unknown = sorted(set(typed_value) - allowed)
     if missing:
         raise TestSpecError(f"Test '{name}' is missing required options: {missing}")
     if unknown:
         raise TestSpecError(f"Test '{name}' has unknown options: {unknown}")
-    return value
+    return typed_value
 
 
 def _require_nonempty_string(name: str, value: Any, label: str) -> str:

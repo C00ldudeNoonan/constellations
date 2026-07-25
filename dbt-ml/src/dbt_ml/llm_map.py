@@ -263,12 +263,16 @@ def execute_map_item(
         objects: list[Mapping[str, Any]] = [output]
     else:
         items = output.get("items")
-        if not isinstance(items, list) or any(
-            not isinstance(item, Mapping) for item in items
-        ):
+        if not isinstance(items, list):
             raise LLMMapError(
                 "provider returned a malformed list for output_cardinality: many"
             )
-        objects = list(items)
+        objects = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise LLMMapError(
+                    "provider returned a malformed list for output_cardinality: many"
+                )
+            objects.append(item)
     rows = [_project_object(obj, runtime.field_names) for obj in objects]
     return rows, usage

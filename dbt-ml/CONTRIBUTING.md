@@ -16,20 +16,21 @@ uv run pytest -q
 ```bash
 uv run pip-audit --skip-editable  # dependency advisories
 uv run ruff check                 # lint
-uv run ty check                   # fast advisory type checking
-uv run mypy                       # strict type checking
+uv run ty check                   # required type checking
+uv run mypy                       # temporary migration parity
 uv run pytest -q                  # tests
 ```
 
-ty checks `src/dbt_ml` only, matching the package scope of mypy. It is an
-advisory signal while its baseline is reduced: ty 0.0.63 currently reports 28
-diagnostics, primarily around third-party stubs and stricter inference than
-mypy. Do not add broad suppressions to make the command clean; fix findings in
-focused follow-up work. mypy remains the authoritative type-checking gate.
+ty is the primary type checker and checks `src/dbt_ml` plus focused static
+compatibility fixtures in `typecheck/`. Ruff's ANN and PYI rules preserve
+annotation discipline for package source; explicit `Any` remains permitted at
+validated dynamic, SDK, and optional-dependency boundaries. Do not add broad
+suppressions to keep the command clean.
 
-CI runs the dependency audit, Ruff, advisory ty, and pytest on every push and
-PR. Release validation also runs mypy and builds the distributions; see the
-workflows in the repository-level `.github/workflows/` directory.
+During the migration tracked in issue #49, CI and release validation also run
+mypy as a parity check. Remove that second checker only after the issue's
+side-by-side validation period is complete. The workflows live in the
+repository-level `.github/workflows/` directory.
 
 ## Adding a new backend
 

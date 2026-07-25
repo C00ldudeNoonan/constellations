@@ -79,10 +79,14 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "RUF"]
+select = ["E", "F", "I", "B", "UP", "RUF", "ANN", "PYI"]
 # Legitimate Unicode (right single quote, em dash, smart quotes) in docstrings,
 # tests, and examples isn't a typo — we deliberately use it for mojibake demos.
-ignore = ["RUF001", "RUF002", "RUF003"]
+ignore = ["RUF001", "RUF002", "RUF003", "ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**/*.py" = ["ANN", "PYI"]
+"tests/**/*.py" = ["ANN", "PYI"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -95,7 +99,10 @@ module = ["datasketch", "langdetect"]
 ignore_missing_imports = true
 
 [tool.ty.src]
-include = ["src/dbt_ml"]
+include = ["src/dbt_ml", "typecheck"]
+
+[tool.ty.rules]
+missing-type-argument = "error"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

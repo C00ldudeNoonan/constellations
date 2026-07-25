@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from anthropic.types import ToolParam
 
 from .base import (
     BatchInferenceItem,
@@ -206,7 +209,7 @@ def _complete_with_sdk(
         max_retries=runtime.max_retries,
         timeout=runtime.timeout_seconds,
     )
-    response = client.messages.create(  # type: ignore[call-overload]
+    response = client.messages.create(
         model=request.model,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
@@ -412,7 +415,7 @@ def _credential_value(credential: ProviderCredential | None) -> str:
     return credential.reveal()
 
 
-def _structured_output_tool(request: InferenceRequest) -> dict[str, Any]:
+def _structured_output_tool(request: InferenceRequest) -> ToolParam:
     return {
         "name": request.output_name,
         "description": request.output_description,

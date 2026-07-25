@@ -3,10 +3,10 @@ from __future__ import annotations
 import inspect
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint, distributions
-from typing import Any, overload
+from typing import Any, Protocol, overload
 
 from pydantic import BaseModel
 
@@ -31,6 +31,14 @@ _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DISTRIBUTION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _IMPLEMENTATION_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+
+class _InferenceProviderDecorator(Protocol):
+    def __call__[T: InferenceProvider](self, provider_cls: type[T], /) -> type[T]: ...
+
+
+class _EmbeddingProviderDecorator(Protocol):
+    def __call__[T: EmbeddingProvider](self, provider_cls: type[T], /) -> type[T]: ...
+
 # Entry-point plugin discovery (issue #71). The group suffix is the provider
 # contract major version: a plugin advertises the contract it was built
 # against by choosing the group and never loads under any other.
@@ -54,53 +62,55 @@ def entry_point_group(capability: str) -> str:
 
 
 @overload
-def register_inference_provider(
-    provider_cls: type[InferenceProvider], /
-) -> type[InferenceProvider]: ...
+def register_inference_provider[T: InferenceProvider](
+    provider_cls: type[T], /
+) -> type[T]: ...
 
 
 @overload
 def register_inference_provider(
     provider_cls: None = None, /
-) -> Callable[[type[InferenceProvider]], type[InferenceProvider]]: ...
+) -> _InferenceProviderDecorator: ...
 
 
 def register_inference_provider(
     provider_cls: type[InferenceProvider] | None = None, /
 ) -> (
     type[InferenceProvider]
-    | Callable[[type[InferenceProvider]], type[InferenceProvider]]
+    | _InferenceProviderDecorator
 ):
-    def decorator(cls: type[InferenceProvider]) -> type[InferenceProvider]:
+    def decorator[T: InferenceProvider](cls: type[T]) -> type[T]:
         _validate_provider_class(cls, capability="inference")
         _validate_inference_metadata(cls)
-        _register(_INFERENCE_PROVIDERS, cls, capability="inference")
+        registered_cls: type[InferenceProvider] = cls
+        _register(_INFERENCE_PROVIDERS, registered_cls, capability="inference")
         return cls
 
     return decorator if provider_cls is None else decorator(provider_cls)
 
 
 @overload
-def register_embedding_provider(
-    provider_cls: type[EmbeddingProvider], /
-) -> type[EmbeddingProvider]: ...
+def register_embedding_provider[T: EmbeddingProvider](
+    provider_cls: type[T], /
+) -> type[T]: ...
 
 
 @overload
 def register_embedding_provider(
     provider_cls: None = None, /
-) -> Callable[[type[EmbeddingProvider]], type[EmbeddingProvider]]: ...
+) -> _EmbeddingProviderDecorator: ...
 
 
 def register_embedding_provider(
     provider_cls: type[EmbeddingProvider] | None = None, /
 ) -> (
     type[EmbeddingProvider]
-    | Callable[[type[EmbeddingProvider]], type[EmbeddingProvider]]
+    | _EmbeddingProviderDecorator
 ):
-    def decorator(cls: type[EmbeddingProvider]) -> type[EmbeddingProvider]:
+    def decorator[T: EmbeddingProvider](cls: type[T]) -> type[T]:
         _validate_provider_class(cls, capability="embedding")
-        _register(_EMBEDDING_PROVIDERS, cls, capability="embedding")
+        registered_cls: type[EmbeddingProvider] = cls
+        _register(_EMBEDDING_PROVIDERS, registered_cls, capability="embedding")
         return cls
 
     return decorator if provider_cls is None else decorator(provider_cls)

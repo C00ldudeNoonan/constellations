@@ -283,7 +283,8 @@ class BigQueryWarehouseConfig(WarehouseConfig):
         except (TypeError, ValueError) as error:
             raise PydanticCustomError(
                 "protected_bigquery_config",
-                str(error),
+                "{message}",
+                {"message": str(error)},
             ) from None
 
     @classmethod

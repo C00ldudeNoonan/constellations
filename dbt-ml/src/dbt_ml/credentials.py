@@ -287,4 +287,8 @@ class CredentialFreeUrl(str):
         try:
             return cls(value)
         except CredentialUrlError as error:
-            raise PydanticCustomError("credential_url", str(error)) from None
+            raise PydanticCustomError(
+                "credential_url",
+                "{message}",
+                {"message": str(error)},
+            ) from None

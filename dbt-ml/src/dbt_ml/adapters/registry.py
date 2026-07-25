@@ -69,7 +69,7 @@ def _protect_unregistered_adapter_input(
     return prepared
 
 
-def register(cls: type[WarehouseAdapter]) -> type[WarehouseAdapter]:
+def register[T: WarehouseAdapter](cls: type[T]) -> type[T]:
     _REGISTRY[cls.adapter_type()] = cls
     return cls
 

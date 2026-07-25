@@ -8,7 +8,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, TracebackType
 from typing import Any, Self
 
 import pyarrow as pa
@@ -258,7 +258,12 @@ class RetrievalStore(ABC):
     def __enter__(self) -> Self: ...
 
     @abstractmethod
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
 
     @abstractmethod
     def safe_descriptor(self) -> SafeRetrievalTarget: ...

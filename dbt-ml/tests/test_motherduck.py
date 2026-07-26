@@ -155,21 +155,66 @@ def test_connect_without_token_lets_duckdb_read_its_own_env(
     not os.environ.get("MOTHERDUCK_TOKEN"),
     reason="requires a live MotherDuck token in MOTHERDUCK_TOKEN",
 )
-def test_motherduck_round_trip_against_live_service() -> None:
+def test_motherduck_capability_audit_against_live_service() -> None:
+    """Verify the advertised DuckDB capabilities work over MotherDuck (#186).
+
+    Exercises atomic full replace, incremental merge, state storage, bounded
+    snapshots, SQL preflight + model materialization, and cleanup in a
+    disposable schema, then removes everything it created.
+    """
     import polars as pl
+
+    from dbt_ml.adapters import StateRecord, StateScope
 
     database = os.environ.get("DBT_ML_MOTHERDUCK_DATABASE", "md:")
     cfg = parse_warehouse_config(
         {
             "type": "duckdb",
-            "schema": "dbt_ml_ci",
+            "schema": "dbt_ml_ci_motherduck",
             "path": database,
             "token": "{{ env_var('MOTHERDUCK_TOKEN') }}",
         }
     )
     with create_adapter(cfg) as adapter:
-        adapter.materialize_full(
-            "motherduck_probe", pl.DataFrame({"id": [1, 2, 3]})
-        )
-        assert adapter.row_count("motherduck_probe") == 3
-        adapter.drop_table("motherduck_probe")
+        try:
+            # atomic full replace
+            adapter.materialize_full("md_probe", pl.DataFrame({"id": ["a", "b", "c"]}))
+            assert adapter.row_count("md_probe") == 3
+            adapter.materialize_full("md_probe", pl.DataFrame({"id": ["a"]}))
+            assert adapter.row_count("md_probe") == 1
+
+            # incremental keyed merge
+            adapter.materialize_full("md_inc", pl.DataFrame({"id": ["a", "b"], "v": [1, 2]}))
+            adapter.materialize_incremental(
+                "md_inc",
+                pl.DataFrame({"id": ["b", "c"], "v": [20, 30]}),
+                key_col="id",
+                on_schema_change="append_new_columns",
+            )
+            merged = {
+                r["id"]: r["v"]
+                for r in adapter.read_table("md_inc").iter_rows(named=True)
+            }
+            assert merged == {"a": 1, "b": 20, "c": 30}
+
+            # state storage
+            scope = StateScope("md_model")
+            adapter.upsert_state(
+                scope, [StateRecord("k1", "fp1", "cv1"), StateRecord("k2", "fp2", "cv1")]
+            )
+            assert set(adapter.fetch_state(scope)) == {"k1", "k2"}
+
+            # bounded snapshot
+            with adapter.table_snapshot("md_probe", batch_size=1) as snap:
+                assert sum(b.num_rows for b in snap) == 1
+
+            # SQL preflight + model materialization
+            assert any(c.name == "x" for c in adapter.dry_run_sql("SELECT 1 AS x").columns)
+            adapter.materialize_sql_full(
+                "md_sql", "SELECT id FROM " + adapter.table_ref("md_probe")
+            )
+            assert adapter.row_count("md_sql") == 1
+        finally:
+            for table in ("md_probe", "md_inc", "md_sql"):
+                adapter.drop_table(table)
+            adapter.delete_state(StateScope("md_model"), ["k1", "k2"])

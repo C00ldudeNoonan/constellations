@@ -174,6 +174,21 @@ class DuckDBWarehouseConfig(WarehouseConfig):
                 "`token` is only valid for a MotherDuck `path: md:<database>`; a "
                 "local DuckDB file needs no token"
             )
+        if self.is_motherduck:
+            # storage_location() (the full path) is written into manifest.json
+            # target blocks, so a credential smuggled into the URI query string
+            # (md:db?motherduck_token=...) would leak despite the protected
+            # `token` field. Reject credential-bearing parameters outright.
+            raw = str(self.path)
+            query = raw.split("?", 1)[1] if "?" in raw else ""
+            for param in query.split("&"):
+                name = param.split("=", 1)[0].strip().lower()
+                if name and "token" in name:
+                    raise ValueError(
+                        "MotherDuck `path` must not carry credentials in its "
+                        f"query string (found `{name}`); use the protected "
+                        "`token:` field with an {{ env_var('NAME') }} reference"
+                    )
         return self
 
     @property

@@ -82,6 +82,29 @@ def test_literal_token_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "md:db?motherduck_token=sk-secret",
+        "md:db?MOTHERDUCK_TOKEN=sk-secret",
+        "md:db?attach_mode=single&token=sk-secret",
+        "md:?motherduck_token=sk-secret",
+    ],
+)
+def test_credential_bearing_uri_params_are_rejected(path: str) -> None:
+    # storage_location() is written into manifest.json target blocks, so a
+    # token smuggled into the URI query string would leak past the protected
+    # `token:` field (codex P1 on #213).
+    with pytest.raises(AdapterError, match="query string"):
+        parse_warehouse_config({"type": "duckdb", "path": path})
+
+
+def test_non_credential_uri_params_remain_allowed() -> None:
+    cfg = _md_config(path="md:economic_data?attach_mode=single", token=None)
+    assert cfg.is_motherduck
+    assert cfg.catalog_name() == "economic_data"
+
+
 def test_token_requires_a_motherduck_path() -> None:
     with pytest.raises(AdapterError):
         parse_warehouse_config(

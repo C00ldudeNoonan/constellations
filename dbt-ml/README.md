@@ -431,12 +431,15 @@ local file. Point `path:` at a `md:` database and supply the service token:
 ```yaml
       warehouse:
         type: duckdb
-        path: md:economic_data            # or `md:` for the account default
+        path: md:economic_data            # or "md:" (quoted) for the account default
         token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
         schema: analytics
 ```
 
-- `path` forms: `md:` (account-default database) or `md:<database>`.
+- `path` forms: `"md:"` (account-default database — quote it, or YAML reads the
+  bare trailing colon as mapping syntax) or `md:<database>`. Credential-bearing
+  query parameters (`?motherduck_token=…`) are rejected; the token belongs only
+  in the protected `token:` field.
 - `token` must be an exact `{{ env_var('NAME') }}` reference — literal tokens
   are rejected. It is never written to `manifest.json`, `run_results.json`,
   logs, or generated dbt sources, and is revealed only at connection. If you

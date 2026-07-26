@@ -344,6 +344,16 @@ def test_transform_rejects_provider_output_count_mismatch(
             {"unexpected": True},
             "Extra inputs are not permitted",
         ),
+        (
+            nlp_entities.validate_options,
+            {"include_text": "yes"},
+            "valid boolean",
+        ),
+        (
+            nlp_entities.validate_options,
+            {"include_text": 1},
+            "valid boolean",
+        ),
     ],
 )
 def test_transform_options_are_strict(

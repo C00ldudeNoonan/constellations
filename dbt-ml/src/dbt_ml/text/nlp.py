@@ -6,7 +6,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from ..optional_dependencies import (
     OptionalDependencyError,
@@ -71,7 +78,7 @@ class NLPTokenOptions(NLPBaseOptions):
 
 
 class NLPEntityOptions(NLPBaseOptions):
-    include_text: bool = False
+    include_text: StrictBool = False
 
 
 @dataclass(frozen=True)

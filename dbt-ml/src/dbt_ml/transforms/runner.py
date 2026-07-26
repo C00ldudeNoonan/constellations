@@ -90,6 +90,10 @@ def validate_transform_contract(
         raise AttributeError(
             f"Transform '{module_path}' `validate_options` must be callable"
         )
+    if inspect.iscoroutinefunction(validator) or inspect.iscoroutinefunction(
+        type(validator).__call__
+    ):
+        raise TypeError("async transform option validators are not supported")
     cast(TransformOptionsValidator, validator)(dict(options))
 
 

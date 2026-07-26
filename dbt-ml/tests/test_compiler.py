@@ -611,6 +611,12 @@ def test_non_incremental_model_kinds_reject_incremental_materialization(
             "async def run(deps):\n    return None\n",
             "async transform functions are not supported",
         ),
+        (
+            {"type": "python", "module": "transforms.derived"},
+            "async def validate_options(options):\n    return None\n\n"
+            "def run(deps):\n    return deps['raw']\n",
+            "async transform option validators are not supported",
+        ),
     ],
 )
 def test_transform_contract_is_validated_at_compile_time(

@@ -45,6 +45,23 @@ repository-level `.github/workflows/` directory.
 7. Add an init template under `src/dbt_ml/templates/<backend>/` if a fresh-
    project starter makes sense.
 
+## Adding a built-in Python transform
+
+1. Put the module under the appropriate package, such as
+   `src/dbt_ml/text/transforms/`, and expose `run(deps, ctx)` with one or two
+   positional arguments.
+2. For transforms with options, expose `validate_options(options) -> None`.
+   The compiler calls this hook before source discovery, credentials, optional
+   SDK initialization, model loading, or warehouse mutation.
+3. Parse runtime options with the same strict Pydantic model used by the
+   validation hook. Keep optional dependencies lazy and provide an actionable
+   extra-install command when they are absent.
+4. Use a provider protocol when execution depends on an external SDK or model.
+   Unit tests must use a deterministic fake and must not require downloads,
+   credentials, or network access.
+5. Document the input and output schemas, sensitive-field behavior, optional
+   extra, and a runnable example whenever the transform is public.
+
 ## Adding a new model kind
 
 Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one

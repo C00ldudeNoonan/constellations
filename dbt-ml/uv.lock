@@ -528,6 +528,7 @@ all = [
     { name = "presidio-anonymizer" },
     { name = "pypdf" },
     { name = "scikit-learn" },
+    { name = "spacy" },
     { name = "tiktoken" },
 ]
 bigquery = [
@@ -548,6 +549,9 @@ mcp = [
 ml = [
     { name = "numpy" },
     { name = "scikit-learn" },
+]
+nlp = [
+    { name = "spacy" },
 ]
 pdf = [
     { name = "fpdf2" },
@@ -621,11 +625,13 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6" },
     { name = "scikit-learn", marker = "extra == 'all'", specifier = ">=1.3" },
     { name = "scikit-learn", marker = "extra == 'ml'", specifier = ">=1.3" },
+    { name = "spacy", marker = "extra == 'all'", specifier = ">=3.8,<4" },
+    { name = "spacy", marker = "extra == 'nlp'", specifier = ">=3.8,<4" },
     { name = "tiktoken", marker = "extra == 'all'", specifier = ">=0.7" },
     { name = "tiktoken", marker = "extra == 'text'", specifier = ">=0.7" },
     { name = "watchfiles", specifier = ">=0.21" },
 ]
-provides-extras = ["bigquery", "gcs", "vertex", "lancedb", "mcp", "html", "pdf", "pii", "text", "ml", "all"]
+provides-extras = ["bigquery", "gcs", "vertex", "lancedb", "mcp", "html", "pdf", "pii", "text", "nlp", "ml", "all"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -4,9 +4,11 @@ import importlib
 import importlib.util
 import inspect
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from types import ModuleType
+from typing import Any, Protocol, cast
 
 import polars as pl
 
@@ -35,6 +37,10 @@ class TransformFn(Protocol):
     def __call__(self, deps: dict[str, pl.DataFrame], *args: Any) -> pl.DataFrame: ...
 
 
+class TransformOptionsValidator(Protocol):
+    def __call__(self, options: Mapping[str, Any]) -> None: ...
+
+
 def transform_call_arity(transform_fn: TransformFn) -> int:
     if inspect.iscoroutinefunction(transform_fn):
         raise TypeError("async transform functions are not supported")
@@ -60,6 +66,38 @@ def load_transform(module_path: str, project_dir: Path) -> TransformFn:
         2. Installed Python package (lets us ship built-ins like
            `dbt_ml.text.transforms.text_stats`).
     """
+    module = _load_transform_module(module_path, project_dir)
+    return _transform_fn(module, module_path)
+
+
+def validate_transform_contract(
+    module_path: str,
+    project_dir: Path,
+    options: Mapping[str, Any],
+) -> None:
+    """Validate a transform's callable and optional configuration hook.
+
+    A module may expose ``validate_options(options)`` to reject invalid
+    configuration during compilation, before execution initializes optional
+    SDKs, language models, credentials, or warehouse reads.
+    """
+    module = _load_transform_module(module_path, project_dir)
+    transform_call_arity(_transform_fn(module, module_path))
+    validator = getattr(module, "validate_options", None)
+    if validator is None:
+        return
+    if not callable(validator):
+        raise AttributeError(
+            f"Transform '{module_path}' `validate_options` must be callable"
+        )
+    if inspect.iscoroutinefunction(validator) or inspect.iscoroutinefunction(
+        type(validator).__call__
+    ):
+        raise TypeError("async transform option validators are not supported")
+    cast(TransformOptionsValidator, validator)(dict(options))
+
+
+def _load_transform_module(module_path: str, project_dir: Path) -> ModuleType:
     file_path = resolve_module_file(module_path, project_dir)
     if file_path.exists():
         spec = importlib.util.spec_from_file_location(module_path, file_path)
@@ -76,7 +114,10 @@ def load_transform(module_path: str, project_dir: Path) -> TransformFn:
                 f"Transform '{module_path}' not found as a project file "
                 f"({file_path}) or as an importable Python module: {e}"
             ) from e
+    return module
 
+
+def _transform_fn(module: ModuleType, module_path: str) -> TransformFn:
     run_fn = getattr(module, "run", None)
     if run_fn is None or not callable(run_fn):
         raise AttributeError(

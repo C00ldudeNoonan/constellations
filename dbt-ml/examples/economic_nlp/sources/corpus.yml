@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: economic_documents
+    description: "Small committed corpus of synthetic economic-policy documents"
+    path: corpus
+    file_pattern: "*.json"
+    recursive: true
+    tags: [economic_data, documents]

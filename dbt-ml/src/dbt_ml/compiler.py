@@ -36,7 +36,7 @@ from .sql_models import (
     validate_single_select,
 )
 from .test_specs import TestSpecError, parse_test_spec
-from .transforms import load_transform, transform_call_arity
+from .transforms import validate_transform_contract
 
 _MODULE_PATTERN = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
 
@@ -822,8 +822,11 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             ("transform", "module"),
         )
     try:
-        transform_fn = load_transform(transform.module, project_dir)
-        transform_call_arity(transform_fn)
+        validate_transform_contract(
+            transform.module,
+            project_dir,
+            transform.options,
+        )
     except (Exception, SystemExit) as e:
         raise _model_error(
             model,

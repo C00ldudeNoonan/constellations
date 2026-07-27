@@ -611,6 +611,12 @@ def test_non_incremental_model_kinds_reject_incremental_materialization(
             "async def run(deps):\n    return None\n",
             "async transform functions are not supported",
         ),
+        (
+            {"type": "python", "module": "transforms.derived"},
+            "async def validate_options(options):\n    return None\n\n"
+            "def run(deps):\n    return deps['raw']\n",
+            "async transform option validators are not supported",
+        ),
     ],
 )
 def test_transform_contract_is_validated_at_compile_time(
@@ -650,6 +656,56 @@ def test_transform_with_deps_and_optional_context_is_valid(tmp_path: Path) -> No
     )
 
     assert dag.execution_order() == ["raw", "derived"]
+
+
+def test_transform_options_are_validated_at_compile_time(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "def validate_options(options):\n"
+        "    if options.get('mode') != 'supported':\n"
+        "        raise ValueError('mode must be supported')\n\n"
+        "def run(deps, ctx):\n"
+        "    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={
+            "type": "python",
+            "module": "transforms.derived",
+            "options": {"mode": "invalid"},
+        },
+    )
+
+    with pytest.raises(ConfigError, match="mode must be supported"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), model],
+            tmp_path,
+        )
+
+
+def test_transform_options_validator_must_be_callable(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "validate_options = 1\n\n"
+        "def run(deps, ctx):\n"
+        "    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+    )
+
+    with pytest.raises(ConfigError, match=r"validate_options.*must be callable"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), model],
+            tmp_path,
+        )
 
 
 @pytest.mark.parametrize(

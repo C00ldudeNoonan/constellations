@@ -15,7 +15,7 @@ from dbt_ml.backends import html_backend, options, pdf_backend
 from dbt_ml.cli import cli
 from dbt_ml.optional_dependencies import OptionalDependencyError
 from dbt_ml.synth import invoice_pdfs
-from dbt_ml.text import dedup, encoding, language, pii, tokens
+from dbt_ml.text import dedup, encoding, language, nlp, pii, tokens
 
 
 def _reset_optional_caches() -> None:
@@ -23,6 +23,7 @@ def _reset_optional_caches() -> None:
     tokens._get_encoding.cache_clear()
     pii._get_analyzer.cache_clear()
     pii._get_anonymizer.cache_clear()
+    nlp._spacy_provider.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -44,6 +45,11 @@ def _reset_optional_caches() -> None:
             "presidio_analyzer",
             "pii",
             lambda: pii.detect_pii("Contact alex@example.com for details."),
+        ),
+        (
+            "spacy",
+            "nlp",
+            lambda: nlp.get_nlp_provider(nlp.NLPTokenOptions()),
         ),
         (
             "tiktoken",
@@ -78,7 +84,7 @@ import builtins
 
 blocked = {
     'bs4', 'datasketch', 'fpdf', 'ftfy', 'langdetect', 'presidio_analyzer',
-    'presidio_anonymizer', 'pypdf', 'tiktoken', 'mcp',
+    'presidio_anonymizer', 'pypdf', 'spacy', 'tiktoken', 'mcp',
 }
 real_import = builtins.__import__
 
@@ -323,6 +329,7 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "presidio-analyzer",
         "presidio-anonymizer",
         "pypdf",
+        "spacy",
         "tiktoken",
     ):
         assert package not in core
@@ -333,6 +340,7 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "gcs",
         "html",
         "mcp",
+        "nlp",
         "pdf",
         "pii",
         "text",

@@ -129,6 +129,7 @@ fitting the workflow analytics engineers already use.**
   and `llm` (Claude tool-use with response caching).
 - **Built-in text/ML preprocessing** — token counting, encoding repair,
   normalized spaCy token/entity child tables,
+  deterministic entity linking to canonical IDs via alias tables,
   language detection, text statistics, near-duplicate detection (MinHash), and
   PII redaction (Microsoft Presidio).
 - **Warehouse and source adapters** — DuckDB or BigQuery materialization, with
@@ -166,7 +167,7 @@ uv run dbt-ml --project-dir examples/invoice_pipeline run
 uv run dbt-ml --project-dir examples/invoice_pipeline test
 ```
 
-Fourteen examples live in [`dbt-ml/examples/`](dbt-ml/examples/), covering
+Fifteen examples live in [`dbt-ml/examples/`](dbt-ml/examples/), covering
 invoices, blog posts, support tickets, arXiv quality checks, PDF and direct LLM
 extraction, classic text ML, document clustering, RAG chunks, governed SQL
 chunks, dbt handoff and embedded execution, and a metric-plus-evidence agent.

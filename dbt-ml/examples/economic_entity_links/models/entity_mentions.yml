@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: entity_mentions
+    description: "One row per entity mention, shaped like nlp_entities output"
+    source: ref('mention_documents')
+    extraction:
+      backend: json
+      options:
+        fields: [entity_id, source_document_id, entity_text, label]
+    materialization: incremental
+    fields:
+      - name: entity_id
+        data_type: string
+      - name: source_document_id
+        data_type: string
+      - name: entity_text
+        data_type: string
+      - name: label
+        data_type: string
+    tests:
+      - not_null: [entity_id, source_document_id, entity_text, label]
+      - unique: entity_id

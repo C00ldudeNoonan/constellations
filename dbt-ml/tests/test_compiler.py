@@ -686,6 +686,87 @@ def test_transform_options_are_validated_at_compile_time(tmp_path: Path) -> None
         )
 
 
+def _declaring_transform(tmp_path: Path, returns: str) -> None:
+    (tmp_path / "transforms").mkdir(exist_ok=True)
+    (tmp_path / "transforms" / "derived.py").write_text(
+        f"def declared_dependencies(options):\n    return {returns}\n\n"
+        "def run(deps, ctx):\n    return deps['raw']\n"
+    )
+
+
+def _declaring_model(*depends_on: str) -> ModelConfig:
+    return ModelConfig(
+        name="derived",
+        depends_on=[f"ref('{name}')" for name in depends_on],
+        transform={"type": "python", "module": "transforms.derived"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("returns", "depends_on", "message"),
+    [
+        (
+            "(options['left'],)",
+            ("raw",),
+            "referenced by options but not in depends_on",
+        ),
+        (
+            "('raw',)",
+            ("raw", "other"),
+            "in depends_on but unused by options",
+        ),
+        ("'raw'", ("raw",), "must return an iterable of model names"),
+        ("['raw', '']", ("raw",), "non-empty model-name strings"),
+        ("[1]", ("raw",), "non-empty model-name strings"),
+    ],
+)
+def test_declared_dependencies_are_reconciled_at_compile_time(
+    tmp_path: Path,
+    returns: str,
+    depends_on: tuple[str, ...],
+    message: str,
+) -> None:
+    _declaring_transform(tmp_path, returns)
+    model = _declaring_model(*depends_on)
+    model.transform.options = {"left": "typo"}  # type: ignore[union-attr]
+
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), _extraction("other"), model],
+            tmp_path,
+        )
+
+
+def test_matching_declared_dependencies_compile_cleanly(tmp_path: Path) -> None:
+    _declaring_transform(tmp_path, "('raw',)")
+
+    dag = validate_project_contract(
+        ProjectConfig(name="p"),
+        [_source()],
+        [_extraction("raw"), _declaring_model("raw")],
+        tmp_path,
+    )
+
+    assert dag.execution_order() == ["raw", "derived"]
+
+
+def test_declared_dependencies_must_be_callable(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "declared_dependencies = 1\n\ndef run(deps, ctx):\n    return deps['raw']\n"
+    )
+
+    with pytest.raises(ConfigError, match=r"declared_dependencies.*must be callable"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), _declaring_model("raw")],
+            tmp_path,
+        )
+
+
 def test_transform_options_validator_must_be_callable(tmp_path: Path) -> None:
     (tmp_path / "transforms").mkdir()
     (tmp_path / "transforms" / "derived.py").write_text(

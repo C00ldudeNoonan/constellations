@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Deterministic alias-table entity linking (issue #217)
+
+- Added the `dbt_ml.text.transforms.link_entities` transform, which resolves
+  entity mentions to canonical economic identifiers — CIK, ticker, agency,
+  ISO 3166, or project-defined keys — through an operator-owned alias table.
+  Matching is deterministic and offline: `exact` compares mention text as-is,
+  `normalized` applies NFKC + casefold + whitespace collapse, and configured
+  methods run in order so the first method producing candidates for a namespace
+  wins that namespace.
+- Every mention yields an explicit outcome. A namespace resolving to one
+  canonical ID is `matched`; several candidates are preserved as one
+  `ambiguous` row each rather than silently guessed; nothing found is
+  `unmatched`. `on_ambiguity: error` fails the run instead.
+- Link rows carry a stable `entity_link_id`, resolver identity and version, and
+  an `alias_set_version` fingerprint of the effective alias set, so alias-table
+  edits are visible downstream without retaining alias contents. `match_score`
+  is reserved (always null) so a future score-producing resolver will not change
+  the published schema.
+- Matched mention text is withheld unless `include_mention_text: true` is
+  explicit and is never folded into `entity_link_id`; `include_fields` keeps the
+  allow-list rules used by the NLP transforms.
+
+### Compile-time reconciliation of transform dependencies
+
+- Python transforms may now expose `declared_dependencies(options)` returning
+  the complete set of model names their options require. Implementing it asserts
+  that options fully determine the transform's inputs, so the compiler enforces
+  that `depends_on` matches exactly. A misspelled or stale dependency reference
+  in `link_entities` previously passed `compile` and failed partway through
+  `build`, after upstream models had already been materialized; it is now
+  rejected during preflight with a file, line, and column diagnostic.
+
 ## v0.2.10 - 2026-07-21
 
 ### Atomic full replacement on BigQuery (issue #171)

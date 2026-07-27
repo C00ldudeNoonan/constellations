@@ -53,13 +53,20 @@ repository-level `.github/workflows/` directory.
 2. For transforms with options, expose `validate_options(options) -> None`.
    The compiler calls this hook before source discovery, credentials, optional
    SDK initialization, model loading, or warehouse mutation.
-3. Parse runtime options with the same strict Pydantic model used by the
+3. When options name the transform's upstream models, also expose
+   `declared_dependencies(options) -> Iterable[str]` returning the complete set
+   of model names those options require. Implementing it asserts that the
+   options fully determine the inputs, so the compiler enforces that
+   `depends_on` matches exactly and rejects a misspelled or stale reference
+   before any model is materialized. Omit the hook when a transform accepts a
+   variable dependency set.
+4. Parse runtime options with the same strict Pydantic model used by the
    validation hook. Keep optional dependencies lazy and provide an actionable
    extra-install command when they are absent.
-4. Use a provider protocol when execution depends on an external SDK or model.
+5. Use a provider protocol when execution depends on an external SDK or model.
    Unit tests must use a deterministic fake and must not require downloads,
    credentials, or network access.
-5. Document the input and output schemas, sensitive-field behavior, optional
+6. Document the input and output schemas, sensitive-field behavior, optional
    extra, and a runnable example whenever the transform is public.
 
 ## Adding a new model kind

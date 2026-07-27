@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: mention_documents
+    description: "Committed entity mentions as produced by an NLP entity transform"
+    path: mentions
+    file_pattern: "*.json"
+    tags: [economic_data, mentions]
+  - name: alias_documents
+    description: "Operator-owned alias rows mapping surface forms to canonical IDs"
+    path: aliases
+    file_pattern: "*.json"
+    tags: [economic_data, aliases]

@@ -15,6 +15,13 @@ Or referenced from YAML as built-in transforms:
 from .dedup import minhash_signature, near_duplicates
 from .encoding import clean_encoding
 from .language import detect_language
+from .linking import (
+    ALIAS_RESOLVER_VERSION,
+    EntityLinkOptions,
+    alias_set_fingerprint,
+    entity_link_id,
+    normalize_alias_text,
+)
 from .nlp import (
     NLPDocument,
     NLPEntity,
@@ -31,6 +38,8 @@ from .stats import text_stats
 from .tokens import count_tokens
 
 __all__ = [
+    "ALIAS_RESOLVER_VERSION",
+    "EntityLinkOptions",
     "NLPDocument",
     "NLPEntity",
     "NLPEntityOptions",
@@ -41,13 +50,16 @@ __all__ = [
     "NLPTokenOptions",
     "PIIEntity",
     "PIIError",
+    "alias_set_fingerprint",
     "clean_encoding",
     "count_tokens",
     "detect_language",
     "detect_pii",
+    "entity_link_id",
     "get_nlp_provider",
     "minhash_signature",
     "near_duplicates",
+    "normalize_alias_text",
     "redact_pii",
     "text_stats",
 ]

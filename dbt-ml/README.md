@@ -1301,8 +1301,10 @@ resolver identity and version, a `match_score` reserved for future
 score-producing resolvers, and an `alias_set_version` fingerprint of the whole
 alias table so alias edits are visible downstream. Mention text is not
 retained unless `include_mention_text: true` is explicit, and `include_fields`
-follows the same allow-list rules as the NLP transforms. See
-`examples/economic_entity_links/` for a runnable pipeline.
+follows the same allow-list rules as the NLP transforms. The `mentions:` and
+`aliases:` values must name exactly the models in `depends_on`; a misspelled or
+stale reference is rejected during `dbt-ml compile`, before any model is
+materialized. See `examples/economic_entity_links/` for a runnable pipeline.
 
 **PII setup** — `redact_pii` uses spaCy under the hood. First-time install:
 

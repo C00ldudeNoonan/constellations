@@ -826,6 +826,7 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             transform.module,
             project_dir,
             transform.options,
+            [parse_ref(dependency) for dependency in model.depends_on or []],
         )
     except (Exception, SystemExit) as e:
         raise _model_error(

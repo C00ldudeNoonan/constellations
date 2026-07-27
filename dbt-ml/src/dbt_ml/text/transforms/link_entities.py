@@ -7,11 +7,15 @@ from typing import Any
 import polars as pl
 
 from ...transforms import TransformContext
-from ._linking import run_links, validate_link_options
+from ._linking import declared_link_dependencies, run_links, validate_link_options
 
 
 def validate_options(options: Mapping[str, Any]) -> None:
     validate_link_options(options)
+
+
+def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
+    return declared_link_dependencies(options)
 
 
 def run(

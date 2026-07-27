@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import polars as pl
@@ -9,7 +10,12 @@ from pydantic import ValidationError
 from dbt_ml.adapters import parse_warehouse_config
 from dbt_ml.compiler import validate_project_contract
 from dbt_ml.config import load_project
-from dbt_ml.text import ALIAS_RESOLVER_VERSION, normalize_alias_text
+from dbt_ml.config.loader import ConfigError
+from dbt_ml.text import (
+    ALIAS_RESOLVER_VERSION,
+    alias_set_fingerprint,
+    normalize_alias_text,
+)
 from dbt_ml.text.transforms import link_entities
 from dbt_ml.transforms import TransformContext
 
@@ -343,16 +349,50 @@ def test_options_are_strict(options: dict[str, object], message: str) -> None:
         link_entities.validate_options(options)
 
 
+def test_alias_fingerprint_ignores_duplicate_rows() -> None:
+    single = [{"alias": "Fed", "entity_namespace": "agency", "canonical_id": "FRB"}]
+    duplicated = single * 3
+    reordered = [
+        {"alias": "US", "entity_namespace": "iso3166", "canonical_id": "US"},
+        *single,
+    ]
+
+    assert alias_set_fingerprint(single) == alias_set_fingerprint(duplicated)
+    assert alias_set_fingerprint(reordered) == alias_set_fingerprint(
+        list(reversed(reordered))
+    )
+    assert alias_set_fingerprint(single) != alias_set_fingerprint(reordered)
+
+
+def test_duplicate_alias_rows_do_not_change_links_or_version() -> None:
+    duplicated = pl.concat([_ALIASES, _ALIASES])
+
+    original = link_entities.run(_deps(), _ctx())
+    with_duplicates = link_entities.run(_deps(aliases=duplicated), _ctx())
+
+    assert original.sort("entity_link_id").equals(
+        with_duplicates.sort("entity_link_id")
+    )
+
+
+def test_declared_dependencies_reports_the_configured_models() -> None:
+    assert link_entities.declared_dependencies(
+        {"mentions": "a", "aliases": "b"}
+    ) == ("a", "b")
+
+
 def test_normalize_alias_text_is_nfkc_casefold_and_collapsed() -> None:
     assert normalize_alias_text("  The  FED ") == "the fed"
     assert normalize_alias_text("Ｆｅｄｅｒａｌ") == "federal"
     assert normalize_alias_text("Apple  Inc.") == "apple inc."
 
 
+def _example_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "examples" / "economic_entity_links"
+
+
 def test_economic_entity_links_example_compiles() -> None:
-    project_dir = (
-        Path(__file__).resolve().parents[1] / "examples" / "economic_entity_links"
-    )
+    project_dir = _example_dir()
     project, sources, models = load_project(project_dir)
 
     dag = validate_project_contract(project, sources, models, project_dir)
@@ -360,3 +400,44 @@ def test_economic_entity_links_example_compiles() -> None:
     order = dag.execution_order()
     assert order.index("entity_links") > order.index("entity_mentions")
     assert order.index("entity_links") > order.index("entity_aliases")
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement", "message"),
+    [
+        (
+            "mentions: entity_mentions",
+            "mentions: entity_mention",
+            "referenced by options but not in depends_on",
+        ),
+        (
+            "depends_on: [ref('entity_mentions'), ref('entity_aliases')]",
+            "depends_on: [ref('entity_mentions'), ref('entity_aliases'), "
+            "ref('unused_extra')]",
+            "in depends_on but unused by options",
+        ),
+    ],
+)
+def test_dependency_mismatch_fails_before_any_warehouse_mutation(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+    message: str,
+) -> None:
+    """A misspelled or stale dependency reference used to survive `compile` and
+    only fail mid-`build`, after upstream models had already been materialized."""
+    project_dir = tmp_path / "project"
+    shutil.copytree(
+        _example_dir(), project_dir, ignore=shutil.ignore_patterns("target")
+    )
+    if "unused_extra" in replacement:
+        aliases_yml = project_dir / "models" / "entity_aliases.yml"
+        (project_dir / "models" / "unused_extra.yml").write_text(
+            aliases_yml.read_text().replace("name: entity_aliases", "name: unused_extra")
+        )
+    model_path = project_dir / "models" / "entity_links.yml"
+    model_path.write_text(model_path.read_text().replace(original, replacement))
+    project, sources, models = load_project(project_dir)
+
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(project, sources, models, project_dir)

@@ -129,9 +129,13 @@ def normalize_alias_text(value: str) -> str:
 def alias_set_fingerprint(rows: Iterable[Mapping[str, str]]) -> str:
     """One-way identity of the complete alias set (namespace, alias, canonical
     ID triples). Recorded on every link row so alias-table edits are visible to
-    downstream invalidation without retaining the alias contents."""
+    downstream invalidation without retaining the alias contents.
+
+    Deduplicated so the fingerprint identifies the *effective* alias set that
+    drives matching: repeated identical rows cannot change any link output, so
+    they must not signal a spurious downstream invalidation."""
     canonical_rows = sorted(
-        (row["entity_namespace"], row["alias"], row["canonical_id"]) for row in rows
+        {(row["entity_namespace"], row["alias"], row["canonical_id"]) for row in rows}
     )
     return canonical_fingerprint(
         canonical_rows, domain=ALIAS_SET_FINGERPRINT_DOMAIN

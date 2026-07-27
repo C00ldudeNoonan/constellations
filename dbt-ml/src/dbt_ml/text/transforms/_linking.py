@@ -47,6 +47,14 @@ def validate_link_options(options: Mapping[str, Any]) -> None:
     EntityLinkOptions.model_validate(options)
 
 
+def declared_link_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
+    """The mentions and alias models these options require. `_dep_frames`
+    enforces the same pair at runtime; declaring it lets the compiler reject a
+    misspelled or stale `depends_on` before any model is materialized."""
+    parsed = EntityLinkOptions.model_validate(options)
+    return (parsed.mentions, parsed.aliases)
+
+
 def run_links(
     deps: dict[str, pl.DataFrame],
     ctx: TransformContext,

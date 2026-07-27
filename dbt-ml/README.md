@@ -1233,6 +1233,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.redact_pii`        | Detects + redacts PII via Microsoft Presidio (requires `en_core_web_sm` spaCy model) |
 | `dbt_ml.text.transforms.nlp_tokens`         | Emits one normalized child row per spaCy token                                 |
 | `dbt_ml.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
+| `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs via an operator-owned alias table       |
 
 All are pure functions importable via `from dbt_ml.text import …` if you'd
 rather wire them into your own transforms.
@@ -1267,6 +1268,41 @@ excluded unless `include_text: true` is explicit. Source columns are also
 excluded unless named in `include_fields`, and the raw text and document-ID
 source fields cannot be repeated through that option. See
 `examples/economic_nlp/` for a complete economic-document pipeline.
+
+### Entity linking to canonical identifiers
+
+`link_entities` resolves entity mentions (for example `nlp_entities` output
+with `include_text: true`) to canonical identifiers — CIK numbers, tickers,
+agency IDs, country codes, or project-defined keys — through an operator-owned
+alias table. It needs no optional extra, no network access, and no credentials.
+
+```yaml
+- name: entity_links
+  depends_on: [ref('document_entities'), ref('entity_aliases')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.link_entities
+    options:
+      mentions: document_entities
+      aliases: entity_aliases
+      match_methods: [exact, normalized]
+      on_ambiguity: keep
+```
+
+The alias model supplies `alias`, `entity_namespace`, and `canonical_id`
+columns (names configurable). Matching is deterministic: `exact` compares the
+mention text as-is; `normalized` applies NFKC + casefold + whitespace collapse.
+Methods run in configured order and the first method that produces candidates
+for a namespace wins that namespace. Every mention yields explicit rows —
+`matched` (one canonical ID in a namespace), `ambiguous` (one row per
+candidate, never a silent guess), or `unmatched` — and `on_ambiguity: error`
+fails the run instead. Each row records a stable `entity_link_id`, the
+resolver identity and version, a `match_score` reserved for future
+score-producing resolvers, and an `alias_set_version` fingerprint of the whole
+alias table so alias edits are visible downstream. Mention text is not
+retained unless `include_mention_text: true` is explicit, and `include_fields`
+follows the same allow-list rules as the NLP transforms. See
+`examples/economic_entity_links/` for a runnable pipeline.
 
 **PII setup** — `redact_pii` uses spaCy under the hood. First-time install:
 
@@ -1401,6 +1437,7 @@ stops before it pollutes everything downstream.
 | `examples/classic_text_ml/`         | deterministic sparse text features + Naive Bayes classification        |
 | `examples/document_clustering/`     | deterministic TF-IDF, K-means clustering, and NMF topics                |
 | `examples/economic_nlp/`            | economic documents → normalized spaCy token and entity child tables    |
+| `examples/economic_entity_links/`   | entity mentions → canonical CIK/ticker/agency IDs via an alias table   |
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
 | `examples/sql_governed_chunks/`     | warehouse-native SQL model applying document permissions               |
 | [`examples/metric_evidence_agent/`](examples/metric_evidence_agent/) | dbt metric + governed, cited dbt-ml evidence over two MCP servers |

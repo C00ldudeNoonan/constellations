@@ -1361,8 +1361,9 @@ Conventions worth knowing:
   `sentence_index` is null. A configured POS or label a document never uses is
   `0`, not null.
 - With a `documents:` dependency the parent table defines which documents get a
-  row, so empty documents still appear; without it, only documents present in
-  the token table do.
+  row, so empty documents still appear and a stale child row for a document that
+  no longer exists is excluded rather than resurrecting it. Without that
+  dependency, only documents present in the token table get a row.
 - Identity columns pass through per document. If one document's child rows
   disagree on `nlp_model`/`nlp_model_version` — or tokens and entities disagree
   with each other — the run fails rather than claim a single reproducible

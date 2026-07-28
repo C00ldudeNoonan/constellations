@@ -35,10 +35,6 @@ BASE_FEATURES: tuple[BaseFeature, ...] = (
 # `entities:` dependency is a configuration error rather than a silent null.
 ENTITY_FEATURES: frozenset[str] = frozenset({"entity_count"})
 
-RATIO_FEATURES: frozenset[str] = frozenset(
-    {"lexical_diversity", "stop_ratio", "alpha_ratio"}
-)
-
 _COLUMN_SAFE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 

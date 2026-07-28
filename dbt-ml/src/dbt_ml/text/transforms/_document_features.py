@@ -13,7 +13,6 @@ import polars as pl
 
 from ...transforms import TransformContext
 from ..features import (
-    RATIO_FEATURES,
     DocumentFeatureOptions,
     entity_label_column,
     link_namespace_column,
@@ -409,16 +408,22 @@ def _fill_counts(
     count_columns = [
         column
         for column, _ in options.output_columns()
-        if column.endswith("_count") or column == "token_count"
+        if column.endswith("_count")
     ]
-    internal = [_STOP_COUNT, _ALPHA_COUNT, _UNIQUE_LEMMA, _SENTENCE_DISTINCT]
+    # `token_count` is always computed because ratios divide by it, even when it
+    # is not itself emitted; the internal helpers back the ratio numerators.
+    internal = [
+        "token_count",
+        _STOP_COUNT,
+        _ALPHA_COUNT,
+        _UNIQUE_LEMMA,
+        _SENTENCE_DISTINCT,
+    ]
     present = [
         column
         for column in dict.fromkeys([*count_columns, *internal])
         if column in frame.columns and column not in options.include_fields
     ]
-    if "token_count" not in present and "token_count" in frame.columns:
-        present.append("token_count")
     return frame.with_columns(
         [pl.col(column).fill_null(0).cast(_COUNT_DTYPE) for column in present]
     )
@@ -477,7 +482,6 @@ def _output_order(options: DocumentFeatureOptions) -> list[str]:
 
 
 __all__ = [
-    "RATIO_FEATURES",
     "declared_feature_dependencies",
     "run_document_features",
     "validate_feature_options",

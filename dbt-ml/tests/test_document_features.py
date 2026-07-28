@@ -169,6 +169,34 @@ def test_documents_dependency_keeps_empty_documents_with_zero_counts() -> None:
     assert empty["nlp_model"] is None
 
 
+def test_empty_corpus_returns_the_typed_schema_with_no_rows() -> None:
+    """A first run before any document is extracted must still produce a
+    well-typed empty relation, not an untyped frame or a crash."""
+    empty = _TOKENS.clear()
+
+    output = _run({"pos_counts": ["NOUN"]}, tokens=empty)
+
+    assert output.is_empty()
+    assert output.schema["document_id"] == pl.String()
+    assert output.schema["token_count"] == pl.Int64()
+    assert output.schema["lexical_diversity"] == pl.Float64()
+    assert output.schema["pos_noun_count"] == pl.Int64()
+    assert output.schema["nlp_model"] == pl.String()
+
+
+def test_child_rows_outside_the_document_universe_are_excluded() -> None:
+    """With a `documents:` dependency the parent table is authoritative, so a
+    stale child row for a document that no longer exists does not resurrect it."""
+    orphaned = _TOKENS.vstack(
+        _TOKENS.head(1).with_columns(pl.lit("removed-doc").alias("document_id"))
+    )
+
+    output = _run({}, tokens=orphaned, documents=_DOCUMENTS)
+
+    assert "removed-doc" not in output["document_id"].to_list()
+    assert output["document_id"].to_list() == ["d1", "d2", "d3"]
+
+
 def test_without_documents_dependency_the_token_table_defines_the_universe() -> None:
     output = _run({})
 

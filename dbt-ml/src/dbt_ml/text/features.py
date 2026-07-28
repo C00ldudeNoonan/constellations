@@ -11,7 +11,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-BASE_FEATURES: tuple[str, ...] = (
+BaseFeature = Literal[
+    "token_count",
+    "sentence_count",
+    "entity_count",
+    "unique_lemma_count",
+    "lexical_diversity",
+    "stop_ratio",
+    "alpha_ratio",
+]
+
+BASE_FEATURES: tuple[BaseFeature, ...] = (
     "token_count",
     "sentence_count",
     "entity_count",
@@ -28,16 +38,6 @@ ENTITY_FEATURES: frozenset[str] = frozenset({"entity_count"})
 RATIO_FEATURES: frozenset[str] = frozenset(
     {"lexical_diversity", "stop_ratio", "alpha_ratio"}
 )
-
-BaseFeature = Literal[
-    "token_count",
-    "sentence_count",
-    "entity_count",
-    "unique_lemma_count",
-    "lexical_diversity",
-    "stop_ratio",
-    "alpha_ratio",
-]
 
 _COLUMN_SAFE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

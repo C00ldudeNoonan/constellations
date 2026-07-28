@@ -23,6 +23,14 @@ surface text, which `nlp_entities` withholds by default — so `entity_mentions`
 is a separate model that opts in with `include_text: true` and feeds only the
 linking step, leaving `document_entities` text-free for analysis.
 
+The alias table carries determiner-prefixed surface forms (`The Federal
+Reserve`, `the United States`) because that is what spaCy's NER actually spans —
+a reminder that an operator-owned alias table has to match real mention text,
+not the tidy canonical name. The corpus exercises all three link outcomes:
+`The Federal Reserve` and `the United States` are `matched`, `Washington` is
+`ambiguous` across `US-DC` and `US-WA` and is preserved as two rows rather than
+guessed, and the date mentions are explicitly `unmatched`.
+
 `document_features` is the analysis-ready table: one row per document with token,
 sentence, and entity counts, lexical diversity, stop-word and alphabetic ratios,
 configured POS and entity-label counts, and counts of distinct canonical IDs per

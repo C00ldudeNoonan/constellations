@@ -24,6 +24,31 @@
   explicit and is never folded into `entity_link_id`; `include_fields` keeps the
   allow-list rules used by the NLP transforms.
 
+### Document-level NLP aggregate features (issue #215)
+
+- Added the `dbt_ml.text.transforms.nlp_document_features` transform, rolling the
+  token, entity, and entity-link child tables up to one typed row per document so
+  downstream dbt models and classic ML no longer each reimplement the same
+  aggregation. It requires no optional extra — it reads tables, not text.
+- `tokens:` is the required aggregation spine; `entities:`, `links:`, and
+  `documents:` are optional. With a `documents:` dependency the parent table
+  defines which documents get a row, so a document with no tokens still appears
+  with zero counts instead of vanishing.
+- Base features (`token_count`, `sentence_count`, `entity_count`,
+  `unique_lemma_count`, `lexical_diversity`, `stop_ratio`, `alpha_ratio`) default
+  to whatever the configured dependencies support. Every other rollup —
+  `pos_counts`, `pos_ratios`, `entity_label_counts`, `link_namespace_counts`,
+  `link_status_counts` — is an explicit list, so the output schema is fixed at
+  compile time and never depends on warehouse contents.
+- Ratios divide by `token_count` and are `null` at a zero denominator, never `0`
+  or `NaN`; `sentence_count` is `null` when a pipeline ran without a parser; a
+  configured POS or label a document never uses is `0`. Aggregation is vectorized
+  polars group-bys rather than per-document Python.
+- Identity columns pass through per document, and a document whose child rows
+  disagree on model identity — or whose token and entity tables disagree with each
+  other — fails rather than claiming one reproducible identity. No document,
+  token, or entity text reaches the output.
+
 ### Compile-time reconciliation of transform dependencies
 
 - Python transforms may now expose `declared_dependencies(options)` returning

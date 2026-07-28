@@ -7,3 +7,8 @@ sources:
     file_pattern: "*.json"
     recursive: true
     tags: [economic_data, documents]
+  - name: economic_aliases
+    description: "Operator-owned aliases for economic institutions and places"
+    path: aliases
+    file_pattern: "*.json"
+    tags: [economic_data, aliases]

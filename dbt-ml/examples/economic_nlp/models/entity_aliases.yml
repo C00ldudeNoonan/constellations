@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: entity_aliases
+    description: "Operator-owned alias dimension for economic institutions"
+    source: ref('economic_aliases')
+    extraction:
+      backend: json
+      options:
+        fields: [alias, entity_namespace, canonical_id]
+    materialization: incremental
+    fields:
+      - name: alias
+        data_type: string
+      - name: entity_namespace
+        data_type: string
+      - name: canonical_id
+        data_type: string
+    tests:
+      - not_null: [alias, entity_namespace, canonical_id]

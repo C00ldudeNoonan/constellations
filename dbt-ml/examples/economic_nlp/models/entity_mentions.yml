@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  # Entity linking needs the matched surface text, which `nlp_entities` withholds
+  # unless asked. This model opts in explicitly and stays internal to the linking
+  # step; `document_entities` remains the text-free table for analysis.
+  - name: entity_mentions
+    description: "Named entities retaining matched text, used only for linking"
+    depends_on: [ref('raw_documents')]
+    transform:
+      type: python
+      module: dbt_ml.text.transforms.nlp_entities
+      options:
+        document_id_field: economic_id
+        text_field: text
+        model: en_core_web_sm
+        language: en
+        batch_size: 32
+        include_text: true
+    materialization: full
+    tags: [economic_data, nlp, entities]
+    tests:
+      - not_null: [entity_id, document_id, entity_text, label]
+      - unique: entity_id

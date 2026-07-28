@@ -1234,6 +1234,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.nlp_tokens`         | Emits one normalized child row per spaCy token                                 |
 | `dbt_ml.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
 | `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs via an operator-owned alias table       |
+| `dbt_ml.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
 
 All are pure functions importable via `from dbt_ml.text import …` if you'd
 rather wire them into your own transforms.
@@ -1305,6 +1306,70 @@ follows the same allow-list rules as the NLP transforms. The `mentions:` and
 `aliases:` values must name exactly the models in `depends_on`; a misspelled or
 stale reference is rejected during `dbt-ml compile`, before any model is
 materialized. See `examples/economic_entity_links/` for a runnable pipeline.
+
+### Document-level aggregate features
+
+`nlp_document_features` rolls the token, entity, and entity-link child tables
+back up to one row per document, so downstream dbt models and classic ML do not
+each reimplement the same aggregation. It needs no optional extra — it reads
+tables, not text.
+
+```yaml
+- name: document_features
+  depends_on:
+    [ref('document_tokens'), ref('document_entities'), ref('entity_links'),
+     ref('raw_documents')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.nlp_document_features
+    options:
+      tokens: document_tokens        # required — the aggregation spine
+      entities: document_entities    # optional
+      links: entity_links            # optional
+      documents: raw_documents       # optional — row universe + metadata
+      documents_id_field: economic_id
+      pos_counts: [NOUN, PROPN]
+      entity_label_counts: [ORG, GPE]
+      link_namespace_counts: [agency, iso3166]
+      include_fields: [publisher, published_at]
+```
+
+Base features come from `emit:`, which defaults to every feature the configured
+dependencies support: `token_count`, `sentence_count`, `entity_count`,
+`unique_lemma_count`, `lexical_diversity`, `stop_ratio`, and `alpha_ratio`.
+Naming a feature that its dependency is missing — `entity_count` with no
+`entities:` — is a compile-time error rather than a silent null.
+
+Every other rollup is an explicit list, so the output schema is fixed at compile
+time and never depends on what happens to be in the warehouse:
+
+| Option | Column pattern | Meaning |
+|---|---|---|
+| `pos_counts` | `pos_noun_count` | tokens with that POS |
+| `pos_ratios` | `pos_noun_ratio` | that count over `token_count` |
+| `entity_label_counts` | `entity_org_count` | entities with that label |
+| `link_namespace_counts` | `linked_agency_count` | distinct canonical IDs in that namespace |
+| `link_status_counts` | `link_ambiguous_count` | mentions with that link status |
+
+Conventions worth knowing:
+
+- Ratios divide by `token_count`, which counts the rows in the token table —
+  space tokens are excluded unless that table was built with `include_space`.
+- A document with no tokens has counts of `0` and ratios of `null`; ratios are
+  undefined at a zero denominator, never `0` or `NaN`.
+- `sentence_count` is `null`, not `0`, when the pipeline had no parser and every
+  `sentence_index` is null. A configured POS or label a document never uses is
+  `0`, not null.
+- With a `documents:` dependency the parent table defines which documents get a
+  row, so empty documents still appear; without it, only documents present in
+  the token table do.
+- Identity columns pass through per document. If one document's child rows
+  disagree on `nlp_model`/`nlp_model_version` — or tokens and entities disagree
+  with each other — the run fails rather than claim a single reproducible
+  identity.
+
+No document, token, or entity text reaches the output. Counting distinct lemmas
+is not retaining them, and `include_fields` allow-lists parent metadata only.
 
 **PII setup** — `redact_pii` uses spaCy under the hood. First-time install:
 

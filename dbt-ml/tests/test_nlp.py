@@ -400,8 +400,10 @@ def test_economic_nlp_example_compiles_without_loading_spacy(
 
     dag = validate_project_contract(project, sources, models, project_dir)
 
-    assert dag.execution_order() == [
-        "raw_documents",
-        "document_entities",
-        "document_tokens",
-    ]
+    # Ordering relationships rather than an exact list, so extending the example
+    # with downstream models does not churn this test. The point of the test is
+    # that compiling the whole project loads no spaCy provider.
+    order = dag.execution_order()
+    assert order[0] == "raw_documents"
+    for child in ("document_tokens", "document_entities"):
+        assert order.index(child) > order.index("raw_documents")

@@ -237,6 +237,23 @@ def test_materialize_full_truncating_parquet_load() -> None:
     assert pl.read_parquet(io.BytesIO(payload)).rows() == [("a", 1), ("b", 2)]
 
 
+def test_parquet_load_enables_list_inference() -> None:
+    # Without list inference BigQuery loads a Parquet LIST as a nested RECORD
+    # instead of ARRAY<T>, which breaks the embed→search vector contract
+    # (issue #226). Every parquet load must opt in.
+    client = _FakeClient()
+    adapter = _adapter(client)
+    df = pl.DataFrame(
+        {"document_id": ["a"], "embedding": [[0.1, 0.2, 0.3]]},
+        schema={"document_id": pl.Utf8, "embedding": pl.List(pl.Float64)},
+    )
+    assert adapter.materialize_full("chunks", df) == 1
+
+    _, _, job_config = client.loads[0]
+    assert job_config.parquet_options is not None
+    assert job_config.parquet_options.enable_list_inference is True
+
+
 def test_incremental_first_load_creates_table() -> None:
     client = _FakeClient()  # get_table -> NotFound
     adapter = _adapter(client)

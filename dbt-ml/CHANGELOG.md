@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- BigQuery `embed:` → `search:` pipelines no longer fail with "Search vector
+  field must use a numeric list warehouse type" (issue #226). The BigQuery
+  adapter now enables Parquet list inference on every load, so `List`-typed
+  columns (including embedding vectors) materialize as native `ARRAY<T>` rather
+  than a nested `RECORD`, and read back as a numeric Arrow list. Tables that
+  were already materialized with the old `RECORD` layout need a
+  `--full-refresh` to be rewritten.
+
 ## v0.3.0 - 2026-07-28
 
 ### Deterministic alias-table entity linking (issue #217)

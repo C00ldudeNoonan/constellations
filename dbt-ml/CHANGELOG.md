@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 - 2026-07-28
 
 ### Deterministic alias-table entity linking (issue #217)
 
@@ -58,6 +58,203 @@
   in `link_entities` previously passed `compile` and failed partway through
   `build`, after upstream models had already been materialized; it is now
   rejected during preflight with a file, line, and column diagnostic.
+
+### Classic NLP enrichment (issue #43)
+
+- Added the `dbt_ml.text.transforms.nlp_tokens` and
+  `dbt_ml.text.transforms.nlp_entities` transforms, which normalize text into
+  token and named-entity child tables — stable child IDs, document ID,
+  token/sentence index, offsets, lemma, POS/tag, and lexical flags for tokens;
+  label, offsets, and nullable confidence for entities — without project-local
+  Python.
+- spaCy ships behind a new `nlp` extra, imported lazily. Language models are
+  never downloaded automatically: a missing model reports the exact
+  `python -m spacy download ...` command, and a missing extra reports the
+  `dbt-ml[nlp]` install command. Provider, model, version, and language identity
+  are published; local model paths are not.
+- Transform options are validated during `compile`, before source discovery,
+  model loading, credentials, or warehouse mutation.
+- Upstream columns are dropped unless named in an explicit `include_fields`
+  allow-list. Matched entity text is excluded by default, requires
+  `include_text: true`, and is never folded into the stable entity fingerprint.
+- Added the runnable `examples/economic_nlp` pipeline.
+
+### MotherDuck deployment mode (issue #186)
+
+- The DuckDB adapter now accepts `path: md:<database>` (or bare `md:` for the
+  account default), running MotherDuck as a deployment mode of the existing
+  adapter rather than a second adapter. Every materialization, state, snapshot,
+  and SQL-model path is shared with local DuckDB unchanged, and local-file
+  behavior is byte-identical.
+- The `token` field is a credential reference, mirroring BigQuery's handling: it
+  must be an exact `{{ env_var('NAME') }}` reference, is valid only on an `md:`
+  path,
+  and never reaches `manifest.json`, `run_results.json`, logs, or generated dbt
+  sources. Omit it and DuckDB reads its own `motherduck_token` environment
+  variable.
+- Every advertised DuckDB capability was audited against the live service —
+  atomic full replace, incremental merge, state upsert/fetch, row+state
+  deletion, bounded snapshots, and SQL dry-run all pass with no fork.
+
+### ty as the primary type checker (issue #49)
+
+- ty is now the required primary static type checker for package source, run in
+  pull-request and release CI. mypy runs alongside it as a temporary
+  migration-parity gate for the bounded observation period in issue #49.
+- Ruff `ANN`/`PYI` rules preserve source annotation discipline, and focused
+  Pydantic static-compatibility fixtures pin checker behavior.
+
+### Execution, adapter, and CLI boundaries (issue #190)
+
+- Split `runner.py` into per-kind executors (chunk, SQL and Python transforms,
+  extraction, embed, llm, search, ML) behind shared execution contracts, split
+  `classic_ml` into a package by responsibility, and centralized the
+  adapter-neutral schema-change invariant so each adapter no longer restates it.
+- Moved the logic behind the CLI into an importable `cli_services/` package —
+  shared project/profile bootstrap, the exit-code error contract, watch, and
+  serving — keeping Click command declarations, options, help text, and
+  user-facing formatting at the edge. Command names, options, exit codes, and
+  safe output are unchanged.
+- Retired approved compatibility debt (issue #210). **Removed:** the
+  `DOCBT_PROFILES_DIR` environment alias (use `DBT_ML_PROFILES_DIR`), legacy
+  LLM cache-row pruning, and legacy classic-ML artifact metadata reads — all
+  dead paths for current inputs. **Reclassified:** running without a `profile:`
+  is now a documented, supported zero-config local DuckDB target rather than
+  deprecated, so its `DeprecationWarning` is gone. Declare a `profile:` plus
+  `profiles.yml` for warehouse targets, credentials, retrieval, or LLM
+  configuration.
+
+### Golden-set retrieval evaluation (issue #137)
+
+- Added `dbt-ml eval` and a `retrieval_tests:` block on `search:` models,
+  scoring `recall`, `precision`, `hit_rate`, `mrr`, and `ndcg` at declared `at`
+  cutoffs. Threshold keys (`<metric>_at_<k>`) are validated at compile time
+  against those cutoffs, and `retrieval_tests` is rejected on non-search models.
+- `golden_set` is an ordinary `ref()` to any dbt-ml model, so it feeds a real
+  DAG edge and always builds before it is evaluated — no new "seed" concept.
+- A query with no relevant labels is diagnosed `no_relevant_labels` and excluded
+  from aggregate means rather than scored as zero, which would understate
+  quality and hide a labeling gap; empty results are a legitimate zero and are
+  scored. `required_ids`/`excluded_ids` are hard policy failures independent of
+  ranking-metric averaging, so a leaked excluded ID fails even at perfect
+  recall.
+- Results land in `target-path/retrieval_eval.json` with store and embedding
+  identity, golden-set content hash, per-query metrics, aggregates, threshold
+  outcomes, and policy violations — no secrets and no raw vectors. `dbt-ml eval`
+  exits 1 on any failing test, matching `dbt-ml test`.
+- `examples/rag_chunks_pipeline` gains a passing evaluation and a deliberately
+  mislabeled one that always fails, so the mechanism is shown catching a real
+  mismatch.
+
+### Metric-plus-evidence agent example (issue #147)
+
+- Added `examples/metric_evidence_agent`, combining a deterministic dbt Semantic
+  Layer metric fixture with a complete dbt-ml agent-context pipeline: dbt MCP
+  metrics orchestrated with all four governed dbt-ml MCP context tools, proving
+  entity/time joins, citations, lineage, freshness, and reduced authorization
+  results. Includes reviewed answer/tool snapshots, an offline regression test,
+  and an opt-in live dbt MCP path.
+- dbt MCP `query_metrics` group-by objects now carry the required `type`
+  discriminator, matching the live request schema.
+
+### Warehouse-native SQL transform models (issues #141, #143, #142)
+
+- Added `transform.type: sql`, authored as an external `.sql` file and
+  materialized **inside the warehouse** via an adapter-owned CTAS — upstream
+  rows never enter the dbt-ml process. The accepted design is recorded in
+  `docs/architecture/sql-models.md`.
+- Templates compile in a sandboxed Jinja environment exposing only
+  `ref('literal')`, `is_incremental()`, `this`, and a frozen string-only
+  `target`. Ref discovery is AST-based, so dynamic or non-literal refs are
+  rejected without executing the template, and a dialect-agnostic guard enforces
+  a single `SELECT`.
+- SQL transforms derive `depends_on` from their refs before edge validation, so
+  lineage, selectors, and `state:` selection work unchanged; missing refs and
+  cycles fail before any warehouse access.
+- `materialization: incremental` requires `unique_key` (and forbids it
+  elsewhere). The runner — not the query text — decides once per run whether
+  `is_incremental()` is true, so it can never diverge from what actually
+  executed; first runs and `--full-refresh` fall back to the query's own
+  non-incremental branch.
+- New `SQL_MODEL_MATERIALIZATION` and `SQL_INCREMENTAL_MATERIALIZATION`
+  capabilities with typed `materialize_sql_full`, `materialize_sql_incremental`,
+  `dry_run_sql`, and `relation_exists`. DuckDB stages into a session-scoped temp
+  table then deletes matching keys and inserts transactionally; BigQuery uses an
+  atomic `CREATE OR REPLACE TABLE ... AS SELECT` and a single `MERGE`. Core
+  never assembles dialect CTAS. Both validate the unique key and apply
+  `on_schema_change` before mutating anything.
+- `code_version` folds the raw `.sql` content hash, template contract version,
+  refs, `unique_key`, and `on_schema_change`, and excludes `warehouse_options`
+  and target-compiled SQL so state does not churn across dialects.
+- Added `examples/sql_governed_chunks`.
+
+### Google Vertex AI embedding provider (issue #174)
+
+- Added a built-in `vertex` embedding provider using the optional `google-genai`
+  SDK behind the `vertex` extra: Vertex `v1`, ADC authentication, requested
+  output dimensionality, normalized usage accounting, and sanitized billed
+  failures.
+- Runner batches split at Vertex model limits — one input for Gemini embedding
+  models, at most five for other text embedding models — preserving input IDs
+  and reporting logical batches separately from actual provider calls.
+- Added operator-owned `embedding:` profile configuration with semantic
+  provider-option identity, separate document and query task types for inherited
+  retrieval, and preflight rejection of unsupported `api_key_env`.
+- `examples/rag_chunks_pipeline` now uses native `embed:` with
+  `embedding: inherit` instead of a fixture transform.
+
+### Embedded execution in a dbt-duckdb DAG (issue #177)
+
+- dbt-ml extraction and transform models can now run in-process as native dbt
+  nodes, so a single `dbt build` executes them, tests them with native dbt
+  tests, and feeds them into downstream dbt SQL models — one DAG, one lineage
+  graph, no orchestrator.
+- `dbt_ml.dbt_embed.materialize(model, *, project_dir, session, upstreams=...)`
+  reuses the standalone runner's single-model path with a capture adapter that
+  returns the output frame instead of writing a dbt-ml-owned target, and serves
+  injected upstream frames so transform models resolve their inputs without a
+  dbt-ml warehouse.
+- `dbt-ml codegen` generates one dbt Python-model shim per extraction/transform
+  model plus a `schema.yml` (fields and tests, reusing the `emit-dbt-sources`
+  translation). dbt-ml YAML stays the source of truth; the emitted files are
+  real dbt nodes, so `ref()` resolves across dbt and dbt-ml and `dbt docs` shows
+  one graph.
+- dbt-duckdb only — warehouse-side Python runtimes sandbox network egress and
+  are out of scope for embedded extraction. dbt-ml is **not** a dbt package:
+  `packages.yml`/`dbt deps` cannot install a Python dependency, so the
+  pip-installed `dbt-ml` package and the codegen-generated dbt resources are two
+  distinct surfaces. The standalone CLI plus `emit-dbt-sources` remains the path
+  for other warehouses.
+- Added `examples/dbt_embed_duckdb`, proving a three-level DAG in one
+  `dbt build`. The bidirectional `dbt_ref` source remains open work on #177.
+
+### Native llm: transformation models (issue #144)
+
+- Added a first-class `llm:` model kind that maps a prompt over an upstream
+  warehouse relation, turning unstructured text into typed rows. The output
+  schema is the model's own `fields:` and the prompt is inline, so no new
+  file-path surface is introduced and versioning flows through `code_version`.
+- `output_cardinality: one` produces one row per input keyed by `id_field`;
+  `many` fans out to one row per object keyed by a deterministic `llm_row_id`,
+  retaining the parent `id_field` for parent-scoped deletion.
+- Every row carries `llm_provider`, `llm_model`, `llm_provider_implementation`,
+  `llm_input_hash`, `llm_config_hash`, and `generated_at`. Credentials stay
+  operator-owned in `profiles.yml`/environment and never enter the block,
+  manifest, or logs.
+- Incremental runs key on a content-plus-config fingerprint: unchanged inputs
+  skip, content or prompt/schema/provider-identity changes regenerate, and
+  removed inputs delete their rows. `code_version` folds the resolved provider
+  identity.
+- The `llm:` node and `backend: llm` extraction share one execution core, so
+  provider resolution, caching, retries, and usage accounting are not
+  duplicated. Added a `deterministic` inference provider so examples and tests
+  run credential-free.
+
+### Dependencies
+
+- Raised the pypdf floor to 6.14.0 (locked 6.14.2) to clear two new public
+  advisories, and bumped transitive pyasn1 to 0.6.4, restoring the
+  dependency-audit gate.
 
 ## v0.2.10 - 2026-07-21
 

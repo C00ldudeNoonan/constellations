@@ -130,6 +130,7 @@ fitting the workflow analytics engineers already use.**
 - **Built-in text/ML preprocessing** — token counting, encoding repair,
   normalized spaCy token/entity child tables,
   deterministic entity linking to canonical IDs via alias tables,
+  document-level aggregate features,
   language detection, text statistics, near-duplicate detection (MinHash), and
   PII redaction (Microsoft Presidio).
 - **Warehouse and source adapters** — DuckDB or BigQuery materialization, with

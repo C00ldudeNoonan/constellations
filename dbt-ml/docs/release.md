@@ -18,14 +18,19 @@ move the secret there as an environment secret.
 ## Cut a release
 
 1. Merge all release-bound PRs to `master`.
-2. Update `dbt-ml/pyproject.toml` with the new package version.
+2. Update `dbt-ml/pyproject.toml` with the new package version. Re-run
+   `uv sync` so `uv.lock` records the same version.
 3. Move the top `dbt-ml/CHANGELOG.md` entries from `Unreleased` to a dated
-   version heading, for example `## v0.2.7 - 2026-07-10`.
+   version heading, for example `## v0.2.7 - 2026-07-10`. Confirm every merged
+   PR since the previous tag has an entry — a feature PR that skipped the
+   changelog is easy to miss.
 4. Run the local checks from `dbt-ml/`:
 
    ```bash
    uv sync --all-extras --dev --locked
+   uv run pip-audit --skip-editable
    uv run ruff check
+   uv run ty check
    uv run mypy
    uv run pytest -q
    uv build

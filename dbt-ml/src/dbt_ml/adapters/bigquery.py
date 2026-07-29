@@ -1436,6 +1436,16 @@ class BigQueryAdapter(WarehouseAdapter):
         )
 
     def _load_parquet(self, table: str, df: pl.DataFrame, job_config: Any) -> None:
+        # Polars writes a List column as a Parquet LIST logical type. Without
+        # list inference, BigQuery's Parquet loader represents that group as a
+        # nested RECORD (`{ list: RECORD REPEATED }`) instead of ARRAY<T>, which
+        # breaks the embed→search vector contract (a vector column must read
+        # back as a numeric Arrow list). Enabling it on every load makes all
+        # List-typed columns materialize as native ARRAY<T> (issue #226).
+        bigquery = _bigquery()
+        parquet_options = job_config.parquet_options or bigquery.ParquetOptions()
+        parquet_options.enable_list_inference = True
+        job_config.parquet_options = parquet_options
         buffer = io.BytesIO()
         df.write_parquet(buffer)
         buffer.seek(0)

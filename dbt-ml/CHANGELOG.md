@@ -71,7 +71,10 @@
   never downloaded automatically: a missing model reports the exact
   `python -m spacy download ...` command, and a missing extra reports the
   `dbt-ml[nlp]` install command. Provider, model, version, and language identity
-  are published; local model paths are not.
+  are published on every output row as `nlp_provider`, `nlp_model`,
+  `nlp_model_version`, and `nlp_language`. The `model` option is published
+  verbatim, so prefer a package name (`en_core_web_sm`) over a filesystem path
+  to a locally trained pipeline if that path is sensitive.
 - Transform options are validated during `compile`, before source discovery,
   model loading, credentials, or warehouse mutation.
 - Upstream columns are dropped unless named in an explicit `include_fields`
@@ -130,8 +133,11 @@
   scoring `recall`, `precision`, `hit_rate`, `mrr`, and `ndcg` at declared `at`
   cutoffs. Threshold keys (`<metric>_at_<k>`) are validated at compile time
   against those cutoffs, and `retrieval_tests` is rejected on non-search models.
-- `golden_set` is an ordinary `ref()` to any dbt-ml model, so it feeds a real
-  DAG edge and always builds before it is evaluated — no new "seed" concept.
+- `golden_set` is an ordinary `ref()` to any dbt-ml model — no new "seed"
+  concept. The ref adds a real DAG edge so a `build`/`run` materializes the
+  golden set ahead of the search index; `dbt-ml eval` itself reads the existing
+  golden table rather than building it, so build the project (or at least the
+  golden-set model) before evaluating.
 - A query with no relevant labels is diagnosed `no_relevant_labels` and excluded
   from aggregate means rather than scored as zero, which would understate
   quality and hide a labeling gap; empty results are a legitimate zero and are
@@ -214,11 +220,15 @@
   returns the output frame instead of writing a dbt-ml-owned target, and serves
   injected upstream frames so transform models resolve their inputs without a
   dbt-ml warehouse.
-- `dbt-ml codegen` generates one dbt Python-model shim per extraction/transform
-  model plus a `schema.yml` (fields and tests, reusing the `emit-dbt-sources`
-  translation). dbt-ml YAML stays the source of truth; the emitted files are
-  real dbt nodes, so `ref()` resolves across dbt and dbt-ml and `dbt docs` shows
-  one graph.
+- `dbt-ml codegen` generates one dbt Python-model shim plus a shared
+  `schema.yml` (fields and tests, reusing the `emit-dbt-sources` translation)
+  for every extraction/transform model whose full dependency closure is
+  embeddable. A model that depends — directly or transitively — on a
+  non-embeddable chunk, embed, `llm:`, ML, or search model is skipped and
+  recorded in `_SKIPPED.txt` so the generated project never references a missing
+  dbt node. dbt-ml YAML stays the source of truth; the emitted files are real
+  dbt nodes, so `ref()` resolves across dbt and dbt-ml and `dbt docs` shows one
+  graph.
 - dbt-duckdb only — warehouse-side Python runtimes sandbox network egress and
   are out of scope for embedded extraction. dbt-ml is **not** a dbt package:
   `packages.yml`/`dbt deps` cannot install a Python dependency, so the

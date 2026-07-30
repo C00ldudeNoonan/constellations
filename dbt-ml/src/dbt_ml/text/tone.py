@@ -75,8 +75,15 @@ class ToneOptions(BaseModel):
     tokens: str
     lexicon: str
     emit: tuple[str, ...]
+    # Optional parent spine. With it, the documents table defines which
+    # documents get a row (a document with no tokens still appears with
+    # token_count 0 and status insufficient_text) and is the source of
+    # include_fields; without it, only documents present in the token table
+    # appear. Mirrors the document-feature contract.
+    documents: str | None = None
 
     document_id_field: str = "document_id"
+    documents_id_field: str = "document_id"
     match_field: str = "lemma"
     language: str = "en"
     language_field: str = "nlp_language"
@@ -101,6 +108,7 @@ class ToneOptions(BaseModel):
         "tokens",
         "lexicon",
         "document_id_field",
+        "documents_id_field",
         "match_field",
         "language",
         "language_field",
@@ -114,6 +122,16 @@ class ToneOptions(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("must not be empty")
+        return normalized
+
+    @field_validator("documents")
+    @classmethod
+    def _non_empty_optional_documents(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must not be empty; omit the option to disable")
         return normalized
 
     @field_validator("lexicon_weight_field")
@@ -145,8 +163,11 @@ class ToneOptions(BaseModel):
 
     @model_validator(mode="after")
     def _consistent_configuration(self) -> ToneOptions:
-        if self.tokens == self.lexicon:
-            raise ValueError("tokens and lexicon must name two different models")
+        configured = [name for name in (self.tokens, self.lexicon, self.documents) if name]
+        if len(configured) != len(set(configured)):
+            raise ValueError("tokens, lexicon, and documents must name different models")
+        if self.include_fields and self.documents is None:
+            raise ValueError("include_fields needs a `documents:` dependency")
         self._validate_output_columns()
         return self
 
@@ -178,8 +199,11 @@ class ToneOptions(BaseModel):
             columns.append((value, f"include_fields[{value}]"))
         return columns
 
-    def declared_dependencies(self) -> tuple[str, str]:
-        return (self.tokens, self.lexicon)
+    def declared_dependencies(self) -> tuple[str, ...]:
+        names = [self.tokens, self.lexicon]
+        if self.documents is not None:
+            names.append(self.documents)
+        return tuple(names)
 
 
 def tone_lexicon_fingerprint(rows: Iterable[Mapping[str, object]]) -> str:

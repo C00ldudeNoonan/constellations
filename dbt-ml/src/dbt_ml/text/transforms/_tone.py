@@ -8,6 +8,7 @@ bounded same-sentence window.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -47,22 +48,23 @@ def validate_tone_options(options: Mapping[str, Any]) -> None:
     ToneOptions.model_validate(options)
 
 
-def declared_tone_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
+def declared_tone_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
     return ToneOptions.model_validate(options).declared_dependencies()
 
 
 def run_tone(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
     options = ToneOptions.model_validate(ctx.options)
-    tokens, lexicon = _dep_frames(deps, options)
+    frames = _dep_frames(deps, options)
+    tokens = frames[options.tokens]
     _require_columns(tokens, _token_columns(options), options.tokens, "tokens")
 
-    lexicon_rows = _lexicon_rows(lexicon, options)
+    lexicon_rows = _lexicon_rows(frames[options.lexicon], options)
     lexicon_version = tone_lexicon_fingerprint(lexicon_rows)
     lexicon_frame = _lexicon_frame(lexicon_rows)
 
-    universe = _document_universe(tokens, options)
+    universe, metadata = _document_universe(frames, options)
     if universe.is_empty():
-        return _empty_output(options, lexicon_version)
+        return _empty_output(options, lexicon_version, metadata)
 
     _reject_unsupported_language(tokens, options)
 
@@ -76,7 +78,6 @@ def run_tone(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFra
     combined = combined.join(_category_scores(matched, options), on="document_id", how="left")
     combined = combined.join(_coverage(matched), on="document_id", how="left")
     combined = combined.join(_document_identity(prepared, options), on="document_id", how="left")
-    metadata = _document_metadata(prepared, options)
     if metadata is not None:
         combined = combined.join(metadata, on="document_id", how="left")
 
@@ -86,14 +87,14 @@ def run_tone(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFra
 
 def _dep_frames(
     deps: dict[str, pl.DataFrame], options: ToneOptions
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    expected = {options.tokens, options.lexicon}
+) -> dict[str, pl.DataFrame]:
+    expected = set(options.declared_dependencies())
     if set(deps) != expected:
         raise ValueError(
-            "Tone scoring expects dependencies named by the `tokens` and `lexicon` "
-            f"options ({sorted(expected)}); got: {sorted(deps)}"
+            "Tone scoring expects dependencies named by the `tokens`, `lexicon`, and "
+            f"`documents` options ({sorted(expected)}); got: {sorted(deps)}"
         )
-    return deps[options.tokens], deps[options.lexicon]
+    return deps
 
 
 def _token_columns(options: ToneOptions) -> tuple[str, ...]:
@@ -103,7 +104,6 @@ def _token_columns(options: ToneOptions) -> tuple[str, ...]:
         options.language_field,
         options.token_index_field,
         *TOKEN_IDENTITY_COLUMNS,
-        *options.include_fields,
     ]
     if options.negation:
         columns.append(options.sentence_index_field)
@@ -160,6 +160,11 @@ def _lexicon_rows(lexicon: pl.DataFrame, options: ToneOptions) -> list[dict[str,
                     f"Lexicon model '{options.lexicon}' column '{weight_column}' must "
                     f"be numeric (row {position})"
                 ) from None
+            if not math.isfinite(weight):
+                raise ValueError(
+                    f"Lexicon model '{options.lexicon}' column '{weight_column}' must "
+                    f"be finite, got {row[weight_column]!r} (row {position})"
+                )
         rows.append({"term": term, "category": category, "weight": weight})
     return rows
 
@@ -193,18 +198,45 @@ def _normalize(value: str) -> str:
     return value.strip().casefold()
 
 
-def _document_universe(tokens: pl.DataFrame, options: ToneOptions) -> pl.DataFrame:
-    universe = (
-        _renamed_id(tokens.select(options.document_id_field), options.document_id_field)
-        .with_columns(pl.col("document_id").cast(pl.String()))
-        .unique()
-    )
-    if universe["document_id"].null_count():
-        raise ValueError(
-            f"Tokens model '{options.tokens}' column '{options.document_id_field}' "
-            "contains null values"
+def _document_universe(
+    frames: dict[str, pl.DataFrame], options: ToneOptions
+) -> tuple[pl.DataFrame, pl.DataFrame | None]:
+    """The documents that get a row. With a `documents:` dependency the parent
+    table defines it — so a document that produced no tokens still gets a
+    token_count 0 / insufficient_text row instead of vanishing — and supplies
+    include_fields; without it, only documents present in the token table."""
+    if options.documents is None:
+        tokens = frames[options.tokens]
+        universe = (
+            _renamed_id(tokens.select(options.document_id_field), options.document_id_field)
+            .with_columns(pl.col("document_id").cast(pl.String()))
+            .unique()
         )
-    return universe
+        if universe["document_id"].null_count():
+            raise ValueError(
+                f"Tokens model '{options.tokens}' column '{options.document_id_field}' "
+                "contains null values"
+            )
+        return universe, None
+
+    documents = frames[options.documents]
+    required = (options.documents_id_field, *options.include_fields)
+    _require_columns(documents, required, options.documents, "documents")
+    selected = _renamed_id(documents.select(required), options.documents_id_field)
+    selected = selected.with_columns(pl.col("document_id").cast(pl.String()))
+    if selected["document_id"].null_count():
+        raise ValueError(
+            f"Documents model '{options.documents}' column "
+            f"'{options.documents_id_field}' contains null values"
+        )
+    if selected["document_id"].n_unique() != selected.height:
+        raise ValueError(
+            f"Documents model '{options.documents}' column "
+            f"'{options.documents_id_field}' contains duplicate values"
+        )
+    universe = selected.select("document_id")
+    metadata = selected if options.include_fields else None
+    return universe, metadata
 
 
 def _reject_unsupported_language(tokens: pl.DataFrame, options: ToneOptions) -> None:
@@ -296,12 +328,6 @@ def _document_identity(prepared: pl.DataFrame, options: ToneOptions) -> pl.DataF
     return _single_valued(prepared, TOKEN_IDENTITY_COLUMNS, options.tokens, "NLP identity")
 
 
-def _document_metadata(prepared: pl.DataFrame, options: ToneOptions) -> pl.DataFrame | None:
-    if not options.include_fields:
-        return None
-    return _single_valued(prepared, options.include_fields, options.tokens, "include_fields")
-
-
 def _single_valued(
     frame: pl.DataFrame, columns: tuple[str, ...], model_name: str, role: str
 ) -> pl.DataFrame:
@@ -384,7 +410,9 @@ def _output_order(options: ToneOptions) -> list[str]:
     return list(dict.fromkeys(columns))
 
 
-def _empty_output(options: ToneOptions, lexicon_version: str) -> pl.DataFrame:
+def _empty_output(
+    options: ToneOptions, lexicon_version: str, metadata: pl.DataFrame | None
+) -> pl.DataFrame:
     schema: dict[str, pl.DataType] = {"document_id": pl.String()}
     for category in options.emit:
         schema[category_score_column(category)] = _SCORE_DTYPE
@@ -393,8 +421,11 @@ def _empty_output(options: ToneOptions, lexicon_version: str) -> pl.DataFrame:
     schema["matched_token_count"] = _COUNT_DTYPE
     schema["coverage"] = _SCORE_DTYPE
     schema["status"] = pl.String()
+    # Passthrough columns keep their source dtype so an empty run cannot
+    # materialize a mistyped table (Codex review).
+    metadata_schema = metadata.schema if metadata is not None else {}
     for field in options.include_fields:
-        schema[field] = pl.String()
+        schema[field] = metadata_schema.get(field, pl.String())
     for column in TOKEN_IDENTITY_COLUMNS:
         schema[column] = pl.String()
     schema["scorer"] = pl.String()

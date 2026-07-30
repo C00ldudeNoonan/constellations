@@ -14,7 +14,7 @@ def validate_options(options: Mapping[str, Any]) -> None:
     validate_tone_options(options)
 
 
-def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
+def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
     return declared_tone_dependencies(options)
 
 

@@ -3,13 +3,15 @@ version: 2
 models:
   - name: document_tone
     description: "Deterministic per-document tone from the token table and lexicon"
-    depends_on: [ref('document_tokens'), ref('tone_lexicon')]
+    depends_on: [ref('document_tokens'), ref('tone_lexicon'), ref('raw_documents')]
     transform:
       type: python
       module: dbt_ml.text.transforms.document_tone
       options:
         tokens: document_tokens
         lexicon: tone_lexicon
+        documents: raw_documents       # row universe + metadata; keeps zero-token docs
+        documents_id_field: economic_id
         document_id_field: document_id
         match_field: lemma
         language: en

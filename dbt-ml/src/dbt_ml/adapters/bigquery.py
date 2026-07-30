@@ -2030,22 +2030,29 @@ class BigQueryAdapter(WarehouseAdapter):
 
         existing = self._table_columns(table)
 
-        # First run: table does not exist yet; no old children to delete, so
-        # load directly (cannot MERGE into a non-existent table) then upsert state.
+        # First run: create an empty table from the schema so the transactional
+        # MERGE path below can run for both children and state in one script,
+        # eliminating the gap where a failed state merge leaves committed children
+        # without state (issue #229 P1).
         if existing is None:
-            if new_rows.height > 0:
-                job_config = bigquery.LoadJobConfig(
+            if new_rows.width > 0:
+                create_config = bigquery.LoadJobConfig(
                     source_format=bigquery.SourceFormat.PARQUET,
                     write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
                 )
-                self._apply_layout_to_load(job_config, options)
-                self._load_parquet(table, new_rows, job_config)
+                self._apply_layout_to_load(create_config, options)
+                self._load_parquet(table, new_rows.head(0), create_config)
                 self._apply_post_create_options(table, options)
-            if state_records:
-                self._merge_state(state_scope, state_records, replace=False)
-            return new_rows.height
+                existing = self._table_columns(table)
+            else:
+                # No schema available; only state needs advancing (no children to be
+                # inconsistent with when the table does not exist yet).
+                if state_records:
+                    self._merge_state(state_scope, state_records, replace=False)
+                return new_rows.height
 
         # Existing table: build one atomic multi-statement script.
+        assert existing is not None
         load_df = new_rows
         if new_rows.height > 0:
             plan = plan_schema_change(

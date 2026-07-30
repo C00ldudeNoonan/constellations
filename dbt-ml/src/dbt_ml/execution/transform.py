@@ -319,8 +319,18 @@ def _run_incremental_transform(
         model, project, project_dir, resolved=resolved
     )
     state_scope = StateScope(model.name)
+    options = warehouse_options(adapter, model)
+    _reject_unsupported_incremental_strategy(options, model)
     is_incremental = not full_refresh
     prior_state = adapter.fetch_state(state_scope) if is_incremental else {}
+
+    # No state baseline but a pre-existing target — e.g. a table switched from
+    # `materialization: full`, or an interrupted first run. Its rows are not
+    # owned by any per-parent state, so a child-keyed upsert would leave orphan
+    # children a parent no longer emits. Rebuild with a full replace to
+    # establish the baseline; subsequent runs are incremental (Codex review).
+    if is_incremental and not prior_state and adapter.relation_exists(model.name):
+        is_incremental = False
 
     reference_fingerprints = {
         ref: _frame_fingerprint(deps[ref]) for ref in contract.reference_deps
@@ -347,7 +357,6 @@ def _run_incremental_transform(
     removed = (
         [key for key in prior_state if key not in current_keys] if is_incremental else []
     )
-    options = warehouse_options(adapter, model)
 
     # No changed or new parents: at most some removed parents need deleting.
     # Skip invoking the transform so an unchanged corpus performs no provider
@@ -419,6 +428,24 @@ def _run_incremental_transform(
     result.documents_deleted = len(removed)
     result.metrics = _incremental_metrics(contract, is_incremental=True)
     return result
+
+
+def _reject_unsupported_incremental_strategy(
+    options: Any, model: ModelConfig
+) -> None:
+    """An incremental transform publishes only changed and new parents. A
+    partition-replacing strategy (BigQuery `insert_overwrite`) would drop every
+    row in a touched partition — including unchanged parents sharing it — while
+    their state stays current, so they would be skipped forever. Reject it; the
+    default key-merge strategy is required (Codex review)."""
+    if getattr(options, "incremental_strategy", None) == "insert_overwrite":
+        raise RunError(
+            f"Incremental transform '{model.name}' cannot use "
+            "warehouse_options.incremental_strategy: insert_overwrite — it replaces "
+            "whole partitions, but incremental transforms publish only changed and "
+            "new parents, which would drop unchanged parents sharing a partition. "
+            "Use the default merge strategy."
+        )
 
 
 def _parent_groups(

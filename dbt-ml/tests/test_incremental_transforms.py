@@ -377,10 +377,17 @@ class _RecordingAdapter:
     """Duck-typed WarehouseAdapter subset the incremental executor calls,
     advertising BigQuery's capabilities and recording the operations issued."""
 
-    def __init__(self, upstream: dict[str, pl.DataFrame]) -> None:
+    def __init__(
+        self,
+        upstream: dict[str, pl.DataFrame],
+        *,
+        warehouse_options: object | None = None,
+        preexisting: dict[str, pl.DataFrame] | None = None,
+    ) -> None:
         self._upstream = upstream
-        self._tables: dict[str, pl.DataFrame] = {}
+        self._tables: dict[str, pl.DataFrame] = dict(preexisting or {})
         self._state: dict[str, dict[str, object]] = {}
+        self._warehouse_options = warehouse_options
         self.calls: list[tuple] = []
 
     def capabilities(self):
@@ -392,7 +399,10 @@ class _RecordingAdapter:
         return "bigquery"
 
     def parse_warehouse_options(self, options, *, model_name):
-        return None
+        return self._warehouse_options
+
+    def relation_exists(self, name: str) -> bool:
+        return name in self._tables
 
     def read_table(self, name: str):
         return self._upstream[name]
@@ -553,3 +563,52 @@ def test_reference_dep_change_reprocesses_every_parent(tmp_path: Path) -> None:
     assert second.documents_skipped == 0
     delete_calls = [c for c in adapter.calls if c[0] == "delete_rows_and_state"]
     assert delete_calls == [("delete_rows_and_state", "document_id", ["docA", "docB"])]
+
+
+def test_preexisting_target_without_state_is_rebuilt(tmp_path: Path) -> None:
+    # A transform switched from `materialization: full` has a populated target
+    # but no per-parent state. Incremental must rebuild (full replace) rather
+    # than upsert over orphan children (Codex review P1).
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "word_tokens.py").write_text(_TRANSFORM_SOURCE)
+    model = _incremental_model("word_tokens", "transforms.word_tokens", ["ref('documents')"])
+
+    stale = pl.DataFrame(
+        {
+            "word_id": ["stale"],
+            "document_id": ["docA"],
+            "position": [99],
+            "word": ["orphan"],
+        }
+    )
+    adapter = _RecordingAdapter(
+        {"documents": pl.DataFrame({"document_id": ["docA"], "body": ["alpha beta"]})},
+        preexisting={"word_tokens": stale},
+    )
+
+    result = _run_incremental(tmp_path, adapter, model)
+    assert result.documents_processed == 1
+    # Full replace, not an upsert, so the orphan row is gone and state is reset.
+    assert [c[0] for c in adapter.calls if c[0].startswith("materialize")] == [
+        "materialize_full"
+    ]
+    assert any(c[0] == "replace_state" for c in adapter.calls)
+    words = set(adapter._tables["word_tokens"]["word"].to_list())
+    assert words == {"alpha", "beta"}
+
+
+def test_insert_overwrite_strategy_is_rejected(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "word_tokens.py").write_text(_TRANSFORM_SOURCE)
+    model = _incremental_model("word_tokens", "transforms.word_tokens", ["ref('documents')"])
+
+    adapter = _RecordingAdapter(
+        {"documents": pl.DataFrame({"document_id": ["docA"], "body": ["alpha"]})},
+        warehouse_options=SimpleNamespace(incremental_strategy="insert_overwrite"),
+    )
+    with pytest.raises(RunError, match="insert_overwrite"):
+        _run_incremental(tmp_path, adapter, model)
+    # Rejected before any warehouse mutation.
+    assert not adapter.calls

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Incremental Python transforms with child-row deletion (issue #218)
+
+- One-to-many Python transforms may now declare
+  `declared_incremental_contract(options)` and run with
+  `materialization: incremental`. The runner skips parents whose input and code
+  version are unchanged, invokes the transform only on changed and new parents,
+  and replaces a changed parent's children by deleting on the parent key and
+  upserting on the child key — so an unchanged corpus performs no provider work,
+  a shrunk parent leaves no orphan child rows, and a removed parent's rows and
+  state are deleted.
+- The `IncrementalContract` names the output `parent_key` and `child_key`, the
+  `parent_source` dependency (and its key column) that defines the parents, and
+  whole-table `reference_deps`. A change to any reference dependency (such as the
+  `link_entities` alias table) invalidates every parent. The contract is
+  required for incremental Python transforms and validated against `depends_on`
+  at compile time, so a grain mismatch is a compile error rather than a
+  wrong-key delete at build time.
+- `nlp_tokens`, `nlp_entities`, and `link_entities` declare the contract and can
+  now materialize incrementally. State advances only after a successful
+  publication; a failed publication reprocesses the affected parents on retry
+  and never advances their state past the failure. The active warehouse adapter
+  owns the delete, upsert, and state operations, and incremental materialization
+  fails preflight on an adapter lacking the required capabilities.
+
 ### Fixed
 
 - BigQuery `embed:` → `search:` pipelines no longer fail with "Search vector

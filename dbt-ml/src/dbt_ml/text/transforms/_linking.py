@@ -7,7 +7,7 @@ from typing import Any
 
 import polars as pl
 
-from ...transforms import TransformContext
+from ...transforms import IncrementalContract, TransformContext
 from ..linking import (
     ALIAS_RESOLVER_VERSION,
     EntityLinkOptions,
@@ -53,6 +53,20 @@ def declared_link_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
     misspelled or stale `depends_on` before any model is materialized."""
     parsed = EntityLinkOptions.model_validate(options)
     return (parsed.mentions, parsed.aliases)
+
+
+def declared_link_incremental_contract(options: Mapping[str, Any]) -> IncrementalContract:
+    """Parents are documents in the `mentions` model; the `aliases` model is a
+    whole-table reference input, so an alias-table edit re-links every document
+    (issue #218). Child rows are keyed by `entity_link_id`."""
+    parsed = EntityLinkOptions.model_validate(options)
+    return IncrementalContract(
+        parent_key="document_id",
+        child_key="entity_link_id",
+        parent_source=parsed.mentions,
+        parent_source_key=parsed.document_id_field,
+        reference_deps=(parsed.aliases,),
+    )
 
 
 def run_links(

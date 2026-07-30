@@ -430,9 +430,11 @@ def _run_model(
         else:
             result = _run_transform_model(
                 model=model,
+                project=project,
                 project_dir=project_dir,
                 adapter=adapter,
                 resolved=resolved,
+                full_refresh=full_refresh,
             )
     elif model.chunk is not None:
         result = _run_chunk_model(

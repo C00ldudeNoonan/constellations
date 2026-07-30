@@ -561,29 +561,84 @@ def test_model_edge_contracts_fail_before_execution(
         )
 
 
-@pytest.mark.parametrize("kind", ["transform", "ml"])
-def test_non_incremental_model_kinds_reject_incremental_materialization(
-    tmp_path: Path, kind: str
-) -> None:
-    if kind == "transform":
-        model = ModelConfig(
-            name="derived",
-            depends_on=["ref('raw')"],
-            transform={"type": "python", "module": "transforms.derived"},
-            materialization="incremental",
-        )
-    else:
-        model = ModelConfig(
-            name="derived",
-            depends_on=["ref('raw')"],
-            ml={"task": "features", "text_field": "text"},
-            materialization="incremental",
-        )
-
+def test_ml_model_rejects_incremental_materialization(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        ml={"task": "features", "text_field": "text"},
+        materialization="incremental",
+    )
     with pytest.raises(ConfigError, match="only supports `materialization: full`"):
         validate_project_contract(
             ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
         )
+
+
+def test_python_transform_incremental_requires_contract(tmp_path: Path) -> None:
+    # A python transform may be incremental (issue #218) only when it declares
+    # an IncrementalContract; without the hook it is rejected at compile time.
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+        materialization="incremental",
+    )
+    with pytest.raises(ConfigError, match="declared_incremental_contract"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+        )
+
+
+def test_python_transform_incremental_contract_validated_against_deps(
+    tmp_path: Path,
+) -> None:
+    # A declared contract whose parent_source is not a dependency is a compile
+    # error, not a wrong-key delete at build time.
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "from dbt_ml.transforms import IncrementalContract\n\n"
+        "def declared_incremental_contract(options):\n"
+        "    return IncrementalContract(\n"
+        "        parent_key='document_id', child_key='token_id',\n"
+        "        parent_source='not_a_dep', parent_source_key='document_id')\n\n"
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+        materialization="incremental",
+    )
+    with pytest.raises(ConfigError, match="parent_source 'not_a_dep' is not in"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+        )
+
+
+def test_python_transform_incremental_contract_accepts_valid(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "from dbt_ml.transforms import IncrementalContract\n\n"
+        "def declared_incremental_contract(options):\n"
+        "    return IncrementalContract(\n"
+        "        parent_key='document_id', child_key='token_id',\n"
+        "        parent_source_key='document_id')\n\n"
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+        materialization="incremental",
+    )
+    dag = validate_project_contract(
+        ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+    )
+    assert dag.execution_order() == ["raw", "derived"]
 
 
 @pytest.mark.parametrize(

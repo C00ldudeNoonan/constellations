@@ -128,7 +128,11 @@ def test_unique_key_forbidden_on_python_transform() -> None:
         _validate_materialization(model)
 
 
-def test_python_transform_still_rejects_incremental() -> None:
+def test_python_transform_incremental_passes_materialization_gate() -> None:
+    # Since issue #218, `_validate_materialization` no longer rejects a python
+    # transform declaring incremental — the requirement that it declare an
+    # `IncrementalContract` is enforced in `_validate_transform` (which loads the
+    # module). A python transform still may not use `unique_key`, though.
     from dbt_ml.compiler import _validate_materialization
 
     model = ModelConfig(
@@ -137,8 +141,17 @@ def test_python_transform_still_rejects_incremental() -> None:
         depends_on=["ref('up')"],
         materialization="incremental",
     )
-    with pytest.raises(ConfigError, match="only supports"):
-        _validate_materialization(model)
+    _validate_materialization(model)  # must not raise
+
+    keyed = ModelConfig(
+        name="m",
+        transform=TransformConfig(type="python", module="transforms.x"),
+        depends_on=["ref('up')"],
+        materialization="incremental",
+        unique_key="id",
+    )
+    with pytest.raises(ConfigError, match="unique_key"):
+        _validate_materialization(keyed)
 
 
 def test_incremental_sql_transform_passes_materialization_check(tmp_path: Path) -> None:

@@ -60,13 +60,27 @@ repository-level `.github/workflows/` directory.
    `depends_on` matches exactly and rejects a misspelled or stale reference
    before any model is materialized. Omit the hook when a transform accepts a
    variable dependency set.
-4. Parse runtime options with the same strict Pydantic model used by the
+4. A one-to-many transform (many stable child rows per input parent) may opt
+   into `materialization: incremental` by exposing
+   `declared_incremental_contract(options) -> IncrementalContract`. The contract
+   names the output `parent_key` (delete scope) and `child_key` (upsert scope),
+   the `parent_source` dependency (and its key column) whose rows define the
+   parents, and any whole-table `reference_deps`. The runner then skips
+   unchanged parents, invokes the transform only on changed and new parents, and
+   replaces a changed parent's children by deleting on the parent key and
+   upserting on the child key. Emit the same deterministic `child_key` for the
+   same input, carry the `parent_key` on every output row, and process parents
+   independently (a transform needing cross-parent state cannot be incremental).
+   Without the hook a transform stays `full`; declaring it for
+   `materialization: incremental` is required and validated against `depends_on`
+   at compile time.
+5. Parse runtime options with the same strict Pydantic model used by the
    validation hook. Keep optional dependencies lazy and provide an actionable
    extra-install command when they are absent.
-5. Use a provider protocol when execution depends on an external SDK or model.
+6. Use a provider protocol when execution depends on an external SDK or model.
    Unit tests must use a deterministic fake and must not require downloads,
    credentials, or network access.
-6. Document the input and output schemas, sensitive-field behavior, optional
+7. Document the input and output schemas, sensitive-field behavior, optional
    extra, and a runnable example whenever the transform is public.
 
 ## Adding a new model kind

@@ -701,19 +701,23 @@ def _validate_materialization(model: ModelConfig) -> None:
         and model.transform.type == "sql"
         and model.materialization == "incremental"
     )
+    # Python transforms may be incremental when they declare an
+    # `IncrementalContract` (issue #218); `_validate_transform` enforces that a
+    # contract is present and agrees with `depends_on`. SQL transforms keep the
+    # `unique_key` route (#142); every other model kind is full-only.
+    is_incremental_python_transform = (
+        model.transform is not None
+        and model.transform.type == "python"
+        and model.materialization == "incremental"
+    )
     if (
         model.transform is not None
         and model.materialization != "full"
-        and not is_incremental_sql_transform
+        and not (is_incremental_sql_transform or is_incremental_python_transform)
     ):
         raise _model_error(
             model,
-            f"Transform model '{model.name}' only supports `materialization: full`"
-            + (
-                ", or `incremental` for `type: sql` (#142)"
-                if model.transform.type == "sql"
-                else ""
-            ),
+            f"Transform model '{model.name}' only supports `materialization: full`",
             ("materialization",),
         )
     if model.unique_key is not None and not is_incremental_sql_transform:
@@ -827,6 +831,7 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             project_dir,
             transform.options,
             [parse_ref(dependency) for dependency in model.depends_on or []],
+            materialization=model.materialization,
         )
     except (Exception, SystemExit) as e:
         raise _model_error(

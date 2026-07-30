@@ -251,13 +251,16 @@ def test_full_refresh_reprocesses_all(fresh_project: Path) -> None:
     assert raw.documents_skipped == 0
 
 
-def test_incremental_transform_is_rejected(fresh_project: Path) -> None:
+def test_incremental_transform_without_contract_is_rejected(fresh_project: Path) -> None:
+    # invoice_summary is an aggregation transform that declares no
+    # IncrementalContract, so it cannot opt into incremental materialization
+    # (issue #218).
     generate_invoices(3, fresh_project / "data" / "invoices", seed=1)
     summary_yml = fresh_project / "models" / "invoice_summary.yml"
     text = summary_yml.read_text()
     summary_yml.write_text(text.replace("materialization: full", "materialization: incremental"))
 
-    with pytest.raises(ConfigError, match="only supports `materialization: full`"):
+    with pytest.raises(ConfigError, match="declared_incremental_contract"):
         run_project(fresh_project, select="invoice_summary")
 
 

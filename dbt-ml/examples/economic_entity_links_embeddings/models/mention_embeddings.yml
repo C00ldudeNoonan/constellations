@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: mention_embeddings
+    description: "Entity mentions with native deterministic embeddings for linking"
+    depends_on: [ref('entity_mentions')]
+
+    embed:
+      # Offline default so this example runs with no credentials. For a real
+      # provider, change `provider`/`model` and add the matching `embedding:`
+      # block to profiles.yml; keep the same `dimensions` on both embed models.
+      provider: deterministic
+      model: deterministic-v1
+      text_field: entity_text
+      id_field: entity_id
+      vector_field: embedding
+      dimensions: 8
+      batch_size: 128
+
+    materialization: incremental
+
+    tests:
+      - not_null: [entity_id, source_document_id, entity_text, embedding]
+      - unique: entity_id

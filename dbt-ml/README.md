@@ -1308,6 +1308,23 @@ follows the same allow-list rules as the NLP transforms. The `mentions:` and
 stale reference is rejected during `dbt-ml compile`, before any model is
 materialized. See `examples/economic_entity_links/` for a runnable pipeline.
 
+The resolver is selected by the `resolver:` option, defaulting to `alias_table`
+(above). Set `resolver: vector_similarity` to link by embedding similarity
+instead: `mention_vector_field` and `alias_vector_field` name precomputed vector
+columns — produced upstream by the ordinary `embed` model kind — and each
+mention resolves to alias candidates whose `metric` similarity (`cosine`,
+`dot`, or `euclidean`) is at or above `threshold`, with the score written to
+`match_score`. Candidates within `ambiguity_margin` of a namespace's top score
+are `ambiguous` rather than silently arg-maxed. Because the vectors are computed
+by the `embed` kind, credentials and provider batching stay in that executor and
+this resolver remains an offline transform; the mention/status/privacy contract
+and output schema are identical to the alias-table resolver. Vectors from
+different embedding models occupy unrelated spaces, so when both sides carry the
+`embed` kind's `embedding_config_hash` a mismatch fails the run rather than
+emitting meaningless links (`embedding_config_hash_field: null` bypasses the
+check). See `examples/economic_entity_links_embeddings/` for a runnable,
+credential-free pipeline using the built-in `deterministic` embedding provider.
+
 ### Document-level aggregate features
 
 `nlp_document_features` rolls the token, entity, and entity-link child tables

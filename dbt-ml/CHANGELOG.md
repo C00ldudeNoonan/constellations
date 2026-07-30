@@ -52,6 +52,29 @@
   owns the delete, upsert, and state operations, and incremental materialization
   fails preflight on an adapter lacking the required capabilities.
 
+### Entity-linking resolver registry + vector-similarity resolver (issue #217)
+
+- Introduced a resolver seam behind the `link_entities` `resolver:` option so
+  additional resolvers slot in without changing the output schema. The default
+  remains `alias_table`; validation is a discriminated union, so an unknown
+  resolver is rejected during `dbt-ml compile` with the valid names listed.
+- Added the `vector_similarity` resolver, which links a mention's precomputed
+  embedding to alias embeddings by `cosine`, `dot`, or `euclidean` similarity at
+  or above a required `threshold`, populating the reserved `match_score` column.
+  Candidates within `ambiguity_margin` of a namespace's top score are preserved
+  as `ambiguous` rows rather than silently resolved to the arg-max; the
+  `matched`/`ambiguous`/`unmatched` statuses, privacy defaults, and output
+  schema match the alias-table resolver exactly.
+- The resolver consumes vectors produced upstream by the `embed` model kind, so
+  credentials, provider batching, and versioned embedding identity stay in that
+  executor and the linker remains a deterministic, offline transform. It refuses
+  to compare vectors from different embedding spaces: when both sides carry an
+  `embedding_config_hash`, a mismatch fails the run rather than emitting
+  meaningless links. The `alias_set_version` fingerprint now covers the alias
+  vector set so alias embedding changes invalidate downstream.
+- Added a runnable, credential-free `examples/economic_entity_links_embeddings/`
+  pipeline using the built-in `deterministic` embedding provider.
+
 ### Fixed
 
 - BigQuery `embed:` → `search:` pipelines no longer fail with "Search vector

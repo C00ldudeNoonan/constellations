@@ -1,0 +1,10 @@
+name: economic_entity_links_embeddings
+version: "0.1.0"
+profile: economic_entity_links_embeddings
+
+extraction:
+  default_backend: json
+
+source-paths: ["sources"]
+model-paths: ["models"]
+target-path: "target"

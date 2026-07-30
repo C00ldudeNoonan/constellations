@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: entity_aliases
+    description: "Operator-owned alias dimension: surface form to canonical ID"
+    source: ref('alias_documents')
+    extraction:
+      backend: json
+      options:
+        fields: [alias_id, alias, entity_namespace, canonical_id]
+    materialization: incremental
+    fields:
+      - name: alias_id
+        data_type: string
+      - name: alias
+        data_type: string
+      - name: entity_namespace
+        data_type: string
+      - name: canonical_id
+        data_type: string
+    tests:
+      - not_null: [alias_id, alias, entity_namespace, canonical_id]
+      - unique: alias_id

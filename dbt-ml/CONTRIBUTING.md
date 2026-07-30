@@ -83,6 +83,30 @@ repository-level `.github/workflows/` directory.
 7. Document the input and output schemas, sensitive-field behavior, optional
    extra, and a runnable example whenever the transform is public.
 
+### Adding an entity-linking resolver
+
+The `link_entities` transform dispatches to a resolver selected by its
+`resolver:` option. To add one:
+
+1. Add a strict options model in `src/dbt_ml/text/linking.py` that subclasses
+   `_EntityLinkBaseOptions` (shared mention identity, privacy, and projection
+   fields) with a `resolver: Literal["<name>"]` discriminator, then add it to
+   the `EntityLinkConfig` union.
+2. Implement an `EntityResolver` (declaring the mention columns it reads and how
+   to extract a per-mention match signal) whose `build_reference` validates and
+   indexes the alias frame and exposes a `fingerprint` for `alias_set_version`.
+   Register the instance in `RESOLVERS` and give it a `version` constant that is
+   bumped whenever its matching semantics change.
+3. Keep resolution deterministic and offline. Reuse existing model kinds for
+   anything needing credentials or a provider — the vector-similarity resolver
+   consumes vectors produced by the `embed` kind rather than embedding text
+   itself — so the transform seam stays credential-free and unit-testable with
+   hand-authored inputs.
+4. The shared driver in `text/transforms/_linking.py` owns row shaping,
+   ambiguity policy, and the fixed output schema; resolvers only return
+   per-namespace `NamespaceResolution` outcomes, so `match_score` and the status
+   columns stay consistent across resolvers.
+
 ## Adding a new model kind
 
 Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one

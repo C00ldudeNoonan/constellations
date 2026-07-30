@@ -28,3 +28,7 @@ __pycache__/
 docs/research/
 docs/private/
 **/_scratch/
+
+# local credentials — never commit (note: `*.env` does NOT match a literal `.env`)
+.env
+*.env

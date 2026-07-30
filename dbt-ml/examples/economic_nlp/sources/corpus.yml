@@ -12,3 +12,8 @@ sources:
     path: aliases
     file_pattern: "*.json"
     tags: [economic_data, aliases]
+  - name: economic_tone_lexicon
+    description: "Operator-owned economic tone lexicon (term, category, weight)"
+    path: lexicon
+    file_pattern: "*.json"
+    tags: [economic_data, tone]

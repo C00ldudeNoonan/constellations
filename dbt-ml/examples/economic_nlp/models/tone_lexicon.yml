@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: tone_lexicon
+    description: "Operator-owned economic tone lexicon (term, category, weight)"
+    source: ref('economic_tone_lexicon')
+    extraction:
+      backend: json
+      options:
+        fields: [term, category, weight]
+    materialization: incremental
+    fields:
+      - name: term
+        data_type: string
+      - name: category
+        data_type: string
+      - name: weight
+        data_type: float
+    tests:
+      - not_null: [term, category]

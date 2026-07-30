@@ -44,3 +44,17 @@ select document_id, publisher, token_count, lexical_diversity,
 from economic_nlp.document_features
 order by document_id;
 ```
+
+`document_tone` scores each document against the operator-owned `tone_lexicon`
+(term, category, weight). It is deterministic and reads the token table, so it
+needs no language model. General polarity (`positive`/`negative`) and domain
+signals (`uncertainty`, `dovish`) are separate lexicon categories, each emitted
+as a normalized score and a hit count, with the lexicon fingerprinted as
+`lexicon_version` and publisher/release date carried through for analysis.
+
+```sql
+select document_id, publisher, published_at, positive_score, negative_score,
+       uncertainty_score, dovish_score, coverage, status
+from economic_nlp.document_tone
+order by document_id;
+```

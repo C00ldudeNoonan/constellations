@@ -1235,6 +1235,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
 | `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs via an operator-owned alias table       |
 | `dbt_ml.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
+| `dbt_ml.text.transforms.document_tone`      | Scores per-document tone from the token table + an operator-owned lexicon      |
 
 All are pure functions importable via `from dbt_ml.text import …` if you'd
 rather wire them into your own transforms.
@@ -1371,6 +1372,56 @@ Conventions worth knowing:
 
 No document, token, or entity text reaches the output. Counting distinct lemmas
 is not retaining them, and `include_fields` allow-lists parent metadata only.
+
+### Document tone / sentiment
+
+`document_tone` scores per-document tone by matching the token table against an
+operator-owned tone lexicon. It is deterministic and reads tables, not text, so
+it needs no optional extra and no LLM — a general sentiment score is never
+presented as an economic fact. The lexicon is a normal upstream model (rows of
+`term`, `category`, optional `weight`), exactly like the entity-linking alias
+table.
+
+```yaml
+- name: document_tone
+  depends_on: [ref('document_tokens'), ref('tone_lexicon')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.document_tone
+    options:
+      tokens: document_tokens      # the token child table
+      lexicon: tone_lexicon        # operator-owned term/category/weight table
+      match_field: lemma           # token column matched (case-insensitively)
+      language: en
+      emit: [positive, negative, uncertainty, hawkish, dovish]
+      include_fields: [publisher, published_at]
+```
+
+`emit` is an explicit list of lexicon categories, so the output schema is fixed
+at compile time regardless of the lexicon rows in the warehouse. Each emitted
+category `c` produces `c_score` and `c_hits`; general polarity
+(`positive`/`negative`) and domain signals (`uncertainty`, `hawkish`/`dovish`, …)
+are just different categories in the lexicon, so they stay separate by
+construction.
+
+Conventions worth knowing:
+
+- A category score is the sum of matched term weights normalized by
+  `token_count`; `coverage` is `matched_token_count / token_count`. Both are
+  `null` when there is too little text (below `min_tokens`, `status` is
+  `insufficient_text`), never a misleading `0`.
+- With `negation` on (the default), a matched term preceded by a negator within
+  a bounded same-sentence window flips its contribution; `*_hits` still counts
+  the raw match. Negators are configurable for non-English lexicons.
+- The lexicon's content is fingerprinted as `lexicon_version`, so an edit is
+  visible to downstream invalidation without retaining the lexicon. `scorer` and
+  `scorer_version` identify the deterministic path so a future learned scorer can
+  be added without a schema change.
+- Tokens whose `nlp_language` disagrees with the configured `language` fail the
+  run rather than being scored against the wrong lexicon.
+- No document text or matched phrases reach the output; `include_fields`
+  allow-lists parent metadata (publisher, release date) so tone joins to them on
+  the same row.
 
 **PII setup** — `redact_pii` uses spaCy under the hood. First-time install:
 

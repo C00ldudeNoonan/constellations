@@ -45,10 +45,18 @@ from .nlp import (
 from .pii import PIIEntity, PIIError, detect_pii, redact_pii
 from .stats import text_stats
 from .tokens import count_tokens
+from .tone import (
+    TONE_SCORER_VERSION,
+    ToneOptions,
+    category_hits_column,
+    category_score_column,
+    tone_lexicon_fingerprint,
+)
 
 __all__ = [
     "ALIAS_RESOLVER_VERSION",
     "BASE_FEATURES",
+    "TONE_SCORER_VERSION",
     "DocumentFeatureOptions",
     "EntityLinkOptions",
     "NLPDocument",
@@ -61,7 +69,10 @@ __all__ = [
     "NLPTokenOptions",
     "PIIEntity",
     "PIIError",
+    "ToneOptions",
     "alias_set_fingerprint",
+    "category_hits_column",
+    "category_score_column",
     "clean_encoding",
     "count_tokens",
     "detect_language",
@@ -78,4 +89,5 @@ __all__ = [
     "pos_ratio_column",
     "redact_pii",
     "text_stats",
+    "tone_lexicon_fingerprint",
 ]

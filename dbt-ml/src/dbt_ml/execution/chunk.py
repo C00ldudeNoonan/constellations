@@ -132,43 +132,39 @@ def run_chunk_model(
             for document_id in processed_state
             if document_id not in current_ids
         ]
-        # Re-chunking may produce fewer IDs, so old rows must be removed before
-        # the chunk_id-keyed incremental upsert.
-        stale = removed + changed_ids
-        if stale:
+        if removed:
             adapter.delete_rows_and_state(
                 model.name,
                 key_col="document_id",
-                keys=stale,
+                keys=removed,
                 state_scope=state_scope,
             )
             deleted = len(removed)
 
     rows_written = 0
-    if rows or full_refresh or model.materialization == "full":
-        chunk_frame = pl.DataFrame(rows) if rows else pl.DataFrame()
-        if model.materialization == "full" or full_refresh:
-            rows_written = adapter.materialize_full(
-                model.name,
-                chunk_frame,
-                options=parsed_warehouse_options,
-            )
-        else:
-            try:
-                rows_written = adapter.materialize_incremental(
-                    model.name,
-                    chunk_frame,
-                    key_col="chunk_id",
-                    on_schema_change=model.on_schema_change,
-                    options=parsed_warehouse_options,
-                )
-            except AdapterError as error:
-                raise RunError(str(error)) from error
-
+    chunk_frame = pl.DataFrame(rows) if rows else pl.DataFrame()
     if model.materialization == "full" or full_refresh:
+        rows_written = adapter.materialize_full(
+            model.name,
+            chunk_frame,
+            options=parsed_warehouse_options,
+        )
         adapter.replace_state(state_scope, state_records)
     else:
-        adapter.upsert_state(state_scope, state_records)
+        try:
+            rows_written = adapter.replace_children(
+                model.name,
+                parent_key="document_id",
+                parent_ids=changed_ids,
+                child_key="chunk_id",
+                new_rows=chunk_frame,
+                state_scope=state_scope,
+                state_records=state_records,
+                on_schema_change=model.on_schema_change,
+                options=parsed_warehouse_options,
+            )
+        except AdapterError as error:
+            raise RunError(str(error)) from error
 
     return ModelRunResult(
         model_name=model.name,

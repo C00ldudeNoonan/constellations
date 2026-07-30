@@ -75,6 +75,24 @@
 - Added a runnable, credential-free `examples/economic_entity_links_embeddings/`
   pipeline using the built-in `deterministic` embedding provider.
 
+### Atomic parent-scoped child replacement (issue #229)
+
+- The three-step incremental publication sequence (delete old children, insert
+  new children, advance state) is now a single atomic warehouse transaction for
+  changed parents, eliminating the window where a crash left children and state
+  inconsistent. A new `replace_children` adapter method wraps the three steps; a
+  new `ATOMIC_PARENT_CHILD_REPLACE` capability advertises support. Both DuckDB
+  and BigQuery implement it: DuckDB uses its `_transaction()` context manager;
+  BigQuery stages new rows outside the transaction then runs a single
+  `BEGIN TRANSACTION … COMMIT TRANSACTION` multi-statement script containing the
+  DELETE, MERGE, and state MERGE.
+- Removed parents still go through the existing `delete_rows_and_state` path;
+  only the changed-parent child replacement is now atomic.
+- `chunk`, `llm` (many-cardinality), and incremental Python transform executors
+  are migrated to `replace_children`.
+- `_require_incremental_capabilities` now checks for
+  `ATOMIC_PARENT_CHILD_REPLACE` instead of `ATOMIC_KEYED_UPSERT`.
+
 ### Fixed
 
 - BigQuery `embed:` → `search:` pipelines no longer fail with "Search vector

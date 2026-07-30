@@ -331,6 +331,7 @@ class WarehouseCapability(StrEnum):
     TABULAR_PREDICATE_PUSHDOWN = "tabular_predicate_pushdown"
     PAGED_STATE_RECONCILIATION = "paged_state_reconciliation"
     ATOMIC_STATE_SCOPE_REPLACE = "atomic_state_scope_replace"
+    ATOMIC_PARENT_CHILD_REPLACE = "atomic_parent_child_replace"
 
 
 @dataclass(frozen=True)
@@ -944,6 +945,26 @@ class WarehouseAdapter(ABC):
         state_record_keys: Sequence[str] | None = None,
     ) -> int:
         """Atomically delete target rows and their scoped state when supported."""
+
+    @abstractmethod
+    def replace_children(
+        self,
+        table: str,
+        *,
+        parent_key: str,
+        parent_ids: Sequence[str],
+        child_key: str,
+        new_rows: pl.DataFrame,
+        state_scope: StateScope,
+        state_records: Sequence[StateRecord],
+        on_schema_change: str = "fail",
+        options: BaseModel | None = None,
+    ) -> int:
+        """Atomically replace children for `parent_ids` and advance state.
+
+        Within a single warehouse transaction: deletes rows in `table` where
+        `parent_key` is in `parent_ids`, upserts `new_rows` by `child_key`,
+        and upserts `state_records`. Returns the number of rows written."""
 
     @abstractmethod
     def drop_table(self, table: str) -> None: ...

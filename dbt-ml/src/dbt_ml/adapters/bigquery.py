@@ -664,6 +664,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 # replace atomically) falls back to a staged drop-and-rename.
                 WarehouseCapability.ATOMIC_FULL_REPLACE,
                 WarehouseCapability.ATOMIC_KEYED_UPSERT,
+                WarehouseCapability.ATOMIC_PARENT_CHILD_REPLACE,
                 WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
@@ -2008,6 +2009,165 @@ class BigQueryAdapter(WarehouseAdapter):
         statements.extend(["COMMIT TRANSACTION;", "SELECT deleted_count;"])
         deleted = self.scalar("\n".join(statements), params)
         return int(deleted or 0)
+
+    def replace_children(
+        self,
+        table: str,
+        *,
+        parent_key: str,
+        parent_ids: Sequence[Any],
+        child_key: str,
+        new_rows: pl.DataFrame,
+        state_scope: StateScope,
+        state_records: Sequence[StateRecord],
+        on_schema_change: str = "fail",
+        options: BaseModel | None = None,
+    ) -> int:
+        validate_state_records(state_records)
+        if new_rows.height > 0:
+            validate_incremental_keys(new_rows, child_key)
+        bigquery = _bigquery()
+
+        existing = self._table_columns(table)
+
+        # First run: table does not exist yet; no old children to delete, so
+        # load directly (cannot MERGE into a non-existent table) then upsert state.
+        if existing is None:
+            if new_rows.height > 0:
+                job_config = bigquery.LoadJobConfig(
+                    source_format=bigquery.SourceFormat.PARQUET,
+                    write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                )
+                self._apply_layout_to_load(job_config, options)
+                self._load_parquet(table, new_rows, job_config)
+                self._apply_post_create_options(table, options)
+            if state_records:
+                self._merge_state(state_scope, state_records, replace=False)
+            return new_rows.height
+
+        # Existing table: build one atomic multi-statement script.
+        load_df = new_rows
+        if new_rows.height > 0:
+            plan = plan_schema_change(
+                existing, list(new_rows.columns), on_schema_change, table
+            )
+            if plan.columns_to_load != list(new_rows.columns):
+                load_df = new_rows.select(plan.columns_to_load)
+            if plan.allow_field_addition:
+                schema_config = bigquery.LoadJobConfig(
+                    source_format=bigquery.SourceFormat.PARQUET,
+                    write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                    schema_update_options=[
+                        bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+                    ],
+                )
+                self._load_parquet(table, load_df.head(0), schema_config)
+
+        staging: str | None = None
+        if load_df.height > 0:
+            staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+            staging_config = bigquery.LoadJobConfig(
+                source_format=bigquery.SourceFormat.PARQUET,
+                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            )
+            self._load_parquet(staging, load_df, staging_config)
+
+        try:
+            statements: list[str] = ["BEGIN TRANSACTION;"]
+            params: list[Any] = []
+
+            if parent_ids:
+                statements.append(
+                    f"DELETE FROM {self.table_ref(table)} "
+                    f"WHERE {self.quote_ident(parent_key)} IN UNNEST(?);"
+                )
+                params.append(list(parent_ids))
+
+            if staging is not None:
+                final_columns = list(existing)
+                final_columns.extend(
+                    c for c in load_df.columns if c not in final_columns
+                )
+                key = self.quote_ident(child_key)
+                assignments = ", ".join(
+                    f"target.{self.quote_ident(col)} = source.{self.quote_ident(col)}"
+                    if col in load_df.columns
+                    else f"target.{self.quote_ident(col)} = NULL"
+                    for col in final_columns
+                )
+                insert_cols_str = ", ".join(
+                    self.quote_ident(c) for c in load_df.columns
+                )
+                insert_vals_str = ", ".join(
+                    f"source.{self.quote_ident(c)}" for c in load_df.columns
+                )
+                statements.append(
+                    f"MERGE {self.table_ref(table)} AS target "
+                    f"USING {self.table_ref(staging)} AS source "
+                    f"ON target.{key} = source.{key} "
+                    f"WHEN MATCHED THEN UPDATE SET {assignments} "
+                    f"WHEN NOT MATCHED THEN INSERT ({insert_cols_str}) "
+                    f"VALUES ({insert_vals_str});"
+                )
+
+            if state_records:
+                record_keys = [r.record_key for r in state_records]
+                fingerprints = [r.input_fingerprint for r in state_records]
+                versions = [r.code_version for r in state_records]
+                statements.append(
+                    f"MERGE {self._state_ref} AS target\n"
+                    "USING (\n"
+                    "    SELECT\n"
+                    "        ? AS model_name,\n"
+                    "        ? AS state_scope,\n"
+                    "        ? AS target_identity,\n"
+                    "        ids[OFFSET(o)] AS record_key,\n"
+                    "        fs[OFFSET(o)] AS input_fingerprint,\n"
+                    "        vs[OFFSET(o)] AS code_version\n"
+                    "    FROM (SELECT ? AS ids, ? AS fs, ? AS vs),\n"
+                    "        UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(ids) - 1)) AS o\n"
+                    ") AS source\n"
+                    "ON target.model_name = source.model_name\n"
+                    "    AND target.state_scope = source.state_scope\n"
+                    "    AND target.target_identity = source.target_identity\n"
+                    "    AND target.record_key = source.record_key\n"
+                    "WHEN MATCHED THEN UPDATE SET\n"
+                    "    input_fingerprint = source.input_fingerprint,\n"
+                    "    code_version = source.code_version,\n"
+                    "    last_run_at = CURRENT_TIMESTAMP()\n"
+                    "WHEN NOT MATCHED THEN INSERT\n"
+                    "    (model_name, state_scope, target_identity, record_key,\n"
+                    "     input_fingerprint, code_version, last_run_at)\n"
+                    "    VALUES (source.model_name, source.state_scope,\n"
+                    "            source.target_identity, source.record_key,\n"
+                    "            source.input_fingerprint, source.code_version,\n"
+                    "            CURRENT_TIMESTAMP());"
+                )
+                params.extend(
+                    [
+                        state_scope.model_name,
+                        state_scope.stage,
+                        state_scope.target_identity,
+                        record_keys,
+                        fingerprints,
+                        versions,
+                    ]
+                )
+
+            statements.append("COMMIT TRANSACTION;")
+            if len(statements) > 2:
+                self._run_query("\n".join(statements), params or None)
+        except BaseException as error:
+            if staging is not None:
+                try:
+                    self.drop_table(staging)
+                except Exception as cleanup_error:
+                    error.add_note(f"Failed to clean staging table: {cleanup_error}")
+            raise
+        else:
+            if staging is not None:
+                self.drop_table(staging)
+        return new_rows.height
 
     def drop_table(self, table: str) -> None:
         self.client.delete_table(self._table_id(table), not_found_ok=True)

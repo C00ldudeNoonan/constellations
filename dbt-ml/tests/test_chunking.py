@@ -459,6 +459,8 @@ def test_metadata_only_update_rewrites_chunks_with_stable_ids(
 def test_failed_chunk_replacement_cannot_leave_old_state_current(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """replace_children is atomic: a failure rolls back the whole transaction,
+    so chunks and state are never left inconsistent (issue #229)."""
     from dbt_ml.adapters.base import AdapterError
     from dbt_ml.adapters.duckdb import DuckDBAdapter
     from dbt_ml.runner import RunError, run_project
@@ -478,26 +480,32 @@ def test_failed_chunk_replacement_cannot_leave_old_state_current(
     finally:
         con.close()
 
-    original_materialize = DuckDBAdapter.materialize_incremental
+    original_replace = DuckDBAdapter.replace_children
     failed = False
 
-    def fail_chunk_once(self: DuckDBAdapter, table: str, *args: object, **kwargs: object) -> int:
+    def fail_replace_once(
+        self: DuckDBAdapter, table: str, *args: object, **kwargs: object
+    ) -> int:
         nonlocal failed
         if table == "document_chunks" and not failed:
             failed = True
             raise AdapterError("simulated chunk publication failure")
-        return original_materialize(self, table, *args, **kwargs)  # type: ignore[arg-type]
+        return original_replace(self, table, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", fail_chunk_once)
+    monkeypatch.setattr(DuckDBAdapter, "replace_children", fail_replace_once)
     with pytest.raises(RunError, match="simulated chunk publication failure"):
         run_project(project)
 
+    # Atomic rollback: old chunks and state must both still be present.
     con = duckdb.connect(str(db_path))
     try:
-        assert con.execute('SELECT COUNT(*) FROM "db".docs.document_chunks').fetchone() == (0,)
+        assert con.execute('SELECT COUNT(*) FROM "db".docs.document_chunks').fetchone() == (
+            len(original_ids),
+        )
         assert con.execute(
             "SELECT COUNT(*) FROM \"db\".docs.dbt_ml_state WHERE model_name = 'document_chunks'"
-        ).fetchone() == (0,)
+        ).fetchone() == (1,)
+        # Restore the title so the document hash matches the pre-failure state.
         con.execute(
             'UPDATE "db".docs.document_registry SET title = ?',
             ["Original title"],
@@ -505,9 +513,11 @@ def test_failed_chunk_replacement_cannot_leave_old_state_current(
     finally:
         con.close()
 
+    # Document hash now matches stored state → skipped, not reprocessed.
     results = run_project(project)
     chunk_result = next(r for r in results if r.model_name == "document_chunks")
-    assert chunk_result.documents_processed == 1
+    assert chunk_result.documents_processed == 0
+    assert chunk_result.documents_skipped == 1
     assert {row[0] for row in _chunks(project)} == original_ids
 
 

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Deterministic document tone/sentiment (issue #216)
+
+- Added the `dbt_ml.text.transforms.document_tone` transform, which scores
+  per-document tone by matching the token child table against an operator-owned
+  tone lexicon (`term`, `category`, optional `weight`). It is deterministic and
+  reads tables, not text, so it needs no optional extra and no LLM — a general
+  sentiment score is never presented as an economic fact.
+- Signals are lexicon categories selected by an explicit `emit:` list, so general
+  polarity (`positive`/`negative`) and domain signals (`uncertainty`,
+  `hawkish`/`dovish`, …) stay separate and the output schema is fixed at compile
+  time. Each emitted category produces a normalized `<category>_score` and a
+  `<category>_hits` count, plus `token_count`, `matched_token_count`, `coverage`,
+  and a `status`.
+- Scores and coverage divide by `token_count` and are `null` — never a misleading
+  `0` — when a document falls below `min_tokens` (`status: insufficient_text`).
+  Optional negation flips a matched term preceded by a negator within a bounded
+  same-sentence window; negators are configurable for non-English lexicons.
+- The lexicon's content is fingerprinted as `lexicon_version` so an edit is
+  visible to downstream invalidation without retaining the lexicon; `scorer` and
+  `scorer_version` identify the deterministic path so a future learned scorer is
+  additive. Tokens whose `nlp_language` disagrees with the configured `language`
+  fail the run. No document text or matched phrases reach the output;
+  `include_fields` carries publisher/release-date metadata onto the tone row.
+- Added a `document_tone` model and committed tone lexicon to the
+  `examples/economic_nlp` pipeline.
+
 ### Incremental Python transforms with child-row deletion (issue #218)
 
 - One-to-many Python transforms may now declare

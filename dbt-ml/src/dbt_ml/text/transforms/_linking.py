@@ -1,20 +1,25 @@
-"""Shared execution for the built-in entity-linking child-table transform."""
+"""Shared execution for the built-in entity-linking child-table transform.
+
+The driver here owns mention identity, the passthrough/include projection,
+ambiguity policy, and row shaping. The per-resolver matching (alias-table text
+matching or vector similarity) is delegated to the resolver selected by the
+``resolver`` option; see ``dbt_ml.text.linking``.
+"""
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import polars as pl
 
 from ...transforms import IncrementalContract, TransformContext
 from ..linking import (
-    ALIAS_RESOLVER_VERSION,
-    EntityLinkOptions,
+    EntityResolver,
     LinkStatus,
-    alias_set_fingerprint,
     entity_link_id,
-    normalize_alias_text,
+    get_resolver,
+    parse_entity_link_options,
 )
 
 _LINK_SCHEMA: dict[str, pl.DataType] = {
@@ -38,28 +43,30 @@ _LINK_SCHEMA: dict[str, pl.DataType] = {
 class _Mention:
     mention_id: str
     document_id: str
-    text: str | None
-    passthrough: dict[str, Any]
-    included: dict[str, Any]
+    text: Any
+    signal: Any
+    passthrough: dict[str, Any] = field(default_factory=dict)
+    included: dict[str, Any] = field(default_factory=dict)
 
 
 def validate_link_options(options: Mapping[str, Any]) -> None:
-    EntityLinkOptions.model_validate(options)
+    parse_entity_link_options(options)
 
 
 def declared_link_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
     """The mentions and alias models these options require. `_dep_frames`
     enforces the same pair at runtime; declaring it lets the compiler reject a
     misspelled or stale `depends_on` before any model is materialized."""
-    parsed = EntityLinkOptions.model_validate(options)
+    parsed = parse_entity_link_options(options)
     return (parsed.mentions, parsed.aliases)
 
 
 def declared_link_incremental_contract(options: Mapping[str, Any]) -> IncrementalContract:
     """Parents are documents in the `mentions` model; the `aliases` model is a
-    whole-table reference input, so an alias-table edit re-links every document
-    (issue #218). Child rows are keyed by `entity_link_id`."""
-    parsed = EntityLinkOptions.model_validate(options)
+    whole-table reference input, so an alias/reference edit re-links every
+    document (issue #218). Child rows are keyed by `entity_link_id`. This holds
+    for every resolver, since the shared driver fixes those output columns."""
+    parsed = parse_entity_link_options(options)
     return IncrementalContract(
         parent_key="document_id",
         child_key="entity_link_id",
@@ -73,40 +80,54 @@ def run_links(
     deps: dict[str, pl.DataFrame],
     ctx: TransformContext,
 ) -> pl.DataFrame:
-    options = EntityLinkOptions.model_validate(ctx.options)
+    options = parse_entity_link_options(ctx.options)
+    resolver = get_resolver(options.resolver)
     mentions_frame, aliases_frame = _dep_frames(deps, options)
-    mentions, schema = _input_mentions(mentions_frame, options)
+    resolver.validate_frames(mentions_frame, aliases_frame, options)
+    mentions, schema = _input_mentions(mentions_frame, options, resolver)
     if not mentions:
         return pl.DataFrame(schema=schema)
 
-    alias_rows = _alias_rows(aliases_frame, options)
-    alias_version = alias_set_fingerprint(alias_rows)
-    lookups = _alias_lookups(alias_rows, options)
+    reference = resolver.build_reference(aliases_frame, options)
+    reference_version = reference.fingerprint
 
     rows: list[dict[str, Any]] = []
     ambiguous_pairs: list[tuple[str, str]] = []
     for mention in mentions:
-        resolved = _resolve(mention.text, options, lookups)
-        if not resolved:
+        resolutions = (
+            reference.resolve(mention.signal) if mention.signal is not None else {}
+        )
+        if not resolutions:
             rows.append(
-                _link_row(mention, options, alias_version, None, None, None, "unmatched")
+                _link_row(
+                    mention,
+                    options,
+                    reference_version,
+                    resolver.version,
+                    namespace=None,
+                    canonical_id=None,
+                    method=None,
+                    score=None,
+                    status="unmatched",
+                )
             )
             continue
-        for namespace in sorted(resolved):
-            method, canonical_ids = resolved[namespace]
-            status: LinkStatus = "matched" if len(canonical_ids) == 1 else "ambiguous"
-            if status == "ambiguous":
+        for namespace in sorted(resolutions):
+            resolution = resolutions[namespace]
+            if resolution.status == "ambiguous":
                 ambiguous_pairs.append((mention.mention_id, namespace))
-            for canonical_id in sorted(canonical_ids):
+            for candidate in resolution.candidates:
                 rows.append(
                     _link_row(
                         mention,
                         options,
-                        alias_version,
-                        namespace,
-                        canonical_id,
-                        method,
-                        status,
+                        reference_version,
+                        resolver.version,
+                        namespace=namespace,
+                        canonical_id=candidate.canonical_id,
+                        method=resolution.method,
+                        score=candidate.score,
+                        status=resolution.status,
                     )
                 )
 
@@ -124,7 +145,7 @@ def run_links(
 
 def _dep_frames(
     deps: dict[str, pl.DataFrame],
-    options: EntityLinkOptions,
+    options: Any,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     expected = {options.mentions, options.aliases}
     if set(deps) != expected:
@@ -137,54 +158,61 @@ def _dep_frames(
 
 def _input_mentions(
     frame: pl.DataFrame,
-    options: EntityLinkOptions,
+    options: Any,
+    resolver: EntityResolver,
 ) -> tuple[list[_Mention], dict[str, pl.DataType]]:
+    text_needed = resolver.text_required() or options.include_mention_text
     required = {
-        "mention_id_field": options.mention_id_field,
-        "document_id_field": options.document_id_field,
-        "mention_text_field": options.mention_text_field,
+        options.mention_id_field,
+        options.document_id_field,
+        *(({options.mention_text_field}) if text_needed else set()),
+        *resolver.required_mention_columns(options),
     }
     passthrough_fields = {
-        name: field
-        for name, field in (
+        name: field_name
+        for name, field_name in (
             ("label", options.label_field),
             ("start", options.start_field),
             ("end", options.end_field),
         )
-        if field is not None
+        if field_name is not None
     }
     missing = sorted(
         {
-            field
-            for field in (*required.values(), *passthrough_fields.values())
-            if field not in frame.columns
+            field_name
+            for field_name in (*required, *passthrough_fields.values())
+            if field_name not in frame.columns
         }
     )
     if missing:
+        text_hint = (
+            " If mention text is absent, the upstream NLP transform may need "
+            "`include_text: true`."
+            if text_needed and options.mention_text_field in missing
+            else ""
+        )
         raise ValueError(
             f"Mentions model '{options.mentions}' is missing configured columns "
-            f"{missing}; got: {sorted(frame.columns)}. If mention text is absent, "
-            "the upstream NLP transform may need `include_text: true`."
+            f"{missing}; got: {sorted(frame.columns)}.{text_hint}"
         )
 
     schema = dict(_LINK_SCHEMA)
-    for output_name, field in passthrough_fields.items():
-        schema[output_name] = frame.schema[field]
+    for output_name, field_name in passthrough_fields.items():
+        schema[output_name] = frame.schema[field_name]
     if options.include_mention_text:
         schema["mention_text"] = pl.String()
 
     missing_fields = sorted(set(options.include_fields) - set(frame.columns))
     if missing_fields:
         raise ValueError(f"include_fields contains unknown columns: {missing_fields}")
-    collisions = sorted(
-        set(options.include_fields) & (set(schema) | {"mention_text"})
-    )
+    collisions = sorted(set(options.include_fields) & (set(schema) | {"mention_text"}))
     if collisions:
         raise ValueError(
             f"include_fields collides with entity-link output columns: {collisions}"
         )
-    schema.update({field: frame.schema[field] for field in options.include_fields})
+    schema.update({field_name: frame.schema[field_name] for field_name in options.include_fields})
 
+    has_text_column = options.mention_text_field in frame.columns
     mentions: list[_Mention] = []
     seen_ids: set[str] = set()
     for row in frame.iter_rows(named=True):
@@ -196,118 +224,43 @@ def _input_mentions(
             )
         seen_ids.add(mention_id)
         document_id = _required_id(row, options.document_id_field, "Document ID")
-
-        raw_text = row[options.mention_text_field]
-        if raw_text is not None and not isinstance(raw_text, str):
-            raise ValueError(
-                f"Mention text column '{options.mention_text_field}' must contain "
-                "strings or nulls"
-            )
         mentions.append(
             _Mention(
                 mention_id=mention_id,
                 document_id=document_id,
-                text=raw_text,
+                text=row[options.mention_text_field] if has_text_column else None,
+                signal=resolver.mention_signal(row, options),
                 passthrough={
-                    output_name: row[field]
-                    for output_name, field in passthrough_fields.items()
+                    output_name: row[field_name]
+                    for output_name, field_name in passthrough_fields.items()
                 },
-                included={field: row[field] for field in options.include_fields},
+                included={
+                    field_name: row[field_name] for field_name in options.include_fields
+                },
             )
         )
     return mentions, schema
 
 
-def _required_id(row: Mapping[str, Any], field: str, description: str) -> str:
-    raw = row[field]
+def _required_id(row: Mapping[str, Any], field_name: str, description: str) -> str:
+    raw = row[field_name]
     if raw is None or not str(raw).strip():
-        raise ValueError(f"{description} column '{field}' contains null or empty values")
-    return str(raw)
-
-
-def _alias_rows(
-    frame: pl.DataFrame,
-    options: EntityLinkOptions,
-) -> list[dict[str, str]]:
-    required = (
-        options.alias_text_field,
-        options.namespace_field,
-        options.canonical_id_field,
-    )
-    missing = sorted({field for field in required if field not in frame.columns})
-    if missing:
         raise ValueError(
-            f"Alias model '{options.aliases}' is missing configured columns "
-            f"{missing}; got: {sorted(frame.columns)}"
+            f"{description} column '{field_name}' contains null or empty values"
         )
-
-    rows: list[dict[str, str]] = []
-    for position, row in enumerate(frame.iter_rows(named=True)):
-        values: dict[str, str] = {}
-        for output_name, field in (
-            ("alias", options.alias_text_field),
-            ("entity_namespace", options.namespace_field),
-            ("canonical_id", options.canonical_id_field),
-        ):
-            raw = row[field]
-            if not isinstance(raw, str) or not raw.strip():
-                raise ValueError(
-                    f"Alias model '{options.aliases}' column '{field}' must contain "
-                    f"non-empty strings (row {position})"
-                )
-            values[output_name] = raw
-        rows.append(values)
-    return rows
-
-
-def _alias_lookups(
-    alias_rows: list[dict[str, str]],
-    options: EntityLinkOptions,
-) -> dict[str, dict[str, dict[str, set[str]]]]:
-    """Per-method match key → namespace → canonical IDs, built in one pass so
-    candidate lookup during resolution is dictionary access, not per-mention
-    scans of the alias table."""
-    lookups: dict[str, dict[str, dict[str, set[str]]]] = {
-        method: {} for method in options.match_methods
-    }
-    for row in alias_rows:
-        for method, table in lookups.items():
-            key = row["alias"] if method == "exact" else normalize_alias_text(row["alias"])
-            table.setdefault(key, {}).setdefault(row["entity_namespace"], set()).add(
-                row["canonical_id"]
-            )
-    return lookups
-
-
-def _resolve(
-    text: str | None,
-    options: EntityLinkOptions,
-    lookups: dict[str, dict[str, dict[str, set[str]]]],
-) -> dict[str, tuple[str, set[str]]]:
-    """Namespace → (method, canonical IDs). Methods run in configured order and
-    the first method producing candidates for a namespace wins that namespace;
-    later methods can still contribute other namespaces."""
-    resolved: dict[str, tuple[str, set[str]]] = {}
-    if text is None or not text.strip():
-        return resolved
-    for method in options.match_methods:
-        key = text if method == "exact" else normalize_alias_text(text)
-        hits = lookups[method].get(key)
-        if not hits:
-            continue
-        for namespace, canonical_ids in hits.items():
-            if namespace not in resolved:
-                resolved[namespace] = (method, canonical_ids)
-    return resolved
+    return str(raw)
 
 
 def _link_row(
     mention: _Mention,
-    options: EntityLinkOptions,
-    alias_version: str,
+    options: Any,
+    reference_version: str,
+    resolver_version: str,
+    *,
     namespace: str | None,
     canonical_id: str | None,
     method: str | None,
+    score: float | None,
     status: LinkStatus,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
@@ -324,11 +277,11 @@ def _link_row(
         "entity_namespace": namespace,
         "canonical_id": canonical_id,
         "match_method": method,
-        "match_score": None,
+        "match_score": score,
         "status": status,
         "resolver": options.resolver,
-        "resolver_version": ALIAS_RESOLVER_VERSION,
-        "alias_set_version": alias_version,
+        "resolver_version": resolver_version,
+        "alias_set_version": reference_version,
         **mention.passthrough,
         **mention.included,
     }

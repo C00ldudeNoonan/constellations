@@ -26,10 +26,15 @@ from .features import (
 from .language import detect_language
 from .linking import (
     ALIAS_RESOLVER_VERSION,
+    VECTOR_SIMILARITY_RESOLVER_VERSION,
+    AliasTableResolverOptions,
+    EntityLinkConfig,
     EntityLinkOptions,
+    VectorSimilarityResolverOptions,
     alias_set_fingerprint,
     entity_link_id,
     normalize_alias_text,
+    parse_entity_link_options,
 )
 from .nlp import (
     NLPDocument,
@@ -57,7 +62,10 @@ __all__ = [
     "ALIAS_RESOLVER_VERSION",
     "BASE_FEATURES",
     "TONE_SCORER_VERSION",
+    "VECTOR_SIMILARITY_RESOLVER_VERSION",
+    "AliasTableResolverOptions",
     "DocumentFeatureOptions",
+    "EntityLinkConfig",
     "EntityLinkOptions",
     "NLPDocument",
     "NLPEntity",
@@ -70,6 +78,7 @@ __all__ = [
     "PIIEntity",
     "PIIError",
     "ToneOptions",
+    "VectorSimilarityResolverOptions",
     "alias_set_fingerprint",
     "category_hits_column",
     "category_score_column",
@@ -85,6 +94,7 @@ __all__ = [
     "minhash_signature",
     "near_duplicates",
     "normalize_alias_text",
+    "parse_entity_link_options",
     "pos_count_column",
     "pos_ratio_column",
     "redact_pii",

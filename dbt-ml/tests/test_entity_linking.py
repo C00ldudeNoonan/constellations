@@ -13,6 +13,7 @@ from dbt_ml.config import load_project
 from dbt_ml.config.loader import ConfigError
 from dbt_ml.text import (
     ALIAS_RESOLVER_VERSION,
+    VECTOR_SIMILARITY_RESOLVER_VERSION,
     alias_set_fingerprint,
     normalize_alias_text,
 )
@@ -387,6 +388,336 @@ def test_normalize_alias_text_is_nfkc_casefold_and_collapsed() -> None:
     assert normalize_alias_text("Apple  Inc.") == "apple inc."
 
 
+# --- vector-similarity resolver ---------------------------------------------
+
+_VEC_MENTIONS = pl.DataFrame(
+    {
+        "entity_id": ["m-apple", "m-msft", "m-far"],
+        "document_id": ["d1", "d1", "d1"],
+        "entity_text": ["Apple", "Microsoft", "Something else"],
+        "embedding": [[1.0, 0.0], [0.0, 1.0], [0.7071, 0.7071]],
+        "label": ["ORG", "ORG", "ORG"],
+        "start": [0, 0, 0],
+        "end": [5, 9, 14],
+        "sensitive_notes": ["a", "b", "c"],
+    }
+)
+_VEC_ALIASES = pl.DataFrame(
+    {
+        "canonical_id": ["AAPL", "0000320193", "MSFT"],
+        "entity_namespace": ["ticker", "cik", "ticker"],
+        "embedding": [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+    }
+)
+
+
+def _vec_ctx(options: dict[str, object] | None = None) -> TransformContext:
+    merged: dict[str, object] = {"resolver": "vector_similarity", "threshold": 0.9}
+    merged.update(options or {})
+    return _ctx(merged)
+
+
+def _vec_deps(
+    mentions: pl.DataFrame = _VEC_MENTIONS,
+    aliases: pl.DataFrame = _VEC_ALIASES,
+) -> dict[str, pl.DataFrame]:
+    return _deps(mentions, aliases)
+
+
+# Disables the default label/start/end passthrough for minimal mention frames
+# that only carry identity + embedding columns.
+_NO_SPANS: dict[str, object] = {
+    "label_field": None,
+    "start_field": None,
+    "end_field": None,
+}
+
+
+def test_vector_similarity_matches_above_threshold_with_scores() -> None:
+    first = link_entities.run(_vec_deps(), _vec_ctx())
+    second = link_entities.run(_vec_deps(), _vec_ctx())
+
+    apple = first.filter(pl.col("mention_id") == "m-apple").sort("entity_namespace")
+    assert apple["entity_namespace"].to_list() == ["cik", "ticker"]
+    assert apple["canonical_id"].to_list() == ["0000320193", "AAPL"]
+    assert apple["status"].to_list() == ["matched", "matched"]
+    assert apple["match_method"].to_list() == ["cosine", "cosine"]
+    assert apple["match_score"].to_list() == [pytest.approx(1.0), pytest.approx(1.0)]
+    assert apple["resolver"].to_list() == ["vector_similarity", "vector_similarity"]
+    assert apple["resolver_version"].to_list() == [VECTOR_SIMILARITY_RESOLVER_VERSION] * 2
+
+    msft = first.filter(pl.col("mention_id") == "m-msft")
+    assert msft["canonical_id"].to_list() == ["MSFT"]
+    assert msft["match_score"].to_list() == [pytest.approx(1.0)]
+
+    # Mention text and unlisted source columns are withheld by default.
+    assert "entity_text" not in first.columns
+    assert "sensitive_notes" not in first.columns
+    assert first["entity_link_id"].to_list() == second["entity_link_id"].to_list()
+    assert first["entity_link_id"].n_unique() == first.height
+
+
+def test_vector_similarity_below_threshold_is_unmatched() -> None:
+    output = link_entities.run(_vec_deps(), _vec_ctx())
+
+    far = output.filter(pl.col("mention_id") == "m-far")
+    assert far["status"].to_list() == ["unmatched"]
+    assert far["entity_namespace"].to_list() == [None]
+    assert far["canonical_id"].to_list() == [None]
+    assert far["match_method"].to_list() == [None]
+    assert far["match_score"].to_list() == [None]
+
+
+def test_vector_similarity_null_mention_vector_is_unmatched() -> None:
+    mentions = pl.DataFrame(
+        {
+            "entity_id": ["m-null"],
+            "document_id": ["d1"],
+            "embedding": [None],
+        },
+        schema_overrides={"embedding": pl.List(pl.Float64)},
+    )
+
+    output = link_entities.run(_vec_deps(mentions), _vec_ctx(_NO_SPANS))
+
+    assert output["status"].to_list() == ["unmatched"]
+
+
+def test_vector_similarity_ties_are_ambiguous_not_guessed() -> None:
+    aliases = pl.DataFrame(
+        {
+            "canonical_id": ["AAPL", "APPL"],
+            "entity_namespace": ["ticker", "ticker"],
+            "embedding": [[1.0, 0.0], [1.0, 0.0]],
+        }
+    )
+
+    output = link_entities.run(
+        _vec_deps(aliases=aliases), _vec_ctx()
+    ).filter(pl.col("mention_id") == "m-apple")
+
+    assert output["status"].to_list() == ["ambiguous", "ambiguous"]
+    assert sorted(output["canonical_id"].to_list()) == ["AAPL", "APPL"]
+    assert output["entity_link_id"].n_unique() == 2
+
+
+def test_vector_similarity_ambiguity_margin_widens_ties() -> None:
+    mentions = _VEC_MENTIONS.head(1)  # m-apple only
+    aliases = pl.DataFrame(
+        {
+            "canonical_id": ["EXACT", "CLOSE"],
+            "entity_namespace": ["ticker", "ticker"],
+            # cosine 1.0 vs ~0.99987 — distinct without a margin, tied with one.
+            "embedding": [[1.0, 0.0], [0.984, 0.178]],
+        }
+    )
+
+    strict = link_entities.run(_vec_deps(mentions, aliases), _vec_ctx())
+    assert strict["status"].to_list() == ["matched"]
+    assert strict["canonical_id"].to_list() == ["EXACT"]
+
+    lenient = link_entities.run(
+        _vec_deps(mentions, aliases), _vec_ctx({"ambiguity_margin": 0.05})
+    )
+    assert lenient["status"].to_list() == ["ambiguous", "ambiguous"]
+
+
+def test_vector_similarity_on_ambiguity_error_names_only_ids() -> None:
+    aliases = pl.DataFrame(
+        {
+            "canonical_id": ["AAPL", "APPL"],
+            "entity_namespace": ["ticker", "ticker"],
+            "embedding": [[1.0, 0.0], [1.0, 0.0]],
+        }
+    )
+
+    with pytest.raises(ValueError, match="on_ambiguity is 'error'") as excinfo:
+        link_entities.run(
+            _vec_deps(aliases=aliases), _vec_ctx({"on_ambiguity": "error"})
+        )
+
+    assert "m-apple" in str(excinfo.value)
+    assert "Apple" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("metric", "threshold", "expected"),
+    [
+        ("dot", 1.5, "AAPL"),
+        ("euclidean", -0.5, "AAPL"),
+    ],
+)
+def test_vector_similarity_metric_variants(
+    metric: str, threshold: float, expected: str
+) -> None:
+    mentions = pl.DataFrame(
+        {
+            "entity_id": ["m-apple"],
+            "document_id": ["d1"],
+            "embedding": [[2.0, 0.0]] if metric == "dot" else [[1.0, 0.0]],
+        }
+    )
+    aliases = pl.DataFrame(
+        {
+            "canonical_id": ["AAPL", "MSFT"],
+            "entity_namespace": ["ticker", "ticker"],
+            "embedding": [[1.0, 0.0], [0.0, 1.0]],
+        }
+    )
+
+    output = link_entities.run(
+        _vec_deps(mentions, aliases),
+        _vec_ctx({**_NO_SPANS, "metric": metric, "threshold": threshold}),
+    )
+
+    assert output["status"].to_list() == ["matched"]
+    assert output["canonical_id"].to_list() == [expected]
+    assert output["match_method"].to_list() == [metric]
+
+
+def test_vector_similarity_dimension_mismatch_fails() -> None:
+    mentions = pl.DataFrame(
+        {
+            "entity_id": ["m-apple"],
+            "document_id": ["d1"],
+            "embedding": [[1.0, 0.0, 0.0]],
+        }
+    )
+
+    with pytest.raises(ValueError, match="dimensionality"):
+        link_entities.run(_vec_deps(mentions), _vec_ctx(_NO_SPANS))
+
+
+def test_vector_similarity_rejects_non_numeric_vectors() -> None:
+    aliases = pl.DataFrame(
+        {
+            "canonical_id": ["AAPL"],
+            "entity_namespace": ["ticker"],
+            "embedding": [["not", "a", "number"]],
+        }
+    )
+
+    with pytest.raises(ValueError, match="must contain only numbers"):
+        link_entities.run(_vec_deps(aliases=aliases), _vec_ctx())
+
+
+def test_vector_similarity_reference_version_tracks_alias_vectors() -> None:
+    original = link_entities.run(_vec_deps(), _vec_ctx())
+    moved = _VEC_ALIASES.with_columns(
+        pl.Series("embedding", [[0.9, 0.1], [1.0, 0.0], [0.0, 1.0]])
+    )
+    changed = link_entities.run(_vec_deps(aliases=moved), _vec_ctx())
+    unchanged = link_entities.run(_vec_deps(), _vec_ctx())
+
+    assert original["alias_set_version"].n_unique() == 1
+    assert (
+        original["alias_set_version"].to_list()[0]
+        == unchanged["alias_set_version"].to_list()[0]
+    )
+    assert (
+        original["alias_set_version"].to_list()[0]
+        != changed["alias_set_version"].to_list()[0]
+    )
+
+
+def test_vector_similarity_passthrough_and_include_fields() -> None:
+    mentions = _VEC_MENTIONS.rename({"sensitive_notes": "release_year"})
+
+    output = link_entities.run(
+        _vec_deps(mentions),
+        _vec_ctx({"include_fields": ["release_year"], "include_mention_text": True}),
+    )
+
+    apple = output.filter(pl.col("mention_id") == "m-apple")
+    assert apple["label"].to_list() == ["ORG", "ORG"]
+    assert apple["mention_text"].to_list() == ["Apple", "Apple"]
+    assert apple["release_year"].to_list() == ["a", "a"]
+
+
+def test_vector_similarity_empty_alias_frame_yields_unmatched() -> None:
+    empty_aliases = pl.DataFrame(
+        schema={
+            "canonical_id": pl.String(),
+            "entity_namespace": pl.String(),
+            "embedding": pl.List(pl.Float64),
+        }
+    )
+
+    output = link_entities.run(_vec_deps(aliases=empty_aliases), _vec_ctx())
+
+    assert output["status"].unique().to_list() == ["unmatched"]
+    assert output.height == _VEC_MENTIONS.height
+
+
+def test_vector_similarity_rejects_mismatched_embedding_spaces() -> None:
+    mentions = _VEC_MENTIONS.with_columns(pl.lit("cfg-A").alias("embedding_config_hash"))
+    aliases = _VEC_ALIASES.with_columns(pl.lit("cfg-B").alias("embedding_config_hash"))
+
+    with pytest.raises(ValueError, match="share one embedding space"):
+        link_entities.run(_vec_deps(mentions, aliases), _vec_ctx())
+
+
+def test_vector_similarity_accepts_matching_embedding_spaces() -> None:
+    mentions = _VEC_MENTIONS.with_columns(pl.lit("cfg-A").alias("embedding_config_hash"))
+    aliases = _VEC_ALIASES.with_columns(pl.lit("cfg-A").alias("embedding_config_hash"))
+
+    output = link_entities.run(_vec_deps(mentions, aliases), _vec_ctx())
+
+    assert output.filter(pl.col("mention_id") == "m-msft")["canonical_id"].to_list() == [
+        "MSFT"
+    ]
+    assert "embedding_config_hash" not in output.columns
+
+
+def test_vector_similarity_embedding_space_check_can_be_disabled() -> None:
+    mentions = _VEC_MENTIONS.with_columns(pl.lit("cfg-A").alias("embedding_config_hash"))
+    aliases = _VEC_ALIASES.with_columns(pl.lit("cfg-B").alias("embedding_config_hash"))
+
+    output = link_entities.run(
+        _vec_deps(mentions, aliases),
+        _vec_ctx({"embedding_config_hash_field": None}),
+    )
+
+    assert output.filter(pl.col("mention_id") == "m-msft")["status"].to_list() == [
+        "matched"
+    ]
+
+
+def test_vector_similarity_does_not_require_mention_text_by_default() -> None:
+    mentions = _VEC_MENTIONS.drop("entity_text")
+
+    output = link_entities.run(_vec_deps(mentions), _vec_ctx())
+
+    assert output.filter(pl.col("mention_id") == "m-msft")["canonical_id"].to_list() == [
+        "MSFT"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"resolver": "vector_similarity"}, "threshold"),
+        (
+            {"resolver": "vector_similarity", "threshold": 0.5, "match_methods": ["exact"]},
+            "Extra inputs are not permitted",
+        ),
+        (
+            {"resolver": "vector_similarity", "threshold": 0.5, "ambiguity_margin": -0.1},
+            "non-negative",
+        ),
+        (
+            {"resolver": "vector_similarity", "threshold": float("inf")},
+            "finite",
+        ),
+    ],
+)
+def test_vector_similarity_options_are_strict(
+    options: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        link_entities.validate_options({**_BASE_OPTIONS, **options})
+
+
 def _example_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "examples" / "economic_entity_links"
 
@@ -400,6 +731,23 @@ def test_economic_entity_links_example_compiles() -> None:
     order = dag.execution_order()
     assert order.index("entity_links") > order.index("entity_mentions")
     assert order.index("entity_links") > order.index("entity_aliases")
+
+
+def test_economic_entity_links_embeddings_example_compiles() -> None:
+    project_dir = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "economic_entity_links_embeddings"
+    )
+    project, sources, models = load_project(project_dir)
+
+    dag = validate_project_contract(project, sources, models, project_dir)
+
+    order = dag.execution_order()
+    assert order.index("mention_embeddings") > order.index("entity_mentions")
+    assert order.index("alias_embeddings") > order.index("entity_aliases")
+    assert order.index("entity_links") > order.index("mention_embeddings")
+    assert order.index("entity_links") > order.index("alias_embeddings")
 
 
 @pytest.mark.parametrize(

@@ -23,6 +23,12 @@ from .features import (
     pos_count_column,
     pos_ratio_column,
 )
+from .keyphrases import (
+    KEYPHRASE_DOMAIN,
+    KEYPHRASE_EXTRACTOR_NAME,
+    KEYPHRASE_EXTRACTOR_VERSION,
+    KeyphraseOptions,
+)
 from .language import detect_language
 from .linking import (
     ALIAS_RESOLVER_VERSION,
@@ -61,12 +67,16 @@ from .tone import (
 __all__ = [
     "ALIAS_RESOLVER_VERSION",
     "BASE_FEATURES",
+    "KEYPHRASE_DOMAIN",
+    "KEYPHRASE_EXTRACTOR_NAME",
+    "KEYPHRASE_EXTRACTOR_VERSION",
     "TONE_SCORER_VERSION",
     "VECTOR_SIMILARITY_RESOLVER_VERSION",
     "AliasTableResolverOptions",
     "DocumentFeatureOptions",
     "EntityLinkConfig",
     "EntityLinkOptions",
+    "KeyphraseOptions",
     "NLPDocument",
     "NLPEntity",
     "NLPEntityOptions",

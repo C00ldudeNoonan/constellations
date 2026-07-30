@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Deterministic keyphrase extraction (issue #219)
+
+- Added the `dbt_ml.text.transforms.extract_keyphrases` transform, which
+  extracts a ranked keyphrase child table from the NLP token child table. No
+  IDF, no learned model, no optional extra — the same token table and the same
+  options always produce the same output.
+- Candidates are contiguous lemma n-grams (configurable `min_phrase_length` and
+  `max_phrase_length`, default 1–3) formed within sentence boundaries. Boundary
+  tokens must not be stop words and must not carry a POS tag in the configurable
+  `stop_pos` set; interior tokens are unrestricted, so phrases like "rate of
+  return" are valid 3-grams. Score is normalized term frequency (occurrence count
+  / total candidate n-gram count in the document); tie-breaking is alphabetic on
+  `phrase_lemma` for deterministic rank assignment.
+- Output is a child table with one row per `(document_id, phrase_lemma)`:
+  `phrase_id` (stable hash), `rank`, `score`, `phrase_lemma`, `phrase_length`,
+  `token_start`, `token_end`, `sentence_index`, plus the five NLP identity
+  columns and `extractor`/`extractor_version`. Phrase text is opt-in
+  (`include_phrase_text: true`) because it is a verbatim excerpt of the source
+  document.
+- Supports `declared_incremental_contract` with `parent_key="document_id"` and
+  `child_key="phrase_id"` — re-extracting a changed document replaces exactly
+  its keyphrase rows, consistent with `nlp_tokens` and `nlp_entities`.
+- Added a `document_keyphrases` model to the `examples/economic_nlp` pipeline.
+
 ### Deterministic document tone/sentiment (issue #216)
 
 - Added the `dbt_ml.text.transforms.document_tone` transform, which scores

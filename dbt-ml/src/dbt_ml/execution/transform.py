@@ -6,7 +6,14 @@ from typing import Any
 
 import polars as pl
 
-from ..adapters import AdapterError, WarehouseAdapter, WarehouseCapability
+from ..adapters import (
+    AdapterError,
+    StateRecord,
+    StateScope,
+    StateValue,
+    WarehouseAdapter,
+    WarehouseCapability,
+)
 from ..agent_context import (
     AgentContextValidationError,
     empty_agent_context_frame,
@@ -14,12 +21,21 @@ from ..agent_context import (
 )
 from ..config.model import ModelConfig
 from ..config.profile import DEFAULT_LLM_PROVIDER
+from ..config.project import ProjectConfig
 from ..dag import parse_ref
+from ..hashing import canonical_fingerprint, canonical_json
 from ..paths import resolve_within_project
 from ..profile import ResolvedProfile
 from ..providers import get_inference_provider, resolve_provider_model
 from ..sql_models import compile_sql, discover_refs, read_sql_source
-from ..transforms import TransformContext, load_transform, transform_call_arity
+from ..transforms import (
+    IncrementalContract,
+    TransformContext,
+    load_incremental_contract,
+    load_transform,
+    transform_call_arity,
+)
+from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
 from .errors import artifact_error_text
 from .warehouse import warehouse_options
@@ -126,17 +142,13 @@ def run_sql_model(
 def run_transform_model(
     *,
     model: ModelConfig,
+    project: ProjectConfig,
     project_dir: Path,
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
+    full_refresh: bool = False,
 ) -> ModelRunResult:
     assert model.transform is not None
-    if model.materialization == "incremental":
-        raise RunError(
-            f"Transform model '{model.name}' declares `materialization: incremental`, "
-            "but transforms only support `full` today. Set `materialization: full` "
-            "(or omit it) — see issue #53."
-        )
     if model.transform.type != "python":
         raise RunError(
             f"Model '{model.name}': only `type: python` transforms are supported in v1"
@@ -148,25 +160,9 @@ def run_transform_model(
             f"Transform model '{model.name}' must declare `depends_on:` for v1"
         )
 
-    provider_name: str | None = None
-    provider_model: str | None = None
-    provider_implementation: str | None = None
-    if model.transform.uses_llm:
-        provider_name = (
-            resolved.llm.provider
-            if resolved.llm is not None
-            else DEFAULT_LLM_PROVIDER
-        )
-        selected_model = resolved.llm.model if resolved.llm is not None else None
-        try:
-            provider = get_inference_provider(provider_name)
-            provider_model = resolve_provider_model(provider, selected_model)
-            provider_implementation = provider.implementation_identity()
-        except Exception as e:
-            raise RunError(
-                f"Transform model '{model.name}' could not initialize inference: "
-                f"{artifact_error_text(e)}"
-            ) from e
+    provider_name, provider_model, provider_implementation = _resolve_transform_provider(
+        model, resolved
+    )
 
     transform_fn = load_transform(model.transform.module, project_dir)
     deps: dict[str, pl.DataFrame] = {}
@@ -174,16 +170,86 @@ def run_transform_model(
         dep_name = parse_ref(dep_ref)
         deps[dep_name] = adapter.read_table(dep_name)
 
+    ctx = TransformContext(
+        project_dir=project_dir,
+        profile_name=resolved.profile_name,
+        target_name=resolved.target_name,
+        warehouse=resolved.warehouse,
+        llm=resolved.llm,
+        options=dict(model.transform.options),
+    )
+
+    result = ModelRunResult(
+        model_name=model.name,
+        materialization=model.materialization,
+        kind="transform",
+        provider=provider_name,
+        provider_model=provider_model,
+        provider_implementation=provider_implementation,
+    )
+
+    if model.materialization == "incremental":
+        contract = load_incremental_contract(
+            model.transform.module, project_dir, model.transform.options
+        )
+        # The compiler requires the contract for incremental materialization.
+        assert contract is not None, "incremental transform is missing its contract"
+        _require_incremental_capabilities(model, adapter)
+        return _run_incremental_transform(
+            model=model,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            transform_fn=transform_fn,
+            ctx=ctx,
+            deps=deps,
+            contract=contract,
+            full_refresh=full_refresh,
+            result=result,
+        )
+
+    output = _invoke_transform(transform_fn, deps, ctx, model)
+    adapter.materialize_full(
+        model.name,
+        _validate_agent_context_output(output, model),
+        options=warehouse_options(adapter, model),
+    )
+    result.rows_written = output.height
+    return result
+
+
+def _resolve_transform_provider(
+    model: ModelConfig, resolved: ResolvedProfile
+) -> tuple[str | None, str | None, str | None]:
+    assert model.transform is not None
+    if not model.transform.uses_llm:
+        return None, None, None
+    provider_name = (
+        resolved.llm.provider if resolved.llm is not None else DEFAULT_LLM_PROVIDER
+    )
+    selected_model = resolved.llm.model if resolved.llm is not None else None
+    try:
+        provider = get_inference_provider(provider_name)
+        provider_model = resolve_provider_model(provider, selected_model)
+        provider_implementation = provider.implementation_identity()
+    except Exception as e:
+        raise RunError(
+            f"Transform model '{model.name}' could not initialize inference: "
+            f"{artifact_error_text(e)}"
+        ) from e
+    return provider_name, provider_model, provider_implementation
+
+
+def _invoke_transform(
+    transform_fn: Any,
+    deps: dict[str, pl.DataFrame],
+    ctx: TransformContext,
+    model: ModelConfig,
+) -> pl.DataFrame:
+    assert model.transform is not None
     try:
         if transform_call_arity(transform_fn) == 2:
-            ctx = TransformContext(
-                project_dir=project_dir,
-                profile_name=resolved.profile_name,
-                target_name=resolved.target_name,
-                warehouse=resolved.warehouse,
-                llm=resolved.llm,
-                options=dict(model.transform.options),
-            )
             output = transform_fn(deps, ctx)
         else:
             output = transform_fn(deps)
@@ -194,27 +260,273 @@ def run_transform_model(
         raise RunError(
             f"Transform model '{model.name}' failed: {artifact_error_text(e)}"
         ) from e
-
     if not isinstance(output, pl.DataFrame):
         raise RunError(
             f"Transform '{model.transform.module}' must return a polars.DataFrame"
         )
+    return output
 
-    adapter.materialize_full(
-        model.name,
-        _validate_agent_context_output(output, model),
-        options=warehouse_options(adapter, model),
+
+def _require_incremental_capabilities(
+    model: ModelConfig, adapter: WarehouseAdapter
+) -> None:
+    """Fail preflight when the active adapter cannot atomically upsert a
+    changed parent's children or delete a removed parent's rows and state.
+
+    The parent-keyed delete of a changed parent's old children and the
+    child-keyed upsert of its new children are separate operations; the design
+    assumes no cross-operation transaction, so a retry reprocesses a parent
+    all-or-nothing (issue #218)."""
+    capabilities = adapter.capabilities()
+    missing = [
+        capability.value
+        for capability in (
+            WarehouseCapability.ATOMIC_KEYED_UPSERT,
+            WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
+        )
+        if capability not in capabilities
+    ]
+    if missing:
+        raise RunError(
+            f"Adapter '{adapter.adapter_type()}' cannot run incremental transform "
+            f"'{model.name}': missing capabilities {sorted(missing)}."
+        )
+
+
+def _run_incremental_transform(
+    *,
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    transform_fn: Any,
+    ctx: TransformContext,
+    deps: dict[str, pl.DataFrame],
+    contract: IncrementalContract,
+    full_refresh: bool,
+    result: ModelRunResult,
+) -> ModelRunResult:
+    """Generalize the chunk-model incremental pattern to a declared one-to-many
+    transform: skip unchanged parents, invoke the transform only on changed/new
+    parents, replace each changed parent's children by deleting on the parent
+    key and upserting on the child key, and advance state only after a
+    successful publication (issue #218)."""
+    assert model.transform is not None
+    parent_source = contract.resolve_parent_source(list(deps))
+    parent_frame = deps[parent_source]
+    code_version = compute_model_code_version(
+        model, project, project_dir, resolved=resolved
+    )
+    state_scope = StateScope(model.name)
+    is_incremental = not full_refresh
+    prior_state = adapter.fetch_state(state_scope) if is_incremental else {}
+
+    reference_fingerprints = {
+        ref: _frame_fingerprint(deps[ref]) for ref in contract.reference_deps
+    }
+    groups = _parent_groups(parent_frame, contract.parent_source_key, model.name)
+    current_keys = {key for key, _ in groups}
+
+    processed_parents: list[str] = []
+    state_records: list[StateRecord] = []
+    changed: list[str] = []
+    skipped = 0
+    for parent_key, rows in groups:
+        fingerprint = _parent_fingerprint(parent_key, rows, reference_fingerprints)
+        if is_incremental:
+            prior = prior_state.get(parent_key)
+            if prior == StateValue(fingerprint, code_version):
+                skipped += 1
+                continue
+            if prior is not None:
+                changed.append(parent_key)
+        processed_parents.append(parent_key)
+        state_records.append(StateRecord(parent_key, fingerprint, code_version))
+
+    removed = (
+        [key for key in prior_state if key not in current_keys] if is_incremental else []
+    )
+    options = warehouse_options(adapter, model)
+
+    # No changed or new parents: at most some removed parents need deleting.
+    # Skip invoking the transform so an unchanged corpus performs no provider
+    # work — the primary cost goal of incremental materialization.
+    if is_incremental and not processed_parents:
+        if removed:
+            adapter.delete_rows_and_state(
+                model.name,
+                key_col=contract.parent_key,
+                keys=removed,
+                state_scope=state_scope,
+            )
+        result.documents_skipped = skipped
+        result.documents_deleted = len(removed)
+        result.metrics = _incremental_metrics(contract, is_incremental=True)
+        return result
+
+    call_deps = dict(deps)
+    if is_incremental:
+        call_deps[parent_source] = parent_frame.filter(
+            pl.col(contract.parent_source_key).is_in(processed_parents)
+        )
+
+    output = _validate_agent_context_output(
+        _invoke_transform(transform_fn, call_deps, ctx, model), model
+    )
+    _validate_incremental_output(
+        output, contract, model, set(processed_parents), is_incremental=is_incremental
     )
 
-    return ModelRunResult(
-        model_name=model.name,
-        materialization=model.materialization,
-        kind="transform",
-        provider=provider_name,
-        provider_model=provider_model,
-        provider_implementation=provider_implementation,
-        rows_written=output.height,
+    if not is_incremental:
+        # Full refresh: atomic full replace, then reset the per-parent state
+        # baseline so the next incremental run classifies correctly.
+        result.rows_written = adapter.materialize_full(
+            model.name, output, options=options
+        )
+        adapter.replace_state(state_scope, state_records)
+        result.documents_processed = len(processed_parents)
+        result.metrics = _incremental_metrics(contract, is_incremental=False)
+        return result
+
+    # A changed parent may now produce fewer or different children, so delete
+    # its old rows by the parent key before the child-keyed upsert.
+    stale = removed + changed
+    if stale:
+        adapter.delete_rows_and_state(
+            model.name,
+            key_col=contract.parent_key,
+            keys=stale,
+            state_scope=state_scope,
+        )
+    rows_written = 0
+    if output.height:
+        try:
+            rows_written = adapter.materialize_incremental(
+                model.name,
+                output,
+                key_col=contract.child_key,
+                on_schema_change=model.on_schema_change,
+                options=options,
+            )
+        except AdapterError as error:
+            raise RunError(str(error)) from error
+    adapter.upsert_state(state_scope, state_records)
+
+    result.rows_written = rows_written
+    result.documents_processed = len(processed_parents)
+    result.documents_skipped = skipped
+    result.documents_deleted = len(removed)
+    result.metrics = _incremental_metrics(contract, is_incremental=True)
+    return result
+
+
+def _parent_groups(
+    frame: pl.DataFrame, key_col: str, model_name: str
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    if key_col not in frame.columns:
+        raise RunError(
+            f"Incremental transform '{model_name}': parent_source is missing the "
+            f"parent key column '{key_col}'. Available: {sorted(frame.columns)}"
+        )
+    if frame.schema[key_col] != pl.String:
+        raise RunError(
+            f"Incremental transform '{model_name}': parent key column '{key_col}' "
+            f"must be string-typed, got {frame.schema[key_col]}"
+        )
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for row in frame.iter_rows(named=True):
+        raw = row[key_col]
+        if raw is None or not str(raw).strip():
+            raise RunError(
+                f"Incremental transform '{model_name}': parent key column "
+                f"'{key_col}' contains null or empty values"
+            )
+        key = str(raw)
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = []
+            groups[key] = bucket
+            order.append(key)
+        bucket.append(row)
+    return [(key, groups[key]) for key in order]
+
+
+def _frame_fingerprint(frame: pl.DataFrame) -> str:
+    # Order-insensitive: reordering a reference table (e.g. an alias list) must
+    # not invalidate every parent.
+    return canonical_fingerprint(
+        {"rows": sorted(frame.iter_rows(named=True), key=canonical_json)},
+        domain="dbt-ml.transform-incremental-reference",
     )
+
+
+def _parent_fingerprint(
+    parent_key: str,
+    rows: list[dict[str, Any]],
+    reference_fingerprints: dict[str, str],
+) -> str:
+    return canonical_fingerprint(
+        {
+            "parent": parent_key,
+            "rows": sorted(rows, key=canonical_json),
+            "references": reference_fingerprints,
+        },
+        domain="dbt-ml.transform-incremental-input",
+    )
+
+
+def _validate_incremental_output(
+    output: pl.DataFrame,
+    contract: IncrementalContract,
+    model: ModelConfig,
+    processed_parents: set[str],
+    *,
+    is_incremental: bool,
+) -> None:
+    for column in (contract.parent_key, contract.child_key):
+        if column not in output.columns:
+            raise RunError(
+                f"Incremental transform '{model.name}' output is missing declared "
+                f"column '{column}'"
+            )
+    if output.height == 0:
+        return
+    if output[contract.parent_key].null_count():
+        raise RunError(
+            f"Incremental transform '{model.name}' produced null "
+            f"{contract.parent_key} parent keys"
+        )
+    child = output[contract.child_key]
+    if child.null_count():
+        raise RunError(
+            f"Incremental transform '{model.name}' produced null "
+            f"{contract.child_key} child keys"
+        )
+    if child.n_unique() != output.height:
+        raise RunError(
+            f"Incremental transform '{model.name}' produced duplicate "
+            f"{contract.child_key} child keys"
+        )
+    if is_incremental:
+        emitted = set(output[contract.parent_key].cast(pl.String).to_list())
+        unexpected = sorted(emitted - processed_parents)
+        if unexpected:
+            raise RunError(
+                f"Incremental transform '{model.name}' emitted rows for parents "
+                f"outside the changed/new set: {unexpected[:5]}"
+            )
+
+
+def _incremental_metrics(
+    contract: IncrementalContract, *, is_incremental: bool
+) -> dict[str, Any]:
+    return {
+        "incremental": is_incremental,
+        "parent_key": contract.parent_key,
+        "child_key": contract.child_key,
+    }
 
 
 def _validate_agent_context_output(

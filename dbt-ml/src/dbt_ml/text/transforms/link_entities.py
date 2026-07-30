@@ -6,8 +6,13 @@ from typing import Any
 
 import polars as pl
 
-from ...transforms import TransformContext
-from ._linking import declared_link_dependencies, run_links, validate_link_options
+from ...transforms import IncrementalContract, TransformContext
+from ._linking import (
+    declared_link_dependencies,
+    declared_link_incremental_contract,
+    run_links,
+    validate_link_options,
+)
 
 
 def validate_options(options: Mapping[str, Any]) -> None:
@@ -16,6 +21,10 @@ def validate_options(options: Mapping[str, Any]) -> None:
 
 def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
     return declared_link_dependencies(options)
+
+
+def declared_incremental_contract(options: Mapping[str, Any]) -> IncrementalContract:
+    return declared_link_incremental_contract(options)
 
 
 def run(

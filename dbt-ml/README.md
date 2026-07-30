@@ -1236,6 +1236,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs via an operator-owned alias table       |
 | `dbt_ml.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
 | `dbt_ml.text.transforms.document_tone`      | Scores per-document tone from the token table + an operator-owned lexicon      |
+| `dbt_ml.text.transforms.extract_keyphrases` | Ranks keyphrases per document by n-gram frequency; child table with stable IDs |
 
 All are pure functions importable via `from dbt_ml.text import …` if you'd
 rather wire them into your own transforms.
@@ -1439,6 +1440,64 @@ Conventions worth knowing:
 - No document text or matched phrases reach the output; `include_fields`
   allow-lists parent metadata (publisher, release date) so tone joins to them on
   the same row.
+
+### Keyphrase extraction
+
+`extract_keyphrases` ranks per-document keyphrases by normalized n-gram
+frequency from the NLP token child table. No IDF, no learned model, no optional
+extra — the same token table and the same options always produce the same ranked
+list.
+
+```yaml
+- name: document_keyphrases
+  depends_on: [ref('document_tokens')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.extract_keyphrases
+    options:
+      tokens: document_tokens     # the token child table
+      language: en
+      min_phrase_length: 1        # minimum tokens per candidate phrase
+      max_phrase_length: 3        # maximum tokens per candidate phrase
+      top_k: 15                   # phrases to keep per document
+      # include_phrase_text: true # opt-in: phrase text is a verbatim excerpt
+```
+
+The output is a child table with one row per `(document_id, phrase_lemma)`:
+
+| column | notes |
+|--------|-------|
+| `phrase_id` | stable hash of `(document_id, phrase_lemma)` |
+| `rank` | 1-indexed position within the document |
+| `score` | occurrence count / total candidate n-grams in the document |
+| `phrase_lemma` | space-joined lemmas |
+| `phrase_length` | token count |
+| `token_start` / `token_end` | first occurrence offsets (token indexes) |
+| `sentence_index` | sentence of first occurrence |
+| `phrase_text` | surface form — present only when `include_phrase_text: true` |
+| `extractor` / `extractor_version` | `ngram_freq` / `1` |
+| `nlp_provider` … `nlp_language` | 5 NLP identity columns from the token table |
+
+Conventions worth knowing:
+
+- Candidates are contiguous lemma n-grams within sentence boundaries. Boundary
+  tokens (first and last) must not be stop words and must not carry a POS tag in
+  the configurable `stop_pos` set (default: `PUNCT`, `SPACE`, `NUM`, `SYM`, `X`);
+  interior tokens are unrestricted, so "rate of return" is a valid 3-gram.
+- Score is normalized term frequency: occurrence count / total candidate n-gram
+  count in the document. Rank tie-breaking is alphabetic on `phrase_lemma` for
+  deterministic output regardless of corpus order.
+- Multi-token extraction (`max_phrase_length > 1`) requires sentence boundaries
+  (`sentence_index` non-null). Rebuild the token table with a spaCy pipeline that
+  includes the sentencizer or dependency parser, or set `max_phrase_length: 1` to
+  restrict to unigrams.
+- **Phrase text is opt-in.** `include_phrase_text: true` emits the `phrase_text`
+  column using the `token_text` values already in the token table. Phrase text is
+  a verbatim excerpt of the source document and may contain sensitive content —
+  the default keeps it out of the output.
+- `extract_keyphrases` supports `declared_incremental_contract` with
+  `parent_key="document_id"` and `child_key="phrase_id"`, consistent with
+  `nlp_tokens` and `nlp_entities`.
 
 **PII setup** — `redact_pii` uses spaCy under the hood. First-time install:
 

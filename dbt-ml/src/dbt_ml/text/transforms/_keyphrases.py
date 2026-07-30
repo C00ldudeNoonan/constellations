@@ -63,6 +63,8 @@ def run_keyphrases(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.D
         return _empty_output(options)
 
     _reject_unsupported_language(tokens, options)
+    if options.max_phrase_length > 1:
+        _reject_null_sentence_index(tokens, options)
 
     candidates = _build_candidates(tokens, options)
     if candidates.is_empty():
@@ -115,6 +117,20 @@ def _require_columns(
         raise ValueError(
             f"Tokens model '{model_name}' is missing configured columns "
             f"{missing}; got: {sorted(frame.columns)}"
+        )
+
+
+def _reject_null_sentence_index(
+    tokens: pl.DataFrame, options: KeyphraseOptions
+) -> None:
+    null_count = tokens[options.sentence_index_field].null_count()
+    if null_count:
+        raise ValueError(
+            f"Tokens model '{options.tokens}' column '{options.sentence_index_field}' "
+            f"contains {null_count} null value(s). Multi-token keyphrase extraction "
+            f"(max_phrase_length > 1) requires sentence boundaries — rebuild the token "
+            "table with a spaCy pipeline that includes the sentencizer or dependency "
+            "parser, or set max_phrase_length: 1 to extract unigrams only."
         )
 
 

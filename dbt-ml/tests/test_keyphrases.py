@@ -291,6 +291,29 @@ def test_language_mismatch_fails_actionably() -> None:
         _run(tokens=tokens)
 
 
+def test_null_sentence_index_rejected_for_multi_token() -> None:
+    # spaCy can emit null sentence_index when the sentencizer is disabled.
+    # Multi-token extraction would then group all null-sentence tokens together
+    # and form phrases across unknown boundaries — reject it early.
+    tokens = _TOKENS.with_columns(
+        pl.when(pl.col("document_id") == "d1")
+        .then(None)
+        .otherwise(pl.col("sentence_index"))
+        .cast(pl.Int64())
+        .alias("sentence_index")
+    )
+    with pytest.raises(ValueError, match="sentence"):
+        _run({"max_phrase_length": 2}, tokens=tokens)
+
+
+def test_null_sentence_index_allowed_for_unigrams() -> None:
+    # Unigram extraction does not use sentence_index for phrase construction.
+    tokens = _TOKENS.with_columns(pl.lit(None).cast(pl.Int64()).alias("sentence_index"))
+    result = _run({"max_phrase_length": 1}, tokens=tokens)
+    # sentence_index column is still null in the output, but no error raised.
+    assert not result.is_empty()
+
+
 # ── empty and edge cases ──────────────────────────────────────────────────────
 
 

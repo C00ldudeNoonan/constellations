@@ -270,18 +270,13 @@ def _invoke_transform(
 def _require_incremental_capabilities(
     model: ModelConfig, adapter: WarehouseAdapter
 ) -> None:
-    """Fail preflight when the active adapter cannot atomically upsert a
-    changed parent's children or delete a removed parent's rows and state.
-
-    The parent-keyed delete of a changed parent's old children and the
-    child-keyed upsert of its new children are separate operations; the design
-    assumes no cross-operation transaction, so a retry reprocesses a parent
-    all-or-nothing (issue #218)."""
+    """Fail preflight when the active adapter cannot atomically replace a
+    changed parent's children and advance state in one transaction (issue #229)."""
     capabilities = adapter.capabilities()
     missing = [
         capability.value
         for capability in (
-            WarehouseCapability.ATOMIC_KEYED_UPSERT,
+            WarehouseCapability.ATOMIC_PARENT_CHILD_REPLACE,
             WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
         )
         if capability not in capabilities
@@ -398,29 +393,27 @@ def _run_incremental_transform(
         result.metrics = _incremental_metrics(contract, is_incremental=False)
         return result
 
-    # A changed parent may now produce fewer or different children, so delete
-    # its old rows by the parent key before the child-keyed upsert.
-    stale = removed + changed
-    if stale:
+    if removed:
         adapter.delete_rows_and_state(
             model.name,
             key_col=contract.parent_key,
-            keys=stale,
+            keys=removed,
             state_scope=state_scope,
         )
-    rows_written = 0
-    if output.height:
-        try:
-            rows_written = adapter.materialize_incremental(
-                model.name,
-                output,
-                key_col=contract.child_key,
-                on_schema_change=model.on_schema_change,
-                options=options,
-            )
-        except AdapterError as error:
-            raise RunError(str(error)) from error
-    adapter.upsert_state(state_scope, state_records)
+    try:
+        rows_written = adapter.replace_children(
+            model.name,
+            parent_key=contract.parent_key,
+            parent_ids=changed,
+            child_key=contract.child_key,
+            new_rows=output,
+            state_scope=state_scope,
+            state_records=state_records,
+            on_schema_change=model.on_schema_change,
+            options=options,
+        )
+    except AdapterError as error:
+        raise RunError(str(error)) from error
 
     result.rows_written = rows_written
     result.documents_processed = len(processed_parents)

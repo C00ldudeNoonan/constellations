@@ -379,32 +379,45 @@ def run_llm_model(
                 )
                 adapter.replace_state(state_scope, state_records)
             else:
-                if config.output_cardinality == "many" and work:
-                    # Fan-out counts can change; clear each reprocessed parent's
-                    # old rows before appending the fresh set (parent-scoped).
-                    adapter.delete_rows(
+                if config.output_cardinality == "many":
+                    rows_written = adapter.replace_children(
                         model.name,
-                        key_col=config.id_field,
-                        keys=[item.id_value for item in work],
-                    )
-                if output_rows:
-                    rows_written = adapter.materialize_incremental(
-                        model.name,
-                        output,
-                        key_col=key_col,
+                        parent_key=config.id_field,
+                        parent_ids=[item.id_value for item in work],
+                        child_key=key_col,
+                        new_rows=output,
+                        state_scope=state_scope,
+                        state_records=state_records,
                         on_schema_change=model.on_schema_change,
                         options=warehouse_opts,
                     )
-                if removed:
-                    adapter.delete_rows_and_state(
-                        model.name,
-                        key_col=config.id_field,
-                        keys=removed_id_values,
-                        state_scope=state_scope,
-                        state_record_keys=removed,
-                    )
-                if state_records:
-                    adapter.upsert_state(state_scope, state_records)
+                    if removed:
+                        adapter.delete_rows_and_state(
+                            model.name,
+                            key_col=config.id_field,
+                            keys=removed_id_values,
+                            state_scope=state_scope,
+                            state_record_keys=removed,
+                        )
+                else:
+                    if output_rows:
+                        rows_written = adapter.materialize_incremental(
+                            model.name,
+                            output,
+                            key_col=key_col,
+                            on_schema_change=model.on_schema_change,
+                            options=warehouse_opts,
+                        )
+                    if removed:
+                        adapter.delete_rows_and_state(
+                            model.name,
+                            key_col=config.id_field,
+                            keys=removed_id_values,
+                            state_scope=state_scope,
+                            state_record_keys=removed,
+                        )
+                    if state_records:
+                        adapter.upsert_state(state_scope, state_records)
         except AdapterError as e:
             raise RunError(str(e)) from e
 

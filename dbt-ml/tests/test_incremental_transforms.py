@@ -274,6 +274,8 @@ def test_failed_publication_leaves_no_stale_state_and_preserves_others(
     from dbt_ml.adapters.base import AdapterError
     from dbt_ml.adapters.duckdb import DuckDBAdapter
 
+    # replace_children is atomic: a failure rolls back the whole transaction,
+    # leaving both old rows and old state intact (issue #229).
     project = _project(tmp_path)
     _write_doc(project, "a.json", "alpha beta")
     _write_doc(project, "b.json", "gamma")
@@ -282,7 +284,7 @@ def test_failed_publication_leaves_no_stale_state_and_preserves_others(
     b_rows_before = [row for row in _tokens(project) if row[1] != a_id]
 
     _write_doc(project, "a.json", "alpha beta gamma delta")
-    original = DuckDBAdapter.materialize_incremental
+    original = DuckDBAdapter.replace_children
     failed = False
 
     def fail_once(self: DuckDBAdapter, table: str, *args: object, **kwargs: object) -> int:
@@ -292,12 +294,12 @@ def test_failed_publication_leaves_no_stale_state_and_preserves_others(
             raise AdapterError("simulated publication failure")
         return original(self, table, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", fail_once)
+    monkeypatch.setattr(DuckDBAdapter, "replace_children", fail_once)
     with pytest.raises(RunError, match="simulated publication failure"):
         run_project(project)
 
-    # a.json's state is gone (its rewrite failed); the unchanged b.json is intact.
-    assert a_id not in _state_keys(project)
+    # Atomic rollback: a.json's old state and rows are both still present.
+    assert a_id in _state_keys(project)
     assert [row for row in _tokens(project) if row[1] != a_id] == b_rows_before
 
     monkeypatch.undo()
@@ -420,6 +422,37 @@ class _RecordingAdapter:
         if table is not None and table.height:
             self._tables[model] = table.filter(~pl.col(key_col).is_in(keys))
 
+    def replace_children(
+        self,
+        model,
+        *,
+        parent_key,
+        parent_ids,
+        child_key,
+        new_rows,
+        state_scope,
+        state_records,
+        on_schema_change="fail",
+        options=None,
+    ):
+        from dbt_ml.adapters import StateValue
+
+        self.calls.append(("replace_children", child_key, sorted(parent_ids), new_rows.height))
+        table = self._tables.get(model)
+        if table is not None and table.height and parent_ids:
+            self._tables[model] = table.filter(~pl.col(parent_key).is_in(list(parent_ids)))
+        if new_rows.height > 0 and new_rows.width > 0:
+            existing = self._tables.get(model)
+            if existing is None or not existing.height:
+                self._tables[model] = new_rows
+            else:
+                keep = existing.filter(~pl.col(child_key).is_in(new_rows[child_key].to_list()))
+                self._tables[model] = pl.concat([keep, new_rows])
+        state = self._state.setdefault(state_scope.model_name, {})
+        for record in state_records:
+            state[record.record_key] = StateValue(record.input_fingerprint, record.code_version)
+        return new_rows.height
+
     def materialize_incremental(self, model, frame, *, key_col, on_schema_change, options):
         self.calls.append(("materialize_incremental", key_col, frame.height))
         existing = self._tables.get(model)
@@ -506,11 +539,10 @@ def test_bigquery_shaped_incremental_orchestration(tmp_path: Path) -> None:
 
     first = _run_incremental(tmp_path, adapter, model)
     assert first.documents_processed == 2
-    # All-new parents: no parent-keyed delete, one child-keyed upsert, state advance.
+    # All-new parents: no parent-keyed delete, one replace_children (no parent_ids).
     assert not [c for c in adapter.calls if c[0] == "delete_rows_and_state"]
-    upserts = [c for c in adapter.calls if c[0] == "materialize_incremental"]
-    assert upserts == [("materialize_incremental", "word_id", 4)]
-    assert ("upsert_state", ["docA", "docB"]) in adapter.calls
+    rc_calls = [c for c in adapter.calls if c[0] == "replace_children"]
+    assert rc_calls == [("replace_children", "word_id", [], 4)]
 
     # docA changes (fewer words), docB is removed.
     adapter.calls.clear()
@@ -520,10 +552,11 @@ def test_bigquery_shaped_incremental_orchestration(tmp_path: Path) -> None:
     second = _run_incremental(tmp_path, adapter, model)
     assert second.documents_processed == 1
     assert second.documents_deleted == 1
+    # Removed parent goes through delete_rows_and_state; changed parent through replace_children.
     delete_calls = [c for c in adapter.calls if c[0] == "delete_rows_and_state"]
-    assert delete_calls == [("delete_rows_and_state", "document_id", ["docA", "docB"])]
-    assert [c for c in adapter.calls if c[0] == "materialize_incremental"] == [
-        ("materialize_incremental", "word_id", 1)
+    assert delete_calls == [("delete_rows_and_state", "document_id", ["docB"])]
+    assert [c for c in adapter.calls if c[0] == "replace_children"] == [
+        ("replace_children", "word_id", ["docA"], 1)
     ]
 
     # Nothing changes: no warehouse mutation at all.
@@ -531,7 +564,7 @@ def test_bigquery_shaped_incremental_orchestration(tmp_path: Path) -> None:
     third = _run_incremental(tmp_path, adapter, model)
     assert third.documents_processed == 0
     assert third.documents_skipped == 1
-    mutating = {"delete_rows_and_state", "materialize_incremental"}
+    mutating = {"delete_rows_and_state", "replace_children"}
     assert not [c for c in adapter.calls if c[0] in mutating]
 
 
@@ -555,14 +588,18 @@ def test_reference_dep_change_reprocesses_every_parent(tmp_path: Path) -> None:
     assert first.documents_processed == 2
 
     # The documents are byte-identical, but the reference vocab changed — every
-    # parent's fingerprint moves, so all parents are reprocessed.
+    # parent's fingerprint moves, so all parents are reprocessed via replace_children.
     adapter.calls.clear()
     adapter._upstream["vocab"] = pl.DataFrame({"term": ["beta"]})
     second = _run_incremental(tmp_path, adapter, model)
     assert second.documents_processed == 2
     assert second.documents_skipped == 0
-    delete_calls = [c for c in adapter.calls if c[0] == "delete_rows_and_state"]
-    assert delete_calls == [("delete_rows_and_state", "document_id", ["docA", "docB"])]
+    # No removed parents → no delete_rows_and_state; changed parents go to replace_children.
+    assert not [c for c in adapter.calls if c[0] == "delete_rows_and_state"]
+    rc_calls = [c for c in adapter.calls if c[0] == "replace_children"]
+    assert len(rc_calls) == 1
+    assert rc_calls[0][1] == "row_id"
+    assert rc_calls[0][2] == ["docA", "docB"]
 
 
 def test_preexisting_target_without_state_is_rebuilt(tmp_path: Path) -> None:

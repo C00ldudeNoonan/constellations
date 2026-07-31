@@ -246,6 +246,7 @@ class DuckDBAdapter(WarehouseAdapter):
             {
                 WarehouseCapability.ATOMIC_FULL_REPLACE,
                 WarehouseCapability.ATOMIC_KEYED_UPSERT,
+                WarehouseCapability.ATOMIC_PARENT_CHILD_REPLACE,
                 WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
@@ -779,6 +780,58 @@ class DuckDBAdapter(WarehouseAdapter):
                 deleted_count = int(deleted[0]) if deleted else 0
             self._delete_state_rows(state_scope, scoped_keys)
         return deleted_count
+
+    def replace_children(
+        self,
+        table: str,
+        *,
+        parent_key: str,
+        parent_ids: Sequence[Any],
+        child_key: str,
+        new_rows: pl.DataFrame,
+        state_scope: StateScope,
+        state_records: Sequence[StateRecord],
+        on_schema_change: str = "fail",
+        options: BaseModel | None = None,
+    ) -> int:
+        validate_state_records(state_records)
+        has_rows = new_rows.height > 0 and new_rows.width > 0
+        if has_rows:
+            validate_incremental_keys(new_rows, child_key)
+            self.connection.register("dbt_ml_staging", new_rows)
+        try:
+            with self._transaction():
+                full = self.table_ref(table)
+                existing = self._table_columns(table)
+                if existing is not None and parent_ids:
+                    placeholders = ", ".join("?" for _ in parent_ids)
+                    self.connection.execute(
+                        f"DELETE FROM {full} "
+                        f"WHERE {self.quote_ident(parent_key)} IN ({placeholders})",
+                        list(parent_ids),
+                    )
+                if has_rows:
+                    self.connection.execute(
+                        f"CREATE TABLE IF NOT EXISTS {full} AS "
+                        "SELECT * FROM dbt_ml_staging LIMIT 0"
+                    )
+                    insert_cols = self._reconcile_schema(table, new_rows, on_schema_change)
+                    key = self.quote_ident(child_key)
+                    self.connection.execute(
+                        f"DELETE FROM {full} AS target "
+                        "USING dbt_ml_staging AS source "
+                        f"WHERE target.{key} = source.{key}"
+                    )
+                    col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
+                    self.connection.execute(
+                        f"INSERT INTO {full} BY NAME SELECT {col_list} FROM dbt_ml_staging"
+                    )
+                if state_records:
+                    self._upsert_state_rows(state_scope, state_records)
+        finally:
+            if has_rows:
+                self.connection.unregister("dbt_ml_staging")
+        return new_rows.height
 
     def drop_table(self, table: str) -> None:
         self.connection.execute(f"DROP TABLE IF EXISTS {self.table_ref(table)}")

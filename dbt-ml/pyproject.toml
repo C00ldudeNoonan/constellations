@@ -67,7 +67,6 @@ packages = ["src/dbt_ml"]
 dev = [
     "pytest>=8",
     "ruff>=0.5",
-    "mypy>=1.10",
     "pip-audit>=2.7",
     "types-pyyaml",
     # the bigquery/gcs extras, so adapter unit tests run against real client types
@@ -89,16 +88,6 @@ ignore = ["RUF001", "RUF002", "RUF003", "ANN401"]
 [tool.ruff.lint.per-file-ignores]
 "examples/**/*.py" = ["ANN", "PYI"]
 "tests/**/*.py" = ["ANN", "PYI"]
-
-[tool.mypy]
-python_version = "3.12"
-strict = true
-plugins = ["pydantic.mypy"]
-files = ["src/dbt_ml"]
-
-[[tool.mypy.overrides]]
-module = ["datasketch", "langdetect"]
-ignore_missing_imports = true
 
 [tool.ty.src]
 include = ["src/dbt_ml", "typecheck"]

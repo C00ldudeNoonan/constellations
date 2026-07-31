@@ -82,8 +82,6 @@ uv sync --all-extras --dev --locked
 uv run pip-audit --skip-editable
 uv run ruff check
 uv run ty check
-# Temporary migration-parity gate; remove after issue #49's observation period.
-uv run mypy
 uv run pytest -q
 ```
 
@@ -116,9 +114,9 @@ and exclude unrelated resolution churn.
 
 ## Code and writing style
 
-- Use type hints throughout; ty is the required primary checker. Mypy remains a
-  temporary migration-parity gate until issue #49's observation period ends.
-  Ruff targets Python 3.12 with a 100-column line length.
+- Use type hints throughout; ty is the required and only static type checker.
+  Ruff's ANN and PYI rules enforce annotation presence. Ruff targets Python 3.12
+  with a 100-column line length.
 - Use Pydantic v2 for configuration and Click for CLI behavior.
 - Comments explain non-obvious reasons or constraints, not line-by-line
   mechanics.

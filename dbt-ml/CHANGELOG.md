@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Removed mypy; ty is the sole static type checker (issue #49)
+
+- Completed the mypy → ty migration: `ty` has been the required, blocking type
+  checker since v0.3.0 and ran clean alongside mypy for two release cycles. With
+  parity confirmed, mypy is removed — the `mypy` dev dependency, the
+  `[tool.mypy]` configuration, the CI and release-workflow mypy steps, and the
+  mypy contributor/release guidance are all gone. Annotation-presence discipline
+  is preserved by Ruff's `ANN`/`PYI` rules; `[tool.ty]` is unchanged.
+
 ## v0.4.0 - 2026-07-31
 
 ### Typed relation extraction over entity mentions (issues #220, #240)

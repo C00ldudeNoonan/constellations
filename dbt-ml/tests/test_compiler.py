@@ -75,6 +75,75 @@ def test_capability_preflight_rejects_sql_tests_without_support(
         validate_warehouse_capabilities([model], "non_sql")
 
 
+def _iceberg_model(materialization: str = "full") -> ModelConfig:
+    model = _extraction("raw")
+    model.materialization = materialization
+    model.warehouse_options = {
+        "table_format": "iceberg",
+        "storage_uri": "gs://b/t",
+        "connection": "p.us.c",
+    }
+    return model
+
+
+def test_capability_preflight_requires_iceberg_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ICEBERG_TABLE_FORMAT,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities", lambda _adapter_type: available
+    )
+
+    with pytest.raises(ConfigError, match="iceberg_table_format"):
+        validate_warehouse_capabilities([_iceberg_model()], "no_iceberg")
+    with pytest.raises(ConfigError, match="iceberg_table_format"):
+        validate_warehouse_capabilities([_iceberg_model("incremental")], "no_iceberg")
+
+
+def test_iceberg_full_is_gated_by_iceberg_not_atomic_full_replace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An adapter with the Iceberg capability but no ATOMIC_FULL_REPLACE can still
+    # run an Iceberg full model, while a standard full model on it cannot.
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ATOMIC_FULL_REPLACE,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities", lambda _adapter_type: available
+    )
+
+    validate_warehouse_capabilities([_iceberg_model()], "iceberg_only")
+    standard = _extraction("raw")
+    standard.materialization = "full"
+    with pytest.raises(ConfigError, match="atomic_full_replace"):
+        validate_warehouse_capabilities([standard], "iceberg_only")
+
+
+def test_iceberg_models_pass_on_bigquery() -> None:
+    validate_warehouse_capabilities([_iceberg_model()], "bigquery")
+    validate_warehouse_capabilities([_iceberg_model("incremental")], "bigquery")
+
+
+def test_iceberg_rejected_for_sql_models() -> None:
+    # SQL models materialize via materialize_sql_full, which ignores table_format,
+    # so iceberg must be rejected at compile rather than silently creating a
+    # native table.
+    model = ModelConfig(
+        name="sqlmod",
+        materialization="full",
+        transform={"type": "sql", "path": "models/sqlmod.sql"},
+        warehouse_options={
+            "table_format": "iceberg",
+            "storage_uri": "gs://b/t",
+            "connection": "p.us.c",
+        },
+    )
+    with pytest.raises(ConfigError, match="not supported for SQL models"):
+        validate_warehouse_capabilities([model], "bigquery")
+
+
 def test_operation_preflight_rejects_missing_streaming_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

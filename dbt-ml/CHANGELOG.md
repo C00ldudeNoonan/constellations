@@ -54,6 +54,29 @@
   non-identifier axis names at YAML parse time; slug collisions and the
   expansion limit produce `ConfigError` at load time.
 
+### BigQuery Iceberg/BigLake managed tables (issue #163)
+
+- Added `table_format: iceberg` to BigQuery `warehouse_options`, storing a model
+  as a BigLake managed Apache Iceberg table in Cloud Storage. It pairs with a
+  required `connection` (a Cloud Resource connection, or `DEFAULT`) and
+  `storage_uri` (a `gs://` location).
+- Iceberg targets are created with explicit column DDL derived from the model's
+  output schema via a new polars→BigQuery type mapping (`List`/embedding-vector
+  columns become `ARRAY<T>`, structs become `STRUCT<…>`); BigQuery's unsupported
+  Iceberg column types (`JSON`, `GEOGRAPHY`, `BIGNUMERIC`, `INTERVAL`) are
+  rejected before any warehouse call.
+- Because BigQuery Iceberg tables support neither `CREATE OR REPLACE` nor a
+  truncating load, `full` models are replaced by drop → create → append — not
+  atomic, gated by a new `iceberg_table_format` capability rather than
+  `atomic_full_replace`. `incremental` models `MERGE`/`insert_overwrite` in
+  place, and `on_schema_change: append_new_columns` evolves the schema with
+  `ALTER TABLE … ADD COLUMN`.
+- Interaction matrix: time partitioning only (no `int64` range), and
+  `kms_key_name` is rejected with Iceberg (customer-managed encryption on managed
+  Iceberg is not yet supported). The live round-trip test is gated on
+  `DBT_ML_BQ_TEST_PROJECT`, `DBT_ML_BQ_TEST_CONNECTION`, and
+  `DBT_ML_BQ_TEST_STORAGE_URI`.
+
 ### Deterministic keyphrase extraction (issue #219)
 
 - Added the `dbt_ml.text.transforms.extract_keyphrases` transform, which

@@ -705,6 +705,31 @@ and one run's changed documents must fit in a single flush
 flushes. Time partitioning with a `field` is required. When in doubt,
 stay on `merge` — it is always correct.
 
+**BigLake managed Apache Iceberg tables** (issue #163) — set
+`table_format: iceberg` to store a model as Iceberg in Cloud Storage, queryable
+through BigQuery and external Iceberg readers:
+
+```yaml
+  warehouse_options:
+    table_format: iceberg
+    connection: my-project.us.my-biglake-conn   # Cloud Resource connection, or DEFAULT
+    storage_uri: gs://my-bucket/filings_chunks   # gs:// location for the table data
+    partition_by: {field: filing_date}           # time partitioning only
+    cluster_by: [cik]
+```
+
+Iceberg targets are created with explicit column DDL derived from the model's
+output schema (`List` columns — including embedding vectors — become
+`ARRAY<T>`); `connection` and `storage_uri` are required. Because BigQuery
+Iceberg tables support neither `CREATE OR REPLACE` nor a truncating load, a
+`full` model is replaced by drop → create → append and is therefore **not
+atomic** (a failed run leaves the table empty and the next run repopulates it);
+this path is gated by the adapter's `iceberg_table_format` capability rather than
+`atomic_full_replace`. `incremental` models `MERGE`/`insert_overwrite` in place.
+Current limits: time partitioning only (no `int64` range), no `kms_key_name`, and
+BigQuery's unsupported Iceberg column types (`JSON`, `GEOGRAPHY`, `BIGNUMERIC`,
+`INTERVAL`) are rejected before any warehouse call.
+
 String values support `{{ env_var('NAME') }}` and
 `{{ env_var('NAME', 'default') }}` — the one piece of dbt's Jinja grammar
 profiles need for non-secret routing and per-environment paths. Protected

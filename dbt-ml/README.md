@@ -1318,6 +1318,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.nlp_tokens`         | Emits one normalized child row per spaCy token                                 |
 | `dbt_ml.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
 | `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs by alias table, vector, or fuzzy match  |
+| `dbt_ml.text.transforms.extract_relations`  | Emits typed relations between entity mentions (deterministic co-occurrence)     |
 | `dbt_ml.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
 | `dbt_ml.text.transforms.document_tone`      | Scores per-document tone from the token table + an operator-owned lexicon      |
 | `dbt_ml.text.transforms.extract_keyphrases` | Ranks keyphrases per document by n-gram frequency; child table with stable IDs |
@@ -1437,6 +1438,74 @@ links into the agent-context `context_entity_links` grain (see
 `entity_key`, so a governed metric keyed on the same namespace/name/canonical id
 resolves to the identical `entity_id` — the cross-plane join key. Record the
 resolver identity with `entity_link_method(resolver, resolver_version)`.
+
+### Relation extraction
+
+`extract_relations` emits a child table of relations between the entity mentions
+in a document (for example `nlp_entities` output), one row per related pair. It
+keeps three kinds of relationship strictly distinguishable via the `method`
+column so a consumer never mistakes proximity for a semantic assertion:
+`co_occurrence` (proximity), `rule` (deterministic typed rules), and
+`model_assertion` (a learned/LLM extractor). Two deterministic, offline
+extractors ship — `co_occurrence` and `rule`; the `method` column and the
+extractor registry are shaped so a learned extractor plugs in without touching
+transform execution, and the generic structured-LLM path (#144) remains the way
+to run one now.
+
+```yaml
+- name: document_relations
+  depends_on: [ref('document_entities')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.extract_relations
+    options:
+      mentions: document_entities
+      scope: sentence          # or `window` with `max_char_gap`
+      relation_type: co_occurs_with
+      labels: [ORG, GPE]       # optional: only these labels participate
+  materialization: incremental
+```
+
+Two mentions co-occur when they share a sentence (`scope: sentence`, requires a
+non-null `sentence_index`) or fall within `max_char_gap` characters
+(`scope: window`). Co-occurrence is symmetric, so each unordered pair yields one
+row with `directed: false`; the subject is the earlier-positioned mention and
+the object the later one, giving every pair a stable orientation and
+`relation_id`. Every row records the `relation_type`, the `method`, a `status`
+(`asserted` for the deterministic extractors; `ambiguous`/`no_relation` are
+reserved for learned extractors), a `confidence` (null for the deterministic
+extractors), the subject/object mention IDs and offsets, the participating
+labels, and the extractor identity and version. Evidence text is withheld unless
+`include_mention_text: true` (and then the mentions model must carry it via the
+NLP transform's `include_text: true`).
+
+Set `extractor: rule` for **directed, typed** relations instead of symmetric
+proximity. Each rule asserts a `relation_type` from a subject mention of one
+label to an object mention of another when the two co-occur in scope; the
+distinct `relation_type` values across the rules are exactly the relations the
+model can emit (schema-controlled), and the subject/object orientation follows
+the rule rather than text position. The rules are deterministic and offline —
+no provider, no network.
+
+```yaml
+- name: document_typed_relations
+  depends_on: [ref('document_entities')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.extract_relations
+    options:
+      mentions: document_entities
+      extractor: rule
+      scope: sentence
+      rules:
+        - {subject_label: ORG, object_label: GPE, relation_type: references_geography}
+        - {subject_label: ORG, object_label: MONEY, relation_type: references_amount}
+  materialization: incremental
+```
+
+Relations materialize incrementally on the same one-to-many path as the other
+child tables: a changed document re-derives exactly its relation rows. See
+`examples/economic_nlp/` for runnable co-occurrence and rule pipelines.
 
 ### Document-level aggregate features
 

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Typed relation extraction over entity mentions (issues #220, #240)
+
+- Added the `dbt_ml.text.transforms.extract_relations` transform, which emits a
+  child table of relations between the entity mentions of a document (one row
+  per related pair), anchored on the stable mention IDs from the NLP entity
+  table.
+- The output grain distinguishes three relationship kinds via a `method` column
+  — `co_occurrence` (proximity), `rule` (deterministic typed rules), and
+  `model_assertion` (learned/LLM) — so a consumer never mistakes co-occurrence
+  for a semantic assertion. Rows also carry `relation_type`, `directed`,
+  `status` (`asserted`/`ambiguous`/`no_relation`), `confidence`, subject/object
+  mention IDs and offsets, participating labels, and extractor identity/version.
+- Two deterministic, offline extractors ship:
+  - `co_occurrence` — two mentions co-occur when they share a sentence
+    (`scope: sentence`) or fall within `max_char_gap` characters
+    (`scope: window`). Symmetric, so each unordered pair yields one
+    `directed: false` row with a stable orientation and `relation_id`.
+  - `rule` — directed, typed relations from operator-declared label rules
+    (`subject_label`, `object_label`, `relation_type`); the distinct rule
+    relation types are the schema-controlled set the model can emit, and the
+    subject/object orientation follows the rule rather than text position.
+  Both support an optional `labels` allow-list and a `max_pairs_per_document`
+  guard that fails closed on a pathological document; evidence text is withheld
+  unless `include_mention_text: true`.
+- Learned/LLM extractors slot into the same extractor registry without touching
+  transform execution (the seam pattern from entity-linking resolvers); the
+  generic structured-LLM path (#144) remains the way to run one. A deterministic
+  fake extractor in the test suite exercises typed/directed/scored/multi-status
+  rows through the driver.
+- Relations materialize `full` or `incremental`; the incremental path re-derives
+  exactly a changed document's relation rows (issue #218). Added
+  `document_relations` (co-occurrence) and `document_typed_relations` (rule)
+  models to the `economic_nlp` example.
+
 ### Entity linking: fuzzy resolver, incremental materialization, governed-context composition (issue #217)
 
 - Added a third entity-linking resolver, `resolver: fuzzy`, that matches mention

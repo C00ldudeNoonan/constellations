@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Declarative `for_each` matrix model expansion (issue #57)
+
+- Added a `for_each` key to `ModelConfig`. Declaring it on a model turns it
+  into a template: dbt-ml expands it into one concrete `ModelConfig` per
+  cartesian-product combination of the declared axes and removes the template
+  from the model list.
+- Variant names follow the pattern `<base>__<axis>_<slug>__…` using
+  identifier-safe slugs (letters and digits only; dots, spaces, and other
+  punctuation replaced with `_`; long values truncated with an 8-character
+  SHA-256 suffix). Every variant automatically receives the base model name as
+  a tag so it can be selected with `--select tag:<base_name>`.
+- Placeholder syntax: write `${matrix.<axis>}` anywhere in a string value in
+  the model config. An exact-match placeholder (`"${matrix.min_df}"`) is
+  substituted type-preservingly — an integer axis value yields an integer, a
+  list yields a list, and so on. A placeholder embedded in a longer string
+  (`"prefix_${matrix.label}_suffix"`) is interpolated as a string. Typed
+  fields such as `chunk_size` and `dimensions` accept placeholder strings in
+  the template because expansion runs on raw YAML dicts before Pydantic
+  validation.
+- Expansion is a deterministic pass in `config/loader.py` before dependency
+  resolution, so `transform.path` values that contain placeholders are resolved
+  to real paths before SQL ref discovery runs, and everything downstream — the
+  DAG, selectors, runner, incremental state, manifest, and docs — sees ordinary
+  concrete models.
+- Up to 256 variants per template; the config validator catches empty axes and
+  non-identifier axis names at YAML parse time; slug collisions and the
+  expansion limit produce `ConfigError` at load time.
+
 ### Deterministic keyphrase extraction (issue #219)
 
 - Added the `dbt_ml.text.transforms.extract_keyphrases` transform, which

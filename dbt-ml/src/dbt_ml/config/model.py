@@ -673,6 +673,9 @@ class ModelConfig(BaseModel):
     warehouse_options: dict[str, Any] = Field(default_factory=dict)
     tests: list[Any] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    # Matrix expansion (issue #57): expanded by loader._expand_for_each; absent
+    # on concrete models. Keys are axis names; values are lists of axis values.
+    for_each: dict[str, list[Any]] | None = None
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -753,6 +756,29 @@ class ModelConfig(BaseModel):
             )
         if self.llm is not None:
             self._validate_llm_fields()
+        return self
+
+    @model_validator(mode="after")
+    def _validate_for_each(self) -> ModelConfig:
+        fe = self.for_each
+        if fe is None:
+            return self
+        if not fe:
+            raise ValueError(
+                f"Model '{self.name}': for_each must declare at least one axis"
+            )
+        ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        for axis_name, values in fe.items():
+            if not ident_re.match(axis_name):
+                raise ValueError(
+                    f"Model '{self.name}': for_each axis name '{axis_name}' must be a "
+                    "valid identifier (letters, digits, underscores; start with letter or _)"
+                )
+            if not values:
+                raise ValueError(
+                    f"Model '{self.name}': for_each axis '{axis_name}' must have at least "
+                    "one value"
+                )
         return self
 
     def _validate_llm_fields(self) -> None:

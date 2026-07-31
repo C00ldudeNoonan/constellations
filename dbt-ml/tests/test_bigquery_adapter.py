@@ -32,6 +32,7 @@ from dbt_ml.adapters import (
 from dbt_ml.adapters.bigquery import (
     BigQueryAdapter,
     BigQueryWarehouseConfig,
+    BigQueryWarehouseOptions,
     to_query_parameters,
 )
 from dbt_ml.credentials import ProtectedCredential
@@ -1264,6 +1265,226 @@ def test_emit_dbt_sources_for_bigquery(tmp_path: Path) -> None:
     assert source["tables"][0]["name"] == "filings"
 
 
+# ─── Iceberg / BigLake managed tables (issue #163) ──────────────────────────
+
+_ICEBERG = {
+    "table_format": "iceberg",
+    "storage_uri": "gs://bucket/tbl",
+    "connection": "proj.us.conn",
+}
+
+
+def test_iceberg_options_require_storage_uri_and_connection() -> None:
+    with pytest.raises(ValidationError, match="requires"):
+        BigQueryWarehouseOptions.model_validate({"table_format": "iceberg"})
+    with pytest.raises(ValidationError, match="requires"):
+        BigQueryWarehouseOptions.model_validate(
+            {"table_format": "iceberg", "storage_uri": "gs://b/t"}
+        )
+
+
+def test_iceberg_keys_require_table_format() -> None:
+    with pytest.raises(ValidationError, match="require `table_format: iceberg`"):
+        BigQueryWarehouseOptions.model_validate({"storage_uri": "gs://b/t"})
+
+
+def test_iceberg_storage_uri_must_be_gs() -> None:
+    with pytest.raises(ValidationError, match="gs:// Cloud Storage URI"):
+        BigQueryWarehouseOptions.model_validate({**_ICEBERG, "storage_uri": "s3://b/t"})
+
+
+def test_iceberg_rejects_kms_and_int64_partitioning() -> None:
+    with pytest.raises(ValidationError, match=r"kms_key_name.*iceberg"):
+        BigQueryWarehouseOptions.model_validate(
+            {**_ICEBERG, "kms_key_name": "projects/p/locations/l/keyRings/r/cryptoKeys/k"}
+        )
+    with pytest.raises(ValidationError, match="time partitioning only"):
+        BigQueryWarehouseOptions.model_validate(
+            {
+                **_ICEBERG,
+                "partition_by": {
+                    "field": "n",
+                    "data_type": "int64",
+                    "range": {"start": 0, "end": 10, "interval": 1},
+                },
+            }
+        )
+
+
+def test_iceberg_column_ddl_maps_polars_dtypes() -> None:
+    adapter = _adapter()
+    df = pl.DataFrame(
+        schema={
+            "s": pl.String,
+            "i": pl.Int32,
+            "f": pl.Float64,
+            "b": pl.Boolean,
+            "d": pl.Date,
+            "ts": pl.Datetime("us", "UTC"),
+            "dt": pl.Datetime("us"),
+            "vec": pl.List(pl.Float64),
+            "obj": pl.Struct({"a": pl.Int64, "c": pl.String}),
+            "n": pl.Decimal(10, 2),
+        }
+    )
+    assert adapter._iceberg_column_ddl(df) == (
+        "`s` STRING, `i` INT64, `f` FLOAT64, `b` BOOL, `d` DATE, "
+        "`ts` TIMESTAMP, `dt` DATETIME, `vec` ARRAY<FLOAT64>, "
+        "`obj` STRUCT<`a` INT64, `c` STRING>, `n` NUMERIC"
+    )
+
+
+def test_iceberg_column_ddl_rejects_unsupported_types() -> None:
+    adapter = _adapter()
+    duration = pl.DataFrame(schema={"d": pl.Duration})
+    with pytest.raises(AdapterError, match="column 'd'"):
+        adapter._iceberg_column_ddl(duration)
+    big = pl.DataFrame(schema={"n": pl.Decimal(20, 10)})
+    with pytest.raises(AdapterError, match="BIGNUMERIC"):
+        adapter._iceberg_column_ddl(big)
+
+
+def test_materialize_full_iceberg_drops_creates_and_appends() -> None:
+    from google.cloud import bigquery
+
+    client = _FakeClient()
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a", "b"], "x": [1, 2]})
+    assert adapter.materialize_full("docs", df, options=_parse_options(_ICEBERG)) == 2
+
+    assert client.dropped == ["proj.ds.docs"]
+    assert client.queries[0][0] == (
+        "CREATE TABLE `proj`.`ds`.`docs` (`document_id` STRING, `x` INT64) "
+        "WITH CONNECTION `proj.us.conn` OPTIONS (file_format = 'PARQUET', "
+        "table_format = 'ICEBERG', storage_uri = 'gs://bucket/tbl')"
+    )
+    payload, table_id, job_config = client.loads[0]
+    assert table_id == "proj.ds.docs"
+    assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+    assert pl.read_parquet(io.BytesIO(payload)).rows() == [("a", 1), ("b", 2)]
+
+
+def test_materialize_full_iceberg_default_connection_and_partition() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    opts = _parse_options(
+        {
+            **_ICEBERG,
+            "connection": "DEFAULT",
+            "partition_by": {"field": "filing_date"},
+            "cluster_by": ["cik"],
+        }
+    )
+    df = pl.DataFrame({"cik": ["1"], "filing_date": ["2026-01-01"]})
+    adapter.materialize_full("docs", df, options=opts)
+
+    assert client.queries[0][0] == (
+        "CREATE TABLE `proj`.`ds`.`docs` (`cik` STRING, `filing_date` STRING) "
+        "PARTITION BY `filing_date` CLUSTER BY `cik` "
+        "WITH CONNECTION DEFAULT OPTIONS (file_format = 'PARQUET', "
+        "table_format = 'ICEBERG', storage_uri = 'gs://bucket/tbl')"
+    )
+
+
+def test_incremental_iceberg_first_run_creates_then_appends() -> None:
+    from google.cloud import bigquery
+
+    client = _FakeClient()  # get_table -> NotFound
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [1]})
+    adapter.materialize_incremental(
+        "docs", df, key_col="document_id", options=_parse_options(_ICEBERG)
+    )
+
+    assert client.queries[0][0].startswith("CREATE TABLE `proj`.`ds`.`docs` (")
+    assert "table_format = 'ICEBERG'" in client.queries[0][0]
+    _, table_id, job_config = client.loads[0]
+    assert table_id == "proj.ds.docs"
+    assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+
+
+def test_incremental_iceberg_existing_table_merges() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [9]})
+    adapter.materialize_incremental(
+        "docs", df, key_col="document_id", options=_parse_options(_ICEBERG)
+    )
+
+    merge_sql = client.queries[-1][0]
+    assert merge_sql.startswith("MERGE `proj`.`ds`.`docs` AS target ")
+    assert "WHEN MATCHED THEN UPDATE SET" in merge_sql
+
+
+def test_incremental_iceberg_adds_columns_with_ddl() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [9], "y": ["new"]})
+    adapter.materialize_incremental(
+        "docs",
+        df,
+        key_col="document_id",
+        on_schema_change="append_new_columns",
+        options=_parse_options(_ICEBERG),
+    )
+
+    alter = next(q[0] for q in client.queries if q[0].startswith("ALTER TABLE"))
+    assert alter == "ALTER TABLE `proj`.`ds`.`docs` ADD COLUMN `y` STRING"
+
+
+def test_materialize_full_iceberg_validates_schema_before_dropping() -> None:
+    # An unsupported dtype must fail before the existing target is dropped, so a
+    # bad schema never destroys the last good table.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id"]
+    adapter = _adapter(client)
+    df = pl.DataFrame(schema={"document_id": pl.String, "d": pl.Duration})
+    with pytest.raises(AdapterError, match="column 'd'"):
+        adapter.materialize_full("docs", df, options=_parse_options(_ICEBERG))
+    assert client.dropped == []
+    assert client.queries == []
+
+
+def test_iceberg_connection_rejects_injection() -> None:
+    with pytest.raises(ValidationError, match="Cloud Resource connection identifier"):
+        BigQueryWarehouseOptions.model_validate(
+            {**_ICEBERG, "connection": "proj.us.c` OPTIONS(x); DROP TABLE t"}
+        )
+
+
+def test_iceberg_connection_accepts_resource_path() -> None:
+    opts = BigQueryWarehouseOptions.model_validate(
+        {**_ICEBERG, "connection": "projects/p/locations/us/connections/c"}
+    )
+    assert opts.connection == "projects/p/locations/us/connections/c"
+
+
+def test_full_chunks_iceberg_inserts_from_staging() -> None:
+    client = _FakeClient()
+    schema_df = pl.DataFrame(schema={"document_id": pl.String, "x": pl.Int64})
+
+    class _ArrowJob(_FakeJob):
+        def to_arrow(self) -> Any:
+            return schema_df.to_arrow()
+
+    client.query_results.append(_ArrowJob())  # answers the LIMIT 0 schema probe
+    adapter = _adapter(client)
+    chunks = [pl.DataFrame({"document_id": ["a"], "x": [1]})]
+    adapter.materialize_full_chunks(
+        "docs", iter(chunks), options=_parse_options(_ICEBERG)
+    )
+
+    create = next(q[0] for q in client.queries if q[0].startswith("CREATE TABLE"))
+    assert "table_format = 'ICEBERG'" in create
+    insert = next(q[0] for q in client.queries if q[0].startswith("INSERT INTO"))
+    assert insert.startswith(
+        "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`dbt_ml_staging__docs__"
+    )
+    assert "proj.ds.docs" in client.dropped
+
+
 # ─── optional integration (needs real GCP credentials) ─────────────────────
 
 _BQ_PROJECT = os.environ.get("DBT_ML_BQ_TEST_PROJECT")
@@ -1367,6 +1588,57 @@ def test_integration_warehouse_options_round_trip() -> None:
                 "ORDER BY document_id"
             )
             assert rows == [("a2",), ("b",)]
+    finally:
+        adapter._reset_storage_for_test()
+
+
+_BQ_ICEBERG_CONNECTION = os.environ.get("DBT_ML_BQ_TEST_CONNECTION")
+_BQ_ICEBERG_STORAGE_URI = os.environ.get("DBT_ML_BQ_TEST_STORAGE_URI")
+
+
+@pytest.mark.skipif(
+    not (_BQ_PROJECT and _BQ_ICEBERG_CONNECTION and _BQ_ICEBERG_STORAGE_URI),
+    reason=(
+        "set DBT_ML_BQ_TEST_PROJECT, DBT_ML_BQ_TEST_CONNECTION (a BigLake Cloud "
+        "Resource connection), and DBT_ML_BQ_TEST_STORAGE_URI (a gs:// prefix) to "
+        "run the Iceberg round-trip"
+    ),
+)
+def test_integration_iceberg_round_trip() -> None:
+    dataset = "dbt_ml_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, BigQueryAdapter)
+    opts = adapter.parse_warehouse_options(
+        {
+            "table_format": "iceberg",
+            "connection": _BQ_ICEBERG_CONNECTION,
+            "storage_uri": f"{_BQ_ICEBERG_STORAGE_URI.rstrip('/')}/{dataset}",
+        },
+        model_name="docs",
+    )
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "docs",
+                pl.DataFrame(
+                    {"document_id": ["a", "b"], "vec": [[0.1, 0.2], [0.3, 0.4]]}
+                ),
+                options=opts,
+            )
+            adapter.materialize_incremental(
+                "docs",
+                pl.DataFrame({"document_id": ["a", "c"], "vec": [[9.0, 9.0], [0.5, 0.6]]}),
+                key_col="document_id",
+                options=opts,
+            )
+            rows = adapter.rows(
+                f"SELECT document_id FROM {adapter.table_ref('docs')} "
+                "ORDER BY document_id"
+            )
+            assert rows == [("a",), ("b",), ("c",)]
     finally:
         adapter._reset_storage_for_test()
 

@@ -452,6 +452,26 @@ class BigQueryPartitionBy(BaseModel):
 
 _LABEL_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 _LABEL_VALUE_RE = re.compile(r"^[a-z0-9_-]{0,63}$")
+# BigLake Cloud Resource connection identifier (issue #163). Accepts the
+# `project.region.name` short form and the `projects/…/locations/…/connections/…`
+# resource path; the character class deliberately excludes backticks, quotes,
+# whitespace, and statement punctuation so a connection value cannot break out of
+# the backtick-quoted identifier in `WITH CONNECTION`.
+_CONNECTION_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+# Polars integer dtypes that map to BigQuery INT64 for explicit Iceberg column
+# DDL (issue #163). Unsigned 64-bit values above 2^63-1 overflow INT64; BigQuery
+# has no unsigned integer type, matching how the Parquet load path coerces them.
+_BQ_INT_DTYPES = (
+    pl.Int8,
+    pl.Int16,
+    pl.Int32,
+    pl.Int64,
+    pl.UInt8,
+    pl.UInt16,
+    pl.UInt32,
+    pl.UInt64,
+)
 
 
 class BigQueryWarehouseOptions(BaseModel):
@@ -475,6 +495,14 @@ class BigQueryWarehouseOptions(BaseModel):
     # partition present in the incoming batch — dbt-bigquery semantics,
     # for pipelines that reprocess whole partitions at a time.
     incremental_strategy: Literal["merge", "insert_overwrite"] = "merge"
+    # BigLake managed Apache Iceberg tables (issue #163). When set, the target is
+    # created with explicit column DDL and a `WITH CONNECTION … OPTIONS(…)` clause
+    # rather than via load-job schema autodetect; data is stored as Iceberg in the
+    # `storage_uri` bucket. `connection` is a Cloud Resource connection name
+    # (`project.region.name` or `DEFAULT`).
+    table_format: Literal["iceberg"] | None = None
+    storage_uri: str | None = None
+    connection: str | None = None
 
     @field_validator("cluster_by", mode="before")
     @classmethod
@@ -514,6 +542,53 @@ class BigQueryWarehouseOptions(BaseModel):
                     "incremental_strategy: insert_overwrite supports time "
                     "partitioning only (timestamp/date/datetime)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_iceberg(self) -> BigQueryWarehouseOptions:
+        """Interaction matrix for BigLake Iceberg tables (issue #163). Managed
+        Iceberg tables need a Cloud Storage location and a Cloud Resource
+        connection, support time partitioning only, and — for now — cannot pair
+        with customer-managed encryption (unconfirmed on managed Iceberg)."""
+        if self.table_format is None:
+            if self.storage_uri is not None or self.connection is not None:
+                raise ValueError(
+                    "`storage_uri` and `connection` require `table_format: iceberg`"
+                )
+            return self
+        if self.storage_uri is None or self.connection is None:
+            missing = ", ".join(
+                f"`{name}`"
+                for name in ("storage_uri", "connection")
+                if getattr(self, name) is None
+            )
+            raise ValueError(f"`table_format: iceberg` requires {missing}")
+        if not self.storage_uri.startswith("gs://") or len(self.storage_uri) <= len(
+            "gs://"
+        ):
+            raise ValueError(
+                "`storage_uri` must be a gs:// Cloud Storage URI, e.g. "
+                "gs://my-bucket/my-table"
+            )
+        if not self.connection.strip():
+            raise ValueError("`connection` must not be empty")
+        if not _CONNECTION_RE.match(self.connection):
+            raise ValueError(
+                "`connection` must be a Cloud Resource connection identifier "
+                "(project.region.name, a projects/…/locations/…/connections/… "
+                "path, or DEFAULT) — letters, digits, `.`, `_`, `-`, `/` only"
+            )
+        if self.kms_key_name is not None:
+            raise ValueError(
+                "`kms_key_name` is not supported with `table_format: iceberg` "
+                "(customer-managed encryption on managed Iceberg tables is not "
+                "yet supported by dbt-ml)"
+            )
+        if self.partition_by is not None and self.partition_by.data_type == "int64":
+            raise ValueError(
+                "`table_format: iceberg` supports time partitioning only "
+                "(timestamp/date/datetime), not int64 range partitioning"
+            )
         return self
 
 
@@ -667,6 +742,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 WarehouseCapability.ATOMIC_PARENT_CHILD_REPLACE,
                 WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
                 WarehouseCapability.CHUNKED_WRITES,
+                WarehouseCapability.ICEBERG_TABLE_FORMAT,
                 WarehouseCapability.PAGED_STATE_RECONCILIATION,
                 WarehouseCapability.SCHEMA_EVOLUTION,
                 WarehouseCapability.SQL_QUERIES,
@@ -1420,6 +1496,176 @@ class BigQueryAdapter(WarehouseAdapter):
             clauses.append(f"OPTIONS ({', '.join(option_entries)})")
         return (" " + " ".join(clauses)) if clauses else ""
 
+    # ─── Iceberg (BigLake managed) tables, issue #163 ─────────────────────
+    #
+    # Managed Iceberg tables cannot be created by load-job autodetect and do not
+    # support CREATE OR REPLACE, so they need explicit column DDL. These helpers
+    # build the column list and the `WITH CONNECTION … OPTIONS(…)` suffix.
+
+    def _bq_column_type(self, dtype: pl.DataType) -> str:
+        """The BigQuery column type for a polars dtype, for explicit Iceberg DDL.
+        Raises ValueError for dtypes BigQuery Iceberg cannot represent."""
+        if isinstance(dtype, pl.Struct):
+            fields = ", ".join(
+                f"{self.quote_ident(field.name)} "
+                f"{self._bq_column_type(cast('pl.DataType', field.dtype))}"
+                for field in dtype.fields
+            )
+            return f"STRUCT<{fields}>"
+        if isinstance(dtype, pl.List | pl.Array):
+            inner = cast("pl.DataType", dtype.inner)
+            if isinstance(inner, pl.List | pl.Array):
+                raise ValueError(
+                    "nested arrays are not supported in a BigQuery Iceberg column"
+                )
+            return f"ARRAY<{self._bq_column_type(inner)}>"
+        if isinstance(dtype, pl.Datetime):
+            return "TIMESTAMP" if dtype.time_zone is not None else "DATETIME"
+        if isinstance(dtype, pl.Decimal):
+            precision = dtype.precision if dtype.precision is not None else 38
+            if precision > 38 or dtype.scale > 9:
+                raise ValueError(
+                    f"decimal(precision={precision}, scale={dtype.scale}) exceeds "
+                    "BigQuery NUMERIC; BIGNUMERIC is not supported on Iceberg tables"
+                )
+            return "NUMERIC"
+        if isinstance(dtype, pl.Enum):
+            return "STRING"
+        if dtype == pl.Boolean:
+            return "BOOL"
+        if dtype in _BQ_INT_DTYPES:
+            return "INT64"
+        if dtype in (pl.Float32, pl.Float64):
+            return "FLOAT64"
+        if dtype in (pl.String, pl.Categorical):
+            return "STRING"
+        if dtype == pl.Date:
+            return "DATE"
+        if dtype == pl.Time:
+            return "TIME"
+        if dtype == pl.Binary:
+            return "BYTES"
+        raise ValueError(
+            f"polars dtype {dtype} has no BigQuery Iceberg column type "
+            "(unsupported: Duration/INTERVAL, JSON, Object, or an all-null column)"
+        )
+
+    def _iceberg_column_ddl(self, df: pl.DataFrame) -> str:
+        columns: list[str] = []
+        for name, dtype in df.schema.items():
+            try:
+                bq_type = self._bq_column_type(dtype)
+            except ValueError as error:
+                raise AdapterError(
+                    f"Cannot create Iceberg table column '{name}': {error}"
+                ) from None
+            columns.append(f"{self.quote_ident(name)} {bq_type}")
+        return ", ".join(columns)
+
+    @staticmethod
+    def _connection_clause(connection: str) -> str:
+        if connection.strip().upper() == "DEFAULT":
+            return "WITH CONNECTION DEFAULT"
+        # Config validation already restricts `connection` to a safe grammar
+        # (`_CONNECTION_RE`); escaping backticks is defense-in-depth so the value
+        # can never break out of the quoted identifier.
+        escaped = connection.replace("\\", "\\\\").replace("`", "\\`")
+        return f"WITH CONNECTION `{escaped}`"
+
+    def _iceberg_ddl_clauses(self, layout: BigQueryWarehouseOptions) -> str:
+        """`[PARTITION BY …] [CLUSTER BY …] WITH CONNECTION … OPTIONS(…)` for an
+        Iceberg CREATE TABLE. kms_key_name is excluded (rejected by config)."""
+        assert layout.storage_uri is not None and layout.connection is not None
+        clauses: list[str] = []
+        if layout.partition_by is not None:
+            clauses.append(
+                f"PARTITION BY {self._partition_expression(layout.partition_by)}"
+            )
+        if layout.cluster_by:
+            clauses.append(
+                "CLUSTER BY "
+                + ", ".join(self.quote_ident(c) for c in layout.cluster_by)
+            )
+        clauses.append(self._connection_clause(layout.connection))
+        option_entries = [
+            "file_format = 'PARQUET'",
+            "table_format = 'ICEBERG'",
+            f"storage_uri = {self._sql_string(layout.storage_uri)}",
+            *self._table_option_entries(layout, include_kms=False),
+        ]
+        clauses.append(f"OPTIONS ({', '.join(option_entries)})")
+        return " " + " ".join(clauses)
+
+    def _iceberg_create_sql(
+        self, table: str, df: pl.DataFrame, layout: BigQueryWarehouseOptions
+    ) -> str:
+        """The Iceberg `CREATE TABLE` statement. Building it validates every
+        column dtype — `_iceberg_column_ddl` raises on an unsupported type — so a
+        caller that must drop the target first should build this *before* the
+        drop, to avoid destroying the last good table on a bad schema."""
+        return (
+            f"CREATE TABLE {self.table_ref(table)} "
+            f"({self._iceberg_column_ddl(df)})"
+            f"{self._iceberg_ddl_clauses(layout)}"
+        )
+
+    def _create_iceberg_table(
+        self, table: str, df: pl.DataFrame, layout: BigQueryWarehouseOptions
+    ) -> None:
+        self._run_query(
+            self._iceberg_create_sql(table, df, layout),
+            job_labels=layout.labels or None,
+        )
+
+    def _iceberg_append_load(
+        self, table: str, df: pl.DataFrame, layout: BigQueryWarehouseOptions
+    ) -> None:
+        """Append `df` to an existing Iceberg table. Iceberg load jobs are
+        append-only, so callers create/truncate the target first."""
+        bigquery = _bigquery()
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        if layout.labels:
+            job_config.labels = dict(layout.labels)
+        self._load_parquet(table, df, job_config)
+
+    def _iceberg_full_materialize(
+        self, table: str, df: pl.DataFrame, layout: BigQueryWarehouseOptions
+    ) -> int:
+        """Full replacement for a managed Iceberg target. Iceberg supports
+        neither CREATE OR REPLACE nor a truncating load, so this drops the
+        target, recreates it with explicit column DDL, then appends. The
+        drop→create→append window is intentionally not atomic — Iceberg
+        full-refresh is gated by the ICEBERG_TABLE_FORMAT capability rather than
+        ATOMIC_FULL_REPLACE, and a failed append leaves an empty table that the
+        next run repopulates."""
+        create_sql = self._iceberg_create_sql(table, df, layout)  # validates schema
+        self.drop_table(table)
+        self._run_query(create_sql, job_labels=layout.labels or None)
+        self._iceberg_append_load(table, df, layout)
+        return df.height
+
+    def _iceberg_add_columns(
+        self, table: str, df: pl.DataFrame, columns: list[str]
+    ) -> None:
+        """Evolve an Iceberg target's schema via `ALTER TABLE … ADD COLUMN`,
+        the DDL equivalent of the load-job field addition used for standard
+        tables (`on_schema_change: append_new_columns`)."""
+        if not columns:
+            return
+        schema = df.schema
+        try:
+            additions = ", ".join(
+                f"ADD COLUMN {self.quote_ident(name)} "
+                f"{self._bq_column_type(schema[name])}"
+                for name in columns
+            )
+        except ValueError as error:
+            raise AdapterError(f"Cannot add Iceberg column: {error}") from None
+        self._run_query(f"ALTER TABLE {self.table_ref(table)} {additions}")
+
     def _apply_post_create_options(
         self, table: str, options: BaseModel | None
     ) -> None:
@@ -1661,6 +1907,8 @@ class BigQueryAdapter(WarehouseAdapter):
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
         layout = self._layout(options)
+        if layout is not None and layout.table_format == "iceberg":
+            return self._iceberg_full_materialize(table, df, layout)
         if layout is None:
             self._load_parquet(table, df, job_config)
             return df.height
@@ -1769,8 +2017,16 @@ class BigQueryAdapter(WarehouseAdapter):
         load_df = df
         allow_field_addition = False
 
+        layout = self._layout(options)
+        is_iceberg = layout is not None and layout.table_format == "iceberg"
+
         existing = self._table_columns(table)
         if existing is None:
+            if is_iceberg:
+                assert layout is not None
+                self._create_iceberg_table(table, load_df, layout)
+                self._iceberg_append_load(table, load_df, layout)
+                return df.height
             job_config = bigquery.LoadJobConfig(
                 source_format=bigquery.SourceFormat.PARQUET,
                 write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
@@ -1789,7 +2045,6 @@ class BigQueryAdapter(WarehouseAdapter):
         if plan.columns_to_load != list(df.columns):
             load_df = df.select(plan.columns_to_load)
 
-        layout = self._layout(options)
         job_labels = layout.labels if layout is not None else None
         insert_overwrite = (
             layout is not None and layout.incremental_strategy == "insert_overwrite"
@@ -1803,12 +2058,21 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
 
         if allow_field_addition:
-            schema_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.PARQUET,
-                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
-            )
-            self._load_parquet(table, load_df.head(0), schema_config)
+            if is_iceberg:
+                # Iceberg load jobs are append-only and cannot evolve the target
+                # schema, so add the new columns with DDL instead.
+                self._iceberg_add_columns(
+                    table, load_df, [c for c in load_df.columns if c not in existing]
+                )
+            else:
+                schema_config = bigquery.LoadJobConfig(
+                    source_format=bigquery.SourceFormat.PARQUET,
+                    write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                    schema_update_options=[
+                        bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+                    ],
+                )
+                self._load_parquet(table, load_df.head(0), schema_config)
 
         staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
         staging_config = bigquery.LoadJobConfig(
@@ -1901,6 +2165,23 @@ class BigQueryAdapter(WarehouseAdapter):
                 total += df.height
             if first:
                 return self.materialize_full(table, pl.DataFrame())
+            if layout is not None and layout.table_format == "iceberg":
+                # Iceberg cannot CREATE OR REPLACE or be renamed into; build the
+                # explicit-schema target from the staged rows and INSERT them.
+                # Non-atomic like the single-frame Iceberg full path.
+                schema_df = self.query_df(
+                    f"SELECT * FROM {self.table_ref(staging)} LIMIT 0"
+                )
+                create_sql = self._iceberg_create_sql(table, schema_df, layout)
+                self.drop_table(table)
+                self._run_query(create_sql, job_labels=job_labels)
+                self._run_query(
+                    f"INSERT INTO {self.table_ref(table)} "
+                    f"SELECT * FROM {self.table_ref(staging)}",
+                    job_labels=job_labels,
+                )
+                self.drop_table(staging)
+                return total
             layout_clauses = self._ddl_layout_clauses(options)
             if not layout_clauses or self._partition_spec_matches(table, layout):
                 # One CREATE OR REPLACE swaps the staged rows in atomically;

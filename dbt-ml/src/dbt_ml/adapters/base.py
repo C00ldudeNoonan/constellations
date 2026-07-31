@@ -332,6 +332,10 @@ class WarehouseCapability(StrEnum):
     PAGED_STATE_RECONCILIATION = "paged_state_reconciliation"
     ATOMIC_STATE_SCOPE_REPLACE = "atomic_state_scope_replace"
     ATOMIC_PARENT_CHILD_REPLACE = "atomic_parent_child_replace"
+    # Managed open-table formats (BigLake Apache Iceberg, issue #163). Full
+    # replacement of such a table is not atomic — it is gated by this capability
+    # instead of ATOMIC_FULL_REPLACE.
+    ICEBERG_TABLE_FORMAT = "iceberg_table_format"
 
 
 @dataclass(frozen=True)

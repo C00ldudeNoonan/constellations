@@ -223,6 +223,21 @@ def validate_warehouse_capabilities(
     available = adapter_capabilities(adapter_type)
     for model in models:
         required: dict[WarehouseCapability, str] = {}
+        # An Iceberg-format target (issue #163) is created and replaced through a
+        # non-atomic explicit-DDL path, so it is gated by ICEBERG_TABLE_FORMAT
+        # rather than ATOMIC_FULL_REPLACE. Full validation of the iceberg options
+        # happens when the adapter parses them; here only the format matters.
+        is_iceberg = model.warehouse_options.get("table_format") == "iceberg"
+        if is_iceberg and model.transform is not None and model.transform.type == "sql":
+            # SQL models materialize through materialize_sql_full/_incremental,
+            # which do not honor table_format — accepting iceberg here would
+            # silently create an ordinary native table (issue #163).
+            raise _model_error(
+                model,
+                f"Model '{model.name}': `table_format: iceberg` is not supported "
+                "for SQL models; use a non-SQL model kind (extraction, transform, "
+                "embed, chunk) to materialize an Iceberg table.",
+            )
         if model.search is not None:
             required[WarehouseCapability.STREAMING_TABULAR_READS] = (
                 "bounded search-index publication reads"
@@ -231,13 +246,22 @@ def validate_warehouse_capabilities(
                 "bounded publication-state reconciliation"
             )
         elif model.materialization == "full":
-            required[WarehouseCapability.ATOMIC_FULL_REPLACE] = (
-                "full materialization"
-            )
+            if is_iceberg:
+                required[WarehouseCapability.ICEBERG_TABLE_FORMAT] = (
+                    "iceberg full materialization"
+                )
+            else:
+                required[WarehouseCapability.ATOMIC_FULL_REPLACE] = (
+                    "full materialization"
+                )
         else:
             required[WarehouseCapability.ATOMIC_KEYED_UPSERT] = (
                 "incremental materialization"
             )
+            if is_iceberg:
+                required[WarehouseCapability.ICEBERG_TABLE_FORMAT] = (
+                    "iceberg incremental materialization"
+                )
         if model.extraction is not None:
             required[WarehouseCapability.TYPED_EMPTY_RELATIONS] = (
                 "empty extraction results"

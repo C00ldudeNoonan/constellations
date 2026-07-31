@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.0 - 2026-07-31
+
 ### Typed relation extraction over entity mentions (issues #220, #240)
 
 - Added the `dbt_ml.text.transforms.extract_relations` transform, which emits a

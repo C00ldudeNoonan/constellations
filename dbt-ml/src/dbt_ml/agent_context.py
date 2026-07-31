@@ -602,6 +602,81 @@ def make_context_entity_link_id(
     )
 
 
+def entity_link_method(resolver: str, resolver_version: str) -> str:
+    """Canonical ``link_method`` identity for a ``link_entities`` resolver, e.g.
+    ``entity_link:alias_table:1``. Recording the resolver and its version keeps
+    the governed link's derivation auditable and invalidates the projected row
+    when either changes."""
+    return (
+        f"entity_link:{_non_empty(resolver, 'resolver')}:"
+        f"{_non_empty(resolver_version, 'resolver_version')}"
+    )
+
+
+def project_entity_link(
+    *,
+    context_id: str,
+    entity_namespace: str,
+    entity_name: str,
+    canonical_id: str,
+    relationship_type: str,
+    link_method: str,
+    recorded_from: datetime,
+    confidence: float | None = None,
+    dbt_unique_id: str | None = None,
+    recorded_to: datetime | None = None,
+    provenance: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project one resolved entity link — a ``canonical_id`` produced by the
+    ``link_entities`` transform — into a governed ``context_entity_links`` row
+    (issue #145).
+
+    The ``canonical_id`` becomes the row's ``entity_key``, so a governed metric
+    that keys the same ``(entity_namespace, entity_name, canonical_id)`` resolves
+    to the *identical* ``entity_id``. That shared id is the join key that lets an
+    agent combine documentary evidence with structured metrics across the two MCP
+    planes (issues #132/#147) without either side understanding the other's
+    schema.
+
+    Pass only resolved links: ``canonical_id`` must be non-empty, so an
+    ``unmatched`` mention (which carries no canonical key) is never published to
+    the governed context. Callers typically also drop ``ambiguous`` rows, or keep
+    them only with a caller-chosen ``relationship_type`` — this helper does not
+    guess. When ``provenance`` is omitted, a canonical fingerprint over the
+    link's identity, relationship, and method is recorded.
+    """
+    canonical = _non_empty(canonical_id, "canonical_id")
+    entity_key = canonical_entity_key(canonical)
+    entity_id = make_entity_id(entity_namespace, entity_name, entity_key)
+    method = _non_empty(link_method, "link_method")
+    if confidence is not None and not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    if provenance is None:
+        provenance = {
+            "context_id": context_id,
+            "entity_id": entity_id,
+            "relationship_type": relationship_type,
+            "link_method": method,
+        }
+    return {
+        "context_entity_link_id": make_context_entity_link_id(
+            context_id, entity_id, relationship_type
+        ),
+        "context_id": context_id,
+        "entity_namespace": entity_namespace,
+        "entity_name": entity_name,
+        "entity_id": entity_id,
+        "entity_key": entity_key,
+        "dbt_unique_id": dbt_unique_id,
+        "relationship_type": relationship_type,
+        "link_method": method,
+        "confidence": confidence,
+        "recorded_from": recorded_from,
+        "recorded_to": recorded_to,
+        "link_provenance_fingerprint": make_provenance_fingerprint(dict(provenance)),
+    }
+
+
 def content_hash(text: str) -> str:
     if not isinstance(text, str):
         raise ValueError("content must be a string")

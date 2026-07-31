@@ -13,12 +13,13 @@ from dbt_ml.config import load_project
 from dbt_ml.config.loader import ConfigError
 from dbt_ml.text import (
     ALIAS_RESOLVER_VERSION,
+    FUZZY_RESOLVER_VERSION,
     VECTOR_SIMILARITY_RESOLVER_VERSION,
     alias_set_fingerprint,
     normalize_alias_text,
 )
 from dbt_ml.text.transforms import link_entities
-from dbt_ml.transforms import TransformContext
+from dbt_ml.transforms import IncrementalContract, TransformContext
 
 _MENTIONS = pl.DataFrame(
     {
@@ -342,7 +343,7 @@ _BASE_OPTIONS: dict[str, object] = {"mentions": "mentions", "aliases": "aliases"
         ({**_BASE_OPTIONS, "include_fields": ["entity_text"]}, "must not repeat"),
         ({**_BASE_OPTIONS, "include_mention_text": "yes"}, "valid boolean"),
         ({**_BASE_OPTIONS, "label_field": ""}, "use null to disable"),
-        ({**_BASE_OPTIONS, "resolver": "fuzzy"}, "alias_table"),
+        ({**_BASE_OPTIONS, "resolver": "nonsense"}, "alias_table"),
     ],
 )
 def test_options_are_strict(options: dict[str, object], message: str) -> None:
@@ -380,6 +381,40 @@ def test_declared_dependencies_reports_the_configured_models() -> None:
     assert link_entities.declared_dependencies(
         {"mentions": "a", "aliases": "b"}
     ) == ("a", "b")
+
+
+def test_incremental_contract_treats_documents_as_parents_and_aliases_as_reference() -> None:
+    """Parents are documents in the `mentions` model, keyed by the configured
+    `document_id_field`; the `aliases` model is a whole-table reference input so
+    an alias edit re-links every document (issue #218). Child rows are keyed by
+    `entity_link_id`."""
+    contract = link_entities.declared_incremental_contract(
+        {"mentions": "m", "aliases": "a", "document_id_field": "source_document_id"}
+    )
+    assert contract == IncrementalContract(
+        parent_key="document_id",
+        child_key="entity_link_id",
+        parent_source="m",
+        parent_source_key="source_document_id",
+        reference_deps=("a",),
+    )
+    # The grain must agree with `depends_on` or the compiler rejects it before
+    # any wrong-key delete can run at build time.
+    contract.validate_against(["m", "a"])
+
+
+def test_incremental_contract_is_resolver_independent() -> None:
+    """The shared driver fixes the output columns, so every resolver produces the
+    same one-to-many grain."""
+    base = {"mentions": "m", "aliases": "a"}
+    alias_contract = link_entities.declared_incremental_contract(base)
+    vector_contract = link_entities.declared_incremental_contract(
+        {**base, "resolver": "vector_similarity", "threshold": 0.5}
+    )
+    assert alias_contract == vector_contract
+    assert vector_contract.parent_key == "document_id"
+    assert vector_contract.child_key == "entity_link_id"
+    assert vector_contract.reference_deps == ("a",)
 
 
 def test_normalize_alias_text_is_nfkc_casefold_and_collapsed() -> None:
@@ -718,6 +753,253 @@ def test_vector_similarity_options_are_strict(
         link_entities.validate_options({**_BASE_OPTIONS, **options})
 
 
+# --- fuzzy resolver ----------------------------------------------------------
+
+
+def _fuzzy_ctx(options: dict[str, object] | None = None) -> TransformContext:
+    merged: dict[str, object] = {"resolver": "fuzzy", "threshold": 0.4}
+    merged.update(options or {})
+    return _ctx(merged)
+
+
+def test_fuzzy_matches_token_variants_alias_table_would_miss() -> None:
+    """`jaccard_token` links a reordered/extra-word surface form that neither
+    exact nor normalized alias matching would catch."""
+    mentions = pl.DataFrame(
+        {
+            "entity_id": ["m-1"],
+            "document_id": ["d1"],
+            "entity_text": ["big red apple"],
+        }
+    )
+    aliases = pl.DataFrame(
+        {
+            "alias": ["red apple"],
+            "entity_namespace": ["fruit"],
+            "canonical_id": ["RA"],
+        }
+    )
+
+    first = link_entities.run(
+        _deps(mentions, aliases),
+        _fuzzy_ctx({**_NO_SPANS, "metric": "jaccard_token", "threshold": 0.6}),
+    )
+    second = link_entities.run(
+        _deps(mentions, aliases),
+        _fuzzy_ctx({**_NO_SPANS, "metric": "jaccard_token", "threshold": 0.6}),
+    )
+
+    # tokens {big,red,apple} ∩ {red,apple} / union = 2/3.
+    assert first["status"].to_list() == ["matched"]
+    assert first["canonical_id"].to_list() == ["RA"]
+    assert first["match_method"].to_list() == ["jaccard_token"]
+    assert first["match_score"].to_list() == [pytest.approx(2 / 3)]
+    assert first["resolver"].to_list() == ["fuzzy"]
+    assert first["resolver_version"].to_list() == [FUZZY_RESOLVER_VERSION]
+    assert first["entity_link_id"].to_list() == second["entity_link_id"].to_list()
+    assert "entity_text" not in first.columns
+
+
+def test_fuzzy_trigram_dice_scores_partial_overlap() -> None:
+    mentions = pl.DataFrame(
+        {"entity_id": ["m-1"], "document_id": ["d1"], "entity_text": ["abcd"]}
+    )
+    aliases = pl.DataFrame(
+        {"alias": ["abc"], "entity_namespace": ["x"], "canonical_id": ["ABC"]}
+    )
+
+    output = link_entities.run(
+        _deps(mentions, aliases),
+        _fuzzy_ctx({**_NO_SPANS, "metric": "trigram_dice", "threshold": 0.5}),
+    )
+
+    # space-padded trigram sets |A|=6, |B|=5, |A∩B|=3 → Dice = 6/11.
+    assert output["status"].to_list() == ["matched"]
+    assert output["canonical_id"].to_list() == ["ABC"]
+    assert output["match_score"].to_list() == [pytest.approx(6 / 11)]
+
+
+def test_fuzzy_below_threshold_is_unmatched() -> None:
+    mentions = pl.DataFrame(
+        {"entity_id": ["m-1"], "document_id": ["d1"], "entity_text": ["abcd"]}
+    )
+    aliases = pl.DataFrame(
+        {"alias": ["abc"], "entity_namespace": ["x"], "canonical_id": ["ABC"]}
+    )
+
+    output = link_entities.run(
+        _deps(mentions, aliases),
+        _fuzzy_ctx({**_NO_SPANS, "metric": "trigram_dice", "threshold": 0.6}),
+    )
+
+    assert output["status"].to_list() == ["unmatched"]
+    assert output["canonical_id"].to_list() == [None]
+    assert output["match_score"].to_list() == [None]
+
+
+def test_fuzzy_ties_are_ambiguous_not_guessed() -> None:
+    mentions = pl.DataFrame(
+        {"entity_id": ["m-1"], "document_id": ["d1"], "entity_text": ["Mercury"]}
+    )
+    aliases = pl.DataFrame(
+        {
+            "alias": ["Mercury", "Mercury"],
+            "entity_namespace": ["ticker", "ticker"],
+            "canonical_id": ["MCY", "MERC"],
+        }
+    )
+
+    output = link_entities.run(
+        _deps(mentions, aliases), _fuzzy_ctx(_NO_SPANS)
+    ).sort("canonical_id")
+
+    assert output["status"].to_list() == ["ambiguous", "ambiguous"]
+    assert output["canonical_id"].to_list() == ["MCY", "MERC"]
+    assert output["match_score"].to_list() == [pytest.approx(1.0), pytest.approx(1.0)]
+    assert output["entity_link_id"].n_unique() == 2
+
+
+def test_fuzzy_ambiguity_margin_widens_near_ties() -> None:
+    mentions = pl.DataFrame(
+        {"entity_id": ["m-1"], "document_id": ["d1"], "entity_text": ["abcd"]}
+    )
+    aliases = pl.DataFrame(
+        {
+            # "abcd" scores 1.0; "abc" scores 6/11 ≈ 0.545 (top − 0.455).
+            "alias": ["abcd", "abc"],
+            "entity_namespace": ["x", "x"],
+            "canonical_id": ["EXACT", "CLOSE"],
+        }
+    )
+
+    strict = link_entities.run(_deps(mentions, aliases), _fuzzy_ctx(_NO_SPANS))
+    assert strict["status"].to_list() == ["matched"]
+    assert strict["canonical_id"].to_list() == ["EXACT"]
+
+    lenient = link_entities.run(
+        _deps(mentions, aliases), _fuzzy_ctx({**_NO_SPANS, "ambiguity_margin": 0.5})
+    )
+    assert lenient["status"].to_list() == ["ambiguous", "ambiguous"]
+
+
+def test_fuzzy_normalize_toggles_case_sensitivity() -> None:
+    mentions = pl.DataFrame(
+        {"entity_id": ["m-1"], "document_id": ["d1"], "entity_text": ["APPLE"]}
+    )
+    aliases = pl.DataFrame(
+        {"alias": ["apple"], "entity_namespace": ["x"], "canonical_id": ["A"]}
+    )
+
+    normalized = link_entities.run(
+        _deps(mentions, aliases), _fuzzy_ctx({**_NO_SPANS, "threshold": 0.9})
+    )
+    assert normalized["status"].to_list() == ["matched"]
+    assert normalized["match_score"].to_list() == [pytest.approx(1.0)]
+
+    literal = link_entities.run(
+        _deps(mentions, aliases),
+        _fuzzy_ctx({**_NO_SPANS, "threshold": 0.9, "normalize": False}),
+    )
+    assert literal["status"].to_list() == ["unmatched"]
+
+
+def test_fuzzy_null_and_empty_mention_text_stay_unmatched() -> None:
+    mentions = pl.DataFrame(
+        {
+            "entity_id": ["m-null", "m-blank"],
+            "document_id": ["d1", "d1"],
+            "entity_text": [None, "   "],
+        }
+    )
+    aliases = pl.DataFrame(
+        {"alias": ["apple"], "entity_namespace": ["x"], "canonical_id": ["A"]}
+    )
+
+    output = link_entities.run(_deps(mentions, aliases), _fuzzy_ctx(_NO_SPANS))
+
+    assert output["status"].to_list() == ["unmatched", "unmatched"]
+
+
+def test_fuzzy_empty_alias_frame_yields_unmatched() -> None:
+    empty_aliases = pl.DataFrame(
+        schema={
+            "alias": pl.String(),
+            "entity_namespace": pl.String(),
+            "canonical_id": pl.String(),
+        }
+    )
+
+    output = link_entities.run(_deps(aliases=empty_aliases), _fuzzy_ctx())
+
+    assert output["status"].unique().to_list() == ["unmatched"]
+    assert output.height == _MENTIONS.height
+
+
+def test_fuzzy_reference_version_tracks_alias_set() -> None:
+    original = link_entities.run(_deps(), _fuzzy_ctx())
+    edited = _ALIASES.with_columns(
+        pl.Series("canonical_id", ["0000320193", "AAPL", "FRB", "MCY", "RENAMED"])
+    )
+    changed = link_entities.run(_deps(aliases=edited), _fuzzy_ctx())
+
+    assert original["alias_set_version"].n_unique() == 1
+    assert (
+        original["alias_set_version"].to_list()[0]
+        != changed["alias_set_version"].to_list()[0]
+    )
+
+
+def test_fuzzy_on_ambiguity_error_names_only_ids() -> None:
+    mentions = pl.DataFrame(
+        {"entity_id": ["m-mercury"], "document_id": ["d1"], "entity_text": ["Mercury"]}
+    )
+    aliases = pl.DataFrame(
+        {
+            "alias": ["Mercury", "Mercury"],
+            "entity_namespace": ["ticker", "ticker"],
+            "canonical_id": ["MCY", "MERC"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="on_ambiguity is 'error'") as excinfo:
+        link_entities.run(
+            _deps(mentions, aliases),
+            _fuzzy_ctx({**_NO_SPANS, "on_ambiguity": "error"}),
+        )
+
+    assert "m-mercury" in str(excinfo.value)
+    assert "Mercury" not in str(excinfo.value)
+
+
+def test_fuzzy_requires_mention_text_column() -> None:
+    mentions = _MENTIONS.drop("entity_text")
+
+    with pytest.raises(ValueError, match="entity_text"):
+        link_entities.run(_deps(mentions), _fuzzy_ctx())
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"resolver": "fuzzy"}, "threshold"),
+        ({"resolver": "fuzzy", "threshold": 0.5, "match_methods": ["exact"]},
+         "Extra inputs are not permitted"),
+        ({"resolver": "fuzzy", "threshold": 0.0}, r"\(0, 1\]"),
+        ({"resolver": "fuzzy", "threshold": 1.5}, r"\(0, 1\]"),
+        ({"resolver": "fuzzy", "threshold": float("nan")}, r"\(0, 1\]"),
+        ({"resolver": "fuzzy", "threshold": 0.5, "ambiguity_margin": -0.1},
+         "non-negative"),
+        ({"resolver": "fuzzy", "threshold": 0.5, "metric": "levenshtein"},
+         "metric"),
+        ({"resolver": "fuzzy", "threshold": 0.5, "normalize": "yes"},
+         "valid boolean"),
+    ],
+)
+def test_fuzzy_options_are_strict(options: dict[str, object], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        link_entities.validate_options({**_BASE_OPTIONS, **options})
+
+
 def _example_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "examples" / "economic_entity_links"
 
@@ -731,6 +1013,8 @@ def test_economic_entity_links_example_compiles() -> None:
     order = dag.execution_order()
     assert order.index("entity_links") > order.index("entity_mentions")
     assert order.index("entity_links") > order.index("entity_aliases")
+    entity_links = next(model for model in models if model.name == "entity_links")
+    assert entity_links.materialization == "incremental"
 
 
 def test_economic_entity_links_embeddings_example_compiles() -> None:
@@ -748,6 +1032,8 @@ def test_economic_entity_links_embeddings_example_compiles() -> None:
     assert order.index("alias_embeddings") > order.index("entity_aliases")
     assert order.index("entity_links") > order.index("mention_embeddings")
     assert order.index("entity_links") > order.index("alias_embeddings")
+    entity_links = next(model for model in models if model.name == "entity_links")
+    assert entity_links.materialization == "incremental"
 
 
 @pytest.mark.parametrize(

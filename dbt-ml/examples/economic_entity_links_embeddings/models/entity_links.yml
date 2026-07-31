@@ -20,7 +20,10 @@ models:
         threshold: 0.999
         start_field: null
         end_field: null
-    materialization: full
+    # Incremental (#218): parents are documents in `mention_embeddings`; the
+    # `alias_embeddings` reference is a whole-table input, so an alias-vector
+    # edit re-links every document. Child rows are keyed by `entity_link_id`.
+    materialization: incremental
     tags: [economic_data, entity_links]
     tests:
       - not_null: [entity_link_id, mention_id, document_id, status, resolver,

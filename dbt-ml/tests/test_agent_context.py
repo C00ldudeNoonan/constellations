@@ -20,6 +20,7 @@ from dbt_ml.agent_context import (
     citation_locator,
     content_hash,
     contract_descriptor,
+    entity_link_method,
     freshness_status,
     interval_contains,
     is_publishable_context,
@@ -31,6 +32,7 @@ from dbt_ml.agent_context import (
     make_entity_id,
     make_provenance_fingerprint,
     policy_fingerprint,
+    project_entity_link,
     retrieval_projection_fingerprint,
     validate_agent_context_frame,
     validate_agent_context_relations,
@@ -195,6 +197,111 @@ def _link(
             {"model": "model.economic_data.context_entity_links"}
         ),
     }
+
+
+def test_entity_link_method_records_resolver_identity() -> None:
+    assert entity_link_method("alias_table", "1") == "entity_link:alias_table:1"
+    assert entity_link_method("fuzzy", "2") == "entity_link:fuzzy:2"
+    with pytest.raises(ValueError, match="resolver_version"):
+        entity_link_method("alias_table", "")
+
+
+def test_project_entity_link_bridges_link_entities_to_governed_context() -> None:
+    """A ``link_entities`` matched row projects into a valid
+    ``context_entity_links`` row, and its ``entity_id`` equals the id a governed
+    metric keyed on the same canonical value resolves to — the cross-plane join
+    key (#132/#147)."""
+    document = _document()
+    chunk = _chunk(document)
+    # A link_entities-shaped output: matched rows carry a canonical_id + score;
+    # unmatched rows do not. Only matched rows are published to the governed
+    # context, and each mention's document is joined to its chunk's context_id.
+    link_rows = [
+        {
+            "document_id": document["document_id"],
+            "mention_id": "m-1",
+            "entity_namespace": "cik",
+            "canonical_id": "0000320193",
+            "match_score": 0.98,
+            "status": "matched",
+            "resolver": "fuzzy",
+            "resolver_version": "1",
+        },
+        {
+            "document_id": document["document_id"],
+            "mention_id": "m-2",
+            "entity_namespace": "cik",
+            "canonical_id": None,
+            "match_score": None,
+            "status": "unmatched",
+            "resolver": "fuzzy",
+            "resolver_version": "1",
+        },
+    ]
+    context_by_document = {document["document_id"]: chunk["context_id"]}
+
+    projected = [
+        project_entity_link(
+            context_id=context_by_document[row["document_id"]],
+            entity_namespace=row["entity_namespace"],
+            entity_name="issuer",
+            canonical_id=row["canonical_id"],
+            relationship_type="mentions",
+            link_method=entity_link_method(row["resolver"], row["resolver_version"]),
+            recorded_from=_T0,
+            confidence=row["match_score"],
+            dbt_unique_id="semantic_model.economic_data.filings",
+        )
+        for row in link_rows
+        if row["status"] == "matched"
+    ]
+
+    links_frame = pl.DataFrame(projected).with_columns(
+        pl.col("recorded_from").dt.replace_time_zone("UTC"),
+        pl.col("recorded_to").cast(pl.Datetime(time_unit="us", time_zone="UTC")),
+    )
+    # The projection satisfies the governed contract end to end.
+    validate_agent_context_relations(
+        pl.DataFrame([document]),
+        pl.DataFrame([chunk]),
+        links_frame,
+    )
+
+    assert links_frame.height == 1
+    row = links_frame.row(0, named=True)
+    assert row["link_method"] == "entity_link:fuzzy:1"
+    assert row["confidence"] == pytest.approx(0.98)
+
+    # The cross-plane join: a governed metric that keys the same namespace/name
+    # and canonical id derives the identical entity_id.
+    metric_entity_id = make_entity_id(
+        "cik", "issuer", canonical_entity_key("0000320193")
+    )
+    assert row["entity_id"] == metric_entity_id
+
+
+def test_project_entity_link_rejects_unresolved_and_out_of_range_inputs() -> None:
+    with pytest.raises(ValueError, match="canonical_id"):
+        project_entity_link(
+            context_id="c",
+            entity_namespace="cik",
+            entity_name="issuer",
+            canonical_id="",
+            relationship_type="mentions",
+            link_method="entity_link:fuzzy:1",
+            recorded_from=_T0,
+        )
+    with pytest.raises(ValueError, match="confidence must be between 0 and 1"):
+        project_entity_link(
+            context_id="c",
+            entity_namespace="cik",
+            entity_name="issuer",
+            canonical_id="0000320193",
+            relationship_type="mentions",
+            link_method="entity_link:fuzzy:1",
+            recorded_from=_T0,
+            confidence=1.5,
+        )
 
 
 def test_contract_descriptor_is_versioned_and_machine_readable() -> None:

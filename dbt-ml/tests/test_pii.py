@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import polars as pl
@@ -15,7 +16,7 @@ from dbt_ml.text.transforms import redact_pii as t_redact_pii
 from dbt_ml.transforms import TransformContext
 
 
-def _ctx(options: dict | None = None) -> TransformContext:
+def _ctx(options: dict[str, Any] | None = None) -> TransformContext:
     return TransformContext(
         project_dir=Path("."),
         profile_name="test",
@@ -35,7 +36,7 @@ def _reset_analyzer_cache() -> None:
     pii_module._get_anonymizer.cache_clear()
 
 
-def _mock_analyzer(monkeypatch: pytest.MonkeyPatch, spans: list[dict]) -> None:
+def _mock_analyzer(monkeypatch: pytest.MonkeyPatch, spans: list[dict[str, Any]]) -> None:
     """Patch _get_analyzer to return a stub that reports the given spans."""
 
     class _StubResult:
@@ -80,10 +81,10 @@ def test_detect_pii_empty_input() -> None:
 
 def test_detect_pii_score_threshold_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
     """score_threshold should be forwarded to Presidio."""
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
     class _Stub:
-        def analyze(self, **kwargs) -> list:
+        def analyze(self, **kwargs) -> list[Any]:
             captured.update(kwargs)
             return []
 

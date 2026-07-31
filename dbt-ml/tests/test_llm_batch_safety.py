@@ -9,15 +9,16 @@ and every budget boundary.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import duckdb
 import pytest
 from pydantic import ValidationError
 
 from dbt_ml.backends import get_backend, llm_backend
-from dbt_ml.backends.llm_backend import BatchCancelledError
+from dbt_ml.backends.llm_backend import BatchCancelledError, ExtractionResult
 from dbt_ml.backends.options import LLMBackendOptions
 from dbt_ml.budget import (
     BudgetExceededError,
@@ -86,7 +87,7 @@ class _FakeNativeProvider(InferenceProvider):
 
     def submit_batch(
         self,
-        requests: list[BatchInferenceRequest],
+        requests: Sequence[BatchInferenceRequest],
         *,
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
@@ -116,7 +117,7 @@ class _FakeNativeProvider(InferenceProvider):
     def fetch_batch_results(
         self,
         batch_id: str,
-        requests: list[BatchInferenceRequest],
+        requests: Sequence[BatchInferenceRequest],
         *,
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
@@ -197,7 +198,7 @@ def test_partitions_respect_provider_limit_deterministically(
         ["INVOICE-2 body text", "INVOICE-3 body text"],
         ["INVOICE-4 body text"],
     ]
-    assert [item.fields["value"] for item in out.items] == [
+    assert [cast(ExtractionResult, item).fields["value"] for item in out.items] == [
         f"INVOICE-{i} body text" for i in range(5)
     ]
     assert out.metrics["batch_submissions"] == 3
@@ -208,7 +209,9 @@ def test_partitions_respect_provider_limit_deterministically(
     assert _job_rows(tmp_path / "cache.duckdb") == []
     again = backend.extract_batch_with_metrics(docs, _options(tmp_path))
     assert len(_FakeNativeProvider.submissions) == 3
-    assert all(item.metrics["cache_hits"] == 1 for item in again.items)
+    assert all(
+        cast(ExtractionResult, item).metrics["cache_hits"] == 1 for item in again.items
+    )
 
 
 def test_batch_size_option_bounds_partitions(
@@ -243,7 +246,7 @@ def test_interrupted_batch_resumes_without_resubmission(
     assert _FakeNativeProvider.submissions == ["job-0"]
     assert out.metrics["batch_submissions"] == 0
     assert out.metrics["batches_resumed"] == 1
-    assert [item.fields["value"] for item in out.items] == [
+    assert [cast(ExtractionResult, item).fields["value"] for item in out.items] == [
         "INVOICE-0 body text",
         "INVOICE-1 body text",
     ]
@@ -434,10 +437,14 @@ def test_budget_config_is_strictly_typed() -> None:
         LLMBudgetConfig(max_documents=0)
     with pytest.raises(ValidationError):
         LLMBudgetConfig(max_cost_usd=-1.0)
+    # Deliberately invalid kwargs (a dict[str, Any] keeps the static checker from
+    # rejecting them before the runtime ValidationError we are asserting).
+    bad_kwargs: dict[str, Any] = {"unknown_cap": 5}
     with pytest.raises(ValidationError):
-        LLMBudgetConfig(unknown_cap=5)
+        LLMBudgetConfig(**bad_kwargs)
+    bad_kwargs = {"max_api_calls": "10"}
     with pytest.raises(ValidationError):
-        LLMBudgetConfig(max_api_calls="10")
+        LLMBudgetConfig(**bad_kwargs)
 
 
 def test_llm_backend_options_validate_batch_safety_fields() -> None:
@@ -575,7 +582,7 @@ def test_runner_partial_batch_failure_publishes_nothing_by_default(
     _add_model_options(invoice_project, "        batch: true")
 
     def fake(
-        requests: list[BatchInferenceRequest],
+        requests: Sequence[BatchInferenceRequest],
         **kwargs: Any,
     ) -> tuple[BatchInferenceResult, bool]:
         items = [

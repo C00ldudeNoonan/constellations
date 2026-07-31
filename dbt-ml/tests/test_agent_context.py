@@ -216,7 +216,7 @@ def test_project_entity_link_bridges_link_entities_to_governed_context() -> None
     # A link_entities-shaped output: matched rows carry a canonical_id + score;
     # unmatched rows do not. Only matched rows are published to the governed
     # context, and each mention's document is joined to its chunk's context_id.
-    link_rows = [
+    link_rows: list[dict[str, Any]] = [
         {
             "document_id": document["document_id"],
             "mention_id": "m-1",

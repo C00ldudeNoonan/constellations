@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -99,7 +100,7 @@ def _write_doc(project: Path, name: str, body: str) -> None:
     (project / "data" / "docs" / name).write_text(json.dumps({"body": body}))
 
 
-def _tokens(project: Path) -> list[tuple]:
+def _tokens(project: Path) -> list[tuple[Any, ...]]:
     con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
     try:
         return con.execute(
@@ -110,7 +111,7 @@ def _tokens(project: Path) -> list[tuple]:
         con.close()
 
 
-def _result(results: list, name: str):
+def _result(results: list[Any], name: str):
     return next(r for r in results if r.model_name == name)
 
 
@@ -287,12 +288,12 @@ def test_failed_publication_leaves_no_stale_state_and_preserves_others(
     original = DuckDBAdapter.replace_children
     failed = False
 
-    def fail_once(self: DuckDBAdapter, table: str, *args: object, **kwargs: object) -> int:
+    def fail_once(self: DuckDBAdapter, table: str, *args: Any, **kwargs: Any) -> int:
         nonlocal failed
         if table == "word_tokens" and not failed:
             failed = True
             raise AdapterError("simulated publication failure")
-        return original(self, table, *args, **kwargs)  # type: ignore[arg-type]
+        return original(self, table, *args, **kwargs)
 
     monkeypatch.setattr(DuckDBAdapter, "replace_children", fail_once)
     with pytest.raises(RunError, match="simulated publication failure"):
@@ -390,7 +391,7 @@ class _RecordingAdapter:
         self._tables: dict[str, pl.DataFrame] = dict(preexisting or {})
         self._state: dict[str, dict[str, object]] = {}
         self._warehouse_options = warehouse_options
-        self.calls: list[tuple] = []
+        self.calls: list[tuple[Any, ...]] = []
 
     def capabilities(self):
         from dbt_ml.adapters.bigquery import BigQueryAdapter

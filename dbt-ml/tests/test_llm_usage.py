@@ -10,6 +10,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -66,8 +67,8 @@ def fake_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     calls = {"n": 0}
 
     def _fake(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: object
-    ) -> tuple[dict, dict]:
+        content: str, model: str, system: str, fields_spec: list[Any], **kwargs: object
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         calls["n"] += 1
         return {**_FIELDS, "invoice_id": f"INV-{calls['n']}"}, dict(_CALL_USAGE)
 
@@ -75,7 +76,7 @@ def fake_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     return calls
 
 
-def test_run_aggregates_usage_per_model(llm_project: Path, fake_api: dict) -> None:
+def test_run_aggregates_usage_per_model(llm_project: Path, fake_api: dict[str, Any]) -> None:
     results = run_project(llm_project)
     r = next(x for x in results if x.model_name == "raw_invoices_llm")
 
@@ -92,7 +93,7 @@ def test_run_aggregates_usage_per_model(llm_project: Path, fake_api: dict) -> No
 
 
 def test_cache_hits_counted_with_zero_tokens(
-    llm_project: Path, fake_api: dict
+    llm_project: Path, fake_api: dict[str, Any]
 ) -> None:
     run_project(llm_project)
     # full_refresh bypasses incremental state, so every document is
@@ -107,7 +108,7 @@ def test_cache_hits_counted_with_zero_tokens(
 
 
 def test_pricing_config_yields_cost_estimate(
-    llm_project: Path, fake_api: dict
+    llm_project: Path, fake_api: dict[str, Any]
 ) -> None:
     profiles = llm_project / "profiles.yml"
     profiles.write_text(
@@ -192,7 +193,7 @@ def test_batch_cost_uses_selected_provider_multiplier(
     assert r.provider_implementation == "test/provider-implementation"
 
 
-def test_usage_persisted_in_run_results(llm_project: Path, fake_api: dict) -> None:
+def test_usage_persisted_in_run_results(llm_project: Path, fake_api: dict[str, Any]) -> None:
     results = run_project(llm_project)
     payload = json.loads(write_run_results(llm_project, results).read_text())
     row = next(
@@ -206,7 +207,7 @@ def test_usage_persisted_in_run_results(llm_project: Path, fake_api: dict) -> No
     assert "api_key" not in json.dumps(row)
 
 
-def test_run_summary_prints_usage_line(llm_project: Path, fake_api: dict) -> None:
+def test_run_summary_prints_usage_line(llm_project: Path, fake_api: dict[str, Any]) -> None:
     runner = CliRunner()
     result = runner.invoke(cli, ["--project-dir", str(llm_project), "run"])
     assert result.exit_code == 0, result.output
@@ -315,7 +316,7 @@ def test_api_key_secret_is_not_persisted_or_logged(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     llm_project: Path,
-    fake_api: dict,
+    fake_api: dict[str, Any],
 ) -> None:
     profiles = llm_project / "profiles.yml"
     profiles.write_text(

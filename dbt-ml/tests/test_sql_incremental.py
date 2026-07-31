@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, Literal
 
 import pytest
 
@@ -74,9 +75,9 @@ def _sql_model(
     tmp_path: Path,
     sql_text: str,
     *,
-    materialization: str = "incremental",
+    materialization: Literal["full", "incremental"] = "incremental",
     unique_key: str | None = "id",
-    on_schema_change: str = "fail",
+    on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail",
 ) -> ModelConfig:
     sql_dir = tmp_path / "sql"
     sql_dir.mkdir(exist_ok=True)
@@ -408,7 +409,7 @@ def _write_event(project_dir: Path, event_id: str, name: str, updated_at: str) -
     )
 
 
-def _snapshot_rows(project_dir: Path) -> list[tuple]:
+def _snapshot_rows(project_dir: Path) -> list[tuple[Any, ...]]:
     import duckdb
 
     con = duckdb.connect(str(project_dir / "target" / "w.duckdb"))

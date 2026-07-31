@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -143,7 +144,7 @@ def _write_project(tmp_path: Path, *, retrieval_tests_yaml: str = "") -> Path:
     return project
 
 
-def _write_golden_rows(project: Path, rows: list[dict]) -> None:
+def _write_golden_rows(project: Path, rows: list[dict[str, Any]]) -> None:
     golden = project / "golden"
     golden.mkdir(exist_ok=True)
     for row in rows:

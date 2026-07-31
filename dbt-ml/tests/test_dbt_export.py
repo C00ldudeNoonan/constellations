@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -20,12 +21,12 @@ def fresh_project(tmp_path: Path, example_project_dir: Path) -> Path:
     return dst
 
 
-def _table(payload: dict, name: str) -> dict:
+def _table(payload: dict[str, Any], name: str) -> dict[str, Any]:
     src = payload["sources"][0]
     return next(t for t in src["tables"] if t["name"] == name)
 
 
-def _col(table: dict, name: str) -> dict:
+def _col(table: dict[str, Any], name: str) -> dict[str, Any]:
     return next(c for c in table["columns"] if c["name"] == name)
 
 

@@ -212,7 +212,7 @@ def test_effective_default_backend_changes_model_code_version(tmp_path: Path) ->
     )
 
 
-def _resolved_llm(tmp_path: Path, **overrides: object) -> ResolvedProfile:
+def _resolved_llm(tmp_path: Path, **overrides: Any) -> ResolvedProfile:
     return ResolvedProfile(
         profile_name="p",
         target_name="dev",

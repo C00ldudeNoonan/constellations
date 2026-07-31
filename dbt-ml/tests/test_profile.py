@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -60,7 +61,7 @@ def _write_profiles(
     name: str = "test_proj",
     *,
     default_target: str = "dev",
-    targets: dict[str, dict] | None = None,
+    targets: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     targets = targets or {
         "dev": {
@@ -465,7 +466,7 @@ def test_resolved_profile_is_frozen_dataclass(tmp_path: Path) -> None:
     resolved = resolve_profile(project, tmp_path)
     assert isinstance(resolved, ResolvedProfile)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        resolved.target_name = "other"  # type: ignore[misc]
+        cast(Any, resolved).target_name = "other"
 
 
 def test_target_source_path_overrides(tmp_path: Path) -> None:
@@ -731,7 +732,7 @@ def test_missing_inactive_bigquery_reference_does_not_break_active_target(
     prod = resolve_profile(project, tmp_path, target="prod")
     adapter = create_adapter(prod.warehouse, project_dir=tmp_path)
     with pytest.raises(AdapterError) as exc_info:
-        adapter._credentials()  # type: ignore[attr-defined]
+        cast(Any, adapter)._credentials()
 
     message = str(exc_info.value)
     assert "not set or is empty" in message
@@ -757,7 +758,7 @@ def test_environment_selected_bigquery_type_protects_credentials_first(
     adapter = create_adapter(resolved.warehouse, project_dir=tmp_path)
 
     with pytest.raises(AdapterError) as exc_info:
-        adapter._credentials()  # type: ignore[attr-defined]
+        cast(Any, adapter)._credentials()
 
     assert env_name not in str(exc_info.value)
 

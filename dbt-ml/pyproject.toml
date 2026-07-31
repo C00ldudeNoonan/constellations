@@ -90,7 +90,7 @@ ignore = ["RUF001", "RUF002", "RUF003", "ANN401"]
 "tests/**/*.py" = ["ANN", "PYI"]
 
 [tool.ty.src]
-include = ["src/dbt_ml", "typecheck"]
+include = ["src/dbt_ml", "typecheck", "tests", "examples", "scripts"]
 
 [tool.ty.rules]
 missing-type-argument = "error"

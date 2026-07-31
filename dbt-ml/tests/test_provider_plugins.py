@@ -6,7 +6,7 @@ import sys
 import textwrap
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict
@@ -402,11 +402,11 @@ def test_loose_model_config_is_rejected() -> None:
 
 
 def test_parse_profile_options_rejects_unknown_keys_and_unpublished() -> None:
-    parsed = parse_profile_options(_OptionedProvider, {"region": "eu-west"})  # type: ignore[arg-type]
+    parsed = parse_profile_options(cast(Any, _OptionedProvider), {"region": "eu-west"})
     assert isinstance(parsed, _StrictOptions)
     assert parsed.region == "eu-west"
     with pytest.raises(ProviderConfigurationError):
-        parse_profile_options(_OptionedProvider, {"unknown": 1})  # type: ignore[arg-type]
+        parse_profile_options(cast(Any, _OptionedProvider), {"unknown": 1})
 
     class NoOptions:
         provider_name = "bare"
@@ -415,9 +415,9 @@ def test_parse_profile_options_rejects_unknown_keys_and_unpublished() -> None:
         def profile_options_model(cls) -> type[BaseModel] | None:
             return None
 
-    assert parse_profile_options(NoOptions, None) is None  # type: ignore[arg-type]
+    assert parse_profile_options(cast(Any, NoOptions), None) is None
     with pytest.raises(ProviderConfigurationError, match="does not accept"):
-        parse_profile_options(NoOptions, {"anything": 1})  # type: ignore[arg-type]
+        parse_profile_options(cast(Any, NoOptions), {"anything": 1})
 
 
 def test_fingerprint_tracks_semantic_fields_only() -> None:
@@ -454,7 +454,7 @@ def test_registered_provider_receives_frozen_options(clean_registry: None) -> No
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        provider.profile_options.region = "us"  # type: ignore[misc]
+        cast(Any, provider.profile_options).region = "us"
 
 
 # ─── billed failures ────────────────────────────────────────────────────────
@@ -694,7 +694,7 @@ def test_resolve_batch_item_synthesizes_failure_from_item_usage() -> None:
         error=ProviderError("failed item", safe_for_display=True),
         usage=usage,
     )
-    resolved = LLMBackend._resolve_batch_item(
+    resolved = cast(Any, LLMBackend)._resolve_batch_item(
         item,
         cache_path=None,
         cache_key="key",

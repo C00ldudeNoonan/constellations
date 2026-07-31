@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import itertools
 import os
+import re
 import stat
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -22,6 +25,112 @@ from .yaml_diagnostics import (
 
 class ConfigError(Exception):
     pass
+
+
+_MAX_FOR_EACH_VARIANTS = 256
+_MAX_SLUG_LEN = 32
+_MATRIX_RE = re.compile(r"\$\{matrix\.([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _value_slug(value: Any) -> str:
+    if isinstance(value, list):
+        return "_".join(_value_slug(v) for v in value) or "empty"
+    raw = str(value).lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    if not slug:
+        slug = "x"
+    if len(slug) > _MAX_SLUG_LEN:
+        h = hashlib.sha256(slug.encode()).hexdigest()[:8]
+        slug = slug[: _MAX_SLUG_LEN - 9] + "_" + h
+    return slug
+
+
+def _variant_name(base: str, axis_names: list[str], combo: tuple[Any, ...]) -> str:
+    parts = [base]
+    for key, value in zip(axis_names, combo, strict=True):
+        parts.append(f"{key}_{_value_slug(value)}")
+    return "__".join(parts)
+
+
+def _substitute(value: Any, matrix: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        m = _MATRIX_RE.fullmatch(value)
+        if m:
+            key = m.group(1)
+            if key not in matrix:
+                raise ConfigError(
+                    f"Matrix placeholder '${{matrix.{key}}}' references unknown axis '{key}'"
+                )
+            return matrix[key]
+
+        def _repl(mo: re.Match[str]) -> str:
+            k = mo.group(1)
+            if k not in matrix:
+                raise ConfigError(
+                    f"Matrix placeholder '${{matrix.{k}}}' references unknown axis '{k}'"
+                )
+            return str(matrix[k])
+
+        return _MATRIX_RE.sub(_repl, value)
+    if isinstance(value, dict):
+        return {k: _substitute(v, matrix) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute(v, matrix) for v in value]
+    return value
+
+
+def _expand_for_each(models: list[ModelConfig]) -> list[ModelConfig]:
+    result: list[ModelConfig] = []
+    for model in models:
+        if model.for_each is None:
+            result.append(model)
+            continue
+
+        axes = model.for_each
+        axis_names = list(axes.keys())
+        combinations = list(itertools.product(*[axes[k] for k in axis_names]))
+
+        if len(combinations) > _MAX_FOR_EACH_VARIANTS:
+            raise ConfigError(
+                f"Model '{model.name}': for_each expands to {len(combinations)} variants "
+                f"(max {_MAX_FOR_EACH_VARIANTS})"
+            )
+
+        base_name = model.name
+        base_dict = model.model_dump(mode="python", exclude={"for_each"})
+        seen_names: set[str] = set()
+
+        for combo in combinations:
+            matrix = dict(zip(axis_names, combo, strict=True))
+            variant_name = _variant_name(base_name, axis_names, combo)
+
+            if variant_name in seen_names:
+                raise ConfigError(
+                    f"Model '{base_name}': variant name collision '{variant_name}'; "
+                    "two axis value combinations produce the same slug"
+                )
+            seen_names.add(variant_name)
+
+            variant_dict: dict[str, Any] = _substitute(base_dict, matrix)
+            variant_dict["name"] = variant_name
+
+            tags: list[str] = list(variant_dict.get("tags") or [])
+            if base_name not in tags:
+                tags.append(base_name)
+            variant_dict["tags"] = tags
+
+            try:
+                variant = ModelConfig.model_validate(variant_dict)
+            except ValidationError as e:
+                raise ConfigError(
+                    f"Model '{base_name}' for_each variant '{variant_name}' failed validation:\n"
+                    f"{e}"
+                ) from e
+
+            variant._yaml_provenance = model._yaml_provenance
+            result.append(variant)
+
+    return result
 
 
 def load_project(
@@ -113,6 +222,7 @@ def load_project(
         )
 
     _populate_sql_depends_on(models, project_dir)
+    models = _expand_for_each(models)
 
     return project, sources, models
 

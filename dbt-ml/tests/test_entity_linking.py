@@ -17,6 +17,7 @@ from dbt_ml.text import (
     VECTOR_SIMILARITY_RESOLVER_VERSION,
     alias_set_fingerprint,
     normalize_alias_text,
+    parse_entity_link_options,
 )
 from dbt_ml.text.transforms import link_entities
 from dbt_ml.transforms import IncrementalContract, TransformContext
@@ -744,6 +745,13 @@ def test_vector_similarity_does_not_require_mention_text_by_default() -> None:
             {"resolver": "vector_similarity", "threshold": float("inf")},
             "finite",
         ),
+        # A malformed threshold/margin must fail preflight, not coerce silently.
+        ({"resolver": "vector_similarity", "threshold": True}, "boolean"),
+        ({"resolver": "vector_similarity", "threshold": "0.9"}, "number"),
+        (
+            {"resolver": "vector_similarity", "threshold": 0.5, "ambiguity_margin": True},
+            "boolean",
+        ),
     ],
 )
 def test_vector_similarity_options_are_strict(
@@ -993,11 +1001,26 @@ def test_fuzzy_requires_mention_text_column() -> None:
          "metric"),
         ({"resolver": "fuzzy", "threshold": 0.5, "normalize": "yes"},
          "valid boolean"),
+        # A malformed threshold must fail preflight, not silently coerce to 1.0 /
+        # a float and change matching.
+        ({"resolver": "fuzzy", "threshold": True}, "boolean"),
+        ({"resolver": "fuzzy", "threshold": "0.5"}, "number"),
+        ({"resolver": "fuzzy", "threshold": 0.5, "ambiguity_margin": True},
+         "boolean"),
     ],
 )
 def test_fuzzy_options_are_strict(options: dict[str, object], message: str) -> None:
     with pytest.raises(ValidationError, match=message):
         link_entities.validate_options({**_BASE_OPTIONS, **options})
+
+
+def test_fuzzy_threshold_accepts_integer_but_not_bool_or_string() -> None:
+    """YAML `threshold: 1` is a legitimate integer bound; `true`/`"1"` are not."""
+    parsed = parse_entity_link_options(
+        {**_BASE_OPTIONS, "resolver": "fuzzy", "threshold": 1}
+    )
+    assert parsed.threshold == 1.0
+    assert isinstance(parsed.threshold, float)
 
 
 def _example_dir() -> Path:

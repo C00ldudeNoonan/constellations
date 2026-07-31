@@ -59,6 +59,17 @@ def _require_non_empty(value: str) -> str:
     return normalized
 
 
+def _reject_coerced_number(value: Any) -> Any:
+    """Reject a boolean or string before Pydantic's lax coercion turns it into a
+    float. Without this, ``threshold: true`` silently becomes ``1.0`` and
+    ``threshold: "0.5"`` becomes ``0.5``, quietly changing which links match —
+    contrary to the strict preflight-validation contract. ``int`` is still
+    accepted (YAML ``0``/``1``) and coerced to ``float`` downstream."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("must be a number, not a boolean or a string")
+    return value
+
+
 class _EntityLinkBaseOptions(BaseModel):
     """Fields shared by every resolver: mention identity, privacy controls, and
     the passthrough/include projection. Resolver-specific matching inputs live on
@@ -190,6 +201,10 @@ class VectorSimilarityResolverOptions(_EntityLinkBaseOptions):
             raise ValueError("must not be empty; use null to disable")
         return normalized
 
+    _reject_coerced = field_validator(
+        "threshold", "ambiguity_margin", mode="before"
+    )(_reject_coerced_number)
+
     @field_validator("threshold")
     @classmethod
     def _finite_threshold(cls, value: float) -> float:
@@ -223,6 +238,10 @@ class FuzzyResolverOptions(_EntityLinkBaseOptions):
     # Candidates within this margin of a namespace's top score are ambiguous
     # rather than silently resolved to the arg-max. 0.0 flags only exact ties.
     ambiguity_margin: float = 0.0
+
+    _reject_coerced = field_validator(
+        "threshold", "ambiguity_margin", mode="before"
+    )(_reject_coerced_number)
 
     @field_validator("alias_text_field")
     @classmethod

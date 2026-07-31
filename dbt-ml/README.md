@@ -375,6 +375,65 @@ manifest written by a previous `compile` or `run`. The CI recipe: store
 `target/manifest.json` from main, then on PRs run
 `dbt-ml build --select 'state:modified+' --state path/to/main-manifest/`.
 
+## Matrix model expansion (`for_each`)
+
+Declare `for_each` on any model to turn it into a template. dbt-ml expands
+it into one concrete model per cartesian-product combination of the axis
+values before the DAG is built, so selectors, lineage, incremental state,
+and the manifest all see ordinary models.
+
+```yaml
+models:
+  - name: ticket_tfidf
+    depends_on: [ref('raw_tickets')]
+    for_each:
+      min_df:    [1, 2, 5]
+      ngram_range: [[1, 1], [1, 2]]
+    ml:
+      task: features
+      mode: fit_transform
+      provider: builtin.tfidf
+      text_field: body
+      artifact:
+        path: target/artifacts/ticket_tfidf
+      options:
+        min_df:      ${matrix.min_df}
+        ngram_range: ${matrix.ngram_range}
+```
+
+This produces six models named
+`ticket_tfidf__min_df_1__ngram_range_1_1`,
+`ticket_tfidf__min_df_1__ngram_range_1_2`, …,
+`ticket_tfidf__min_df_5__ngram_range_1_2`.
+
+**Placeholder syntax** — write `${matrix.<axis>}` anywhere in a string value
+in the model config:
+
+- An **exact-match** placeholder (`"${matrix.min_df}"`) substitutes the axis
+  value type-preservingly: an integer axis value produces an integer, a list
+  produces a list. Typed config fields such as `chunk_size` or `dimensions`
+  work correctly.
+- A placeholder **embedded** in a longer string
+  (`"artifacts/${matrix.label}"`) is interpolated as a string.
+
+**Naming** — variant names are `<base>__<axis>_<slug>__…`. Slugs are
+identifier-safe (letters, digits, underscores; `.` and spaces become `_`).
+Long values are truncated with an 8-character SHA-256 suffix.
+
+**Selecting variants** — every variant is automatically tagged with the base
+model name, so `--select tag:ticket_tfidf` (or `--select tag:ticket_tfidf+`)
+runs all six variants and their downstream:
+
+```bash
+dbt-ml run --select 'tag:ticket_tfidf+'
+dbt-ml run --select ticket_tfidf__min_df_1__ngram_range_1_2
+```
+
+**Limits and errors** — a template may expand to at most 256 variants.
+Axis names must be valid identifiers. Empty axis lists and slug collisions
+(two combinations that produce the same name) are rejected at project load
+time with a clear error.
+
 ## Profiles
 
 Warehouse and LLM config live in `profiles.yml`, *not* in `dbt_ml_project.yml`.

@@ -460,3 +460,50 @@ def test_non_for_each_models_alongside_for_each(tmp_path: Path) -> None:
     assert "matrix_model__k_5" in names
     assert "matrix_model" not in names
     assert len(models) == 3  # 1 plain + 2 expanded
+
+
+def test_typed_field_placeholder_substituted_before_validation(tmp_path: Path) -> None:
+    """${matrix.KEY} in a strictly-typed field (chunk_size: int) must work via
+    YAML loading — expansion on raw dicts happens before ModelConfig validation."""
+    project_path = _make_project(
+        tmp_path,
+        "\n".join(
+            [
+                "version: 2",
+                "models:",
+                "  - name: chunker",
+                "    for_each:",
+                "      size: [256, 512, 1024]",
+                "    chunk:",
+                "      text_field: body",
+                "      chunk_size: ${matrix.size}",
+                "      chunk_overlap: 0",
+            ]
+        ),
+    )
+    _, _, models = load_project(project_path)
+    assert len(models) == 3
+    sizes = sorted(m.chunk.chunk_size for m in models if m.chunk)  # type: ignore[union-attr]
+    assert sizes == [256, 512, 1024]
+    assert all(isinstance(m.chunk.chunk_size, int) for m in models if m.chunk)  # type: ignore[union-attr]
+
+
+def test_yaml_level_validation_error_has_no_cause(tmp_path: Path) -> None:
+    """Validation errors at load time must not chain the ValidationError as
+    __cause__ (prevents credential leakage through exception chains)."""
+    project_path = _make_project(
+        tmp_path,
+        "\n".join(
+            [
+                "version: 2",
+                "models:",
+                "  - name: bad",
+                "    chunk:",
+                "      text_field: body",
+                "      unknown_field: oops",
+            ]
+        ),
+    )
+    with pytest.raises(ConfigError) as exc_info:
+        load_project(project_path)
+    assert exc_info.value.__cause__ is None

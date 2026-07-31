@@ -36,7 +36,28 @@ move the secret there as an environment secret.
    uv build
    ```
 
-5. Commit the release prep, then tag and push. The tag must match the package
+5. **BigQuery pre-release smoke test.** The default `pytest` run skips the live
+   BigQuery integration tests, so warehouse-adapter, capability-contract,
+   incremental, or materialization changes are only exercised against a fake
+   client and DuckDB. When the release touches any of those, run the live tests
+   once against a real project — a declared-capability or materialization gap on
+   BigQuery is otherwise invisible until a consumer hits it (this is what shipped
+   the v0.2.9 → v0.2.10 hotfix). Authentication is Application Default
+   Credentials — dbt-ml does not read a `.env` file; export real environment
+   variables:
+
+   ```bash
+   # ADC via gcloud, or point at a service-account key (keep it out of the repo):
+   gcloud auth application-default login
+   # or: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
+
+   DBT_ML_BQ_TEST_PROJECT=your-gcp-project uv run pytest -q tests/test_bigquery_adapter.py
+   ```
+
+   The tests create and drop their own scratch datasets. If you cannot run them,
+   note in the release PR that the BigQuery live path was not exercised.
+
+6. Commit the release prep, then tag and push. The tag must match the package
    version in `pyproject.toml` with a leading `v`:
 
    ```bash

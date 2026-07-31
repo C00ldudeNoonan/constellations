@@ -1292,7 +1292,7 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `dbt_ml.text.transforms.redact_pii`        | Detects + redacts PII via Microsoft Presidio (requires `en_core_web_sm` spaCy model) |
 | `dbt_ml.text.transforms.nlp_tokens`         | Emits one normalized child row per spaCy token                                 |
 | `dbt_ml.text.transforms.nlp_entities`       | Emits one normalized child row per spaCy named entity                          |
-| `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs via an operator-owned alias table       |
+| `dbt_ml.text.transforms.link_entities`      | Links entity mentions to canonical IDs by alias table, vector, or fuzzy match  |
 | `dbt_ml.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
 | `dbt_ml.text.transforms.document_tone`      | Scores per-document tone from the token table + an operator-owned lexicon      |
 | `dbt_ml.text.transforms.extract_keyphrases` | Ranks keyphrases per document by n-gram frequency; child table with stable IDs |
@@ -1384,6 +1384,34 @@ different embedding models occupy unrelated spaces, so when both sides carry the
 emitting meaningless links (`embedding_config_hash_field: null` bypasses the
 check). See `examples/economic_entity_links_embeddings/` for a runnable,
 credential-free pipeline using the built-in `deterministic` embedding provider.
+
+Set `resolver: fuzzy` to match mention text against alias text by deterministic
+string similarity — the option to reach for when surface forms vary (spelling
+variants, legal suffixes, reordered words) but you have no embeddings. `metric`
+selects `trigram_dice` (character-trigram Dice, default; robust to typos and
+suffixes) or `jaccard_token` (whitespace-token Jaccard; suits reordered
+multi-word names); both are in `[0, 1]`. A mention resolves to alias candidates
+whose similarity is at or above the required `threshold`, with the score written
+to `match_score`; `ambiguity_margin` and the `matched`/`ambiguous`/`unmatched`
+statuses behave exactly as for `vector_similarity`. Matching is case- and
+width-insensitive by default (`normalize: false` scores the raw surface forms).
+Like `alias_table` it needs no optional extra, no network access, and no
+credentials — the similarity math is pure and deterministic, so identical
+inputs always produce identical links.
+
+All three resolvers support `materialization: incremental`: parents are the
+documents in the `mentions` model and the `aliases` model is a whole-table
+reference input, so an unchanged corpus re-links nothing while any alias-table
+edit re-links every document (child rows are keyed by `entity_link_id`). The
+example projects materialize incrementally.
+
+To join documentary evidence to governed structured metrics, project matched
+links into the agent-context `context_entity_links` grain (see
+[agent-context](docs/architecture/agent-context-v1.md)) with
+`dbt_ml.agent_context.project_entity_link`: the `canonical_id` becomes the row's
+`entity_key`, so a governed metric keyed on the same namespace/name/canonical id
+resolves to the identical `entity_id` — the cross-plane join key. Record the
+resolver identity with `entity_link_method(resolver, resolver_version)`.
 
 ### Document-level aggregate features
 

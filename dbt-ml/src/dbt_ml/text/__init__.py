@@ -32,10 +32,12 @@ from .keyphrases import (
 from .language import detect_language
 from .linking import (
     ALIAS_RESOLVER_VERSION,
+    FUZZY_RESOLVER_VERSION,
     VECTOR_SIMILARITY_RESOLVER_VERSION,
     AliasTableResolverOptions,
     EntityLinkConfig,
     EntityLinkOptions,
+    FuzzyResolverOptions,
     VectorSimilarityResolverOptions,
     alias_set_fingerprint,
     entity_link_id,
@@ -67,6 +69,7 @@ from .tone import (
 __all__ = [
     "ALIAS_RESOLVER_VERSION",
     "BASE_FEATURES",
+    "FUZZY_RESOLVER_VERSION",
     "KEYPHRASE_DOMAIN",
     "KEYPHRASE_EXTRACTOR_NAME",
     "KEYPHRASE_EXTRACTOR_VERSION",
@@ -76,6 +79,7 @@ __all__ = [
     "DocumentFeatureOptions",
     "EntityLinkConfig",
     "EntityLinkOptions",
+    "FuzzyResolverOptions",
     "KeyphraseOptions",
     "NLPDocument",
     "NLPEntity",

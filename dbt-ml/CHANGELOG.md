@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Entity linking: fuzzy resolver, incremental materialization, governed-context composition (issue #217)
+
+- Added a third entity-linking resolver, `resolver: fuzzy`, that matches mention
+  text against alias text by deterministic offline string similarity. `metric`
+  selects `trigram_dice` (character-trigram Dice, default) or `jaccard_token`
+  (whitespace-token Jaccard); both score in `[0, 1]`. A required `threshold`,
+  `ambiguity_margin`, and the `matched`/`ambiguous`/`unmatched` statuses behave
+  as for `vector_similarity`, and the similarity is written to `match_score`.
+  Matching is case- and width-insensitive by default (`normalize: false` scores
+  raw surface forms). No optional extra, network access, or credentials.
+- `link_entities` now supports `materialization: incremental` for every resolver
+  (issue #218): documents in the `mentions` model are the parents and the
+  `aliases` model is a whole-table reference input, so an unchanged corpus
+  re-links nothing while any alias edit re-links every document. Both
+  `economic_entity_links` and `economic_entity_links_embeddings` example projects
+  now materialize incrementally.
+- Added `dbt_ml.agent_context.project_entity_link` and `entity_link_method` to
+  project a matched link into the agent-context `context_entity_links` grain
+  (issue #145). The link's `canonical_id` becomes the row's `entity_key`, so a
+  governed metric keyed on the same namespace/name/canonical value resolves to
+  the identical `entity_id` — the cross-plane join key for combining documentary
+  evidence with structured metrics (issues #132/#147). Unresolved mentions
+  cannot be projected.
+
 ### Declarative `for_each` matrix model expansion (issue #57)
 
 - Added a `for_each` key to `ModelConfig`. Declaring it on a model turns it

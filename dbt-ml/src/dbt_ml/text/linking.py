@@ -40,6 +40,7 @@ from ..hashing import canonical_fingerprint
 # version moved for unrelated reasons.
 ALIAS_RESOLVER_VERSION = "1"
 VECTOR_SIMILARITY_RESOLVER_VERSION = "1"
+FUZZY_RESOLVER_VERSION = "1"
 
 ALIAS_SET_FINGERPRINT_DOMAIN = "dbt-ml.entity-alias-set"
 VECTOR_REFERENCE_FINGERPRINT_DOMAIN = "dbt-ml.entity-vector-reference-set"
@@ -47,6 +48,7 @@ ENTITY_LINK_FINGERPRINT_DOMAIN = "dbt-ml.entity-link"
 
 MatchMethod = Literal["exact", "normalized"]
 SimilarityMetric = Literal["cosine", "euclidean", "dot"]
+FuzzyMetric = Literal["trigram_dice", "jaccard_token"]
 LinkStatus = Literal["matched", "ambiguous", "unmatched"]
 
 
@@ -55,6 +57,17 @@ def _require_non_empty(value: str) -> str:
     if not normalized:
         raise ValueError("must not be empty")
     return normalized
+
+
+def _reject_coerced_number(value: Any) -> Any:
+    """Reject a boolean or string before Pydantic's lax coercion turns it into a
+    float. Without this, ``threshold: true`` silently becomes ``1.0`` and
+    ``threshold: "0.5"`` becomes ``0.5``, quietly changing which links match —
+    contrary to the strict preflight-validation contract. ``int`` is still
+    accepted (YAML ``0``/``1``) and coerced to ``float`` downstream."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("must be a number, not a boolean or a string")
+    return value
 
 
 class _EntityLinkBaseOptions(BaseModel):
@@ -188,6 +201,10 @@ class VectorSimilarityResolverOptions(_EntityLinkBaseOptions):
             raise ValueError("must not be empty; use null to disable")
         return normalized
 
+    _reject_coerced = field_validator(
+        "threshold", "ambiguity_margin", mode="before"
+    )(_reject_coerced_number)
+
     @field_validator("threshold")
     @classmethod
     def _finite_threshold(cls, value: float) -> float:
@@ -203,8 +220,56 @@ class VectorSimilarityResolverOptions(_EntityLinkBaseOptions):
         return value
 
 
+class FuzzyResolverOptions(_EntityLinkBaseOptions):
+    resolver: Literal["fuzzy"] = "fuzzy"
+    alias_text_field: str = "alias"
+    # `trigram_dice` (character-trigram Dice) is robust to spelling variants,
+    # legal suffixes, and typos — the reason to reach past `alias_table`'s
+    # exact/normalized matching. `jaccard_token` compares whitespace tokens and
+    # suits reordered multi-word names. Both are in [0, 1], higher is better.
+    metric: FuzzyMetric = "trigram_dice"
+    # NFKC-fold, casefold, and whitespace-collapse both sides before scoring, so
+    # fuzzy matching is case- and width-insensitive by default. Disable to score
+    # the raw surface forms.
+    normalize: StrictBool = True
+    # No default: a similarity bar is meaningless without an operator-chosen
+    # acceptance threshold, so require it explicitly.
+    threshold: float
+    # Candidates within this margin of a namespace's top score are ambiguous
+    # rather than silently resolved to the arg-max. 0.0 flags only exact ties.
+    ambiguity_margin: float = 0.0
+
+    _reject_coerced = field_validator(
+        "threshold", "ambiguity_margin", mode="before"
+    )(_reject_coerced_number)
+
+    @field_validator("alias_text_field")
+    @classmethod
+    def _non_empty_alias_field(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+    @field_validator("threshold")
+    @classmethod
+    def _threshold_in_unit_interval(cls, value: float) -> float:
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise ValueError(
+                "threshold must be a finite number in (0, 1]; fuzzy similarity is "
+                "always in [0, 1]"
+            )
+        return value
+
+    @field_validator("ambiguity_margin")
+    @classmethod
+    def _non_negative_margin(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("ambiguity_margin must be a finite, non-negative number")
+        return value
+
+
 EntityLinkConfig = Annotated[
-    AliasTableResolverOptions | VectorSimilarityResolverOptions,
+    AliasTableResolverOptions
+    | VectorSimilarityResolverOptions
+    | FuzzyResolverOptions,
     Field(discriminator="resolver"),
 ]
 
@@ -213,13 +278,13 @@ EntityLinkConfig = Annotated[
 EntityLinkOptions = AliasTableResolverOptions
 
 _ENTITY_LINK_ADAPTER: TypeAdapter[
-    AliasTableResolverOptions | VectorSimilarityResolverOptions
+    AliasTableResolverOptions | VectorSimilarityResolverOptions | FuzzyResolverOptions
 ] = TypeAdapter(EntityLinkConfig)
 
 
 def parse_entity_link_options(
     options: Mapping[str, Any],
-) -> AliasTableResolverOptions | VectorSimilarityResolverOptions:
+) -> AliasTableResolverOptions | VectorSimilarityResolverOptions | FuzzyResolverOptions:
     """Validate raw options into the resolver-specific model. ``resolver`` is
     optional and defaults to ``alias_table`` (phase-1 behavior); an unknown value
     fails discriminator validation with the valid tags named."""
@@ -247,6 +312,38 @@ class NamespaceResolution:
     method: str
     status: Literal["matched", "ambiguous"]
     candidates: tuple[Candidate, ...]
+
+
+def _resolve_scored_candidates(
+    scored_by_namespace: Mapping[str, list[tuple[float, str]]],
+    *,
+    margin: float,
+    method: str,
+) -> dict[str, NamespaceResolution]:
+    """Turn per-namespace ``(score, canonical_id)`` candidates that already
+    cleared the acceptance threshold into resolutions. Within a namespace the
+    top score wins; any candidate within ``margin`` of it is preserved as an
+    equally-plausible winner, so several winners yield ``ambiguous`` rather than
+    a silently arg-maxed guess. Shared by every score-producing resolver."""
+    resolved: dict[str, NamespaceResolution] = {}
+    for namespace, scored in scored_by_namespace.items():
+        top = max(score for score, _ in scored)
+        winners = sorted({cid for score, cid in scored if top - score <= margin})
+        best_score = {
+            cid: max(score for score, other in scored if other == cid)
+            for cid in winners
+        }
+        status: Literal["matched", "ambiguous"] = (
+            "matched" if len(winners) == 1 else "ambiguous"
+        )
+        resolved[namespace] = NamespaceResolution(
+            method=method,
+            status=status,
+            candidates=tuple(
+                Candidate(canonical_id=cid, score=best_score[cid]) for cid in winners
+            ),
+        )
+    return resolved
 
 
 class ResolverReference(ABC):
@@ -508,29 +605,9 @@ class _VectorReference(ResolverReference):
                 by_namespace.setdefault(alias.namespace, []).append(
                     (score, alias.canonical_id)
                 )
-
-        resolved: dict[str, NamespaceResolution] = {}
-        for namespace, scored in by_namespace.items():
-            top = max(score for score, _ in scored)
-            winners = sorted(
-                {cid for score, cid in scored if top - score <= self._margin}
-            )
-            best_score = {
-                cid: max(score for score, other in scored if other == cid)
-                for cid in winners
-            }
-            status: Literal["matched", "ambiguous"] = (
-                "matched" if len(winners) == 1 else "ambiguous"
-            )
-            resolved[namespace] = NamespaceResolution(
-                method=self._metric,
-                status=status,
-                candidates=tuple(
-                    Candidate(canonical_id=cid, score=best_score[cid])
-                    for cid in winners
-                ),
-            )
-        return resolved
+        return _resolve_scored_candidates(
+            by_namespace, margin=self._margin, method=self._metric
+        )
 
 
 class VectorSimilarityResolver(EntityResolver):
@@ -625,12 +702,137 @@ class VectorSimilarityResolver(EntityResolver):
         return _VectorReference(aliases, dimensions or 0, options)
 
 
+# --- Fuzzy resolver ----------------------------------------------------------
+
+
+def _fuzzy_representation(text: str, metric: FuzzyMetric) -> frozenset[str]:
+    """The metric's comparison signature for a prepared string. Character
+    trigrams (space-padded so boundaries and short strings still produce grams)
+    for ``trigram_dice``; whitespace tokens for ``jaccard_token``. An empty
+    string yields an empty signature that matches nothing."""
+    if not text:
+        return frozenset()
+    if metric == "jaccard_token":
+        return frozenset(text.split())
+    padded = f"  {text}  "
+    return frozenset(padded[index : index + 3] for index in range(len(padded) - 2))
+
+
+def _fuzzy_score(a: frozenset[str], b: frozenset[str], metric: FuzzyMetric) -> float:
+    """Set-similarity in [0, 1]. Dice for trigrams, Jaccard for tokens; either
+    empty signature scores 0 so empty text never matches."""
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    if metric == "jaccard_token":
+        return intersection / len(a | b)
+    return 2 * intersection / (len(a) + len(b))
+
+
+@dataclass(frozen=True)
+class _FuzzyAlias:
+    namespace: str
+    canonical_id: str
+    signature: frozenset[str]
+
+
+class _FuzzyReference(ResolverReference):
+    def __init__(
+        self,
+        aliases: list[_FuzzyAlias],
+        options: FuzzyResolverOptions,
+        fingerprint: str,
+    ) -> None:
+        self._aliases = aliases
+        self._metric = options.metric
+        self._normalize = options.normalize
+        self._threshold = options.threshold
+        self._margin = options.ambiguity_margin
+        self._fingerprint = fingerprint
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    def _prepare(self, text: str) -> str:
+        return normalize_alias_text(text) if self._normalize else text
+
+    def resolve(self, signal: Any) -> dict[str, NamespaceResolution]:
+        text = signal
+        if not isinstance(text, str) or not text.strip():
+            return {}
+        mention_signature = _fuzzy_representation(self._prepare(text), self._metric)
+        if not mention_signature:
+            return {}
+        by_namespace: dict[str, list[tuple[float, str]]] = {}
+        for alias in self._aliases:
+            score = _fuzzy_score(mention_signature, alias.signature, self._metric)
+            if score >= self._threshold:
+                by_namespace.setdefault(alias.namespace, []).append(
+                    (score, alias.canonical_id)
+                )
+        return _resolve_scored_candidates(
+            by_namespace, margin=self._margin, method=self._metric
+        )
+
+
+class FuzzyResolver(EntityResolver):
+    name = "fuzzy"
+    version = FUZZY_RESOLVER_VERSION
+
+    def text_required(self) -> bool:
+        return True
+
+    def required_mention_columns(self, options: Any) -> tuple[str, ...]:
+        return ()
+
+    def mention_signal(self, row: Mapping[str, Any], options: Any) -> Any:
+        raw = row[options.mention_text_field]
+        if raw is not None and not isinstance(raw, str):
+            raise ValueError(
+                f"Mention text column '{options.mention_text_field}' must contain "
+                "strings or nulls"
+            )
+        return raw
+
+    def build_reference(
+        self, frame: pl.DataFrame, options: FuzzyResolverOptions
+    ) -> _FuzzyReference:
+        alias_rows = _reference_rows(
+            frame,
+            options,
+            value_fields=(
+                ("alias", options.alias_text_field),
+                ("entity_namespace", options.namespace_field),
+                ("canonical_id", options.canonical_id_field),
+            ),
+        )
+        aliases = [
+            _FuzzyAlias(
+                namespace=row["entity_namespace"],
+                canonical_id=row["canonical_id"],
+                signature=_fuzzy_representation(
+                    normalize_alias_text(row["alias"])
+                    if options.normalize
+                    else row["alias"],
+                    options.metric,
+                ),
+            )
+            for row in alias_rows
+        ]
+        return _FuzzyReference(aliases, options, alias_set_fingerprint(alias_rows))
+
+
 # --- Registry ----------------------------------------------------------------
 
 
 RESOLVERS: dict[str, EntityResolver] = {
     resolver.name: resolver
-    for resolver in (AliasTableResolver(), VectorSimilarityResolver())
+    for resolver in (
+        AliasTableResolver(),
+        VectorSimilarityResolver(),
+        FuzzyResolver(),
+    )
 }
 
 

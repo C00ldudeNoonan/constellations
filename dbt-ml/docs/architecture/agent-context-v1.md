@@ -91,6 +91,26 @@ entities without duplicating registry rows.
 | `recorded_to` | timestamp | yes | Exclusive UTC system-time boundary; null means current. |
 | `link_provenance_fingerprint` | string | no | One-way identity of link derivation provenance. |
 
+#### Projecting `link_entities` output into this grain
+
+The `link_entities` transform (see the main README) resolves entity mentions to
+canonical IDs on a different grain — one row per mention/candidate, keyed by
+`entity_link_id`. `dbt_ml.agent_context.project_entity_link` bridges a matched
+link into a `context_entity_links` row: the link's `canonical_id` becomes the
+row's `entity_key`, so `entity_id` is `fp("…-entity", {entity_namespace,
+entity_name, entity_key})` — the *same* id a governed dbt metric keyed on that
+namespace/name/canonical value resolves to. That shared `entity_id` is the join
+key that combines documentary evidence with structured metrics across the two
+MCP planes; neither plane has to understand the other's schema.
+
+Only resolved links belong in the governed context: `project_entity_link`
+requires a non-empty `canonical_id`, so `unmatched` mentions are never
+published, and callers typically drop `ambiguous` rows rather than record a
+guess. Record the deriving resolver with
+`entity_link_method(resolver, resolver_version)` (for example
+`entity_link:fuzzy:1`) so the link's method identity is auditable and
+invalidates the row when the resolver changes.
+
 ## Shared fields
 
 ### Bitemporal fields

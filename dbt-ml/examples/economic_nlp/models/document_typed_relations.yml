@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: document_typed_relations
+    description: "Directed, typed relations between entity mentions from label rules"
+    depends_on: [ref('document_entities')]
+    transform:
+      type: python
+      module: dbt_ml.text.transforms.extract_relations
+      options:
+        mentions: document_entities
+        extractor: rule
+        scope: sentence
+        # Deterministic, schema-controlled typed rules: the distinct
+        # relation_type values are exactly what this model can emit. Unlike the
+        # symmetric co-occurrence table, every row is directed subject -> object.
+        rules:
+          - subject_label: ORG
+            object_label: GPE
+            relation_type: references_geography
+          - subject_label: ORG
+            object_label: MONEY
+            relation_type: references_amount
+    materialization: incremental
+    tags: [economic_data, nlp, relations]
+    tests:
+      - not_null:
+          [relation_id, document_id, subject_mention_id, object_mention_id,
+           relation_type, method, status, extractor, extractor_version]
+      - unique: relation_id
+      - accepted_values:
+          column: method
+          values: [co_occurrence, rule, model_assertion]
+      - accepted_values:
+          column: directed
+          values: [true]

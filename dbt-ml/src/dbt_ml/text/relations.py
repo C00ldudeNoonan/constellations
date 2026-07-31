@@ -44,6 +44,7 @@ from ..hashing import canonical_fingerprint
 # status assignment) so downstream consumers can invalidate rows produced by an
 # older extractor even when the package version moved for unrelated reasons.
 CO_OCCURRENCE_EXTRACTOR_VERSION = "1"
+RULE_EXTRACTOR_VERSION = "1"
 
 RELATION_FINGERPRINT_DOMAIN = "dbt-ml.entity-relation"
 
@@ -81,10 +82,6 @@ class _RelationBaseOptions(BaseModel):
     label_field: str | None = "label"
     mention_text_field: str = "entity_text"
 
-    # The single relation type this extractor emits. Co-occurrence is untyped, so
-    # this is an operator-chosen label (schema-controlled by being a fixed
-    # choice); a future typed extractor validates its output against an allow-list.
-    relation_type: str = "co_occurs_with"
     # Only mentions whose label is in this allow-list participate; empty = all.
     labels: tuple[str, ...] = ()
     # Fail closed on a pathological document rather than materialize a runaway
@@ -102,7 +99,6 @@ class _RelationBaseOptions(BaseModel):
         "start_field",
         "end_field",
         "mention_text_field",
-        "relation_type",
     )
     @classmethod
     def _non_empty_string(cls, value: str) -> str:
@@ -144,19 +140,79 @@ class CoOccurrenceExtractorOptions(_RelationBaseOptions):
     # sentences, so sentence_index is recorded only when both sides agree).
     scope: CoOccurrenceScope = "sentence"
     max_char_gap: int = Field(default=100, ge=0, le=1_000_000)
+    # Co-occurrence is untyped, so this is an operator-chosen label (schema-
+    # controlled by being a single fixed choice) and every row is symmetric.
+    relation_type: str = "co_occurs_with"
+
+    @field_validator("relation_type")
+    @classmethod
+    def _non_empty_relation_type(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+
+class RelationRule(BaseModel):
+    """One directed, typed rule: assert ``relation_type`` from a subject mention
+    of ``subject_label`` to an object mention of ``object_label`` when the two
+    co-occur in scope. Directed by construction — undirected proximity is what
+    the co-occurrence extractor is for."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subject_label: str
+    object_label: str
+    relation_type: str
+
+    @field_validator("subject_label", "object_label", "relation_type")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+
+class RuleExtractorOptions(_RelationBaseOptions):
+    extractor: Literal["rule"] = "rule"
+    scope: CoOccurrenceScope = "sentence"
+    max_char_gap: int = Field(default=100, ge=0, le=1_000_000)
+    # The schema-controlled set of typed rules. The distinct `relation_type`
+    # values are exactly the relations this model can emit.
+    rules: tuple[RelationRule, ...]
+
+    @field_validator("rules")
+    @classmethod
+    def _unique_non_empty_rules(
+        cls, values: tuple[RelationRule, ...]
+    ) -> tuple[RelationRule, ...]:
+        if not values:
+            raise ValueError("rules must not be empty")
+        keys = [(r.subject_label, r.object_label, r.relation_type) for r in values]
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "rules must be unique on (subject_label, object_label, relation_type)"
+            )
+        return values
+
+    @model_validator(mode="after")
+    def _rules_require_label_field(self) -> RuleExtractorOptions:
+        if self.label_field is None:
+            raise ValueError(
+                "the rule extractor matches on mention labels and requires "
+                "label_field; set it to the mentions model's label column"
+            )
+        return self
 
 
 RelationExtractorConfig = Annotated[
-    CoOccurrenceExtractorOptions,
+    CoOccurrenceExtractorOptions | RuleExtractorOptions,
     Field(discriminator="extractor"),
 ]
 
-_RELATION_ADAPTER: TypeAdapter[CoOccurrenceExtractorOptions] = TypeAdapter(
-    RelationExtractorConfig
-)
+_RELATION_ADAPTER: TypeAdapter[
+    CoOccurrenceExtractorOptions | RuleExtractorOptions
+] = TypeAdapter(RelationExtractorConfig)
 
 
-def parse_relation_options(options: Mapping[str, Any]) -> CoOccurrenceExtractorOptions:
+def parse_relation_options(
+    options: Mapping[str, Any],
+) -> CoOccurrenceExtractorOptions | RuleExtractorOptions:
     """Validate raw options into the extractor-specific model. ``extractor`` is
     optional and defaults to ``co_occurrence``; an unknown value fails
     discriminator validation with the valid tags named."""
@@ -201,6 +257,63 @@ def _order_key(mention: Mention) -> tuple[int, int, str]:
     return (mention.start, mention.end, mention.mention_id)
 
 
+def _candidate_pairs(
+    mentions: Sequence[Mention],
+    *,
+    scope: CoOccurrenceScope,
+    max_char_gap: int,
+    max_pairs: int,
+) -> list[tuple[Mention, Mention]]:
+    """Ordered ``(earlier, later)`` mention pairs that share a sentence
+    (``scope='sentence'``) or fall within ``max_char_gap`` characters
+    (``scope='window'``). Fails closed once the pair count would exceed
+    ``max_pairs`` so a pathological document cannot explode quadratically.
+    Shared by every extractor that pairs mentions in scope."""
+    pairs: list[tuple[Mention, Mention]] = []
+
+    def _emit(subject: Mention, obj: Mention) -> None:
+        if len(pairs) >= max_pairs:
+            raise ValueError(
+                f"relation extraction produced more than max_pairs_per_document "
+                f"({max_pairs}) candidate pairs for a single document; narrow "
+                "`scope`/`labels`/`max_char_gap` or raise the cap"
+            )
+        pairs.append((subject, obj))
+
+    if scope == "sentence":
+        by_sentence: dict[int, list[Mention]] = {}
+        for mention in mentions:
+            if mention.sentence_index is None:
+                raise ValueError(
+                    "relation scope 'sentence' requires a non-null sentence_index "
+                    "on every mention; rebuild the mention table with a spaCy "
+                    "pipeline that sets sentence boundaries, or use scope 'window'"
+                )
+            by_sentence.setdefault(mention.sentence_index, []).append(mention)
+        for sentence_index in sorted(by_sentence):
+            group = by_sentence[sentence_index]
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    _emit(group[i], group[j])
+        return pairs
+
+    for i in range(len(mentions)):
+        subject = mentions[i]
+        for j in range(i + 1, len(mentions)):
+            obj = mentions[j]
+            # Mentions are order-key sorted, so `obj` starts at or after
+            # `subject`. Gap is the characters between the spans; overlap
+            # (negative gap) clamps in and always qualifies.
+            if obj.start - subject.end > max_char_gap:
+                continue
+            _emit(subject, obj)
+    return pairs
+
+
+def _shared_sentence(subject: Mention, obj: Mention) -> int | None:
+    return subject.sentence_index if subject.sentence_index == obj.sentence_index else None
+
+
 class RelationExtractor(ABC):
     name: str
     version: str
@@ -238,80 +351,82 @@ class CoOccurrenceExtractor(RelationExtractor):
     ) -> list[Relation]:
         if len(mentions) < 2:
             return []
-        pairs = (
-            self._sentence_pairs(mentions)
-            if options.scope == "sentence"
-            else self._window_pairs(mentions, options.max_char_gap)
+        pairs = _candidate_pairs(
+            mentions,
+            scope=options.scope,
+            max_char_gap=options.max_char_gap,
+            max_pairs=options.max_pairs_per_document,
+        )
+        return [
+            Relation(
+                subject=subject,
+                object=obj,
+                relation_type=options.relation_type,
+                directed=False,
+                status="asserted",
+                confidence=None,
+                sentence_index=_shared_sentence(subject, obj),
+            )
+            for subject, obj in pairs
+        ]
+
+
+# --- Rule extractor ----------------------------------------------------------
+
+
+class RuleExtractor(RelationExtractor):
+    """Deterministic typed extractor. For each mention pair in scope it asserts a
+    directed relation whenever the pair's labels match a configured rule, in
+    either orientation, so the subject/object of the emitted row follow the
+    rule's direction rather than text position."""
+
+    name = "rule"
+    version = RULE_EXTRACTOR_VERSION
+    method: RelationMethod = "rule"
+
+    def required_mention_columns(self, options: Any) -> tuple[str, ...]:
+        return ()
+
+    def extract(
+        self, mentions: Sequence[Mention], options: RuleExtractorOptions
+    ) -> list[Relation]:
+        if len(mentions) < 2:
+            return []
+        pairs = _candidate_pairs(
+            mentions,
+            scope=options.scope,
+            max_char_gap=options.max_char_gap,
+            max_pairs=options.max_pairs_per_document,
         )
         relations: list[Relation] = []
-        for subject, obj in pairs:
-            if len(relations) >= options.max_pairs_per_document:
-                raise ValueError(
-                    f"co_occurrence produced more than max_pairs_per_document "
-                    f"({options.max_pairs_per_document}) relations for a single "
-                    "document; narrow `scope`/`labels`/`max_char_gap` or raise the cap"
-                )
-            shared_sentence = (
-                subject.sentence_index
-                if subject.sentence_index == obj.sentence_index
-                else None
-            )
-            relations.append(
-                Relation(
-                    subject=subject,
-                    object=obj,
-                    relation_type=options.relation_type,
-                    directed=False,
-                    status="asserted",
-                    confidence=None,
-                    sentence_index=shared_sentence,
-                )
-            )
+        for earlier, later in pairs:
+            sentence_index = _shared_sentence(earlier, later)
+            for rule in options.rules:
+                # A rule is directed subject_label -> object_label; try both
+                # orientations of the unordered pair so the emitted subject/object
+                # follow the rule, not text position.
+                for subject, obj in ((earlier, later), (later, earlier)):
+                    if (
+                        subject.label == rule.subject_label
+                        and obj.label == rule.object_label
+                    ):
+                        relations.append(
+                            Relation(
+                                subject=subject,
+                                object=obj,
+                                relation_type=rule.relation_type,
+                                directed=True,
+                                status="asserted",
+                                confidence=None,
+                                sentence_index=sentence_index,
+                            )
+                        )
         return relations
-
-    @staticmethod
-    def _sentence_pairs(
-        mentions: Sequence[Mention],
-    ) -> list[tuple[Mention, Mention]]:
-        by_sentence: dict[int, list[Mention]] = {}
-        for mention in mentions:
-            if mention.sentence_index is None:
-                raise ValueError(
-                    "co_occurrence scope 'sentence' requires a non-null "
-                    "sentence_index on every mention; rebuild the mention table "
-                    "with a spaCy pipeline that sets sentence boundaries, or use "
-                    "scope 'window'"
-                )
-            by_sentence.setdefault(mention.sentence_index, []).append(mention)
-        pairs: list[tuple[Mention, Mention]] = []
-        for sentence_index in sorted(by_sentence):
-            group = by_sentence[sentence_index]
-            for i in range(len(group)):
-                for j in range(i + 1, len(group)):
-                    pairs.append((group[i], group[j]))
-        return pairs
-
-    @staticmethod
-    def _window_pairs(
-        mentions: Sequence[Mention], max_char_gap: int
-    ) -> list[tuple[Mention, Mention]]:
-        pairs: list[tuple[Mention, Mention]] = []
-        for i in range(len(mentions)):
-            subject = mentions[i]
-            for j in range(i + 1, len(mentions)):
-                obj = mentions[j]
-                # Mentions are order-key sorted, so `obj` starts at or after
-                # `subject`. Gap is the characters between the spans; overlap
-                # (negative gap) clamps to 0 and always qualifies.
-                gap = obj.start - subject.end
-                if gap > max_char_gap:
-                    continue
-                pairs.append((subject, obj))
-        return pairs
 
 
 RELATION_EXTRACTORS: dict[str, RelationExtractor] = {
-    extractor.name: extractor for extractor in (CoOccurrenceExtractor(),)
+    extractor.name: extractor
+    for extractor in (CoOccurrenceExtractor(), RuleExtractor())
 }
 
 

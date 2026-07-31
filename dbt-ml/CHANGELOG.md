@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Typed relation extraction over entity mentions (issue #220)
+### Typed relation extraction over entity mentions (issues #220, #240)
 
 - Added the `dbt_ml.text.transforms.extract_relations` transform, which emits a
   child table of relations between the entity mentions of a document (one row
@@ -14,19 +14,27 @@
   for a semantic assertion. Rows also carry `relation_type`, `directed`,
   `status` (`asserted`/`ambiguous`/`no_relation`), `confidence`, subject/object
   mention IDs and offsets, participating labels, and extractor identity/version.
-- The deterministic, offline `co_occurrence` extractor ships today: two mentions
-  co-occur when they share a sentence (`scope: sentence`) or fall within
-  `max_char_gap` characters (`scope: window`). Co-occurrence is symmetric, so
-  each unordered pair yields one `directed: false` row with a stable orientation
-  and `relation_id`; an optional `labels` allow-list restricts participants and
-  `max_pairs_per_document` fails closed on a pathological document. Evidence
-  text is withheld unless `include_mention_text: true`.
-- Learned/rule extractors slot into the extractor registry without touching
-  transform execution (the same seam pattern as entity-linking resolvers); the
-  generic structured-LLM path (#144) remains the way to run a learned extractor.
+- Two deterministic, offline extractors ship:
+  - `co_occurrence` — two mentions co-occur when they share a sentence
+    (`scope: sentence`) or fall within `max_char_gap` characters
+    (`scope: window`). Symmetric, so each unordered pair yields one
+    `directed: false` row with a stable orientation and `relation_id`.
+  - `rule` — directed, typed relations from operator-declared label rules
+    (`subject_label`, `object_label`, `relation_type`); the distinct rule
+    relation types are the schema-controlled set the model can emit, and the
+    subject/object orientation follows the rule rather than text position.
+  Both support an optional `labels` allow-list and a `max_pairs_per_document`
+  guard that fails closed on a pathological document; evidence text is withheld
+  unless `include_mention_text: true`.
+- Learned/LLM extractors slot into the same extractor registry without touching
+  transform execution (the seam pattern from entity-linking resolvers); the
+  generic structured-LLM path (#144) remains the way to run one. A deterministic
+  fake extractor in the test suite exercises typed/directed/scored/multi-status
+  rows through the driver.
 - Relations materialize `full` or `incremental`; the incremental path re-derives
-  exactly a changed document's relation rows (issue #218). Added a
-  `document_relations` model to the `economic_nlp` example.
+  exactly a changed document's relation rows (issue #218). Added
+  `document_relations` (co-occurrence) and `document_typed_relations` (rule)
+  models to the `economic_nlp` example.
 
 ### Entity linking: fuzzy resolver, incremental materialization, governed-context composition (issue #217)
 

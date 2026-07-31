@@ -72,3 +72,17 @@ select document_id, subject_mention_id, object_mention_id,
 from economic_nlp.document_relations
 order by document_id, subject_start;
 ```
+
+`document_typed_relations` uses the `rule` extractor instead: operator-declared
+label rules (`ORG -> GPE` as `references_geography`, `ORG -> MONEY` as
+`references_amount`) assert **directed, typed** relations, so `method = rule`
+and `directed = true`. The relation types are schema-controlled — only the
+types named in the rules can appear — and the subject/object orientation follows
+the rule rather than text position.
+
+```sql
+select document_id, subject_mention_id, object_mention_id,
+       subject_label, object_label, relation_type
+from economic_nlp.document_typed_relations
+order by document_id;
+```

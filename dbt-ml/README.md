@@ -1421,11 +1421,11 @@ in a document (for example `nlp_entities` output), one row per related pair. It
 keeps three kinds of relationship strictly distinguishable via the `method`
 column so a consumer never mistakes proximity for a semantic assertion:
 `co_occurrence` (proximity), `rule` (deterministic typed rules), and
-`model_assertion` (a learned/LLM extractor). Only the deterministic
-`co_occurrence` extractor ships today; the `method` column and the extractor
-registry are shaped so the others plug in without touching transform execution,
-and the generic structured-LLM path (#144) remains the way to run a learned
-extractor now.
+`model_assertion` (a learned/LLM extractor). Two deterministic, offline
+extractors ship — `co_occurrence` and `rule`; the `method` column and the
+extractor registry are shaped so a learned extractor plugs in without touching
+transform execution, and the generic structured-LLM path (#144) remains the way
+to run one now.
 
 ```yaml
 - name: document_relations
@@ -1447,15 +1447,40 @@ non-null `sentence_index`) or fall within `max_char_gap` characters
 row with `directed: false`; the subject is the earlier-positioned mention and
 the object the later one, giving every pair a stable orientation and
 `relation_id`. Every row records the `relation_type`, the `method`, a `status`
-(`asserted` for co-occurrence; `ambiguous`/`no_relation` are reserved for
-learned extractors), a `confidence` (null for the deterministic extractor), the
-subject/object mention IDs and offsets, the participating labels, and the
-extractor identity and version. Evidence text is withheld unless
+(`asserted` for the deterministic extractors; `ambiguous`/`no_relation` are
+reserved for learned extractors), a `confidence` (null for the deterministic
+extractors), the subject/object mention IDs and offsets, the participating
+labels, and the extractor identity and version. Evidence text is withheld unless
 `include_mention_text: true` (and then the mentions model must carry it via the
-NLP transform's `include_text: true`). Relations materialize incrementally on
-the same one-to-many path as the other child tables: a changed document
-re-derives exactly its relation rows. See `examples/economic_nlp/` for a
-runnable pipeline.
+NLP transform's `include_text: true`).
+
+Set `extractor: rule` for **directed, typed** relations instead of symmetric
+proximity. Each rule asserts a `relation_type` from a subject mention of one
+label to an object mention of another when the two co-occur in scope; the
+distinct `relation_type` values across the rules are exactly the relations the
+model can emit (schema-controlled), and the subject/object orientation follows
+the rule rather than text position. The rules are deterministic and offline —
+no provider, no network.
+
+```yaml
+- name: document_typed_relations
+  depends_on: [ref('document_entities')]
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.extract_relations
+    options:
+      mentions: document_entities
+      extractor: rule
+      scope: sentence
+      rules:
+        - {subject_label: ORG, object_label: GPE, relation_type: references_geography}
+        - {subject_label: ORG, object_label: MONEY, relation_type: references_amount}
+  materialization: incremental
+```
+
+Relations materialize incrementally on the same one-to-many path as the other
+child tables: a changed document re-derives exactly its relation rows. See
+`examples/economic_nlp/` for runnable co-occurrence and rule pipelines.
 
 ### Document-level aggregate features
 

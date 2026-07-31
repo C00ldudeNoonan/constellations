@@ -14,6 +14,7 @@ from dbt_ml.config import load_project
 from dbt_ml.config.loader import ConfigError
 from dbt_ml.text.relations import (
     CO_OCCURRENCE_EXTRACTOR_VERSION,
+    RULE_EXTRACTOR_VERSION,
     Mention,
     Relation,
     RelationExtractor,
@@ -251,6 +252,141 @@ def test_options_are_strict(options: dict[str, object], message: str) -> None:
         extract_relations.validate_options(options)
 
 
+# --- rule extractor: directed typed relations --------------------------------
+
+
+def _rule_ctx(rules: list[dict[str, str]], extra: dict[str, object] | None = None):
+    options: dict[str, object] = {"extractor": "rule", "rules": rules}
+    options.update(extra or {})
+    return _ctx(options)
+
+
+def test_rule_extractor_emits_directed_typed_relations() -> None:
+    output = extract_relations.run(
+        _deps(),
+        _rule_ctx(
+            [
+                {"subject_label": "ORG", "object_label": "GPE",
+                 "relation_type": "operates_in"},
+                {"subject_label": "ORG", "object_label": "MONEY",
+                 "relation_type": "reports"},
+            ]
+        ),
+    ).sort("relation_type")
+
+    assert list(
+        zip(
+            output["subject_mention_id"],
+            output["object_mention_id"],
+            output["relation_type"],
+            strict=True,
+        )
+    ) == [("e1", "e2", "operates_in"), ("e1", "e3", "reports")]
+    assert output["method"].unique().to_list() == ["rule"]
+    assert output["directed"].unique().to_list() == [True]
+    assert output["status"].unique().to_list() == ["asserted"]
+    assert output["extractor"].unique().to_list() == ["rule"]
+    assert output["extractor_version"].unique().to_list() == [RULE_EXTRACTOR_VERSION]
+    assert output["relation_id"].n_unique() == output.height
+
+
+def test_rule_orientation_follows_the_rule_not_text_position() -> None:
+    # e1 (ORG) precedes e2 (GPE) in text, but the rule is GPE -> ORG, so the
+    # emitted subject is the GPE mention even though it is positionally later.
+    mentions = pl.DataFrame(
+        {
+            "entity_id": ["e1", "e2"],
+            "document_id": ["d", "d"],
+            "sentence_index": [0, 0],
+            "start": [0, 10],
+            "end": [5, 15],
+            "label": ["ORG", "GPE"],
+            "entity_text": ["Fed", "France"],
+        }
+    )
+    output = extract_relations.run(
+        _deps(mentions),
+        _rule_ctx(
+            [{"subject_label": "GPE", "object_label": "ORG",
+              "relation_type": "hosts"}]
+        ),
+    )
+    assert output.height == 1
+    row = output.row(0, named=True)
+    assert row["subject_mention_id"] == "e2"
+    assert row["object_mention_id"] == "e1"
+    assert row["subject_label"] == "GPE"
+    assert row["object_label"] == "ORG"
+    assert row["directed"] is True
+
+
+def test_rule_extractor_yields_no_rows_when_no_pair_matches() -> None:
+    output = extract_relations.run(
+        _deps(),
+        _rule_ctx(
+            [{"subject_label": "PERSON", "object_label": "GPE",
+              "relation_type": "born_in"}]
+        ),
+    )
+    assert output.height == 0
+
+
+def test_rule_extractor_respects_window_scope() -> None:
+    output = extract_relations.run(
+        _deps(),
+        _rule_ctx(
+            [{"subject_label": "ORG", "object_label": "MONEY",
+              "relation_type": "reports"}],
+            {"scope": "window", "max_char_gap": 6},
+        ),
+    )
+    # e1(ORG,0-5) → e3(MONEY,20-25) has a 15-char gap, beyond the window, so no
+    # relation is emitted even though the labels match.
+    assert output.height == 0
+
+
+@pytest.mark.parametrize(
+    ("rules", "extra", "message"),
+    [
+        ([], {}, "rules must not be empty"),
+        (
+            [
+                {"subject_label": "ORG", "object_label": "GPE",
+                 "relation_type": "x"},
+                {"subject_label": "ORG", "object_label": "GPE",
+                 "relation_type": "x"},
+            ],
+            {},
+            "rules must be unique",
+        ),
+        (
+            [{"subject_label": "ORG", "object_label": "GPE",
+              "relation_type": "x"}],
+            {"label_field": None},
+            "label_field",
+        ),
+        (
+            [{"subject_label": "ORG", "object_label": "GPE"}],
+            {},
+            "relation_type",
+        ),
+        (
+            [{"subject_label": " ", "object_label": "GPE",
+              "relation_type": "x"}],
+            {},
+            "must not be empty",
+        ),
+    ],
+)
+def test_rule_options_are_strict(
+    rules: list[dict[str, str]], extra: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        extract_relations.validate_options(
+            {"mentions": "m", "extractor": "rule", "rules": rules, **extra}
+        )
+
+
 # --- extractor seam: typed / directed / scored relations ---------------------
 
 
@@ -327,8 +463,10 @@ def test_economic_nlp_relations_example_compiles() -> None:
 
     order = dag.execution_order()
     assert order.index("document_relations") > order.index("document_entities")
-    relations = next(model for model in models if model.name == "document_relations")
-    assert relations.materialization == "incremental"
+    assert order.index("document_typed_relations") > order.index("document_entities")
+    by_name = {model.name: model for model in models}
+    assert by_name["document_relations"].materialization == "incremental"
+    assert by_name["document_typed_relations"].materialization == "incremental"
 
 
 def test_relation_dependency_mismatch_fails_at_compile(tmp_path: Path) -> None:

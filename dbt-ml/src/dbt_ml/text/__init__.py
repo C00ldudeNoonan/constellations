@@ -58,8 +58,11 @@ from .nlp import (
 from .pii import PIIEntity, PIIError, detect_pii, redact_pii
 from .relations import (
     CO_OCCURRENCE_EXTRACTOR_VERSION,
+    RULE_EXTRACTOR_VERSION,
     CoOccurrenceExtractorOptions,
     RelationExtractorConfig,
+    RelationRule,
+    RuleExtractorOptions,
     parse_relation_options,
     relation_id,
 )
@@ -81,6 +84,7 @@ __all__ = [
     "KEYPHRASE_DOMAIN",
     "KEYPHRASE_EXTRACTOR_NAME",
     "KEYPHRASE_EXTRACTOR_VERSION",
+    "RULE_EXTRACTOR_VERSION",
     "TONE_SCORER_VERSION",
     "VECTOR_SIMILARITY_RESOLVER_VERSION",
     "AliasTableResolverOptions",
@@ -101,6 +105,8 @@ __all__ = [
     "PIIEntity",
     "PIIError",
     "RelationExtractorConfig",
+    "RelationRule",
+    "RuleExtractorOptions",
     "ToneOptions",
     "VectorSimilarityResolverOptions",
     "alias_set_fingerprint",

@@ -58,3 +58,17 @@ select document_id, publisher, published_at, positive_score, negative_score,
 from economic_nlp.document_tone
 order by document_id;
 ```
+
+`document_relations` pairs the entity mentions that co-occur in a sentence,
+reading the text-free `document_entities` table so it records offsets and labels
+but no evidence text. Every row is labelled `method = co_occurrence` and
+`directed = false` — this asserts only that two entities appeared together, not
+a semantic relationship. The `method`/`status` columns leave room for future
+rule-derived or model-asserted relations in the same table.
+
+```sql
+select document_id, subject_mention_id, object_mention_id,
+       subject_label, object_label, relation_type, method, status
+from economic_nlp.document_relations
+order by document_id, subject_start;
+```

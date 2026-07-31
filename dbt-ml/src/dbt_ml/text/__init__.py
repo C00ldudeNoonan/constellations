@@ -56,6 +56,13 @@ from .nlp import (
     get_nlp_provider,
 )
 from .pii import PIIEntity, PIIError, detect_pii, redact_pii
+from .relations import (
+    CO_OCCURRENCE_EXTRACTOR_VERSION,
+    CoOccurrenceExtractorOptions,
+    RelationExtractorConfig,
+    parse_relation_options,
+    relation_id,
+)
 from .stats import text_stats
 from .tokens import count_tokens
 from .tone import (
@@ -69,6 +76,7 @@ from .tone import (
 __all__ = [
     "ALIAS_RESOLVER_VERSION",
     "BASE_FEATURES",
+    "CO_OCCURRENCE_EXTRACTOR_VERSION",
     "FUZZY_RESOLVER_VERSION",
     "KEYPHRASE_DOMAIN",
     "KEYPHRASE_EXTRACTOR_NAME",
@@ -76,6 +84,7 @@ __all__ = [
     "TONE_SCORER_VERSION",
     "VECTOR_SIMILARITY_RESOLVER_VERSION",
     "AliasTableResolverOptions",
+    "CoOccurrenceExtractorOptions",
     "DocumentFeatureOptions",
     "EntityLinkConfig",
     "EntityLinkOptions",
@@ -91,6 +100,7 @@ __all__ = [
     "NLPTokenOptions",
     "PIIEntity",
     "PIIError",
+    "RelationExtractorConfig",
     "ToneOptions",
     "VectorSimilarityResolverOptions",
     "alias_set_fingerprint",
@@ -109,9 +119,11 @@ __all__ = [
     "near_duplicates",
     "normalize_alias_text",
     "parse_entity_link_options",
+    "parse_relation_options",
     "pos_count_column",
     "pos_ratio_column",
     "redact_pii",
+    "relation_id",
     "text_stats",
     "tone_lexicon_fingerprint",
 ]

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Typed relation extraction over entity mentions (issue #220)
+
+- Added the `dbt_ml.text.transforms.extract_relations` transform, which emits a
+  child table of relations between the entity mentions of a document (one row
+  per related pair), anchored on the stable mention IDs from the NLP entity
+  table.
+- The output grain distinguishes three relationship kinds via a `method` column
+  — `co_occurrence` (proximity), `rule` (deterministic typed rules), and
+  `model_assertion` (learned/LLM) — so a consumer never mistakes co-occurrence
+  for a semantic assertion. Rows also carry `relation_type`, `directed`,
+  `status` (`asserted`/`ambiguous`/`no_relation`), `confidence`, subject/object
+  mention IDs and offsets, participating labels, and extractor identity/version.
+- The deterministic, offline `co_occurrence` extractor ships today: two mentions
+  co-occur when they share a sentence (`scope: sentence`) or fall within
+  `max_char_gap` characters (`scope: window`). Co-occurrence is symmetric, so
+  each unordered pair yields one `directed: false` row with a stable orientation
+  and `relation_id`; an optional `labels` allow-list restricts participants and
+  `max_pairs_per_document` fails closed on a pathological document. Evidence
+  text is withheld unless `include_mention_text: true`.
+- Learned/rule extractors slot into the extractor registry without touching
+  transform execution (the same seam pattern as entity-linking resolvers); the
+  generic structured-LLM path (#144) remains the way to run a learned extractor.
+- Relations materialize `full` or `incremental`; the incremental path re-derives
+  exactly a changed document's relation rows (issue #218). Added a
+  `document_relations` model to the `economic_nlp` example.
+
 ### Entity linking: fuzzy resolver, incremental materialization, governed-context composition (issue #217)
 
 - Added a third entity-linking resolver, `resolver: fuzzy`, that matches mention

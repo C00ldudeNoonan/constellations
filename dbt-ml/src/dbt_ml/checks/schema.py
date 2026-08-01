@@ -4,6 +4,7 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +144,12 @@ def _run_named_test(
         return [_embedding_duplicates(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "embedding_outliers":
         return [_embedding_outliers(model_name, table_ref, adapter, arg, store_failures)]
+    if test_name == "column_stat":
+        return [_column_stat(model_name, table_ref, adapter, arg)]
+    if test_name == "cardinality":
+        return [_cardinality(model_name, table_ref, adapter, arg)]
+    if test_name == "outlier_rate":
+        return [_outlier_rate(model_name, table_ref, adapter, arg, store_failures)]
     raise UnknownTestError(
         f"Unknown test '{test_name}'. Supported: {sorted(SUPPORTED_TESTS)}"
     )
@@ -876,6 +883,250 @@ def _nonfinite(test_name: str, model_name: str, column: str) -> TestResult:
             "check to locate them"
         ),
     )
+
+
+# ─── distribution / statistical checks (issue #10) ─────────────────────────
+
+
+Number = int | float | Decimal
+
+
+def _is_finite_number(value: Number) -> bool:
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, Decimal):
+        return value.is_finite()
+    return True  # int is always finite
+
+
+def _numeric_values(
+    adapter: WarehouseAdapter,
+    table_ref: str,
+    column: str,
+    *,
+    with_rows: bool,
+) -> tuple[pl.DataFrame | None, list[Number | None], list[Number], int]:
+    """Read a numeric `column` and return, aligned by row: the source frame
+    (only when `with_rows`), the per-row value (``None`` for SQL nulls and
+    non-finite values), the finite non-null values, and the total row count.
+
+    Values keep their native Python type — ``int`` (exact, even above 2**53),
+    ``float``, or ``Decimal`` (DuckDB DECIMAL / BigQuery NUMERIC) — so exact
+    ``min``/``max``/``sum`` comparisons do not lose precision. A non-numeric
+    column raises ``UnknownTestError`` (the runner turns it into a failed check)
+    — checked from the schema so it fails even when the relation is empty or
+    all-null — rather than crashing the run.
+    """
+    schema = adapter.query_df(f"SELECT * FROM {table_ref} LIMIT 0")
+    if column not in schema.columns:
+        raise UnknownTestError(
+            f"distribution check column '{column}' not found in the relation; "
+            f"got: {sorted(schema.columns)}"
+        )
+    dtype = schema.schema[column]
+    if not dtype.is_numeric():
+        raise UnknownTestError(
+            f"distribution check column '{column}' must be numeric, but has type "
+            f"{dtype}"
+        )
+    frame: pl.DataFrame | None = None
+    if with_rows:
+        frame = adapter.query_df(f"SELECT * FROM {table_ref}")
+        raw = frame[column].to_list()
+    else:
+        raw = adapter.query_df(
+            f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
+        )["v"].to_list()
+
+    parsed: list[Number | None] = []
+    values: list[Number] = []
+    for item in raw:
+        if item is None or isinstance(item, bool) or not _is_finite_number(item):
+            parsed.append(None)
+            continue
+        parsed.append(item)
+        values.append(item)
+    return frame, parsed, values, len(raw)
+
+
+def _percentile(ordered: list[float], q: float) -> float:
+    """Linear-interpolated quantile of an ascending list (numpy/`quantile_cont`
+    convention), deterministic for a given input."""
+    if len(ordered) == 1:
+        return ordered[0]
+    position = q * (len(ordered) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def _stat_value(stat: str, values: list[Number], quantile: float | None) -> Number:
+    # min/max/sum keep the values' native type so exact int/Decimal comparisons
+    # against the configured bounds do not lose precision.
+    if stat == "min":
+        return min(values)
+    if stat == "max":
+        return max(values)
+    if stat == "sum":
+        return sum(values)
+    # The remaining statistics are inherently real-valued; compute in float.
+    floats = [float(v) for v in values]
+    n = len(floats)
+    if stat == "mean":
+        return math.fsum(floats) / n
+    if stat == "stddev":
+        mean = math.fsum(floats) / n
+        return math.sqrt(math.fsum((x - mean) ** 2 for x in floats) / n)
+    ordered = sorted(floats)
+    if stat == "median":
+        return _percentile(ordered, 0.5)
+    assert quantile is not None  # validated: stat == "quantile" requires it
+    return _percentile(ordered, quantile)
+
+
+def _column_stat(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+) -> TestResult:
+    """A numeric column's summary statistic (`mean`/`min`/`max`/`sum`/`stddev`/
+    `median`/`quantile`) must fall within `[min, max]` (either bound optional)."""
+    opts = _require_dict("column_stat", arg)
+    column = opts["column"]
+    stat = opts["stat"]
+    lower = opts.get("min")
+    upper = opts.get("max")
+
+    _frame, _parsed, values, _total = _numeric_values(
+        adapter, table_ref, column, with_rows=False
+    )
+    if not values:
+        return _pass("column_stat", model_name, column, "no non-null numeric values")
+
+    value = _stat_value(stat, values, opts.get("quantile"))
+    ok = (lower is None or value >= lower) and (upper is None or value <= upper)
+    bounds = f"[{opts.get('min', '-inf')}, {opts.get('max', 'inf')}]"
+    shown = f"{value:.6g}" if isinstance(value, float) else str(value)
+    return TestResult(
+        test_name="column_stat",
+        model_name=model_name,
+        column=column,
+        status="pass" if ok else "fail",
+        message=f"{stat}={shown} vs {bounds}",
+    )
+
+
+_NAN_KEY = object()  # single identity for every NaN so they count as one value
+
+
+def _canonical_cardinality_key(value: Any) -> Any:
+    if isinstance(value, float) and math.isnan(value):
+        return _NAN_KEY
+    if isinstance(value, Decimal) and value.is_nan():
+        return _NAN_KEY
+    return value
+
+
+def _cardinality(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+) -> TestResult:
+    """Distinct-value count (`min`/`max`) and/or distinct ratio
+    (`min_ratio`/`max_ratio`, distinct/total-rows) of `column`."""
+    opts = _require_dict("cardinality", arg)
+    column = opts["column"]
+    raw = adapter.query_df(
+        f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
+    )["v"].to_list()
+    total = len(raw)
+    # NaN != NaN, so a raw set would count each NaN as its own value and inflate
+    # cardinality toward the row count; collapse every NaN to one sentinel.
+    try:
+        distinct = len({_canonical_cardinality_key(x) for x in raw if x is not None})
+    except TypeError as e:
+        raise UnknownTestError(
+            f"cardinality expects a scalar column; '{column}' holds unhashable values"
+        ) from e
+    ratio = distinct / total if total else 0.0
+
+    problems = []
+    if "min" in opts and distinct < opts["min"]:
+        problems.append(f"distinct {distinct} < min {opts['min']}")
+    if "max" in opts and distinct > opts["max"]:
+        problems.append(f"distinct {distinct} > max {opts['max']}")
+    if "min_ratio" in opts and ratio < opts["min_ratio"]:
+        problems.append(f"ratio {ratio:.3f} < min_ratio {opts['min_ratio']}")
+    if "max_ratio" in opts and ratio > opts["max_ratio"]:
+        problems.append(f"ratio {ratio:.3f} > max_ratio {opts['max_ratio']}")
+    ok = not problems
+    return TestResult(
+        test_name="cardinality",
+        model_name=model_name,
+        column=column,
+        status="pass" if ok else "fail",
+        message=(
+            f"distinct={distinct}, ratio={ratio:.3f} of {total} rows"
+            if ok
+            else "; ".join(problems)
+        ),
+    )
+
+
+def _outlier_rate(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    store_failures: bool = False,
+) -> TestResult:
+    """Fraction of numeric outliers in `column` must be <= `max_rate` (default 0).
+    `method: iqr` (default, `k`·IQR beyond the quartiles, default k=1.5) or
+    `method: zscore` (|z| > `k`, default k=3)."""
+    opts = _require_dict("outlier_rate", arg)
+    column = opts["column"]
+    method = opts.get("method", "iqr")
+    k = float(opts.get("k", 1.5 if method == "iqr" else 3.0))
+    max_rate = float(opts.get("max_rate", 0.0))
+
+    frame, parsed, values, _total = _numeric_values(
+        adapter, table_ref, column, with_rows=store_failures
+    )
+    if len(values) < 4:
+        return _pass("outlier_rate", model_name, column, "need >= 4 numeric values")
+
+    # Outlier detection is a statistic; compute in float (exact int/Decimal
+    # precision is not meaningful for an IQR/z-score cutoff).
+    floats = [float(v) for v in values]
+    if method == "iqr":
+        ordered = sorted(floats)
+        q1 = _percentile(ordered, 0.25)
+        q3 = _percentile(ordered, 0.75)
+        iqr = q3 - q1
+        low, high = q1 - k * iqr, q3 + k * iqr
+
+        def _is_outlier(x: float) -> bool:
+            return x < low or x > high
+    else:
+        mean = math.fsum(floats) / len(floats)
+        std = math.sqrt(math.fsum((x - mean) ** 2 for x in floats) / len(floats))
+
+        def _is_outlier(x: float) -> bool:
+            return std > 0.0 and abs(x - mean) / std > k
+
+    outliers = sum(1 for x in floats if _is_outlier(x))
+    rate = outliers / len(floats)
+    ok = rate <= max_rate
+    result = TestResult(
+        test_name="outlier_rate",
+        model_name=model_name,
+        column=column,
+        status="pass" if ok else "fail",
+        message=(
+            f"{outliers}/{len(values)} outliers ({method}, rate {rate:.3f}, "
+            f"max {max_rate:.3f})"
+        ),
+    )
+    if not ok and store_failures:
+        failing = [x is not None and _is_outlier(float(x)) for x in parsed]
+        _store_failing_rows(adapter, model_name, "outlier_rate", column, frame, failing, result)
+    return result
 
 
 def _fuzzy_contains(needle: str, haystack: str, min_score: float) -> bool:

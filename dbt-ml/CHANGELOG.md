@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Distribution data checks (issue #10)
+
+- Added three deterministic single-column distribution test types:
+  - `column_stat` — a numeric column's `mean`/`min`/`max`/`sum`/`stddev`/
+    `median`/`quantile` must fall within `[min, max]`.
+  - `cardinality` — distinct-value count (`min`/`max`) and/or distinct ratio
+    (`min_ratio`/`max_ratio`).
+  - `outlier_rate` — fraction of numeric outliers (`method: iqr` with `k`·IQR,
+    or `method: zscore`) must be `<= max_rate` (default 0); honors
+    `--store-failures`.
+- All compute in process, validate options at compile time, skip nulls/non-finite
+  values, and fail actionably on a non-numeric column. The `arxiv_papers` example
+  gains `column_stat`, `outlier_rate`, and `cardinality` checks. Run-over-run
+  baselines and drift metrics (PSI/KS/chi-squared) remain tracked in #10.
+
 ### Embedding-quality data checks (issue #10)
 
 - Added four deterministic, offline test types that operate on the vector column

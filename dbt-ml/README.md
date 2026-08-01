@@ -1787,6 +1787,27 @@ tests:
 `grounded_in` also supports `method: fuzzy` with a `min_score`. These run as
 full-table aggregates, so they stay cheap and reproducible.
 
+**Embedding-quality checks** (deterministic, over the vector column of an
+`embed` model — no provider call):
+
+```yaml
+tests:
+  # dimensionality + finiteness + L2-norm bounds + zero-vector rate
+  - embedding_valid: { column: embedding, dimensions: 1536, max_zero_rate: 0.0 }
+  # collapse guard: mean per-dimension variance must stay above a floor
+  - embedding_variance: { column: embedding, min_variance: 0.0001 }
+  # exact-duplicate-vector rate (redundant copies / total) — usually a cache/join bug
+  - embedding_duplicates: { column: embedding, max_rate: 0.0 }
+  # fraction of vectors beyond `z` std-devs of the centroid distance
+  - embedding_outliers: { column: embedding, z: 3.0, max_rate: 0.01 }
+```
+
+These read only the vector column (memory proportional to the embeddings, not
+the whole relation) and compute norms, per-dimension variance, exact-duplicate
+rates, and centroid-distance outliers in process. A zero or NaN embedding is a
+common silent provider failure, and near-zero variance catches representation
+collapse — both invisible to `not_null`.
+
 **Inspecting failures.** Pass `--store-failures` to `dbt-ml test` or `dbt-ml
 build` to persist the offending rows of each failing test to a
 `dbt_ml_test_failures__<model>__<test>[__<column>]` table (replaced each run).

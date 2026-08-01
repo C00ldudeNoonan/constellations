@@ -17,6 +17,10 @@ SUPPORTED_TESTS = {
     "null_rate",
     "grounded_in",
     "relationships",
+    "embedding_valid",
+    "embedding_variance",
+    "embedding_duplicates",
+    "embedding_outliers",
 }
 SUPPORTED_SEVERITIES = {"error", "warn"}
 
@@ -152,6 +156,45 @@ def _validate_argument(name: str, argument: Any) -> None:
         if not 0.0 <= score <= 1.0:
             raise TestSpecError("Test 'grounded_in' min_score must be between 0 and 1")
         return
+    if name == "embedding_valid":
+        options = _options(
+            name,
+            argument,
+            required={"column"},
+            optional={"dimensions", "min_norm", "max_norm", "max_zero_rate"},
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        if "dimensions" in options:
+            _positive_int(name, options["dimensions"], "dimensions")
+        min_norm = _optional_finite_number(name, options, "min_norm")
+        max_norm = _optional_finite_number(name, options, "max_norm")
+        for label, value in (("min_norm", min_norm), ("max_norm", max_norm)):
+            if value is not None and value < 0:
+                raise TestSpecError(f"Test '{name}' {label} must be non-negative")
+        if min_norm is not None and max_norm is not None and min_norm > max_norm:
+            raise TestSpecError(f"Test '{name}' requires min_norm <= max_norm")
+        _rate(name, options, "max_zero_rate")
+        return
+    if name == "embedding_variance":
+        options = _options(name, argument, required={"column", "min_variance"})
+        _require_nonempty_string(name, options["column"], "column")
+        if _finite_number(name, options["min_variance"], "min_variance") < 0:
+            raise TestSpecError(f"Test '{name}' min_variance must be non-negative")
+        return
+    if name == "embedding_duplicates":
+        options = _options(name, argument, required={"column"}, optional={"max_rate"})
+        _require_nonempty_string(name, options["column"], "column")
+        _rate(name, options, "max_rate")
+        return
+    if name == "embedding_outliers":
+        options = _options(
+            name, argument, required={"column"}, optional={"max_rate", "z"}
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        _rate(name, options, "max_rate")
+        if "z" in options and _finite_number(name, options["z"], "z") <= 0:
+            raise TestSpecError(f"Test '{name}' z must be a positive number")
+        return
     if name == "relationships":
         if not isinstance(argument, dict) or not all(
             key in argument for key in ("column", "to")
@@ -237,3 +280,19 @@ def _finite_number(name: str, value: Any, label: str) -> float:
     if not math.isfinite(number):
         raise TestSpecError(f"Test '{name}' {label} must be a finite number")
     return number
+
+
+def _positive_int(name: str, value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise TestSpecError(f"Test '{name}' {label} must be a positive integer")
+    return value
+
+
+def _rate(name: str, options: dict[str, Any], key: str) -> float:
+    """A fraction option in [0, 1], defaulting to 0.0 when absent."""
+    if key not in options:
+        return 0.0
+    rate = _finite_number(name, options[key], key)
+    if not 0.0 <= rate <= 1.0:
+        raise TestSpecError(f"Test '{name}' {key} must be between 0 and 1")
+    return rate

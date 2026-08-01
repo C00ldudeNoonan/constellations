@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Embedding-quality data checks (issue #10)
+
+- Added four deterministic, offline test types that operate on the vector column
+  of an `embed` model, extending the quality-check framework:
+  - `embedding_valid` — per-vector dimensionality, finiteness, L2-norm bounds
+    (`min_norm`/`max_norm`), and zero-vector rate (`max_zero_rate`, default 0).
+  - `embedding_variance` — collapse guard: mean per-dimension variance must be
+    `>= min_variance`.
+  - `embedding_duplicates` — exact-duplicate-vector rate `<= max_rate`
+    (default 0), detected by hashing.
+  - `embedding_outliers` — fraction of vectors beyond `z` (default 3) standard
+    deviations of the centroid distance must be `<= max_rate` (default 0).
+- Each check reads only the vector column (memory proportional to the embedding
+  data, not the whole relation) and computes in process — no provider call. A
+  zero/NaN embedding and representation collapse are common silent provider
+  failures that `not_null` cannot see. Options are validated at compile time,
+  and the `economic_entity_links_embeddings` example gains `embedding_valid` +
+  `embedding_variance` checks.
+
 ### Removed mypy; ty is the sole static type checker, now project-wide (issue #49)
 
 - Completed the mypy → ty migration: `ty` has been the required, blocking type

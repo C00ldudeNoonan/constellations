@@ -1787,6 +1787,27 @@ tests:
 `grounded_in` also supports `method: fuzzy` with a `min_score`. These run as
 full-table aggregates, so they stay cheap and reproducible.
 
+**Distribution checks** (deterministic statistics over a single column):
+
+```yaml
+tests:
+  # a summary statistic within bounds (stat: mean|min|max|sum|stddev|median|quantile)
+  - column_stat: { column: n_authors, stat: mean, min: 1, max: 10 }
+  - column_stat: { column: score, stat: quantile, quantile: 0.95, max: 1.0 }
+  # distinct-value count and/or distinct ratio (distinct / total rows)
+  - cardinality: { column: primary_category, min: 2 }
+  - cardinality: { column: id, min_ratio: 1.0 }        # every row distinct
+  # fraction of numeric outliers, by IQR (default, k·IQR) or z-score
+  - outlier_rate: { column: n_authors, method: iqr, max_rate: 0.02 }
+```
+
+`column_stat` and `outlier_rate` operate on a numeric column (nulls and
+non-finite values are skipped; a non-numeric column fails with an actionable
+message). `outlier_rate` reads only the target column and supports
+`--store-failures`. Run-over-run baselines and drift metrics (PSI / KS /
+chi-squared) are tracked as follow-ups in
+[issue #10](https://github.com/C00ldudeNoonan/dbt-ml/issues/10).
+
 **Embedding-quality checks** (deterministic, over the vector column of an
 `embed` model — no provider call):
 

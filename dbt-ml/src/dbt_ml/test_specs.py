@@ -21,7 +21,12 @@ SUPPORTED_TESTS = {
     "embedding_variance",
     "embedding_duplicates",
     "embedding_outliers",
+    "column_stat",
+    "cardinality",
+    "outlier_rate",
 }
+
+_COLUMN_STATS = {"mean", "min", "max", "sum", "stddev", "median", "quantile"}
 SUPPORTED_SEVERITIES = {"error", "warn"}
 
 _REF_PATTERN = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
@@ -194,6 +199,71 @@ def _validate_argument(name: str, argument: Any) -> None:
         _rate(name, options, "max_rate")
         if "z" in options and _finite_number(name, options["z"], "z") <= 0:
             raise TestSpecError(f"Test '{name}' z must be a positive number")
+        return
+    if name == "column_stat":
+        options = _options(
+            name, argument, required={"column", "stat"}, optional={"min", "max", "quantile"}
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        stat = options["stat"]
+        if not isinstance(stat, str) or stat not in _COLUMN_STATS:
+            raise TestSpecError(
+                f"Test '{name}' stat must be one of {sorted(_COLUMN_STATS)}"
+            )
+        minimum = _optional_finite_number(name, options, "min")
+        maximum = _optional_finite_number(name, options, "max")
+        if minimum is None and maximum is None:
+            raise TestSpecError(f"Test '{name}' requires at least one of: min, max")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise TestSpecError(f"Test '{name}' requires min <= max")
+        if stat == "quantile":
+            if "quantile" not in options:
+                raise TestSpecError(f"Test '{name}' stat 'quantile' requires a quantile")
+            q = _finite_number(name, options["quantile"], "quantile")
+            if not 0.0 <= q <= 1.0:
+                raise TestSpecError(f"Test '{name}' quantile must be between 0 and 1")
+        elif "quantile" in options:
+            raise TestSpecError(
+                f"Test '{name}' quantile only applies when stat is 'quantile'"
+            )
+        return
+    if name == "cardinality":
+        options = _options(
+            name,
+            argument,
+            required={"column"},
+            optional={"min", "max", "min_ratio", "max_ratio"},
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        for key in ("min", "max"):
+            if key in options:
+                value = options[key]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise TestSpecError(
+                        f"Test '{name}' {key} must be a non-negative integer"
+                    )
+        min_ratio = _rate(name, options, "min_ratio") if "min_ratio" in options else None
+        max_ratio = _rate(name, options, "max_ratio") if "max_ratio" in options else None
+        if not any(key in options for key in ("min", "max", "min_ratio", "max_ratio")):
+            raise TestSpecError(
+                f"Test '{name}' requires at least one of: min, max, min_ratio, max_ratio"
+            )
+        if "min" in options and "max" in options and options["min"] > options["max"]:
+            raise TestSpecError(f"Test '{name}' requires min <= max")
+        if min_ratio is not None and max_ratio is not None and min_ratio > max_ratio:
+            raise TestSpecError(f"Test '{name}' requires min_ratio <= max_ratio")
+        return
+    if name == "outlier_rate":
+        options = _options(
+            name, argument, required={"column"}, optional={"method", "k", "max_rate"}
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        method = options.get("method", "iqr")
+        if not isinstance(method, str) or method not in {"iqr", "zscore"}:
+            raise TestSpecError(f"Test '{name}' method must be 'iqr' or 'zscore'")
+        if "k" in options and _finite_number(name, options["k"], "k") <= 0:
+            raise TestSpecError(f"Test '{name}' k must be a positive number")
+        _rate(name, options, "max_rate")
         return
     if name == "relationships":
         if not isinstance(argument, dict) or not all(

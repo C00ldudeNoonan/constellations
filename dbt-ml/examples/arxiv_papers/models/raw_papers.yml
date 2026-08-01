@@ -54,6 +54,12 @@ models:
           values: [cs.LG, cs.CL, cs.CV, cs.AI, cs.IR, cs.DB, stat.ML, cs.NE, cs.DC]
       # plausibility range on author count
       - accepted_range: { column: n_authors, min: 1, max: 30 }
+      # distribution: the mean author count should stay in a sane band, and no
+      # single paper should be a wild author-count outlier
+      - column_stat: { column: n_authors, stat: mean, min: 1, max: 10 }
+      - outlier_rate: { column: n_authors, method: iqr, max_rate: 0.2 }
+      # cardinality: expect a healthy spread of categories, not one lump
+      - cardinality: { column: primary_category, min: 2 }
       # silent-extraction-failure guard
       - null_rate: { column: title, max: 0.0 }
       # deterministic faithfulness: the title must actually appear in the abstract

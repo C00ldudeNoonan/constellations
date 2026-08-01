@@ -136,13 +136,13 @@ def _run_named_test(
     if test_name == "relationships":
         return [_relationships(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "embedding_valid":
-        return [_embedding_valid(model_name, table_ref, adapter, arg)]
+        return [_embedding_valid(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "embedding_variance":
-        return [_embedding_variance(model_name, table_ref, adapter, arg)]
+        return [_embedding_variance(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "embedding_duplicates":
-        return [_embedding_duplicates(model_name, table_ref, adapter, arg)]
+        return [_embedding_duplicates(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "embedding_outliers":
-        return [_embedding_outliers(model_name, table_ref, adapter, arg)]
+        return [_embedding_outliers(model_name, table_ref, adapter, arg, store_failures)]
     raise UnknownTestError(
         f"Unknown test '{test_name}'. Supported: {sorted(SUPPORTED_TESTS)}"
     )
@@ -540,16 +540,30 @@ def _relationships(
 # ─── embedding-quality checks (issue #10) ──────────────────────────────────
 
 
-def _load_vectors(
-    adapter: WarehouseAdapter, table_ref: str, column: str
-) -> tuple[list[list[float]], int, int]:
-    """Read only the vector `column` (not whole rows) and return the non-null
-    vectors, the null count, and the total row count.
+Vector = list[float]
 
-    Reading a single column keeps memory proportional to the embedding data
-    rather than the full relation. Non-numeric or missing elements become NaN so
-    `embedding_valid` can flag them; other checks assume finite input and rely on
-    `embedding_valid` as the upstream gate.
+
+def _load_vectors(
+    adapter: WarehouseAdapter,
+    table_ref: str,
+    column: str,
+    *,
+    with_rows: bool,
+) -> tuple[pl.DataFrame | None, list[Vector | None], list[Vector], int]:
+    """Read the vector `column` and return, aligned by row: the source frame
+    (only when `with_rows`), the per-row parsed value (``None`` for SQL nulls),
+    the non-null vectors, and the total row count.
+
+    In the default path only the one column is read, so memory stays
+    proportional to the embedding data rather than the whole relation;
+    `with_rows` (used under ``--store-failures``) reads full rows so offending
+    ones can be persisted, and the per-row list stays aligned to that frame.
+
+    A column that does not resolve to vectors — a scalar field reached by a typo
+    or schema drift — raises ``UnknownTestError`` (which the runner turns into a
+    failed check) rather than crashing mid-iteration or silently treating a
+    string as a character vector. Non-numeric *elements* become NaN so
+    `embedding_valid` can report them.
     """
     schema = adapter.query_df(f"SELECT * FROM {table_ref} LIMIT 0")
     if column not in schema.columns:
@@ -557,15 +571,31 @@ def _load_vectors(
             f"embedding check column '{column}' not found in the relation; "
             f"got: {sorted(schema.columns)}"
         )
-    df = adapter.query_df(f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}")
-    vectors: list[list[float]] = []
-    null_count = 0
-    for item in df["v"].to_list():
+    frame: pl.DataFrame | None = None
+    if with_rows:
+        frame = adapter.query_df(f"SELECT * FROM {table_ref}")
+        raw = frame[column].to_list()
+    else:
+        raw = adapter.query_df(
+            f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
+        )["v"].to_list()
+
+    parsed: list[Vector | None] = []
+    vectors: list[Vector] = []
+    for item in raw:
         if item is None:
-            null_count += 1
+            parsed.append(None)
             continue
-        vectors.append([_as_float(x) for x in item])
-    return vectors, null_count, len(df)
+        if isinstance(item, str | bytes) or not isinstance(item, list | tuple):
+            raise UnknownTestError(
+                f"embedding check column '{column}' must contain vectors (lists of "
+                f"numbers), but found a {type(item).__name__} value; point the check "
+                "at the embed model's vector column"
+            )
+        vector = [_as_float(x) for x in item]
+        parsed.append(vector)
+        vectors.append(vector)
+    return frame, parsed, vectors, len(raw)
 
 
 def _as_float(value: Any) -> float:
@@ -575,18 +605,39 @@ def _as_float(value: Any) -> float:
         return math.nan
 
 
-def _consistent_dimensions(vectors: list[list[float]]) -> int | None:
+def _consistent_dimensions(vectors: list[Vector]) -> int | None:
     """The shared dimensionality, or None if the vectors disagree."""
     dims = {len(v) for v in vectors}
     return next(iter(dims)) if len(dims) == 1 else None
 
 
-def _norm(vector: list[float]) -> float:
+def _norm(vector: Vector) -> float:
     return math.sqrt(math.fsum(x * x for x in vector))
 
 
+def _all_finite(vector: Vector) -> bool:
+    return all(math.isfinite(x) for x in vector)
+
+
+def _store_failing_rows(
+    adapter: WarehouseAdapter,
+    model_name: str,
+    test_name: str,
+    column: str,
+    frame: pl.DataFrame | None,
+    failing: list[bool],
+    result: TestResult,
+) -> None:
+    """Persist the rows flagged by `failing` (aligned to `frame`) when the caller
+    loaded full rows for `--store-failures`."""
+    if frame is None or not any(failing):
+        return
+    _store_df(adapter, model_name, test_name, column, frame.filter(pl.Series(failing)), result)
+
+
 def _embedding_valid(
-    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    store_failures: bool = False,
 ) -> TestResult:
     """Per-vector integrity: consistent `dimensions`, finite entries, L2 norm
     within [`min_norm`, `max_norm`], and zero-vector rate <= `max_zero_rate`
@@ -598,25 +649,36 @@ def _embedding_valid(
     max_norm = opts.get("max_norm")
     max_zero_rate = float(opts.get("max_zero_rate", 0.0))
 
-    vectors, _nulls, total = _load_vectors(adapter, table_ref, column)
+    frame, parsed, vectors, total = _load_vectors(
+        adapter, table_ref, column, with_rows=store_failures
+    )
     if not vectors:
         return _pass("embedding_valid", model_name, column, "no non-null vectors")
 
     dim_bad = nonfinite = norm_bad = zero = 0
+    is_zero: list[bool] = []
+    row_bad: list[bool] = []  # individually invalid (dim/finite/norm), per non-null vector
     for vector in vectors:
+        bad = False
+        zero_vector = False
         if dimensions is not None and len(vector) != dimensions:
             dim_bad += 1
-            continue
-        if any(not math.isfinite(x) for x in vector):
+            bad = True
+        elif not _all_finite(vector):
             nonfinite += 1
-            continue
-        norm = _norm(vector)
-        if norm == 0.0:
-            zero += 1
-        if (min_norm is not None and norm < min_norm) or (
-            max_norm is not None and norm > max_norm
-        ):
-            norm_bad += 1
+            bad = True
+        else:
+            norm = _norm(vector)
+            zero_vector = norm == 0.0
+            if zero_vector:
+                zero += 1
+            if (min_norm is not None and norm < min_norm) or (
+                max_norm is not None and norm > max_norm
+            ):
+                norm_bad += 1
+                bad = True
+        is_zero.append(zero_vector)
+        row_bad.append(bad)
     zero_rate = zero / len(vectors)
 
     problems = []
@@ -626,20 +688,29 @@ def _embedding_valid(
         problems.append(f"{nonfinite} non-finite")
     if norm_bad:
         problems.append(f"{norm_bad} out-of-norm-range")
-    if zero_rate > max_zero_rate:
+    zero_rate_bad = zero_rate > max_zero_rate
+    if zero_rate_bad:
         problems.append(f"zero-vector rate {zero_rate:.3f} > {max_zero_rate:.3f}")
     ok = not problems
-    return TestResult(
+    result = TestResult(
         test_name="embedding_valid",
         model_name=model_name,
         column=column,
         status="pass" if ok else "fail",
         message="" if ok else f"{', '.join(problems)} of {total} vectors",
     )
+    if not ok and store_failures:
+        offending = iter(
+            bad or (zero_rate_bad and z) for bad, z in zip(row_bad, is_zero, strict=True)
+        )
+        failing = [False if v is None else next(offending) for v in parsed]
+        _store_failing_rows(adapter, model_name, "embedding_valid", column, frame, failing, result)
+    return result
 
 
 def _embedding_variance(
-    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    store_failures: bool = False,
 ) -> TestResult:
     """Collapse guard: the mean per-dimension (population) variance across the
     embedding set must be >= `min_variance`. Near-zero variance means the
@@ -648,12 +719,16 @@ def _embedding_variance(
     column = opts["column"]
     min_variance = float(opts["min_variance"])
 
-    vectors, _nulls, _total = _load_vectors(adapter, table_ref, column)
+    _frame, _parsed, vectors, _total = _load_vectors(
+        adapter, table_ref, column, with_rows=False
+    )
     if len(vectors) < 2:
         return _pass("embedding_variance", model_name, column, "need >= 2 vectors")
     dims = _consistent_dimensions(vectors)
     if dims is None:
         return _inconsistent("embedding_variance", model_name, column)
+    if not all(_all_finite(v) for v in vectors):
+        return _nonfinite("embedding_variance", model_name, column)
 
     n = len(vectors)
     mean = [math.fsum(v[i] for v in vectors) / n for i in range(dims)]
@@ -672,7 +747,8 @@ def _embedding_variance(
 
 
 def _embedding_duplicates(
-    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    store_failures: bool = False,
 ) -> TestResult:
     """Exact-duplicate-vector rate (redundant copies / total) must be
     <= `max_rate` (default 0). Duplicates usually mean a cache or join bug rather
@@ -681,7 +757,9 @@ def _embedding_duplicates(
     column = opts["column"]
     max_rate = float(opts.get("max_rate", 0.0))
 
-    vectors, _nulls, _total = _load_vectors(adapter, table_ref, column)
+    frame, parsed, vectors, _total = _load_vectors(
+        adapter, table_ref, column, with_rows=store_failures
+    )
     if not vectors:
         return _pass("embedding_duplicates", model_name, column, "no non-null vectors")
 
@@ -689,7 +767,7 @@ def _embedding_duplicates(
     duplicate_copies = sum(count - 1 for count in counts.values() if count > 1)
     rate = duplicate_copies / len(vectors)
     ok = rate <= max_rate
-    return TestResult(
+    result = TestResult(
         test_name="embedding_duplicates",
         model_name=model_name,
         column=column,
@@ -699,10 +777,18 @@ def _embedding_duplicates(
             f"(rate {rate:.3f}, max {max_rate:.3f})"
         ),
     )
+    if not ok and store_failures:
+        repeated = {vector for vector, count in counts.items() if count > 1}
+        failing = [v is not None and tuple(v) in repeated for v in parsed]
+        _store_failing_rows(
+            adapter, model_name, "embedding_duplicates", column, frame, failing, result
+        )
+    return result
 
 
 def _embedding_outliers(
-    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    store_failures: bool = False,
 ) -> TestResult:
     """Fraction of vectors whose L2 distance from the centroid exceeds
     `z` standard deviations (default 3) must be <= `max_rate` (default 0)."""
@@ -711,26 +797,31 @@ def _embedding_outliers(
     max_rate = float(opts.get("max_rate", 0.0))
     z = float(opts.get("z", 3.0))
 
-    vectors, _nulls, _total = _load_vectors(adapter, table_ref, column)
+    frame, parsed, vectors, _total = _load_vectors(
+        adapter, table_ref, column, with_rows=store_failures
+    )
     if len(vectors) < 3:
         return _pass("embedding_outliers", model_name, column, "need >= 3 vectors")
     dims = _consistent_dimensions(vectors)
     if dims is None:
         return _inconsistent("embedding_outliers", model_name, column)
+    if not all(_all_finite(v) for v in vectors):
+        return _nonfinite("embedding_outliers", model_name, column)
 
     n = len(vectors)
     centroid = [math.fsum(v[i] for v in vectors) / n for i in range(dims)]
-    distances = [
-        math.sqrt(math.fsum((v[i] - centroid[i]) ** 2 for i in range(dims)))
-        for v in vectors
-    ]
+
+    def _distance(vector: Vector) -> float:
+        return math.sqrt(math.fsum((vector[i] - centroid[i]) ** 2 for i in range(dims)))
+
+    distances = [_distance(v) for v in vectors]
     mean_d = math.fsum(distances) / n
     std_d = math.sqrt(math.fsum((d - mean_d) ** 2 for d in distances) / n)
     cutoff = mean_d + z * std_d
     outliers = 0 if std_d == 0.0 else sum(1 for d in distances if d > cutoff)
     rate = outliers / n
     ok = rate <= max_rate
-    return TestResult(
+    result = TestResult(
         test_name="embedding_outliers",
         model_name=model_name,
         column=column,
@@ -740,6 +831,15 @@ def _embedding_outliers(
             f"(rate {rate:.3f}, max {max_rate:.3f})"
         ),
     )
+    if not ok and store_failures:
+        failing = [
+            v is not None and len(v) == dims and _all_finite(v) and _distance(v) > cutoff
+            for v in parsed
+        ]
+        _store_failing_rows(
+            adapter, model_name, "embedding_outliers", column, frame, failing, result
+        )
+    return result
 
 
 def _pass(test_name: str, model_name: str, column: str, message: str) -> TestResult:
@@ -761,6 +861,19 @@ def _inconsistent(test_name: str, model_name: str, column: str) -> TestResult:
         message=(
             "vectors have inconsistent dimensionality; add an `embedding_valid` "
             "check with `dimensions` to locate the offending rows"
+        ),
+    )
+
+
+def _nonfinite(test_name: str, model_name: str, column: str) -> TestResult:
+    return TestResult(
+        test_name=test_name,
+        model_name=model_name,
+        column=column,
+        status="fail",
+        message=(
+            "vectors contain non-finite entries (NaN/Inf); add an `embedding_valid` "
+            "check to locate them"
         ),
     )
 

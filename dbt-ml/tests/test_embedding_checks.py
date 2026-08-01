@@ -175,6 +175,101 @@ def test_embedding_outliers_needs_three_vectors(tmp_path: Path) -> None:
     assert "need >= 3" in r.message
 
 
+# ─── robustness: non-vector columns and non-finite input ────────────────────
+
+
+def _adapter(tmp_path: Path) -> Any:
+    return create_adapter(
+        parse_warehouse_config(
+            {"type": "duckdb", "path": str(tmp_path / "e.duckdb"), "schema": "main"}
+        )
+    )
+
+
+@pytest.mark.parametrize("bad_column", [[1, 2, 3], ["10", "20", "30"]])
+def test_non_vector_column_raises_unknown_test_error(
+    tmp_path: Path, bad_column: list[Any]
+) -> None:
+    # A scalar/string column (typo or schema drift) must raise UnknownTestError —
+    # which run_model_tests turns into a failed check — not a TypeError that aborts
+    # the run, and a string must never be silently read as a character vector.
+    with _adapter(tmp_path) as adapter:
+        adapter.materialize_full("emb", pl.DataFrame({"vec": bad_column}))
+        with pytest.raises(SpecError, match="must contain vectors"):
+            evaluate_test_spec(
+                {"embedding_valid": {"column": "vec"}},
+                model_name="emb",
+                table_ref=adapter.table_ref("emb"),
+                adapter=adapter,
+            )
+
+
+@pytest.mark.parametrize("check", ["embedding_variance", "embedding_outliers"])
+def test_nonfinite_vectors_fail_without_crashing(tmp_path: Path, check: str) -> None:
+    # Opposing infinities make math.fsum raise; the aggregate checks must report a
+    # failure themselves instead of letting the ValueError abort the run.
+    spec: dict[str, Any] = {check: {"column": "vec"}}
+    if check == "embedding_variance":
+        spec[check]["min_variance"] = 0.01
+    r = _check(
+        tmp_path,
+        [[float("inf")], [float("-inf")], [0.0]],
+        spec,
+    )
+    assert r.status == "fail"
+    assert "non-finite" in r.message
+
+
+# ─── --store-failures persistence ────────────────────────────────────────────
+
+
+def test_store_failures_persists_duplicate_rows(tmp_path: Path) -> None:
+    with _adapter(tmp_path) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {"id": ["a", "b", "c"], "vec": [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]},
+                schema={"id": pl.String, "vec": pl.List(pl.Float64)},
+            ),
+        )
+        r = evaluate_test_spec(
+            {"embedding_duplicates": {"column": "vec"}},
+            model_name="emb",
+            table_ref=adapter.table_ref("emb"),
+            adapter=adapter,
+            store_failures=True,
+        )[0]
+        assert r.status == "fail"
+        assert r.failures_table is not None
+        assert r.failure_count == 2  # both members of the duplicate group
+        stored = adapter.query_df(f"SELECT * FROM {adapter.table_ref(r.failures_table)}")
+        assert stored.height == 2
+        assert set(stored["id"].to_list()) == {"a", "b"}
+
+
+def test_store_failures_persists_zero_vector_rows(tmp_path: Path) -> None:
+    with _adapter(tmp_path) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {"id": ["a", "b"], "vec": [[1.0, 0.0], [0.0, 0.0]]},
+                schema={"id": pl.String, "vec": pl.List(pl.Float64)},
+            ),
+        )
+        r = evaluate_test_spec(
+            {"embedding_valid": {"column": "vec"}},
+            model_name="emb",
+            table_ref=adapter.table_ref("emb"),
+            adapter=adapter,
+            store_failures=True,
+        )[0]
+        assert r.status == "fail"
+        assert r.failure_count == 1  # the single zero vector
+        assert r.failures_table is not None
+        stored = adapter.query_df(f"SELECT * FROM {adapter.table_ref(r.failures_table)}")
+        assert stored["id"].to_list() == ["b"]
+
+
 # ─── compile-time validation ────────────────────────────────────────────────
 
 

@@ -2,6 +2,7 @@
 against a real DuckDB adapter over a column — no LLM, no sampling."""
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +141,48 @@ def test_outlier_rate_store_failures_persists_rows(tmp_path: Path) -> None:
         assert r.failure_count == 1
         stored = adapter.query_df(f"SELECT * FROM {adapter.table_ref(r.failures_table)}")
         assert stored["n"].to_list() == [100]
+
+
+# ─── numeric-type robustness (Codex review) ──────────────────────────────────
+
+
+def test_column_stat_accepts_decimal_column(tmp_path: Path) -> None:
+    frame = pl.DataFrame(
+        {"p": [Decimal("1.5"), Decimal("2.5"), Decimal("3.5")]},
+        schema={"p": pl.Decimal(10, 2)},
+    )
+    r = _check(
+        tmp_path, frame, {"column_stat": {"column": "p", "stat": "mean", "min": 2, "max": 3}}
+    )
+    assert r.status == "pass"
+
+
+def test_column_stat_preserves_large_integer_precision(tmp_path: Path) -> None:
+    # 2**53 + 1 is not exactly representable as float64; an exact max must not
+    # round down to 2**53 and pass a bound of 2**53.
+    big = 9007199254740993
+    frame = pl.DataFrame({"n": [big, 1, 2]}, schema={"n": pl.Int64})
+    r = _check(tmp_path, frame, {"column_stat": {"column": "n", "stat": "max", "max": big - 1}})
+    assert r.status == "fail"
+    assert str(big) in r.message
+
+
+def test_non_numeric_empty_column_fails_not_passes(tmp_path: Path) -> None:
+    # An all-null / empty non-numeric column must still fail the numeric contract
+    # rather than slip through as "no non-null numeric values".
+    empty = pl.DataFrame({"c": []}, schema={"c": pl.String})
+    with pytest.raises(SpecError, match="must be numeric"):
+        _check(tmp_path, empty, {"column_stat": {"column": "c", "stat": "mean", "max": 1}})
+    with pytest.raises(SpecError, match="must be numeric"):
+        _check(tmp_path, empty, {"outlier_rate": {"column": "c"}})
+
+
+def test_cardinality_collapses_repeated_nans(tmp_path: Path) -> None:
+    nan = float("nan")
+    frame = pl.DataFrame({"v": [1.0, nan, nan, nan, 1.0]}, schema={"v": pl.Float64})
+    # distinct values are {1.0, NaN} = 2, not five separate NaN objects.
+    assert _check(tmp_path, frame, {"cardinality": {"column": "v", "max": 2}}).status == "pass"
+    assert _check(tmp_path, frame, {"cardinality": {"column": "v", "max": 1}}).status == "fail"
 
 
 # ─── compile-time validation ─────────────────────────────────────────────────

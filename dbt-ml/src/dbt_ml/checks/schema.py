@@ -4,6 +4,7 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -887,24 +888,46 @@ def _nonfinite(test_name: str, model_name: str, column: str) -> TestResult:
 # ─── distribution / statistical checks (issue #10) ─────────────────────────
 
 
+Number = int | float | Decimal
+
+
+def _is_finite_number(value: Number) -> bool:
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, Decimal):
+        return value.is_finite()
+    return True  # int is always finite
+
+
 def _numeric_values(
     adapter: WarehouseAdapter,
     table_ref: str,
     column: str,
     *,
     with_rows: bool,
-) -> tuple[pl.DataFrame | None, list[float | None], list[float], int]:
+) -> tuple[pl.DataFrame | None, list[Number | None], list[Number], int]:
     """Read a numeric `column` and return, aligned by row: the source frame
     (only when `with_rows`), the per-row value (``None`` for SQL nulls and
     non-finite values), the finite non-null values, and the total row count.
 
-    A non-numeric column raises ``UnknownTestError`` (the runner turns it into a
-    failed check) rather than crashing the run."""
+    Values keep their native Python type — ``int`` (exact, even above 2**53),
+    ``float``, or ``Decimal`` (DuckDB DECIMAL / BigQuery NUMERIC) — so exact
+    ``min``/``max``/``sum`` comparisons do not lose precision. A non-numeric
+    column raises ``UnknownTestError`` (the runner turns it into a failed check)
+    — checked from the schema so it fails even when the relation is empty or
+    all-null — rather than crashing the run.
+    """
     schema = adapter.query_df(f"SELECT * FROM {table_ref} LIMIT 0")
     if column not in schema.columns:
         raise UnknownTestError(
             f"distribution check column '{column}' not found in the relation; "
             f"got: {sorted(schema.columns)}"
+        )
+    dtype = schema.schema[column]
+    if not dtype.is_numeric():
+        raise UnknownTestError(
+            f"distribution check column '{column}' must be numeric, but has type "
+            f"{dtype}"
         )
     frame: pl.DataFrame | None = None
     if with_rows:
@@ -915,23 +938,14 @@ def _numeric_values(
             f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
         )["v"].to_list()
 
-    parsed: list[float | None] = []
-    values: list[float] = []
+    parsed: list[Number | None] = []
+    values: list[Number] = []
     for item in raw:
-        if item is None:
+        if item is None or isinstance(item, bool) or not _is_finite_number(item):
             parsed.append(None)
             continue
-        if isinstance(item, bool) or not isinstance(item, int | float):
-            raise UnknownTestError(
-                f"distribution check column '{column}' must be numeric, but found a "
-                f"{type(item).__name__} value"
-            )
-        number = float(item)
-        if not math.isfinite(number):
-            parsed.append(None)
-            continue
-        parsed.append(number)
-        values.append(number)
+        parsed.append(item)
+        values.append(item)
     return frame, parsed, values, len(raw)
 
 
@@ -949,20 +963,24 @@ def _percentile(ordered: list[float], q: float) -> float:
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
-def _stat_value(stat: str, values: list[float], quantile: float | None) -> float:
-    n = len(values)
-    if stat == "mean":
-        return math.fsum(values) / n
-    if stat == "sum":
-        return math.fsum(values)
+def _stat_value(stat: str, values: list[Number], quantile: float | None) -> Number:
+    # min/max/sum keep the values' native type so exact int/Decimal comparisons
+    # against the configured bounds do not lose precision.
     if stat == "min":
         return min(values)
     if stat == "max":
         return max(values)
+    if stat == "sum":
+        return sum(values)
+    # The remaining statistics are inherently real-valued; compute in float.
+    floats = [float(v) for v in values]
+    n = len(floats)
+    if stat == "mean":
+        return math.fsum(floats) / n
     if stat == "stddev":
-        mean = math.fsum(values) / n
-        return math.sqrt(math.fsum((x - mean) ** 2 for x in values) / n)
-    ordered = sorted(values)
+        mean = math.fsum(floats) / n
+        return math.sqrt(math.fsum((x - mean) ** 2 for x in floats) / n)
+    ordered = sorted(floats)
     if stat == "median":
         return _percentile(ordered, 0.5)
     assert quantile is not None  # validated: stat == "quantile" requires it
@@ -989,13 +1007,25 @@ def _column_stat(
     value = _stat_value(stat, values, opts.get("quantile"))
     ok = (lower is None or value >= lower) and (upper is None or value <= upper)
     bounds = f"[{opts.get('min', '-inf')}, {opts.get('max', 'inf')}]"
+    shown = f"{value:.6g}" if isinstance(value, float) else str(value)
     return TestResult(
         test_name="column_stat",
         model_name=model_name,
         column=column,
         status="pass" if ok else "fail",
-        message=f"{stat}={value:.6g} vs {bounds}",
+        message=f"{stat}={shown} vs {bounds}",
     )
+
+
+_NAN_KEY = object()  # single identity for every NaN so they count as one value
+
+
+def _canonical_cardinality_key(value: Any) -> Any:
+    if isinstance(value, float) and math.isnan(value):
+        return _NAN_KEY
+    if isinstance(value, Decimal) and value.is_nan():
+        return _NAN_KEY
+    return value
 
 
 def _cardinality(
@@ -1009,9 +1039,10 @@ def _cardinality(
         f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
     )["v"].to_list()
     total = len(raw)
-    non_null = [x for x in raw if x is not None]
+    # NaN != NaN, so a raw set would count each NaN as its own value and inflate
+    # cardinality toward the row count; collapse every NaN to one sentinel.
     try:
-        distinct = len(set(non_null))
+        distinct = len({_canonical_cardinality_key(x) for x in raw if x is not None})
     except TypeError as e:
         raise UnknownTestError(
             f"cardinality expects a scalar column; '{column}' holds unhashable values"
@@ -1060,8 +1091,11 @@ def _outlier_rate(
     if len(values) < 4:
         return _pass("outlier_rate", model_name, column, "need >= 4 numeric values")
 
+    # Outlier detection is a statistic; compute in float (exact int/Decimal
+    # precision is not meaningful for an IQR/z-score cutoff).
+    floats = [float(v) for v in values]
     if method == "iqr":
-        ordered = sorted(values)
+        ordered = sorted(floats)
         q1 = _percentile(ordered, 0.25)
         q3 = _percentile(ordered, 0.75)
         iqr = q3 - q1
@@ -1070,14 +1104,14 @@ def _outlier_rate(
         def _is_outlier(x: float) -> bool:
             return x < low or x > high
     else:
-        mean = math.fsum(values) / len(values)
-        std = math.sqrt(math.fsum((x - mean) ** 2 for x in values) / len(values))
+        mean = math.fsum(floats) / len(floats)
+        std = math.sqrt(math.fsum((x - mean) ** 2 for x in floats) / len(floats))
 
         def _is_outlier(x: float) -> bool:
             return std > 0.0 and abs(x - mean) / std > k
 
-    outliers = sum(1 for x in values if _is_outlier(x))
-    rate = outliers / len(values)
+    outliers = sum(1 for x in floats if _is_outlier(x))
+    rate = outliers / len(floats)
     ok = rate <= max_rate
     result = TestResult(
         test_name="outlier_rate",
@@ -1090,7 +1124,7 @@ def _outlier_rate(
         ),
     )
     if not ok and store_failures:
-        failing = [x is not None and _is_outlier(x) for x in parsed]
+        failing = [x is not None and _is_outlier(float(x)) for x in parsed]
         _store_failing_rows(adapter, model_name, "outlier_rate", column, frame, failing, result)
     return result
 

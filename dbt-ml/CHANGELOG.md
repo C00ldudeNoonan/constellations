@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Run-over-run drift checks (issue #10)
+
+- Added a `drift` test type: compares a column's distribution against the same
+  field in a baseline model referenced by `to: ref('baseline')`, failing when
+  the divergence exceeds `max`.
+- Metrics: `psi` (Population Stability Index, default), `ks` (Kolmogorov-Smirnov,
+  numeric only), and `jensen_shannon`. Numeric columns are compared over
+  baseline-quantile bins (`bins`, default 10); categoricals over their value
+  proportions. `field` maps to a differently-named baseline column.
+- The baseline is an ordinary model you snapshot and reference — an explicit,
+  git-reviewable comparison rather than an implicit last-run store — and it
+  becomes a DAG dependency of the tested model (same path as `relationships`),
+  so it is built first. Deterministic and offline; a non-numeric/numeric
+  mismatch and `ks` on a categorical column fail with actionable messages.
+  Chi-squared and the optional LLM-judge tier remain tracked in #10.
+
 ### Distribution data checks (issue #10)
 
 - Added three deterministic single-column distribution test types:

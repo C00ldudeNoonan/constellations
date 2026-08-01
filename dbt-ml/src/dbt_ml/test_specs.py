@@ -24,9 +24,11 @@ SUPPORTED_TESTS = {
     "column_stat",
     "cardinality",
     "outlier_rate",
+    "drift",
 }
 
 _COLUMN_STATS = {"mean", "min", "max", "sum", "stddev", "median", "quantile"}
+_DRIFT_METRICS = {"psi", "ks", "jensen_shannon"}
 SUPPORTED_SEVERITIES = {"error", "warn"}
 
 _REF_PATTERN = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
@@ -44,7 +46,13 @@ class ParsedTestSpec:
 
     @property
     def relationship_target(self) -> str | None:
-        if self.name != "relationships":
+        return self.ref_target
+
+    @property
+    def ref_target(self) -> str | None:
+        """The model this test depends on via a `to:` ref (relationships parent,
+        or the drift baseline), so the DAG builds it first."""
+        if self.name not in {"relationships", "drift"}:
             return None
         target = self.argument["to"]
         match = _REF_PATTERN.match(target)
@@ -86,9 +94,11 @@ def parse_test_spec(spec: Any) -> ParsedTestSpec:
 
 
 def relationship_test_targets(specs: list[Any]) -> set[str]:
+    """Models referenced by a test's `to:` (relationships parent or drift
+    baseline), which must be built before the test runs."""
     targets: set[str] = set()
     for spec in specs:
-        target = parse_test_spec(spec).relationship_target
+        target = parse_test_spec(spec).ref_target
         if target is not None:
             targets.add(target)
     return targets
@@ -264,6 +274,30 @@ def _validate_argument(name: str, argument: Any) -> None:
         if "k" in options and _finite_number(name, options["k"], "k") <= 0:
             raise TestSpecError(f"Test '{name}' k must be a positive number")
         _rate(name, options, "max_rate")
+        return
+    if name == "drift":
+        options = _options(
+            name,
+            argument,
+            required={"column", "to", "max"},
+            optional={"field", "metric", "bins"},
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        _require_nonempty_string(name, options["to"], "to")
+        if "field" in options:
+            _require_nonempty_string(name, options["field"], "field")
+        metric = options.get("metric", "psi")
+        if not isinstance(metric, str) or metric not in _DRIFT_METRICS:
+            raise TestSpecError(
+                f"Test '{name}' metric must be one of {sorted(_DRIFT_METRICS)}"
+            )
+        max_value = _finite_number(name, options["max"], "max")
+        if max_value < 0:
+            raise TestSpecError(f"Test '{name}' max must be non-negative")
+        if "bins" in options:
+            bins = options["bins"]
+            if isinstance(bins, bool) or not isinstance(bins, int) or bins < 2:
+                raise TestSpecError(f"Test '{name}' bins must be an integer >= 2")
         return
     if name == "relationships":
         if not isinstance(argument, dict) or not all(

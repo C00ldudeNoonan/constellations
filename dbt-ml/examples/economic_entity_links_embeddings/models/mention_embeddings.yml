@@ -22,3 +22,8 @@ models:
     tests:
       - not_null: [entity_id, source_document_id, entity_text, embedding]
       - unique: entity_id
+      # Deterministic embedding-quality checks (#10): the vectors must all be
+      # 8-dimensional with no zero/NaN embeddings, and must not collapse to a
+      # single point. No provider call — pure math over the vector column.
+      - embedding_valid: { column: embedding, dimensions: 8, max_zero_rate: 0.0 }
+      - embedding_variance: { column: embedding, min_variance: 0.0001 }

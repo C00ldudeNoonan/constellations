@@ -171,9 +171,10 @@ def test_llm_pipeline_end_to_end(
     }
 
     def fake(
-        self: LLMBackend, content: str, model: str, system: str, fields_spec: list,
+        self: Any, content: str, model: str, system: str,
+        fields_spec: list[dict[str, Any]],
         **kwargs: Any,
-    ) -> dict:
+    ) -> dict[str, Any]:
         return dict(canned)
 
     monkeypatch.setattr(LLMBackend, "_call_api", fake)
@@ -384,7 +385,7 @@ def test_vllm_base_url_is_part_of_cache_key(
         calls += 1
         return {"vendor": "v", "invoice_id": "i", "total": 1.0}
 
-    common = {
+    common: dict[str, Any] = {
         "fields_spec": schema,
         "provider": "vllm",
         "model": "invoice-extractor",
@@ -411,7 +412,7 @@ def test_vllm_base_url_is_part_of_cache_key(
 
 
 def test_no_endpoint_preserves_legacy_cache_key() -> None:
-    values = {
+    values: dict[str, Any] = {
         "provider": "anthropic",
         "provider_identity": "anthropic/1",
         "model": "claude-test",
@@ -438,7 +439,7 @@ def test_no_endpoint_preserves_legacy_cache_key() -> None:
 
 
 def test_cache_key_separates_provider_implementations() -> None:
-    common = {
+    common: dict[str, Any] = {
         "provider": "anthropic",
         "model": "shared-model",
         "content_hash": "content",
@@ -464,7 +465,7 @@ def test_cache_key_survives_dbt_ml_release_changes(
     """The response cache is keyed on the semantic request and the provider
     contract identity — never the dbt-ml release — so routine upgrades do
     not force paid re-extraction."""
-    common = {
+    common: dict[str, Any] = {
         "provider": "anthropic",
         "model": "shared-model",
         "content_hash": "content",
@@ -541,13 +542,13 @@ def test_cache_file_is_private_and_rejects_symlinks(
     real_connect = llm_backend.duckdb.connect
 
     class InspectingConnection:
-        def __init__(self, *args: object, **kwargs: object) -> None:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._connection = real_connect(*args, **kwargs)
 
         def __getattr__(self, name: str) -> object:
             return getattr(self._connection, name)
 
-        def execute(self, *args: object, **kwargs: object) -> object:
+        def execute(self, *args: Any, **kwargs: Any) -> object:
             result = self._connection.execute(*args, **kwargs)
             if args and "INSERT INTO llm_cache" in str(args[0]):
                 wal_modes.append(stat.S_IMODE(wal_path.stat().st_mode))
@@ -673,7 +674,8 @@ def test_extract_with_usage_carries_tokens(tmp_path: Path) -> None:
     from dbt_ml.backends.llm_backend import extract_fields_with_usage
 
     def fake(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+        content: str, model: str, system: str, fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         return {"x": 1}, {"input_tokens": 500, "output_tokens": 42}
 
@@ -695,7 +697,8 @@ def test_extract_with_usage_cache_hit_is_zero_tokens(tmp_path: Path) -> None:
     from dbt_ml.backends.llm_backend import extract_fields_with_usage
 
     def fake(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+        content: str, model: str, system: str, fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         return {"x": 1}, {"input_tokens": 500, "output_tokens": 42}
 
@@ -723,7 +726,8 @@ def test_extract_with_usage_accepts_bare_dict_fake() -> None:
     from dbt_ml.backends.llm_backend import extract_fields_with_usage
 
     def fake(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+        content: str, model: str, system: str, fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> dict[str, Any]:
         return {"x": 1}
 
@@ -747,7 +751,8 @@ def test_max_concurrent_gates_api_calls() -> None:
     lock = threading.Lock()
 
     def fake(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: Any
+        content: str, model: str, system: str, fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> dict[str, Any]:
         nonlocal active, peak
         with lock:

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 import pytest
@@ -126,7 +126,8 @@ def test_vectorizer_payload_invariant_under_permutation(provider: str) -> None:
     options = _text_options({})
     payloads = [
         _fit_vectorizer(
-            _source_rows(_frame(order), "text"), provider, options, {}
+            _source_rows(_frame(order), "text"),
+            cast(Any, provider), options, {}
         )
         for order in PERMUTATIONS
     ]

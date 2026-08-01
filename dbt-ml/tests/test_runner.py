@@ -69,7 +69,7 @@ def fresh_project(tmp_path: Path, example_project_dir: Path) -> Path:
     return dst
 
 
-def _query(db_path: Path, sql: str) -> list[tuple]:
+def _query(db_path: Path, sql: str) -> list[tuple[Any, ...]]:
     con = duckdb.connect(str(db_path))
     try:
         return con.execute(sql).fetchall()

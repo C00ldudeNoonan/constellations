@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 from click.testing import CliRunner
@@ -75,7 +76,9 @@ def test_capability_preflight_rejects_sql_tests_without_support(
         validate_warehouse_capabilities([model], "non_sql")
 
 
-def _iceberg_model(materialization: str = "full") -> ModelConfig:
+def _iceberg_model(
+    materialization: Literal["full", "incremental"] = "full",
+) -> ModelConfig:
     model = _extraction("raw")
     model.materialization = materialization
     model.warehouse_options = {
@@ -852,7 +855,8 @@ def test_declared_dependencies_are_reconciled_at_compile_time(
 ) -> None:
     _declaring_transform(tmp_path, returns)
     model = _declaring_model(*depends_on)
-    model.transform.options = {"left": "typo"}  # type: ignore[union-attr]
+    assert model.transform is not None
+    model.transform.options = {"left": "typo"}
 
     with pytest.raises(ConfigError, match=message):
         validate_project_contract(

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from hashlib import blake2b
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import polars as pl
@@ -716,7 +717,7 @@ def test_case_probe_does_not_inherit_behavior_across_mount_boundary(
     mounted.mkdir()
     original_stat = Path.stat
 
-    def fake_stat(path: Path, *args: object, **kwargs: object) -> object:
+    def fake_stat(path: Path, *args: Any, **kwargs: Any) -> object:
         if path == mounted:
             return SimpleNamespace(st_dev=101)
         if path == tmp_path:

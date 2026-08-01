@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 from urllib.error import HTTPError
 
 import pytest
@@ -206,7 +206,7 @@ def test_vllm_http_failures_do_not_expose_endpoint_or_response(
 
     def fail(*args: Any, **kwargs: Any) -> Any:
         del args, kwargs
-        raise HTTPError(
+        raise cast(Any, HTTPError)(
             f"https://example.test/{endpoint_marker}",
             503,
             "upstream body marker",
@@ -232,7 +232,7 @@ def test_vllm_http_failures_do_not_expose_endpoint_or_response(
 
 def test_vllm_does_not_follow_http_redirects() -> None:
     handler = vllm_provider._RejectRedirects()
-    redirected = handler.redirect_request(
+    redirected = cast(Any, handler).redirect_request(
         object(),
         None,
         307,

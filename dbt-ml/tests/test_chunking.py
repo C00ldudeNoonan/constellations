@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -285,7 +286,7 @@ def _write_doc(
     )
 
 
-def _chunks(project: Path) -> list[tuple]:
+def _chunks(project: Path) -> list[tuple[Any, ...]]:
     con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
     try:
         return con.execute(
@@ -484,13 +485,13 @@ def test_failed_chunk_replacement_cannot_leave_old_state_current(
     failed = False
 
     def fail_replace_once(
-        self: DuckDBAdapter, table: str, *args: object, **kwargs: object
+        self: DuckDBAdapter, table: str, *args: Any, **kwargs: Any
     ) -> int:
         nonlocal failed
         if table == "document_chunks" and not failed:
             failed = True
             raise AdapterError("simulated chunk publication failure")
-        return original_replace(self, table, *args, **kwargs)  # type: ignore[arg-type]
+        return original_replace(self, table, *args, **kwargs)
 
     monkeypatch.setattr(DuckDBAdapter, "replace_children", fail_replace_once)
     with pytest.raises(RunError, match="simulated chunk publication failure"):

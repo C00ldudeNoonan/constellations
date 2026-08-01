@@ -6,6 +6,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import lancedb
 import polars as pl
@@ -519,7 +520,7 @@ def test_unacknowledged_receipt_advances_no_state(
 
     original_upsert = LanceDBStore.upsert
 
-    def unacknowledged(self: LanceDBStore, *args: object, **kwargs: object) -> object:
+    def unacknowledged(self: Any, *args: Any, **kwargs: Any) -> object:
         receipt = original_upsert(self, *args, **kwargs)
         return replace(receipt, atomic=False)
 
@@ -529,6 +530,7 @@ def test_unacknowledged_receipt_advances_no_state(
 
     project, _, _ = load_project(tmp_path)
     resolved = resolve_profile(project, tmp_path)
+    assert resolved.retrieval is not None
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         scope = StateScope.for_target_descriptor(
             "context_search",

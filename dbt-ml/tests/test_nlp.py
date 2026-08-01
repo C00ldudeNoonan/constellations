@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -101,7 +102,7 @@ class _FakeProvider:
         return iter(self.documents)
 
 
-def _ctx(options: dict[str, object] | None = None) -> TransformContext:
+def _ctx(options: dict[str, Any] | None = None) -> TransformContext:
     return TransformContext(
         project_dir=Path("."),
         profile_name="test",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -43,8 +44,8 @@ def test_pdf_pipeline_end_to_end(
     call_count = {"n": 0}
 
     def fake_api(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: object
-    ) -> dict:
+        content: str, model: str, system: str, fields_spec: list[Any], **kwargs: object
+    ) -> dict[str, Any]:
         call_count["n"] += 1
         return {
             "invoice_id": f"INV-FROMTEXT-{call_count['n']}",
@@ -84,8 +85,8 @@ def test_pdf_pipeline_caches_llm_calls(
     api_calls = {"n": 0}
 
     def fake_api(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: object
-    ) -> dict:
+        content: str, model: str, system: str, fields_spec: list[Any], **kwargs: object
+    ) -> dict[str, Any]:
         api_calls["n"] += 1
         return {
             "invoice_id": "INV-X",
@@ -119,8 +120,8 @@ def test_pdf_transform_propagates_custom_api_key_env(
     seen_references: list[CredentialReference] = []
 
     def fake_api(
-        content: str, model: str, system: str, fields_spec: list, **kwargs: object
-    ) -> dict:
+        content: str, model: str, system: str, fields_spec: list[Any], **kwargs: object
+    ) -> dict[str, Any]:
         reference = kwargs["api_key_env"]
         assert isinstance(reference, CredentialReference)
         seen_references.append(reference)

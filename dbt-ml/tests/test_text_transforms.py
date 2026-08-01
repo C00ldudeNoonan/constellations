@@ -7,6 +7,7 @@ that's tested separately. This file just locks in the per-transform contract.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
@@ -29,7 +30,7 @@ from dbt_ml.text.transforms import (
 from dbt_ml.transforms import TransformContext
 
 
-def _ctx(options: dict | None = None) -> TransformContext:
+def _ctx(options: dict[str, Any] | None = None) -> TransformContext:
     return TransformContext(
         project_dir=Path("."),
         profile_name="test",

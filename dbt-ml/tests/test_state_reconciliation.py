@@ -8,6 +8,7 @@ larger than one page.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import polars as pl
 import pytest
@@ -273,12 +274,12 @@ class _ResidencyProbeAdapter(DuckDBAdapter):
         inner = super()._open_state_page_reader(request)
         original_fetch = inner.fetch_page
 
-        def fetch_page(cursor=None):  # type: ignore[no-untyped-def]
+        def fetch_page(cursor: str | None = None) -> StatePage:
             page = original_fetch(cursor)
             type(self).max_page = max(type(self).max_page, len(page.records))
             return page
 
-        inner.fetch_page = fetch_page  # type: ignore[method-assign]
+        cast(Any, inner).fetch_page = fetch_page
         return inner
 
 

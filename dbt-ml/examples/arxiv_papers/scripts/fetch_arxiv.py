@@ -20,12 +20,13 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Any
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _ARXIV = "{http://arxiv.org/schemas/atom}"
 
 
-def fetch(category: str, count: int) -> list[dict]:
+def fetch(category: str, count: int) -> list[dict[str, Any]]:
     query = urllib.parse.urlencode(
         {
             "search_query": f"cat:{category}",
@@ -40,7 +41,7 @@ def fetch(category: str, count: int) -> list[dict]:
         xml = resp.read()
 
     root = ET.fromstring(xml)
-    papers: list[dict] = []
+    papers: list[dict[str, Any]] = []
     for entry in root.findall(f"{_ATOM}entry"):
         raw_id = entry.findtext(f"{_ATOM}id", "").rsplit("/", 1)[-1]
         arxiv_id = raw_id.split("v")[0]  # strip version suffix
@@ -62,7 +63,7 @@ def fetch(category: str, count: int) -> list[dict]:
                 "authors": authors,
                 "n_authors": len(authors),
                 "primary_category": primary_category,
-                "categories": sorted(set(categories)),
+                "categories": sorted(str(c) for c in set(categories)),
                 "published": published,
                 # restate title so grounded_in behaves consistently with synthetic
                 "abstract": f"{title}. {summary}",

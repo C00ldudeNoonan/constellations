@@ -16,20 +16,19 @@ uv run pytest -q
 ```bash
 uv run pip-audit --skip-editable  # dependency advisories
 uv run ruff check                 # lint
-uv run ty check                   # required type checking
-uv run mypy                       # temporary migration parity
+uv run ty check                   # type checking
 uv run pytest -q                  # tests
 ```
 
-ty is the primary type checker and checks `src/dbt_ml` plus focused static
-compatibility fixtures in `typecheck/`. Ruff's ANN and PYI rules preserve
-annotation discipline for package source; explicit `Any` remains permitted at
-validated dynamic, SDK, and optional-dependency boundaries. Do not add broad
-suppressions to keep the command clean.
-
-During the migration tracked in issue #49, CI and release validation also run
-mypy as a parity check. Remove that second checker only after the issue's
-side-by-side validation period is complete. The workflows live in the
+ty is the required and only static type checker, and it checks the whole
+project — `src/dbt_ml`, `tests`, `examples`, `scripts`, and the focused static
+compatibility fixtures in `typecheck/`. Ruff's ANN and PYI rules enforce
+annotation *presence* on package source only (tests and examples are exempt so
+fixture code needn't be fully annotated, but ty still type-checks their bodies).
+Explicit `Any` remains permitted at validated dynamic, SDK, and
+optional-dependency boundaries; in test doubles, prefer `cast(Any, obj)` over a
+suppression comment. Do not add broad suppressions to keep the command clean. CI
+and release validation run the same checks; the workflows live in the
 repository-level `.github/workflows/` directory.
 
 ## Adding a new backend

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -72,7 +73,7 @@ def _embedding_project(tmp_path: Path) -> Path:
     return project
 
 
-def _query(project: Path, sql: str, params: list[object] | None = None) -> list[tuple]:
+def _query(project: Path, sql: str, params: list[object] | None = None) -> list[tuple[Any, ...]]:
     connection = duckdb.connect(
         str(project / "target" / "db.duckdb"),
         read_only=params is None,
@@ -196,6 +197,7 @@ def test_embed_model_materializes_canonical_rows_and_artifacts(tmp_path: Path) -
         item for item in build_manifest(project)["models"] if item["name"] == "document_embeddings"
     )
     assert model["kind"] == "embed"
+    assert result.artifact_metadata is not None
     assert model["embedding"] == result.artifact_metadata["embedding"]
     assert set(model["embedding"]) == {
         "provider",

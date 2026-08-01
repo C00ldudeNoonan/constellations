@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Removed mypy; ty is the sole static type checker, now project-wide (issue #49)
+
+- Completed the mypy → ty migration: `ty` has been the required, blocking type
+  checker since v0.3.0 and ran clean alongside mypy for two release cycles. With
+  parity confirmed, mypy is removed — the `mypy` dev dependency, the
+  `[tool.mypy]` configuration, the CI and release-workflow mypy steps, and the
+  mypy contributor/release guidance are all gone.
+- Extended ty coverage from `src/dbt_ml` to the whole project — `tests`,
+  `examples`, and `scripts` are now type-checked too (previously neither checker
+  looked at them). Resolved ~160 findings this surfaced with real annotations,
+  narrowing, and `cast(Any, …)` at test-double boundaries rather than broad
+  suppressions. Annotation-*presence* (Ruff `ANN`/`PYI`) stays enforced on
+  package source only; `[tool.ty]` rules are unchanged.
+
 ## v0.4.0 - 2026-07-31
 
 ### Typed relation extraction over entity mentions (issues #220, #240)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -44,7 +45,7 @@ def papers(tmp_path: Path) -> Iterator[WarehouseAdapter]:
         yield adapter
 
 
-def _run(adapter: WarehouseAdapter, spec: dict):
+def _run(adapter: WarehouseAdapter, spec: dict[str, Any]):
     return evaluate_test_spec(
         spec, model_name="papers", table_ref=adapter.table_ref("papers"), adapter=adapter
     )[0]

@@ -6,6 +6,7 @@ no snapshots, mirroring the document-features and tone tests.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -106,7 +107,7 @@ def _row(frame: pl.DataFrame, document_id: str) -> dict[str, object]:
     return rows[0]
 
 
-def _rows(frame: pl.DataFrame, document_id: str) -> list[dict[str, object]]:
+def _rows(frame: pl.DataFrame, document_id: str) -> list[dict[str, Any]]:
     return frame.filter(pl.col("document_id") == document_id).to_dicts()
 
 

@@ -134,13 +134,13 @@ def test_query_parameters_type_inference() -> None:
 # ─── client interactions against a fake ─────────────────────────────────────
 
 
-class _FakeRow(tuple):
+class _FakeRow(tuple[Any, ...]):
     def values(self) -> tuple[Any, ...]:
         return tuple(self)
 
 
 class _FakeJob:
-    def __init__(self, rows: list[tuple] | None = None, affected: int | None = None):
+    def __init__(self, rows: list[tuple[Any, ...]] | None = None, affected: int | None = None):
         self._rows = [_FakeRow(r) for r in (rows or [])]
         self.num_dml_affected_rows = affected
         self.result_timeout: Any = "unset"
@@ -1615,7 +1615,7 @@ def test_integration_iceberg_round_trip() -> None:
         {
             "table_format": "iceberg",
             "connection": _BQ_ICEBERG_CONNECTION,
-            "storage_uri": f"{_BQ_ICEBERG_STORAGE_URI.rstrip('/')}/{dataset}",
+            "storage_uri": f"{(_BQ_ICEBERG_STORAGE_URI or '').rstrip('/')}/{dataset}",
         },
         model_name="docs",
     )
@@ -1869,7 +1869,7 @@ def test_credentials_service_account_json_scopes_and_quota(
             captured["quota_project"] = qp
             return self
 
-    def fake_from_info(info: dict, scopes: Any = None) -> _FakeCreds:
+    def fake_from_info(info: dict[str, Any], scopes: Any = None) -> _FakeCreds:
         captured["info"] = info
         captured["scopes"] = scopes
         return _FakeCreds()
@@ -2054,7 +2054,7 @@ def test_credentials_impersonation_wraps_source(
 
     class _FakeImpersonated:
         def __init__(
-            self, source_credentials: Any, target_principal: str, target_scopes: list
+            self, source_credentials: Any, target_principal: str, target_scopes: list[Any]
         ) -> None:
             captured["source"] = source_credentials
             captured["principal"] = target_principal
@@ -2122,6 +2122,7 @@ def test_environment_keyfile_resolves_relative_to_project_at_sdk_boundary(
 def test_default_job_config_priority_and_cost_cap() -> None:
     adapter = _adapter(priority="batch", maximum_bytes_billed=10**9)
     job_config = adapter._default_job_config()
+    assert job_config is not None
     assert job_config.priority == "BATCH"
     assert job_config.maximum_bytes_billed == 10**9
 

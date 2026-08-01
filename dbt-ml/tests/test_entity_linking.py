@@ -15,6 +15,7 @@ from dbt_ml.text import (
     ALIAS_RESOLVER_VERSION,
     FUZZY_RESOLVER_VERSION,
     VECTOR_SIMILARITY_RESOLVER_VERSION,
+    FuzzyResolverOptions,
     alias_set_fingerprint,
     normalize_alias_text,
     parse_entity_link_options,
@@ -1019,6 +1020,7 @@ def test_fuzzy_threshold_accepts_integer_but_not_bool_or_string() -> None:
     parsed = parse_entity_link_options(
         {**_BASE_OPTIONS, "resolver": "fuzzy", "threshold": 1}
     )
+    assert isinstance(parsed, FuzzyResolverOptions)
     assert parsed.threshold == 1.0
     assert isinstance(parsed.threshold, float)
 

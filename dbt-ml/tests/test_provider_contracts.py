@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -678,7 +678,7 @@ def test_credentials_are_explicit_and_redacted(
     assert unsafe_env_name not in str(reference_exc_info.value)
 
     with pytest.raises(TypeError):
-        ProviderCredential("LEGACY_ENV_NAME", secret)
+        cast(Any, ProviderCredential)("LEGACY_ENV_NAME", secret)
     assert not hasattr(credential, "env_var")
     assert PROVIDER_CONTRACT_VERSION == 3
 
@@ -743,7 +743,7 @@ def test_request_error_rejects_unsafe_provider_error_text() -> None:
             "test",
             "inference",
             code="safe",
-            retryable=1,  # type: ignore[arg-type]
+            retryable=cast(Any, 1),
         )
 
 
@@ -780,7 +780,7 @@ def test_provider_boundary_replaces_unsafe_provider_error_text() -> None:
     with pytest.raises(ValueError, match="safe_for_display must be boolean"):
         ProviderResponseError(
             "must remain unsafe",
-            safe_for_display="false",  # type: ignore[arg-type]
+            safe_for_display=cast(Any, "false"),
         )
 
 

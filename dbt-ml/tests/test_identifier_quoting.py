@@ -7,6 +7,7 @@ safely quoted wherever they reach SQL.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -80,7 +81,7 @@ def test_schema_tests_with_reserved_column(tmp_path: Path) -> None:
         )
         table_ref = adapter.table_ref("order")
 
-        def run(spec: object) -> list:
+        def run(spec: object) -> list[Any]:
             return evaluate_test_spec(
                 spec, model_name="order", table_ref=table_ref, adapter=adapter
             )

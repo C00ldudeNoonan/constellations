@@ -238,6 +238,7 @@ def test_code_version_changes_with_prompt_and_provider(tmp_path: Any) -> None:
     facts = next(m for m in models if m.name == "facts")
     base = compute_model_code_version(facts, proj, project, resolved=resolved)
 
+    assert facts.llm is not None
     changed_prompt = facts.model_copy(
         update={"llm": facts.llm.model_copy(update={"prompt": "different"})}
     )

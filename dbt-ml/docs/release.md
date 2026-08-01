@@ -31,7 +31,6 @@ move the secret there as an environment secret.
    uv run pip-audit --skip-editable
    uv run ruff check
    uv run ty check
-   uv run mypy
    uv run pytest -q
    uv build
    ```

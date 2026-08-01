@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -605,15 +606,15 @@ def test_adapter_test_reset_deletes_duckdb_file(tmp_path: Path) -> None:
     cfg = _wh(tmp_path / "t.duckdb")
     with create_adapter(cfg) as adapter:
         adapter.materialize_full("x", pl.DataFrame({"a": [1]}))
-    adapter2 = create_adapter(cfg)
+    adapter2: Any = create_adapter(cfg)
     assert hasattr(adapter2, "_reset_storage_for_test")
-    out = adapter2._reset_storage_for_test()  # type: ignore[attr-defined]
+    out = adapter2._reset_storage_for_test()
     assert "t.duckdb" in out
     assert not (tmp_path / "t.duckdb").exists()
 
 
 def test_outside_context_raises(tmp_path: Path) -> None:
-    adapter = create_adapter(_wh(tmp_path / "t.duckdb"))
+    adapter: Any = create_adapter(_wh(tmp_path / "t.duckdb"))
     with pytest.raises(AdapterError):
         adapter.connection  # noqa: B018
 

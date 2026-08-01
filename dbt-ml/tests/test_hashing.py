@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -97,9 +98,9 @@ def test_fingerprint_domain_version_and_value_are_separate_inputs() -> None:
         ({"domain": "chunk-input", "digest_size": 65}, "digest_size"),
     ],
 )
-def test_fingerprint_rejects_invalid_framing(kwargs: dict[str, object], message: str) -> None:
+def test_fingerprint_rejects_invalid_framing(kwargs: dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        canonical_fingerprint("value", **kwargs)  # type: ignore[arg-type]
+        canonical_fingerprint("value", **kwargs)
 
 
 def test_unsupported_values_fail_closed() -> None:

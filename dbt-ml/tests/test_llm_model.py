@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -67,7 +68,7 @@ def _project(
     return project
 
 
-def _rows(project: Path, sql: str) -> list[tuple]:
+def _rows(project: Path, sql: str) -> list[tuple[Any, ...]]:
     connection = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
     try:
         return connection.execute(sql).fetchall()

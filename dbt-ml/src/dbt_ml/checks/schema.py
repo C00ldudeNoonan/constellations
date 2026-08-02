@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 import re
 from collections import Counter
@@ -150,6 +151,8 @@ def _run_named_test(
         return [_cardinality(model_name, table_ref, adapter, arg)]
     if test_name == "outlier_rate":
         return [_outlier_rate(model_name, table_ref, adapter, arg, store_failures)]
+    if test_name == "drift":
+        return [_drift(model_name, table_ref, adapter, arg)]
     raise UnknownTestError(
         f"Unknown test '{test_name}'. Supported: {sorted(SUPPORTED_TESTS)}"
     )
@@ -1127,6 +1130,189 @@ def _outlier_rate(
         failing = [x is not None and _is_outlier(float(x)) for x in parsed]
         _store_failing_rows(adapter, model_name, "outlier_rate", column, frame, failing, result)
     return result
+
+
+# ─── run-over-run drift (issue #10) ────────────────────────────────────────
+
+
+def _drift_column(
+    adapter: WarehouseAdapter, table_ref: str, column: str
+) -> tuple[bool, list[Any]]:
+    """Read `column` and return (is_numeric, non-null values). Numeric values are
+    floats (finite only); everything else is returned as-is for categorical
+    comparison."""
+    schema = adapter.query_df(f"SELECT * FROM {table_ref} LIMIT 0")
+    if column not in schema.columns:
+        raise UnknownTestError(
+            f"drift column '{column}' not found in {table_ref}; "
+            f"got: {sorted(schema.columns)}"
+        )
+    numeric = schema.schema[column].is_numeric()
+    raw = adapter.query_df(
+        f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
+    )["v"].to_list()
+    if numeric:
+        values = [float(x) for x in raw if x is not None and _is_finite_number(x)]
+    else:
+        values = [x for x in raw if x is not None]
+    return numeric, values
+
+
+def _quantile_bin_edges(baseline: list[float], bins: int) -> list[float]:
+    """Ascending, de-duplicated bin edges at `bins` equal-mass quantiles of the
+    baseline — so PSI/JS bins are stable and populated on the reference run."""
+    ordered = sorted(baseline)
+    edges: list[float] = []
+    for i in range(bins + 1):
+        edge = _percentile(ordered, i / bins)
+        if not edges or edge > edges[-1]:
+            edges.append(edge)
+    return edges
+
+
+def _bin_proportions(values: list[float], edges: list[float]) -> list[float]:
+    n_bins = len(edges) - 1
+    if n_bins <= 0 or not values:
+        return [1.0]  # degenerate (single-valued baseline): one bin holds all mass
+    counts = [0] * n_bins
+    for value in values:
+        index = bisect.bisect_right(edges, value) - 1
+        counts[min(max(index, 0), n_bins - 1)] += 1
+    total = len(values)
+    return [c / total for c in counts]
+
+
+def _around_proportions(values: list[float], pivot: float) -> list[float]:
+    """Proportions in three bins — below / equal to / above `pivot` — used when a
+    constant baseline collapses quantile bins, so a shift away from the constant
+    still registers as drift."""
+    below = sum(1 for v in values if v < pivot)
+    above = sum(1 for v in values if v > pivot)
+    total = len(values)
+    equal = total - below - above
+    return [below / total, equal / total, above / total]
+
+
+def _category_proportions(values: list[Any], categories: list[Any]) -> list[float]:
+    counts = Counter(values)
+    total = len(values)
+    return [counts.get(category, 0) / total for category in categories]
+
+
+def _psi(current: list[float], baseline: list[float]) -> float:
+    """Population Stability Index with additive smoothing so empty bins do not
+    blow up the log ratio."""
+    eps = 1e-6
+    return math.fsum(
+        (c - b) * math.log((c + eps) / (b + eps))
+        for c, b in zip(current, baseline, strict=True)
+    )
+
+
+def _jensen_shannon(current: list[float], baseline: list[float]) -> float:
+    """Jensen-Shannon divergence in bits, so the value (and threshold) sits in
+    [0, 1]."""
+    mid = [(c + b) / 2 for c, b in zip(current, baseline, strict=True)]
+
+    def _kl(p: list[float], q: list[float]) -> float:
+        return math.fsum(
+            pi * math.log2(pi / qi) for pi, qi in zip(p, q, strict=True) if pi > 0
+        )
+
+    return 0.5 * _kl(current, mid) + 0.5 * _kl(baseline, mid)
+
+
+def _ks_statistic(current: list[float], baseline: list[float]) -> float:
+    """Two-sample Kolmogorov-Smirnov statistic: max gap between the empirical
+    CDFs."""
+    ca, cb = sorted(current), sorted(baseline)
+    na, nb = len(ca), len(cb)
+    gap = 0.0
+    for value in sorted(set(ca) | set(cb)):
+        fa = bisect.bisect_right(ca, value) / na
+        fb = bisect.bisect_right(cb, value) / nb
+        gap = max(gap, abs(fa - fb))
+    return gap
+
+
+def _drift(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any
+) -> TestResult:
+    """Distribution drift of `column` against the same field in a baseline model
+    (`to: ref('baseline')`), by `metric`: `psi` (default), `ks` (numeric only),
+    or `jensen_shannon`. Fails when the divergence exceeds `max`.
+
+    The baseline is an ordinary model you snapshot and reference — an explicit,
+    git-reviewable run-over-run comparison rather than an implicit last-run store.
+    """
+    from ..dag import parse_ref
+
+    opts = _require_dict("drift", arg)
+    column = opts["column"]
+    field = opts.get("field", column)
+    metric = opts.get("metric", "psi")
+    max_value = float(opts["max"])
+    bins = int(opts.get("bins", 10))
+
+    baseline_name = parse_ref(str(opts["to"]))
+    baseline_ref = adapter.table_ref(baseline_name)
+    cur_numeric, current = _drift_column(adapter, table_ref, column)
+    base_numeric, baseline = _drift_column(adapter, baseline_ref, field)
+
+    if cur_numeric != base_numeric:
+        return TestResult(
+            test_name="drift", model_name=model_name, column=column, status="fail",
+            message=(
+                f"'{column}' and baseline '{baseline_name}.{field}' must both be "
+                "numeric or both categorical"
+            ),
+        )
+    if not current or not baseline:
+        return _pass(
+            "drift", model_name, column,
+            f"insufficient data (current {len(current)}, baseline {len(baseline)})",
+        )
+    if metric == "ks" and not cur_numeric:
+        return TestResult(
+            test_name="drift", model_name=model_name, column=column, status="fail",
+            message="metric 'ks' requires numeric columns",
+        )
+
+    if cur_numeric:
+        if metric == "ks":
+            value = _ks_statistic(current, baseline)
+        else:
+            edges = _quantile_bin_edges(baseline, bins)
+            if len(edges) < 2:
+                # Constant baseline: quantile bins collapse to a point, so split
+                # the axis around that value to still detect a shift away from it.
+                pivot = edges[0] if edges else baseline[0]
+                cur_p = _around_proportions(current, pivot)
+                base_p = _around_proportions(baseline, pivot)
+            else:
+                cur_p = _bin_proportions(current, edges)
+                base_p = _bin_proportions(baseline, edges)
+            value = _psi(cur_p, base_p) if metric == "psi" else _jensen_shannon(cur_p, base_p)
+    else:
+        try:
+            categories = sorted(set(current) | set(baseline), key=str)
+        except TypeError as e:
+            raise UnknownTestError(
+                f"drift on non-numeric column '{column}' requires scalar values, but "
+                "it holds unhashable (list/struct) values"
+            ) from e
+        cur_p = _category_proportions(current, categories)
+        base_p = _category_proportions(baseline, categories)
+        value = _psi(cur_p, base_p) if metric == "psi" else _jensen_shannon(cur_p, base_p)
+
+    ok = value <= max_value
+    return TestResult(
+        test_name="drift",
+        model_name=model_name,
+        column=column,
+        status="pass" if ok else "fail",
+        message=f"{metric}={value:.4g} vs {baseline_name}.{field} (max {max_value:g})",
+    )
 
 
 def _fuzzy_contains(needle: str, haystack: str, min_score: float) -> bool:

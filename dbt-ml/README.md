@@ -1804,9 +1804,32 @@ tests:
 `column_stat` and `outlier_rate` operate on a numeric column (nulls and
 non-finite values are skipped; a non-numeric column fails with an actionable
 message). `outlier_rate` reads only the target column and supports
-`--store-failures`. Run-over-run baselines and drift metrics (PSI / KS /
-chi-squared) are tracked as follow-ups in
-[issue #10](https://github.com/C00ldudeNoonan/dbt-ml/issues/10).
+`--store-failures`.
+
+**Drift checks** (run-over-run distribution change against a baseline model):
+
+```yaml
+tests:
+  # distribution of `n_authors` vs the same field in a snapshot you maintain
+  - drift: { column: n_authors, to: ref('papers_baseline'), metric: psi, max: 0.2 }
+  - drift: { column: score, to: ref('scores_baseline'), metric: ks, max: 0.1 }
+  # categorical proportion drift; `field` maps to a differently-named baseline col
+  - drift:
+      column: primary_category
+      to: ref('papers_baseline')
+      field: category
+      metric: jensen_shannon
+      max: 0.05
+```
+
+The baseline is an **ordinary model you snapshot and `ref()`** — an explicit,
+git-reviewable run-over-run comparison, not an implicit last-run store — and
+dbt-ml builds it before the check (same dependency path as `relationships`).
+`metric` is `psi` (default), `ks` (numeric only), or `jensen_shannon`; numeric
+columns are compared over baseline-quantile bins (`bins`, default 10) and
+categoricals over their value proportions. The check fails when the divergence
+exceeds `max`. Chi-squared and an optional sampled LLM-judge tier remain tracked
+in [issue #10](https://github.com/C00ldudeNoonan/dbt-ml/issues/10).
 
 **Embedding-quality checks** (deterministic, over the vector column of an
 `embed` model — no provider call):

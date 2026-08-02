@@ -120,6 +120,27 @@ def test_empty_baseline_is_insufficient_data(adapter: WarehouseAdapter) -> None:
     assert "insufficient data" in r.message
 
 
+# ─── chi_squared ─────────────────────────────────────────────────────────────
+
+
+def test_chi_squared_zero_for_identical(adapter: WarehouseAdapter) -> None:
+    frame = pl.DataFrame({"c": ["a", "a", "b", "b"]})
+    _materialize(adapter, "baseline", frame)
+    _materialize(adapter, "current", frame)
+    r = _drift(adapter, "current", {"column": "c", "to": "ref('baseline')",
+                                    "metric": "chi_squared", "max": 0.001})
+    assert r.status == "pass"
+    assert "chi_squared=0" in r.message
+
+
+def test_chi_squared_trips_on_categorical_shift(adapter: WarehouseAdapter) -> None:
+    _materialize(adapter, "baseline", pl.DataFrame({"c": ["a", "a", "a", "b", "b"]}))
+    _materialize(adapter, "current", pl.DataFrame({"c": ["a", "b", "b", "b", "b"]}))
+    r = _drift(adapter, "current", {"column": "c", "to": "ref('baseline')",
+                                    "metric": "chi_squared", "max": 1.0})
+    assert r.status == "fail"
+
+
 # ─── robustness (Codex review) ───────────────────────────────────────────────
 
 

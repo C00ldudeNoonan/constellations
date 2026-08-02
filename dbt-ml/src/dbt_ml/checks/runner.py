@@ -3,11 +3,40 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..adapters import WarehouseAdapter, WarehouseCapability, create_adapter
+from ..budget import BudgetLedger
 from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import load_project
 from ..config.model import ModelConfig
-from ..profile import resolve_profile
+from ..profile import ResolvedProfile, resolve_profile
+from ..test_specs import uses_llm_judge
 from .schema import TestResult, UnknownTestError, evaluate_test_spec
+
+
+def validate_test_requirements(
+    models: list[ModelConfig], resolved: ResolvedProfile
+) -> None:
+    """Preflight: fail before discovery/build/materialization when a selected
+    model declares an `llm_judge` test but no `llm:` profile is configured."""
+    if resolved.llm is not None:
+        return
+    offenders = sorted(
+        model.name
+        for model in models
+        if model.tests and uses_llm_judge(model.tests)
+    )
+    if offenders:
+        raise UnknownTestError(
+            f"models {offenders} declare an `llm_judge` test but no `llm:` profile "
+            "is configured; add an `llm:` block to the active profile"
+        )
+
+
+def _test_run_budget(resolved: ResolvedProfile) -> BudgetLedger | None:
+    """One run-scope budget ledger shared across every model's tests, so
+    `llm_judge` calls honor `llm.budget` caps just like `llm:` models."""
+    if resolved.llm is None or resolved.llm.budget is None:
+        return None
+    return BudgetLedger(resolved.llm.budget, scope="run")
 
 
 def run_project_tests(
@@ -40,10 +69,10 @@ def run_project_tests(
     selected_names = set(
         dag.select_models(select=select, exclude=exclude, modified=modified)
     )
-    validate_warehouse_capabilities(
-        [model for model in models if model.name in selected_names],
-        resolved.warehouse.type,
-    )
+    selected = [model for model in models if model.name in selected_names]
+    validate_warehouse_capabilities(selected, resolved.warehouse.type)
+    validate_test_requirements(selected, resolved)
+    run_budget = _test_run_budget(resolved)
 
     results: list[TestResult] = []
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
@@ -56,6 +85,8 @@ def run_project_tests(
                 run_model_tests(
                     model, adapter, project_dir=project_dir,
                     store_failures=store_failures,
+                    resolved=resolved,
+                    run_budget=run_budget,
                 )
             )
     return results
@@ -67,6 +98,8 @@ def run_model_tests(
     *,
     project_dir: Path | None = None,
     store_failures: bool = False,
+    resolved: ResolvedProfile | None = None,
+    run_budget: BudgetLedger | None = None,
 ) -> list[TestResult]:
     if not model.tests:
         return []
@@ -101,6 +134,8 @@ def run_model_tests(
                     adapter=adapter,
                     project_dir=project_dir,
                     store_failures=store_failures,
+                    resolved=resolved,
+                    run_budget=run_budget,
                 )
             )
         except UnknownTestError as e:

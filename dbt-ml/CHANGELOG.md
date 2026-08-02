@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Complete the data-quality checks: chi-squared, golden sets, LLM-judge (issue #10)
+
+- `drift` gains a `chi_squared` metric (Pearson goodness-of-fit statistic of the
+  current counts against the baseline-expected counts). Unlike the bounded
+  PSI/KS/JS metrics it scales with sample size, so its `max` is calibrated per
+  corpus.
+- Added the `golden` test type: compare a model's rows to a checked-in golden
+  model referenced by `to: ref(...)`, joined on `key`, with optional per-column
+  numeric `tolerance` and an `exhaustive` flag (fail on unexpected extra rows).
+  Missing golden keys and column mismatches fail; `--store-failures` persists the
+  offending keys and which columns diverged. The golden model is an ordinary
+  model built first as a DAG dependency (same path as `relationships`).
+- Added the optional `llm_judge` test type: samples up to `sample_size` rows
+  (deterministically by `seed` — a stable sort precedes sampling so warehouse row
+  order cannot change the sample), asks the profile's `llm:` provider whether each
+  `column` value meets `criterion` (structured boolean verdict via the shared
+  inference path), and fails when the pass rate falls below `min_pass_rate`. It is
+  a sampled escape hatch for subjective quality, not a deterministic gate. The
+  test runner threads the resolved profile and run budget through `build` and
+  `test`, so judge calls honor `llm.provider_options` and the run-wide
+  `llm.budget` caps just like `llm:` models, and a project declaring `llm_judge`
+  without an `llm:` profile fails preflight before any model is built.
+- `golden` numeric `tolerance` now also covers `DECIMAL`/`NUMERIC` columns, and
+  duplicate keys are surfaced (a golden-side duplicate errors; model-side
+  duplicates fail the check) rather than silently collapsing.
+- With these, #10's deterministic distribution/embedding/golden checks are
+  complete; only provider-specific extensions remain.
+
 ### Run-over-run drift checks (issue #10)
 
 - Added a `drift` test type: compares a column's distribution against the same

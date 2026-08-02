@@ -1825,11 +1825,54 @@ tests:
 The baseline is an **ordinary model you snapshot and `ref()`** — an explicit,
 git-reviewable run-over-run comparison, not an implicit last-run store — and
 dbt-ml builds it before the check (same dependency path as `relationships`).
-`metric` is `psi` (default), `ks` (numeric only), or `jensen_shannon`; numeric
-columns are compared over baseline-quantile bins (`bins`, default 10) and
-categoricals over their value proportions. The check fails when the divergence
-exceeds `max`. Chi-squared and an optional sampled LLM-judge tier remain tracked
-in [issue #10](https://github.com/C00ldudeNoonan/dbt-ml/issues/10).
+`metric` is `psi` (default), `ks` (numeric only), `jensen_shannon`, or
+`chi_squared`; numeric columns are compared over baseline-quantile bins
+(`bins`, default 10) and categoricals over their value proportions. The check
+fails when the divergence exceeds `max`. (Note `chi_squared` is a raw statistic
+that scales with sample size, so calibrate its `max` per corpus, unlike the
+bounded PSI/KS/JS.)
+
+**Golden-set checks** (compare a model to checked-in expected rows):
+
+```yaml
+tests:
+  - golden:
+      to: ref('extractions_golden')   # a model holding the expected output rows
+      key: invoice_id                 # join key present in both
+      columns: [vendor, total]        # default: all shared non-key columns
+      tolerance: { total: 0.01 }      # per-column absolute numeric tolerance
+      exhaustive: false               # true also fails on unexpected extra rows
+```
+
+The golden model is an ordinary model you `ref()` (a seed or a snapshot),
+reviewable in git and built first as a dependency. Every golden key must appear
+in the model and match each compared column exactly (or within `tolerance`);
+`--store-failures` persists the offending keys and which columns diverged.
+
+**LLM-judge check** (optional, sampled — the subjective escape hatch):
+
+```yaml
+tests:
+  - llm_judge:
+      column: summary
+      criterion: "is a faithful, single-sentence summary of the source"
+      sample_size: 20            # rows sampled per run (deterministic by `seed`)
+      seed: 0
+      min_pass_rate: 0.95        # fail if fewer than 95% of sampled rows pass
+```
+
+`llm_judge` samples rows deterministically (a stable sort before seeded
+sampling, so the same `seed` selects the same rows regardless of warehouse row
+order), asks the profile's `llm:` provider whether each `column` value meets
+`criterion` (structured boolean verdict via the shared #144 inference path), and
+fails when the pass rate drops below `min_pass_rate`. It honors the same
+`llm.provider_options` and `llm.budget` caps as `llm:` models — each judge call
+is charged to the run budget and stops at the run-wide `max_api_calls` /
+`max_cost_usd`, and a project that declares `llm_judge` without an `llm:` profile
+fails preflight before any model is built. It is a sampled, cost-bounded escape
+hatch for subjective qualities — not a deterministic CI gate — so keep it off the
+critical path and prefer the deterministic checks above. Tests run against the
+offline `deterministic` provider.
 
 **Embedding-quality checks** (deterministic, over the vector column of an
 `embed` model — no provider call):

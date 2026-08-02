@@ -92,6 +92,18 @@ def test_missing_column_fails_actionably(adapter: WarehouseAdapter) -> None:
         _judge(adapter, {"column": "nope", "criterion": "x"}, llm=_det())
 
 
+def test_provider_error_becomes_failed_check_not_crash(adapter: WarehouseAdapter) -> None:
+    # An unknown provider must fail the check (ProviderError caught), not abort
+    # the whole test run.
+    r = _judge(
+        adapter,
+        {"column": "body", "criterion": "x", "sample_size": 2, "min_pass_rate": 0.0},
+        llm=LLMConfig(provider="no_such_provider"),
+    )
+    assert r.status == "fail"
+    assert "could not run" in r.message
+
+
 def test_empty_text_passes_without_calls(adapter: WarehouseAdapter) -> None:
     adapter.materialize_full(
         "docs", pl.DataFrame({"body": [None, "  "]}, schema={"body": pl.String})

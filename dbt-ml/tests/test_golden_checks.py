@@ -135,6 +135,15 @@ def test_missing_key_column_fails_actionably(adapter: WarehouseAdapter) -> None:
         _golden(adapter, _GOLDEN.rename({"id": "other"}), {})
 
 
+def test_nonscalar_key_column_fails_without_crashing(adapter: WarehouseAdapter) -> None:
+    frame = pl.DataFrame(
+        {"id": [["a"], ["b"]], "v": [1, 2]}, schema={"id": pl.List(pl.String), "v": pl.Int64}
+    )
+    adapter.materialize_full("golden", frame)
+    with pytest.raises(SpecError, match="unhashable"):
+        _golden(adapter, frame, {})
+
+
 def test_golden_target_is_a_dag_dependency() -> None:
     targets = relationship_test_targets(
         [{"golden": {"to": "ref('expected_snapshot')", "key": "id"}}]

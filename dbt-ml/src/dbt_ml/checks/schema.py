@@ -1405,21 +1405,28 @@ def _golden(
     # A golden set is keyed, so duplicate keys make the comparison ambiguous.
     # Golden-side duplicates are a data error; model-side duplicates are a real
     # failure (silently keeping the last row would hide extra/conflicting rows).
-    golden_key_counts = Counter(grow[key] for grow in golden.iter_rows(named=True))
+    # A non-scalar key column is unhashable — surface that as a failed check
+    # rather than an uncaught TypeError that aborts the whole test run.
+    try:
+        golden_key_counts = Counter(grow[key] for grow in golden.iter_rows(named=True))
+        actual_rows: dict[Any, dict[str, Any]] = {}
+        duplicate_actual: list[Any] = []
+        for row in actual.iter_rows(named=True):
+            k = row[key]
+            if k in actual_rows:
+                duplicate_actual.append(k)
+            actual_rows[k] = row
+    except TypeError as e:
+        raise UnknownTestError(
+            f"golden test key '{key}' must be a scalar column, but it holds "
+            "unhashable (list/struct) values"
+        ) from e
     golden_dupes = sorted(str(k) for k, c in golden_key_counts.items() if c > 1)
     if golden_dupes:
         raise UnknownTestError(
             f"golden model '{golden_name}' has duplicate '{key}' values: "
             f"{golden_dupes[:5]}"
         )
-
-    actual_rows: dict[Any, dict[str, Any]] = {}
-    duplicate_actual: list[Any] = []
-    for row in actual.iter_rows(named=True):
-        k = row[key]
-        if k in actual_rows:
-            duplicate_actual.append(k)
-        actual_rows[k] = row
 
     failures: list[dict[str, Any]] = []
     missing_keys = 0
@@ -1541,19 +1548,6 @@ def _llm_judge(
 
     llm = resolved.llm
     provider_options = llm.provider_options or None
-    provider_instance = get_inference_provider(
-        llm.provider, profile_options=provider_options
-    ) if provider_options else get_inference_provider(llm.provider)
-    guard = (
-        BudgetGuard(
-            None, run_budget,
-            cost_estimator=budget_cost_estimator(
-                resolved, batch=False, provider=provider_instance
-            ),
-        )
-        if run_budget is not None
-        else None
-    )
     system = f"{_LLM_JUDGE_SYSTEM}\n\nCriterion: {criterion}"
     fields_spec = [
         {"name": "passes", "type": "boolean",
@@ -1562,7 +1556,26 @@ def _llm_judge(
     ]
     passed = 0
     judged = 0
+    # Provider construction, credential resolution, and each call are all inside
+    # the try: a provider/credential/config error becomes a failed check rather
+    # than an uncaught exception that aborts the whole test run.
     try:
+        guard = (
+            BudgetGuard(
+                None, run_budget,
+                cost_estimator=budget_cost_estimator(
+                    resolved,
+                    batch=False,
+                    provider=(
+                        get_inference_provider(llm.provider, profile_options=provider_options)
+                        if provider_options
+                        else get_inference_provider(llm.provider)
+                    ),
+                ),
+            )
+            if run_budget is not None
+            else None
+        )
         for text in sample:
             if guard is not None:
                 guard.ensure_headroom()
@@ -1589,10 +1602,10 @@ def _llm_judge(
             status="fail",
             message=f"run budget exceeded after {judged} judge call(s): {e}",
         )
-    except ProviderError as e:
+    except (ProviderError, ValueError) as e:
         return TestResult(
             test_name="llm_judge", model_name=model_name, column=column,
-            status="fail", message=f"llm_judge could not reach the provider: {e}",
+            status="fail", message=f"llm_judge could not run: {e}",
         )
 
     rate = passed / len(sample)

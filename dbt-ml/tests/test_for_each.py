@@ -239,7 +239,11 @@ def test_partial_placeholder_produces_string() -> None:
         assert v.ml.artifact is not None
     # Compare via as_posix() — a Path's str() is OS-dependent (backslashes on
     # Windows), while POSIX is the config's canonical serialized form.
-    paths = [v.ml.artifact.path.as_posix() for v in variants if v.ml and v.ml.artifact]  # type: ignore[union-attr]
+    paths = [
+        v.ml.artifact.path.as_posix()
+        for v in variants
+        if v.ml and v.ml.artifact and v.ml.artifact.path is not None
+    ]
     assert paths == [
         "target/artifacts/feat_model_small",
         "target/artifacts/feat_model_large",

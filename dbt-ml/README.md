@@ -1861,12 +1861,18 @@ tests:
       min_pass_rate: 0.95        # fail if fewer than 95% of sampled rows pass
 ```
 
-`llm_judge` samples rows deterministically, asks the profile's `llm:` provider
-whether each `column` value meets `criterion` (structured boolean verdict via the
-#144 path), and fails when the pass rate drops below `min_pass_rate`. It is a
-sampled, cost-bounded escape hatch for subjective qualities — not a deterministic
-CI gate — so keep it off the critical path and prefer the deterministic checks
-above. Tests run against the offline `deterministic` provider.
+`llm_judge` samples rows deterministically (a stable sort before seeded
+sampling, so the same `seed` selects the same rows regardless of warehouse row
+order), asks the profile's `llm:` provider whether each `column` value meets
+`criterion` (structured boolean verdict via the shared #144 inference path), and
+fails when the pass rate drops below `min_pass_rate`. It honors the same
+`llm.provider_options` and `llm.budget` caps as `llm:` models — each judge call
+is charged to the run budget and stops at the run-wide `max_api_calls` /
+`max_cost_usd`, and a project that declares `llm_judge` without an `llm:` profile
+fails preflight before any model is built. It is a sampled, cost-bounded escape
+hatch for subjective qualities — not a deterministic CI gate — so keep it off the
+critical path and prefer the deterministic checks above. Tests run against the
+offline `deterministic` provider.
 
 **Embedding-quality checks** (deterministic, over the vector column of an
 `embed` model — no provider call):

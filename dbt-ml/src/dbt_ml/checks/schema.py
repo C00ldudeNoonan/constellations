@@ -14,6 +14,7 @@ import polars as pl
 from ..adapters import WarehouseAdapter
 
 if TYPE_CHECKING:
+    from ..budget import BudgetLedger
     from ..profile import ResolvedProfile
 from ..test_specs import (
     SUPPORTED_TESTS,
@@ -57,6 +58,7 @@ def evaluate_test_spec(
     project_dir: Path | None = None,
     store_failures: bool = False,
     resolved: ResolvedProfile | None = None,
+    run_budget: BudgetLedger | None = None,
 ) -> list[TestResult]:
     """Parse one test spec and run it.
 
@@ -80,6 +82,7 @@ def evaluate_test_spec(
             project_dir,
             store_failures,
             resolved,
+            run_budget,
         ),
         parsed.severity,
     )
@@ -115,6 +118,7 @@ def _run_named_test(
     project_dir: Path | None,
     store_failures: bool = False,
     resolved: ResolvedProfile | None = None,
+    run_budget: BudgetLedger | None = None,
 ) -> list[TestResult]:
     if test_name == "not_null":
         return _not_null(model_name, table_ref, adapter, arg, store_failures)
@@ -162,7 +166,7 @@ def _run_named_test(
     if test_name == "golden":
         return [_golden(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "llm_judge":
-        return [_llm_judge(model_name, table_ref, adapter, arg, resolved)]
+        return [_llm_judge(model_name, table_ref, adapter, arg, resolved, run_budget)]
     raise UnknownTestError(
         f"Unknown test '{test_name}'. Supported: {sorted(SUPPORTED_TESTS)}"
     )
@@ -1348,10 +1352,13 @@ def _drift(
 # ─── golden sets (issue #10) ───────────────────────────────────────────────
 
 
+def _numeric_for_tolerance(value: Any) -> bool:
+    # int/float/Decimal are comparable within a tolerance; bool is not a measure.
+    return isinstance(value, int | float | Decimal) and not isinstance(value, bool)
+
+
 def _values_match(actual: Any, expected: Any, tol: float | None) -> bool:
-    if tol is not None and isinstance(actual, int | float) and isinstance(expected, int | float):
-        if isinstance(actual, bool) or isinstance(expected, bool):
-            return actual == expected
+    if tol is not None and _numeric_for_tolerance(actual) and _numeric_for_tolerance(expected):
         return abs(float(actual) - float(expected)) <= tol
     return actual == expected
 
@@ -1395,10 +1402,31 @@ def _golden(
             )
         compared = list(configured)
 
-    actual_rows = {row[key]: row for row in actual.iter_rows(named=True)}
+    # A golden set is keyed, so duplicate keys make the comparison ambiguous.
+    # Golden-side duplicates are a data error; model-side duplicates are a real
+    # failure (silently keeping the last row would hide extra/conflicting rows).
+    golden_key_counts = Counter(grow[key] for grow in golden.iter_rows(named=True))
+    golden_dupes = sorted(str(k) for k, c in golden_key_counts.items() if c > 1)
+    if golden_dupes:
+        raise UnknownTestError(
+            f"golden model '{golden_name}' has duplicate '{key}' values: "
+            f"{golden_dupes[:5]}"
+        )
+
+    actual_rows: dict[Any, dict[str, Any]] = {}
+    duplicate_actual: list[Any] = []
+    for row in actual.iter_rows(named=True):
+        k = row[key]
+        if k in actual_rows:
+            duplicate_actual.append(k)
+        actual_rows[k] = row
+
     failures: list[dict[str, Any]] = []
     missing_keys = 0
     mismatched = 0
+    duplicate_keys = len(set(duplicate_actual))
+    for k in sorted({str(k) for k in duplicate_actual}):
+        failures.append({"key": k, "issue": "duplicate_in_model"})
     for grow in golden.iter_rows(named=True):
         k = grow[key]
         arow = actual_rows.get(k)
@@ -1427,6 +1455,8 @@ def _golden(
         problems.append(f"{missing_keys} missing")
     if mismatched:
         problems.append(f"{mismatched} mismatched")
+    if duplicate_keys:
+        problems.append(f"{duplicate_keys} duplicate keys")
     if extra_keys:
         problems.append(f"{extra_keys} unexpected")
     ok = not problems
@@ -1462,16 +1492,24 @@ _LLM_JUDGE_SYSTEM = (
 def _llm_judge(
     model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
     resolved: ResolvedProfile | None,
+    run_budget: BudgetLedger | None = None,
 ) -> TestResult:
     """Optional, sampled LLM-as-judge for subjective qualities. Samples up to
     `sample_size` rows (deterministically by `seed`), asks the profile's LLM
     whether each `column` value satisfies `criterion`, and fails when the pass
     rate falls below `min_pass_rate`. This is a sampled escape hatch, not a
     deterministic CI gate — keep sample sizes and cost bounded.
+
+    Routes through the shared usage-accounting inference path and charges the
+    run budget ledger (honoring `llm.budget` / `llm.provider_options`), so judge
+    calls respect the same caps and provider configuration as `llm:` models.
     """
     import random
 
-    from ..backends.llm_backend import extract_fields_from_text
+    from ..backends.llm_backend import extract_fields_with_usage
+    from ..budget import BudgetExceededError, BudgetGuard
+    from ..execution.cost import budget_cost_estimator
+    from ..providers import get_inference_provider
     from ..providers.base import ProviderError
 
     opts = _require_dict("llm_judge", arg)
@@ -1493,13 +1531,29 @@ def _llm_judge(
     raw = adapter.query_df(
         f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
     )["v"].to_list()
-    texts = [str(x) for x in raw if x is not None and str(x).strip()]
+    # SQL does not guarantee row order, so sort before seeded sampling to keep the
+    # same seed selecting the same rows across runs and warehouses.
+    texts = sorted(str(x) for x in raw if x is not None and str(x).strip())
     if not texts:
         return _pass("llm_judge", model_name, column, "no non-null text to judge")
     rng = random.Random(seed)
     sample = texts if len(texts) <= sample_size else rng.sample(texts, sample_size)
 
     llm = resolved.llm
+    provider_options = llm.provider_options or None
+    provider_instance = get_inference_provider(
+        llm.provider, profile_options=provider_options
+    ) if provider_options else get_inference_provider(llm.provider)
+    guard = (
+        BudgetGuard(
+            None, run_budget,
+            cost_estimator=budget_cost_estimator(
+                resolved, batch=False, provider=provider_instance
+            ),
+        )
+        if run_budget is not None
+        else None
+    )
     system = f"{_LLM_JUDGE_SYSTEM}\n\nCriterion: {criterion}"
     fields_spec = [
         {"name": "passes", "type": "boolean",
@@ -1507,9 +1561,12 @@ def _llm_judge(
         {"name": "reason", "type": "string", "description": "brief justification"},
     ]
     passed = 0
+    judged = 0
     try:
         for text in sample:
-            output = extract_fields_from_text(
+            if guard is not None:
+                guard.ensure_headroom()
+            output, usage = extract_fields_with_usage(
                 text,
                 fields_spec=fields_spec,
                 provider=llm.provider,
@@ -1518,10 +1575,20 @@ def _llm_judge(
                 api_key_env=llm.api_key_env,
                 base_url=llm.base_url,
                 timeout_seconds=llm.timeout_seconds,
+                provider_options=provider_options,
                 max_tokens=max_output_tokens,
             )
+            if guard is not None:
+                guard.charge_metrics(usage)
+            judged += 1
             if bool(output.get("passes")):
                 passed += 1
+    except BudgetExceededError as e:
+        return TestResult(
+            test_name="llm_judge", model_name=model_name, column=column,
+            status="fail",
+            message=f"run budget exceeded after {judged} judge call(s): {e}",
+        )
     except ProviderError as e:
         return TestResult(
             test_name="llm_judge", model_name=model_name, column=column,

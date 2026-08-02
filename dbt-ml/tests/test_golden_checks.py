@@ -92,6 +92,44 @@ def test_store_failures_persists_offending_keys(adapter: WarehouseAdapter) -> No
     assert "mismatch:vendor" in stored["issue"][0]
 
 
+def test_tolerance_applies_to_decimal_columns(adapter: WarehouseAdapter) -> None:
+    from decimal import Decimal
+
+    schema = {"id": pl.String, "amount": pl.Decimal(10, 2)}
+    golden = pl.DataFrame(
+        {"id": ["1", "2"], "amount": [Decimal("10.00"), Decimal("20.00")]}, schema=schema
+    )
+    near = pl.DataFrame(
+        {"id": ["1", "2"], "amount": [Decimal("10.05"), Decimal("20.00")]}, schema=schema
+    )
+    ad = adapter
+    ad.materialize_full("golden", golden)  # replace the string-total golden
+    ad.materialize_full("model", near)
+    within = evaluate_test_spec(
+        {"golden": {"to": "ref('golden')", "key": "id", "tolerance": {"amount": 0.1}}},
+        model_name="model", table_ref=ad.table_ref("model"), adapter=ad,
+    )[0]
+    assert within.status == "pass"
+    tight = evaluate_test_spec(
+        {"golden": {"to": "ref('golden')", "key": "id", "tolerance": {"amount": 0.01}}},
+        model_name="model", table_ref=ad.table_ref("model"), adapter=ad,
+    )[0]
+    assert tight.status == "fail"
+
+
+def test_duplicate_model_keys_fail(adapter: WarehouseAdapter) -> None:
+    dupes = pl.concat([_GOLDEN, _GOLDEN.head(1)])  # id "1" appears twice
+    r = _golden(adapter, dupes, {})
+    assert r.status == "fail"
+    assert "1 duplicate keys" in r.message
+
+
+def test_duplicate_golden_keys_raise(adapter: WarehouseAdapter) -> None:
+    adapter.materialize_full("golden", pl.concat([_GOLDEN, _GOLDEN.head(1)]))
+    with pytest.raises(SpecError, match="duplicate"):
+        _golden(adapter, _GOLDEN, {})
+
+
 def test_missing_key_column_fails_actionably(adapter: WarehouseAdapter) -> None:
     with pytest.raises(SpecError, match="key 'id' not found"):
         _golden(adapter, _GOLDEN.rename({"id": "other"}), {})

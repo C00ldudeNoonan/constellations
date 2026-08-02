@@ -15,13 +15,18 @@
   offending keys and which columns diverged. The golden model is an ordinary
   model built first as a DAG dependency (same path as `relationships`).
 - Added the optional `llm_judge` test type: samples up to `sample_size` rows
-  (deterministically by `seed`), asks the profile's `llm:` provider whether each
+  (deterministically by `seed` — a stable sort precedes sampling so warehouse row
+  order cannot change the sample), asks the profile's `llm:` provider whether each
   `column` value meets `criterion` (structured boolean verdict via the shared
-  inference path), and fails when the pass rate falls below `min_pass_rate`. It
-  is a sampled escape hatch for subjective quality, not a deterministic gate; the
-  test runner threads the resolved profile through so the check can reach the
-  provider, and the default suite exercises it against the offline
-  `deterministic` provider.
+  inference path), and fails when the pass rate falls below `min_pass_rate`. It is
+  a sampled escape hatch for subjective quality, not a deterministic gate. The
+  test runner threads the resolved profile and run budget through `build` and
+  `test`, so judge calls honor `llm.provider_options` and the run-wide
+  `llm.budget` caps just like `llm:` models, and a project declaring `llm_judge`
+  without an `llm:` profile fails preflight before any model is built.
+- `golden` numeric `tolerance` now also covers `DECIMAL`/`NUMERIC` columns, and
+  duplicate keys are surfaced (a golden-side duplicate errors; model-side
+  duplicates fail the check) rather than silently collapsing.
 - With these, #10's deterministic distribution/embedding/golden checks are
   complete; only provider-specific extensions remain.
 

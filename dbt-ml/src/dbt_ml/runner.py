@@ -18,7 +18,7 @@ from .adapters import (
     create_adapter,
 )
 from .budget import BudgetLedger
-from .checks import TestResult, run_model_tests
+from .checks import TestResult, run_model_tests, validate_test_requirements
 from .compiler import (
     validate_project_contract,
     validate_retrieval_capabilities,
@@ -283,6 +283,9 @@ def build_project(
     )
     models_by_name = {m.name: m for m in models}
 
+    validate_test_requirements(
+        [model for model in models if model.name in set(selected)], resolved
+    )
     run_budget = _run_budget_ledger(resolved)
     out = BuildResult()
     blocked: set[str] = set()
@@ -331,6 +334,8 @@ def build_project(
                     adapter,
                     project_dir=project_dir,
                     store_failures=store_failures,
+                    resolved=resolved,
+                    run_budget=run_budget,
                 )
             )
             out.test_results.extend(model_tests)

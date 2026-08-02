@@ -101,6 +101,51 @@ def test_empty_text_passes_without_calls(adapter: WarehouseAdapter) -> None:
     assert "no non-null text" in r.message
 
 
+def test_run_budget_caps_judge_calls(adapter: WarehouseAdapter) -> None:
+    from dbt_ml.budget import BudgetLedger, LLMBudgetConfig
+
+    budget = BudgetLedger(LLMBudgetConfig(max_api_calls=2), scope="run")
+    r = evaluate_test_spec(
+        {"llm_judge": {"column": "body", "criterion": "x", "sample_size": 5,
+                       "seed": 0, "min_pass_rate": 0.0}},
+        model_name="docs", table_ref=adapter.table_ref("docs"), adapter=adapter,
+        resolved=_resolved(_DUMMY_WH, llm=LLMConfig(provider="deterministic")),
+        run_budget=budget,
+    )[0]
+    assert r.status == "fail"
+    assert "run budget exceeded" in r.message
+    assert budget.snapshot()["api_calls"] == 2
+
+
+def test_sampling_is_order_independent(adapter: WarehouseAdapter) -> None:
+    # Same data, different physical row order -> same seeded sample -> same verdict.
+    spec = {"column": "body", "criterion": "x", "sample_size": 3, "seed": 1,
+            "min_pass_rate": 0.0}
+    forward = _judge(adapter, spec, llm=_det())
+    adapter.materialize_full(
+        "docs", pl.DataFrame({"body": [f"document {i} about widgets" for i in reversed(range(8))]})
+    )
+    reverse = _judge(adapter, spec, llm=_det())
+    assert forward.message == reverse.message
+
+
+def test_preflight_requires_llm_profile() -> None:
+    from types import SimpleNamespace
+    from typing import cast
+
+    from dbt_ml.checks.runner import validate_test_requirements
+    from dbt_ml.config.model import ModelConfig
+
+    models = cast(
+        list[ModelConfig],
+        [SimpleNamespace(name="m", tests=[{"llm_judge": {"column": "c", "criterion": "x"}}])],
+    )
+    with pytest.raises(SpecError, match="llm_judge"):
+        validate_test_requirements(models, _resolved(_DUMMY_WH, llm=None))
+    # With an llm: profile the preflight passes.
+    validate_test_requirements(models, _resolved(_DUMMY_WH, llm=_det()))
+
+
 @pytest.mark.parametrize(
     ("spec", "message"),
     [

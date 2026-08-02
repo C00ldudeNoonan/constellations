@@ -95,6 +95,12 @@ def parse_test_spec(spec: Any) -> ParsedTestSpec:
     return ParsedTestSpec(name=name, argument=argument, severity=severity)
 
 
+def uses_llm_judge(specs: list[Any]) -> bool:
+    """Whether any test in `specs` is an `llm_judge`, which needs an `llm:`
+    profile — used to preflight that requirement before discovery/build."""
+    return any(parse_test_spec(spec).name == "llm_judge" for spec in specs)
+
+
 def relationship_test_targets(specs: list[Any]) -> set[str]:
     """Models referenced by a test's `to:` (relationships parent or drift
     baseline), which must be built before the test runs."""

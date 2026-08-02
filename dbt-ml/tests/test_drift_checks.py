@@ -120,6 +120,38 @@ def test_empty_baseline_is_insufficient_data(adapter: WarehouseAdapter) -> None:
     assert "insufficient data" in r.message
 
 
+# ─── robustness (Codex review) ───────────────────────────────────────────────
+
+
+def test_constant_baseline_still_detects_shift(adapter: WarehouseAdapter) -> None:
+    # A single-valued baseline collapses quantile bins; drift must still fire for
+    # a current column that has moved entirely off that constant.
+    _materialize(adapter, "baseline", pl.DataFrame({"x": [0.0, 0.0, 0.0]}))
+    _materialize(adapter, "current", pl.DataFrame({"x": [100.0, 100.0, 100.0]}))
+    for metric in ("psi", "jensen_shannon"):
+        r = _drift(adapter, "current", {"column": "x", "to": "ref('baseline')",
+                                        "metric": metric, "max": 0.2})
+        assert r.status == "fail", (metric, r.message)
+
+
+def test_constant_baseline_no_shift_passes(adapter: WarehouseAdapter) -> None:
+    _materialize(adapter, "baseline", pl.DataFrame({"x": [5.0, 5.0]}))
+    _materialize(adapter, "current", pl.DataFrame({"x": [5.0, 5.0, 5.0]}))
+    r = _drift(adapter, "current", {"column": "x", "to": "ref('baseline')", "max": 0.2})
+    assert r.status == "pass"
+    assert "psi=0" in r.message
+
+
+def test_nonscalar_categorical_column_fails_actionably(adapter: WarehouseAdapter) -> None:
+    # A list/struct column classifies as categorical; the unhashable values must
+    # produce a failed check, not an uncaught TypeError that aborts the run.
+    frame = pl.DataFrame({"tags": [["a"], ["b"]]}, schema={"tags": pl.List(pl.String)})
+    _materialize(adapter, "baseline", frame)
+    _materialize(adapter, "current", frame)
+    with pytest.raises(SpecError, match="unhashable"):
+        _drift(adapter, "current", {"column": "tags", "to": "ref('baseline')", "max": 0.2})
+
+
 # ─── dependency wiring + validation ──────────────────────────────────────────
 
 

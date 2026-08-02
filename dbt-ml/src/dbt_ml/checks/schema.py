@@ -1182,6 +1182,17 @@ def _bin_proportions(values: list[float], edges: list[float]) -> list[float]:
     return [c / total for c in counts]
 
 
+def _around_proportions(values: list[float], pivot: float) -> list[float]:
+    """Proportions in three bins — below / equal to / above `pivot` — used when a
+    constant baseline collapses quantile bins, so a shift away from the constant
+    still registers as drift."""
+    below = sum(1 for v in values if v < pivot)
+    above = sum(1 for v in values if v > pivot)
+    total = len(values)
+    equal = total - below - above
+    return [below / total, equal / total, above / total]
+
+
 def _category_proportions(values: list[Any], categories: list[Any]) -> list[float]:
     counts = Counter(values)
     total = len(values)
@@ -1272,11 +1283,24 @@ def _drift(
             value = _ks_statistic(current, baseline)
         else:
             edges = _quantile_bin_edges(baseline, bins)
-            cur_p = _bin_proportions(current, edges)
-            base_p = _bin_proportions(baseline, edges)
+            if len(edges) < 2:
+                # Constant baseline: quantile bins collapse to a point, so split
+                # the axis around that value to still detect a shift away from it.
+                pivot = edges[0] if edges else baseline[0]
+                cur_p = _around_proportions(current, pivot)
+                base_p = _around_proportions(baseline, pivot)
+            else:
+                cur_p = _bin_proportions(current, edges)
+                base_p = _bin_proportions(baseline, edges)
             value = _psi(cur_p, base_p) if metric == "psi" else _jensen_shannon(cur_p, base_p)
     else:
-        categories = sorted(set(current) | set(baseline), key=str)
+        try:
+            categories = sorted(set(current) | set(baseline), key=str)
+        except TypeError as e:
+            raise UnknownTestError(
+                f"drift on non-numeric column '{column}' requires scalar values, but "
+                "it holds unhashable (list/struct) values"
+            ) from e
         cur_p = _category_proportions(current, categories)
         base_p = _category_proportions(baseline, categories)
         value = _psi(cur_p, base_p) if metric == "psi" else _jensen_shannon(cur_p, base_p)

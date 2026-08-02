@@ -5,6 +5,7 @@ from .runner import (
     load_incremental_contract,
     load_transform,
     transform_call_arity,
+    transform_requires_llm,
     validate_transform_contract,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "load_incremental_contract",
     "load_transform",
     "transform_call_arity",
+    "transform_requires_llm",
     "validate_transform_contract",
 ]

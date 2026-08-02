@@ -12,12 +12,17 @@ from dbt_ml.adapters import parse_warehouse_config
 from dbt_ml.compiler import validate_project_contract
 from dbt_ml.config import load_project
 from dbt_ml.config.loader import ConfigError
+from dbt_ml.config.profile import LLMConfig
 from dbt_ml.text.relations import (
     CO_OCCURRENCE_EXTRACTOR_VERSION,
     RULE_EXTRACTOR_VERSION,
     Mention,
+    ModelAssertionExtractor,
+    ModelAssertionExtractorOptions,
     Relation,
+    RelationAssertion,
     RelationExtractor,
+    RelationInference,
 )
 from dbt_ml.text.transforms import extract_relations
 from dbt_ml.transforms import IncrementalContract, TransformContext
@@ -403,8 +408,13 @@ class _FakeModelExtractor(RelationExtractor):
         return ()
 
     def extract(
-        self, mentions: Sequence[Mention], options: object
+        self,
+        mentions: Sequence[Mention],
+        options: object,
+        *,
+        infer: RelationInference | None = None,
     ) -> list[Relation]:
+        del infer
         if len(mentions) < 2:
             return []
         subject, obj = mentions[0], mentions[1]
@@ -448,6 +458,185 @@ def test_extractor_seam_carries_typed_directed_scored_relations(
     assert output["confidence"].to_list() == [pytest.approx(0.87), pytest.approx(0.42)]
     # Distinct relation_type → distinct relation_id for the same mention pair.
     assert output["relation_id"].n_unique() == 2
+
+
+# --- model_assertion extractor -----------------------------------------------
+
+_MA_MENTIONS = [
+    Mention(mention_id="e1", sentence_index=0, start=0, end=5, label="ORG", text="Apple"),
+    Mention(mention_id="e2", sentence_index=0, start=10, end=15, label="ORG", text="Beats"),
+    Mention(mention_id="e3", sentence_index=0, start=20, end=25, label="GPE", text="US"),
+    Mention(mention_id="e4", sentence_index=1, start=40, end=45, label="ORG", text="Acme"),
+]
+
+
+class _FakeInference:
+    def __init__(self, assertions: list[RelationAssertion]) -> None:
+        self._assertions = assertions
+
+    def assert_relations(
+        self,
+        pairs: Sequence[tuple[Mention, Mention]],
+        options: ModelAssertionExtractorOptions,
+    ) -> list[RelationAssertion]:
+        del pairs, options
+        return list(self._assertions)
+
+
+def _ma_options(**overrides: object) -> ModelAssertionExtractorOptions:
+    payload: dict[str, object] = {
+        "mentions": "m",
+        "relation_types": ("acquired", "located_in"),
+        "threshold": 0.6,
+    }
+    payload.update(overrides)
+    return ModelAssertionExtractorOptions.model_validate(payload)
+
+
+def test_model_assertion_maps_status_by_threshold_and_conflicts() -> None:
+    infer = _FakeInference(
+        [
+            RelationAssertion("e1", "e2", "acquired", 0.9),  # asserted
+            RelationAssertion("e1", "e3", "located_in", 0.4),  # below threshold
+            RelationAssertion("e2", "e3", "acquired", 0.8),  # two types for one
+            RelationAssertion("e2", "e3", "located_in", 0.7),  # pair -> ambiguous
+        ]
+    )
+    relations = ModelAssertionExtractor().extract(_MA_MENTIONS, _ma_options(), infer=infer)
+    by_key = {
+        (r.subject.mention_id, r.object.mention_id, r.relation_type): r for r in relations
+    }
+    assert by_key[("e1", "e2", "acquired")].status == "asserted"
+    assert by_key[("e1", "e2", "acquired")].confidence == pytest.approx(0.9)
+    assert by_key[("e1", "e2", "acquired")].directed is True
+    assert by_key[("e1", "e3", "located_in")].status == "no_relation"
+    assert by_key[("e2", "e3", "acquired")].status == "ambiguous"
+    assert by_key[("e2", "e3", "located_in")].status == "ambiguous"
+
+
+def test_model_assertion_drops_ungoverned_assertions() -> None:
+    infer = _FakeInference(
+        [
+            RelationAssertion("e1", "e2", "merged_with", 0.9),  # not in allow-list
+            RelationAssertion("e1", "e9", "acquired", 0.9),  # unknown mention
+            RelationAssertion("e1", "e1", "acquired", 0.9),  # self relation
+            RelationAssertion("e1", "e4", "acquired", 0.9),  # not an in-scope pair
+        ]
+    )
+    assert ModelAssertionExtractor().extract(_MA_MENTIONS, _ma_options(), infer=infer) == []
+
+
+def test_model_assertion_requires_inference() -> None:
+    with pytest.raises(ValueError, match="requires an inference provider"):
+        ModelAssertionExtractor().extract(_MA_MENTIONS, _ma_options(), infer=None)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"extractor": "model_assertion", "mentions": "m"}, "relation_types"),
+        (
+            {"extractor": "model_assertion", "mentions": "m", "relation_types": []},
+            "must not be empty",
+        ),
+        (
+            {"extractor": "model_assertion", "mentions": "m", "relation_types": ["a", "a"]},
+            "must be unique",
+        ),
+        (
+            {
+                "extractor": "model_assertion",
+                "mentions": "m",
+                "relation_types": ["a"],
+                "threshold": 1.5,
+            },
+            "between 0 and 1",
+        ),
+        (
+            {
+                "extractor": "model_assertion",
+                "mentions": "m",
+                "relation_types": ["a"],
+                "threshold": "0.5",
+            },
+            "must be a number",
+        ),
+    ],
+)
+def test_model_assertion_options_are_strict(
+    options: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        extract_relations.validate_options(options)
+
+
+def test_model_assertion_runs_through_deterministic_provider() -> None:
+    # Full driver wiring: build_inference -> extract_fields_with_usage ->
+    # deterministic provider -> mapping -> row shaping. The deterministic
+    # provider emits placeholder assertions that reference no real pair or
+    # allowed type, so all are dropped, leaving a well-formed empty frame.
+    ctx = TransformContext(
+        project_dir=Path("."),
+        profile_name="test",
+        target_name="dev",
+        warehouse=parse_warehouse_config(
+            {"type": "duckdb", "path": "./test.duckdb", "schema": "main"}
+        ),
+        llm=LLMConfig(provider="deterministic"),
+        options={
+            "mentions": "mentions",
+            "extractor": "model_assertion",
+            "relation_types": ["acquired", "located_in"],
+        },
+    )
+    output = extract_relations.run(_deps(), ctx)
+    assert output.schema["confidence"] == pl.Float64
+    assert set(("method", "status", "relation_type")).issubset(output.columns)
+
+
+_MA_MODEL_YAML = """version: 2
+models:
+  - name: document_relations_llm
+    depends_on: [ref('document_entities')]
+    transform:
+      type: python
+      module: dbt_ml.text.transforms.extract_relations
+      {uses_llm}options:
+        mentions: document_entities
+        extractor: model_assertion
+        relation_types: [acquired, references_geography]
+    materialization: full
+"""
+
+
+def _write_ma_model(project_dir: Path, *, uses_llm: bool) -> None:
+    (project_dir / "models" / "document_relations_llm.yml").write_text(
+        _MA_MODEL_YAML.format(uses_llm="uses_llm: true\n      " if uses_llm else "")
+    )
+
+
+def test_model_assertion_requires_uses_llm_at_compile(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    shutil.copytree(
+        _example_dir(), project_dir, ignore=shutil.ignore_patterns("target")
+    )
+    _write_ma_model(project_dir, uses_llm=False)
+    project, sources, models = load_project(project_dir)
+    with pytest.raises(ConfigError, match="uses_llm"):
+        validate_project_contract(project, sources, models, project_dir)
+
+
+def test_model_assertion_compiles_with_uses_llm(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    shutil.copytree(
+        _example_dir(), project_dir, ignore=shutil.ignore_patterns("target")
+    )
+    _write_ma_model(project_dir, uses_llm=True)
+    project, sources, models = load_project(project_dir)
+    dag = validate_project_contract(project, sources, models, project_dir)
+    assert dag.execution_order().index("document_relations_llm") > dag.execution_order().index(
+        "document_entities"
+    )
 
 
 # --- example -----------------------------------------------------------------

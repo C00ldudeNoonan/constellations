@@ -30,6 +30,28 @@
 - With these, #10's deterministic distribution/embedding/golden checks are
   complete; only provider-specific extensions remain.
 
+### LLM `model_assertion` relation extractor (issue #240)
+
+- Added the `model_assertion` extractor to `extract_relations`, the first
+  built-in transform to call an LLM. Per document it asks a governed inference
+  provider which of the schema-controlled `relation_types` hold between the
+  in-scope candidate mention pairs, with a `confidence`; assertions at/above
+  `threshold` are `asserted`, below are `no_relation`, and a pair mapped to
+  conflicting types is `ambiguous`. Out-of-allow-list types and hallucinated
+  mention pairs are dropped, so the model can only assert governed relations.
+- It runs through the same shared structured-inference core as the native `llm:`
+  kind (`extract_fields_with_usage`, `output_cardinality: many`), so caching,
+  retries, and credential resolution are shared. Provider, model, and
+  credentials resolve from the profile's `llm:` block only; a model using it must
+  set `transform.uses_llm: true`, enforced at compile via a new transform
+  `requires_llm(options)` hook, and the resolved provider identity folds into the
+  model's code version so a provider/model change reprocesses the table.
+- Evidence text and raw provider responses never enter logs or artifacts — only
+  the shaped relation grain (`relation_type`, `directed`, `status`, `confidence`,
+  mention IDs/offsets, extractor identity) is published. Unit tests inject a
+  deterministic fake; a driver test exercises the full path offline through the
+  `deterministic` provider.
+
 ### Run-over-run drift checks (issue #10)
 
 - Added a `drift` test type: compares a column's distribution against the same

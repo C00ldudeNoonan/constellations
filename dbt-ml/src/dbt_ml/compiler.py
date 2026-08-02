@@ -36,7 +36,7 @@ from .sql_models import (
     validate_single_select,
 )
 from .test_specs import TestSpecError, parse_test_spec
-from .transforms import validate_transform_contract
+from .transforms import transform_requires_llm, validate_transform_contract
 
 _MODULE_PATTERN = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
 
@@ -863,6 +863,17 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             f"Transform model '{model.name}' module '{transform.module}' is invalid: {e}",
             ("transform", "module"),
         ) from e
+    if (
+        not transform.uses_llm
+        and transform_requires_llm(transform.module, project_dir, transform.options)
+    ):
+        raise _model_error(
+            model,
+            f"Transform model '{model.name}' uses an inference-based extractor and "
+            "requires `transform.uses_llm: true` so an `llm:` provider is resolved "
+            "and the model reprocesses when the provider or model changes",
+            ("transform", "uses_llm"),
+        )
 
 
 def _model_error(

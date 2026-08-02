@@ -25,10 +25,12 @@ SUPPORTED_TESTS = {
     "cardinality",
     "outlier_rate",
     "drift",
+    "golden",
+    "llm_judge",
 }
 
 _COLUMN_STATS = {"mean", "min", "max", "sum", "stddev", "median", "quantile"}
-_DRIFT_METRICS = {"psi", "ks", "jensen_shannon"}
+_DRIFT_METRICS = {"psi", "ks", "jensen_shannon", "chi_squared"}
 SUPPORTED_SEVERITIES = {"error", "warn"}
 
 _REF_PATTERN = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
@@ -52,7 +54,7 @@ class ParsedTestSpec:
     def ref_target(self) -> str | None:
         """The model this test depends on via a `to:` ref (relationships parent,
         or the drift baseline), so the DAG builds it first."""
-        if self.name not in {"relationships", "drift"}:
+        if self.name not in {"relationships", "drift", "golden"}:
             return None
         target = self.argument["to"]
         match = _REF_PATTERN.match(target)
@@ -298,6 +300,63 @@ def _validate_argument(name: str, argument: Any) -> None:
             bins = options["bins"]
             if isinstance(bins, bool) or not isinstance(bins, int) or bins < 2:
                 raise TestSpecError(f"Test '{name}' bins must be an integer >= 2")
+        return
+    if name == "golden":
+        options = _options(
+            name,
+            argument,
+            required={"to", "key"},
+            optional={"columns", "tolerance", "exhaustive"},
+        )
+        _require_nonempty_string(name, options["to"], "to")
+        _require_nonempty_string(name, options["key"], "key")
+        if "columns" in options:
+            columns = options["columns"]
+            if not isinstance(columns, list) or not columns or any(
+                not isinstance(c, str) or not c.strip() for c in columns
+            ):
+                raise TestSpecError(
+                    f"Test '{name}' columns must be a non-empty list of column names"
+                )
+        if "tolerance" in options:
+            tolerance = options["tolerance"]
+            if not isinstance(tolerance, dict) or not tolerance:
+                raise TestSpecError(f"Test '{name}' tolerance must be a non-empty mapping")
+            for col, tol in tolerance.items():
+                if not isinstance(col, str) or not col.strip():
+                    raise TestSpecError(f"Test '{name}' tolerance keys must be column names")
+                if _finite_number(name, tol, f"tolerance[{col}]") < 0:
+                    raise TestSpecError(f"Test '{name}' tolerance values must be non-negative")
+        if "exhaustive" in options and not isinstance(options["exhaustive"], bool):
+            raise TestSpecError(f"Test '{name}' exhaustive must be a boolean")
+        return
+    if name == "llm_judge":
+        options = _options(
+            name,
+            argument,
+            required={"column", "criterion"},
+            optional={"sample_size", "min_pass_rate", "seed", "max_output_tokens"},
+        )
+        _require_nonempty_string(name, options["column"], "column")
+        _require_nonempty_string(name, options["criterion"], "criterion")
+        if "sample_size" in options:
+            size = options["sample_size"]
+            if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+                raise TestSpecError(f"Test '{name}' sample_size must be a positive integer")
+        if "min_pass_rate" in options:
+            rate = _finite_number(name, options["min_pass_rate"], "min_pass_rate")
+            if not 0.0 <= rate <= 1.0:
+                raise TestSpecError(f"Test '{name}' min_pass_rate must be between 0 and 1")
+        if "seed" in options and (
+            isinstance(options["seed"], bool) or not isinstance(options["seed"], int)
+        ):
+            raise TestSpecError(f"Test '{name}' seed must be an integer")
+        if "max_output_tokens" in options:
+            tokens = options["max_output_tokens"]
+            if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
+                raise TestSpecError(
+                    f"Test '{name}' max_output_tokens must be a positive integer"
+                )
         return
     if name == "relationships":
         if not isinstance(argument, dict) or not all(

@@ -6,7 +6,7 @@ from ..adapters import WarehouseAdapter, WarehouseCapability, create_adapter
 from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import load_project
 from ..config.model import ModelConfig
-from ..profile import resolve_profile
+from ..profile import ResolvedProfile, resolve_profile
 from .schema import TestResult, UnknownTestError, evaluate_test_spec
 
 
@@ -56,6 +56,7 @@ def run_project_tests(
                 run_model_tests(
                     model, adapter, project_dir=project_dir,
                     store_failures=store_failures,
+                    resolved=resolved,
                 )
             )
     return results
@@ -67,6 +68,7 @@ def run_model_tests(
     *,
     project_dir: Path | None = None,
     store_failures: bool = False,
+    resolved: ResolvedProfile | None = None,
 ) -> list[TestResult]:
     if not model.tests:
         return []
@@ -101,6 +103,7 @@ def run_model_tests(
                     adapter=adapter,
                     project_dir=project_dir,
                     store_failures=store_failures,
+                    resolved=resolved,
                 )
             )
         except UnknownTestError as e:

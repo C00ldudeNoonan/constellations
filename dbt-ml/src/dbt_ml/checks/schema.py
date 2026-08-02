@@ -7,11 +7,14 @@ from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
 from ..adapters import WarehouseAdapter
+
+if TYPE_CHECKING:
+    from ..profile import ResolvedProfile
 from ..test_specs import (
     SUPPORTED_TESTS,
     TestSpecError,
@@ -53,6 +56,7 @@ def evaluate_test_spec(
     adapter: WarehouseAdapter,
     project_dir: Path | None = None,
     store_failures: bool = False,
+    resolved: ResolvedProfile | None = None,
 ) -> list[TestResult]:
     """Parse one test spec and run it.
 
@@ -75,6 +79,7 @@ def evaluate_test_spec(
             adapter,
             project_dir,
             store_failures,
+            resolved,
         ),
         parsed.severity,
     )
@@ -109,6 +114,7 @@ def _run_named_test(
     adapter: WarehouseAdapter,
     project_dir: Path | None,
     store_failures: bool = False,
+    resolved: ResolvedProfile | None = None,
 ) -> list[TestResult]:
     if test_name == "not_null":
         return _not_null(model_name, table_ref, adapter, arg, store_failures)
@@ -153,6 +159,10 @@ def _run_named_test(
         return [_outlier_rate(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "drift":
         return [_drift(model_name, table_ref, adapter, arg)]
+    if test_name == "golden":
+        return [_golden(model_name, table_ref, adapter, arg, store_failures)]
+    if test_name == "llm_judge":
+        return [_llm_judge(model_name, table_ref, adapter, arg, resolved)]
     raise UnknownTestError(
         f"Unknown test '{test_name}'. Supported: {sorted(SUPPORTED_TESTS)}"
     )
@@ -1222,6 +1232,26 @@ def _jensen_shannon(current: list[float], baseline: list[float]) -> float:
     return 0.5 * _kl(current, mid) + 0.5 * _kl(baseline, mid)
 
 
+def _chi_squared(current: list[float], baseline: list[float], n: int) -> float:
+    """Pearson chi-squared goodness-of-fit statistic of the current counts
+    against the baseline-expected counts. Note this scales with sample size, so
+    the `max` threshold is calibrated per corpus (unlike PSI/JS/KS)."""
+    eps = 1e-12
+    return n * math.fsum(
+        (c - b) ** 2 / (b + eps) for c, b in zip(current, baseline, strict=True)
+    )
+
+
+def _binned_metric(
+    metric: str, current: list[float], baseline: list[float], n: int
+) -> float:
+    if metric == "psi":
+        return _psi(current, baseline)
+    if metric == "jensen_shannon":
+        return _jensen_shannon(current, baseline)
+    return _chi_squared(current, baseline, n)
+
+
 def _ks_statistic(current: list[float], baseline: list[float]) -> float:
     """Two-sample Kolmogorov-Smirnov statistic: max gap between the empirical
     CDFs."""
@@ -1292,7 +1322,7 @@ def _drift(
             else:
                 cur_p = _bin_proportions(current, edges)
                 base_p = _bin_proportions(baseline, edges)
-            value = _psi(cur_p, base_p) if metric == "psi" else _jensen_shannon(cur_p, base_p)
+            value = _binned_metric(metric, cur_p, base_p, len(current))
     else:
         try:
             categories = sorted(set(current) | set(baseline), key=str)
@@ -1303,7 +1333,7 @@ def _drift(
             ) from e
         cur_p = _category_proportions(current, categories)
         base_p = _category_proportions(baseline, categories)
-        value = _psi(cur_p, base_p) if metric == "psi" else _jensen_shannon(cur_p, base_p)
+        value = _binned_metric(metric, cur_p, base_p, len(current))
 
     ok = value <= max_value
     return TestResult(
@@ -1312,6 +1342,203 @@ def _drift(
         column=column,
         status="pass" if ok else "fail",
         message=f"{metric}={value:.4g} vs {baseline_name}.{field} (max {max_value:g})",
+    )
+
+
+# ─── golden sets (issue #10) ───────────────────────────────────────────────
+
+
+def _values_match(actual: Any, expected: Any, tol: float | None) -> bool:
+    if tol is not None and isinstance(actual, int | float) and isinstance(expected, int | float):
+        if isinstance(actual, bool) or isinstance(expected, bool):
+            return actual == expected
+        return abs(float(actual) - float(expected)) <= tol
+    return actual == expected
+
+
+def _golden(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    store_failures: bool = False,
+) -> TestResult:
+    """Compare this model's rows to a checked-in golden model (`to: ref(...)`),
+    joined on `key`. Each configured column must match its expected value —
+    exactly, or within a per-column numeric `tolerance`. Missing golden keys
+    always fail; extra actual rows fail only when `exhaustive: true`."""
+    from ..dag import parse_ref
+
+    opts = _require_dict("golden", arg)
+    key = opts["key"]
+    tolerance = opts.get("tolerance", {})
+    exhaustive = bool(opts.get("exhaustive", False))
+    golden_name = parse_ref(str(opts["to"]))
+    golden_ref = adapter.table_ref(golden_name)
+
+    actual = adapter.query_df(f"SELECT * FROM {table_ref}")
+    golden = adapter.query_df(f"SELECT * FROM {golden_ref}")
+    for frame, name in ((actual, model_name), (golden, golden_name)):
+        if key not in frame.columns:
+            raise UnknownTestError(
+                f"golden test key '{key}' not found in '{name}'; got: "
+                f"{sorted(frame.columns)}"
+            )
+
+    configured = opts.get("columns")
+    if configured is None:
+        compared = [c for c in golden.columns if c != key and c in actual.columns]
+    else:
+        missing = sorted(
+            set(configured) - (set(golden.columns) & set(actual.columns))
+        )
+        if missing:
+            raise UnknownTestError(
+                f"golden test columns not present in both models: {missing}"
+            )
+        compared = list(configured)
+
+    actual_rows = {row[key]: row for row in actual.iter_rows(named=True)}
+    failures: list[dict[str, Any]] = []
+    missing_keys = 0
+    mismatched = 0
+    for grow in golden.iter_rows(named=True):
+        k = grow[key]
+        arow = actual_rows.get(k)
+        if arow is None:
+            missing_keys += 1
+            failures.append({"key": str(k), "issue": "missing_in_model"})
+            continue
+        bad = [
+            col for col in compared
+            if not _values_match(arow.get(col), grow.get(col), tolerance.get(col))
+        ]
+        if bad:
+            mismatched += 1
+            failures.append({"key": str(k), "issue": f"mismatch:{','.join(bad)}"})
+
+    extra_keys = 0
+    if exhaustive:
+        golden_keys = {grow[key] for grow in golden.iter_rows(named=True)}
+        for k in actual_rows:
+            if k not in golden_keys:
+                extra_keys += 1
+                failures.append({"key": str(k), "issue": "unexpected_in_model"})
+
+    problems = []
+    if missing_keys:
+        problems.append(f"{missing_keys} missing")
+    if mismatched:
+        problems.append(f"{mismatched} mismatched")
+    if extra_keys:
+        problems.append(f"{extra_keys} unexpected")
+    ok = not problems
+    result = TestResult(
+        test_name="golden",
+        model_name=model_name,
+        column=key,
+        status="pass" if ok else "fail",
+        message=(
+            f"matches golden '{golden_name}' ({golden.height} rows)"
+            if ok
+            else f"{', '.join(problems)} vs golden '{golden_name}'"
+        ),
+    )
+    if not ok and store_failures:
+        _store_df(
+            adapter, model_name, "golden", key,
+            pl.DataFrame(failures, schema={"key": pl.String, "issue": pl.String}),
+            result,
+        )
+    return result
+
+
+# ─── optional sampled LLM-as-judge (issue #10) ─────────────────────────────
+
+_LLM_JUDGE_SYSTEM = (
+    "You are a strict data-quality judge. You are given one text value and a "
+    "criterion. Decide whether the text clearly satisfies the criterion. Set "
+    "passes=true only when it clearly does, otherwise passes=false."
+)
+
+
+def _llm_judge(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+    resolved: ResolvedProfile | None,
+) -> TestResult:
+    """Optional, sampled LLM-as-judge for subjective qualities. Samples up to
+    `sample_size` rows (deterministically by `seed`), asks the profile's LLM
+    whether each `column` value satisfies `criterion`, and fails when the pass
+    rate falls below `min_pass_rate`. This is a sampled escape hatch, not a
+    deterministic CI gate — keep sample sizes and cost bounded.
+    """
+    import random
+
+    from ..backends.llm_backend import extract_fields_from_text
+    from ..providers.base import ProviderError
+
+    opts = _require_dict("llm_judge", arg)
+    column = opts["column"]
+    criterion = opts["criterion"]
+    sample_size = int(opts.get("sample_size", 20))
+    min_pass_rate = float(opts.get("min_pass_rate", 1.0))
+    seed = int(opts.get("seed", 0))
+    max_output_tokens = int(opts.get("max_output_tokens", 256))
+
+    if resolved is None or resolved.llm is None:
+        raise UnknownTestError(
+            "llm_judge requires an LLM profile; add an `llm:` block to the active "
+            "profile (or run through `dbt-ml test`, which resolves it)"
+        )
+    if column not in adapter.query_df(f"SELECT * FROM {table_ref} LIMIT 0").columns:
+        raise UnknownTestError(f"llm_judge column '{column}' not found in {table_ref}")
+
+    raw = adapter.query_df(
+        f"SELECT {adapter.quote_ident(column)} AS v FROM {table_ref}"
+    )["v"].to_list()
+    texts = [str(x) for x in raw if x is not None and str(x).strip()]
+    if not texts:
+        return _pass("llm_judge", model_name, column, "no non-null text to judge")
+    rng = random.Random(seed)
+    sample = texts if len(texts) <= sample_size else rng.sample(texts, sample_size)
+
+    llm = resolved.llm
+    system = f"{_LLM_JUDGE_SYSTEM}\n\nCriterion: {criterion}"
+    fields_spec = [
+        {"name": "passes", "type": "boolean",
+         "description": "true if the text clearly satisfies the criterion"},
+        {"name": "reason", "type": "string", "description": "brief justification"},
+    ]
+    passed = 0
+    try:
+        for text in sample:
+            output = extract_fields_from_text(
+                text,
+                fields_spec=fields_spec,
+                provider=llm.provider,
+                model=llm.model,
+                system=system,
+                api_key_env=llm.api_key_env,
+                base_url=llm.base_url,
+                timeout_seconds=llm.timeout_seconds,
+                max_tokens=max_output_tokens,
+            )
+            if bool(output.get("passes")):
+                passed += 1
+    except ProviderError as e:
+        return TestResult(
+            test_name="llm_judge", model_name=model_name, column=column,
+            status="fail", message=f"llm_judge could not reach the provider: {e}",
+        )
+
+    rate = passed / len(sample)
+    ok = rate >= min_pass_rate
+    return TestResult(
+        test_name="llm_judge",
+        model_name=model_name,
+        column=column,
+        status="pass" if ok else "fail",
+        message=(
+            f"pass_rate={rate:.3f} (min {min_pass_rate:g}, sampled {len(sample)} of "
+            f"{len(texts)}, provider={llm.provider})"
+        ),
     )
 
 

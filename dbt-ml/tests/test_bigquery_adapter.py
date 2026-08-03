@@ -2313,6 +2313,10 @@ def test_state_page_reader_pins_one_system_time_snapshot() -> None:
     assert client.queries[0][0] == "SELECT CURRENT_TIMESTAMP()"
     page_sql, page_config = client.queries[1]
     assert "FOR SYSTEM_TIME AS OF ?" in page_sql
+    # BigQuery requires the alias before the time-travel clause; the reverse
+    # order is a syntax error that blocks every state page read (#249).
+    assert "AS state FOR SYSTEM_TIME AS OF ?" in page_sql
+    assert "FOR SYSTEM_TIME AS OF ? AS state" not in page_sql
     assert "ORDER BY state.record_key" in page_sql
     assert "LIMIT ?" in page_sql
     assert _param_values(page_config)[0] == ts
@@ -2349,6 +2353,10 @@ def test_state_page_reader_absence_probe_time_travels_both_relations() -> None:
     assert page.next_cursor is None
     sql, _ = client.queries[1]
     assert sql.count("FOR SYSTEM_TIME AS OF ?") == 2
+    # Both relations must alias before the time-travel clause (#249).
+    assert "AS state FOR SYSTEM_TIME AS OF ?" in sql
+    assert "AS probe FOR SYSTEM_TIME AS OF ?" in sql
+    assert "FOR SYSTEM_TIME AS OF ? AS" not in sql
     assert "NOT EXISTS" in sql
     assert "`chunk_id` = state.record_key" in sql
 
@@ -2373,6 +2381,24 @@ def test_state_page_reader_missing_probe_relation_fails() -> None:
             StateScope("m"), page_size=5, absent_from=probe
         ):
             pass
+
+
+def test_state_page_read_failure_preserves_cause_without_leaking_text() -> None:
+    # The read used to swallow the warehouse error with `from None`, hiding
+    # syntax faults like #249. The exception chain must be preserved via
+    # `from exc`, but the artifact-visible message must stay generic so raw
+    # warehouse text (SQL/response details) never reaches run_results.json
+    # or the CLI (AGENTS.md).
+    ts = datetime.now(UTC)
+    client = _FakeClient()
+    client.query_results = [_FakeJob(rows=[(ts,)]), _FailingJob()]
+    adapter = _adapter(client)
+    with adapter.state_page_reader(StateScope("m"), page_size=2) as reader:
+        with pytest.raises(AdapterError) as excinfo:
+            reader.fetch_page(None)
+    assert str(excinfo.value) == "BigQuery state page read failed"
+    assert "simulated merge failure" not in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
 
 
 def test_replace_state_scope_stages_batches_and_merges_once() -> None:

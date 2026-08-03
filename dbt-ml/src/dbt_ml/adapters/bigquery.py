@@ -2676,9 +2676,11 @@ class BigQueryAdapter(WarehouseAdapter):
             except AdapterError:
                 raise
             except Exception as exc:
-                raise AdapterError(
-                    f"BigQuery state page read failed: {exc}"
-                ) from exc
+                # Preserve the cause for the exception chain, but keep the
+                # artifact-visible message generic: raw warehouse exception
+                # text may carry SQL or response details and must not reach
+                # run_results.json or the CLI (AGENTS.md).
+                raise AdapterError("BigQuery state page read failed") from exc
             records = tuple(
                 StatePageRecord(
                     str(row[0]),

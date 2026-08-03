@@ -2383,18 +2383,21 @@ def test_state_page_reader_missing_probe_relation_fails() -> None:
             pass
 
 
-def test_state_page_read_failure_preserves_underlying_cause() -> None:
+def test_state_page_read_failure_preserves_cause_without_leaking_text() -> None:
     # The read used to swallow the warehouse error with `from None`, hiding
-    # syntax faults like #249. The message must surface the cause and the
-    # exception chain must be preserved.
+    # syntax faults like #249. The exception chain must be preserved via
+    # `from exc`, but the artifact-visible message must stay generic so raw
+    # warehouse text (SQL/response details) never reaches run_results.json
+    # or the CLI (AGENTS.md).
     ts = datetime.now(UTC)
     client = _FakeClient()
     client.query_results = [_FakeJob(rows=[(ts,)]), _FailingJob()]
     adapter = _adapter(client)
     with adapter.state_page_reader(StateScope("m"), page_size=2) as reader:
-        with pytest.raises(AdapterError, match="simulated merge failure") as excinfo:
+        with pytest.raises(AdapterError) as excinfo:
             reader.fetch_page(None)
-    assert "BigQuery state page read failed" in str(excinfo.value)
+    assert str(excinfo.value) == "BigQuery state page read failed"
+    assert "simulated merge failure" not in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, RuntimeError)
 
 

@@ -222,7 +222,7 @@ class ModelAssertionExtractorOptions(_RelationBaseOptions):
     # The relations the model may assert. Also the output-schema enum, so the
     # model is constrained to this set both at request and validation time.
     relation_types: tuple[str, ...]
-    directed: bool = True
+    directed: StrictBool = True
     # Assertions at/above are `asserted`; below are `no_relation`.
     threshold: float = 0.5
     # Optional operator instructions folded into the system prompt.

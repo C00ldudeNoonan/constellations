@@ -12,6 +12,7 @@ from typing import Any, Protocol, cast
 
 import polars as pl
 
+from ..budget import BudgetLedger
 from ..config.profile import LLMConfig, WarehouseConfig
 from ..versioning import resolve_module_file
 
@@ -31,6 +32,9 @@ class TransformContext:
     warehouse: WarehouseConfig
     llm: LLMConfig | None
     options: dict[str, Any] = field(default_factory=dict)
+    # The invocation-wide LLM budget ledger, threaded so a `uses_llm` transform
+    # charges and enforces `llm.budget` like the native `llm:` kind (issue #240).
+    run_budget: BudgetLedger | None = None
 
 
 @dataclass(frozen=True)

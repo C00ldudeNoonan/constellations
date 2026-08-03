@@ -19,6 +19,7 @@ from ..agent_context import (
     empty_agent_context_frame,
     validate_agent_context_frame,
 )
+from ..budget import BudgetLedger
 from ..config.model import ModelConfig
 from ..config.profile import DEFAULT_LLM_PROVIDER
 from ..config.project import ProjectConfig
@@ -147,6 +148,7 @@ def run_transform_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool = False,
+    run_budget: BudgetLedger | None = None,
 ) -> ModelRunResult:
     assert model.transform is not None
     if model.transform.type != "python":
@@ -177,6 +179,7 @@ def run_transform_model(
         warehouse=resolved.warehouse,
         llm=resolved.llm,
         options=dict(model.transform.options),
+        run_budget=run_budget,
     )
 
     result = ModelRunResult(

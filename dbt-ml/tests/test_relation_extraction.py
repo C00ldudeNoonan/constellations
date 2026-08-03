@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from dbt_ml.adapters import parse_warehouse_config
+from dbt_ml.budget import BudgetExceededError, BudgetLedger, LLMBudgetConfig
 from dbt_ml.compiler import validate_project_contract
 from dbt_ml.config import load_project
 from dbt_ml.config.loader import ConfigError
@@ -592,6 +593,81 @@ def test_model_assertion_runs_through_deterministic_provider() -> None:
     output = extract_relations.run(_deps(), ctx)
     assert output.schema["confidence"] == pl.Float64
     assert set(("method", "status", "relation_type")).issubset(output.columns)
+
+
+def _ma_ctx(run_budget: BudgetLedger | None = None) -> TransformContext:
+    return TransformContext(
+        project_dir=Path("."),
+        profile_name="test",
+        target_name="dev",
+        warehouse=parse_warehouse_config(
+            {"type": "duckdb", "path": "./test.duckdb", "schema": "main"}
+        ),
+        llm=LLMConfig(provider="deterministic"),
+        options={
+            "mentions": "m",
+            "extractor": "model_assertion",
+            "relation_types": ["acquired", "located_in"],
+        },
+        run_budget=run_budget,
+    )
+
+
+def _ma_pairs() -> list[tuple[Mention, Mention]]:
+    return [(_MA_MENTIONS[0], _MA_MENTIONS[1])]
+
+
+def test_model_assertion_malformed_response_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A missing/malformed `items` must fail, not silently produce zero relations
+    # (which would delete a document's children on an incremental run).
+    from dbt_ml.text.transforms import _relations
+
+    monkeypatch.setattr(
+        _relations, "extract_fields_with_usage", lambda content, **kw: ({"items": "x"}, {})
+    )
+    infer = _relations._build_inference(_ma_ctx())
+    with pytest.raises(ValueError, match="malformed"):
+        infer.assert_relations(_ma_pairs(), _ma_options())
+
+
+def test_model_assertion_drops_out_of_range_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dbt_ml.text.transforms import _relations
+
+    items = [
+        {"subject_mention_id": "e1", "object_mention_id": "e2",
+         "relation_type": "acquired", "confidence": 1.5},
+        {"subject_mention_id": "e1", "object_mention_id": "e2",
+         "relation_type": "acquired", "confidence": float("nan")},
+        {"subject_mention_id": "e1", "object_mention_id": "e2",
+         "relation_type": "acquired", "confidence": 0.9},
+    ]
+    monkeypatch.setattr(
+        _relations, "extract_fields_with_usage", lambda content, **kw: ({"items": items}, {})
+    )
+    infer = _relations._build_inference(_ma_ctx())
+    result = infer.assert_relations(_ma_pairs(), _ma_options())
+    assert [a.confidence for a in result] == [pytest.approx(0.9)]
+
+
+def test_model_assertion_charges_and_enforces_run_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dbt_ml.text.transforms import _relations
+
+    monkeypatch.setattr(
+        _relations,
+        "extract_fields_with_usage",
+        lambda content, **kw: ({"items": []}, {"api_calls": 1}),
+    )
+    ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="run")
+    infer = _relations._build_inference(_ma_ctx(run_budget=ledger))
+    infer.assert_relations(_ma_pairs(), _ma_options())  # charges api_calls=1
+    with pytest.raises(BudgetExceededError):
+        infer.assert_relations(_ma_pairs(), _ma_options())  # budget now exhausted
 
 
 _MA_MODEL_YAML = """version: 2

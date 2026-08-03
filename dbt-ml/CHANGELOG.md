@@ -41,11 +41,15 @@
   mention pairs are dropped, so the model can only assert governed relations.
 - It runs through the same shared structured-inference core as the native `llm:`
   kind (`extract_fields_with_usage`, `output_cardinality: many`), so caching,
-  retries, and credential resolution are shared. Provider, model, and
-  credentials resolve from the profile's `llm:` block only; a model using it must
-  set `transform.uses_llm: true`, enforced at compile via a new transform
-  `requires_llm(options)` hook, and the resolved provider identity folds into the
-  model's code version so a provider/model change reprocesses the table.
+  retries, and credential resolution are shared, and the run-wide `llm.budget`
+  caps (`max_api_calls`, token, and cost limits) are charged and enforced per
+  call. Provider, model, and credentials resolve from the profile's `llm:` block
+  only; a model using it must set `transform.uses_llm: true`, enforced at compile
+  via a new transform `requires_llm(options)` hook, and the resolved provider
+  identity folds into the model's code version so a provider/model change
+  reprocesses the table. A malformed provider response fails the run rather than
+  silently deleting a document's relations, and confidences outside `[0, 1]` (or
+  non-finite) are dropped.
 - Evidence text and raw provider responses never enter logs or artifacts — only
   the shaped relation grain (`relation_type`, `directed`, `status`, `confidence`,
   mention IDs/offsets, extractor identity) is published. Unit tests inject a

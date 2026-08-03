@@ -6,13 +6,16 @@ the extractor selected by the ``extractor`` option; see ``dbt_ml.text.relations`
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import polars as pl
 
 from ...backends.llm_backend import extract_fields_with_usage
+from ...budget import BudgetGuard
 from ...config.profile import DEFAULT_LLM_PROVIDER, LLMConfig
+from ...execution.cost import estimate_cost
 from ...providers import get_inference_provider, resolve_provider_model
 from ...transforms import IncrementalContract, TransformContext
 from ..relations import (
@@ -123,6 +126,9 @@ def _build_inference(ctx: TransformContext) -> RelationInference:
         else get_inference_provider(provider_name)
     )
     model = resolve_provider_model(provider, llm.model if llm is not None else None)
+    # Charge and enforce `llm.budget` for every provider call, like the `llm:`
+    # kind — the run ledger is shared across the invocation (issue #240).
+    guard = BudgetGuard(None, ctx.run_budget, cost_estimator=_cost_estimator(llm))
     return _ProviderRelationInference(
         provider=provider_name,
         model=model,
@@ -131,7 +137,23 @@ def _build_inference(ctx: TransformContext) -> RelationInference:
         provider_options=provider_options or None,
         cache_path=str(llm.cache_path) if llm is not None and llm.cache_path else None,
         timeout_seconds=llm.timeout_seconds if llm is not None else None,
+        guard=guard,
     )
+
+
+def _cost_estimator(
+    llm: LLMConfig | None,
+) -> Callable[[Mapping[str, Any]], float] | None:
+    """Per-call USD estimate from the profile's pricing, for spend caps when the
+    provider does not self-report cost (sync path, so no batch discount)."""
+    if llm is None or llm.pricing is None:
+        return None
+    pricing = llm.pricing
+
+    def _estimate(metrics: Mapping[str, Any]) -> float:
+        return estimate_cost(dict(metrics), pricing)
+
+    return _estimate
 
 
 class _ProviderRelationInference:
@@ -150,6 +172,7 @@ class _ProviderRelationInference:
         provider_options: dict[str, Any] | None,
         cache_path: str | None,
         timeout_seconds: float | None,
+        guard: BudgetGuard,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -158,6 +181,7 @@ class _ProviderRelationInference:
         self._provider_options = provider_options
         self._cache_path = cache_path
         self._timeout_seconds = timeout_seconds
+        self._guard = guard
 
     def assert_relations(
         self,
@@ -180,12 +204,23 @@ class _ProviderRelationInference:
             kwargs["cache_path"] = self._cache_path
         if self._timeout_seconds is not None:
             kwargs["timeout_seconds"] = self._timeout_seconds
-        output, _usage = extract_fields_with_usage(
+        if self._guard.active:
+            self._guard.ensure_headroom()
+        output, usage = extract_fields_with_usage(
             _relation_inference_content(pairs, options), **kwargs
         )
+        if self._guard.active:
+            self._guard.charge_metrics(usage)
         items = output.get("items")
         if not isinstance(items, list):
-            return []
+            # A missing/malformed `items` is a provider-response error, not "no
+            # relations": returning [] would let an incremental run replace the
+            # document's children with nothing and advance state, silently
+            # deleting relations. Raise so the run fails and retries.
+            raise ValueError(
+                "relation inference provider returned a malformed response "
+                "(expected a list of assertions)"
+            )
         assertions: list[RelationAssertion] = []
         for item in items:
             if not isinstance(item, Mapping):
@@ -202,12 +237,18 @@ class _ProviderRelationInference:
                 continue
             if isinstance(confidence, bool) or not isinstance(confidence, int | float):
                 continue
+            confidence = float(confidence)
+            # The schema only asks for a number; drop values outside the
+            # documented unit interval rather than publish an invalid confidence
+            # that would also drive threshold status assignment.
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                continue
             assertions.append(
                 RelationAssertion(
                     subject_mention_id=subject_id,
                     object_mention_id=object_id,
                     relation_type=relation_type,
-                    confidence=float(confidence),
+                    confidence=confidence,
                 )
             )
         return assertions

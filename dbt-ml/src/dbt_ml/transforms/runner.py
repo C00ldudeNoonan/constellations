@@ -12,6 +12,7 @@ from typing import Any, Protocol, cast
 
 import polars as pl
 
+from ..budget import BudgetLedger
 from ..config.profile import LLMConfig, WarehouseConfig
 from ..versioning import resolve_module_file
 
@@ -31,6 +32,9 @@ class TransformContext:
     warehouse: WarehouseConfig
     llm: LLMConfig | None
     options: dict[str, Any] = field(default_factory=dict)
+    # The invocation-wide LLM budget ledger, threaded so a `uses_llm` transform
+    # charges and enforces `llm.budget` like the native `llm:` kind (issue #240).
+    run_budget: BudgetLedger | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +226,26 @@ def load_incremental_contract(
     None when the module does not implement it."""
     module = _load_transform_module(module_path, project_dir)
     return _incremental_contract_hook(module, module_path, options)
+
+
+def transform_requires_llm(
+    module_path: str,
+    project_dir: Path,
+    options: Mapping[str, Any],
+) -> bool:
+    """Whether a transform's optional ``requires_llm(options)`` hook reports that
+    the configuration needs a resolved ``llm:`` provider. Such a model must set
+    ``transform.uses_llm: true`` so the executor resolves inference and the code
+    version folds the provider identity. Absent hook → ``False``."""
+    module = _load_transform_module(module_path, project_dir)
+    hook = getattr(module, "requires_llm", None)
+    if hook is None:
+        return False
+    if not callable(hook):
+        raise AttributeError(
+            f"Transform '{module_path}' `requires_llm` must be callable"
+        )
+    return bool(hook(dict(options)))
 
 
 def _incremental_contract_hook(

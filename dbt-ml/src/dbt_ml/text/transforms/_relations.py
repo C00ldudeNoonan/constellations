@@ -6,15 +6,24 @@ the extractor selected by the ``extractor`` option; see ``dbt_ml.text.relations`
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import polars as pl
 
+from ...backends.llm_backend import extract_fields_with_usage
+from ...budget import BudgetGuard
+from ...config.profile import DEFAULT_LLM_PROVIDER, LLMConfig
+from ...execution.cost import estimate_cost
+from ...providers import get_inference_provider, resolve_provider_model
 from ...transforms import IncrementalContract, TransformContext
 from ..relations import (
     Mention,
+    ModelAssertionExtractorOptions,
+    RelationAssertion,
     RelationExtractor,
+    RelationInference,
     _order_key,
     get_relation_extractor,
     parse_relation_options,
@@ -76,6 +85,7 @@ def run_relations(
 ) -> pl.DataFrame:
     options = parse_relation_options(ctx.options)
     extractor = get_relation_extractor(options.extractor)
+    infer = _build_inference(ctx) if extractor.requires_inference() else None
     frame = _mentions_frame(deps, options)
     schema = _output_schema(options)
     grouped = _grouped_mentions(frame, options, extractor)
@@ -84,9 +94,192 @@ def run_relations(
 
     rows: list[dict[str, Any]] = []
     for document_id in sorted(grouped):
-        for relation in extractor.extract(grouped[document_id], options):
+        for relation in extractor.extract(grouped[document_id], options, infer=infer):
             rows.append(_relation_row(document_id, relation, options, extractor))
     return pl.DataFrame(rows, schema=schema, strict=False)
+
+
+# --- LLM inference for the model_assertion extractor (issue #240) -------------
+
+_RELATION_FIELDS_SPEC: list[dict[str, Any]] = [
+    {"name": "subject_mention_id", "type": "string",
+     "description": "id of the subject mention, copied verbatim from the input"},
+    {"name": "object_mention_id", "type": "string",
+     "description": "id of the object mention, copied verbatim from the input"},
+    {"name": "relation_type", "type": "string",
+     "description": "one of the allowed relation types, or omit the pair"},
+    {"name": "confidence", "type": "number",
+     "description": "confidence between 0 and 1"},
+]
+
+
+def _build_inference(ctx: TransformContext) -> RelationInference:
+    """Resolve the governed inference provider from the profile's `llm:` block
+    (never from the project YAML). Mirrors the `llm:` model kind's resolution so
+    provider/model/credential/endpoint all come from operator-owned config."""
+    llm: LLMConfig | None = ctx.llm
+    provider_name = llm.provider if llm is not None else DEFAULT_LLM_PROVIDER
+    provider_options = dict(llm.provider_options) if llm is not None else {}
+    provider = (
+        get_inference_provider(provider_name, profile_options=provider_options)
+        if provider_options
+        else get_inference_provider(provider_name)
+    )
+    model = resolve_provider_model(provider, llm.model if llm is not None else None)
+    # Charge and enforce `llm.budget` for every provider call, like the `llm:`
+    # kind — the run ledger is shared across the invocation (issue #240).
+    guard = BudgetGuard(None, ctx.run_budget, cost_estimator=_cost_estimator(llm))
+    return _ProviderRelationInference(
+        provider=provider_name,
+        model=model,
+        api_key_env=llm.api_key_env if llm is not None else None,
+        base_url=llm.base_url if llm is not None else None,
+        provider_options=provider_options or None,
+        cache_path=str(llm.cache_path) if llm is not None and llm.cache_path else None,
+        timeout_seconds=llm.timeout_seconds if llm is not None else None,
+        guard=guard,
+    )
+
+
+def _cost_estimator(
+    llm: LLMConfig | None,
+) -> Callable[[Mapping[str, Any]], float] | None:
+    """Per-call USD estimate from the profile's pricing, for spend caps when the
+    provider does not self-report cost (sync path, so no batch discount)."""
+    if llm is None or llm.pricing is None:
+        return None
+    pricing = llm.pricing
+
+    def _estimate(metrics: Mapping[str, Any]) -> float:
+        return estimate_cost(dict(metrics), pricing)
+
+    return _estimate
+
+
+class _ProviderRelationInference:
+    """`RelationInference` backed by the shared structured-LLM core
+    (`extract_fields_with_usage`, `output_cardinality: many`), so caching,
+    retries, and credential resolution match the `llm:`/`backend: llm` paths.
+    Only the shaped assertions are returned — raw provider output never escapes."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        api_key_env: Any,
+        base_url: str | None,
+        provider_options: dict[str, Any] | None,
+        cache_path: str | None,
+        timeout_seconds: float | None,
+        guard: BudgetGuard,
+    ) -> None:
+        self._provider = provider
+        self._model = model
+        self._api_key_env = api_key_env
+        self._base_url = base_url
+        self._provider_options = provider_options
+        self._cache_path = cache_path
+        self._timeout_seconds = timeout_seconds
+        self._guard = guard
+
+    def assert_relations(
+        self,
+        pairs: Sequence[tuple[Mention, Mention]],
+        options: ModelAssertionExtractorOptions,
+    ) -> list[RelationAssertion]:
+        if not pairs:
+            return []
+        kwargs: dict[str, Any] = {
+            "fields_spec": _RELATION_FIELDS_SPEC,
+            "provider": self._provider,
+            "model": self._model,
+            "system": _relation_system_prompt(options),
+            "output_cardinality": "many",
+            "api_key_env": self._api_key_env,
+            "base_url": self._base_url,
+            "provider_options": self._provider_options,
+        }
+        if self._cache_path is not None:
+            kwargs["cache_path"] = self._cache_path
+        if self._timeout_seconds is not None:
+            kwargs["timeout_seconds"] = self._timeout_seconds
+        if self._guard.active:
+            self._guard.ensure_headroom()
+        output, usage = extract_fields_with_usage(
+            _relation_inference_content(pairs, options), **kwargs
+        )
+        if self._guard.active:
+            self._guard.charge_metrics(usage)
+        items = output.get("items")
+        if not isinstance(items, list):
+            # A missing/malformed `items` is a provider-response error, not "no
+            # relations": returning [] would let an incremental run replace the
+            # document's children with nothing and advance state, silently
+            # deleting relations. Raise so the run fails and retries.
+            raise ValueError(
+                "relation inference provider returned a malformed response "
+                "(expected a list of assertions)"
+            )
+        assertions: list[RelationAssertion] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            subject_id = item.get("subject_mention_id")
+            object_id = item.get("object_mention_id")
+            relation_type = item.get("relation_type")
+            confidence = item.get("confidence")
+            if not (
+                isinstance(subject_id, str)
+                and isinstance(object_id, str)
+                and isinstance(relation_type, str)
+            ):
+                continue
+            if isinstance(confidence, bool) or not isinstance(confidence, int | float):
+                continue
+            confidence = float(confidence)
+            # The schema only asks for a number; drop values outside the
+            # documented unit interval rather than publish an invalid confidence
+            # that would also drive threshold status assignment.
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                continue
+            assertions.append(
+                RelationAssertion(
+                    subject_mention_id=subject_id,
+                    object_mention_id=object_id,
+                    relation_type=relation_type,
+                    confidence=confidence,
+                )
+            )
+        return assertions
+
+
+def _relation_system_prompt(options: ModelAssertionExtractorOptions) -> str:
+    allowed = ", ".join(options.relation_types)
+    base = (
+        "You extract typed relations between entity mentions in one document. "
+        "For each candidate pair, decide whether one of these relation types "
+        f"holds: {allowed}. Only use those types; if none applies, omit the pair. "
+        "Copy subject_mention_id and object_mention_id verbatim from the input "
+        "and set the direction so the relation reads subject -> object. Give a "
+        "confidence between 0 and 1."
+    )
+    return f"{base}\n\n{options.prompt}" if options.prompt else base
+
+
+def _relation_inference_content(
+    pairs: Sequence[tuple[Mention, Mention]],
+    options: ModelAssertionExtractorOptions,
+) -> str:
+    lines = ["Candidate mention pairs:"]
+    for index, (subject, obj) in enumerate(pairs):
+        lines.append(
+            f"{index + 1}. "
+            f"A(id={subject.mention_id}, label={subject.label}, "
+            f"text={subject.text!r}) "
+            f"B(id={obj.mention_id}, label={obj.label}, text={obj.text!r})"
+        )
+    return "\n".join(lines)
 
 
 def _mentions_frame(

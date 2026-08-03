@@ -440,6 +440,7 @@ def _run_model(
                 adapter=adapter,
                 resolved=resolved,
                 full_refresh=full_refresh,
+                run_budget=run_budget,
             )
     elif model.chunk is not None:
         result = _run_chunk_model(

@@ -78,7 +78,13 @@ repository-level `.github/workflows/` directory.
    extra-install command when they are absent.
 6. Use a provider protocol when execution depends on an external SDK or model.
    Unit tests must use a deterministic fake and must not require downloads,
-   credentials, or network access.
+   credentials, or network access. A transform that calls an LLM resolves the
+   provider from `ctx.llm` (the profile's `llm:` block) — reuse
+   `backends.llm_backend.extract_fields_with_usage` so caching/retries/credential
+   resolution match the `llm:` kind — and should expose `requires_llm(options) ->
+   bool`. The compiler enforces `transform.uses_llm: true` for such a model, and
+   `versioning.py` then folds the resolved provider identity into its code
+   version. The `extract_relations` `model_assertion` extractor is the reference.
 7. Document the input and output schemas, sensitive-field behavior, optional
    extra, and a runnable example whenever the transform is public.
 

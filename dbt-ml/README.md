@@ -1446,11 +1446,9 @@ in a document (for example `nlp_entities` output), one row per related pair. It
 keeps three kinds of relationship strictly distinguishable via the `method`
 column so a consumer never mistakes proximity for a semantic assertion:
 `co_occurrence` (proximity), `rule` (deterministic typed rules), and
-`model_assertion` (a learned/LLM extractor). Two deterministic, offline
-extractors ship — `co_occurrence` and `rule`; the `method` column and the
-extractor registry are shaped so a learned extractor plugs in without touching
-transform execution, and the generic structured-LLM path (#144) remains the way
-to run one now.
+`model_assertion` (a learned/LLM extractor). All three ship: `co_occurrence` and
+`rule` are deterministic and offline, and `model_assertion` calls a governed
+inference provider through the same registry seam.
 
 ```yaml
 - name: document_relations
@@ -1500,6 +1498,35 @@ no provider, no network.
       rules:
         - {subject_label: ORG, object_label: GPE, relation_type: references_geography}
         - {subject_label: ORG, object_label: MONEY, relation_type: references_amount}
+  materialization: incremental
+```
+
+Set `extractor: model_assertion` for a **learned/LLM** extractor. Per document it
+asks a governed inference provider whether one of the schema-controlled
+`relation_types` holds between each in-scope candidate pair, with a `confidence`;
+assertions at/above `threshold` are `asserted`, below are `no_relation`, and a
+pair the model maps to conflicting types is `ambiguous`. The `relation_types`
+list is the allow-list — the model may only assert those, enforced in the prompt
+and re-validated (out-of-list or hallucinated mention pairs are dropped). It runs
+through the same shared inference core as the `llm:` kind (caching, retries), so
+the model requires `transform.uses_llm: true` and resolves provider, model, and
+credentials from the profile's `llm:` block only — never from project YAML.
+Switching the provider or model reprocesses the table (the model identity folds
+into the code version). Evidence text and provider responses never enter
+artifacts.
+
+```yaml
+- name: document_relations_llm
+  depends_on: [ref('document_entities')]   # entities must carry text (include_text: true)
+  transform:
+    type: python
+    module: dbt_ml.text.transforms.extract_relations
+    uses_llm: true
+    options:
+      mentions: document_entities
+      extractor: model_assertion
+      relation_types: [acquired, subsidiary_of, references_geography]
+      threshold: 0.6
   materialization: incremental
 ```
 

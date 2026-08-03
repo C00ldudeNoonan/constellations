@@ -26,7 +26,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import (
     BaseModel,
@@ -45,6 +45,7 @@ from ..hashing import canonical_fingerprint
 # older extractor even when the package version moved for unrelated reasons.
 CO_OCCURRENCE_EXTRACTOR_VERSION = "1"
 RULE_EXTRACTOR_VERSION = "1"
+MODEL_ASSERTION_EXTRACTOR_VERSION = "1"
 
 RELATION_FINGERPRINT_DOMAIN = "dbt-ml.entity-relation"
 
@@ -63,6 +64,15 @@ def _require_non_empty(value: str) -> str:
     if not normalized:
         raise ValueError("must not be empty")
     return normalized
+
+
+def _reject_coerced_number(value: Any) -> Any:
+    """Reject a boolean or string before Pydantic's lax coercion turns it into a
+    float, so ``threshold: true`` or ``threshold: "0.9"`` fails the strict
+    preflight rather than silently changing which relations are asserted."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("must be a number, not a boolean or a string")
+    return value
 
 
 class _RelationBaseOptions(BaseModel):
@@ -200,19 +210,72 @@ class RuleExtractorOptions(_RelationBaseOptions):
         return self
 
 
+class ModelAssertionExtractorOptions(_RelationBaseOptions):
+    """A learned/LLM extractor (issue #240). For each in-scope candidate pair it
+    asks a governed inference provider whether one of the ``relation_types`` holds
+    and with what confidence. The type set is a schema-controlled allow-list: the
+    model may only assert those, enforced in the output schema and re-validated."""
+
+    extractor: Literal["model_assertion"] = "model_assertion"
+    scope: CoOccurrenceScope = "sentence"
+    max_char_gap: int = Field(default=100, ge=0, le=1_000_000)
+    # The relations the model may assert. Also the output-schema enum, so the
+    # model is constrained to this set both at request and validation time.
+    relation_types: tuple[str, ...]
+    directed: StrictBool = True
+    # Assertions at/above are `asserted`; below are `no_relation`.
+    threshold: float = 0.5
+    # Optional operator instructions folded into the system prompt.
+    prompt: str | None = None
+
+    @field_validator("relation_types")
+    @classmethod
+    def _unique_non_empty_types(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if not normalized:
+            raise ValueError("relation_types must not be empty")
+        if any(not value for value in normalized):
+            raise ValueError("relation_types entries must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("relation_types entries must be unique")
+        return normalized
+
+    @field_validator("threshold", mode="before")
+    @classmethod
+    def _strict_threshold(cls, value: Any) -> Any:
+        return _reject_coerced_number(value)
+
+    @field_validator("threshold")
+    @classmethod
+    def _threshold_in_unit_range(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("threshold must be between 0 and 1")
+        return value
+
+    @field_validator("prompt")
+    @classmethod
+    def _non_empty_prompt(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("prompt must not be empty; use null to omit")
+        return normalized
+
+
 RelationExtractorConfig = Annotated[
-    CoOccurrenceExtractorOptions | RuleExtractorOptions,
+    CoOccurrenceExtractorOptions | RuleExtractorOptions | ModelAssertionExtractorOptions,
     Field(discriminator="extractor"),
 ]
 
 _RELATION_ADAPTER: TypeAdapter[
-    CoOccurrenceExtractorOptions | RuleExtractorOptions
+    CoOccurrenceExtractorOptions | RuleExtractorOptions | ModelAssertionExtractorOptions
 ] = TypeAdapter(RelationExtractorConfig)
 
 
 def parse_relation_options(
     options: Mapping[str, Any],
-) -> CoOccurrenceExtractorOptions | RuleExtractorOptions:
+) -> CoOccurrenceExtractorOptions | RuleExtractorOptions | ModelAssertionExtractorOptions:
     """Validate raw options into the extractor-specific model. ``extractor`` is
     optional and defaults to ``co_occurrence``; an unknown value fails
     discriminator validation with the valid tags named."""
@@ -314,6 +377,30 @@ def _shared_sentence(subject: Mention, obj: Mention) -> int | None:
     return subject.sentence_index if subject.sentence_index == obj.sentence_index else None
 
 
+@dataclass(frozen=True)
+class RelationAssertion:
+    """One provider-returned assertion for a candidate pair, before the extractor
+    validates it against the allow-list and candidate set."""
+
+    subject_mention_id: str
+    object_mention_id: str
+    relation_type: str
+    confidence: float
+
+
+class RelationInference(Protocol):
+    """Governed inference for provider-based extractors. The driver builds the
+    concrete implementation from the resolved `llm:` profile; unit tests inject a
+    deterministic fake. Implementations must not let raw evidence text or provider
+    response bodies escape into logs or artifacts."""
+
+    def assert_relations(
+        self,
+        pairs: Sequence[tuple[Mention, Mention]],
+        options: ModelAssertionExtractorOptions,
+    ) -> list[RelationAssertion]: ...
+
+
 class RelationExtractor(ABC):
     name: str
     version: str
@@ -324,15 +411,27 @@ class RelationExtractor(ABC):
         ``include_mention_text``. Co-occurrence pairs on offsets, not text."""
         return False
 
+    def requires_inference(self) -> bool:
+        """Whether the driver must supply an inference provider (`infer`).
+        Deterministic extractors are offline and return ``False``."""
+        return False
+
     @abstractmethod
     def required_mention_columns(self, options: Any) -> tuple[str, ...]:
         """Extra mention columns this extractor reads beyond id/document/label
         and the evidence offsets the driver always requires."""
 
     @abstractmethod
-    def extract(self, mentions: Sequence[Mention], options: Any) -> list[Relation]:
+    def extract(
+        self,
+        mentions: Sequence[Mention],
+        options: Any,
+        *,
+        infer: RelationInference | None = None,
+    ) -> list[Relation]:
         """Produce the relations for one document's mentions. Mentions are
-        pre-filtered by the label allow-list and sorted by ``_order_key``."""
+        pre-filtered by the label allow-list and sorted by ``_order_key``.
+        ``infer`` is supplied only when ``requires_inference()`` is true."""
 
 
 # --- Co-occurrence extractor -------------------------------------------------
@@ -347,8 +446,13 @@ class CoOccurrenceExtractor(RelationExtractor):
         return ()
 
     def extract(
-        self, mentions: Sequence[Mention], options: CoOccurrenceExtractorOptions
+        self,
+        mentions: Sequence[Mention],
+        options: CoOccurrenceExtractorOptions,
+        *,
+        infer: RelationInference | None = None,
     ) -> list[Relation]:
+        del infer
         if len(mentions) < 2:
             return []
         pairs = _candidate_pairs(
@@ -388,8 +492,13 @@ class RuleExtractor(RelationExtractor):
         return ()
 
     def extract(
-        self, mentions: Sequence[Mention], options: RuleExtractorOptions
+        self,
+        mentions: Sequence[Mention],
+        options: RuleExtractorOptions,
+        *,
+        infer: RelationInference | None = None,
     ) -> list[Relation]:
+        del infer
         if len(mentions) < 2:
             return []
         pairs = _candidate_pairs(
@@ -424,9 +533,105 @@ class RuleExtractor(RelationExtractor):
         return relations
 
 
+# --- Model-assertion extractor -----------------------------------------------
+
+
+class ModelAssertionExtractor(RelationExtractor):
+    """Learned/LLM extractor (issue #240). Asks a governed inference provider,
+    per document, which of the schema-controlled ``relation_types`` hold between
+    the in-scope candidate mention pairs. Provider-returned assertions are
+    validated against the candidate set and the allow-list before shaping."""
+
+    name = "model_assertion"
+    version = MODEL_ASSERTION_EXTRACTOR_VERSION
+    method: RelationMethod = "model_assertion"
+
+    def text_required(self) -> bool:
+        return True
+
+    def requires_inference(self) -> bool:
+        return True
+
+    def required_mention_columns(self, options: Any) -> tuple[str, ...]:
+        return ()
+
+    def extract(
+        self,
+        mentions: Sequence[Mention],
+        options: ModelAssertionExtractorOptions,
+        *,
+        infer: RelationInference | None = None,
+    ) -> list[Relation]:
+        if infer is None:
+            raise ValueError(
+                "the model_assertion extractor requires an inference provider; "
+                "the driver supplies it from the resolved `llm:` profile"
+            )
+        if len(mentions) < 2:
+            return []
+        pairs = _candidate_pairs(
+            mentions,
+            scope=options.scope,
+            max_char_gap=options.max_char_gap,
+            max_pairs=options.max_pairs_per_document,
+        )
+        if not pairs:
+            return []
+
+        by_id = {mention.mention_id: mention for mention in mentions}
+        candidate_unordered = {
+            frozenset((subject.mention_id, obj.mention_id)) for subject, obj in pairs
+        }
+        allow = set(options.relation_types)
+
+        # Directed (subject, object) -> relation_type -> best confidence. Drop
+        # assertions the model hallucinated (unknown mention, non-candidate pair,
+        # or out-of-allow-list type) so it can only assert governed relations.
+        grouped: dict[tuple[str, str], dict[str, float]] = {}
+        for assertion in infer.assert_relations(pairs, options):
+            subject_id = assertion.subject_mention_id
+            object_id = assertion.object_mention_id
+            if subject_id == object_id or subject_id not in by_id or object_id not in by_id:
+                continue
+            if frozenset((subject_id, object_id)) not in candidate_unordered:
+                continue
+            if assertion.relation_type not in allow:
+                continue
+            confidence = float(assertion.confidence)
+            types = grouped.setdefault((subject_id, object_id), {})
+            if assertion.relation_type not in types or confidence > types[assertion.relation_type]:
+                types[assertion.relation_type] = confidence
+
+        relations: list[Relation] = []
+        for (subject_id, object_id), types in grouped.items():
+            subject = by_id[subject_id]
+            obj = by_id[object_id]
+            sentence_index = _shared_sentence(subject, obj)
+            # A single directed pair mapped to several relation types is a
+            # conflict the model could not resolve — preserve it as ambiguous.
+            ambiguous = len(types) > 1
+            for relation_type, confidence in sorted(types.items()):
+                if ambiguous:
+                    status: RelationStatus = "ambiguous"
+                else:
+                    status = "asserted" if confidence >= options.threshold else "no_relation"
+                relations.append(
+                    Relation(
+                        subject=subject,
+                        object=obj,
+                        relation_type=relation_type,
+                        directed=options.directed,
+                        status=status,
+                        confidence=confidence,
+                        sentence_index=sentence_index,
+                    )
+                )
+        return relations
+
+
 RELATION_EXTRACTORS: dict[str, RelationExtractor] = {
     extractor.name: extractor
-    for extractor in (CoOccurrenceExtractor(), RuleExtractor())
+    for extractor in (CoOccurrenceExtractor(), RuleExtractor(), ModelAssertionExtractor())
 }
 
 

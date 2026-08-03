@@ -2643,7 +2643,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
             absence_sql = (
                 " AND NOT EXISTS (SELECT 1 FROM "
-                f"{self.table_ref(probe.table)} FOR SYSTEM_TIME AS OF ? AS probe "
+                f"{self.table_ref(probe.table)} AS probe FOR SYSTEM_TIME AS OF ? "
                 f"WHERE probe.{self.quote_ident(probe.key_column)} = "
                 "state.record_key)"
             )
@@ -2667,7 +2667,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 rows = self.rows(
                     "SELECT state.record_key, state.input_fingerprint, "
                     "state.code_version, state.last_run_at "
-                    f"FROM {self._state_ref} FOR SYSTEM_TIME AS OF ? AS state "
+                    f"FROM {self._state_ref} AS state FOR SYSTEM_TIME AS OF ? "
                     "WHERE state.model_name = ? AND state.state_scope = ? "
                     f"AND state.target_identity = ?{key_sql}{absence_sql} "
                     "ORDER BY state.record_key LIMIT ?",
@@ -2675,8 +2675,10 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
             except AdapterError:
                 raise
-            except Exception:
-                raise AdapterError("BigQuery state page read failed") from None
+            except Exception as exc:
+                raise AdapterError(
+                    f"BigQuery state page read failed: {exc}"
+                ) from exc
             records = tuple(
                 StatePageRecord(
                     str(row[0]),

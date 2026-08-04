@@ -2,9 +2,10 @@
 
 Status: implemented, including entry-point plugin discovery, provider-owned
 profile configuration, and failed-outcome accounting (issue #71). Built-ins
-include Anthropic and vLLM inference plus deterministic and Vertex AI
-embeddings. Additional vendor integrations are not on the current roadmap; the
-entry-point contract remains available for separately distributed plugins.
+include Anthropic, vLLM, and Vertex AI inference plus deterministic and Vertex
+AI embeddings. Vertex AI is a first-class built-in spanning both capabilities
+(issue #17); other new vendor integrations are not on the current roadmap, and
+the entry-point contract remains available for separately distributed plugins.
 
 dbt-ml treats hosted inference as an execution capability, not as a property of
 the LLM backend. Models describe the transformation they need; a provider
@@ -12,10 +13,11 @@ translates that provider-neutral request into an SDK call. This boundary keeps
 model compilation, caching, materialization, lineage, and usage accounting
 independent from Anthropic or any future inference service.
 
-The built-in inference implementations are Anthropic and vLLM. The built-in
-embedding implementations are deterministic and Vertex AI. The contracts cover
-inference and embeddings separately so a target can select different providers
-for generation and vectorization.
+The built-in inference implementations are Anthropic, vLLM, and Vertex AI. The
+built-in embedding implementations are deterministic and Vertex AI. The
+contracts cover inference and embeddings separately so a target can select
+different providers for generation and vectorization; a target may also select
+`vertex` for both.
 
 ## Contract surface
 
@@ -367,6 +369,29 @@ per input. Token statistics are normalized into `ProviderUsage`; malformed
 billed responses carry sanitized failed-outcome usage. Query helpers mark
 requests as query inputs so inherited retrieval uses the separately configured
 query task type.
+
+## Vertex AI inference mapping
+
+`VertexInferenceProvider` (issue #17) shares the `vertex` provider name with the
+embedding provider and uses the same optional `google-genai` SDK in explicit
+Vertex mode with the stable `v1` API. Authentication is Application Default
+Credentials; `api_key_env` is rejected at profile resolution. Profile options
+select only the GCP project and location, which are execution routing and do not
+enter the transformation's semantic identity.
+
+The provider forwards the provider-neutral `InferenceRequest` to
+`generate_content`: `system_prompt` becomes the system instruction, `content`
+the user content, and the request `output_schema` is forwarded as the Gemini
+`response_schema` with `response_mime_type=application/json`, so the model is
+constrained to the requested fields. `temperature`, `max_tokens`, and the
+`max_retries`/timeout runtime map onto the SDK config and HTTP options exactly
+as the embedding provider does. A `MAX_TOKENS` finish reason is treated as a
+truncated response and rejected — partial structured output is never used — and
+any non-`STOP` finish reason (safety, recitation) is surfaced as a sanitized
+error carrying only the enum name. Usage metadata is normalized into
+`ProviderUsage` (prompt, candidate, and cached-content tokens), and a
+malformed-but-billed response carries sanitized failed-outcome usage. The model
+is not defaulted: a profile or model must name an explicit Gemini model.
 
 ## Adding a provider
 

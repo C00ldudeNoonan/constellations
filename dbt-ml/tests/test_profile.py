@@ -402,6 +402,7 @@ def test_profile_selected_provider_enforces_native_batch_capability(
         supports_native_batch=False,
         resolve_model=lambda model: model or "sync-model",
         resolve_base_url=lambda base_url: base_url,
+        validate_credential_reference=lambda env_var: None,
     )
     monkeypatch.setattr("dbt_ml.profile.get_inference_provider", lambda _name: provider)
     _write_project(tmp_path, profile="test_proj")

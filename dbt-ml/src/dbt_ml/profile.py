@@ -177,6 +177,9 @@ def resolve_profile(
             # selected provider's published model; the raw mapping stays on
             # the resolved profile and is re-parsed at the provider boundary.
             parse_profile_options(type(inference_provider), llm.provider_options)
+            # Reject an api_key_env a provider cannot accept (e.g. Vertex, which
+            # is ADC-only) at preflight, matching the embedding path below.
+            inference_provider.validate_credential_reference(llm.api_key_env)
             llm = llm.model_copy(
                 update={
                     "model": resolve_provider_model(inference_provider, llm.model),

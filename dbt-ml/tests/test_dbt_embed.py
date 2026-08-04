@@ -132,3 +132,92 @@ def test_embeddable_skips_transforms_that_depend_on_nonemittable_models() -> Non
         _fake_model("downstream", transform=True, deps=["bad"]),  # transitively
     ]
     assert {m.name for m in _embeddable_models(models)} == {"ex", "good"}
+
+
+# --- dbt_ref source: the reverse dbt->dbt-ml direction (#177) -----------------
+
+
+@pytest.fixture
+def dbt_ref_project(tmp_path: Path) -> Path:
+    """A minimal dbt-ml project with one transform whose input is a dbt-built
+    table (`source: dbt_ref('vendor_dim')`)."""
+    proj = tmp_path / "dbt_ref_proj"
+    (proj / "models").mkdir(parents=True)
+    (proj / "transforms").mkdir()
+    (proj / "dbt_ml_project.yml").write_text(
+        "name: refproj\nversion: '0.1.0'\nprofile: refproj\n", encoding="utf-8"
+    )
+    (proj / "profiles.yml").write_text(
+        "refproj:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        "        path: ./target/db.duckdb\n"
+        "        schema: main\n",
+        encoding="utf-8",
+    )
+    (proj / "models" / "enriched_vendors.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: enriched_vendors\n"
+        "    source: dbt_ref('vendor_dim')\n"
+        "    materialization: full\n"
+        "    transform:\n"
+        "      type: python\n"
+        "      module: transforms.enrich\n"
+        "    fields:\n"
+        "      - {name: vendor, type: string}\n"
+        "      - {name: spend_doubled, type: float}\n",
+        encoding="utf-8",
+    )
+    (proj / "transforms" / "enrich.py").write_text(
+        "from __future__ import annotations\n\n"
+        "import polars as pl\n\n\n"
+        "def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:\n"
+        "    frame = deps['vendor_dim']\n"
+        "    return frame.with_columns((pl.col('spend') * 2).alias('spend_doubled'))\n",
+        encoding="utf-8",
+    )
+    return proj
+
+
+def test_dbt_ref_shim_reads_the_dbt_built_table(dbt_ref_project: Path, tmp_path: Path) -> None:
+    out = tmp_path / "gen"
+    generate_dbt_models(dbt_ref_project, out)
+    shim = (out / "enriched_vendors.py").read_text(encoding="utf-8")
+    # The dbt_ref source is fed in like any upstream: dbt orders vendor_dim first,
+    # the shim reads it from dbt.ref(...) and injects it.
+    assert "'vendor_dim': dbt.ref('vendor_dim').pl()," in shim
+    assert "upstreams=upstreams" in shim
+    assert "'enriched_vendors'," in shim
+
+
+def test_dbt_ref_model_is_embeddable_and_in_schema(dbt_ref_project: Path, tmp_path: Path) -> None:
+    out = tmp_path / "gen"
+    generate_dbt_models(dbt_ref_project, out)
+    schema = yaml.safe_load((out / "schema.yml").read_text(encoding="utf-8"))
+    assert "enriched_vendors" in {m["name"] for m in schema["models"]}
+
+
+def test_materialize_dbt_ref_transform_reads_injected_dbt_table(dbt_ref_project: Path) -> None:
+    # The reverse direction end to end: feed the frame the dbt Python model would
+    # have read from dbt.ref('vendor_dim') and assert dbt-ml transforms it.
+    vendor_dim = pl.DataFrame({"vendor": ["Acme", "Globex"], "spend": [10.0, 7.0]})
+    result = materialize(
+        "enriched_vendors",
+        project_dir=dbt_ref_project,
+        upstreams={"vendor_dim": vendor_dim},
+    )
+    rows = {r["vendor"]: r for r in result.to_dicts()}
+    assert rows["Acme"]["spend_doubled"] == pytest.approx(20.0)
+    assert rows["Globex"]["spend_doubled"] == pytest.approx(14.0)
+
+
+def test_standalone_run_rejects_dbt_ref_models(dbt_ref_project: Path) -> None:
+    from dbt_ml.execution import RunError
+    from dbt_ml.runner import run_project
+
+    with pytest.raises(RunError, match="embedded mode"):
+        run_project(dbt_ref_project)

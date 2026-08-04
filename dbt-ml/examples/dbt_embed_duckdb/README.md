@@ -82,8 +82,24 @@ write-up.
   BigQuery/Dataproc) sandbox network egress, so extraction backends that call
   Anthropic or read files can't run there. Other warehouses keep using the
   standalone CLI + `emit-dbt-sources` handoff.
-- **Extraction/transform models.** The bidirectional `dbt_ref` source (a dbt-ml
-  model consuming a dbt table via `session`) is the next slice in #177.
+- **Bidirectional `dbt_ref` source (now supported).** A dbt-ml transform can
+  consume a **dbt-built** table by declaring `source: dbt_ref('<dbt_model>')`
+  in its dbt-ml YAML:
+
+  ```yaml
+  # dbt-ml project: models/enriched_vendors.yml
+  models:
+    - name: enriched_vendors
+      source: dbt_ref('vendor_dim')      # reads a dbt-built table
+      transform: { type: python, module: transforms.enrich }
+  ```
+
+  `dbt-ml codegen` renders this into a literal `dbt.ref('vendor_dim')` in the
+  shim, so dbt orders the dbt model first and `dbt docs` shows one lineage graph
+  spanning both directions. These models run **only** in embedded mode — the
+  standalone `dbt-ml run`/`build` rejects them, since only dbt can resolve the
+  ref. v1 is dbt_ref-only (one dbt-built table per transform; mixing with dbt-ml
+  `depends_on` is a follow-up).
 - **No dbt-ml-side incremental** in embedded mode; the LLM response cache still
   makes re-runs cheap under dbt full-refresh.
 - `DBT_ML_PROJECT_DIR` locates the colocated dbt-ml project because dbt-duckdb

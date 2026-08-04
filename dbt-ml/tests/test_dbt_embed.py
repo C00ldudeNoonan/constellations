@@ -175,12 +175,30 @@ def dbt_ref_project(tmp_path: Path) -> Path:
     (proj / "transforms" / "enrich.py").write_text(
         "from __future__ import annotations\n\n"
         "import polars as pl\n\n\n"
+        "def declared_dependencies(options):\n"
+        "    # The dbt_ref target is the transform's declared input; the compiler\n"
+        "    # must validate the contract against it even though it forms no\n"
+        "    # dbt-ml DAG edge (#177).\n"
+        "    return ('vendor_dim',)\n\n\n"
         "def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:\n"
         "    frame = deps['vendor_dim']\n"
         "    return frame.with_columns((pl.col('spend') * 2).alias('spend_doubled'))\n",
         encoding="utf-8",
     )
     return proj
+
+
+def test_dbt_ref_transform_contract_validates_against_the_ref_target(
+    dbt_ref_project: Path,
+) -> None:
+    # Regression: a dbt_ref transform whose module declares its dependency must
+    # compile — the contract is validated against the dbt_ref target, not the
+    # (empty) depends_on. Compiling the project must not raise.
+    from dbt_ml.compiler import validate_project_contract
+    from dbt_ml.config import load_project
+
+    project, sources, models = load_project(dbt_ref_project)
+    validate_project_contract(project, sources, models, dbt_ref_project)
 
 
 def test_dbt_ref_shim_reads_the_dbt_built_table(dbt_ref_project: Path, tmp_path: Path) -> None:

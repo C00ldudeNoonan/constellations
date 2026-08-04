@@ -877,12 +877,21 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             "valid dotted Python module path",
             ("transform", "module"),
         )
+    # A dbt_ref('...') source is the transform's single input (#177): it forms no
+    # dbt-ml DAG edge, but the module's declared_dependencies still name it, so it
+    # must be the dependency the contract is validated against.
+    if model.source is not None and is_dbt_ref(model.source):
+        declared_dependencies = [parse_dbt_ref(model.source)]
+    else:
+        declared_dependencies = [
+            parse_ref(dependency) for dependency in model.depends_on or []
+        ]
     try:
         validate_transform_contract(
             transform.module,
             project_dir,
             transform.options,
-            [parse_ref(dependency) for dependency in model.depends_on or []],
+            declared_dependencies,
             materialization=model.materialization,
         )
     except (Exception, SystemExit) as e:

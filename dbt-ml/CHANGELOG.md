@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 - 2026-08-04
 
 ### Complete the data-quality checks: chi-squared, golden sets, LLM-judge (issue #10)
 
@@ -119,6 +119,33 @@
   narrowing, and `cast(Any, …)` at test-double boundaries rather than broad
   suppressions. Annotation-*presence* (Ruff `ANN`/`PYI`) stays enforced on
   package source only; `[tool.ty]` rules are unchanged.
+
+### Vertex AI Gemini inference provider (issue #17)
+
+- Added `VertexInferenceProvider` as a core built-in, so `provider: vertex` now
+  covers **both** structured generation and embeddings (the Vertex embedding
+  provider shipped earlier). The inference and embedding registries stay
+  separate but share the `vertex` name.
+
+### `dbt_ref` source: consume dbt-built tables (issue #177)
+
+- A dbt-ml transform can now read a dbt-built table by declaring
+  `source: dbt_ref('<dbt_model>')`, closing the bidirectional gap in the
+  embedded dbt-duckdb integration (Architecture A). These models run in embedded
+  mode via `dbt-ml codegen` + `dbt build` — the standalone runner rejects a
+  `dbt_ref(...)` source with an actionable error, since only dbt can resolve it.
+
+### Fixed
+
+- BigQuery `search:` model builds no longer fail during state reconciliation
+  with `BigQuery state page read failed` (issue #249). BigQuery requires the
+  table alias *before* `FOR SYSTEM_TIME AS OF …`; the state-page reader and its
+  absence-probe subquery emitted it after, a syntax error.
+
+### Dependencies
+
+- Raised `cryptography` to `>=50.0.0` (CVE-2026-69247, flagged by `pip-audit`)
+  and re-locked.
 
 ## v0.4.0 - 2026-07-31
 

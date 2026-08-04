@@ -23,7 +23,7 @@ from ..budget import BudgetLedger
 from ..config.model import ModelConfig
 from ..config.profile import DEFAULT_LLM_PROVIDER
 from ..config.project import ProjectConfig
-from ..dag import parse_ref
+from ..dag import is_dbt_ref, parse_dbt_ref, parse_ref
 from ..hashing import canonical_fingerprint, canonical_json
 from ..paths import resolve_within_project
 from ..profile import ResolvedProfile
@@ -157,7 +157,10 @@ def run_transform_model(
         )
     if not model.transform.module:
         raise RunError(f"Model '{model.name}': transform requires a `module:`")
-    if not model.depends_on:
+    dbt_ref_source = (
+        model.source if model.source and is_dbt_ref(model.source) else None
+    )
+    if not model.depends_on and dbt_ref_source is None:
         raise RunError(
             f"Transform model '{model.name}' must declare `depends_on:` for v1"
         )
@@ -168,7 +171,13 @@ def run_transform_model(
 
     transform_fn = load_transform(model.transform.module, project_dir)
     deps: dict[str, pl.DataFrame] = {}
-    for dep_ref in model.depends_on:
+    if dbt_ref_source is not None:
+        # The single input is a dbt-built table (#177). In embedded mode the dbt
+        # Python shim reads `dbt.ref('name')` and injects it as an upstream, which
+        # the CaptureAdapter serves through the same `read_table` path.
+        dbt_ref_name = parse_dbt_ref(dbt_ref_source)
+        deps[dbt_ref_name] = adapter.read_table(dbt_ref_name)
+    for dep_ref in model.depends_on or []:
         dep_name = parse_ref(dep_ref)
         deps[dep_name] = adapter.read_table(dep_name)
 

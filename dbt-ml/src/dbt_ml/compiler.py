@@ -11,7 +11,7 @@ from .config.model import ModelConfig, protect_model_llm_credential_option
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .config.yaml_diagnostics import ConfigPath
-from .dag import DAGError, ProjectDAG, parse_ref
+from .dag import DAGError, ProjectDAG, is_dbt_ref, parse_dbt_ref, parse_ref
 from .embedding import resolve_search_embedding_identity
 from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
@@ -537,6 +537,34 @@ def _validate_model_edges(
             "extraction/transform/ml/chunk/embed/llm/search",
         )
 
+    if model.source is not None and is_dbt_ref(model.source):
+        # A `dbt_ref('...')` source names a dbt-built table (reverse direction,
+        # #177). v1: transform-only, single input, resolved by dbt in embedded
+        # mode — never validated against the dbt-ml graph.
+        if model.transform is None:
+            raise _model_error(
+                model,
+                f"{_kind_label(model)} model '{model.name}' may not use a "
+                "`dbt_ref(...)` source; it is supported only on transform models",
+                ("source",),
+            )
+        if model.depends_on is not None:
+            raise _model_error(
+                model,
+                f"Transform model '{model.name}' with a `dbt_ref(...)` source must "
+                "not also declare `depends_on:` (v1 reads a single dbt-built table)",
+                ("depends_on",),
+            )
+        target = parse_dbt_ref(model.source)
+        if target in model_names or target in source_names or target in search_names:
+            raise _model_error(
+                model,
+                f"Transform model '{model.name}' dbt_ref('{target}') names a dbt-ml "
+                "node; a dbt_ref must name a dbt-built table outside the dbt-ml graph",
+                ("source",),
+            )
+        return
+
     if model.extraction is not None:
         if not model.source:
             raise _model_error(
@@ -849,12 +877,21 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             "valid dotted Python module path",
             ("transform", "module"),
         )
+    # A dbt_ref('...') source is the transform's single input (#177): it forms no
+    # dbt-ml DAG edge, but the module's declared_dependencies still name it, so it
+    # must be the dependency the contract is validated against.
+    if model.source is not None and is_dbt_ref(model.source):
+        declared_dependencies = [parse_dbt_ref(model.source)]
+    else:
+        declared_dependencies = [
+            parse_ref(dependency) for dependency in model.depends_on or []
+        ]
     try:
         validate_transform_contract(
             transform.module,
             project_dir,
             transform.options,
-            [parse_ref(dependency) for dependency in model.depends_on or []],
+            declared_dependencies,
             materialization=model.materialization,
         )
     except (Exception, SystemExit) as e:

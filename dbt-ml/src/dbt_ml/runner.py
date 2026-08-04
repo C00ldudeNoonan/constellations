@@ -30,7 +30,7 @@ from .config.model import (
 )
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
-from .dag import ProjectDAG
+from .dag import ProjectDAG, is_dbt_ref
 from .execution import ModelRunResult as ModelRunResult
 from .execution import RunError as RunError
 from .execution import chunk as _chunk_execution
@@ -196,6 +196,25 @@ def run_project(
             "activation and state replacement are implemented by #153"
         )
 
+    dbt_ref_models = sorted(
+        model.name
+        for model in models
+        if model.name in set(selected)
+        and model.source is not None
+        and is_dbt_ref(model.source)
+    )
+    if dbt_ref_models:
+        # A dbt_ref('...') source reads a dbt-built table, which only dbt can
+        # resolve. These models run in embedded mode (dbt-duckdb Python models via
+        # `dbt_ml.dbt_embed.materialize`), not the standalone runner (#177).
+        raise RunError(
+            "Models "
+            + ", ".join(f"'{name}'" for name in dbt_ref_models)
+            + " use a `dbt_ref(...)` source and can only run in embedded mode "
+            "(dbt-duckdb) via `dbt-ml codegen` + `dbt build`, not standalone "
+            "`dbt-ml run`/`build`."
+        )
+
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
@@ -274,6 +293,25 @@ def build_project(
         raise RunError(
             "--full-refresh is unavailable for search resources until atomic store "
             "activation and state replacement are implemented by #153"
+        )
+
+    dbt_ref_models = sorted(
+        model.name
+        for model in models
+        if model.name in set(selected)
+        and model.source is not None
+        and is_dbt_ref(model.source)
+    )
+    if dbt_ref_models:
+        # A dbt_ref('...') source reads a dbt-built table, which only dbt can
+        # resolve. These models run in embedded mode (dbt-duckdb Python models via
+        # `dbt_ml.dbt_embed.materialize`), not the standalone runner (#177).
+        raise RunError(
+            "Models "
+            + ", ".join(f"'{name}'" for name in dbt_ref_models)
+            + " use a `dbt_ref(...)` source and can only run in embedded mode "
+            "(dbt-duckdb) via `dbt-ml codegen` + `dbt build`, not standalone "
+            "`dbt-ml run`/`build`."
         )
 
     required_sources = set(dag.required_sources(selected))

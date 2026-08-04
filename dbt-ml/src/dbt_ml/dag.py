@@ -10,6 +10,23 @@ from .config.source import SourceConfig
 from .test_specs import TestSpecError, relationship_test_targets
 
 _REF_PATTERN = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
+# A `dbt_ref('name')` source names a dbt-built table (the reverse dbt->dbt-ml
+# direction, #177). It is a boundary input resolved by dbt in embedded mode, not
+# a dbt-ml node, so it is parsed separately from `ref(...)`.
+_DBT_REF_PATTERN = re.compile(r"^\s*dbt_ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
+
+
+def is_dbt_ref(value: str) -> bool:
+    """Whether `value` is a `dbt_ref('name')` source expression."""
+    return _DBT_REF_PATTERN.match(value) is not None
+
+
+def parse_dbt_ref(value: str) -> str:
+    """Extract the dbt model name from a `dbt_ref('name')` expression."""
+    match = _DBT_REF_PATTERN.match(value)
+    if match is None:
+        raise ValueError(f"invalid dbt_ref expression: {value!r}")
+    return match.group(1)
 
 
 class NodeKind(StrEnum):
@@ -66,7 +83,9 @@ class ProjectDAG:
             kind = NodeKind.SEARCH_INDEX if model.search is not None else NodeKind.MODEL
             self._add_node(Node(model.name, kind, frozenset(model.tags)))
             preds: set[str] = set()
-            if model.source:
+            if model.source and not is_dbt_ref(model.source):
+                # A dbt_ref('...') source is a dbt-built table resolved by dbt in
+                # embedded mode, not a dbt-ml node — it forms no dbt-ml graph edge.
                 preds.add(parse_ref(model.source))
             if model.depends_on:
                 preds.update(parse_ref(dep) for dep in model.depends_on)

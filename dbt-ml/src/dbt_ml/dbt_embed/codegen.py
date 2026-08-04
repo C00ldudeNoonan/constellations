@@ -18,7 +18,7 @@ import yaml
 
 from ..config import load_project
 from ..config.model import ModelConfig
-from ..dag import parse_ref
+from ..dag import is_dbt_ref, parse_dbt_ref, parse_ref
 from ..dbt_export import _table_for_model
 
 _GENERATED_HEADER = (
@@ -110,6 +110,11 @@ def _model_entry(table: dict[str, object]) -> dict[str, object]:
 
 def _render_shim(project_name: str, model: ModelConfig) -> str:
     deps = [parse_ref(d) for d in (model.depends_on or [])]
+    # A dbt_ref('...') source (#177) is fed in exactly like a dbt-ml upstream:
+    # the shim reads dbt.ref('name') and passes the frame through `upstreams`,
+    # and dbt orders the dbt-built table before this node.
+    if model.source and is_dbt_ref(model.source):
+        deps = [parse_dbt_ref(model.source), *deps]
     name = model.name
 
     lines = [

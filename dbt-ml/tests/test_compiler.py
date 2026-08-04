@@ -1166,3 +1166,42 @@ def test_build_materializes_relationship_target_before_running_child_test(
     assert [run.model_name for run in result.run_results] == ["parent", "child"]
     relationship = next(test for test in result.test_results if test.test_name == "relationships")
     assert relationship.passed
+
+
+# --- dbt_ref source validation (#177) ----------------------------------------
+
+
+def _dbt_ref_transform(
+    name: str = "enriched", ref: str = "vendor_dim", deps: list[str] | None = None
+) -> ModelConfig:
+    return ModelConfig(
+        name=name,
+        source=f"dbt_ref('{ref}')",
+        depends_on=[f"ref('{d}')" for d in deps] if deps else None,
+        transform={"type": "python", "module": "transforms.enrich"},
+    )
+
+
+def test_dbt_ref_source_rejected_on_non_transform(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="raw", source="dbt_ref('vendor_dim')", extraction={"backend": "json"}
+    )
+    with pytest.raises(ConfigError, match="only on transform models"):
+        validate_project_contract(ProjectConfig(name="p"), [], [model], tmp_path)
+
+
+def test_dbt_ref_source_rejects_extra_depends_on(tmp_path: Path) -> None:
+    # v1 is dbt_ref-only: a dbt_ref transform's single input is the dbt table.
+    model = _dbt_ref_transform(deps=["other"])
+    with pytest.raises(ConfigError, match="must not also declare `depends_on"):
+        validate_project_contract(ProjectConfig(name="p"), [], [model], tmp_path)
+
+
+def test_dbt_ref_must_not_name_a_dbt_ml_node(tmp_path: Path) -> None:
+    # A dbt_ref names a dbt-built table outside the dbt-ml graph; colliding with
+    # a dbt-ml source (or model) is a configuration error.
+    model = _dbt_ref_transform(ref="vendor_dim")
+    with pytest.raises(ConfigError, match="names a dbt-ml node"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source("vendor_dim")], [model], tmp_path
+        )

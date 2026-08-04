@@ -1131,8 +1131,11 @@ Incremental runs skip inputs whose content and configuration are unchanged,
 regenerate rows when the content or the prompt/schema/provider identity change,
 and delete an input's rows when it is removed upstream (parent-scoped for
 fan-out). The built-in `deterministic` provider runs offline for tests and
-examples; a production provider implements the same `InferenceProvider`
-contract. Manifest and run-results artifacts expose only the safe resolved
+examples; production providers implement the same `InferenceProvider`
+contract — `anthropic`, `vllm`, and `vertex` (Gemini models on Vertex AI via
+`google-genai`, ADC-only, selecting the GCP project and location under profile
+`llm:` configuration; install `dbt-ml[vertex]`). Manifest and run-results
+artifacts expose only the safe resolved
 identity and aggregate usage — prompts, input text, and credentials are never
 copied into artifacts. Native provider batch execution for `llm:` models is
 deferred (issue #149 covers the batch machinery `backend: llm` already uses).

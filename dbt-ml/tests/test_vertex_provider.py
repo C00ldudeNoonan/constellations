@@ -17,17 +17,22 @@ from dbt_ml.optional_dependencies import OptionalDependencyError
 from dbt_ml.profile import ProfileError, resolve_profile
 from dbt_ml.providers import (
     EmbeddingRequest,
+    InferenceRequest,
     ProviderConfigurationError,
     ProviderRequestError,
     ProviderResponseError,
     ProviderRuntimeOptions,
     get_embedding_provider,
+    get_inference_provider,
     list_embedding_providers,
+    list_inference_providers,
 )
 from dbt_ml.providers import vertex as vertex_module
 from dbt_ml.providers.vertex import (
     VertexEmbeddingOptions,
     VertexEmbeddingProvider,
+    VertexInferenceOptions,
+    VertexInferenceProvider,
 )
 
 
@@ -511,3 +516,347 @@ def test_build_runs_vertex_embed_model_with_mocked_responses(
     )
     assert embedding["provider"] == "vertex"
     assert embedding["provider_options_identity"]
+
+
+# --- Vertex AI inference (Gemini structured extraction, issue #17) -----------
+
+
+class _FakeInferenceModels:
+    def __init__(self, calls: list[dict[str, Any]], *, response: Any) -> None:
+        self.calls = calls
+        self._response = response
+
+    def generate_content(
+        self,
+        *,
+        model: str,
+        contents: Any,
+        config: dict[str, Any],
+    ) -> Any:
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        return self._response
+
+
+class _FakeInferenceGenAI:
+    def __init__(self, response: Any) -> None:
+        self.client_options: list[dict[str, Any]] = []
+        self.calls: list[dict[str, Any]] = []
+        self.close_count = 0
+        self._response = response
+
+    def Client(self, **options: Any) -> Any:
+        self.client_options.append(options)
+        owner = self
+
+        class Client:
+            models = _FakeInferenceModels(owner.calls, response=owner._response)
+
+            def close(self) -> None:
+                owner.close_count += 1
+
+        return Client()
+
+
+def _inference_response(
+    *,
+    output: str = '{"relation_type": "acquired"}',
+    finish: str = "STOP",
+    prompt_tokens: int = 10,
+    output_tokens: int = 5,
+    thoughts_tokens: int = 0,
+    cached: int = 0,
+    response_id: str = "resp-1",
+    include_text: bool = True,
+) -> Any:
+    candidate = SimpleNamespace(
+        finish_reason=SimpleNamespace(name=finish),
+        content=SimpleNamespace(parts=[SimpleNamespace(text=output)]),
+    )
+    response = SimpleNamespace(
+        candidates=[candidate],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=prompt_tokens,
+            candidates_token_count=output_tokens,
+            thoughts_token_count=thoughts_tokens,
+            cached_content_token_count=cached,
+        ),
+        response_id=response_id,
+    )
+    if include_text:
+        response.text = output
+    return response
+
+
+def _inference_provider(**options: Any) -> VertexInferenceProvider:
+    provider = get_inference_provider("vertex", profile_options=options)
+    assert isinstance(provider, VertexInferenceProvider)
+    return provider
+
+
+def _inference_request(**overrides: Any) -> InferenceRequest:
+    fields: dict[str, Any] = {
+        "model": "gemini-2.5-flash",
+        "content": "Document text.",
+        "system_prompt": "Extract relations.",
+        "output_schema": {"type": "object", "properties": {}},
+    }
+    fields.update(overrides)
+    return InferenceRequest(**fields)
+
+
+def test_vertex_inference_provider_is_registered_with_strict_typed_options() -> None:
+    assert "vertex" in list_inference_providers()
+    provider = _inference_provider(project="economic-data-prod", location="us-central1")
+
+    assert isinstance(provider.profile_options, VertexInferenceOptions)
+    assert provider.profile_options.project == "economic-data-prod"
+
+    with pytest.raises(ProviderConfigurationError, match="rejected provider_options"):
+        _inference_provider(unknown=True)
+
+
+def test_vertex_inference_maps_request_runtime_and_parses_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(
+        _inference_response(
+            output='{"relation_type": "acquired", "confidence": 0.9}',
+            prompt_tokens=12,
+            output_tokens=7,
+            cached=3,
+            response_id="resp-42",
+        )
+    )
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+    provider = _inference_provider(project="proj", location="us-central1")
+
+    schema = {"type": "object", "properties": {"relation_type": {"type": "string"}}}
+    result = provider.complete(
+        _inference_request(
+            output_schema=schema,
+            output_name="relation",
+            max_tokens=256,
+        ),
+        credential=None,
+        runtime=ProviderRuntimeOptions(max_retries=2, timeout_seconds=30.0),
+    )
+
+    assert result.output == {"relation_type": "acquired", "confidence": 0.9}
+    assert result.usage.input_tokens == 12
+    assert result.usage.output_tokens == 7
+    assert result.usage.cache_read_input_tokens == 3
+    assert result.provider_request_id == "resp-42"
+
+    client_options = fake.client_options[0]
+    assert client_options["vertexai"] is True
+    assert client_options["location"] == "us-central1"
+    assert client_options["project"] == "proj"
+    assert client_options["http_options"]["timeout"] == 30000
+    assert client_options["http_options"]["retry_options"]["attempts"] == 3
+
+    call = fake.calls[0]
+    assert call["model"] == "gemini-2.5-flash"
+    assert call["contents"] == "Document text."
+    assert call["config"]["system_instruction"] == "Extract relations."
+    assert call["config"]["max_output_tokens"] == 256
+    assert call["config"]["response_mime_type"] == "application/json"
+    assert call["config"]["response_schema"] == schema
+    assert fake.close_count == 1
+
+
+def test_vertex_inference_folds_thinking_tokens_into_output_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Gemini thinking models report reasoning tokens separately; they must be
+    # counted as output usage so budgets and metrics see the full spend.
+    fake = _FakeInferenceGenAI(
+        _inference_response(output_tokens=5, thoughts_tokens=40)
+    )
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    result = _inference_provider().complete(
+        _inference_request(),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+    assert result.usage.output_tokens == 45
+
+
+def test_vertex_inference_billed_failure_includes_thinking_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(
+        _inference_response(output="not json", output_tokens=3, thoughts_tokens=20)
+    )
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    with pytest.raises(ProviderResponseError) as excinfo:
+        _inference_provider().complete(
+            _inference_request(),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+    assert excinfo.value.failure is not None
+    assert excinfo.value.failure.usage.output_tokens == 23
+
+
+def test_vertex_inference_omits_project_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(_inference_response())
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    _inference_provider(location="us-central1").complete(
+        _inference_request(),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+    assert "project" not in fake.client_options[0]
+
+
+def test_vertex_inference_reads_text_fallback_when_parts_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _inference_response(output='{"relation_type": "supplies"}')
+    response.candidates[0].content = SimpleNamespace(parts=None)
+    fake = _FakeInferenceGenAI(response)
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    result = _inference_provider().complete(
+        _inference_request(),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+    assert result.output == {"relation_type": "supplies"}
+
+
+def test_vertex_inference_rejects_api_keys_and_has_actionable_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _inference_provider()
+    with pytest.raises(ProviderConfigurationError, match="Default Credentials"):
+        provider.resolve_credential("GOOGLE_API_KEY")
+
+    def missing() -> Any:
+        raise OptionalDependencyError(
+            "Vertex AI inference requires the optional dependency 'google-genai'. "
+            "Install it with: pip install 'dbt-ml[vertex]'"
+        )
+
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", missing)
+    with pytest.raises(ProviderConfigurationError, match=r"dbt-ml\[vertex\]"):
+        provider.complete(
+            _inference_request(),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+
+
+def test_vertex_inference_api_key_env_is_rejected_during_profile_resolution(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: vertex_project\nversion: '0.1.0'\nprofile: vertex_project\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "vertex_project:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        "        path: ./target/db.duckdb\n"
+        "        schema: docs\n"
+        "      llm:\n"
+        "        provider: vertex\n"
+        "        model: gemini-2.5-flash\n"
+        "        api_key_env: GOOGLE_API_KEY\n"
+    )
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(
+        ProfileError,
+        match=r"Application Default Credentials.*does not accept api_key_env",
+    ):
+        resolve_profile(project, tmp_path)
+
+
+def test_vertex_inference_truncation_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(_inference_response(finish="MAX_TOKENS"))
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    with pytest.raises(ProviderResponseError, match="truncated at max_tokens"):
+        _inference_provider().complete(
+            _inference_request(max_tokens=8),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+
+
+def test_vertex_inference_non_stop_finish_reason_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(_inference_response(finish="SAFETY"))
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    with pytest.raises(ProviderResponseError, match="SAFETY"):
+        _inference_provider().complete(
+            _inference_request(),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+
+
+def test_vertex_inference_malformed_json_is_sanitized_and_accounts_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(
+        _inference_response(output="not valid json", prompt_tokens=15, output_tokens=4)
+    )
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    with pytest.raises(ProviderResponseError) as excinfo:
+        _inference_provider().complete(
+            _inference_request(),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+
+    assert "malformed JSON" in str(excinfo.value)
+    assert excinfo.value.failure is not None
+    assert excinfo.value.failure.error_code == "invalid_response"
+    assert excinfo.value.failure.usage.input_tokens == 15
+    assert excinfo.value.failure.usage.output_tokens == 4
+
+
+def test_vertex_inference_sdk_error_text_does_not_cross_provider_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sensitive-document-fragment"
+
+    class Models:
+        def generate_content(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise RuntimeError(f"upstream echoed {secret} and /private/path")
+
+    class Client:
+        models = Models()
+
+        def close(self) -> None:
+            return None
+
+    fake = SimpleNamespace(Client=lambda **kwargs: Client())
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    with pytest.raises(ProviderRequestError) as excinfo:
+        _inference_provider().complete(
+            _inference_request(content=secret),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+
+    assert excinfo.value.code == "RuntimeError"
+    assert secret not in str(excinfo.value)
+    assert "/private/path" not in str(excinfo.value)

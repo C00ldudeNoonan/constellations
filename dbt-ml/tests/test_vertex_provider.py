@@ -563,6 +563,7 @@ def _inference_response(
     finish: str = "STOP",
     prompt_tokens: int = 10,
     output_tokens: int = 5,
+    thoughts_tokens: int = 0,
     cached: int = 0,
     response_id: str = "resp-1",
     include_text: bool = True,
@@ -576,6 +577,7 @@ def _inference_response(
         usage_metadata=SimpleNamespace(
             prompt_token_count=prompt_tokens,
             candidates_token_count=output_tokens,
+            thoughts_token_count=thoughts_tokens,
             cached_content_token_count=cached,
         ),
         response_id=response_id,
@@ -660,6 +662,42 @@ def test_vertex_inference_maps_request_runtime_and_parses_output(
     assert call["config"]["response_mime_type"] == "application/json"
     assert call["config"]["response_schema"] == schema
     assert fake.close_count == 1
+
+
+def test_vertex_inference_folds_thinking_tokens_into_output_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Gemini thinking models report reasoning tokens separately; they must be
+    # counted as output usage so budgets and metrics see the full spend.
+    fake = _FakeInferenceGenAI(
+        _inference_response(output_tokens=5, thoughts_tokens=40)
+    )
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    result = _inference_provider().complete(
+        _inference_request(),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+    assert result.usage.output_tokens == 45
+
+
+def test_vertex_inference_billed_failure_includes_thinking_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(
+        _inference_response(output="not json", output_tokens=3, thoughts_tokens=20)
+    )
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    with pytest.raises(ProviderResponseError) as excinfo:
+        _inference_provider().complete(
+            _inference_request(),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+    assert excinfo.value.failure is not None
+    assert excinfo.value.failure.usage.output_tokens == 23
 
 
 def test_vertex_inference_omits_project_when_unset(

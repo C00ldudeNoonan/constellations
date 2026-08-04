@@ -436,13 +436,17 @@ def _inference_usage(response: Any, *, required: bool) -> ProviderUsage:
                 safe_for_display=True,
             )
         return ProviderUsage()
+    # Gemini thinking models bill reasoning tokens in a separate
+    # `thoughts_token_count`; fold them into output usage so run metrics and
+    # `max_tokens`/budget enforcement account for the full billable spend.
+    output_tokens = _inference_usage_value(
+        raw_usage, "candidates_token_count", required=required
+    ) + _inference_usage_value(raw_usage, "thoughts_token_count")
     return ProviderUsage(
         input_tokens=_inference_usage_value(
             raw_usage, "prompt_token_count", required=required
         ),
-        output_tokens=_inference_usage_value(
-            raw_usage, "candidates_token_count", required=required
-        ),
+        output_tokens=output_tokens,
         cache_read_input_tokens=_inference_usage_value(
             raw_usage, "cached_content_token_count"
         ),

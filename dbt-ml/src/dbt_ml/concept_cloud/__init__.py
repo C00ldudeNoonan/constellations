@@ -15,6 +15,7 @@ canonical id or label.
 """
 from __future__ import annotations
 
+from .artifact import render_concept_cloud, write_concept_cloud
 from .schema import (
     CONCEPT_CLOUD_SCHEMA_VERSION,
     Concept,
@@ -41,4 +42,6 @@ __all__ = [
     "Provenance",
     "parse_concept_cloud_export",
     "placeholder_export",
+    "render_concept_cloud",
+    "write_concept_cloud",
 ]

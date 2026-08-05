@@ -69,7 +69,11 @@
     const labels = [...new Set(DATA.concepts.map(c => c.label || "—"))].sort();
     const colorForLabel = {};
     labels.forEach((l, i) => colorForLabel[l] = PALETTE[i % PALETTE.length]);
-    const RESOURCE_COLOR = { source: "#8b98a9", model: "#3fb950", exposure: "#d2a8ff" };
+    // Known dbt resource kinds; anything else falls back to the neutral grey.
+    const RESOURCE_COLOR = {
+      source: "#8b98a9", model: "#3fb950", exposure: "#d2a8ff",
+      seed: "#79c0ff", snapshot: "#ffa657", analysis: "#d2a8ff", metric: "#56d4bc",
+    };
 
     const hidden = new Set();   // labels toggled off
     let selected = null;        // currently selected node id

@@ -38,6 +38,25 @@ def test_parse_rejects_unknown_schema_version() -> None:
         parse_concept_cloud_export(bad)
 
 
+def test_parse_rejects_missing_schema_version() -> None:
+    # An unversioned bundle must not be silently treated as the current schema.
+    bad = _bundle()
+    del bad["schema_version"]
+    with pytest.raises(ValueError, match="must declare a schema_version"):
+        parse_concept_cloud_export(bad)
+
+
+def test_dag_node_accepts_arbitrary_dbt_resource_types() -> None:
+    # Real dbt manifests carry seeds, snapshots, analyses, etc.; the plane must
+    # project them, not reject them.
+    bundle = _bundle()
+    bundle["dag_plane"]["nodes"].append(
+        {"id": "seed.p.currencies", "label": "currencies", "resource_type": "seed"}
+    )
+    export = parse_concept_cloud_export(bundle)
+    assert any(n.resource_type == "seed" for n in export.dag_plane.nodes)
+
+
 def test_parse_rejects_unknown_fields() -> None:
     bad = _bundle()
     bad["surprise"] = True

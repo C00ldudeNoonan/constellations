@@ -17,12 +17,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # evolve independently; the artifact refuses a bundle it does not understand.
 CONCEPT_CLOUD_SCHEMA_VERSION = "1"
 
-# dbt node classes on the ground plane (from the downstream dbt manifest).
-DagResourceType = Literal["source", "model", "exposure"]
 # Mirrors dbt_ml.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
-# Mirrors the entity-linking `status` column.
-LinkStatus = Literal["matched", "ambiguous", "unmatched"]
+# A concept in the cloud is a canonical entity, so it is always linked — either
+# a clean match or a match the resolver flagged ambiguous. Entity-linking's third
+# status, `unmatched`, has a null canonical id (no canonical concept), so those
+# mentions have no node and are excluded by the export job.
+LinkStatus = Literal["matched", "ambiguous"]
 
 
 def _require_non_empty(value: str) -> str:
@@ -37,15 +38,18 @@ class _Frozen(BaseModel):
 
 
 class DagNode(_Frozen):
-    """One node on the static DAG plane. `id` is the dbt `unique_id`."""
+    """One node on the static DAG plane. `id` is the dbt `unique_id`;
+    `resource_type` is the dbt resource kind verbatim (source, model, seed,
+    snapshot, exposure, analysis, …) — kept free-form so any downstream dbt
+    manifest projects cleanly, with the artifact color-coding known kinds."""
 
     id: str
     label: str
-    resource_type: DagResourceType
+    resource_type: str
     # Optional coarse grouping for plane layout (e.g. staging/marts); free-form.
     layer: str | None = None
 
-    @field_validator("id", "label")
+    @field_validator("id", "label", "resource_type")
     @classmethod
     def _non_empty(cls, value: str) -> str:
         return _require_non_empty(value)
@@ -220,10 +224,16 @@ class ConceptCloudExport(_Frozen):
 
 
 def parse_concept_cloud_export(data: dict[str, Any]) -> ConceptCloudExport:
-    """Validate a raw bundle mapping into a `ConceptCloudExport`, rejecting an
-    unknown `schema_version` with the supported version named."""
-    version = data.get("schema_version") if isinstance(data, dict) else None
-    if version is not None and version != CONCEPT_CLOUD_SCHEMA_VERSION:
+    """Validate a raw bundle mapping into a `ConceptCloudExport`. The bundle must
+    declare a `schema_version`, and it must match this build's — an unversioned
+    or mismatched artifact is rejected rather than silently treated as current."""
+    if not isinstance(data, dict) or "schema_version" not in data:
+        raise ValueError(
+            "concept-cloud bundle must declare a schema_version; "
+            f"this build understands {CONCEPT_CLOUD_SCHEMA_VERSION!r}"
+        )
+    version = data["schema_version"]
+    if version != CONCEPT_CLOUD_SCHEMA_VERSION:
         raise ValueError(
             f"unsupported concept-cloud schema_version {version!r}; "
             f"this build understands {CONCEPT_CLOUD_SCHEMA_VERSION!r}"

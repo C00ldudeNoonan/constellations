@@ -1,0 +1,44 @@
+"""Concept-cloud visualization export contract (issue #255).
+
+The visualization renders dbt-ml's extracted concepts as a 3D cloud above a
+static 2D plane of the downstream dbt DAG. This package defines the versioned
+JSON **export contract** that decouples the two halves of the feature: a
+self-contained static artifact renders one of these bundles, and an export job
+(reading a project's manifests + entity/linking/relation relations) produces
+them. Only the contract lives here — no rendering, no warehouse access.
+
+The bundle is deliberately credential- and PII-safe: it carries only canonical
+concept identity, aggregate frequencies, typed edges, and manifest-level DAG
+lineage. Human-readable concept text is included only when the operator opted
+into it upstream (`include_text`); otherwise `display` falls back to the
+canonical id or label.
+"""
+from __future__ import annotations
+
+from .schema import (
+    CONCEPT_CLOUD_SCHEMA_VERSION,
+    Concept,
+    ConceptCloudExport,
+    ConceptEdge,
+    CrossLayerEdge,
+    DagEdge,
+    DagNode,
+    DagPlane,
+    Provenance,
+    parse_concept_cloud_export,
+    placeholder_export,
+)
+
+__all__ = [
+    "CONCEPT_CLOUD_SCHEMA_VERSION",
+    "Concept",
+    "ConceptCloudExport",
+    "ConceptEdge",
+    "CrossLayerEdge",
+    "DagEdge",
+    "DagNode",
+    "DagPlane",
+    "Provenance",
+    "parse_concept_cloud_export",
+    "placeholder_export",
+]

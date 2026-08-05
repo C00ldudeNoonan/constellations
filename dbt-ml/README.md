@@ -2017,6 +2017,49 @@ response cache all run locally. See
 [`examples/dbt_embed_duckdb`](examples/dbt_embed_duckdb) for a runnable
 three-level DAG (extraction → transforms → SQL mart).
 
+## Concept cloud (visualization, proof of concept)
+
+`dbt-ml concept-cloud` renders extracted entities as an explorable 3D **concept
+cloud** floating over a 2D plane of the dbt DAG, with lines tying each concept
+down to the model that produced it — a way to *see* how the fuzzy unstructured
+layer maps onto the deterministic structured one (issue #255).
+
+The command writes a single **self-contained HTML file** (the rendering library
+is inlined, so it opens offline in any browser — the inline preview panels in
+some tools do not run WebGL, so open the file directly):
+
+```bash
+# Try it with built-in bundles — no project needed:
+dbt-ml concept-cloud --demo -o cloud.html         # ~45-entity economic-data sample
+dbt-ml concept-cloud --placeholder -o cloud.html  # minimal example
+
+# Export a real project's concepts:
+dbt-ml --project-dir path/to/dbt_ml_project concept-cloud \
+  --linking-model link_entities \
+  --relation-model extract_relations \
+  --dbt-manifest path/to/dbt/target/manifest.json \
+  -o cloud.html
+```
+
+The export job is a three-way join over artifacts dbt-ml already produces: the
+entity-linking output supplies canonical concepts (sized by mention frequency,
+colored by entity type) and the mention→canonical map; the relation grain
+supplies typed concept-to-concept edges; and the DAG plane comes from the
+downstream dbt `manifest.json` (or dbt-ml's own if `--dbt-manifest` is omitted).
+The viewer has orbit controls, click-to-trace cross-layer beams, a text search,
+entity-type toggles, an orphan highlight (nodes with no edges), and a
+min-frequency filter.
+
+**Prerequisites.** The cloud is keyed on `canonical_id`, so an entity-linking
+(`link_entities`) model must have run; and human-readable node labels require the
+NLP/linking models to set `include_text: true` (otherwise nodes show ids).
+
+**Boundaries.** The artifact reads only exported/queried output tables — no
+warehouse credentials ever enter it, and raw document text appears only when the
+operator opted into it upstream. The bundle is a versioned contract
+(`ConceptCloudExport`, `schema_version`), so the static viewer and the export job
+evolve independently.
+
 ## Artifacts
 
 `dbt-ml compile` writes the manifest; `run` and `build` write the manifest and

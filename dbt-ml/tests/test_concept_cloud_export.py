@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import polars as pl
@@ -11,8 +12,11 @@ from dbt_ml.concept_cloud import (
     build_concept_cloud,
     dag_plane_from_dbt_manifest,
     dag_plane_from_dbt_ml_manifest,
+    export_concept_cloud,
     render_concept_cloud,
 )
+from dbt_ml.config import load_project
+from dbt_ml.profile import resolve_profile
 
 _LINKING_NODE = "model.p.link_entities"
 
@@ -173,3 +177,62 @@ def test_export_end_to_end_through_duckdb(tmp_path: Path) -> None:
     assert export.concept_edges[0].weight == 3
     html = render_concept_cloud(export)
     assert "Acme" in html and "__CONCEPT_CLOUD_DATA__" not in html
+
+
+def test_export_concept_cloud_wrapper_stitches_a_dbt_manifest(tmp_path: Path) -> None:
+    # The wrapper path: read the project's tables through the adapter, use a
+    # downstream dbt manifest as the plane, and stitch concepts to the emitted
+    # source node (source.dbt_ml_<project>.<linking_model>).
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: economic_data\nversion: '0.1.0'\nprofile: economic_data\n",
+        encoding="utf-8",
+    )
+    warehouse_path = tmp_path / "w.duckdb"
+    (tmp_path / "profiles.yml").write_text(
+        "economic_data:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        f"        path: {warehouse_path}\n"
+        "        schema: main\n",
+        encoding="utf-8",
+    )
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        adapter.materialize_full("link_entities", _links())
+        adapter.materialize_full("extract_relations", _relations())
+
+    linking_source = "source.dbt_ml_economic_data.link_entities"
+    manifest = {
+        "sources": {linking_source: {"name": "link_entities", "resource_type": "source"}},
+        "nodes": {
+            "model.economic_data.mart_entity_network": {
+                "name": "mart_entity_network", "resource_type": "model"
+            }
+        },
+        "exposures": {},
+        "parent_map": {
+            "model.economic_data.mart_entity_network": [linking_source]
+        },
+    }
+    manifest_path = tmp_path / "dbt_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    export = export_concept_cloud(
+        tmp_path,
+        linking_model="link_entities",
+        relation_model="extract_relations",
+        dbt_manifest=manifest_path,
+    )
+
+    assert {c.canonical_id for c in export.concepts} == {"org:acme", "gpe:ny"}
+    node_ids = {n.id for n in export.dag_plane.nodes}
+    assert linking_source in node_ids
+    assert {e.dag_node for e in export.cross_layer_edges} == {linking_source}
+    assert export.concept_edges  # canonicalized from the relation table
+    # A rendered artifact from a real export is still self-contained.
+    assert "3d-force-graph - https://github.com/vasturiano" in render_concept_cloud(export)

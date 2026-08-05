@@ -209,12 +209,15 @@
         })
         .linkVisibility(l => l.kind === "cross"
           ? (selected ? touching.has(linkKey(l)) : false) : true)
+        // 3d-force-graph defaults linkOpacity to 0.2, which washes lines out on
+        // the dark background; raise it and use solid colors for contrast.
+        .linkOpacity(0.85)
         .linkColor(l => {
-          if (l.kind === "cross") return "#f0b429";
-          if (l.kind === "dag") return "#33415580";
-          return selected && !touching.has(linkKey(l)) ? "#2b364480" : "#7ee78780";
+          if (l.kind === "cross") return "#ffcb47";      // amber beam
+          if (l.kind === "dag") return "#8291a6";        // plane lineage (subdued)
+          return selected && !touching.has(linkKey(l)) ? "#3a4657" : "#8ce99a";
         })
-        .linkWidth(l => l.kind === "cross" ? 1.5 : (l.kind === "concept" ? 0.6 : 0.4))
+        .linkWidth(l => l.kind === "cross" ? 2.2 : (l.kind === "concept" ? 1.1 : 0.8))
         .linkDirectionalArrowLength(l => l.kind === "concept" && l.directed ? 3 : 0)
         .linkDirectionalParticles(l =>
           l.kind === "cross" && touching.has(linkKey(l)) ? 3 : 0)

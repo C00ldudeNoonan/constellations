@@ -116,3 +116,36 @@ def test_cli_concept_cloud_requires_a_source() -> None:
     result = CliRunner().invoke(cli, ["concept-cloud"])
     assert result.exit_code != 0
     assert "--linking-model" in result.output
+
+
+def test_demo_export_is_valid_and_sizable() -> None:
+    from dbt_ml.concept_cloud import demo_export, parse_concept_cloud_export
+
+    export = demo_export()
+    assert len(export.concepts) >= 40
+    assert len(export.concept_edges) >= 30
+    assert any(e.directed for e in export.concept_edges)  # has asserted relations
+    assert len({c.label for c in export.concepts}) >= 6  # varied types for color
+    # Round-trips through the parse gate (referential validation, versioning).
+    parse_concept_cloud_export(json.loads(export.to_json()))
+
+
+def test_render_pins_canvas_to_viewport() -> None:
+    # Regression: the WebGL canvas initialized 0x0 when the container had not
+    # laid out; the artifact must size the graph to the viewport explicitly.
+    html = render_concept_cloud(placeholder_export())
+    assert ".width(window.innerWidth)" in html
+    assert 'addEventListener("resize"' in html
+
+
+def test_cli_concept_cloud_demo_writes_sizable_artifact(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from dbt_ml.cli import cli
+
+    out = tmp_path / "demo.html"
+    result = CliRunner().invoke(cli, ["concept-cloud", "--demo", "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    island = _extract_data_island(out.read_text(encoding="utf-8"))
+    assert island["project"] == "economic_data"
+    assert len(island["concepts"]) >= 40

@@ -16,6 +16,7 @@ canonical id or label.
 from __future__ import annotations
 
 from .artifact import render_concept_cloud, write_concept_cloud
+from .demo import demo_export
 from .export import (
     ConceptCloudExportError,
     build_concept_cloud,
@@ -51,6 +52,7 @@ __all__ = [
     "build_concept_cloud",
     "dag_plane_from_dbt_manifest",
     "dag_plane_from_dbt_ml_manifest",
+    "demo_export",
     "export_concept_cloud",
     "parse_concept_cloud_export",
     "placeholder_export",

@@ -19,6 +19,7 @@ from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .concept_cloud import (
     ConceptCloudExportError,
+    demo_export,
     export_concept_cloud,
     placeholder_export,
     write_concept_cloud,
@@ -1414,7 +1415,12 @@ def mcp_serve(
 @click.option(
     "--placeholder",
     is_flag=True,
-    help="Render the built-in placeholder bundle instead of a real project.",
+    help="Render the tiny built-in placeholder bundle.",
+)
+@click.option(
+    "--demo",
+    is_flag=True,
+    help="Render the sizable built-in economic-data demo bundle (~45 entities).",
 )
 @click.option(
     "--linking-model",
@@ -1449,6 +1455,7 @@ def concept_cloud(
     ctx: click.Context,
     output: Path,
     placeholder: bool,
+    demo: bool,
     linking_model: str | None,
     relation_model: str | None,
     entity_model: str | None,
@@ -1459,16 +1466,21 @@ def concept_cloud(
 
     Pass ``--linking-model`` to export a real project's concepts (optionally with
     ``--relation-model``/``--entity-model`` and a downstream ``--dbt-manifest``),
-    or ``--placeholder`` for the built-in demo bundle.
+    ``--demo`` for the sizable built-in example, or ``--placeholder`` for the
+    minimal one.
     """
-    if placeholder:
-        written = write_concept_cloud(placeholder_export(), output)
-        click.echo(f"Wrote placeholder concept-cloud artifact to {written}")
+    if placeholder or demo:
+        bundle = demo_export() if demo else placeholder_export()
+        written = write_concept_cloud(bundle, output)
+        click.echo(
+            f"Wrote {'demo' if demo else 'placeholder'} concept-cloud artifact "
+            f"({len(bundle.concepts)} concepts) to {written}"
+        )
         return
     if not linking_model:
         raise click.ClickException(
             "Pass --linking-model <model> to export a project's concepts, "
-            "or --placeholder for the demo bundle."
+            "or --demo / --placeholder for a built-in bundle."
         )
     try:
         export = export_concept_cloud(

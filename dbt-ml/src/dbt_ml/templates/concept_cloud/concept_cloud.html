@@ -229,6 +229,14 @@
           selected = null; recomputeTouching(); showDetail(null); refresh();
         });
 
+      // 3d-force-graph sizes its canvas from the container once at init; if the
+      // container hasn't laid out yet the canvas is 0×0 and nothing draws. Pin it
+      // to the viewport and keep it in sync on resize.
+      const resizeGraph = () =>
+        Graph.width(window.innerWidth).height(window.innerHeight);
+      resizeGraph();
+      window.addEventListener("resize", resizeGraph);
+
       // Frame the whole graph once the force layout settles.
       let fitted = false;
       Graph.onEngineStop(() => {

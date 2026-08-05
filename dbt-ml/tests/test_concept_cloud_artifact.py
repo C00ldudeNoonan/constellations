@@ -149,3 +149,12 @@ def test_cli_concept_cloud_demo_writes_sizable_artifact(tmp_path: Path) -> None:
     island = _extract_data_island(out.read_text(encoding="utf-8"))
     assert island["project"] == "economic_data"
     assert len(island["concepts"]) >= 40
+
+
+def test_render_includes_orphan_and_filter_controls() -> None:
+    html = render_concept_cloud(placeholder_export())
+    # Orphan highlight + filtering controls are present and wired.
+    assert 'id="orphans"' in html and "highlightOrphans" in html
+    assert "isOrphan" in html          # orphan = no meaningful edges
+    assert 'id="minfreq"' in html and "minFreq" in html
+    assert 'id="show-plane"' in html and "showPlane" in html

@@ -33,6 +33,11 @@
       cursor: pointer; user-select: none; }
     .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
     .legend-item.off { opacity: .35; }
+    #filters { margin-top: 14px; border-top: 1px solid #263141; padding-top: 10px; }
+    .ctl { display: block; margin: 8px 0; font-size: 13px; cursor: pointer; }
+    .ctl input[type="range"] { width: 100%; margin-top: 4px; accent-color: var(--accent); }
+    .ctl input[type="checkbox"] { accent-color: var(--accent); margin-right: 6px; }
+    .ctl .val { color: var(--muted); }
     #detail { position: fixed; bottom: 16px; left: 16px; z-index: 10; max-width: 320px;
       background: var(--panel); border: 1px solid #263141; border-radius: 8px;
       padding: 10px 12px; display: none; }
@@ -50,6 +55,15 @@
   <aside id="panel">
     <h2>Entity types</h2>
     <div id="legend"></div>
+    <div id="filters">
+      <h2>Filters</h2>
+      <label class="ctl"><input type="checkbox" id="orphans"> Highlight orphans</label>
+      <label class="ctl">
+        Min frequency: <span class="val" id="minfreq-val">0</span>
+        <input type="range" id="minfreq" min="0" max="100" value="0">
+      </label>
+      <label class="ctl"><input type="checkbox" id="show-plane" checked> Show dbt DAG plane</label>
+    </div>
   </aside>
   <aside id="detail"></aside>
   <div id="graph"></div>
@@ -79,14 +93,33 @@
       seed: "#79c0ff", snapshot: "#ffa657", analysis: "#d2a8ff", metric: "#56d4bc",
     };
 
-    const hidden = new Set();   // labels toggled off
+    const hidden = new Set();   // entity labels toggled off
     let selected = null;        // currently selected node id
     let Graph = null;           // assigned once the library loads
+    let highlightOrphans = false;
+    let minFreq = 0;            // hide concepts below this mention frequency
+    let showPlane = true;       // show/hide the dbt DAG plane
 
-    // The library-independent UI (subtitle, legend) renders immediately; the
-    // 3d-force-graph library loads non-blockingly so a slow/unreachable CDN
+    // A node is an orphan when it has no *meaningful* edge — a concept-to-concept
+    // relation or a DAG lineage edge. Cross-layer links to the linking model are
+    // ignored, otherwise every concept would connect and none could be orphaned.
+    const degree = {};
+    for (const e of DATA.concept_edges) {
+      degree[e.source] = (degree[e.source] || 0) + 1;
+      degree[e.target] = (degree[e.target] || 0) + 1;
+    }
+    for (const e of DATA.dag_plane.edges) {
+      degree[e.from] = (degree[e.from] || 0) + 1;
+      degree[e.to] = (degree[e.to] || 0) + 1;
+    }
+    const isOrphan = id => !(degree[id] > 0);
+    const maxFreq = Math.max(1, ...DATA.concepts.map(c => c.frequency));
+
+    // The library-independent UI (subtitle, legend, filters) renders immediately;
+    // the 3d-force-graph library loads non-blockingly so a slow/unreachable CDN
     // degrades to a message instead of hanging or blanking the page.
     buildLegend();
+    buildControls();
     loadForceGraph().then(buildGraph).catch(() => showFallback(
       "Couldn't load the 3d-force-graph library (the artifact fetches it from a " +
       "CDN on first view — this needs network). Entity types are listed on the left."
@@ -126,6 +159,32 @@
         };
         legend.appendChild(row);
       });
+    }
+
+    function buildControls() {
+      const orphans = document.getElementById("orphans");
+      orphans.addEventListener("change", () => {
+        highlightOrphans = orphans.checked;
+        if (Graph) Graph.nodeColor(Graph.nodeColor());
+      });
+      const slider = document.getElementById("minfreq");
+      const sliderVal = document.getElementById("minfreq-val");
+      slider.max = String(maxFreq);
+      slider.addEventListener("input", () => {
+        minFreq = Number(slider.value);
+        sliderVal.textContent = slider.value;
+        refreshVisibility();
+      });
+      const plane = document.getElementById("show-plane");
+      plane.addEventListener("change", () => {
+        showPlane = plane.checked;
+        refreshVisibility();
+      });
+    }
+
+    function refreshVisibility() {
+      if (!Graph) return;
+      Graph.nodeVisibility(Graph.nodeVisibility()).linkVisibility(Graph.linkVisibility());
     }
 
     function showDetail(node) {
@@ -191,15 +250,26 @@
              .linkColor(Graph.linkColor()).linkDirectionalParticles(Graph.linkDirectionalParticles());
       }
 
+      function nodeVisible(n) {
+        if (n.kind === "dag") return showPlane;
+        if (hidden.has(n.label)) return false;
+        return n.frequency >= minFreq;
+      }
+
       Graph = ForceGraph3D()(document.getElementById("graph"))
         .backgroundColor("#0b0f17")
         .graphData({ nodes, links })
         .nodeLabel(n => n.kind === "concept"
           ? `${n.name} · ${n.label} · freq ${n.frequency}`
-          : `${n.name} · ${n.resource_type}`)
+          + (isOrphan(n.id) ? " · orphan" : "")
+          : `${n.name} · ${n.resource_type}`
+          + (isOrphan(n.id) ? " · orphan" : ""))
         .nodeVal(n => n.kind === "dag" ? 6 : Math.max(2, n.val))
-        .nodeVisibility(n => n.kind === "dag" || !hidden.has(n.label))
+        .nodeVisibility(nodeVisible)
         .nodeColor(n => {
+          // Orphan highlight overrides everything: unconnected nodes glow red,
+          // the rest recede.
+          if (highlightOrphans) return isOrphan(n.id) ? "#ff5c5c" : "#2b3644";
           const base = n.kind === "dag"
             ? (RESOURCE_COLOR[n.resource_type] || "#8b98a9") : colorForLabel[n.label];
           if (!selected) return base;
@@ -207,8 +277,12 @@
             return base;
           return "#2b3644";
         })
-        .linkVisibility(l => l.kind === "cross"
-          ? (selected ? touching.has(linkKey(l)) : false) : true)
+        .linkVisibility(l => {
+          const s = l.source, t = l.target;
+          if (typeof s === "object" && (!nodeVisible(s) || !nodeVisible(t))) return false;
+          return l.kind === "cross"
+            ? (selected ? touching.has(linkKey(l)) : false) : true;
+        })
         // 3d-force-graph defaults linkOpacity to 0.2, which washes lines out on
         // the dark background; raise it and use solid colors for contrast.
         .linkOpacity(0.85)

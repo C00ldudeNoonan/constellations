@@ -36,6 +36,21 @@ def test_render_embeds_the_bundle_and_replaces_the_sentinel() -> None:
     assert island["dag_plane"]["edges"][0]["from"].startswith("source.")
 
 
+def test_render_inlines_the_vendored_library_by_default() -> None:
+    # A rendered artifact must be self-contained: the 3d-force-graph library is
+    # inlined so it renders offline with no network.
+    html = render_concept_cloud(placeholder_export())
+    assert "3d-force-graph - https://github.com/vasturiano" in html
+    assert "/*__CONCEPT_CLOUD_LIB__*/" not in html
+
+
+def test_render_can_skip_library_inlining() -> None:
+    html = render_concept_cloud(placeholder_export(), inline_lib=False)
+    assert "3d-force-graph - https://github.com/vasturiano" not in html
+    # The CDN fallback loader is still present for an online viewer.
+    assert 'createElement("script")' in html
+
+
 def test_render_does_not_hard_block_on_the_cdn() -> None:
     # The library must be injected dynamically (non-blocking), not via a static
     # <script src> that would hang the page if the CDN is slow/unreachable.
@@ -93,11 +108,11 @@ def test_cli_concept_cloud_placeholder_writes_artifact(tmp_path: Path) -> None:
     assert "invoice_pipeline" in _extract_data_island(out.read_text(encoding="utf-8"))["project"]
 
 
-def test_cli_concept_cloud_requires_placeholder_until_export_job() -> None:
+def test_cli_concept_cloud_requires_a_source() -> None:
     from click.testing import CliRunner
 
     from dbt_ml.cli import cli
 
     result = CliRunner().invoke(cli, ["concept-cloud"])
     assert result.exit_code != 0
-    assert "milestone 3" in result.output
+    assert "--linking-model" in result.output

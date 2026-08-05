@@ -17,7 +17,12 @@ from .cli_services.context import build_dag_or_click as _build_dag
 from .cli_services.context import load_project_or_click as _load
 from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
-from .concept_cloud import placeholder_export, write_concept_cloud
+from .concept_cloud import (
+    ConceptCloudExportError,
+    export_concept_cloud,
+    placeholder_export,
+    write_concept_cloud,
+)
 from .config import ConfigError
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
@@ -1409,23 +1414,79 @@ def mcp_serve(
 @click.option(
     "--placeholder",
     is_flag=True,
-    help="Render the built-in placeholder bundle (the only source available "
-    "until the export job lands, #255 milestone 3).",
+    help="Render the built-in placeholder bundle instead of a real project.",
 )
-def concept_cloud(output: Path, placeholder: bool) -> None:
-    """Render the 3D concept-cloud artifact (#255).
+@click.option(
+    "--linking-model",
+    default=None,
+    help="Entity-linking model whose canonical_id rows become the cloud.",
+)
+@click.option(
+    "--relation-model",
+    default=None,
+    help="Relation model whose rows become concept-to-concept edges.",
+)
+@click.option(
+    "--entity-model",
+    default=None,
+    help="NLP entity model used to enrich labels/display text.",
+)
+@click.option(
+    "--dbt-manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Downstream dbt manifest.json to use as the DAG plane.",
+)
+@click.option(
+    "--top-n",
+    default=200,
+    show_default=True,
+    help="Cap the cloud to the N most frequent canonical concepts.",
+)
+@_project_context_options
+@click.pass_context
+def concept_cloud(
+    ctx: click.Context,
+    output: Path,
+    placeholder: bool,
+    linking_model: str | None,
+    relation_model: str | None,
+    entity_model: str | None,
+    dbt_manifest: Path | None,
+    top_n: int,
+) -> None:
+    """Render the self-contained 3D concept-cloud artifact (#255).
 
-    Only ``--placeholder`` is supported today; rendering a real project's
-    concepts is the export-job milestone. The artifact fetches its rendering
-    library from a CDN the first time it is opened.
+    Pass ``--linking-model`` to export a real project's concepts (optionally with
+    ``--relation-model``/``--entity-model`` and a downstream ``--dbt-manifest``),
+    or ``--placeholder`` for the built-in demo bundle.
     """
-    if not placeholder:
+    if placeholder:
+        written = write_concept_cloud(placeholder_export(), output)
+        click.echo(f"Wrote placeholder concept-cloud artifact to {written}")
+        return
+    if not linking_model:
         raise click.ClickException(
-            "Only --placeholder rendering is available so far; the real export "
-            "job (#255 milestone 3) is not implemented yet."
+            "Pass --linking-model <model> to export a project's concepts, "
+            "or --placeholder for the demo bundle."
         )
-    written = write_concept_cloud(placeholder_export(), output)
-    click.echo(f"Wrote concept-cloud artifact to {written}")
+    try:
+        export = export_concept_cloud(
+            ctx.obj["project_dir"],
+            linking_model=linking_model,
+            relation_model=relation_model,
+            entity_model=entity_model,
+            dbt_manifest=dbt_manifest,
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            top_n=top_n,
+        )
+    except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
+        raise ConfigClickError(str(e)) from e
+    written = write_concept_cloud(export, output)
+    click.echo(
+        f"Wrote concept-cloud artifact ({len(export.concepts)} concepts) to {written}"
+    )
 
 
 @cli.group()

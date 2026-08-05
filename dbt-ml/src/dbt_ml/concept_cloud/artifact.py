@@ -12,21 +12,26 @@ from pathlib import Path
 
 from .schema import ConceptCloudExport
 
-_TEMPLATE = (
-    Path(__file__).resolve().parent.parent
-    / "templates"
-    / "concept_cloud"
-    / "concept_cloud.html"
-)
+_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "concept_cloud"
+_TEMPLATE = _TEMPLATE_DIR / "concept_cloud.html"
+_VENDOR_LIB = _TEMPLATE_DIR / "vendor" / "3d-force-graph.min.js"
 _DATA_SENTINEL = "__CONCEPT_CLOUD_DATA__"
+_LIB_SENTINEL = "/*__CONCEPT_CLOUD_LIB__*/"
 
 
-def render_concept_cloud(export: ConceptCloudExport) -> str:
-    """Return the artifact HTML with `export` embedded as an inline JSON island."""
+def render_concept_cloud(export: ConceptCloudExport, *, inline_lib: bool = True) -> str:
+    """Return the artifact HTML with `export` embedded as an inline JSON island.
+
+    When `inline_lib` is true (the default) the vendored 3d-force-graph library is
+    inlined too, making the page fully self-contained and offline. If the vendored
+    copy is absent the page still works online via its CDN fallback."""
     template = _TEMPLATE.read_text(encoding="utf-8")
     if _DATA_SENTINEL not in template:
         raise RuntimeError("concept-cloud template is missing its data sentinel")
-    return template.replace(_DATA_SENTINEL, _embed_json(export), 1)
+    html = template.replace(_DATA_SENTINEL, _embed_json(export), 1)
+    if inline_lib and _VENDOR_LIB.exists():
+        html = html.replace(_LIB_SENTINEL, _VENDOR_LIB.read_text(encoding="utf-8"), 1)
+    return html
 
 
 def write_concept_cloud(export: ConceptCloudExport, out_path: str | Path) -> Path:

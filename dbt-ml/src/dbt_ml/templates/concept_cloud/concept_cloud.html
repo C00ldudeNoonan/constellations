@@ -55,6 +55,10 @@
   <div id="graph"></div>
   <footer>drag to orbit · scroll to zoom · click a node to trace beams</footer>
 
+  <!-- The 3d-force-graph library is inlined here at render time so the artifact
+       is fully self-contained (works offline, no CDN). If it is ever stripped,
+       the script below falls back to fetching it from a CDN. -->
+  <script>/*__CONCEPT_CLOUD_LIB__*/</script>
   <script id="cc-data" type="application/json">__CONCEPT_CLOUD_DATA__</script>
   <script>
     "use strict";

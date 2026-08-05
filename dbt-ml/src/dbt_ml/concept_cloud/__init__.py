@@ -16,6 +16,13 @@ canonical id or label.
 from __future__ import annotations
 
 from .artifact import render_concept_cloud, write_concept_cloud
+from .export import (
+    ConceptCloudExportError,
+    build_concept_cloud,
+    dag_plane_from_dbt_manifest,
+    dag_plane_from_dbt_ml_manifest,
+    export_concept_cloud,
+)
 from .schema import (
     CONCEPT_CLOUD_SCHEMA_VERSION,
     Concept,
@@ -34,12 +41,17 @@ __all__ = [
     "CONCEPT_CLOUD_SCHEMA_VERSION",
     "Concept",
     "ConceptCloudExport",
+    "ConceptCloudExportError",
     "ConceptEdge",
     "CrossLayerEdge",
     "DagEdge",
     "DagNode",
     "DagPlane",
     "Provenance",
+    "build_concept_cloud",
+    "dag_plane_from_dbt_manifest",
+    "dag_plane_from_dbt_ml_manifest",
+    "export_concept_cloud",
     "parse_concept_cloud_export",
     "placeholder_export",
     "render_concept_cloud",

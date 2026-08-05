@@ -226,6 +226,12 @@
           selected = null; recomputeTouching(); showDetail(null); refresh();
         });
 
+      // Frame the whole graph once the force layout settles.
+      let fitted = false;
+      Graph.onEngineStop(() => {
+        if (!fitted) { fitted = true; Graph.zoomToFit(500, 60); }
+      });
+
       document.getElementById("search").addEventListener("input", e => {
         const q = e.target.value.trim().toLowerCase();
         if (!q) { selected = null; recomputeTouching(); showDetail(null); refresh(); return; }

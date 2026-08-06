@@ -308,10 +308,16 @@ or exceptions.
 
 Errors crossing the provider boundary use the `ProviderError` hierarchy.
 Unexpected SDK exceptions become `ProviderRequestError` values containing the
-provider, operation, exception type, and retryability—not the upstream error
-message. Unsafe provider error codes are replaced with `provider_error`.
-Response errors must likewise use static, non-sensitive descriptions instead
-of forwarding raw response bodies.
+provider, operation, an error code, and retryability—not the upstream error
+message. When the SDK exception exposes an HTTP status (via `.status_code`,
+`.code`, or `.response.status_code`), the code is `http_<status>` and
+retryability is derived from it (the transient set is 408, 409, 425, 429, and
+the 5xx family); otherwise the code falls back to the exception type name and
+retryability defaults to false. The status is the one non-sensitive signal
+callers use to tell a transient failure (retry) from a permanent one (fail
+fast). Unsafe provider error codes are replaced with `provider_error`. Response
+errors must likewise use static, non-sensitive descriptions instead of
+forwarding raw response bodies.
 
 This gives run results a stable error vocabulary while leaving detailed SDK
 diagnostics behind the credential boundary. Provider request IDs are allowed

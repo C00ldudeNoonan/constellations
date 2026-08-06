@@ -24,6 +24,7 @@ from .base import (
     ProviderRuntimeOptions,
     ProviderUsage,
     provider_error_debug_enabled,
+    provider_request_error,
     redacted_exception_text,
     sanitized_provider_error,
     validate_batch_job_id,
@@ -66,9 +67,7 @@ class AnthropicInferenceProvider(InferenceProvider):
                     "anthropic inference request failed:\n%s",
                     redacted_exception_text(error),
                 )
-            failure = ProviderRequestError(
-                self.name(), "inference", code=type(error).__name__
-            )
+            failure = provider_request_error(self.name(), "inference", error)
         if failure is not None:
             del request
             raise failure

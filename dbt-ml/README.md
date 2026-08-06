@@ -307,10 +307,10 @@ dbt-ml init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh pr
 dbt-ml seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 dbt-ml compile                                             # parse YAML, validate DAG, write manifest.json
 dbt-ml graph                                               # Mermaid DAG to stdout
-dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR]
+dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR] [--source-filter GLOB]
 dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 dbt-ml eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
-dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR]
+dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB]
 dbt-ml ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table
 dbt-ml search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
@@ -352,6 +352,14 @@ declaration. Configuration failures exit 2.
   is lock-serialized so threading is safe.
 - `--select` / `--exclude` limit source discovery as well as model execution;
   an unrelated GCS branch is never listed or authenticated.
+- `--source-filter GLOB` (repeatable) on `run`/`build` scopes a run to the
+  *documents* whose source-relative path matches the glob (`*` spans `/`, so
+  `--source-filter 'AAPL/*'` selects a whole prefix) — distinct from `--select`,
+  which chooses models. It's the seam for orchestrator-driven **partitioned**
+  processing (one ticker/partition per run, parallelized, backfillable). A
+  filtered run is **additive/upsert-only**: it never deletes, requires
+  incremental extraction models, and is rejected with `--full-refresh`. Deletion
+  of removed documents is reconciled by a periodic unfiltered full run.
 
 ## Selectors
 

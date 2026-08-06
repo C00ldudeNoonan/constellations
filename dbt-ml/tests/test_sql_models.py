@@ -157,6 +157,30 @@ def test_duckdb_dry_run_rejects_invalid_sql(tmp_path: Path) -> None:
             adapter.dry_run_sql("SELECT * FROM does_not_exist_table")
 
 
+def test_duckdb_sql_error_omits_raw_warehouse_text(tmp_path: Path) -> None:
+    # #262: raw warehouse exception text must not land in the artifact-visible
+    # AdapterError message (it can echo SQL fragments or row values into
+    # run_results.json). Only the exception class is surfaced; the raw detail
+    # stays on the chained cause for local debugging.
+    from dbt_ml.adapters.base import AdapterError
+
+    config = DuckDBWarehouseConfig(path=tmp_path / "w.duckdb", schema_name="main")
+    with DuckDBAdapter(config) as adapter:
+        with pytest.raises(AdapterError) as excinfo:
+            adapter.materialize_sql_full(
+                "down", "SELECT * FROM does_not_exist_table"
+            )
+
+    message = str(excinfo.value)
+    assert message.startswith("SQL model materialization for 'down' failed")
+    assert "[" in message and message.rstrip().endswith("]")  # class hint present
+    assert "does_not_exist_table" not in message  # raw text stayed out
+    # The cause is preserved so operators can still see the detail locally.
+    cause = excinfo.value.__cause__
+    assert cause is not None
+    assert "does_not_exist_table" in str(cause)
+
+
 # ── end-to-end example ───────────────────────────────────────────────────────
 
 def test_governed_chunks_example_builds_end_to_end(tmp_path: Path) -> None:

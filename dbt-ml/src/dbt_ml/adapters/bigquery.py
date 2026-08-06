@@ -1734,8 +1734,12 @@ class BigQueryAdapter(WarehouseAdapter):
                 job_labels=(layout.labels or None) if layout is not None else None,
             )
         except Exception as e:
+            # Raw warehouse text can echo SQL fragments or row values into
+            # run_results.json; surface only the safe error class and preserve
+            # the cause via `from e` for local tracebacks (#262).
             raise AdapterError(
-                f"SQL model materialization for '{table}' failed: {e}"
+                f"SQL model materialization for '{table}' failed "
+                f"[{type(e).__name__}]"
             ) from e
         num_rows = int(self.client.get_table(self._table_id(table)).num_rows or 0)
         job_metadata: dict[str, Any] = {}
@@ -1757,7 +1761,7 @@ class BigQueryAdapter(WarehouseAdapter):
         try:
             job = self.client.query(select_sql, job_config=job_config)
         except Exception as e:
-            raise AdapterError(f"SQL dry-run failed: {e}") from e
+            raise AdapterError(f"SQL dry-run failed [{type(e).__name__}]") from e
         columns = tuple(
             SqlRelationColumn(name=str(f.name), data_type=str(f.field_type))
             for f in (job.schema or [])
@@ -1790,7 +1794,8 @@ class BigQueryAdapter(WarehouseAdapter):
                 self._run_query(f"CREATE TABLE {staging_ref} AS {select_sql}")
             except Exception as e:
                 raise AdapterError(
-                    f"Incremental SQL model staging for '{table}' failed: {e}"
+                    f"Incremental SQL model staging for '{table}' failed "
+                    f"[{type(e).__name__}]"
                 ) from e
 
             check_rows = list(
@@ -1864,7 +1869,7 @@ class BigQueryAdapter(WarehouseAdapter):
             except Exception as e:
                 raise AdapterError(
                     f"Incremental SQL model materialization for '{table}' "
-                    f"failed: {e}"
+                    f"failed [{type(e).__name__}]"
                 ) from e
             affected = int(job.num_dml_affected_rows or 0)
             job_metadata: dict[str, Any] = {}

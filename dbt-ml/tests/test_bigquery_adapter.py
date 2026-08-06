@@ -2868,3 +2868,27 @@ def test_delete_rows_and_state_staging_preserves_native_key_dtype(
     state_df = pl.read_parquet(io.BytesIO(loads[state_tbl]))
     assert target_df["k"].dtype == pl.Int64   # native INT64 preserved
     assert state_df["k"].dtype == pl.String
+
+
+def test_bigquery_sql_error_omits_raw_warehouse_text() -> None:
+    # #262: BigQuery SQL-model errors must not interpolate raw warehouse text
+    # (which can carry SQL fragments or row values) into the artifact-visible
+    # AdapterError message. Only the exception class is surfaced; the raw detail
+    # stays on the chained cause.
+    from google.api_core.exceptions import BadRequest
+
+    class _RaisingClient(_FakeClient):
+        def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
+            raise BadRequest("Syntax error: unexpected SECRET_VALUE at [1:5]")
+
+    adapter = _adapter(_RaisingClient())
+
+    with pytest.raises(AdapterError) as excinfo:
+        adapter.dry_run_sql("SELECT SECRET_VALUE")
+
+    message = str(excinfo.value)
+    assert message == "SQL dry-run failed [BadRequest]"
+    assert "SECRET_VALUE" not in message
+    cause = excinfo.value.__cause__
+    assert cause is not None
+    assert "SECRET_VALUE" in str(cause)

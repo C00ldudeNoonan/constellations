@@ -2707,3 +2707,67 @@ def test_bigquery_materialize_sql_incremental_appends_new_columns(
     merge_sql, _ = client.queries[-1]
     assert "`w`" in merge_sql
     assert client.dropped == [_STAGING_ID]
+
+
+# ── #260: batch the unbounded array-param delete/fetch methods ───────────────
+
+
+def _array_param(job_config: Any) -> Any:
+    from google.cloud import bigquery
+
+    arrays = [
+        p
+        for p in job_config.query_parameters
+        if isinstance(p, bigquery.ArrayQueryParameter)
+    ]
+    assert len(arrays) == 1
+    return arrays[0]
+
+
+def test_delete_rows_batches_large_key_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._KEY_REQUEST_BATCH", 2)
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id"]
+    client.query_results = [_FakeJob(affected=2), _FakeJob(affected=2), _FakeJob(affected=1)]
+    adapter = _adapter(client)
+
+    total = adapter.delete_rows(
+        "docs", key_col="document_id", keys=["a", "b", "c", "d", "e"]
+    )
+    assert total == 5  # affected counts summed across batches
+    deletes = [cfg for sql, cfg in client.queries if sql.strip().startswith("DELETE")]
+    assert len(deletes) == 3  # 5 keys / batch 2 -> 3 bounded requests
+    for cfg in deletes:
+        assert len(_array_param(cfg).values) <= 2
+    batched = [k for cfg in deletes for k in _array_param(cfg).values]
+    assert sorted(batched) == ["a", "b", "c", "d", "e"]
+
+
+def test_delete_state_batches_large_key_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._KEY_REQUEST_BATCH", 2)
+    client = _FakeClient()
+    adapter = _adapter(client)
+
+    adapter.delete_state(StateScope("m"), [f"k{i}" for i in range(5)])
+    deletes = [cfg for sql, cfg in client.queries if sql.strip().startswith("DELETE")]
+    assert len(deletes) == 3
+    for cfg in deletes:
+        assert len(_array_param(cfg).values) <= 2
+    batched = [k for cfg in deletes for k in _array_param(cfg).values]
+    assert sorted(batched) == [f"k{i}" for i in range(5)]
+
+
+def test_fetch_state_subset_batches_and_merges(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._KEY_REQUEST_BATCH", 2)
+    client = _FakeClient()
+    client.query_results = [
+        _FakeJob(rows=[("k0", "h0", "v0"), ("k1", "h1", "v1")]),
+        _FakeJob(rows=[("k2", "h2", "v2"), ("k3", "h3", "v3")]),
+        _FakeJob(rows=[("k4", "h4", "v4")]),
+    ]
+    adapter = _adapter(client)
+
+    result = adapter._fetch_state_subset(StateScope("m"), [f"k{i}" for i in range(5)])
+    assert result == {f"k{i}": StateValue(f"h{i}", f"v{i}") for i in range(5)}
+    selects = [sql for sql, _ in client.queries if sql.strip().startswith("SELECT")]
+    assert len(selects) == 3

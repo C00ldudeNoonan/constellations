@@ -449,8 +449,12 @@ class DuckDBAdapter(WarehouseAdapter):
         try:
             self.connection.execute(f"CREATE OR REPLACE TABLE {full} AS {select_sql}")
         except duckdb.Error as e:
+            # Raw warehouse text can echo SQL fragments or row values into
+            # run_results.json; surface only the safe error class and preserve
+            # the cause via `from e` for local tracebacks (#262).
             raise AdapterError(
-                f"SQL model materialization for '{table}' failed: {e}"
+                f"SQL model materialization for '{table}' failed "
+                f"[{type(e).__name__}]"
             ) from e
         row = self.connection.execute(f"SELECT COUNT(*) FROM {full}").fetchone()
         return SqlMaterializationResult(
@@ -467,7 +471,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 for name, dtype in zip(rel.columns, rel.types, strict=True)
             )
         except duckdb.Error as e:
-            raise AdapterError(f"SQL dry-run failed: {e}") from e
+            raise AdapterError(f"SQL dry-run failed [{type(e).__name__}]") from e
         return SqlRelationSchema(columns=columns)
 
     def relation_exists(self, table: str) -> bool:
@@ -542,7 +546,8 @@ class DuckDBAdapter(WarehouseAdapter):
             total = int(total_row[0]) if total_row else 0
         except duckdb.Error as e:
             raise AdapterError(
-                f"Incremental SQL model materialization for '{table}' failed: {e}"
+                f"Incremental SQL model materialization for '{table}' failed "
+                f"[{type(e).__name__}]"
             ) from e
         finally:
             self.connection.execute(f"DROP TABLE IF EXISTS {staging}")

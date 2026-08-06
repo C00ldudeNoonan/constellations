@@ -92,6 +92,14 @@ _STATE_MIGRATION_PREFIX = "dbt_ml_staging__state_migration_v2__"
 _STATE_MERGE_INLINE_MAX = 5000
 # Rows per Parquet load when staging a large state set (bounds peak memory).
 _STATE_MERGE_LOAD_BATCH = 20000
+# Keys per request for the array-parameter delete/fetch paths, so a large key
+# set is split across bounded requests instead of one that fails at scale (#260).
+_KEY_REQUEST_BATCH = 5000
+
+
+def _chunked(items: Sequence[Any], size: int) -> Iterator[list[Any]]:
+    for start in range(0, len(items), size):
+        yield list(items[start : start + size])
 _STATE_V1_COLUMNS = (
     ("model_name", "STRING", "REQUIRED"),
     ("document_id", "STRING", "REQUIRED"),
@@ -2246,12 +2254,16 @@ class BigQueryAdapter(WarehouseAdapter):
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:
         if not keys or self._table_columns(table) is None:
             return 0
-        job = self._run_query(
-            f"DELETE FROM {self.table_ref(table)} "
-            f"WHERE {self.quote_ident(key_col)} IN UNNEST(?)",
-            [list(keys)],
-        )
-        return int(job.num_dml_affected_rows or 0)
+        # Batch the key set so the request never carries an unbounded array (#260).
+        affected = 0
+        for chunk in _chunked(keys, _KEY_REQUEST_BATCH):
+            job = self._run_query(
+                f"DELETE FROM {self.table_ref(table)} "
+                f"WHERE {self.quote_ident(key_col)} IN UNNEST(?)",
+                [chunk],
+            )
+            affected += int(job.num_dml_affected_rows or 0)
+        return affected
 
     def delete_rows_and_state(
         self,
@@ -2667,43 +2679,50 @@ class BigQueryAdapter(WarehouseAdapter):
         validate_state_keys(record_keys)
         if not record_keys:
             return
-        self._run_query(
-            f"DELETE FROM {self._state_ref} "
-            "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
-            "AND record_key IN UNNEST(?)",
-            [
-                scope.model_name,
-                scope.stage,
-                scope.target_identity,
-                list(record_keys),
-            ],
-        )
+        # Batch the key set so the request never carries an unbounded array (#260).
+        for chunk in _chunked(record_keys, _KEY_REQUEST_BATCH):
+            self._run_query(
+                f"DELETE FROM {self._state_ref} "
+                "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+                "AND record_key IN UNNEST(?)",
+                [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                    chunk,
+                ],
+            )
 
     # ─── paged state reconciliation (issue #153) ─────────────────────────
 
     def _fetch_state_subset(
         self, scope: StateScope, record_keys: Sequence[str]
     ) -> dict[str, StateValue]:
-        result = self.rows(
-            f"SELECT record_key, input_fingerprint, code_version FROM {self._state_ref} "
-            "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
-            "AND record_key IN UNNEST(?)",
-            [
-                scope.model_name,
-                scope.stage,
-                scope.target_identity,
-                list(record_keys),
-            ],
-        )
+        # Dedupe so a repeated input key cannot be mistaken for a duplicate state
+        # row, then batch so the request never carries an unbounded array (#260).
+        unique_keys = list(dict.fromkeys(record_keys))
         state: dict[str, StateValue] = {}
-        for row in result:
-            record_key = str(row[0])
-            if record_key in state:
-                raise AdapterError(
-                    "BigQuery state contains duplicate record keys in the requested "
-                    "scope; repair the state table before retrying."
-                )
-            state[record_key] = StateValue(str(row[1]), str(row[2]))
+        for chunk in _chunked(unique_keys, _KEY_REQUEST_BATCH):
+            result = self.rows(
+                "SELECT record_key, input_fingerprint, code_version "
+                f"FROM {self._state_ref} "
+                "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+                "AND record_key IN UNNEST(?)",
+                [
+                    scope.model_name,
+                    scope.stage,
+                    scope.target_identity,
+                    chunk,
+                ],
+            )
+            for row in result:
+                record_key = str(row[0])
+                if record_key in state:
+                    raise AdapterError(
+                        "BigQuery state contains duplicate record keys in the "
+                        "requested scope; repair the state table before retrying."
+                    )
+                state[record_key] = StateValue(str(row[1]), str(row[2]))
         return state
 
     def _open_state_page_reader(self, request: StatePageRequest) -> StatePageReader:

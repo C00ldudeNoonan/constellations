@@ -66,3 +66,7 @@ class DocumentSource(ABC):
     @abstractmethod
     def scan(self, source: SourceConfig, project_dir: Path) -> SourceScan:
         """Cheap listing summary for `source freshness`."""
+
+    def close(self) -> None:  # noqa: B027 - optional hook, default no-op by design
+        """Release any client/connection the source holds. Default: no-op
+        (local sources hold nothing); remote sources override to close clients."""

@@ -12,7 +12,7 @@ from pathlib import Path
 from .config import load_project
 from .config.source import SourceConfig
 from .profile import apply_source_path_overrides, resolve_profile
-from .sources import get_document_source
+from .sources import SourceScan, get_document_source
 
 
 @dataclass
@@ -45,8 +45,16 @@ def check_freshness(
 def _check_one(source: SourceConfig, project_dir: Path) -> FreshnessResult:
     backend = get_document_source(source.path)
     # SourceError (bad path, auth, max_objects cap) propagates: a broken
-    # source must fail the command, not report a passing no_data.
-    scan = backend.scan(source, project_dir)
+    # source must fail the command, not report a passing no_data. Close the
+    # backend either way so a remote source's client is released.
+    try:
+        scan = backend.scan(source, project_dir)
+    finally:
+        backend.close()
+    return _freshness_from_scan(source, scan)
+
+
+def _freshness_from_scan(source: SourceConfig, scan: SourceScan) -> FreshnessResult:
     if not scan.exists or scan.file_count == 0 or scan.newest_epoch is None:
         return FreshnessResult(
             source_name=source.name,

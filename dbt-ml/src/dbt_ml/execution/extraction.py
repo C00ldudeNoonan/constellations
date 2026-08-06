@@ -12,7 +12,9 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import shutil
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -54,6 +56,68 @@ from .values import scalarize
 from .warehouse import warehouse_options
 
 log = logging.getLogger(__name__)
+
+# Fetch-staging directories (#273): a killed/crashed process never runs
+# TemporaryDirectory.__exit__, leaking everything it fetched. Two mitigations:
+# per-document cleanup below bounds a *live* run's peak disk use to in-flight
+# documents, and the startup sweep self-heals directories a *dead* run left
+# behind, which nothing else will ever clean up.
+_FETCH_DIR_PREFIX = "dbt_ml_fetch_"
+# A directory's mtime is refreshed by every file written inside it, so a live
+# run's own directory always looks recent. This is generous headroom above any
+# realistic per-run fetch cadence, not a tight leak-detection window.
+_STALE_FETCH_DIR_MAX_AGE_SECONDS = 6 * 60 * 60
+_swept_stale_fetch_dirs = False
+
+
+def _sweep_stale_fetch_dirs(root: Path, *, max_age_seconds: float) -> None:
+    """Best-effort removal of `dbt_ml_fetch_*` directories under `root` that are
+    older than `max_age_seconds`. Never raises: a sweep failure must not fail
+    the run it happens to run alongside."""
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    now = time.time()
+    for entry in entries:
+        if not entry.name.startswith(_FETCH_DIR_PREFIX):
+            continue
+        try:
+            if not entry.is_dir() or now - entry.stat().st_mtime < max_age_seconds:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            log.debug("failed to sweep stale fetch dir %s", entry, exc_info=True)
+
+
+def _sweep_stale_fetch_dirs_once() -> None:
+    """Run the stale-directory sweep at most once per process. Each dbt-ml
+    invocation (standalone CLI or embedded `materialize()`) is a fresh process,
+    so once-per-process is once-per-run without needing a shared choke point
+    across runner.py and dbt_embed."""
+    global _swept_stale_fetch_dirs
+    if _swept_stale_fetch_dirs:
+        return
+    _swept_stale_fetch_dirs = True
+    _sweep_stale_fetch_dirs(
+        Path(tempfile.gettempdir()), max_age_seconds=_STALE_FETCH_DIR_MAX_AGE_SECONDS
+    )
+
+
+def _cleanup_fetched(path: Path, work_dir: Path) -> None:
+    """Best-effort removal of one document's fetch-staging bytes right after
+    extraction, so peak staging disk usage is bounded by in-flight documents
+    rather than the whole run's corpus (#273). `fetch()`'s contract guarantees
+    the returned path lives under `work_dir`, so this never touches a source
+    document itself — only the snapshot dbt-ml made of it."""
+    try:
+        top = work_dir / path.relative_to(work_dir).parts[0]
+        if top.is_dir():
+            shutil.rmtree(top, ignore_errors=True)
+        else:
+            top.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        log.debug("failed to clean up fetch-staging path %s", path, exc_info=True)
 
 
 _EXTRACTION_LINEAGE_SCHEMA: dict[str, Any] = {
@@ -174,6 +238,7 @@ def run_extraction_model(
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
 ) -> ModelRunResult:
+    _sweep_stale_fetch_dirs_once()
     assert model.extraction is not None
     backend_name = model.extraction.backend or project.extraction.default_backend
     backend = get_backend(backend_name)
@@ -354,6 +419,7 @@ def run_extraction_model(
             def _one(
                 doc: DocumentRef,
             ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
+                local_path: Path | None = None
                 try:
                     if budget_guard is not None:
                         budget_guard.ensure_headroom()
@@ -376,6 +442,12 @@ def run_extraction_model(
                         "extraction failed for %s", doc.relative_path, exc_info=True
                     )
                     return doc, None, artifact_error_text(e)
+                finally:
+                    # Delete this document's staged bytes now rather than at the
+                    # end of the whole run (#273): peak fetch-staging disk usage
+                    # is bounded by in-flight documents, not the corpus size.
+                    if local_path is not None:
+                        _cleanup_fetched(local_path, work_dir)
 
             def _iter_extracted() -> (
                 Iterator[list[tuple[DocumentRef, ExtractionResult | None, str | None]]]
@@ -583,19 +655,26 @@ def _extract_batched(
 
     fetched = [(doc, path) for doc, path, err in entries if path is not None]
     try:
-        batch_output = (
-            backend.extract_batch_with_metrics(
-                [p for _, p in fetched], options, budget=budget
+        try:
+            batch_output = (
+                backend.extract_batch_with_metrics(
+                    [p for _, p in fetched], options, budget=budget
+                )
+                if fetched
+                else None
             )
-            if fetched
-            else None
-        )
-    except (BudgetExceededError, BatchCancelledError):
-        raise
-    except Exception as e:
-        raise RunError(
-            f"Batch extraction failed for model '{model_name}': {e}"
-        ) from e
+        except (BudgetExceededError, BatchCancelledError):
+            raise
+        except Exception as e:
+            raise RunError(
+                f"Batch extraction failed for model '{model_name}': {e}"
+            ) from e
+    finally:
+        # The submit/poll/fetch cycle above can run long (#149); once it
+        # returns — success, failure, or cancellation — the staged files have
+        # served their purpose and needn't wait for the whole run to end (#273).
+        for _doc, path in fetched:
+            _cleanup_fetched(path, work_dir)
     batch_out = batch_output.items if batch_output is not None else []
     by_doc_id = {
         doc.document_id: res

@@ -38,6 +38,7 @@ from ..providers import (
     get_inference_provider,
     profile_options_fingerprint,
     provider_error_debug_enabled,
+    provider_request_error,
     redacted_exception_text,
     resolve_provider_model,
     sanitized_provider_error,
@@ -736,9 +737,7 @@ def _default_call_api(
                 provider,
                 redacted_exception_text(error),
             )
-        failure = ProviderRequestError(
-            provider, "inference", code=type(error).__name__
-        )
+        failure = provider_request_error(provider, "inference", error)
     if failure is not None:
         raise failure
     if result is None:
@@ -855,9 +854,7 @@ def _run_message_batch(
                 provider,
                 redacted_exception_text(error),
             )
-        failure = ProviderRequestError(
-            provider, "batch inference", code=type(error).__name__
-        )
+        failure = provider_request_error(provider, "batch inference", error)
     if failure is not None:
         raise failure
     if result is None:

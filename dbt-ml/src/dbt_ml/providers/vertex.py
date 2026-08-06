@@ -24,12 +24,12 @@ from .base import (
     ProviderConfigurationError,
     ProviderCredential,
     ProviderError,
-    ProviderRequestError,
     ProviderResponseError,
     ProviderRuntimeOptions,
     ProviderUsage,
     provider_error_debug_enabled,
     provider_option,
+    provider_request_error,
     redacted_exception_text,
     sanitized_provider_error,
 )
@@ -275,9 +275,7 @@ class VertexInferenceProvider(InferenceProvider):
                     "vertex inference request failed:\n%s",
                     redacted_exception_text(error),
                 )
-            failure = ProviderRequestError(
-                self.name(), "inference", code=type(error).__name__
-            )
+            failure = provider_request_error(self.name(), "inference", error)
         del request
         raise failure
 

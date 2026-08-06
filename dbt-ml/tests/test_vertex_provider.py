@@ -860,3 +860,48 @@ def test_vertex_inference_sdk_error_text_does_not_cross_provider_boundary(
     assert excinfo.value.code == "RuntimeError"
     assert secret not in str(excinfo.value)
     assert "/private/path" not in str(excinfo.value)
+
+
+def test_vertex_inference_surfaces_http_status_for_retry_triage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 429 (rate limit) must surface as a retryable http_429, distinguishable
+    # from a permanent 400/403 — so a caller can build a retry policy (#258).
+    class _ClientError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__("quota")
+            self.code = code
+
+    def _raising(code: int) -> Any:
+        class Models:
+            def generate_content(self, **kwargs: Any) -> Any:
+                del kwargs
+                raise _ClientError(code)
+
+        class Client:
+            models = Models()
+
+            def close(self) -> None:
+                return None
+
+        return SimpleNamespace(Client=lambda **kwargs: Client())
+
+    monkeypatch.setattr(
+        vertex_module, "_load_google_genai_inference", lambda: _raising(429)
+    )
+    with pytest.raises(ProviderRequestError) as excinfo:
+        _inference_provider().complete(
+            _inference_request(), credential=None, runtime=ProviderRuntimeOptions()
+        )
+    assert excinfo.value.code == "http_429"
+    assert excinfo.value.retryable is True
+
+    monkeypatch.setattr(
+        vertex_module, "_load_google_genai_inference", lambda: _raising(403)
+    )
+    with pytest.raises(ProviderRequestError) as excinfo:
+        _inference_provider().complete(
+            _inference_request(), credential=None, runtime=ProviderRuntimeOptions()
+        )
+    assert excinfo.value.code == "http_403"
+    assert excinfo.value.retryable is False

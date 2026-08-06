@@ -240,6 +240,52 @@ def _sanitized_provider_error(
     )
 
 
+# HTTP statuses worth retrying (transient): request timeout, conflict, too-early,
+# rate limit, and the 5xx family. Mirrors the vLLM provider's own set.
+RETRYABLE_HTTP_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def http_status_of(error: BaseException) -> int | None:
+    """Best-effort HTTP status from a provider SDK exception, without importing
+    any optional SDK. Duck-types the fields the google-genai, google-api-core,
+    anthropic, and httpx exception hierarchies expose (`.status_code`, `.code`,
+    `.response.status_code`); returns None when no HTTP status is present.
+
+    The status is the one non-sensitive signal a caller needs to tell a
+    transient failure (429/5xx) from a permanent one (400/403/404)."""
+    candidates = (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    )
+    for value in candidates:
+        if (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and 100 <= value <= 599
+        ):
+            return value
+    return None
+
+
+def provider_request_error(
+    provider: str, operation: str, error: BaseException
+) -> ProviderRequestError:
+    """Wrap an unexpected SDK error as a `ProviderRequestError`, preserving its
+    HTTP status (as `code="http_<status>"`) and classifying retryability so a
+    caller can distinguish a retryable 429/5xx from a permanent 4xx. Falls back
+    to the exception type name when the SDK exposes no status."""
+    status = http_status_of(error)
+    if status is not None:
+        return ProviderRequestError(
+            provider,
+            operation,
+            code=f"http_{status}",
+            retryable=status in RETRYABLE_HTTP_STATUSES,
+        )
+    return ProviderRequestError(provider, operation, code=type(error).__name__)
+
+
 ProviderCredential = ProtectedCredential
 
 
@@ -1008,10 +1054,8 @@ class InferenceProvider(BaseProvider):
                 items.append(
                     BatchInferenceItem(
                         item.request_id,
-                        error=ProviderRequestError(
-                            self.name(),
-                            "inference",
-                            code=type(error).__name__,
+                        error=provider_request_error(
+                            self.name(), "inference", error
                         ),
                     )
                 )
@@ -1157,9 +1201,7 @@ class EmbeddingProvider(BaseProvider):
                     self.name(),
                     redacted_exception_text(error),
                 )
-            failure = ProviderRequestError(
-                self.name(), "embedding", code=type(error).__name__
-            )
+            failure = provider_request_error(self.name(), "embedding", error)
         if failure is not None:
             raise failure
         if not isinstance(result, EmbeddingResult):

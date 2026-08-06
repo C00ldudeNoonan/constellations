@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import fnmatch
 import logging
 import os
 import shutil
@@ -163,9 +164,25 @@ def run_project(
     profiles_dir: Path | None = None,
     threads: int = 1,
     state: Path | None = None,
+    source_filter: Sequence[str] = (),
 ) -> list[ModelRunResult]:
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
+    # Validate --source-filter before resolving the profile: it is a deterministic
+    # option error that a missing credential / bad profile must not mask, and a
+    # rejected filter should not resolve credentials first (#266 review). The
+    # select/exclude closure is a superset of the final (state-narrowed)
+    # selection, so validating it is safe.
+    subset_run = (
+        _prepare_subset_run(
+            source_filter,
+            full_refresh=full_refresh,
+            selected=dag.select_models(select=select, exclude=exclude),
+            models=models,
+        )
+        if source_filter
+        else False
+    )
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -219,6 +236,7 @@ def run_project(
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
         project_dir,
+        source_filter=source_filter,
     )
 
     models_by_name = {m.name: m for m in models}
@@ -237,6 +255,7 @@ def run_project(
             full_refresh=full_refresh,
             threads=threads,
             run_budget=run_budget,
+            subset_run=subset_run,
         )
 
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
@@ -259,12 +278,28 @@ def build_project(
     threads: int = 1,
     store_failures: bool = False,
     state: Path | None = None,
+    source_filter: Sequence[str] = (),
 ) -> BuildResult:
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
     skipped (dbt `build` semantics)."""
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
+    # Validate --source-filter before resolving the profile: it is a deterministic
+    # option error that a missing credential / bad profile must not mask, and a
+    # rejected filter should not resolve credentials first (#266 review). The
+    # select/exclude closure is a superset of the final (state-narrowed)
+    # selection, so validating it is safe.
+    subset_run = (
+        _prepare_subset_run(
+            source_filter,
+            full_refresh=full_refresh,
+            selected=dag.select_models(select=select, exclude=exclude),
+            models=models,
+        )
+        if source_filter
+        else False
+    )
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -318,6 +353,7 @@ def build_project(
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
         project_dir,
+        source_filter=source_filter,
     )
     models_by_name = {m.name: m for m in models}
 
@@ -346,6 +382,7 @@ def build_project(
                     full_refresh=full_refresh,
                     threads=threads,
                     run_budget=run_budget,
+                    subset_run=subset_run,
                 )
             except RunError as e:
                 out.run_results.append(
@@ -408,7 +445,10 @@ def _run_in_batches(
 
 
 def _discover_sources(
-    sources: list[SourceConfig], project_dir: Path
+    sources: list[SourceConfig],
+    project_dir: Path,
+    *,
+    source_filter: Sequence[str] = (),
 ) -> dict[str, DiscoveredSource]:
     out: dict[str, DiscoveredSource] = {}
     for source in sources:
@@ -417,8 +457,57 @@ def _discover_sources(
             refs = backend.discover(source, project_dir)
         except SourceError as e:
             raise RunError(str(e)) from e
+        if source_filter:
+            # Subset a run to documents whose source-relative path matches any
+            # filter glob (`*` spans `/`, so `AAPL/*` selects a whole prefix).
+            refs = [
+                ref
+                for ref in refs
+                if any(fnmatch.fnmatch(ref.relative_path, pat) for pat in source_filter)
+            ]
         out[source.name] = DiscoveredSource(backend=backend, refs=refs)
     return out
+
+
+def _prepare_subset_run(
+    source_filter: Sequence[str],
+    *,
+    full_refresh: bool,
+    selected: Sequence[str],
+    models: list[ModelConfig],
+) -> bool:
+    """Validate `--source-filter` against the run and return whether it is an
+    additive subset run. A filtered run upserts a slice and never deletes, so it
+    is incompatible with a full refresh or a non-incremental extraction model."""
+    if not source_filter:
+        return False
+    if full_refresh:
+        raise RunError(
+            "--source-filter cannot be combined with --full-refresh: a filtered "
+            "run is additive (upsert-only) and never deletes. Run a full refresh "
+            "without a filter to rebuild the whole model."
+        )
+    selected_set = set(selected)
+    unsafe: list[str] = []
+    for model in models:
+        if model.name not in selected_set or model.extraction is None:
+            continue
+        if model.materialization != "incremental":
+            unsafe.append(f"{model.name} (materialization: {model.materialization})")
+        elif model.warehouse_options.get("incremental_strategy") == "insert_overwrite":
+            # insert_overwrite replaces every partition a batch touches, so a
+            # partial (filtered) batch would delete sibling documents sharing
+            # those partitions — not additive. Only merge (upsert) is safe.
+            unsafe.append(f"{model.name} (incremental_strategy: insert_overwrite)")
+    if unsafe:
+        raise RunError(
+            "--source-filter requires additive extraction models — incremental "
+            "materialization with the default merge strategy — because a filtered "
+            "run upserts a subset and must never replace whole tables or "
+            "partitions. Unsafe selected extraction models: "
+            + ", ".join(sorted(unsafe))
+        )
+    return True
 
 
 def _run_budget_ledger(resolved: ResolvedProfile) -> BudgetLedger | None:
@@ -440,6 +529,7 @@ def _run_model(
     full_refresh: bool,
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
+    subset_run: bool = False,
 ) -> ModelRunResult:
     start = time.monotonic()
     if model.extraction is not None:
@@ -453,6 +543,7 @@ def _run_model(
             full_refresh=full_refresh,
             threads=threads,
             run_budget=run_budget,
+            subset_run=subset_run,
         )
     elif model.ml is not None:
         result = _run_ml_model(

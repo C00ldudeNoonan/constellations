@@ -7,6 +7,7 @@ loop is inherently interactive), but owns no command declaration.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import click
@@ -29,6 +30,7 @@ def run_watch(
     select: str | None,
     exclude: str | None,
     threads: int = 1,
+    source_filter: Sequence[str] = (),
 ) -> None:
     """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
     from watchfiles import watch
@@ -86,6 +88,7 @@ def run_watch(
                 target=target,
                 profiles_dir=profiles_dir,
                 threads=threads,
+                source_filter=source_filter,
             )
         except (*CONFIG_ERRORS, RunError) as e:
             click.echo(f"error: {e}", err=True)

@@ -172,6 +172,7 @@ def run_extraction_model(
     full_refresh: bool,
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
+    subset_run: bool = False,
 ) -> ModelRunResult:
     assert model.extraction is not None
     backend_name = model.extraction.backend or project.extraction.default_backend
@@ -272,7 +273,12 @@ def run_extraction_model(
         docs_to_process.append(doc)
 
     deleted = 0
-    if is_incremental:
+    # A subset run (`--source-filter`) only discovered a slice of the source, so
+    # "absent from this run" does NOT mean "removed upstream" — every other
+    # partition's document would look removed. Skip the delete pass entirely:
+    # a filtered run is additive/upsert-only, and removed-document reconciliation
+    # is the job of a periodic full (unfiltered) run (#266).
+    if is_incremental and not subset_run:
         current_ids = {doc.document_id for doc in docs}
         removed = [doc_id for doc_id in processed_state if doc_id not in current_ids]
         if removed:

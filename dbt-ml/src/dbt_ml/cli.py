@@ -794,6 +794,15 @@ def _model_kind(model: ModelConfig) -> str:
     help="Previous manifest.json (or its directory) for state:modified selection.",
 )
 @click.option(
+    "--source-filter",
+    "source_filter",
+    multiple=True,
+    metavar="GLOB",
+    help="Process only source documents whose relative path matches this glob "
+    "(repeatable, e.g. --source-filter 'AAPL/*'). Additive/upsert-only: a "
+    "filtered run never deletes and cannot be combined with --full-refresh.",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -809,6 +818,7 @@ def run(
     watch: bool,
     threads: int,
     state: Path | None,
+    source_filter: tuple[str, ...],
     json_output: bool,
 ) -> None:
     """Extract and materialize selected models into the configured warehouse."""
@@ -825,6 +835,7 @@ def run(
             select=select,
             exclude=exclude,
             threads=threads,
+            source_filter=source_filter,
         )
         return
 
@@ -839,6 +850,7 @@ def run(
             profiles_dir=profiles_dir,
             threads=threads,
             state=state,
+            source_filter=source_filter,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -982,6 +994,15 @@ def _usage_summary(
     help="Previous manifest.json (or its directory) for state:modified selection.",
 )
 @click.option(
+    "--source-filter",
+    "source_filter",
+    multiple=True,
+    metavar="GLOB",
+    help="Process only source documents whose relative path matches this glob "
+    "(repeatable, e.g. --source-filter 'AAPL/*'). Additive/upsert-only: a "
+    "filtered run never deletes and cannot be combined with --full-refresh.",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -997,6 +1018,7 @@ def build(
     threads: int,
     store_failures: bool,
     state: Path | None,
+    source_filter: tuple[str, ...],
     json_output: bool,
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
@@ -1016,6 +1038,7 @@ def build(
             threads=threads,
             store_failures=store_failures,
             state=state,
+            source_filter=source_filter,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e

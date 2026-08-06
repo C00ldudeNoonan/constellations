@@ -91,6 +91,64 @@ def test_sweep_tolerates_missing_root(tmp_path: Path) -> None:
     )  # must not raise
 
 
+def test_sweep_preserves_a_stale_looking_directory_owned_by_a_live_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A single long native-batch submission (#149) can sit idle for hours with
+    # no new writes, so its directory's mtime looks just as stale as an
+    # actually-leaked one. Only the owner-PID marker tells them apart.
+    idle_batch = tmp_path / "dbt_ml_fetch_idle_batch"
+    idle_batch.mkdir()
+    (idle_batch / extraction_module._OWNER_MARKER_NAME).write_text("12345")
+    old = time.time() - 999_999
+    os.utime(idle_batch, (old, old))
+    monkeypatch.setattr(extraction_module, "_pid_is_alive", lambda pid: True)
+
+    extraction_module._sweep_stale_fetch_dirs(tmp_path, max_age_seconds=3600)
+
+    assert idle_batch.exists()
+
+
+def test_sweep_removes_a_stale_directory_whose_owner_pid_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dead_owner = tmp_path / "dbt_ml_fetch_dead_owner"
+    dead_owner.mkdir()
+    (dead_owner / extraction_module._OWNER_MARKER_NAME).write_text("999999")
+    old = time.time() - 999_999
+    os.utime(dead_owner, (old, old))
+    monkeypatch.setattr(extraction_module, "_pid_is_alive", lambda pid: False)
+
+    extraction_module._sweep_stale_fetch_dirs(tmp_path, max_age_seconds=3600)
+
+    assert not dead_owner.exists()
+
+
+def test_write_owner_marker_records_current_pid(tmp_path: Path) -> None:
+    extraction_module._write_owner_marker(tmp_path)
+
+    marker = tmp_path / extraction_module._OWNER_MARKER_NAME
+    assert int(marker.read_text()) == os.getpid()
+
+
+def test_pid_is_alive_for_the_current_process() -> None:
+    assert extraction_module._pid_is_alive(os.getpid()) is True
+
+
+def test_fetch_dir_is_live_false_without_a_marker(tmp_path: Path) -> None:
+    assert extraction_module._fetch_dir_is_live(tmp_path) is False
+
+
+def test_fetch_dir_is_live_false_with_a_corrupt_marker(tmp_path: Path) -> None:
+    (tmp_path / extraction_module._OWNER_MARKER_NAME).write_text("not-a-pid")
+    assert extraction_module._fetch_dir_is_live(tmp_path) is False
+
+
+def test_fetch_dir_is_live_true_for_the_current_process(tmp_path: Path) -> None:
+    (tmp_path / extraction_module._OWNER_MARKER_NAME).write_text(str(os.getpid()))
+    assert extraction_module._fetch_dir_is_live(tmp_path) is True
+
+
 def test_sweep_once_runs_a_single_time(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[None] = []
     monkeypatch.setattr(
@@ -124,7 +182,14 @@ def test_incremental_extraction_bounds_peak_fetch_staging(
     def _spy(path: Path, work_dir: Path) -> None:
         real_cleanup(path, work_dir)
         nonlocal max_entries_seen
-        max_entries_seen = max(max_entries_seen, len(list(work_dir.iterdir())))
+        # The owner-PID marker is expected to sit in work_dir for the run's
+        # whole lifetime (#273 review); only count actual staged documents.
+        remaining = [
+            p
+            for p in work_dir.iterdir()
+            if p.name != extraction_module._OWNER_MARKER_NAME
+        ]
+        max_entries_seen = max(max_entries_seen, len(remaining))
 
     monkeypatch.setattr(extraction_module, "_cleanup_fetched", _spy)
 

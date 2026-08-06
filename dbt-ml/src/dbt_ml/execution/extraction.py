@@ -12,7 +12,9 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import shutil
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -63,17 +65,75 @@ log = logging.getLogger(__name__)
 # documents, and the startup sweep self-heals directories a *dead* run left
 # behind, which nothing else will ever clean up.
 _FETCH_DIR_PREFIX = "dbt_ml_fetch_"
-# A directory's mtime is refreshed by every file written inside it, so a live
-# run's own directory always looks recent. This is generous headroom above any
-# realistic per-run fetch cadence, not a tight leak-detection window.
+# A directory's mtime is refreshed by every file *written* inside it, but a
+# single long native-batch submission (#149) can sit idle for hours without
+# creating any new entries while it waits on an external API — age alone
+# cannot tell that apart from a directory a dead process abandoned (#273
+# review). The owner-PID marker below resolves the ambiguity; this threshold
+# only decides which directories are even worth checking.
 _STALE_FETCH_DIR_MAX_AGE_SECONDS = 6 * 60 * 60
+_OWNER_MARKER_NAME = ".dbt_ml_owner_pid"
 _swept_stale_fetch_dirs = False
 
 
+def _write_owner_marker(work_dir: Path) -> None:
+    """Record this process's PID so a later sweep — possibly run by a
+    different dbt-ml process — can tell a directory still owned by a live run
+    apart from one a dead run left behind (#273)."""
+    try:
+        (work_dir / _OWNER_MARKER_NAME).write_text(str(os.getpid()))
+    except OSError:
+        log.debug(
+            "failed to write fetch-staging owner marker in %s", work_dir, exc_info=True
+        )
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort, non-destructive liveness check. An inconclusive result
+    reports "alive" so a sweep skips the directory rather than risking
+    deletion of a live run's staging area. Never uses `os.kill(pid, 0)` on
+    Windows: CPython implements non-special `os.kill` signals there via
+    `TerminateProcess`, so that "probe" would actually kill the process it is
+    only trying to inspect."""
+    if os.name == "nt":
+        try:
+            probe = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except OSError:
+            return True
+        return str(pid) in probe.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _fetch_dir_is_live(entry: Path) -> bool:
+    """True if `entry` carries an owner marker naming a still-running process.
+    A missing/unreadable marker means either a pre-fix dbt-ml version leaked
+    this directory (no marker was ever written) or the marker write itself
+    failed — both fall back to the age check the caller already made."""
+    marker = entry / _OWNER_MARKER_NAME
+    try:
+        pid = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return _pid_is_alive(pid)
+
+
 def _sweep_stale_fetch_dirs(root: Path, *, max_age_seconds: float) -> None:
-    """Best-effort removal of `dbt_ml_fetch_*` directories under `root` that are
-    older than `max_age_seconds`. Never raises: a sweep failure must not fail
-    the run it happens to run alongside."""
+    """Best-effort removal of `dbt_ml_fetch_*` directories under `root` that
+    are both older than `max_age_seconds` and not owned by a still-running
+    process. Never raises: a sweep failure must not fail the run it happens to
+    run alongside."""
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -84,6 +144,8 @@ def _sweep_stale_fetch_dirs(root: Path, *, max_age_seconds: float) -> None:
             continue
         try:
             if not entry.is_dir() or now - entry.stat().st_mtime < max_age_seconds:
+                continue
+            if _fetch_dir_is_live(entry):
                 continue
             shutil.rmtree(entry, ignore_errors=True)
         except OSError:
@@ -415,6 +477,7 @@ def run_extraction_model(
         # one chunk, so corpus size is bounded by the flush size, not memory.
         with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
             work_dir = Path(scratch)
+            _write_owner_marker(work_dir)
 
             def _one(
                 doc: DocumentRef,

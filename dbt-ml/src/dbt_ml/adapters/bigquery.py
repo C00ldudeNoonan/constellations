@@ -2280,7 +2280,33 @@ class BigQueryAdapter(WarehouseAdapter):
         target_exists = bool(target_keys) and self._table_columns(table) is not None
         if not target_exists and not scoped_keys:
             return 0
+        # One atomic transaction deletes the target rows and their state together
+        # (issue #229). Small key sets ride inline as array params; large sets are
+        # staged into temp tables the transaction references, so the request stays
+        # bounded without splitting the atomic delete into non-atomic chunks (#260).
+        if max(len(target_keys), len(scoped_keys)) <= _STATE_MERGE_INLINE_MAX:
+            return self._delete_rows_and_state_inline(
+                table, key_col, target_keys, scoped_keys, state_scope, target_exists
+            )
+        return self._delete_rows_and_state_staged(
+            table,
+            key_col,
+            target_keys,
+            scoped_keys,
+            state_scope,
+            target_exists,
+            reuse_state_from_target=state_record_keys is None,
+        )
 
+    def _delete_rows_and_state_inline(
+        self,
+        table: str,
+        key_col: str,
+        target_keys: list[Any],
+        scoped_keys: list[str],
+        state_scope: StateScope,
+        target_exists: bool,
+    ) -> int:
         statements = ["DECLARE deleted_count INT64 DEFAULT 0;", "BEGIN TRANSACTION;"]
         params: list[Any] = []
         if target_exists:
@@ -2309,6 +2335,99 @@ class BigQueryAdapter(WarehouseAdapter):
         statements.extend(["COMMIT TRANSACTION;", "SELECT deleted_count;"])
         deleted = self.scalar("\n".join(statements), params)
         return int(deleted or 0)
+
+    def _delete_rows_and_state_staged(
+        self,
+        table: str,
+        key_col: str,
+        target_keys: list[Any],
+        scoped_keys: list[str],
+        state_scope: StateScope,
+        target_exists: bool,
+        *,
+        reuse_state_from_target: bool,
+    ) -> int:
+        bigquery = _bigquery()
+        append = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        target_staging: str | None = None
+        state_staging: str | None = None
+        try:
+            statements = [
+                "DECLARE deleted_count INT64 DEFAULT 0;",
+                "BEGIN TRANSACTION;",
+            ]
+            params: list[Any] = []
+            if target_exists:
+                target_staging = f"dbt_ml_staging__delete_target__{uuid4().hex[:12]}"
+                self._load_keys(target_staging, target_keys, append)
+                statements.extend(
+                    [
+                        f"DELETE FROM {self.table_ref(table)} "
+                        f"WHERE {self.quote_ident(key_col)} IN "
+                        f"(SELECT k FROM {self.table_ref(target_staging)});",
+                        "SET deleted_count = @@row_count;",
+                    ]
+                )
+            if scoped_keys:
+                if reuse_state_from_target and target_staging is not None:
+                    # scoped_keys IS target_keys — reuse the staged set, no reload.
+                    state_source = target_staging
+                else:
+                    state_staging = f"dbt_ml_staging__delete_state__{uuid4().hex[:12]}"
+                    self._load_keys(state_staging, scoped_keys, append)
+                    state_source = state_staging
+                statements.append(
+                    f"DELETE FROM {self._state_ref} "
+                    "WHERE model_name = ? AND state_scope = ? AND target_identity = ? "
+                    f"AND record_key IN (SELECT k FROM {self.table_ref(state_source)});"
+                )
+                params.extend(
+                    [
+                        state_scope.model_name,
+                        state_scope.stage,
+                        state_scope.target_identity,
+                    ]
+                )
+            statements.extend(["COMMIT TRANSACTION;", "SELECT deleted_count;"])
+            deleted = self.scalar("\n".join(statements), params or None)
+            return int(deleted or 0)
+        finally:
+            for staging in (target_staging, state_staging):
+                if staging is not None:
+                    self.client.delete_table(self._table_id(staging), not_found_ok=True)
+
+    def _load_keys(self, table: str, keys: Sequence[Any], job_config: Any) -> None:
+        """Stream a key set into a single-column (`k`) staging table via bounded
+        Parquet loads, so a large IN-list can reference the table instead of
+        shipping every key as an array query parameter. The column dtype is
+        inferred from the keys — never coerced to string — so the staged
+        subquery still matches a native (e.g. INT64) key column (#260 review)."""
+        for chunk in _chunked(keys, _STATE_MERGE_LOAD_BATCH):
+            self._load_parquet(table, pl.DataFrame({"k": chunk}), job_config)
+
+    def _load_state_records(
+        self, table: str, records: Sequence[StateRecord], job_config: Any
+    ) -> None:
+        """Stream state records into a staging table (record_key/input_fingerprint/
+        code_version) via bounded Parquet loads, so a large state MERGE can read
+        the table instead of shipping parallel array query parameters."""
+        for chunk in _chunked(records, _STATE_MERGE_LOAD_BATCH):
+            df = pl.DataFrame(
+                {
+                    "record_key": [r.record_key for r in chunk],
+                    "input_fingerprint": [r.input_fingerprint for r in chunk],
+                    "code_version": [r.code_version for r in chunk],
+                },
+                schema={
+                    "record_key": pl.String,
+                    "input_fingerprint": pl.String,
+                    "code_version": pl.String,
+                },
+            )
+            self._load_parquet(table, df, job_config)
 
     def replace_children(
         self,
@@ -2370,25 +2489,62 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
                 self._load_parquet(table, load_df.head(0), schema_config)
 
-        staging: str | None = None
-        if load_df.height > 0:
-            staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
-            staging_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.PARQUET,
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            )
-            self._load_parquet(staging, load_df, staging_config)
+        # Stage the child rows, and any large parent-id / state-record set, into
+        # temp tables the transaction references — so the request never carries an
+        # unbounded array while the delete + child MERGE + state MERGE stay one
+        # atomic script (#260). Every staging table name is chosen before its load
+        # and loaded inside the try, so a mid-load failure still cleans them up.
+        append_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        staging: str | None = (
+            f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+            if load_df.height > 0
+            else None
+        )
+        parent_staging: str | None = (
+            f"dbt_ml_staging__replace_parents__{uuid4().hex[:12]}"
+            if parent_ids and len(parent_ids) > _STATE_MERGE_INLINE_MAX
+            else None
+        )
+        state_staging: str | None = (
+            f"dbt_ml_staging__replace_state__{uuid4().hex[:12]}"
+            if state_records and len(state_records) > _STATE_MERGE_INLINE_MAX
+            else None
+        )
+        staging_tables = [
+            t for t in (staging, parent_staging, state_staging) if t is not None
+        ]
 
         try:
+            if staging is not None:
+                staging_config = bigquery.LoadJobConfig(
+                    source_format=bigquery.SourceFormat.PARQUET,
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                )
+                self._load_parquet(staging, load_df, staging_config)
+            if parent_staging is not None:
+                self._load_keys(parent_staging, list(parent_ids), append_config)
+            if state_staging is not None:
+                self._load_state_records(state_staging, state_records, append_config)
+
             statements: list[str] = ["BEGIN TRANSACTION;"]
             params: list[Any] = []
 
             if parent_ids:
-                statements.append(
-                    f"DELETE FROM {self.table_ref(table)} "
-                    f"WHERE {self.quote_ident(parent_key)} IN UNNEST(?);"
-                )
-                params.append(list(parent_ids))
+                if parent_staging is not None:
+                    statements.append(
+                        f"DELETE FROM {self.table_ref(table)} "
+                        f"WHERE {self.quote_ident(parent_key)} IN "
+                        f"(SELECT k FROM {self.table_ref(parent_staging)});"
+                    )
+                else:
+                    statements.append(
+                        f"DELETE FROM {self.table_ref(table)} "
+                        f"WHERE {self.quote_ident(parent_key)} IN UNNEST(?);"
+                    )
+                    params.append(list(parent_ids))
 
             if staging is not None:
                 final_columns = list(existing)
@@ -2418,21 +2574,29 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
 
             if state_records:
-                record_keys = [r.record_key for r in state_records]
-                fingerprints = [r.input_fingerprint for r in state_records]
-                versions = [r.code_version for r in state_records]
+                if state_staging is not None:
+                    source_select = (
+                        "    SELECT ? AS model_name, ? AS state_scope,\n"
+                        "        ? AS target_identity,\n"
+                        "        record_key, input_fingerprint, code_version\n"
+                        f"    FROM {self.table_ref(state_staging)}\n"
+                    )
+                else:
+                    source_select = (
+                        "    SELECT\n"
+                        "        ? AS model_name,\n"
+                        "        ? AS state_scope,\n"
+                        "        ? AS target_identity,\n"
+                        "        ids[OFFSET(o)] AS record_key,\n"
+                        "        fs[OFFSET(o)] AS input_fingerprint,\n"
+                        "        vs[OFFSET(o)] AS code_version\n"
+                        "    FROM (SELECT ? AS ids, ? AS fs, ? AS vs),\n"
+                        "        UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(ids) - 1)) AS o\n"
+                    )
                 statements.append(
                     f"MERGE {self._state_ref} AS target\n"
                     "USING (\n"
-                    "    SELECT\n"
-                    "        ? AS model_name,\n"
-                    "        ? AS state_scope,\n"
-                    "        ? AS target_identity,\n"
-                    "        ids[OFFSET(o)] AS record_key,\n"
-                    "        fs[OFFSET(o)] AS input_fingerprint,\n"
-                    "        vs[OFFSET(o)] AS code_version\n"
-                    "    FROM (SELECT ? AS ids, ? AS fs, ? AS vs),\n"
-                    "        UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(ids) - 1)) AS o\n"
+                    f"{source_select}"
                     ") AS source\n"
                     "ON target.model_name = source.model_name\n"
                     "    AND target.state_scope = source.state_scope\n"
@@ -2455,25 +2619,32 @@ class BigQueryAdapter(WarehouseAdapter):
                         state_scope.model_name,
                         state_scope.stage,
                         state_scope.target_identity,
-                        record_keys,
-                        fingerprints,
-                        versions,
                     ]
                 )
+                if state_staging is None:
+                    params.extend(
+                        [
+                            [r.record_key for r in state_records],
+                            [r.input_fingerprint for r in state_records],
+                            [r.code_version for r in state_records],
+                        ]
+                    )
 
             statements.append("COMMIT TRANSACTION;")
             if len(statements) > 2:
                 self._run_query("\n".join(statements), params or None)
         except BaseException as error:
-            if staging is not None:
+            for staging_table in staging_tables:
                 try:
-                    self.drop_table(staging)
+                    self.drop_table(staging_table)
                 except Exception as cleanup_error:
-                    error.add_note(f"Failed to clean staging table: {cleanup_error}")
+                    error.add_note(
+                        f"Failed to clean staging table {staging_table}: {cleanup_error}"
+                    )
             raise
         else:
-            if staging is not None:
-                self.drop_table(staging)
+            for staging_table in staging_tables:
+                self.drop_table(staging_table)
         return new_rows.height
 
     def drop_table(self, table: str) -> None:

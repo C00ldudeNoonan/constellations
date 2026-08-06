@@ -77,6 +77,27 @@ class GCSDocumentSource(DocumentSource):
             self._client = self._make_client(project)
         return self._client
 
+    def close(self) -> None:
+        """Release the cached storage client's HTTP session. Idempotent."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+
+    @staticmethod
+    def _api_error(operation: str, error: Exception) -> SourceError:
+        """Map a google-cloud exception to a `SourceError` with a concise,
+        response-body-free label. `code` (HTTP status) is surfaced when present
+        so a 404/403 (permanent) reads differently from a 429/5xx (transient)."""
+        status = getattr(error, "code", None)
+        label = type(error).__name__
+        if isinstance(status, int) and not isinstance(status, bool):
+            label = f"{label} {status}"
+        return SourceError(f"GCS {operation} failed [{label}]")
+
     def _make_client(self, project: str | None = None) -> Any:
         storage = _storage()
         from google.auth.exceptions import DefaultCredentialsError
@@ -102,13 +123,18 @@ class GCSDocumentSource(DocumentSource):
         # so listing `raw/doc` would also return `raw/docs/…`. Normalizing
         # to a trailing slash keeps sibling prefixes out.
         list_prefix = f"{prefix.rstrip('/')}/" if prefix else ""
-        listed = list(
-            self._get_client(source.project).list_blobs(
-                bucket_name,
-                prefix=list_prefix or None,
-                max_results=source.max_objects + 1,
+        try:
+            listed = list(
+                self._get_client(source.project).list_blobs(
+                    bucket_name,
+                    prefix=list_prefix or None,
+                    max_results=source.max_objects + 1,
+                )
             )
-        )
+        except (SourceError, ConfigError):
+            raise
+        except Exception as e:
+            raise self._api_error(f"listing gs://{bucket_name}/{list_prefix}", e) from e
         if len(listed) > source.max_objects:
             raise SourceError(
                 f"Source '{source.name}': more than {source.max_objects} objects "
@@ -162,7 +188,18 @@ class GCSDocumentSource(DocumentSource):
         blob = bucket.blob(meta["name"], generation=meta.get("generation"))
         suffix = PurePosixPath(ref.relative_path).suffix
         local = work_dir / f"{ref.document_id}{suffix}"
-        blob.download_to_filename(str(local))
+        # Download to a temp path and atomically move into place, cleaning up on
+        # any failure — a partial/aborted download must not be left behind as if
+        # it were the document (mirrors sources/local.py's contract).
+        partial = work_dir / f".{ref.document_id}{suffix}.partial"
+        try:
+            blob.download_to_filename(str(partial))
+        except (SourceError, ConfigError):
+            raise
+        except Exception as e:
+            partial.unlink(missing_ok=True)
+            raise self._api_error(f"download of {ref.source_uri or ref.relative_path}", e) from e
+        partial.replace(local)
         return local
 
     def scan(self, source: SourceConfig, project_dir: Path) -> SourceScan:

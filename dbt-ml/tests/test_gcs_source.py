@@ -451,3 +451,60 @@ def test_integration_discover_and_fetch(tmp_path: Path) -> None:
         assert json.loads(local.read_text()) == {"x": 1}
     finally:
         bucket.blob(f"{prefix}/doc.json").delete()
+
+
+class _ApiErr(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__("boom")
+        self.code = code
+
+
+def test_discover_wraps_listing_errors_as_source_error() -> None:
+    class _ErrClient(_FakeStorageClient):
+        def list_blobs(self, *a: Any, **k: Any) -> Any:
+            raise _ApiErr(503)
+
+    source = _gcs_source(_ErrClient([]))
+    with pytest.raises(SourceError, match=r"GCS listing.*503"):
+        source.discover(_cfg(), Path("."))
+
+
+def test_fetch_cleans_up_partial_download_on_error(tmp_path: Path) -> None:
+    class _FailBlob(_FakeBlob):
+        def download_to_filename(self, filename: str) -> None:
+            Path(filename).write_bytes(b"partial bytes")  # a partial write...
+            raise _ApiErr(500)                              # ...then the transfer fails
+
+    client = _FakeStorageClient([_FailBlob("raw/docs/a.html")])
+    source = _gcs_source(client)
+    (ref,) = source.discover(_cfg(), tmp_path)
+
+    with pytest.raises(SourceError, match=r"GCS download.*500"):
+        source.fetch(ref, tmp_path)
+    # No partial file (and no final file) is left behind.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fetch_writes_final_file_atomically_on_success(tmp_path: Path) -> None:
+    client = _FakeStorageClient([_FakeBlob("raw/docs/a.html", payload=b"hello")])
+    source = _gcs_source(client)
+    (ref,) = source.discover(_cfg(), tmp_path)
+
+    local = source.fetch(ref, tmp_path)
+    assert local.read_bytes() == b"hello"
+    # No leftover .partial temp file.
+    assert not any(p.name.endswith(".partial") for p in tmp_path.iterdir())
+
+
+def test_close_releases_client_and_is_idempotent() -> None:
+    closed = {"n": 0}
+
+    class _ClosableClient(_FakeStorageClient):
+        def close(self) -> None:
+            closed["n"] += 1
+
+    source = _gcs_source(_ClosableClient([]))
+    source.close()
+    source.close()  # idempotent — no client to close the second time
+    assert closed["n"] == 1
+    assert source._client is None

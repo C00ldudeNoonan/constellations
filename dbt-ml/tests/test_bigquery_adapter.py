@@ -2771,3 +2771,70 @@ def test_fetch_state_subset_batches_and_merges(monkeypatch: pytest.MonkeyPatch) 
     assert result == {f"k{i}": StateValue(f"h{i}", f"v{i}") for i in range(5)}
     selects = [sql for sql, _ in client.queries if sql.strip().startswith("SELECT")]
     assert len(selects) == 3
+
+
+# ── #260: stage the atomic array-param methods at scale ──────────────────────
+
+
+def test_delete_rows_and_state_stages_at_scale(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._STATE_MERGE_INLINE_MAX", 2)
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id"]
+    client.query_results = [_FakeJob(rows=[(3,)])]  # SELECT deleted_count
+    adapter = _adapter(client)
+
+    deleted = adapter.delete_rows_and_state(
+        "docs",
+        key_col="document_id",
+        keys=[f"k{i}" for i in range(3)],
+        state_scope=StateScope("m"),
+    )
+    assert deleted == 3
+    # Keys were staged via a Parquet load, not shipped as an array param.
+    staged = {tbl for _, tbl, _ in client.loads}
+    assert any("dbt_ml_staging__delete_target__" in t for t in staged)
+    from google.cloud import bigquery
+
+    script, cfg = client.queries[-1]
+    assert "BEGIN TRANSACTION" in script  # still one atomic transaction
+    assert "IN (SELECT k FROM" in script
+    assert "IN UNNEST" not in script
+    assert not any(
+        isinstance(p, bigquery.ArrayQueryParameter) for p in (cfg.query_parameters or [])
+    )
+    # scoped_keys defaulted to target_keys, so the state delete reuses one staging
+    # table (no second load).
+    assert len(staged) == 1
+    assert any("dbt_ml_staging__delete_target__" in t for t in client.dropped)
+
+
+def test_replace_children_stages_parents_and_state_at_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._STATE_MERGE_INLINE_MAX", 2)
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["parent_id", "child_id"]  # existing target
+    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V2_SCHEMA)
+    adapter = _adapter(client)
+
+    empty = pl.DataFrame(schema={"parent_id": pl.String, "child_id": pl.String})
+    adapter.replace_children(
+        "chunks",
+        parent_key="parent_id",
+        parent_ids=[f"p{i}" for i in range(3)],
+        child_key="child_id",
+        new_rows=empty,
+        state_scope=StateScope("m"),
+        state_records=[StateRecord(f"p{i}", f"h{i}", "v1") for i in range(3)],
+    )
+    staged = {tbl for _, tbl, _ in client.loads}
+    assert any("dbt_ml_staging__replace_parents__" in t for t in staged)
+    assert any("dbt_ml_staging__replace_state__" in t for t in staged)
+
+    script = next(sql for sql, _ in client.queries if "BEGIN TRANSACTION" in sql)
+    assert "IN (SELECT k FROM" in script  # parent delete reads the staging table
+    assert "dbt_ml_staging__replace_state__" in script  # state MERGE reads staging
+    assert "UNNEST(?)" not in script and "GENERATE_ARRAY" not in script
+    # Both staging tables are cleaned up.
+    assert any("dbt_ml_staging__replace_parents__" in t for t in client.dropped)
+    assert any("dbt_ml_staging__replace_state__" in t for t in client.dropped)

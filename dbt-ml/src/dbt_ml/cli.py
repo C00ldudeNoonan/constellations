@@ -835,6 +835,7 @@ def run(
             select=select,
             exclude=exclude,
             threads=threads,
+            source_filter=source_filter,
         )
         return
 

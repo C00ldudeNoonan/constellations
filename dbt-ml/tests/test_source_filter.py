@@ -58,12 +58,28 @@ def test_filter_rejects_full_refresh() -> None:
 
 
 def test_filter_rejects_non_incremental_extraction_model() -> None:
-    with pytest.raises(RunError, match="requires incremental extraction models"):
+    with pytest.raises(RunError, match="additive extraction models"):
         _prepare_subset_run(
             ("AAPL/*",),
             full_refresh=False,
             selected=["m"],
             models=[_extraction_model("m", materialization="full")],
+        )
+
+
+def test_filter_rejects_insert_overwrite_strategy() -> None:
+    # insert_overwrite replaces whole partitions, so a filtered (partial) batch
+    # would clobber sibling documents — not additive (#266 review).
+    model = ModelConfig(
+        name="m",
+        source="ref('src')",
+        extraction={"backend": "json"},
+        materialization="incremental",
+        warehouse_options={"incremental_strategy": "insert_overwrite"},
+    )
+    with pytest.raises(RunError, match="insert_overwrite"):
+        _prepare_subset_run(
+            ("AAPL/*",), full_refresh=False, selected=["m"], models=[model]
         )
 
 

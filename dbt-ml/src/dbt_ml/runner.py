@@ -168,6 +168,21 @@ def run_project(
 ) -> list[ModelRunResult]:
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
+    # Validate --source-filter before resolving the profile: it is a deterministic
+    # option error that a missing credential / bad profile must not mask, and a
+    # rejected filter should not resolve credentials first (#266 review). The
+    # select/exclude closure is a superset of the final (state-narrowed)
+    # selection, so validating it is safe.
+    subset_run = (
+        _prepare_subset_run(
+            source_filter,
+            full_refresh=full_refresh,
+            selected=dag.select_models(select=select, exclude=exclude),
+            models=models,
+        )
+        if source_filter
+        else False
+    )
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -217,9 +232,6 @@ def run_project(
             "`dbt-ml run`/`build`."
         )
 
-    subset_run = _prepare_subset_run(
-        source_filter, full_refresh=full_refresh, selected=selected, models=models
-    )
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
@@ -273,6 +285,21 @@ def build_project(
     skipped (dbt `build` semantics)."""
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
+    # Validate --source-filter before resolving the profile: it is a deterministic
+    # option error that a missing credential / bad profile must not mask, and a
+    # rejected filter should not resolve credentials first (#266 review). The
+    # select/exclude closure is a superset of the final (state-narrowed)
+    # selection, so validating it is safe.
+    subset_run = (
+        _prepare_subset_run(
+            source_filter,
+            full_refresh=full_refresh,
+            selected=dag.select_models(select=select, exclude=exclude),
+            models=models,
+        )
+        if source_filter
+        else False
+    )
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -322,9 +349,6 @@ def build_project(
             "`dbt-ml run`/`build`."
         )
 
-    subset_run = _prepare_subset_run(
-        source_filter, full_refresh=full_refresh, selected=selected, models=models
-    )
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
@@ -464,19 +488,24 @@ def _prepare_subset_run(
             "without a filter to rebuild the whole model."
         )
     selected_set = set(selected)
-    non_incremental = sorted(
-        model.name
-        for model in models
-        if model.name in selected_set
-        and model.extraction is not None
-        and model.materialization != "incremental"
-    )
-    if non_incremental:
+    unsafe: list[str] = []
+    for model in models:
+        if model.name not in selected_set or model.extraction is None:
+            continue
+        if model.materialization != "incremental":
+            unsafe.append(f"{model.name} (materialization: {model.materialization})")
+        elif model.warehouse_options.get("incremental_strategy") == "insert_overwrite":
+            # insert_overwrite replaces every partition a batch touches, so a
+            # partial (filtered) batch would delete sibling documents sharing
+            # those partitions — not additive. Only merge (upsert) is safe.
+            unsafe.append(f"{model.name} (incremental_strategy: insert_overwrite)")
+    if unsafe:
         raise RunError(
-            "--source-filter requires incremental extraction models (a filtered "
-            "run upserts a subset and must not replace the whole table). These "
-            "selected extraction models are not incremental: "
-            + ", ".join(non_incremental)
+            "--source-filter requires additive extraction models — incremental "
+            "materialization with the default merge strategy — because a filtered "
+            "run upserts a subset and must never replace whole tables or "
+            "partitions. Unsafe selected extraction models: "
+            + ", ".join(sorted(unsafe))
         )
     return True
 

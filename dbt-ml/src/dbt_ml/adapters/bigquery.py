@@ -2400,12 +2400,13 @@ class BigQueryAdapter(WarehouseAdapter):
                     self.client.delete_table(self._table_id(staging), not_found_ok=True)
 
     def _load_keys(self, table: str, keys: Sequence[Any], job_config: Any) -> None:
-        """Stream a key set into a single-column (`k STRING`) staging table via
-        bounded Parquet loads, so a large IN-list can reference the table instead
-        of shipping every key as an array query parameter."""
+        """Stream a key set into a single-column (`k`) staging table via bounded
+        Parquet loads, so a large IN-list can reference the table instead of
+        shipping every key as an array query parameter. The column dtype is
+        inferred from the keys — never coerced to string — so the staged
+        subquery still matches a native (e.g. INT64) key column (#260 review)."""
         for chunk in _chunked(keys, _STATE_MERGE_LOAD_BATCH):
-            df = pl.DataFrame({"k": [str(k) for k in chunk]}, schema={"k": pl.String})
-            self._load_parquet(table, df, job_config)
+            self._load_parquet(table, pl.DataFrame({"k": chunk}), job_config)
 
     def _load_state_records(
         self, table: str, records: Sequence[StateRecord], job_config: Any
@@ -2488,35 +2489,46 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
                 self._load_parquet(table, load_df.head(0), schema_config)
 
-        staging: str | None = None
-        if load_df.height > 0:
-            staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
-            staging_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.PARQUET,
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            )
-            self._load_parquet(staging, load_df, staging_config)
-
-        # Large parent-id / state-record sets are staged into temp tables the
-        # transaction references, so the request never carries an unbounded array
-        # while the delete + child MERGE + state MERGE stay one atomic script (#260).
+        # Stage the child rows, and any large parent-id / state-record set, into
+        # temp tables the transaction references — so the request never carries an
+        # unbounded array while the delete + child MERGE + state MERGE stay one
+        # atomic script (#260). Every staging table name is chosen before its load
+        # and loaded inside the try, so a mid-load failure still cleans them up.
         append_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         )
-        parent_staging: str | None = None
-        if parent_ids and len(parent_ids) > _STATE_MERGE_INLINE_MAX:
-            parent_staging = f"dbt_ml_staging__replace_parents__{uuid4().hex[:12]}"
-            self._load_keys(parent_staging, list(parent_ids), append_config)
-        state_staging: str | None = None
-        if state_records and len(state_records) > _STATE_MERGE_INLINE_MAX:
-            state_staging = f"dbt_ml_staging__replace_state__{uuid4().hex[:12]}"
-            self._load_state_records(state_staging, state_records, append_config)
+        staging: str | None = (
+            f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+            if load_df.height > 0
+            else None
+        )
+        parent_staging: str | None = (
+            f"dbt_ml_staging__replace_parents__{uuid4().hex[:12]}"
+            if parent_ids and len(parent_ids) > _STATE_MERGE_INLINE_MAX
+            else None
+        )
+        state_staging: str | None = (
+            f"dbt_ml_staging__replace_state__{uuid4().hex[:12]}"
+            if state_records and len(state_records) > _STATE_MERGE_INLINE_MAX
+            else None
+        )
         staging_tables = [
             t for t in (staging, parent_staging, state_staging) if t is not None
         ]
 
         try:
+            if staging is not None:
+                staging_config = bigquery.LoadJobConfig(
+                    source_format=bigquery.SourceFormat.PARQUET,
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                )
+                self._load_parquet(staging, load_df, staging_config)
+            if parent_staging is not None:
+                self._load_keys(parent_staging, list(parent_ids), append_config)
+            if state_staging is not None:
+                self._load_state_records(state_staging, state_records, append_config)
+
             statements: list[str] = ["BEGIN TRANSACTION;"]
             params: list[Any] = []
 

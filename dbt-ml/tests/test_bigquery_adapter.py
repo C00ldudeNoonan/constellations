@@ -2838,3 +2838,33 @@ def test_replace_children_stages_parents_and_state_at_scale(
     # Both staging tables are cleaned up.
     assert any("dbt_ml_staging__replace_parents__" in t for t in client.dropped)
     assert any("dbt_ml_staging__replace_state__" in t for t in client.dropped)
+
+
+def test_delete_rows_and_state_staging_preserves_native_key_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non-string key column (e.g. INT64) must not be coerced to STRING in the
+    # staging table, or the staged subquery would mismatch the native column and
+    # BigQuery would reject the delete (#260 review).
+    import io
+
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._STATE_MERGE_INLINE_MAX", 2)
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["id"]
+    client.query_results = [_FakeJob(rows=[(0,)])]
+    adapter = _adapter(client)
+
+    adapter.delete_rows_and_state(
+        "docs",
+        key_col="id",
+        keys=[1, 2, 3],  # INT64 target keys
+        state_scope=StateScope("m"),
+        state_record_keys=["a", "b", "c"],  # STRING state keys
+    )
+    loads = {tbl: payload for payload, tbl, _ in client.loads}
+    target_tbl = next(t for t in loads if "delete_target" in t)
+    state_tbl = next(t for t in loads if "delete_state" in t)
+    target_df = pl.read_parquet(io.BytesIO(loads[target_tbl]))
+    state_df = pl.read_parquet(io.BytesIO(loads[state_tbl]))
+    assert target_df["k"].dtype == pl.Int64   # native INT64 preserved
+    assert state_df["k"].dtype == pl.String

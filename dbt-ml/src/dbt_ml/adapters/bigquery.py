@@ -85,6 +85,13 @@ _INSTALL_HINT = (
 
 _STATE_TABLE = "dbt_ml_state"
 _STATE_MIGRATION_PREFIX = "dbt_ml_staging__state_migration_v2__"
+# Above this many records, `_merge_state` stages the set via a Parquet load and
+# one MERGE instead of passing it inline as array query parameters — whose single
+# request grows with the record count and fails at scale (issue #256). Below it,
+# the inline MERGE is kept: fewer round trips, no staging table.
+_STATE_MERGE_INLINE_MAX = 5000
+# Rows per Parquet load when staging a large state set (bounds peak memory).
+_STATE_MERGE_LOAD_BATCH = 20000
 _STATE_V1_COLUMNS = (
     ("model_name", "STRING", "REQUIRED"),
     ("document_id", "STRING", "REQUIRED"),
@@ -2508,10 +2515,18 @@ class BigQueryAdapter(WarehouseAdapter):
         *,
         replace: bool,
     ) -> None:
-        record_keys = [record.record_key for record in records]
-        fingerprints = [record.input_fingerprint for record in records]
-        versions = [record.code_version for record in records]
-        replace_clause = (
+        # A single inline MERGE passes the whole record set as array query
+        # parameters, so its one request grows with the record count and fails at
+        # scale (SSLEOFError at ~75k, issue #256). Small sets stay inline (cheap,
+        # no staging); large sets are staged via bounded Parquet loads and merged
+        # from the staging table — still one atomic MERGE.
+        if len(records) <= _STATE_MERGE_INLINE_MAX:
+            self._merge_state_inline(scope, records, replace=replace)
+        else:
+            self._merge_state_staged(scope, records, replace=replace)
+
+    def _state_replace_clause(self, replace: bool) -> str:
+        return (
             """
             WHEN NOT MATCHED BY SOURCE
                 AND target.model_name = ?
@@ -2522,6 +2537,17 @@ class BigQueryAdapter(WarehouseAdapter):
             if replace
             else ""
         )
+
+    def _merge_state_inline(
+        self,
+        scope: StateScope,
+        records: Sequence[StateRecord],
+        *,
+        replace: bool,
+    ) -> None:
+        record_keys = [record.record_key for record in records]
+        fingerprints = [record.input_fingerprint for record in records]
+        versions = [record.code_version for record in records]
         params: list[Any] = [
             scope.model_name,
             scope.stage,
@@ -2560,10 +2586,75 @@ class BigQueryAdapter(WarehouseAdapter):
                 VALUES (source.model_name, source.state_scope, source.target_identity,
                         source.record_key, source.input_fingerprint,
                         source.code_version, CURRENT_TIMESTAMP())
-            {replace_clause}
+            {self._state_replace_clause(replace)}
             """,
             params,
         )
+
+    def _merge_state_staged(
+        self,
+        scope: StateScope,
+        records: Sequence[StateRecord],
+        *,
+        replace: bool,
+    ) -> None:
+        bigquery = _bigquery()
+        staging = f"dbt_ml_staging__state_merge__{uuid4().hex[:12]}"
+        append_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        try:
+            for start in range(0, len(records), _STATE_MERGE_LOAD_BATCH):
+                chunk = records[start : start + _STATE_MERGE_LOAD_BATCH]
+                df = pl.DataFrame(
+                    {
+                        "record_key": [r.record_key for r in chunk],
+                        "input_fingerprint": [r.input_fingerprint for r in chunk],
+                        "code_version": [r.code_version for r in chunk],
+                    },
+                    schema={
+                        "record_key": pl.String,
+                        "input_fingerprint": pl.String,
+                        "code_version": pl.String,
+                    },
+                )
+                self._load_parquet(staging, df, append_config)
+            params: list[Any] = [scope.model_name, scope.stage, scope.target_identity]
+            if replace:
+                params.extend([scope.model_name, scope.stage, scope.target_identity])
+            self._run_query(
+                f"""
+                MERGE {self._state_ref} AS target
+                USING (
+                    SELECT
+                        ? AS model_name,
+                        ? AS state_scope,
+                        ? AS target_identity,
+                        record_key, input_fingerprint, code_version
+                    FROM {self.table_ref(staging)}
+                ) AS source
+                ON target.model_name = source.model_name
+                    AND target.state_scope = source.state_scope
+                    AND target.target_identity = source.target_identity
+                    AND target.record_key = source.record_key
+                WHEN MATCHED THEN UPDATE SET
+                    input_fingerprint = source.input_fingerprint,
+                    code_version = source.code_version,
+                    last_run_at = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT
+                    (model_name, state_scope, target_identity, record_key,
+                     input_fingerprint, code_version, last_run_at)
+                    VALUES (source.model_name, source.state_scope,
+                            source.target_identity, source.record_key,
+                            source.input_fingerprint, source.code_version,
+                            CURRENT_TIMESTAMP())
+                {self._state_replace_clause(replace)}
+                """,
+                params,
+            )
+        finally:
+            self.client.delete_table(self._table_id(staging), not_found_ok=True)
 
     def clear_state(self, scope: StateScope) -> None:
         self._run_query(

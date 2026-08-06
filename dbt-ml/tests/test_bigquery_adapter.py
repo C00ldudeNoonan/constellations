@@ -601,6 +601,66 @@ def test_replace_state_is_one_scoped_merge_for_empty_snapshot() -> None:
     ]
 
 
+def test_state_upsert_stages_and_merges_at_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Above the inline threshold the record set must NOT be passed as array query
+    # params (issue #256): it is staged via bounded Parquet loads and merged from
+    # the staging table in one statement.
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._STATE_MERGE_INLINE_MAX", 3)
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._STATE_MERGE_LOAD_BATCH", 2)
+    client = _FakeClient()
+    adapter = _adapter(client)
+    scope = StateScope("m1", stage="publication", target_identity="t")
+
+    records = [StateRecord(f"chunk-{i}", f"h{i}", "v1") for i in range(5)]
+    adapter.upsert_state(scope, records)
+
+    # 5 records at load batch 2 -> 3 loads, all into one staging table.
+    assert len(client.loads) == 3
+    staging_ids = {table_id for _, table_id, _ in client.loads}
+    assert len(staging_ids) == 1
+    assert "dbt_ml_staging__state_merge__" in next(iter(staging_ids))
+
+    merge_sqls = [sql for sql, _ in client.queries if sql.strip().startswith("MERGE")]
+    assert len(merge_sqls) == 1
+    merge_sql, merge_config = next(
+        q for q in client.queries if q[0].strip().startswith("MERGE")
+    )
+    assert "dbt_ml_staging__state_merge__" in merge_sql  # reads the staging table
+    assert "OFFSET" not in merge_sql                     # not the inline array form
+    assert "WHEN NOT MATCHED BY SOURCE" not in merge_sql  # upsert: no delete
+    # No array parameters — only the three scope scalars ride inline.
+    from google.cloud import bigquery
+
+    assert not any(
+        isinstance(p, bigquery.ArrayQueryParameter)
+        for p in merge_config.query_parameters
+    )
+    # Staging table is cleaned up.
+    assert any("dbt_ml_staging__state_merge__" in t for t in client.dropped)
+
+
+def test_state_replace_stages_with_delete_at_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dbt_ml.adapters.bigquery._STATE_MERGE_INLINE_MAX", 3)
+    client = _FakeClient()
+    adapter = _adapter(client)
+    scope = StateScope("m1", stage="publication", target_identity="t")
+
+    adapter.replace_state(scope, [StateRecord(f"c{i}", f"h{i}", "v1") for i in range(5)])
+
+    merge_sql = next(
+        sql for sql, _ in client.queries if sql.strip().startswith("MERGE")
+    )
+    assert "dbt_ml_staging__state_merge__" in merge_sql
+    assert "OFFSET" not in merge_sql
+    # Replace still deletes rows absent from the staged snapshot, atomically.
+    assert "WHEN NOT MATCHED BY SOURCE" in merge_sql
+    assert any("dbt_ml_staging__state_merge__" in t for t in client.dropped)
+
+
 def test_fetch_state_round_trip_shape() -> None:
     client = _FakeClient()
     client.query_results = [_FakeJob(rows=[("chunk-1", "h1", "v1"), ("chunk-2", "h2", "v2")])]

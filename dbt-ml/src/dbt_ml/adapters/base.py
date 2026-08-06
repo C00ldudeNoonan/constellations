@@ -35,6 +35,11 @@ class AdapterError(Exception):
     pass
 
 
+def sanitized_adapter_cause(error: Exception) -> AdapterError:
+    """Retain only a native exception's type in a diagnostic-safe cause chain."""
+    return AdapterError(f"Native adapter error type: {type(error).__name__}")
+
+
 class AdapterConfigError(AdapterError):
     """Adapter validation failure carrying only diagnostic-safe details."""
 

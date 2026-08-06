@@ -2079,12 +2079,18 @@ def test_native_credential_error_is_sanitized(
     with pytest.raises(AdapterError) as exc_info:
         adapter._credentials()
 
-    rendered = "".join((str(exc_info.value), repr(exc_info.value)))
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, AdapterError)
+    assert str(cause) == "Native adapter error type: RuntimeError"
+    assert cause.__traceback__ is None
+    assert cause.__context__ is None
+    assert exc_info.value.__context__ is None
+    rendered = "".join(
+        (str(exc_info.value), repr(exc_info.value), str(cause), repr(cause))
+    )
     assert "credential construction failed" in rendered
     assert sentinel not in rendered
     assert env_name not in rendered
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
-    assert str(exc_info.value.__cause__) == sentinel
 
 
 def test_credentials_impersonation_wraps_source(

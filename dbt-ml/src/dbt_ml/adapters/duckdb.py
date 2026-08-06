@@ -40,6 +40,7 @@ from .base import (
     decode_state_cursor,
     encode_state_cursor,
     plan_schema_change,
+    sanitized_adapter_cause,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
@@ -106,6 +107,8 @@ def _duckdb_arrow_batches(
 ) -> Iterator[pa.RecordBatch]:
     digest = _arrow_reader_digest(reader.schema)
     batch: pa.RecordBatch | None = None
+    failure: AdapterError | None = None
+    failure_cause: AdapterError | None = None
     try:
         for batch in reader:
             _update_arrow_digest(digest, batch)
@@ -114,9 +117,13 @@ def _duckdb_arrow_batches(
         on_complete(digest.hexdigest())
     except Exception as error:
         batch = None
-        raise AdapterError("DuckDB table snapshot batch read failed") from error
+        failure = AdapterError("DuckDB table snapshot batch read failed")
+        failure_cause = sanitized_adapter_cause(error)
     finally:
         reader.close()
+    if failure is not None:
+        assert failure_cause is not None
+        raise failure from failure_cause
 
 
 def _arrow_reader_digest(schema: pa.Schema) -> Any:
@@ -846,7 +853,7 @@ class DuckDBAdapter(WarehouseAdapter):
         params: list[Any] = []
         transaction_open = False
         failure: AdapterError | None = None
-        failure_cause: Exception | None = None
+        failure_cause: AdapterError | None = None
         snapshot_digest: str | None = None
         snapshot_ref: TableReadSnapshot | None = None
         try:
@@ -971,7 +978,7 @@ class DuckDBAdapter(WarehouseAdapter):
                     pass
             cursor.close()
             failure = AdapterError("DuckDB table snapshot could not be opened")
-            failure_cause = error
+            failure_cause = sanitized_adapter_cause(error)
         if failure is not None:
             assert failure_cause is not None
             raise failure from failure_cause
@@ -983,7 +990,7 @@ class DuckDBAdapter(WarehouseAdapter):
         reader: pa.RecordBatchReader | None = None
         transaction_open = False
         failure: AdapterError | None = None
-        failure_cause: Exception | None = None
+        failure_cause: AdapterError | None = None
         result: str | None = None
         batch: pa.RecordBatch | None = None
         try:
@@ -1014,7 +1021,7 @@ class DuckDBAdapter(WarehouseAdapter):
             failure = AdapterError(
                 "DuckDB table snapshot generation could not be validated"
             )
-            failure_cause = error
+            failure_cause = sanitized_adapter_cause(error)
         finally:
             if reader is not None:
                 reader.close()

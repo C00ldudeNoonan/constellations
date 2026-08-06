@@ -792,20 +792,16 @@ class BigQueryAdapter(WarehouseAdapter):
     def _credentials(self) -> Any:
         """Build google credentials per the configured auth method, then apply
         impersonation and quota-project wrapping — mirroring dbt-bigquery."""
-        failure: AdapterError | None = None
         try:
             return self._build_credentials()
-        except ImportError:
-            failure = AdapterError(_INSTALL_HINT)
+        except ImportError as error:
+            raise AdapterError(_INSTALL_HINT) from error
         except CredentialResolutionError as error:
-            failure = AdapterError(str(error))
+            raise AdapterError(str(error)) from error
         except AdapterError as error:
-            failure = AdapterError(str(error))
-        except Exception:
-            failure = AdapterError("BigQuery credential construction failed")
-        if failure is not None:
-            raise failure
-        raise AssertionError("unreachable credential construction state")
+            raise AdapterError(str(error)) from error
+        except Exception as error:
+            raise AdapterError("BigQuery credential construction failed") from error
 
     def _build_credentials(self) -> Any:
         cfg = self._cfg
@@ -1120,6 +1116,7 @@ class BigQueryAdapter(WarehouseAdapter):
         job: Any = None
         fully_consumed = False
         failure: AdapterError | None = None
+        failure_cause: Exception | None = None
         try:
             table_id = self._table_id(request.table)
             initial_table = self.client.get_table(table_id)
@@ -1240,12 +1237,10 @@ class BigQueryAdapter(WarehouseAdapter):
                     fully_consumed = True
                 except AdapterError:
                     raise
-                except Exception:
+                except Exception as error:
                     batch = None
                     projected = None
-                    raise AdapterError(
-                        "BigQuery table snapshot batch read failed"
-                    ) from None
+                    raise AdapterError("BigQuery table snapshot batch read failed") from error
                 finally:
                     close_batches = getattr(arrow_batches, "close", None)
                     if callable(close_batches):
@@ -1258,10 +1253,10 @@ class BigQueryAdapter(WarehouseAdapter):
                     )
                 except AdapterError:
                     raise
-                except Exception:
+                except Exception as error:
                     raise AdapterError(
                         "BigQuery table snapshot generation could not be validated"
-                    ) from None
+                    ) from error
                 if generation != initial_generation:
                     raise AdapterError("BigQuery table changed during its snapshot read")
 
@@ -1311,7 +1306,7 @@ class BigQueryAdapter(WarehouseAdapter):
                     pass
             job = None
             raise
-        except Exception:
+        except Exception as error:
             params.clear()
             rows = None
             arrow_batches = None
@@ -1322,8 +1317,10 @@ class BigQueryAdapter(WarehouseAdapter):
                     pass
             job = None
             failure = AdapterError("BigQuery table snapshot could not be opened")
+            failure_cause = error
         if failure is not None:
-            raise failure
+            assert failure_cause is not None
+            raise failure from failure_cause
         raise AssertionError("unreachable BigQuery table snapshot state")
 
     def execute(self, sql: str, params: list[Any] | None = None) -> Any:

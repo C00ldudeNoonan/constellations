@@ -4,7 +4,7 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import polars as pl
@@ -24,6 +24,7 @@ from dbt_ml.adapters import (
     parse_warehouse_config,
 )
 from dbt_ml.adapters.bigquery import BigQueryAdapter
+from dbt_ml.adapters.duckdb import DuckDBAdapter, _duckdb_arrow_batches
 
 
 def _duckdb_config(path: Path) -> Any:
@@ -162,7 +163,61 @@ def test_duckdb_native_predicate_failure_does_not_retain_value(
             ):
                 pass
 
-    _assert_sentinel_absent_from_error(exc_info.value, sentinel)
+    assert sentinel not in str(exc_info.value)
+    assert sentinel not in repr(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, duckdb.Error)
+
+
+def test_duckdb_snapshot_open_and_generation_failures_preserve_causes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "diagnostic-only-native-error"
+
+    def fail_predicates(*_args: Any) -> tuple[str, list[Any]]:
+        raise RuntimeError(sentinel)
+
+    with create_adapter(_duckdb_config(tmp_path / "causes.duckdb")) as adapter:
+        assert isinstance(adapter, DuckDBAdapter)
+        adapter.materialize_full("records", pl.DataFrame({"record_id": ["a"]}))
+        monkeypatch.setattr("dbt_ml.adapters.duckdb._duckdb_read_predicates", fail_predicates)
+
+        with pytest.raises(AdapterError, match="could not be opened") as open_error:
+            with adapter.table_snapshot("records"):
+                pass
+        assert sentinel not in str(open_error.value)
+        assert isinstance(open_error.value.__cause__, RuntimeError)
+
+        with pytest.raises(AdapterError, match="generation could not be validated") as digest_error:
+            adapter._current_table_digest(TableReadRequest("records", None, 1, (), None))
+        assert sentinel not in str(digest_error.value)
+        assert isinstance(digest_error.value.__cause__, RuntimeError)
+
+
+def test_duckdb_snapshot_batch_failure_preserves_cause() -> None:
+    sentinel = "diagnostic-only-arrow-error"
+
+    class FailingReader:
+        schema = pa.schema([pa.field("value", pa.int64())])
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __iter__(self) -> FailingReader:
+            return self
+
+        def __next__(self) -> pa.RecordBatch:
+            raise RuntimeError(sentinel)
+
+        def close(self) -> None:
+            self.closed = True
+
+    reader = FailingReader()
+    with pytest.raises(AdapterError, match="batch read failed") as exc_info:
+        list(_duckdb_arrow_batches(cast(pa.RecordBatchReader, reader), lambda _digest: None))
+
+    assert sentinel not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert reader.closed
 
 
 @pytest.mark.parametrize(
@@ -476,6 +531,75 @@ def test_bigquery_empty_relation_keeps_typed_schema() -> None:
     with adapter.table_snapshot("records") as snapshot:
         assert list(snapshot) == []
         assert snapshot.schema == pa.schema([pa.field("record_id", pa.string())])
+
+
+def test_bigquery_snapshot_open_failure_preserves_cause() -> None:
+    sentinel = "diagnostic-only-open-error"
+
+    class FailingClient(_FakeBigQueryClient):
+        def get_table(self, _table_id: str) -> Any:
+            raise RuntimeError(sentinel)
+
+    adapter = _bigquery_adapter(FailingClient({"record_id": pa.array(["a"])}))
+    with pytest.raises(AdapterError, match="could not be opened") as exc_info:
+        with adapter.table_snapshot("records"):
+            pass
+
+    assert sentinel not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_bigquery_snapshot_batch_failure_preserves_cause() -> None:
+    sentinel = "diagnostic-only-batch-error"
+
+    class FailingRows(_FakeBigQueryRows):
+        def __init__(self) -> None:
+            super().__init__(
+                pa.table({"record_id": pa.array([], type=pa.string())}), 1
+            )
+
+        def to_arrow_iterable(self, **_kwargs: Any) -> Iterator[pa.RecordBatch]:
+            raise RuntimeError(sentinel)
+            yield from ()
+
+    class FailingJob(_FakeBigQueryJob):
+        def result(self, *, page_size: int, timeout: float | None) -> FailingRows:
+            del page_size, timeout
+            return FailingRows()
+
+    class FailingClient(_FakeBigQueryClient):
+        def query(self, sql: str, job_config: Any = None, **_kwargs: Any) -> FailingJob:
+            self.queries.append((sql, job_config))
+            self.job = FailingJob(pa.table(self.data))
+            return self.job
+
+    adapter = _bigquery_adapter(FailingClient({"record_id": pa.array(["a"])}))
+    with adapter.table_snapshot("records") as snapshot:
+        with pytest.raises(AdapterError, match="batch read failed") as exc_info:
+            list(snapshot)
+
+    assert sentinel not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_bigquery_snapshot_generation_failure_preserves_cause() -> None:
+    sentinel = "diagnostic-only-generation-error"
+
+    class FailingValidationClient(_FakeBigQueryClient):
+        def get_table(self, _table_id: str) -> Any:
+            if self.get_table_calls >= 2:
+                raise RuntimeError(sentinel)
+            return super().get_table(_table_id)
+
+    adapter = _bigquery_adapter(
+        FailingValidationClient({"record_id": pa.array(["a"])})
+    )
+    with pytest.raises(AdapterError, match="generation could not be validated") as exc_info:
+        with adapter.table_snapshot("records") as snapshot:
+            assert len(list(snapshot)) == 1
+
+    assert sentinel not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 def test_bigquery_early_close_cancels_unconsumed_result() -> None:

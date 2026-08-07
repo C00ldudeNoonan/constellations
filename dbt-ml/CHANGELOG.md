@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 - 2026-08-07
 
 ### Incremental change detection: `update_when_changed` (issue #281)
 
@@ -47,6 +47,11 @@
 - Generated manifests omit `post_extract.options`, and compiler diagnostics for
   module/option validation failures use a stable message with the unsafe
   exception chain severed.
+
+### Tooling (issue #283)
+
+- Added dbt-ml project skills that package repository workflows for agent-driven
+  development. No runtime or public config/behavior contract change.
 
 ## v0.6.0 - 2026-08-07
 

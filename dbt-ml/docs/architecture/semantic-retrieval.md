@@ -294,8 +294,10 @@ economic_data:
             # storage_options (operator-controlled, never logged or in artifacts).
             path: target/lancedb
             # path: gs://econ-data-prod/dbt-ml/lancedb
-            # storage_options:
-            #   google_service_account: /run/secrets/gcs-sa.json
+            # storage_options:          # non-secret routing only (identity input)
+            #   region: us-central1
+            # storage_options_env:      # option-key -> env-var name (a reference)
+            #   aws_secret_access_key: DBT_ML_LANCEDB_AWS_SECRET
             collection_template: '{project}__{target}__{collection}'
             timeout_seconds: 30
             minimum_consistency: strong
@@ -1192,9 +1194,16 @@ it safely still requires the reserved provider-enforced fencing capability.
 Cloud paths are for sharing one index between the (single) build host and the
 serving hosts, not for concurrent multi-host publication.
 
-`storage_options` values are held as secrets: they are redacted from
-`repr()`/`model_dump()`/`model_dump_json()` and every other diagnostic surface,
-and are unwrapped only at the `lancedb.connect()` call.
+Cloud credentials follow the repository's reference contract. `storage_options`
+carries only non-secret routing (region, endpoint, …) and is part of the store's
+physical identity, so a changed endpoint yields a distinct safe target and state
+scope rather than silently reconciling one physical store's rows against
+another's; secret-looking keys are rejected there. Secrets are supplied through
+`storage_options_env`, which maps an option key to an environment-variable
+*name* — a reference that is redacted from every dump and resolved to its value
+only at the `lancedb.connect()` call, never stored or fingerprinted. Equivalent
+URI spellings (`s3://`≡`s3a://`, `gs://`≡`gcs://`, trailing slashes) canonicalize
+to one physical target for both the identity and the publisher lock.
 
 ### Initial and incremental publication
 

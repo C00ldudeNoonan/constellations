@@ -2,19 +2,20 @@
 
 Real cloud round-trips are credential-gated and live elsewhere; these unit tests
 pin the wrapper's routing: cloud URIs bypass local-filesystem resolution and the
-local mkdir, storage_options flows into `lancedb.connect()` without leaking into
-identity, and the single-host publisher lock relocates to host-local scratch for
-cloud stores while local-path behavior stays byte-for-byte the same.
+local mkdir, non-secret routing rides in the store identity while credential
+references resolve only at connect, and the single-host publisher lock plus the
+identity both key off a canonical physical target. Local-path behavior stays
+byte-for-byte the same.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import lancedb
 import pytest
-from pydantic import SecretStr
 
+from dbt_ml.credentials import CredentialReference
+from dbt_ml.hashing import canonical_fingerprint
 from dbt_ml.retrieval import LanceDBStore, RetrievalError, parse_store_config
 from dbt_ml.retrieval.lancedb import LanceDBConfig
 
@@ -48,31 +49,40 @@ def test_local_paths_are_not_cloud(path: str) -> None:
     assert _config(path).is_cloud_uri is False
 
 
-def test_storage_options_parsed() -> None:
+def test_storage_options_non_secret_routing_parsed() -> None:
     config = _config(
         "gs://bucket/prefix",
-        storage_options={"google_service_account": "/run/secrets/sa.json"},
+        storage_options={"region": "us-central1", "endpoint": "https://x"},
     )
-    assert {k: v.get_secret_value() for k, v in config.storage_options.items()} == {
-        "google_service_account": "/run/secrets/sa.json"
-    }
+    assert config.storage_options == {"region": "us-central1", "endpoint": "https://x"}
 
 
 def test_storage_options_default_empty() -> None:
-    assert _config("gs://bucket/prefix").storage_options == {}
+    config = _config("gs://bucket/prefix")
+    assert config.storage_options == {}
+    assert config.storage_options_env == {}
 
 
-def test_storage_options_are_redacted_on_every_serialization_surface() -> None:
+@pytest.mark.parametrize(
+    "secret_key",
+    ["aws_secret_access_key", "aws_session_token", "account_key", "sas_token",
+     "password", "api_key", "gcs_credential"],
+)
+def test_secret_looking_key_rejected_from_routing(secret_key: str) -> None:
+    with pytest.raises(Exception, match="non-secret routing only"):
+        _config("gs://bucket/prefix", storage_options={secret_key: "x"})
+
+
+def test_storage_options_env_reference_is_redacted() -> None:
     config = _config(
-        "gs://bucket/prefix",
-        storage_options={"aws_secret_access_key": "SUPERSECRET"},
+        "s3://bucket/prefix",
+        storage_options_env={"aws_secret_access_key": "MY_AWS_SECRET"},
     )
-    # Values are SecretStr, so no diagnostic/serialization surface prints them.
-    assert "SUPERSECRET" not in repr(config)
-    assert "SUPERSECRET" not in str(config)
-    assert "SUPERSECRET" not in config.model_dump_json()
-    assert "SUPERSECRET" not in json.dumps(config.model_dump(mode="json"))
-    assert isinstance(config.storage_options["aws_secret_access_key"], SecretStr)
+    reference = config.storage_options_env["aws_secret_access_key"]
+    assert isinstance(reference, CredentialReference)
+    # The env-var NAME is a reference, redacted from every dump surface.
+    assert "MY_AWS_SECRET" not in repr(config)
+    assert "MY_AWS_SECRET" not in config.model_dump_json()
 
 
 def test_empty_path_rejected() -> None:
@@ -162,6 +172,55 @@ def test_storage_options_absent_when_empty(
     assert captured["kwargs"] == {}
 
 
+def test_connect_resolves_credential_reference_at_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_connect(target: str, **kwargs: object) -> object:
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(lancedb, "connect", fake_connect)
+    monkeypatch.setenv("MY_AWS_SECRET", "resolved-secret-value")
+    config = _config(
+        "s3://bucket/prefix",
+        storage_options={"region": "us-east-1"},
+        storage_options_env={"aws_secret_access_key": "MY_AWS_SECRET"},
+    )
+    with _store(config):
+        pass
+    # Routing rides verbatim; the reference is resolved from the env only here.
+    assert captured["kwargs"] == {
+        "storage_options": {
+            "region": "us-east-1",
+            "aws_secret_access_key": "resolved-secret-value",
+        }
+    }
+
+
+def test_connect_missing_credential_reference_raises_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def fake_connect(target: str, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        return object()
+
+    monkeypatch.setattr(lancedb, "connect", fake_connect)
+    monkeypatch.delenv("MISSING_SECRET", raising=False)
+    config = _config(
+        "s3://bucket/prefix",
+        storage_options_env={"aws_secret_access_key": "MISSING_SECRET"},
+    )
+    with pytest.raises(RetrievalError, match="storage_credential_missing"):
+        with _store(config):
+            pass
+    assert called is False
+
+
 def test_cloud_publisher_lock_excludes_second_publisher(tmp_path: Path) -> None:
     lock_dir = str(tmp_path / "shared-locks")
     config = _config("gs://bucket/prefix", publisher_lock_dir=lock_dir)
@@ -177,7 +236,7 @@ def test_cloud_publisher_lock_excludes_second_publisher(tmp_path: Path) -> None:
         pass
 
 
-def test_cloud_publisher_lock_dir_is_keyed_by_uri() -> None:
+def test_cloud_publisher_lock_dir_is_keyed_by_target() -> None:
     a = _store(_config("gs://bucket/prefix-a"))._lock_dir()
     b = _store(_config("gs://bucket/prefix-b"))._lock_dir()
     same = _store(_config("gs://bucket/prefix-a"))._lock_dir()
@@ -185,6 +244,44 @@ def test_cloud_publisher_lock_dir_is_keyed_by_uri() -> None:
     assert a == same
     # Never a local mkdir on the object-store namespace.
     assert "bucket" not in a.as_posix()
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [("s3a://bucket/p", "s3://bucket/p"), ("gcs://bucket/p", "gs://bucket/p"),
+     ("GS://bucket/p", "gs://bucket/p"), ("s3://bucket/p/", "s3://bucket/p")],
+)
+def test_scheme_aliases_share_lock_and_identity(alias: str, canonical: str) -> None:
+    # Equivalent spellings must resolve to one physical target for both the
+    # lock (so concurrent publishers actually contend) and the state scope.
+    assert _store(_config(alias))._lock_dir() == _store(_config(canonical))._lock_dir()
+    assert (
+        _store(_config(alias)).safe_descriptor().safe_target_identity
+        == _store(_config(canonical)).safe_descriptor().safe_target_identity
+    )
+
+
+def test_endpoint_routing_yields_distinct_target(tmp_path: Path) -> None:
+    # Same URI, different endpoint = a different physical store: distinct state
+    # scope (so B's rows aren't reconciled against A's state) AND distinct lock.
+    a = _config("s3://bucket/p", storage_options={"endpoint": "https://a.example"})
+    b = _config("s3://bucket/p", storage_options={"endpoint": "https://b.example"})
+    assert (
+        _store(a).safe_descriptor().safe_target_identity
+        != _store(b).safe_descriptor().safe_target_identity
+    )
+    override = str(tmp_path / "locks")
+    a2 = _config(
+        "s3://bucket/p",
+        storage_options={"endpoint": "https://a.example"},
+        publisher_lock_dir=override,
+    )
+    b2 = _config(
+        "s3://bucket/p",
+        storage_options={"endpoint": "https://b.example"},
+        publisher_lock_dir=override,
+    )
+    assert _store(a2)._lock_dir() != _store(b2)._lock_dir()
 
 
 def test_cloud_lock_dir_is_independent_of_tmpdir(
@@ -217,16 +314,18 @@ def test_local_store_lock_stays_co_located_by_default(tmp_path: Path) -> None:
     assert store._lock_dir() == data
 
 
-def test_safe_descriptor_stable_and_excludes_storage_options(tmp_path: Path) -> None:
-    base = _config("gs://bucket/prefix")
-    with_secret = _config(
-        "gs://bucket/prefix", storage_options={"aws_secret_access_key": "SECRET"}
+def test_credential_references_do_not_affect_identity() -> None:
+    # Secret references are not part of the physical target: switching which env
+    # var holds the key must not change the state scope, and no secret material
+    # (nor the env-var name) can appear in the identity fingerprint.
+    base = _config("s3://bucket/p")
+    with_ref = _config(
+        "s3://bucket/p", storage_options_env={"aws_secret_access_key": "MY_ENV"}
     )
     id_base = _store(base).safe_descriptor().safe_target_identity
-    id_secret = _store(with_secret).safe_descriptor().safe_target_identity
-    # storage_options must not perturb identity — and the secret must not be in it.
-    assert id_base == id_secret
-    assert "SECRET" not in id_base
+    id_ref = _store(with_ref).safe_descriptor().safe_target_identity
+    assert id_base == id_ref
+    assert "MY_ENV" not in id_ref
 
 
 def test_safe_descriptor_local_identity_is_posix_normalized(tmp_path: Path) -> None:
@@ -234,3 +333,16 @@ def test_safe_descriptor_local_identity_is_posix_normalized(tmp_path: Path) -> N
     id_one = _store(_config(str(local))).safe_descriptor().safe_target_identity
     id_two = _store(_config(local.as_posix())).safe_descriptor().safe_target_identity
     assert id_one == id_two
+
+
+def test_local_identity_unchanged_by_new_fields(tmp_path: Path) -> None:
+    # Backward-compat guard: a local store's identity must still be the exact
+    # pre-routing fingerprint {store_type, path}, so existing state scopes and
+    # published collections keep resolving after this change.
+    local = (tmp_path / "lance").resolve()
+    identity = _store(_config(str(local))).safe_descriptor().safe_target_identity
+    expected = canonical_fingerprint(
+        {"store_type": "lancedb", "path": local.as_posix()},
+        domain="dbt-ml-safe-retrieval-target",
+    )
+    assert identity == expected

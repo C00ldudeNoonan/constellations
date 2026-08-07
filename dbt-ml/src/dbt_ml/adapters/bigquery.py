@@ -22,6 +22,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import quote
 from uuid import uuid4
 
 import polars as pl
@@ -33,6 +34,7 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     GetJsonSchemaHandler,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -236,6 +238,9 @@ class BigQueryWarehouseConfig(WarehouseConfig):
     job_retry_deadline_seconds: float | None = None
     job_creation_timeout_seconds: float | None = None
     job_execution_timeout_seconds: float | None = None
+    # Target-scoped physical-layout policy. The adapter validates and merges
+    # this mapping before source discovery; model-level warehouse_options win.
+    warehouse_defaults: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -306,6 +311,10 @@ class BigQueryWarehouseConfig(WarehouseConfig):
     @classmethod
     def prepare_profile_input(cls, raw: Mapping[str, Any]) -> dict[str, Any]:
         prepared = dict(raw)
+        if "warehouse_defaults" in prepared:
+            prepared["warehouse_defaults"] = _prepare_warehouse_defaults_input(
+                prepared["warehouse_defaults"]
+            )
         for field_name in (
             "keyfile_json",
             "token",
@@ -410,6 +419,19 @@ class BigQueryWarehouseConfig(WarehouseConfig):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_warehouse_defaults(self) -> BigQueryWarehouseConfig:
+        try:
+            _bigquery_default_options(
+                self.warehouse_defaults,
+                target_name="target",
+                schema_name=self.schema_name,
+                model_name="model",
+            )
+        except ValueError as error:
+            raise ValueError(str(error)) from None
+        return self
+
     def absolutize(self, project_dir: Path) -> BigQueryWarehouseConfig:
         if self.keyfile is None or isinstance(
             self.keyfile, CredentialReference
@@ -498,7 +520,7 @@ class BigQueryWarehouseOptions(BaseModel):
     kms_key_name) are set on every (re)create; `labels` are also attached to
     the load and query jobs the adapter runs for the model."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     partition_by: BigQueryPartitionBy | None = None
     cluster_by: list[str] = Field(default_factory=list, max_length=4)
@@ -606,6 +628,90 @@ class BigQueryWarehouseOptions(BaseModel):
                 "(timestamp/date/datetime), not int64 range partitioning"
             )
         return self
+
+
+_BIGQUERY_WAREHOUSE_DEFAULT_KEYS = frozenset(
+    {*BigQueryWarehouseOptions.model_fields, "external_volume"}
+)
+_GCS_EXTERNAL_VOLUME_RE = re.compile(r"^gs://[^/\s?#]+(?:/[^\s?#]*)?$")
+
+
+def _prepare_warehouse_defaults_input(value: Any) -> dict[str, Any]:
+    """Reject unsafe/unknown default keys before generic env interpolation."""
+    if not isinstance(value, Mapping):
+        raise ValueError("`warehouse_defaults` must be a mapping")
+    raw = dict(value)
+    unknown = sorted(
+        str(key) for key in raw if key not in _BIGQUERY_WAREHOUSE_DEFAULT_KEYS
+    )
+    if unknown:
+        raise ValueError(
+            "unknown BigQuery warehouse_defaults key(s): " + ", ".join(unknown)
+        )
+    if "storage_uri" in raw:
+        raise ValueError(
+            "`warehouse_defaults.storage_uri` is unsafe because every model would "
+            "share one location; set `external_volume` so dbt-ml derives a unique "
+            "target/dataset/model path"
+        )
+    return raw
+
+
+def _warehouse_defaults_validation_message(error: ValidationError) -> str:
+    details: list[str] = []
+    for item in error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    ):
+        location = ".".join(str(part) for part in item["loc"])
+        prefix = f"{location}: " if location else ""
+        details.append(f"{prefix}{item['msg']}")
+    return "; ".join(details)
+
+
+def _bigquery_default_options(
+    defaults: Mapping[str, Any],
+    *,
+    target_name: str,
+    schema_name: str,
+    model_name: str,
+) -> dict[str, Any]:
+    raw = _prepare_warehouse_defaults_input(defaults)
+    if not raw:
+        return {}
+    external_volume = raw.pop("external_volume", None)
+    table_format = raw.get("table_format")
+    if table_format == "iceberg" and external_volume is None:
+        raise ValueError(
+            "`warehouse_defaults.table_format: iceberg` requires `external_volume`"
+        )
+    if external_volume is not None:
+        if table_format != "iceberg":
+            raise ValueError(
+                "`warehouse_defaults.external_volume` requires "
+                "`table_format: iceberg`"
+            )
+        if not isinstance(external_volume, str) or not _GCS_EXTERNAL_VOLUME_RE.match(
+            external_volume
+        ):
+            raise ValueError(
+                "`warehouse_defaults.external_volume` must be a gs:// Cloud "
+                "Storage URI"
+            )
+        segments = (target_name, schema_name, model_name)
+        raw["storage_uri"] = "/".join(
+            [
+                external_volume.rstrip("/"),
+                *(quote(segment, safe="") for segment in segments),
+            ]
+        )
+    try:
+        BigQueryWarehouseOptions.model_validate(raw)
+    except ValidationError as error:
+        message = _warehouse_defaults_validation_message(error)
+        raise ValueError(f"invalid BigQuery warehouse_defaults: {message}") from None
+    return raw
 
 
 def parse_keyfile_json(value: dict[str, Any] | str) -> dict[str, Any]:
@@ -775,6 +881,17 @@ class BigQueryAdapter(WarehouseAdapter):
     @classmethod
     def warehouse_options_model(cls) -> type[BaseModel] | None:
         return BigQueryWarehouseOptions
+
+    def warehouse_option_defaults(self, *, model_name: str) -> dict[str, Any]:
+        try:
+            return _bigquery_default_options(
+                self._cfg.warehouse_defaults,
+                target_name=self._cfg.target_name or "default",
+                schema_name=self.schema,
+                model_name=model_name,
+            )
+        except ValueError as error:
+            raise AdapterError(str(error)) from None
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 

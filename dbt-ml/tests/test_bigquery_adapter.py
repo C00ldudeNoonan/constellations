@@ -823,6 +823,129 @@ def test_warehouse_options_cluster_limit_four() -> None:
         _parse_options({"cluster_by": ["a", "b", "c", "d", "e"]})
 
 
+def _adapter_with_iceberg_defaults(*, target_name: str = "prod") -> BigQueryAdapter:
+    adapter = _adapter(
+        warehouse_defaults={
+            "table_format": "iceberg",
+            "connection": "proj.us.biglake",
+            "external_volume": "gs://iceberg-bucket/dbt-ml",
+            "labels": {"managed_by": "dbt_ml"},
+        }
+    )
+    adapter._cfg.bind_target_name(target_name)
+    return adapter
+
+
+def test_profile_warehouse_defaults_derive_target_dataset_model_uri() -> None:
+    prod = _adapter_with_iceberg_defaults(target_name="prod")
+    dev = _adapter_with_iceberg_defaults(target_name="dev")
+
+    prod_options = prod.parse_warehouse_options({}, model_name="filings")
+    dev_options = dev.parse_warehouse_options({}, model_name="filings")
+
+    assert isinstance(prod_options, BigQueryWarehouseOptions)
+    assert isinstance(dev_options, BigQueryWarehouseOptions)
+    assert prod_options.storage_uri == "gs://iceberg-bucket/dbt-ml/prod/ds/filings"
+    assert dev_options.storage_uri == "gs://iceberg-bucket/dbt-ml/dev/ds/filings"
+    assert prod_options.connection == "proj.us.biglake"
+    assert prod_options.labels == {"managed_by": "dbt_ml"}
+
+
+def test_model_warehouse_options_override_profile_defaults() -> None:
+    adapter = _adapter_with_iceberg_defaults()
+
+    options = adapter.parse_warehouse_options(
+        {
+            "connection": "DEFAULT",
+            "storage_uri": "gs://custom-bucket/filings",
+            "labels": {"team": "econ"},
+        },
+        model_name="filings",
+    )
+
+    assert isinstance(options, BigQueryWarehouseOptions)
+    assert options.connection == "DEFAULT"
+    assert options.storage_uri == "gs://custom-bucket/filings"
+    assert options.labels == {"team": "econ"}
+
+
+def test_model_can_opt_out_of_profile_warehouse_defaults() -> None:
+    adapter = _adapter_with_iceberg_defaults()
+
+    assert (
+        adapter.parse_warehouse_options({"inherit": False}, model_name="scratch")
+        is None
+    )
+    options = adapter.parse_warehouse_options(
+        {"inherit": False, "cluster_by": ["document_id"]},
+        model_name="scratch",
+    )
+    assert isinstance(options, BigQueryWarehouseOptions)
+    assert options.table_format is None
+    assert options.cluster_by == ["document_id"]
+
+
+def test_model_warehouse_options_inherit_requires_boolean() -> None:
+    adapter = _adapter_with_iceberg_defaults()
+    with pytest.raises(AdapterError, match=r"inherit must be true or false"):
+        adapter.parse_warehouse_options(
+            {"inherit": "sometimes"},
+            model_name="filings",
+        )
+
+
+def test_bigquery_warehouse_defaults_reject_unsafe_or_invalid_volume() -> None:
+    with pytest.raises(AdapterError, match=r"storage_uri.*external_volume"):
+        parse_warehouse_config(
+            {
+                "type": "bigquery",
+                "project": "proj",
+                "warehouse_defaults": {
+                    "table_format": "iceberg",
+                    "connection": "proj.us.biglake",
+                    "storage_uri": "gs://shared/all-models",
+                },
+            }
+        )
+    with pytest.raises(AdapterError, match=r"external_volume.*gs://"):
+        parse_warehouse_config(
+            {
+                "type": "bigquery",
+                "project": "proj",
+                "warehouse_defaults": {
+                    "table_format": "iceberg",
+                    "connection": "proj.us.biglake",
+                    "external_volume": "s3://wrong-bucket",
+                },
+            }
+        )
+
+
+def test_bigquery_warehouse_defaults_require_complete_iceberg_policy() -> None:
+    with pytest.raises(AdapterError, match="requires `external_volume`"):
+        parse_warehouse_config(
+            {
+                "type": "bigquery",
+                "project": "proj",
+                "warehouse_defaults": {
+                    "table_format": "iceberg",
+                    "connection": "proj.us.biglake",
+                },
+            }
+        )
+    with pytest.raises(AdapterError, match=r"requires.*connection"):
+        parse_warehouse_config(
+            {
+                "type": "bigquery",
+                "project": "proj",
+                "warehouse_defaults": {
+                    "table_format": "iceberg",
+                    "external_volume": "gs://iceberg-bucket",
+                },
+            }
+        )
+
+
 def test_partition_expression_ddl_forms() -> None:
     adapter = _adapter()
 

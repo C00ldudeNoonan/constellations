@@ -9,6 +9,7 @@ existing imports are unchanged.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -47,8 +48,6 @@ def test_load_project_or_click_wraps_config_error(tmp_path: Path) -> None:
 def test_serving_scope_rejects_unknown_index(
     tmp_path: Path, example_project_dir: Path
 ) -> None:
-    import shutil
-
     from dbt_ml.cli_services.serving import resolve_serving_scope
 
     project = tmp_path / "proj"
@@ -71,8 +70,6 @@ def test_serving_scope_rejects_unknown_index(
 def test_watch_reports_no_source_paths(
     tmp_path: Path, example_project_dir: Path
 ) -> None:
-    import shutil
-
     project = tmp_path / "proj"
     shutil.copytree(
         example_project_dir,
@@ -88,5 +85,53 @@ def test_watch_reports_no_source_paths(
             target=None,
             full_refresh=False,
             select=None,
+            exclude=None,
+        )
+
+
+def test_watch_validates_effective_options_before_source_access(
+    tmp_path: Path, example_project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    shutil.copytree(
+        example_project_dir,
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    (project / "profiles.yml").write_text(
+        "invoice_pipeline:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: bigquery\n"
+        "        project: econ\n"
+        "        dataset: documents_dev\n"
+    )
+    model_path = project / "models" / "raw_invoices.yml"
+    model_path.write_text(
+        model_path.read_text().replace(
+            "    materialization: incremental",
+            "    materialization: incremental\n"
+            "    warehouse_options:\n"
+            "      inherit: not-a-boolean",
+            1,
+        )
+    )
+
+    def unexpected_source_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("invalid options must fail before source paths are accessed")
+
+    monkeypatch.setattr(
+        "dbt_ml.cli_services.watch.apply_source_path_overrides", unexpected_source_access
+    )
+
+    with pytest.raises(ConfigClickError, match="inherit"):
+        run_watch(
+            project,
+            profiles_dir=None,
+            target=None,
+            full_refresh=False,
+            select="raw_invoices",
             exclude=None,
         )

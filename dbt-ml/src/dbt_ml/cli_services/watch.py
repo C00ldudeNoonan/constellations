@@ -12,6 +12,7 @@ from pathlib import Path
 
 import click
 
+from ..adapters import create_adapter
 from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import ConfigError
 from ..manifest import write_manifest, write_run_results
@@ -47,9 +48,10 @@ def run_watch(
             project, project_dir, target=target, profiles_dir=profiles_dir
         )
         selected_names = set(selected)
+        adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
         validate_warehouse_capabilities(
             [model for model in models if model.name in selected_names],
-            resolved.warehouse.type,
+            adapter,
         )
         sources = apply_source_path_overrides(sources, resolved)
     except CONFIG_ERRORS as e:

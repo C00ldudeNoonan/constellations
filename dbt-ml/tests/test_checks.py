@@ -10,6 +10,7 @@ import pytest
 from dbt_ml.adapters import WarehouseAdapter, create_adapter, parse_warehouse_config
 from dbt_ml.checks import run_model_tests, run_project_tests
 from dbt_ml.checks.schema import TestResult, UnknownTestError, evaluate_test_spec
+from dbt_ml.config import ConfigError
 from dbt_ml.config.model import ModelConfig
 from dbt_ml.runner import run_project
 from dbt_ml.synth import generate_invoices
@@ -332,6 +333,41 @@ def test_zero_match_model_creates_testable_typed_relation(
     assert results
     assert all(result.status == "pass" for result in results)
     assert all(result.test_name != "relation_exists" for result in results)
+
+
+def test_project_tests_validate_effective_options_before_adapter_connection(
+    fresh_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fresh_project / "profiles.yml").write_text(
+        "invoice_pipeline:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: bigquery\n"
+        "        project: econ\n"
+        "        dataset: documents_dev\n"
+    )
+    model_path = fresh_project / "models" / "raw_invoices.yml"
+    model_path.write_text(
+        model_path.read_text().replace(
+            "    materialization: incremental",
+            "    materialization: incremental\n"
+            "    warehouse_options:\n"
+            "      inherit: not-a-boolean",
+            1,
+        )
+    )
+
+    def unexpected_connection(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("invalid options must fail before the adapter connects")
+
+    monkeypatch.setattr(
+        "dbt_ml.adapters.bigquery.BigQueryAdapter._connect", unexpected_connection
+    )
+
+    with pytest.raises(ConfigError, match="inherit"):
+        run_project_tests(fresh_project, select="raw_invoices")
 
 
 def test_end_to_end_passes(fresh_project: Path) -> None:

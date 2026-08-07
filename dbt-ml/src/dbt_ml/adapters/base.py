@@ -739,17 +739,43 @@ class WarehouseAdapter(ABC):
         partitioning config while its dev target runs DuckDB."""
         return None
 
+    def warehouse_option_defaults(self, *, model_name: str) -> dict[str, Any]:
+        """Return adapter-owned profile defaults for one model.
+
+        Defaults are resolved without warehouse I/O. Adapters may derive
+        model-specific routing here, but must not resolve credentials.
+        """
+        del model_name
+        return {}
+
     def parse_warehouse_options(
         self, options: dict[str, Any], *, model_name: str
     ) -> BaseModel | None:
-        """Validate a model's `warehouse_options` against this adapter's
-        options model. Unknown keys are a config error on adapters that
-        declare a model, and ignored on adapters that don't."""
+        """Merge profile defaults and validate effective warehouse options.
+
+        Model-level top-level keys override profile defaults. `inherit: false`
+        starts from an empty mapping, providing an explicit target-local opt-out.
+        Adapters without an options model continue to ignore the whole block so
+        portable projects can carry BigQuery settings while running on DuckDB.
+        """
         options_model = self.warehouse_options_model()
-        if not options or options_model is None:
+        if options_model is None:
+            return None
+        inherit = options.get("inherit", True)
+        if not isinstance(inherit, bool):
+            raise AdapterError(
+                f"Model '{model_name}': warehouse_options.inherit must be true or false"
+            )
+        effective = (
+            self.warehouse_option_defaults(model_name=model_name) if inherit else {}
+        )
+        effective.update(
+            {key: value for key, value in options.items() if key != "inherit"}
+        )
+        if not effective:
             return None
         try:
-            return options_model.model_validate(options)
+            return options_model.model_validate(effective)
         except ValidationError as e:
             raise AdapterError(
                 f"Model '{model_name}': invalid warehouse_options for "

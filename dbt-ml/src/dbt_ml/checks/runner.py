@@ -70,12 +70,13 @@ def run_project_tests(
         dag.select_models(select=select, exclude=exclude, modified=modified)
     )
     selected = [model for model in models if model.name in selected_names]
-    validate_warehouse_capabilities(selected, resolved.warehouse.type)
+    adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+    validate_warehouse_capabilities(selected, adapter)
     validate_test_requirements(selected, resolved)
     run_budget = _test_run_budget(resolved)
 
     results: list[TestResult] = []
-    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+    with adapter:
         for model in models:
             if model.name not in selected_names:
                 continue

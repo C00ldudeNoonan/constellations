@@ -210,7 +210,8 @@ def compile(ctx: click.Context) -> None:
         resolved = resolve_profile(
             project, project_dir, target=target, profiles_dir=profiles_dir
         )
-        validate_warehouse_capabilities(models, resolved.warehouse.type)
+        adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+        validate_warehouse_capabilities(models, adapter)
         manifest_path = write_manifest(
             project_dir, target=target, profiles_dir=profiles_dir
         )

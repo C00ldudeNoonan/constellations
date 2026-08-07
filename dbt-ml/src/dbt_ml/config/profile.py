@@ -10,6 +10,7 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     GetJsonSchemaHandler,
+    PrivateAttr,
 )
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
@@ -112,8 +113,18 @@ class WarehouseConfig(BaseModel):
         hide_input_in_errors=True,
     )
 
+    _target_name: str | None = PrivateAttr(default=None)
+
     type: str = "duckdb"
     schema_name: str = Field(default="dbt_ml", alias="schema")
+
+    def bind_target_name(self, target_name: str) -> None:
+        """Attach resolved runtime target identity without making it profile YAML."""
+        self._target_name = target_name
+
+    @property
+    def target_name(self) -> str | None:
+        return self._target_name
 
     @classmethod
     def prepare_profile_input(cls, raw: Mapping[str, Any]) -> dict[str, Any]:

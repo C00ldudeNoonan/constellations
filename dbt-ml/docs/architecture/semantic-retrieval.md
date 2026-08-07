@@ -287,7 +287,17 @@ economic_data:
         stores:
           primary:
             type: lancedb
+            # A local path, or a cloud object-store URI so the build host and
+            # the serving hosts share one index (issue #271): s3://, gs://, or
+            # az://. A cloud path skips local-filesystem resolution and passes
+            # straight to lancedb.connect(); credentials/region go in
+            # storage_options (operator-controlled, never logged or in artifacts).
             path: target/lancedb
+            # path: gs://econ-data-prod/dbt-ml/lancedb
+            # storage_options:          # non-secret routing only (identity input)
+            #   region: us-central1
+            # storage_options_env:      # option-key -> env-var name (a reference)
+            #   aws_secret_access_key: DBT_ML_LANCEDB_AWS_SECRET
             collection_template: '{project}__{target}__{collection}'
             timeout_seconds: 30
             minimum_consistency: strong
@@ -1167,6 +1177,33 @@ reassign authority until the operator confirms the old owner is terminated,
 and it advances the fence so a surviving zombie fails its next verification.
 v0.2 does not claim fault-tolerant multi-writer publication beyond this
 documented single-host boundary.
+
+A cloud-backed LanceDB `path` (`s3://`, `gs://`, `az://`, issue #271) does not
+change this boundary. The object store has no local disk to host an OS file
+lock, so the lock lives in a fixed per-machine directory keyed by the store URI
+— deliberately not a `TMPDIR`-derived path, since that varies per
+process/container and would let two publishers' locks silently miss each other.
+It still serializes every publisher sharing that host filesystem and nothing
+more. Publishers in isolated mount namespaces (separate containers) share no
+local path automatically, so those deployments must set `publisher_lock_dir` to
+a volume mounted into every publisher — the only way a local file lock can
+honestly back the single-host capability there. Two *hosts* writing to the same
+cloud prefix are never mutually excluded: that is the same limitation the
+single-host lock already carries for a shared network filesystem, and crossing
+it safely still requires the reserved provider-enforced fencing capability.
+Cloud paths are for sharing one index between the (single) build host and the
+serving hosts, not for concurrent multi-host publication.
+
+Cloud credentials follow the repository's reference contract. `storage_options`
+carries only non-secret routing (region, endpoint, …) and is part of the store's
+physical identity, so a changed endpoint yields a distinct safe target and state
+scope rather than silently reconciling one physical store's rows against
+another's; secret-looking keys are rejected there. Secrets are supplied through
+`storage_options_env`, which maps an option key to an environment-variable
+*name* — a reference that is redacted from every dump and resolved to its value
+only at the `lancedb.connect()` call, never stored or fingerprinted. Equivalent
+URI spellings (`s3://`≡`s3a://`, `gs://`≡`gcs://`, trailing slashes) canonicalize
+to one physical target for both the identity and the publisher lock.
 
 ### Initial and incremental publication
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 from collections.abc import Sequence
@@ -13,6 +14,7 @@ from typing import Any, Literal, Self
 import pyarrow as pa
 from pydantic import ConfigDict, Field, field_validator
 
+from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
 from ..optional_dependencies import (
     import_optional_dependency,
@@ -41,15 +43,78 @@ _OWNER_KEY = b"dbt_ml.owner"
 _CONTRACT_KEY = b"dbt_ml.record_contract"
 _CONFIG_KEY = b"dbt_ml.config_fingerprint"
 
+# Object-store schemes LanceDB connects to natively (Rust object_store cores).
+# A `path` carrying one of these bypasses local-filesystem resolution and the
+# local mkdir, and flows straight into `lancedb.connect()`.
+_CLOUD_SCHEMES = ("s3", "s3a", "gs", "gcs", "az", "abfs", "abfss")
+# Aliases that address the same physical object store are folded to one
+# canonical scheme so the store identity and the publisher lock treat, e.g.,
+# `s3://b/p` and `s3a://b/p` as the same target rather than two.
+_SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs"}
+_CLOUD_URI_RE = re.compile(rf"^({'|'.join(_CLOUD_SCHEMES)})://", re.IGNORECASE)
+# scheme://authority[/path] — the authority (bucket/container/account) must be
+# present. Rejects `s3://` and `gs:///prefix` at parse time instead of failing
+# late inside lancedb.connect() after a publication lease is already held.
+_CLOUD_URI_AUTHORITY_RE = re.compile(
+    rf"^({'|'.join(_CLOUD_SCHEMES)})://([^/]+)(/.*)?$", re.IGNORECASE
+)
+# storage_options is non-secret routing only; keys that name a credential must
+# use storage_options_env (a reference) instead of being pasted as a value.
+_SECRET_OPTION_KEY_RE = re.compile(
+    r"(secret|token|password|access_key|account_key|sas|credential|api_key)",
+    re.IGNORECASE,
+)
+
 
 class LanceDBConfig(RetrievalStoreConfig):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["lancedb"] = "lancedb"
-    path: Path
+    # A local filesystem path or a cloud object-store URI (s3://, gs://, az://).
+    path: str
+    # Non-secret routing passthrough for cloud backends (region, endpoint,
+    # allow_http, …), forwarded to lancedb.connect(storage_options=...). These
+    # values are part of the store's physical identity, so they are folded into
+    # the safe descriptor; secrets must NOT go here (see storage_options_env).
+    storage_options: dict[str, str] = Field(default_factory=dict)
+    # Credential-bearing storage options as references: option-key -> the
+    # environment-variable NAME holding the secret. The value is resolved only
+    # at connect() (in __enter__), mirroring the repo's CredentialReference
+    # contract; the reference is redacted from dumps and never enters the
+    # identity, fingerprints, logs, or artifacts.
+    storage_options_env: dict[str, CredentialReference] = Field(default_factory=dict)
+    # Local directory hosting the publisher lock. Optional for local stores
+    # (defaults to the data dir); for a cloud store it names a host-shared path
+    # so the single-host publisher lock is actually shared across every
+    # publisher on the host (see `_lock_dir`).
+    publisher_lock_dir: str | None = None
     collection_template: str = "{project}__{target}__{collection}"
     timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     minimum_consistency: Literal["strong"] = "strong"
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("path must be a non-empty local path or cloud URI")
+        if _CLOUD_URI_RE.match(value) and not _CLOUD_URI_AUTHORITY_RE.match(value):
+            raise ValueError(
+                "cloud object-store path must include a bucket/container, e.g. "
+                "gs://bucket/prefix or s3://bucket/prefix"
+            )
+        return value
+
+    @field_validator("storage_options")
+    @classmethod
+    def _validate_storage_options(cls, value: dict[str, str]) -> dict[str, str]:
+        secret_keys = sorted(k for k in value if _SECRET_OPTION_KEY_RE.search(k))
+        if secret_keys:
+            raise ValueError(
+                "storage_options is for non-secret routing only; move credential "
+                f"option(s) {secret_keys} to storage_options_env as an "
+                "environment-variable reference"
+            )
+        return value
 
     @field_validator("collection_template")
     @classmethod
@@ -66,9 +131,49 @@ class LanceDBConfig(RetrievalStoreConfig):
             raise ValueError("collection_template renders an invalid collection name")
         return value
 
+    @property
+    def is_cloud_uri(self) -> bool:
+        return bool(_CLOUD_URI_RE.match(self.path))
+
+    def connect_target(self) -> str:
+        """The string handed to `lancedb.connect()`."""
+        return self.path
+
+    def local_data_path(self) -> Path:
+        """Filesystem path for local-disk operations (mkdir, co-located lock).
+
+        Only meaningful for a local store; callers must gate on
+        :attr:`is_cloud_uri` first."""
+        if self.is_cloud_uri:
+            raise RetrievalError(
+                "LanceDB cloud-backed store has no local data path "
+                "(code=lancedb_cloud_no_local_path)"
+            )
+        return Path(self.path)
+
+    def identity_key(self) -> str:
+        """Stable, secret-free identity for the store *location*. Local paths are
+        posix-normalized so the fingerprint is stable across platforms and
+        matches the pre-cloud-URI behavior; cloud URIs are canonicalized so
+        equivalent scheme aliases (s3://≡s3a://, gs://≡gcs://) map to one target.
+        Credentials are excluded; non-secret routing is added separately by the
+        store's safe descriptor so a changed endpoint yields a distinct scope."""
+        if self.is_cloud_uri:
+            return _canonical_cloud_uri(self.path)
+        return Path(self.path).as_posix()
+
+    def routing_options(self) -> dict[str, str]:
+        """Non-secret storage options in a stable order, for the store identity.
+        Empty for local stores and cloud stores without routing, which keeps
+        their descriptor fingerprint byte-identical to the pre-routing shape."""
+        return {key: self.storage_options[key] for key in sorted(self.storage_options)}
+
     def absolutize(self, project_dir: Path) -> LanceDBConfig:
-        path = self.path if self.path.is_absolute() else project_dir / self.path
-        return self.model_copy(update={"path": path.resolve()})
+        if self.is_cloud_uri:
+            return self
+        path = Path(self.path)
+        resolved = path if path.is_absolute() else project_dir / path
+        return self.model_copy(update={"path": str(resolved.resolve())})
 
 
 @register
@@ -133,9 +238,20 @@ class LanceDBStore(RetrievalStore):
         lancedb = import_optional_dependency(
             "lancedb", extra="lancedb", feature="LanceDB retrieval"
         )
-        self._config.path.mkdir(parents=True, exist_ok=True)
+        connect_kwargs: dict[str, Any] = {}
+        if self._config.is_cloud_uri:
+            # No local .mkdir(): the object store owns the namespace, and
+            # Path.mkdir() has no concept of a bucket. lancedb.connect() creates
+            # the prefix lazily on first write.
+            storage_options = self._resolve_storage_options()
+            if storage_options:
+                connect_kwargs["storage_options"] = storage_options
+        else:
+            self._config.local_data_path().mkdir(parents=True, exist_ok=True)
         try:
-            self._db = lancedb.connect(str(self._config.path))
+            self._db = lancedb.connect(
+                self._config.connect_target(), **connect_kwargs
+            )
         except Exception:
             raise RetrievalError(
                 "LanceDB operation 'connect' failed (code=lancedb_connect_failed)"
@@ -149,6 +265,20 @@ class LanceDBStore(RetrievalStore):
         traceback: TracebackType | None,
     ) -> None:
         self._db = None
+
+    def _resolve_storage_options(self) -> dict[str, str]:
+        """Assemble the storage_options passed to lancedb.connect(): non-secret
+        routing verbatim, plus credential references resolved from the
+        environment here at the SDK boundary — never earlier, never stored."""
+        resolved = dict(self._config.storage_options)
+        for option_key, reference in self._config.storage_options_env.items():
+            if not reference.is_available():
+                raise RetrievalError(
+                    f"Storage credential for '{option_key}' is not set "
+                    "(code=lancedb_storage_credential_missing)"
+                )
+            resolved[option_key] = reference.resolve().reveal()
+        return resolved
 
     def _connection(self) -> Any:
         if self._db is None:
@@ -169,23 +299,63 @@ class LanceDBStore(RetrievalStore):
     def publisher_fence(self, collection: str) -> AbstractContextManager[None]:
         """OS-enforced exclusive publisher lock, valid on one host only.
 
-        The lock file lives next to the LanceDB data, so every dbt-ml
-        publisher on the host contends on the same inode/handle. This is the
-        documented single-host safety boundary from #152: it cannot fence a
-        publisher on another machine sharing the directory over a network
-        filesystem."""
+        For a local store the lock file lives next to the LanceDB data, so every
+        dbt-ml publisher on the host contends on the same inode/handle. A
+        cloud-backed store has no local data directory, so the lock lives in a
+        host-stable local directory keyed by the store URI (see `_lock_dir`) —
+        this keeps the same single-host guarantee and no more. This is the
+        documented boundary from #152: the lock cannot fence a publisher on
+        another machine, whether they share a network filesystem or the same
+        object-store prefix. Cross-host publisher exclusion would need
+        provider-enforced fencing, which this store does not advertise."""
         if not _COLLECTION_RE.fullmatch(collection):
             raise RetrievalError("LanceDB collection name is invalid")
-        self._config.path.mkdir(parents=True, exist_ok=True)
-        return _PublisherLock(self._config.path / f"{collection}.dbt-ml-publisher.lock")
+        lock_dir = self._lock_dir()
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        return _PublisherLock(lock_dir / f"{collection}.dbt-ml-publisher.lock")
+
+    def _lock_dir(self) -> Path:
+        """Directory holding this store's publisher lock files.
+
+        Local store, no override: co-located with the data (unchanged). Anything
+        else is keyed by the store URI so publishers of the *same* store share a
+        directory while different stores don't collide.
+
+        For a cloud store the default base is deliberately NOT
+        `tempfile.gettempdir()`: TMPDIR is per-process/per-container, so two
+        publishers on one host could resolve to different directories and their
+        `flock`s would never contend — silently voiding the single-host lock.
+        The default is a fixed host-machine location instead. Publishers running
+        in isolated mount namespaces (separate containers) don't share any local
+        path automatically; those deployments must set `publisher_lock_dir` to a
+        volume mounted into every publisher, which is the only way a local file
+        lock can honestly back the single-host capability there.
+
+        The digest is the store's physical-target identity (canonical URI plus
+        non-secret routing), so scheme aliases (s3://≡s3a://) and a changed
+        endpoint route to the correct — shared or distinct — lock, matching the
+        safe descriptor exactly."""
+        override = self._config.publisher_lock_dir
+        if override is None and not self._config.is_cloud_uri:
+            return self._config.local_data_path()
+        base = Path(override) if override is not None else _default_host_lock_base()
+        digest = self.safe_descriptor().safe_target_identity[:32]
+        return base / digest
 
     def safe_descriptor(self) -> SafeRetrievalTarget:
+        payload: dict[str, Any] = {
+            "store_type": self.store_type(),
+            "path": self._config.identity_key(),
+        }
+        # Add routing only when present so local stores (and cloud stores without
+        # routing) keep the exact pre-routing fingerprint — existing state scopes
+        # stay valid. A changed endpoint/region now yields a distinct identity,
+        # so state from one physical store can't be misread against another.
+        routing = self._config.routing_options()
+        if routing:
+            payload["routing"] = routing
         identity = canonical_fingerprint(
-            {
-                "store_type": self.store_type(),
-                "path": self._config.path.as_posix(),
-            },
-            domain="dbt-ml-safe-retrieval-target",
+            payload, domain="dbt-ml-safe-retrieval-target"
         )
         return SafeRetrievalTarget(self.store_type(), identity)
 
@@ -472,6 +642,32 @@ def _identifier_piece(value: str) -> str:
     if not normalized or normalized[0].isdigit():
         normalized = f"_{normalized}"
     return normalized[:128]
+
+
+def _canonical_cloud_uri(uri: str) -> str:
+    """Canonicalize a cloud URI so equivalent spellings map to one physical
+    target: lowercase the scheme, fold provider aliases (s3a→s3, gcs→gs,
+    abfss→abfs), and drop trailing slashes. The bucket/prefix is left
+    case-sensitive — only the scheme is case-insensitive."""
+    scheme, separator, rest = uri.partition("://")
+    if not separator:
+        return uri
+    canonical_scheme = scheme.lower()
+    canonical_scheme = _SCHEME_ALIASES.get(canonical_scheme, canonical_scheme)
+    return f"{canonical_scheme}://{rest.rstrip('/')}"
+
+
+def _default_host_lock_base() -> Path:
+    """Fixed per-machine base for cloud-store publisher locks, independent of
+    TMPDIR/TEMP so every publisher on the host resolves to the same directory
+    (a `tempfile.gettempdir()` base would vary per process/container and let
+    two publishers' locks silently miss each other). Publishers in isolated
+    mount namespaces still need an explicit `publisher_lock_dir` on a shared
+    volume."""
+    if sys.platform == "win32":
+        base = os.environ.get("PROGRAMDATA") or "C:\\ProgramData"
+        return Path(base) / "dbt-ml" / "lancedb-locks"
+    return Path("/var/tmp/dbt-ml-lancedb-locks")
 
 
 def _sql_string(value: str) -> str:

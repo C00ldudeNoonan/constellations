@@ -154,6 +154,46 @@ def test_multiple_kind_blocks_rejected() -> None:
         )
 
 
+def test_update_when_changed_requires_incremental() -> None:
+    with pytest.raises(ValueError, match="requires `materialization: incremental`"):
+        ModelConfig(
+            name="doc_facts",
+            extraction={"backend": "json"},
+            materialization="full",
+            update_when_changed=["content_hash"],
+        )
+
+
+def test_update_when_changed_rejects_invalid_identifier() -> None:
+    with pytest.raises(ValueError, match="must be a valid identifier"):
+        ModelConfig(
+            name="doc_facts",
+            extraction={"backend": "json"},
+            materialization="incremental",
+            update_when_changed=["not a column"],
+        )
+
+
+def test_update_when_changed_rejects_duplicates() -> None:
+    with pytest.raises(ValueError, match="duplicate column 'content_hash'"):
+        ModelConfig(
+            name="doc_facts",
+            extraction={"backend": "json"},
+            materialization="incremental",
+            update_when_changed=["content_hash", "content_hash"],
+        )
+
+
+def test_update_when_changed_accepts_valid_incremental() -> None:
+    model = ModelConfig(
+        name="doc_facts",
+        extraction={"backend": "json"},
+        materialization="incremental",
+        update_when_changed=["content_hash", "code_version"],
+    )
+    assert model.update_when_changed == ["content_hash", "code_version"]
+
+
 def test_model_file_requires_kind_block() -> None:
     with pytest.raises(
         ValueError,

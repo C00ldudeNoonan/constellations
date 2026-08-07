@@ -245,6 +245,7 @@ def run_embed_model(
                     key_col=config.id_field,
                     on_schema_change=model.on_schema_change,
                     options=warehouse_opts,
+                    update_when_changed=model.update_when_changed,
                 )
             if removed:
                 adapter.delete_rows_and_state(

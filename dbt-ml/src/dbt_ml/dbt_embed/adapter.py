@@ -16,7 +16,7 @@ relations in through the API layer, not by this adapter reading a real warehouse
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import polars as pl
@@ -88,10 +88,12 @@ class CaptureAdapter(DuckDBAdapter):
         key_col: str,
         on_schema_change: str = "fail",
         options: BaseModel | None = None,
+        update_when_changed: Sequence[str] = (),
     ) -> int:
         # Embedded mode has no dbt-ml-side incremental state: dbt owns the table
         # and its incremental strategy. We always hand dbt the full produced frame
-        # and let dbt's own materialization decide how to merge it.
+        # and let dbt's own materialization decide how to merge it, so the
+        # dbt-ml-level change-detection fingerprint does not apply here.
         self._captured = df
         return df.height
 

@@ -633,6 +633,59 @@ def validate_incremental_keys(df: pl.DataFrame, key_col: str) -> None:
         )
 
 
+def validate_update_when_changed_columns(
+    columns: Sequence[str],
+    source_columns: Sequence[str],
+    target_columns: Sequence[str],
+    table: str,
+) -> None:
+    """Every change-detection column (issue #281) must be present in both the
+    incoming batch and the existing target, or the generated predicate would
+    reference a missing column."""
+    source_set = set(source_columns)
+    target_set = set(target_columns)
+    for column in columns:
+        if column not in source_set:
+            raise AdapterError(
+                f"update_when_changed column '{column}' is not in the batch "
+                f"for incremental target '{table}'"
+            )
+        if column not in target_set:
+            raise AdapterError(
+                f"update_when_changed column '{column}' is not in incremental "
+                f"target '{table}'"
+            )
+
+
+def change_predicate(
+    columns: Sequence[str],
+    quote: Callable[[str], str],
+    *,
+    target: str = "target",
+    source: str = "source",
+) -> str:
+    """SQL that is true when any change-detection column differs (NULL-safe).
+    `IS DISTINCT FROM` is supported by both DuckDB and BigQuery GoogleSQL."""
+    return " OR ".join(
+        f"{target}.{quote(column)} IS DISTINCT FROM {source}.{quote(column)}"
+        for column in columns
+    )
+
+
+def unchanged_predicate(
+    columns: Sequence[str],
+    quote: Callable[[str], str],
+    *,
+    target: str = "target",
+    source: str = "source",
+) -> str:
+    """SQL that is true when every change-detection column matches (NULL-safe)."""
+    return " AND ".join(
+        f"{target}.{quote(column)} IS NOT DISTINCT FROM {source}.{quote(column)}"
+        for column in columns
+    )
+
+
 @dataclass(frozen=True)
 class SchemaChangePlan:
     """The adapter-neutral outcome of comparing a staged rowset's columns
@@ -936,6 +989,7 @@ class WarehouseAdapter(ABC):
         key_col: str,
         on_schema_change: str = "fail",
         options: BaseModel | None = None,
+        update_when_changed: Sequence[str] = (),
     ) -> int:
         """Upsert rows in `df` into `table`, keyed on `key_col`. Returns rows written.
 
@@ -947,7 +1001,14 @@ class WarehouseAdapter(ABC):
 
         `options` (parsed warehouse_options) applies only when the target
         table does not exist yet — an existing table keeps its physical
-        layout until --full-refresh rebuilds it."""
+        layout until --full-refresh rebuilds it.
+
+        `update_when_changed` (issue #281) is a change-detection fingerprint: a
+        matched row is rewritten only when at least one listed column differs
+        (NULL-safe) between the batch and the target, so re-publishing unchanged
+        rows does not rewrite large payload columns. Empty (default) always
+        overwrites matched rows. Every listed column must be present in both the
+        batch and the target."""
 
     @abstractmethod
     def materialize_full_chunks(

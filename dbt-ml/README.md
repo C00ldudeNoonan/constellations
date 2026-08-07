@@ -799,6 +799,31 @@ and one run's changed documents must fit in a single flush
 flushes. Time partitioning with a `field` is required. When in doubt,
 stay on `merge` — it is always correct.
 
+#### Incremental change detection (`update_when_changed`)
+
+By default an incremental merge rewrites every column of a matched row,
+including large payload columns, even when the row is byte-identical to
+what is already stored. Declare a change-detection fingerprint to skip
+those no-op rewrites (issue #281):
+
+```yaml
+  materialization: incremental
+  update_when_changed: [content_hash, code_version]
+```
+
+A matched row is updated only when at least one listed column differs
+(NULL-safe) between the batch and the target; unchanged rows are left in
+place, so re-publishing them does not rewrite payload columns — on
+BigQuery that is far fewer bytes billed for the `MERGE`. New rows still
+insert and changed rows still update. The listed columns must exist in
+both the batch and the target; `content_hash` and `code_version` are the
+natural fingerprint for extraction models. Leaving it unset keeps the
+always-overwrite behavior. It is a publication optimization, so it does
+not change `code_version` — enabling it never reprocesses documents.
+Clustering the target on the incremental key (`cluster_by`) additionally
+bounds the per-batch target scan; changing that layout needs a
+`--full-refresh` rebuild.
+
 **BigLake managed Apache Iceberg tables** (issue #163) — set
 `table_format: iceberg` to store a model as Iceberg in Cloud Storage, queryable
 through BigQuery and external Iceberg readers:

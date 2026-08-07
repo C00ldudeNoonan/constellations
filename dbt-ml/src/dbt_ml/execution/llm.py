@@ -407,6 +407,7 @@ def run_llm_model(
                             key_col=key_col,
                             on_schema_change=model.on_schema_change,
                             options=warehouse_opts,
+                            update_when_changed=model.update_when_changed,
                         )
                     if removed:
                         adapter.delete_rows_and_state(

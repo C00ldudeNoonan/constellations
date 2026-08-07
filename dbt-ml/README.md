@@ -812,6 +812,47 @@ through BigQuery and external Iceberg readers:
     cluster_by: [cik]
 ```
 
+Set a BigQuery storage policy once per profile target with
+`warehouse_defaults` inside its `warehouse:` block (issue #284). Defaults can
+carry any BigQuery warehouse option except `storage_uri`; model-level top-level
+keys override them:
+
+```yaml
+# profiles.yml
+economic_data:
+  target: prod
+  outputs:
+    prod:
+      warehouse:
+        type: bigquery
+        project: my-project
+        dataset: economics_marts
+        warehouse_defaults:
+          table_format: iceberg
+          connection: "{{ env_var('BQ_CONNECTION') }}"
+          external_volume: "gs://{{ env_var('ICEBERG_BUCKET') }}/dbt-ml"
+          labels: {managed_by: dbt_ml}
+```
+
+For Iceberg defaults, dbt-ml derives each model's location as
+`{external_volume}/{target}/{dataset}/{model}`. That keeps dev/staging/prod and
+every model on distinct prefixes without templating model YAML. A literal
+`storage_uri` is rejected in `warehouse_defaults` because it would send every
+model to one location; a model may still declare its own `storage_uri`, which
+overrides the derived path. To opt one model out completely (for example, a
+plain native scratch table), start its options from an empty policy:
+
+```yaml
+warehouse_options:
+  inherit: false
+```
+
+An opted-out model can add its own options below `inherit`. Merging is shallow:
+each top-level model option replaces the corresponding target default. Effective
+options are validated before source discovery, credential resolution, or any
+warehouse mutation. Targets without `warehouse_defaults` retain the existing
+behavior.
+
 Iceberg targets are created with explicit column DDL derived from the model's
 output schema (`List` columns — including embedding vectors — become
 `ARRAY<T>`); `connection` and `storage_uri` are required. Because BigQuery

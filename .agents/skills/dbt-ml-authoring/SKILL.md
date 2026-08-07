@@ -118,6 +118,13 @@ from generated manifests, and validation failures do not expose their values.
 - Run `--full-refresh` after intentional contract changes that require rebuilding existing relations, such as incompatible extraction schema/layout changes.
 - Use `--source-filter` only for orchestrated, partitioned incremental extraction. It is additive/upsert-only and does not reconcile deletions; schedule an unfiltered run for deletion reconciliation.
 - Keep BigQuery `insert_overwrite` for batches that contain every document in each touched partition. Use `merge` when that contract is not guaranteed.
+- Put repeated BigQuery layout policy in the active target's
+  `warehouse.warehouse_defaults`. For Iceberg, configure `table_format`,
+  `connection`, and `external_volume`; dbt-ml derives a unique
+  target/dataset/model `storage_uri`. Never set one literal default
+  `storage_uri`. Model `warehouse_options` override top-level defaults, and
+  `inherit: false` opts a model out. Run `--full-refresh` after changing layout
+  for an existing incremental table.
 
 ## Protect data and operator controls
 

@@ -4,7 +4,12 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from .adapters import WarehouseCapability, adapter_capabilities
+from .adapters import (
+    AdapterError,
+    WarehouseAdapter,
+    WarehouseCapability,
+    adapter_capabilities,
+)
 from .backends import BackendOptionsError, list_backends, validate_backend_options
 from .config.loader import ConfigError
 from .config.model import ModelConfig, protect_model_llm_credential_option
@@ -220,16 +225,39 @@ def validate_project_contract(
 
 
 def validate_warehouse_capabilities(
-    models: list[ModelConfig], adapter_type: str
+    models: list[ModelConfig], adapter: str | WarehouseAdapter
 ) -> None:
+    if isinstance(adapter, str):
+        active_adapter = None
+        adapter_type = adapter
+    else:
+        active_adapter = adapter
+        adapter_type = adapter.adapter_type()
     available = adapter_capabilities(adapter_type)
     for model in models:
         required: dict[WarehouseCapability, str] = {}
         # An Iceberg-format target (issue #163) is created and replaced through a
         # non-atomic explicit-DDL path, so it is gated by ICEBERG_TABLE_FORMAT
-        # rather than ATOMIC_FULL_REPLACE. Full validation of the iceberg options
-        # happens when the adapter parses them; here only the format matters.
-        is_iceberg = model.warehouse_options.get("table_format") == "iceberg"
+        # rather than ATOMIC_FULL_REPLACE. An active adapter validates and merges
+        # effective options here; string-only callers retain the legacy raw check.
+        parsed_options: object | None = None
+        if active_adapter is not None:
+            try:
+                parsed_options = active_adapter.parse_warehouse_options(
+                    model.warehouse_options,
+                    model_name=model.name,
+                )
+            except AdapterError as error:
+                raise _model_error(
+                    model,
+                    str(error),
+                    ("warehouse_options",),
+                ) from None
+        is_iceberg = (
+            getattr(parsed_options, "table_format", None) == "iceberg"
+            if active_adapter is not None
+            else model.warehouse_options.get("table_format") == "iceberg"
+        )
         if is_iceberg and model.transform is not None and model.transform.type == "sql":
             # SQL models materialize through materialize_sql_full/_incremental,
             # which do not honor table_format — accepting iceberg here would

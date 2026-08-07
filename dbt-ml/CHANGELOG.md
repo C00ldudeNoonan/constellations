@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Target-aware BigQuery warehouse defaults (issue #284)
+
+- BigQuery profile targets can declare `warehouse_defaults` once inside their
+  `warehouse:` block. Model-level top-level `warehouse_options` override those
+  defaults, while `inherit: false` opts a model out for a plain or separately
+  configured table.
+- Iceberg defaults use `external_volume` to derive a unique
+  `{target}/{dataset}/{model}` Cloud Storage prefix. A literal default
+  `storage_uri` is rejected so separate models or environments cannot silently
+  share one physical location.
+- Effective defaults and overrides are adapter-validated before source
+  discovery, credential construction, or warehouse mutation, and target-level
+  defaults also participate in capability and filtered-run safety checks.
+
 ### Extraction-time field derivation (issue #282)
 
 - Extraction models can declare a project-local `post_extract` hook that

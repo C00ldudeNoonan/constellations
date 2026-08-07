@@ -7,6 +7,7 @@ from typing import Literal
 import duckdb
 import pytest
 
+from dbt_ml.adapters import create_adapter, parse_warehouse_config
 from dbt_ml.config.model import ModelConfig
 from dbt_ml.runner import RunError, _prepare_subset_run, run_project
 from dbt_ml.synth import generate_invoices
@@ -80,6 +81,31 @@ def test_filter_rejects_insert_overwrite_strategy() -> None:
     with pytest.raises(RunError, match="insert_overwrite"):
         _prepare_subset_run(
             ("AAPL/*",), full_refresh=False, selected=["m"], models=[model]
+        )
+
+
+def test_filter_rejects_profile_default_insert_overwrite_strategy() -> None:
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "dataset": "docs_dev",
+            "warehouse_defaults": {
+                "partition_by": {"field": "filing_date"},
+                "incremental_strategy": "insert_overwrite",
+            },
+        }
+    )
+    config.bind_target_name("dev")
+    adapter = create_adapter(config)
+
+    with pytest.raises(RunError, match="insert_overwrite"):
+        _prepare_subset_run(
+            ("AAPL/*",),
+            full_refresh=False,
+            selected=["m"],
+            models=[_extraction_model("m")],
+            adapter=adapter,
         )
 
 

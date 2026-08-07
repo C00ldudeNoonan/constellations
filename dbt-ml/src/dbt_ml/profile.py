@@ -205,10 +205,12 @@ def resolve_profile(
                 f"'{target_name}' selects {e}"
             ) from e
     retrieval = _resolve_retrieval(selected.retrieval, project_dir, profiles_path)
+    warehouse = warehouse.absolutize(project_dir)
+    warehouse.bind_target_name(target_name)
     return ResolvedProfile(
         profile_name=project.profile,
         target_name=target_name,
-        warehouse=warehouse.absolutize(project_dir),
+        warehouse=warehouse,
         llm=llm,
         embedding=embedding,
         retrieval=retrieval,
@@ -237,6 +239,7 @@ def _implicit_local_profile(project: ProjectConfig) -> ResolvedProfile:
             "schema": project.duckdb.schema_name,
         }
     )
+    warehouse.bind_target_name("<inline>")
     return ResolvedProfile(
         profile_name="<inline>",
         target_name="<inline>",

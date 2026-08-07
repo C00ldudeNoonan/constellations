@@ -579,6 +579,79 @@ def test_env_var_interpolation(
     assert resolved.warehouse.schema_name == "fallback_schema"
 
 
+def test_bigquery_warehouse_defaults_interpolate_and_bind_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: bigquery",
+                "        project: econ",
+                "        dataset: economics_dev",
+                "        warehouse_defaults:",
+                "          table_format: iceberg",
+                '          connection: "{{ env_var(\'BQ_CONNECTION\') }}"',
+                '          external_volume: "gs://{{ env_var(\'ICEBERG_BUCKET\') }}/tables"',
+            ]
+        )
+        + "\n",
+    )
+    monkeypatch.setenv("BQ_CONNECTION", "econ.us.biglake")
+    monkeypatch.setenv("ICEBERG_BUCKET", "econ-iceberg")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    adapter = create_adapter(resolved.warehouse, project_dir=tmp_path)
+    options = cast(
+        Any,
+        adapter.parse_warehouse_options({}, model_name="sec_filings"),
+    )
+
+    assert options.connection == "econ.us.biglake"
+    assert options.storage_uri == (
+        "gs://econ-iceberg/tables/dev/economics_dev/sec_filings"
+    )
+
+
+def test_bigquery_warehouse_defaults_reject_credential_key_before_interpolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    env_name = "DISTINCTIVE_WAREHOUSE_DEFAULT_TOKEN"
+    secret = "distinctive-resolved-warehouse-default-secret"
+    monkeypatch.setenv(env_name, secret)
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: bigquery",
+                "        project: econ",
+                "        warehouse_defaults:",
+                f'          token: "{{{{ env_var(\'{env_name}\') }}}}"',
+            ]
+        )
+        + "\n",
+    )
+
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match=r"unknown.*token") as exc_info:
+        resolve_profile(project, tmp_path)
+
+    assert secret not in str(exc_info.value)
+    _assert_error_does_not_retain(exc_info.value, secret, env_name)
+
+
 def test_env_var_missing_without_default_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -187,6 +187,7 @@ def run_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select,
@@ -201,8 +202,16 @@ def run_project(
     )
     validate_warehouse_capabilities(
         [model for model in models if model.name in set(selected)],
-        resolved.warehouse.type,
+        adapter,
     )
+    if source_filter:
+        subset_run = _prepare_subset_run(
+            source_filter,
+            full_refresh=full_refresh,
+            selected=selected,
+            models=models,
+            adapter=adapter,
+        )
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )
@@ -259,7 +268,7 @@ def run_project(
             subset_run=subset_run,
         )
 
-    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+    with adapter:
         if threads > 1 and len(selected) > 1:
             results_by_name = _run_in_batches(dag, selected, adapter, _run, threads)
         else:
@@ -304,6 +313,7 @@ def build_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select,
@@ -318,8 +328,16 @@ def build_project(
     )
     validate_warehouse_capabilities(
         [model for model in models if model.name in set(selected)],
-        resolved.warehouse.type,
+        adapter,
     )
+    if source_filter:
+        subset_run = _prepare_subset_run(
+            source_filter,
+            full_refresh=full_refresh,
+            selected=selected,
+            models=models,
+            adapter=adapter,
+        )
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )
@@ -365,7 +383,7 @@ def build_project(
     out = BuildResult()
     blocked: set[str] = set()
 
-    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+    with adapter:
         for name in selected:
             if name in blocked:
                 out.skipped.append(name)
@@ -484,6 +502,7 @@ def _prepare_subset_run(
     full_refresh: bool,
     selected: Sequence[str],
     models: list[ModelConfig],
+    adapter: WarehouseAdapter | None = None,
 ) -> bool:
     """Validate `--source-filter` against the run and return whether it is an
     additive subset run. A filtered run upserts a slice and never deletes, so it
@@ -503,7 +522,16 @@ def _prepare_subset_run(
             continue
         if model.materialization != "incremental":
             unsafe.append(f"{model.name} (materialization: {model.materialization})")
-        elif model.warehouse_options.get("incremental_strategy") == "insert_overwrite":
+        else:
+            strategy = model.warehouse_options.get("incremental_strategy")
+            if adapter is not None:
+                parsed = adapter.parse_warehouse_options(
+                    model.warehouse_options,
+                    model_name=model.name,
+                )
+                strategy = getattr(parsed, "incremental_strategy", strategy)
+            if strategy != "insert_overwrite":
+                continue
             # insert_overwrite replaces every partition a batch touches, so a
             # partial (filtered) batch would delete sibling documents sharing
             # those partitions — not additive. Only merge (upsert) is safe.

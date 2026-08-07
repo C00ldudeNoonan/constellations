@@ -136,6 +136,47 @@ def test_warehouse_options_portable_and_state_preserving(fresh_project: Path) ->
     assert result.documents_skipped == 5
 
 
+def test_effective_warehouse_defaults_fail_before_discovery_or_connection(
+    fresh_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fresh_project / "profiles.yml").write_text(
+        "invoice_pipeline:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: bigquery\n"
+        "        project: econ\n"
+        "        dataset: documents_dev\n"
+        "        warehouse_defaults:\n"
+        "          table_format: iceberg\n"
+        "          connection: econ.us.biglake\n"
+        "          external_volume: gs://econ-iceberg/tables\n"
+    )
+    raw_yml = fresh_project / "models" / "raw_invoices.yml"
+    raw_yml.write_text(
+        raw_yml.read_text().replace(
+            "    materialization: incremental",
+            "    materialization: incremental\n"
+            "    warehouse_options:\n"
+            "      inherit: not-a-boolean",
+            1,
+        )
+    )
+
+    def unexpected_side_effect(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("warehouse option preflight must run before side effects")
+
+    monkeypatch.setattr("dbt_ml.runner._discover_sources", unexpected_side_effect)
+    monkeypatch.setattr(
+        "dbt_ml.adapters.bigquery.BigQueryAdapter._connect",
+        unexpected_side_effect,
+    )
+
+    with pytest.raises(ConfigError, match="inherit must be true or false"):
+        run_project(fresh_project, select="raw_invoices")
+
+
 def test_second_run_is_incremental(fresh_project: Path) -> None:
     invoices_dir = fresh_project / "data" / "invoices"
     generate_invoices(5, invoices_dir, seed=1)

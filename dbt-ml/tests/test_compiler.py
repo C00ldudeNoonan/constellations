@@ -7,7 +7,11 @@ from typing import Literal
 import pytest
 from click.testing import CliRunner
 
-from dbt_ml.adapters import WarehouseCapability
+from dbt_ml.adapters import (
+    WarehouseCapability,
+    create_adapter,
+    parse_warehouse_config,
+)
 from dbt_ml.cli import cli
 from dbt_ml.compiler import (
     validate_project_contract,
@@ -127,6 +131,49 @@ def test_iceberg_full_is_gated_by_iceberg_not_atomic_full_replace(
 def test_iceberg_models_pass_on_bigquery() -> None:
     validate_warehouse_capabilities([_iceberg_model()], "bigquery")
     validate_warehouse_capabilities([_iceberg_model("incremental")], "bigquery")
+
+
+def _bigquery_adapter_with_iceberg_defaults():
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "dataset": "docs_dev",
+            "warehouse_defaults": {
+                "table_format": "iceberg",
+                "connection": "proj.us.biglake",
+                "external_volume": "gs://iceberg-bucket/tables",
+            },
+        }
+    )
+    config.bind_target_name("dev")
+    return create_adapter(config)
+
+
+def test_capability_preflight_uses_effective_profile_defaults() -> None:
+    model = ModelConfig(
+        name="sqlmod",
+        materialization="full",
+        transform={"type": "sql", "path": "models/sqlmod.sql"},
+    )
+    adapter = _bigquery_adapter_with_iceberg_defaults()
+
+    with pytest.raises(ConfigError, match="not supported for SQL models"):
+        validate_warehouse_capabilities([model], adapter)
+
+    model.warehouse_options = {"inherit": False}
+    validate_warehouse_capabilities([model], adapter)
+
+
+def test_capability_preflight_rejects_invalid_effective_options() -> None:
+    model = _extraction("raw")
+    model.warehouse_options = {"inherit": "not-a-boolean"}
+
+    with pytest.raises(ConfigError, match="inherit must be true or false"):
+        validate_warehouse_capabilities(
+            [model],
+            _bigquery_adapter_with_iceberg_defaults(),
+        )
 
 
 def test_iceberg_rejected_for_sql_models() -> None:

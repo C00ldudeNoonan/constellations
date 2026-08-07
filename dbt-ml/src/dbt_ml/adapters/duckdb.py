@@ -37,13 +37,16 @@ from .base import (
     TableReadSnapshot,
     WarehouseAdapter,
     WarehouseCapability,
+    change_predicate,
     decode_state_cursor,
     encode_state_cursor,
     plan_schema_change,
     sanitized_adapter_cause,
+    unchanged_predicate,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
+    validate_update_when_changed_columns,
 )
 from .registry import register
 
@@ -613,6 +616,7 @@ class DuckDBAdapter(WarehouseAdapter):
         key_col: str,
         on_schema_change: str = "fail",
         options: BaseModel | None = None,
+        update_when_changed: Sequence[str] = (),
     ) -> int:
         if df.height == 0:
             return 0
@@ -622,28 +626,60 @@ class DuckDBAdapter(WarehouseAdapter):
             raise AdapterError(
                 f"Incremental target '{table}' is missing key column '{key_col}'"
             )
+        if update_when_changed and existing is not None:
+            validate_update_when_changed_columns(
+                update_when_changed, df.columns, existing, table
+            )
         full = self.table_ref(table)
         self.connection.register("dbt_ml_staging", df)
         try:
             self.connection.execute("BEGIN TRANSACTION")
             try:
+                table_existed = existing is not None
                 self.connection.execute(
                     f"CREATE TABLE IF NOT EXISTS {full} AS "
                     f"SELECT * FROM dbt_ml_staging LIMIT 0"
                 )
                 insert_cols = self._reconcile_schema(table, df, on_schema_change)
                 key = self.quote_ident(key_col)
-                self.connection.execute(
-                    f"""
-                    DELETE FROM {full} AS target
-                    USING dbt_ml_staging AS source
-                    WHERE target.{key} = source.{key}
-                    """
+                # A change-detection fingerprint only helps against an existing
+                # target; a fresh table takes the whole batch. Delete just the
+                # changed keys so unchanged rows keep their bytes, then insert
+                # only the rows that are new or changed (the unchanged ones are
+                # still present, so re-inserting them would duplicate the key).
+                changed = (
+                    change_predicate(update_when_changed, self.quote_ident)
+                    if update_when_changed and table_existed
+                    else None
                 )
+                if changed is None:
+                    self.connection.execute(
+                        f"DELETE FROM {full} AS target "
+                        f"USING dbt_ml_staging AS source "
+                        f"WHERE target.{key} = source.{key}"
+                    )
+                else:
+                    self.connection.execute(
+                        f"DELETE FROM {full} AS target "
+                        f"USING dbt_ml_staging AS source "
+                        f"WHERE target.{key} = source.{key} AND ({changed})"
+                    )
                 col_list = ", ".join(self.quote_ident(c) for c in insert_cols)
-                self.connection.execute(
-                    f"INSERT INTO {full} BY NAME SELECT {col_list} FROM dbt_ml_staging"
-                )
+                if changed is None:
+                    self.connection.execute(
+                        f"INSERT INTO {full} BY NAME "
+                        f"SELECT {col_list} FROM dbt_ml_staging"
+                    )
+                else:
+                    unchanged = unchanged_predicate(
+                        update_when_changed, self.quote_ident
+                    )
+                    self.connection.execute(
+                        f"INSERT INTO {full} BY NAME "
+                        f"SELECT {col_list} FROM dbt_ml_staging AS source "
+                        f"WHERE NOT EXISTS (SELECT 1 FROM {full} AS target "
+                        f"WHERE target.{key} = source.{key} AND ({unchanged}))"
+                    )
             except BaseException:
                 self.connection.execute("ROLLBACK")
                 raise

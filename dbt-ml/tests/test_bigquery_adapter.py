@@ -288,6 +288,38 @@ def test_incremental_upsert_uses_staging_merge() -> None:
     assert client.dropped == [staging_id]
 
 
+def test_incremental_update_when_changed_guards_the_merge() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "content_hash", "payload"]
+    adapter = _adapter(client)
+    df = pl.DataFrame(
+        {"document_id": ["a"], "content_hash": ["h1"], "payload": ["big"]}
+    )
+    adapter.materialize_incremental(
+        "docs", df, key_col="document_id", update_when_changed=["content_hash"]
+    )
+    sql, _ = client.queries[0]
+    # A matched row is rewritten only when the fingerprint differs (NULL-safe),
+    # so unchanged rows never rewrite the large payload column.
+    assert (
+        "WHEN MATCHED AND (target.`content_hash` IS DISTINCT FROM "
+        "source.`content_hash`) THEN UPDATE SET" in sql
+    )
+    assert "WHEN NOT MATCHED THEN INSERT" in sql
+
+
+def test_incremental_update_when_changed_rejects_unknown_column() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "payload"]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "payload": ["x"]})
+    with pytest.raises(AdapterError, match="update_when_changed column 'content_hash'"):
+        adapter.materialize_incremental(
+            "docs", df, key_col="document_id", update_when_changed=["content_hash"]
+        )
+    assert client.queries == []
+
+
 def test_incremental_append_new_columns_sets_schema_update() -> None:
     from google.cloud import bigquery
 
@@ -1706,6 +1738,67 @@ def test_integration_full_round_trip() -> None:
             adapter.upsert_state(scope, [StateRecord("a", "h2", "v2")])
             assert adapter.fetch_state(scope) == {"a": StateValue("h2", "v2")}
             assert adapter.list_tables() == ["docs"]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set DBT_ML_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_update_when_changed_skips_unchanged_payload() -> None:
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "dbt_ml_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "docs",
+                pl.DataFrame(
+                    {
+                        "document_id": ["a", "b"],
+                        "content_hash": ["h1", "h1"],
+                        "payload": ["A", "B"],
+                    }
+                ),
+            )
+            # 'a' keeps its fingerprint but ships a new payload; the guard must
+            # leave the stored payload untouched. 'c' is new. 'b' is retained.
+            adapter.materialize_incremental(
+                "docs",
+                pl.DataFrame(
+                    {
+                        "document_id": ["a", "c"],
+                        "content_hash": ["h1", "h9"],
+                        "payload": ["SHOULD_NOT_WIN", "C"],
+                    }
+                ),
+                key_col="document_id",
+                update_when_changed=["content_hash"],
+            )
+            assert adapter.rows(
+                f"SELECT document_id, content_hash, payload "
+                f"FROM {adapter.table_ref('docs')} ORDER BY document_id"
+            ) == [("a", "h1", "A"), ("b", "h1", "B"), ("c", "h9", "C")]
+
+            # A changed fingerprint does rewrite the payload.
+            adapter.materialize_incremental(
+                "docs",
+                pl.DataFrame(
+                    {"document_id": ["a"], "content_hash": ["h2"], "payload": ["Z"]}
+                ),
+                key_col="document_id",
+                update_when_changed=["content_hash"],
+            )
+            assert adapter.rows(
+                f"SELECT payload FROM {adapter.table_ref('docs')} "
+                "WHERE document_id = 'a'"
+            ) == [("Z",)]
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()

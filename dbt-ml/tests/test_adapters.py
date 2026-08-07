@@ -440,6 +440,100 @@ def test_materialize_incremental_upserts(tmp_path: Path) -> None:
         assert rows == [("a", 99), ("b", 2)]
 
 
+def test_update_when_changed_skips_unchanged_rows(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame(
+                {"document_id": ["a", "b"], "fp": ["v1", "v1"], "payload": ["A", "B"]}
+            ),
+            key_col="document_id",
+        )
+        # Same fingerprint for 'a' but a different payload: the no-op guard must
+        # leave the original payload untouched. 'b' vanishes from this batch and
+        # must remain. 'c' is new and inserted.
+        written = adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame(
+                {"document_id": ["a", "c"], "fp": ["v1", "v9"], "payload": ["X", "C"]}
+            ),
+            key_col="document_id",
+            update_when_changed=["fp"],
+        )
+        rows = adapter.rows(
+            f"SELECT document_id, fp, payload FROM {adapter.table_ref('docs')} "
+            "ORDER BY document_id"
+        )
+        # 'a' unchanged fingerprint → keeps A (not X); 'b' retained; 'c' inserted.
+        assert rows == [("a", "v1", "A"), ("b", "v1", "B"), ("c", "v9", "C")]
+        assert written == 2
+
+
+def test_update_when_changed_rewrites_changed_rows(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "fp": ["v1"], "payload": ["A"]}),
+            key_col="document_id",
+        )
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "fp": ["v2"], "payload": ["Z"]}),
+            key_col="document_id",
+            update_when_changed=["fp"],
+        )
+        rows = adapter.rows(
+            f"SELECT document_id, fp, payload FROM {adapter.table_ref('docs')}"
+        )
+        assert rows == [("a", "v2", "Z")]
+
+
+def test_update_when_changed_is_null_safe(tmp_path: Path) -> None:
+    null_fp = pl.Series("fp", [None], dtype=pl.String)
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "payload": ["A"]}).with_columns(null_fp),
+            key_col="document_id",
+        )
+        # NULL fp unchanged → no-op (NULL IS NOT DISTINCT FROM NULL).
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "payload": ["X"]}).with_columns(null_fp),
+            key_col="document_id",
+            update_when_changed=["fp"],
+        )
+        assert adapter.rows(
+            f"SELECT payload FROM {adapter.table_ref('docs')}"
+        ) == [("A",)]
+        # NULL → value counts as changed → rewrite.
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "fp": ["v1"], "payload": ["Z"]}),
+            key_col="document_id",
+            update_when_changed=["fp"],
+        )
+        assert adapter.rows(
+            f"SELECT payload FROM {adapter.table_ref('docs')}"
+        ) == [("Z",)]
+
+
+def test_update_when_changed_rejects_unknown_column(tmp_path: Path) -> None:
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.materialize_incremental(
+            "docs",
+            pl.DataFrame({"document_id": ["a"], "payload": ["A"]}),
+            key_col="document_id",
+        )
+        with pytest.raises(AdapterError, match="update_when_changed column 'fp'"):
+            adapter.materialize_incremental(
+                "docs",
+                pl.DataFrame({"document_id": ["a"], "payload": ["B"]}),
+                key_col="document_id",
+                update_when_changed=["fp"],
+            )
+
+
 @pytest.mark.parametrize(
     ("df", "message"),
     [

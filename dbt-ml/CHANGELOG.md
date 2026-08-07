@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Incremental change detection: `update_when_changed` (issue #281)
+
+- Incremental models can declare `update_when_changed: [col, ...]`, a
+  change-detection fingerprint. A matched row is rewritten only when at least
+  one listed column differs (NULL-safe) between the batch and the target, so
+  re-publishing an unchanged row no longer rewrites its large payload columns —
+  on BigQuery that is far fewer bytes billed for the `MERGE` (BigQuery adds an
+  `IS DISTINCT FROM` guard to `WHEN MATCHED`; DuckDB deletes only changed keys
+  and inserts new-or-changed rows). New rows still insert and changed rows still
+  update.
+- The listed columns must exist in both the batch and the target (validated
+  before any warehouse mutation); `content_hash` and `code_version` are the
+  natural fingerprint for extraction models. The option is only valid with
+  `materialization: incremental` and is excluded from `code_version`, so
+  enabling it is backward-compatible and never reprocesses documents. Leaving it
+  unset preserves the always-overwrite behavior.
+
 ### Target-aware BigQuery warehouse defaults (issue #284)
 
 - BigQuery profile targets can declare `warehouse_defaults` once inside their

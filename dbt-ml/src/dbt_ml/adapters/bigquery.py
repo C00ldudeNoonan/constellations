@@ -70,6 +70,7 @@ from .base import (
     TableReadSnapshot,
     WarehouseAdapter,
     WarehouseCapability,
+    change_predicate,
     decode_state_cursor,
     encode_state_cursor,
     plan_schema_change,
@@ -77,6 +78,7 @@ from .base import (
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
+    validate_update_when_changed_columns,
 )
 from .registry import register
 
@@ -2166,6 +2168,7 @@ class BigQueryAdapter(WarehouseAdapter):
         key_col: str,
         on_schema_change: str = "fail",
         options: BaseModel | None = None,
+        update_when_changed: Sequence[str] = (),
     ) -> int:
         if df.height == 0:
             return 0
@@ -2264,12 +2267,25 @@ class BigQueryAdapter(WarehouseAdapter):
                 insert_values = ", ".join(
                     f"source.{self.quote_ident(column)}" for column in load_df.columns
                 )
+                # Change-detection fingerprint (issue #281): a matched row is
+                # updated only when a listed column differs, so re-publishing an
+                # unchanged row does not rewrite its (possibly large) payload
+                # columns and BigQuery bills far fewer bytes for that MERGE.
+                when_matched = "WHEN MATCHED THEN UPDATE SET"
+                if update_when_changed:
+                    validate_update_when_changed_columns(
+                        update_when_changed, load_df.columns, existing, table
+                    )
+                    changed = change_predicate(
+                        update_when_changed, self.quote_ident
+                    )
+                    when_matched = f"WHEN MATCHED AND ({changed}) THEN UPDATE SET"
                 self._run_query(
                     f"MERGE {self.table_ref(table)} AS target "
                     f"USING {self.table_ref(staging)} AS source "
                     f"ON target.{self.quote_ident(key_col)} = "
                     f"source.{self.quote_ident(key_col)} "
-                    f"WHEN MATCHED THEN UPDATE SET {assignments} "
+                    f"{when_matched} {assignments} "
                     f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
                     f"VALUES ({insert_values})",
                     job_labels=job_labels,

@@ -677,6 +677,15 @@ class ModelConfig(BaseModel):
     fields: list[FieldConfig] = Field(default_factory=list)
     materialization: Literal["full", "incremental"] = "full"
     on_schema_change: Literal["fail", "ignore", "append_new_columns"] = "fail"
+    # Change-detection columns for incremental publication (issue #281): when a
+    # matched row's listed columns are all NULL-safe-equal between the batch and
+    # the target, the row is left untouched instead of rewriting every column
+    # (including large payloads). A declared fingerprint — e.g. [content_hash,
+    # code_version] for extraction — keeps document semantics out of the generic
+    # adapter. Empty (default) preserves the always-overwrite behavior. Only
+    # valid with `materialization: incremental`. Excluded from code_version: it
+    # changes publication, not row content.
+    update_when_changed: list[str] = Field(default_factory=list)
     # Required for `materialization: incremental` SQL transforms (issue #142);
     # other incremental model kinds key on a fixed identity column instead
     # (document_id, chunk_id, ...) and must leave this unset.
@@ -773,6 +782,32 @@ class ModelConfig(BaseModel):
             )
         if self.llm is not None:
             self._validate_llm_fields()
+        return self
+
+    @model_validator(mode="after")
+    def _validate_update_when_changed(self) -> ModelConfig:
+        columns = self.update_when_changed
+        if not columns:
+            return self
+        if self.materialization != "incremental":
+            raise ValueError(
+                f"Model '{self.name}': update_when_changed requires "
+                "`materialization: incremental`"
+            )
+        ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        seen: set[str] = set()
+        for column in columns:
+            if not isinstance(column, str) or not ident_re.match(column):
+                raise ValueError(
+                    f"Model '{self.name}': update_when_changed column "
+                    f"{column!r} must be a valid identifier"
+                )
+            if column in seen:
+                raise ValueError(
+                    f"Model '{self.name}': update_when_changed lists duplicate "
+                    f"column '{column}'"
+                )
+            seen.add(column)
         return self
 
     @model_validator(mode="after")

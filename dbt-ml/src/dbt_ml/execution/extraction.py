@@ -657,6 +657,7 @@ def run_extraction_model(
                                 else "append_new_columns"
                             ),
                             options=warehouse_opts,
+                            update_when_changed=model.update_when_changed,
                         )
                     except AdapterError as e:
                         # RunError so `build` fails this model and blocks

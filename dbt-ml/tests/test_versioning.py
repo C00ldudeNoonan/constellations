@@ -194,6 +194,27 @@ def test_code_version_ignores_flush_every(tmp_path: Path) -> None:
     ) == compute_code_version(extraction=tuned, transform=None, project_dir=tmp_path)
 
 
+def test_update_when_changed_does_not_change_model_code_version(
+    tmp_path: Path,
+) -> None:
+    """update_when_changed shapes publication, not row content (issue #281):
+    enabling it must not invalidate existing incremental state and force a
+    reprocess."""
+    project = ProjectConfig(
+        name="p", extraction=ExtractionDefaults(default_backend="json")
+    )
+    base = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction=ExtractionConfig(),
+        materialization="incremental",
+    )
+    guarded = base.model_copy(update={"update_when_changed": ["content_hash"]})
+    assert compute_model_code_version(base, project, tmp_path) == (
+        compute_model_code_version(guarded, project, tmp_path)
+    )
+
+
 def test_effective_default_backend_changes_model_code_version(tmp_path: Path) -> None:
     model = ModelConfig(
         name="raw",

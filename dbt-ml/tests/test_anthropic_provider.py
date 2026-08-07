@@ -14,6 +14,7 @@ from dbt_ml.providers import (
     ProviderResponseError,
     ProviderRuntimeOptions,
 )
+from dbt_ml.providers import anthropic as anthropic_module
 from dbt_ml.providers.anthropic import AnthropicInferenceProvider
 
 
@@ -374,5 +375,64 @@ def test_anthropic_batch_sdk_failure_does_not_retain_credential_locals(
 
     assert secret not in str(exc_info.value)
     assert secret not in _provider_traceback_locals(exc_info.value)
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["submit", "poll", "fetch", "cancel"],
+)
+@pytest.mark.parametrize(
+    ("status_code", "expected_retryable"),
+    [(429, True), (403, False)],
+)
+def test_anthropic_batch_sdk_failures_classify_retryability(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    status_code: int,
+    expected_retryable: bool,
+) -> None:
+    secret = "provider-batch-error-detail"
+
+    class SDKError(Exception):
+        def __init__(self) -> None:
+            super().__init__(secret)
+            self.status_code = status_code
+
+    def fail(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise SDKError
+
+    helper_name = {
+        "submit": "_submit_batch_with_sdk",
+        "poll": "_poll_batch_with_sdk",
+        "fetch": "_fetch_batch_results_with_sdk",
+        "cancel": "_cancel_batch_with_sdk",
+    }[operation]
+    monkeypatch.setattr(anthropic_module, helper_name, fail)
+    provider = AnthropicInferenceProvider()
+    runtime = ProviderRuntimeOptions()
+    requests = (BatchInferenceRequest("a", _request()),)
+
+    with pytest.raises(ProviderBatchError) as exc_info:
+        if operation == "submit":
+            provider.submit_batch(
+                requests, credential=None, runtime=runtime
+            )
+        elif operation == "poll":
+            provider.poll_batch("batch_1", credential=None, runtime=runtime)
+        elif operation == "fetch":
+            provider.fetch_batch_results(
+                "batch_1", requests, credential=None, runtime=runtime
+            )
+        else:
+            provider.cancel_batch(
+                "batch_1", credential=None, runtime=runtime
+            )
+
+    assert exc_info.value.retryable is expected_retryable
+    assert secret not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None

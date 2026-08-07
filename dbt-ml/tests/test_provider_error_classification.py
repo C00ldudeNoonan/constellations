@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dbt_ml.providers.base import (
+    ProviderBatchError,
     ProviderRequestError,
     http_status_of,
+    provider_batch_error,
     provider_request_error,
+    sanitized_provider_error,
 )
 
 
@@ -59,3 +62,37 @@ def test_provider_request_error_preserves_status_and_retryability() -> None:
     e = provider_request_error("vertex", "inference", RuntimeError("x"))
     assert e.code == "RuntimeError"
     assert e.retryable is False
+
+
+def test_provider_batch_error_classifies_status_retryability() -> None:
+    retryable = provider_batch_error(
+        "anthropic", "batch poll", _AnthropicError(429)
+    )
+    assert isinstance(retryable, ProviderBatchError)
+    assert retryable.retryable is True
+
+    permanent = provider_batch_error(
+        "anthropic", "batch results", _AnthropicError(403)
+    )
+    assert permanent.retryable is False
+
+    without_status = provider_batch_error(
+        "anthropic", "batch cancel", RuntimeError("unsafe detail")
+    )
+    assert without_status.retryable is False
+    assert "unsafe detail" not in str(without_status)
+
+
+def test_batch_retryability_survives_provider_boundary_sanitization() -> None:
+    error = provider_batch_error(
+        "anthropic", "batch poll", _AnthropicError(429)
+    )
+    sanitized = sanitized_provider_error(
+        "anthropic",
+        "batch inference",
+        error,
+    )
+
+    assert isinstance(sanitized, ProviderBatchError)
+    assert sanitized.retryable is True
+    assert "boom" not in str(sanitized)

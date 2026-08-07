@@ -319,6 +319,12 @@ fast). Unsafe provider error codes are replaced with `provider_error`. Response
 errors must likewise use static, non-sensitive descriptions instead of
 forwarding raw response bodies.
 
+Unexpected native-batch SDK exceptions become `ProviderBatchError` values with
+the same status-derived retryability. Submit, poll, result-fetch, and cancel
+failures therefore retain a safe transient/permanent classification across the
+provider boundary without retaining SDK messages, response bodies, or headers.
+Batch errors without an HTTP status default to non-retryable.
+
 This gives run results a stable error vocabulary while leaving detailed SDK
 diagnostics behind the credential boundary. Provider request IDs are allowed
 for operational correlation but response bodies and headers are not.

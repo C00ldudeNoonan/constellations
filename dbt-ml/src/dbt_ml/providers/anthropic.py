@@ -23,6 +23,7 @@ from .base import (
     ProviderResponseError,
     ProviderRuntimeOptions,
     ProviderUsage,
+    provider_batch_error,
     provider_error_debug_enabled,
     provider_request_error,
     redacted_exception_text,
@@ -188,10 +189,7 @@ class AnthropicInferenceProvider(InferenceProvider):
                 operation,
                 redacted_exception_text(error),
             )
-        return ProviderBatchError(
-            f"{self.name()} {operation} failed [{type(error).__name__}]",
-            safe_for_display=True,
-        )
+        return provider_batch_error(self.name(), operation, error)
 
 
 def _complete_with_sdk(

@@ -36,6 +36,14 @@ policy-prefilter enforcement are implemented. Full replacement and unsupported
 store capabilities still fail closed. This public example uses the same typed
 `RetrievalStore` API that a query service can wrap.
 
+`profiles.yml` also carries a commented-out `cloud` store (issue #271): a
+LanceDB `path` of `gs://…`, `s3://…`, or `az://…` connects to object storage
+natively, so the machine that runs `dbt-ml build` and the machines that serve
+the index no longer have to share a local disk. Cloud credentials go in
+`storage_options`, forwarded to `lancedb.connect()`. Note the store's publisher
+lock is single-host only for both local and cloud paths — it serializes
+publishers on one machine, not across a fleet writing to the same prefix.
+
 To evaluate real retrieval quality with Vertex AI, install the provider extra,
 change `chunk_embeddings.embed.provider` to `vertex`, change its model to one
 of `gemini-embedding-001`, `text-embedding-005`, or

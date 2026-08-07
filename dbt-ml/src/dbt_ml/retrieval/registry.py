@@ -11,7 +11,7 @@ from .base import RetrievalConfigError, RetrievalStore, RetrievalStoreConfig
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
 
 
-def register(cls: type[RetrievalStore]) -> type[RetrievalStore]:
+def register[StoreT: RetrievalStore](cls: type[StoreT]) -> type[StoreT]:
     _REGISTRY[cls.store_type()] = cls
     return cls
 

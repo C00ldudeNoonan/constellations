@@ -287,7 +287,15 @@ economic_data:
         stores:
           primary:
             type: lancedb
+            # A local path, or a cloud object-store URI so the build host and
+            # the serving hosts share one index (issue #271): s3://, gs://, or
+            # az://. A cloud path skips local-filesystem resolution and passes
+            # straight to lancedb.connect(); credentials/region go in
+            # storage_options (operator-controlled, never logged or in artifacts).
             path: target/lancedb
+            # path: gs://econ-data-prod/dbt-ml/lancedb
+            # storage_options:
+            #   google_service_account: /run/secrets/gcs-sa.json
             collection_template: '{project}__{target}__{collection}'
             timeout_seconds: 30
             minimum_consistency: strong
@@ -1167,6 +1175,17 @@ reassign authority until the operator confirms the old owner is terminated,
 and it advances the fence so a surviving zombie fails its next verification.
 v0.2 does not claim fault-tolerant multi-writer publication beyond this
 documented single-host boundary.
+
+A cloud-backed LanceDB `path` (`s3://`, `gs://`, `az://`, issue #271) does not
+change this boundary. The object store has no local disk to host an OS file
+lock, so the lock relocates to a host-local scratch directory keyed by the
+store URI: it still serializes every publisher on one machine and nothing more.
+Two hosts writing to the same cloud prefix are not mutually excluded — that is
+the same limitation the single-host lock already carries for a shared network
+filesystem, and crossing it safely still requires the reserved
+provider-enforced fencing capability. Cloud paths are for sharing one index
+between the (single) build host and the serving hosts, not for concurrent
+multi-host publication.
 
 ### Initial and incremental publication
 

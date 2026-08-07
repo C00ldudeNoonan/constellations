@@ -13,3 +13,16 @@ rag_chunks_pipeline:
           local:
             type: lancedb
             path: ./target/lancedb
+          # A cloud-backed store shares one index across the machine that runs
+          # `dbt-ml build` and the machines that serve it (MCP server, search
+          # API). lancedb connects to s3://, gs://, and az:// natively; a cloud
+          # `path` skips local-path resolution and passes straight through.
+          # Uncomment and set `default: cloud` to use it.
+          # cloud:
+          #   type: lancedb
+          #   path: gs://my-bucket/dbt-ml/lancedb
+          #   storage_options:
+          #     # Credentials/region for the object store, forwarded to
+          #     # lancedb.connect(storage_options=...). Keep secrets in this
+          #     # operator-controlled profile; they never enter artifacts/logs.
+          #     google_service_account: /run/secrets/gcs-sa.json

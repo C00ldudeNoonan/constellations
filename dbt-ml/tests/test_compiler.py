@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from click.testing import CliRunner
@@ -296,6 +296,43 @@ def test_invalid_backend_is_exit_2_before_profile_resolution(
     assert "dbt_ml_project.yml:4:20" in result.output
     assert "[extraction.default_backend]" in result.output
     assert "no profiles.yml" not in result.output
+
+
+def test_compile_validates_effective_warehouse_options_before_manifest_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: effective_warehouse_options\nprofile: project\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "project:\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: bigquery\n"
+        "        project: econ\n"
+        "        dataset: documents_dev\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction: {}\n"
+        "    warehouse_options:\n      inherit: not-a-boolean\n"
+    )
+
+    def unexpected_manifest(*_args: Any, **_kwargs: Any) -> Path:
+        pytest.fail("invalid effective warehouse options must fail before manifest write")
+
+    monkeypatch.setattr("dbt_ml.cli.write_manifest", unexpected_manifest)
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), "compile"])
+
+    assert result.exit_code == 2, result.output
+    assert "inherit must be true or false" in result.output
 
 
 def test_explicit_unregistered_backend_is_rejected(tmp_path: Path) -> None:

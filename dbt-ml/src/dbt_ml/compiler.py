@@ -15,6 +15,7 @@ from .dag import DAGError, ProjectDAG, is_dbt_ref, parse_dbt_ref, parse_ref
 from .embedding import resolve_search_embedding_identity
 from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
+from .post_extract import validate_post_extract_contract
 from .profile import ResolvedProfile
 from .providers import (
     ProviderConfigurationError,
@@ -169,6 +170,7 @@ def validate_project_contract(
                         str(e),
                         ("extraction", "options", "cache_path"),
                     ) from e
+            _validate_post_extract(model, project_dir)
         if model.transform is not None:
             _validate_transform(model, project_dir)
         if model.embed is not None:
@@ -911,6 +913,29 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             "and the model reprocesses when the provider or model changes",
             ("transform", "uses_llm"),
         )
+
+
+def _validate_post_extract(model: ModelConfig, project_dir: Path) -> None:
+    assert model.extraction is not None
+    hook = model.extraction.post_extract
+    if hook is None:
+        return
+    if not _MODULE_PATTERN.fullmatch(hook.module):
+        raise _model_error(
+            model,
+            f"Extraction model '{model.name}' post_extract module "
+            f"'{hook.module}' is not a valid dotted Python module path",
+            ("extraction", "post_extract", "module"),
+        )
+    try:
+        validate_post_extract_contract(hook.module, project_dir, hook.options)
+    except (Exception, SystemExit) as e:
+        raise _model_error(
+            model,
+            f"Extraction model '{model.name}' post_extract module "
+            f"'{hook.module}' is invalid: {e}",
+            ("extraction", "post_extract", "module"),
+        ) from e
 
 
 def _model_error(

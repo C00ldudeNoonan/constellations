@@ -17,6 +17,7 @@ Author a small, declarative pipeline that matches the user's data, warehouse, an
 | Need | Start with |
 | --- | --- |
 | Folder or GCS documents become rows | `source` + extraction model |
+| Derive fields from a large envelope without storing the raw payload | Extraction model + project-local `post_extract` hook |
 | Derive deterministic fields/tables | Python or SQL transform over `depends_on` |
 | Retrieval units and vectors | chunk model, then embed model |
 | Queryable retrieval index | chunk/embed output, then a `search:` resource |
@@ -76,7 +77,31 @@ models:
       - unique: invoice_id
 ```
 
-Declare `fields:` for a stable typed extraction payload, especially when a source can be empty. dbt-ml supplies lineage/provenance columns; do not restate them unless the current contract requests it. Layer parser-specific behavior under the backend's `options` block and put domain logic in a downstream transform.
+Declare `fields:` for a stable typed extraction payload, especially when a source can be empty. dbt-ml supplies lineage/provenance columns; do not restate them unless the current contract requests it. Layer parser-specific behavior under the backend's `options` block. Put domain logic in a downstream transform unless the source is an envelope whose raw payload must not cross the warehouse boundary; in that case use `extraction.post_extract` to return only the derived fields.
+
+For a project-local post-extract hook, configure a dotted module plus optional
+options and create the corresponding `.py` file inside the project:
+
+```yaml
+extraction:
+  backend: json
+  options:
+    fields: [document_key, content]
+  post_extract:
+    module: post_extract.document_text
+    options:
+      input_field: content
+```
+
+Expose `run(fields)` or `run(fields, ctx)` returning a string-keyed mapping, and
+expose `validate_options(options)` when options are accepted. The returned
+mapping replaces backend fields before staging, so retain desired metadata and
+omit the raw payload. Do not log raw fields or include them in exception text.
+Backend warnings/metrics remain intact automatically; hook source and options
+invalidate incremental state when they change. Use `ctx.local_path` only when
+the verified fetched bytes are needed. Prefer this seam over a custom installed
+backend for project-specific envelope parsing, and verify with an output-schema
+test that the raw field is absent.
 
 ### 3. Make transforms explicit and testable
 

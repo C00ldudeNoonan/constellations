@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Extraction-time field derivation (issue #282)
+
+- Extraction models can declare a project-local `post_extract` hook that
+  replaces each backend result's fields before staging or warehouse
+  publication. This lets envelope sources derive text or structured fields in
+  memory and omit large raw payloads instead of materializing a raw table for a
+  second transform pass.
+- Hook modules and options are validated during compilation, apply to ordinary
+  and native-batch extraction while verified snapshots still exist, participate
+  in incremental `code_version`, preserve backend warnings/metrics, and sanitize
+  failures that might otherwise reveal raw document content.
+
 ## v0.6.0 - 2026-08-07
 
 ### Cloud object-store retrieval stores (issue #271)

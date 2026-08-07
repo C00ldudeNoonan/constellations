@@ -307,10 +307,10 @@ dbt-ml init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh pr
 dbt-ml seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 dbt-ml compile                                             # parse YAML, validate DAG, write manifest.json
 dbt-ml graph                                               # Mermaid DAG to stdout
-dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v|-vv]
+dbt-ml run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
 dbt-ml test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 dbt-ml eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
-dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v|-vv]
+dbt-ml build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
 dbt-ml ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 dbt-ml show <model> [--limit N]                            # peek at a materialized table
 dbt-ml search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
@@ -386,13 +386,20 @@ manifest written by a previous `compile` or `run`. The CI recipe: store
 ## Progress output
 
 `dbt-ml run` and `dbt-ml build` are silent by default beyond their final
-summary table. Pass `-v` for per-source discovery lines, per-model start/
-finish lines, and a live per-model progress bar on a TTY; pass `-vv` for
-DEBUG-level logs without a bar (so orchestrator-captured stderr stays
-line-oriented). For runs launched by an orchestrator such as Dagster, set
-`DBT_ML_VERBOSE=1` (or `2`) instead of changing the CLI invocation. All
-progress output goes to stderr, so `--json` on stdout stays a single
-parseable payload.
+summary table. Pass `-v` for per-source discovery lines, per-model
+start/finish lines, and a live per-model progress bar on a TTY; on
+non-TTY stderr (e.g. a Dagster capture) the same events land as plain
+INFO log lines instead. Exactly one channel is active at a time so the
+bar isn't corrupted by log lines writing over its redraws. For runs
+launched by an orchestrator, `DBT_ML_VERBOSE=1` enables verbose output
+without changing the CLI invocation. All progress output goes to stderr,
+so `--json` on stdout stays a single parseable payload.
+
+The verbose flag is deliberately capped at INFO. DEBUG-level log sites
+(transform failures, provider errors) carry unsanitized exception text
+and traceback frames that the user-facing error path scrubs but a raw
+log stream would not — attach your own DEBUG handler if you need it for
+troubleshooting.
 
 ## Matrix model expansion (`for_each`)
 

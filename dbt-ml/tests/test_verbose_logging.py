@@ -11,7 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from dbt_ml import progress as progress_module
-from dbt_ml.cli import cli
+from dbt_ml.cli import _enable_verbose_output, cli
 from dbt_ml.logging_setup import configure_verbose_logging, resolve_verbosity
 from dbt_ml.progress import (
     _NullReporter,
@@ -42,15 +42,31 @@ def _copy_example(tmp_path: Path, example_project_dir: Path) -> Path:
 
 
 def test_resolve_verbosity_prefers_cli_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DBT_ML_VERBOSE", "2")
+    monkeypatch.setenv("DBT_ML_VERBOSE", "0")
     assert resolve_verbosity(1) == 1
+
+
+def test_resolve_verbosity_caps_repeated_flag_at_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-vv` (and higher) must not escalate past the safe INFO ceiling; the DEBUG
+    log sites carry unsanitized exception text that we deliberately keep off
+    the verbose channel."""
+    monkeypatch.delenv("DBT_ML_VERBOSE", raising=False)
+    assert resolve_verbosity(2) == 1
+    assert resolve_verbosity(5) == 1
 
 
 def test_resolve_verbosity_reads_env_when_no_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DBT_ML_VERBOSE", "1")
+    assert resolve_verbosity(0) == 1
+
+
+def test_resolve_verbosity_caps_env_at_one(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DBT_ML_VERBOSE", "2")
-    assert resolve_verbosity(0) == 2
+    assert resolve_verbosity(0) == 1
 
 
 def test_resolve_verbosity_unset_env_is_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,15 +104,23 @@ def test_configure_verbose_logging_zero_removes_handler() -> None:
     assert getattr(logger, "_dbt_ml_verbose_handler", None) is None
 
 
-def test_verbose_logging_debug_level_at_double_v() -> None:
+def test_verbose_logging_caps_at_info_no_debug() -> None:
+    """DEBUG must never be enabled via the verbose flag: the debug log sites
+    (transform failures, provider errors) carry unsanitized exception text
+    that AGENTS.md keeps out of logs. Regression guard against re-adding a
+    `-vv` DEBUG path."""
     logger = logging.getLogger("dbt_ml")
-    configure_verbose_logging(2)
-    assert logger.level == logging.DEBUG
+    configure_verbose_logging(1)
+    assert logger.level == logging.INFO
+    handler = getattr(logger, "_dbt_ml_verbose_handler", None)
+    assert handler is not None
+    assert handler.level == logging.INFO
 
 
 def test_configure_progress_non_tty_stays_null() -> None:
     buffer = io.StringIO()  # not a TTY
-    configure_progress(1, stream=buffer)
+    installed = configure_progress(1, stream=buffer)
+    assert installed is False
     assert isinstance(get_reporter(), _NullReporter)
 
 
@@ -106,7 +130,8 @@ def test_configure_progress_tty_installs_terminal_reporter() -> None:
             return True
 
     stream = _FakeTTY()
-    configure_progress(1, stream=stream)
+    installed = configure_progress(1, stream=stream)
+    assert installed is True
     assert isinstance(get_reporter(), _TerminalReporter)
 
 
@@ -130,6 +155,43 @@ def test_null_reporter_task_advances_no_op() -> None:
         task.advance(3)  # must not raise
 
 
+def test_enable_verbose_output_tty_uses_only_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When stderr is a TTY, the reporter owns output — the INFO log handler
+    must not attach or per-flush lines would collide with the progress-bar
+    redraws and every discovery/model event would double-print."""
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr("sys.stderr", _FakeTTY())
+    _enable_verbose_output(1)
+    logger = logging.getLogger("dbt_ml")
+    assert getattr(logger, "_dbt_ml_verbose_handler", None) is None
+    assert isinstance(get_reporter(), _TerminalReporter)
+
+
+def test_enable_verbose_output_non_tty_uses_only_log_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+    _enable_verbose_output(1)
+    logger = logging.getLogger("dbt_ml")
+    assert getattr(logger, "_dbt_ml_verbose_handler", None) is not None
+    assert isinstance(get_reporter(), _NullReporter)
+
+
+def test_enable_verbose_output_zero_installs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+    _enable_verbose_output(0)
+    logger = logging.getLogger("dbt_ml")
+    assert getattr(logger, "_dbt_ml_verbose_handler", None) is None
+    assert isinstance(get_reporter(), _NullReporter)
+
+
 def test_verbose_build_emits_progress_and_summary_to_stderr(
     tmp_path: Path, example_project_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -147,6 +209,12 @@ def test_verbose_build_emits_progress_and_summary_to_stderr(
     assert "raw_invoices" in result.stderr
     assert "starting" in result.stderr
     assert "finished" in result.stderr
+    # Under a captured (non-TTY) stderr the log handler is the sole channel,
+    # so the terminal reporter's `[done]` / `[source]` echoes must NOT also
+    # appear — that would mean both channels ran and every event would
+    # double-print.
+    assert "[done]" not in result.stderr
+    assert "[source]" not in result.stderr
 
 
 def test_dbt_ml_verbose_env_var_enables_logging_without_flag(

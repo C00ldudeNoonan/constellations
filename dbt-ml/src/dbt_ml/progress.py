@@ -159,16 +159,24 @@ def set_reporter(reporter: ProgressReporter | None) -> None:
     _reporter = reporter if reporter is not None else _NullReporter()
 
 
-def configure_progress(verbosity: int, *, stream: TextIO | None = None) -> None:
+def configure_progress(verbosity: int, *, stream: TextIO | None = None) -> bool:
     """Install a terminal reporter when verbose is requested and stderr is a
     TTY. Non-TTY callers keep the null reporter so the plain ``log.info`` lines
     stay the sole channel — a captured log stream doesn't want a carriage-return
-    progress bar re-written every flush."""
+    progress bar re-written every flush.
+
+    Returns True when a terminal reporter was installed. Callers use this to
+    avoid enabling the INFO log handler at the same time; a redrawing
+    ``click.progressbar`` and a plain ``log.info`` line share stderr, so
+    running both would corrupt the bar and double-print discovery / model
+    boundary events (once from the log call, once from the reporter callback).
+    """
     target = stream if stream is not None else sys.stderr
     if verbosity <= 0 or not _is_tty(target):
         set_reporter(None)
-        return
+        return False
     set_reporter(_TerminalReporter(target))
+    return True
 
 
 def _is_tty(stream: TextIO) -> bool:

@@ -103,20 +103,35 @@ def _context_override(
 
 
 def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
-    """Repeatable ``-v`` for progress output. ``-v`` enables source-discovery
-    lines, per-model start/finish lines, and a progress bar on a TTY; ``-vv``
-    switches to DEBUG-level logs (no bar so lines don't collide). Also
-    honored via ``DBT_ML_VERBOSE`` for orchestrator-launched runs."""
+    """``-v`` for progress output. Enables per-source discovery lines,
+    per-model start/finish lines, and a live progress bar on a TTY (non-TTY
+    stderr gets plain log lines instead). Also honored via ``DBT_ML_VERBOSE``.
+    Extra ``v``s are silently capped — verbose is always INFO-level; the flag
+    intentionally does not expose DEBUG."""
     return click.option(
         "-v",
         "--verbose",
         "verbose",
         count=True,
         help=(
-            "Enable progress output (-v info + progress bar on TTY, -vv debug). "
-            "Also honored via DBT_ML_VERBOSE=1|2."
+            "Enable progress output: per-source discovery, per-model "
+            "start/finish, and a TTY progress bar. Also honored via "
+            "DBT_ML_VERBOSE=1."
         ),
     )(command)
+
+
+def _enable_verbose_output(verbose_count: int) -> None:
+    """Install exactly one verbose channel — the TTY progress bar/reporter when
+    stderr is a TTY, otherwise the INFO log handler. Both share stderr, so
+    running them together would corrupt the ``click.progressbar`` redraws and
+    double-print discovery / model boundary events (once from the log call,
+    once from the reporter callback)."""
+    verbosity = resolve_verbosity(verbose_count)
+    if configure_progress(verbosity):
+        configure_verbose_logging(0)
+    else:
+        configure_verbose_logging(verbosity)
 
 
 def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
@@ -846,12 +861,7 @@ def run(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    verbosity = resolve_verbosity(verbose)
-    configure_verbose_logging(verbosity)
-    # Progress bar and log lines both go to stderr, so a --json stdout payload
-    # stays a clean single JSON document. Skip the TTY bar under -vv so the
-    # debug stream isn't shredded by carriage-return redraws.
-    configure_progress(verbosity if verbosity == 1 else 0)
+    _enable_verbose_output(verbose)
 
     if watch:
         _run_watch(
@@ -1055,9 +1065,7 @@ def build(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    verbosity = resolve_verbosity(verbose)
-    configure_verbose_logging(verbosity)
-    configure_progress(verbosity if verbosity == 1 else 0)
+    _enable_verbose_output(verbose)
     start = time.monotonic()
     try:
         result = build_project(

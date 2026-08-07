@@ -1,0 +1,4 @@
+interface:
+  display_name: "dbt-ml Engineering"
+  short_description: "Build dbt-ml safely from its real contracts"
+  default_prompt: "Use $dbt-ml-engineering to implement this dbt-ml change safely."

@@ -23,6 +23,12 @@ rag_chunks_pipeline:
           #   path: gs://my-bucket/dbt-ml/lancedb
           #   storage_options:
           #     # Credentials/region for the object store, forwarded to
-          #     # lancedb.connect(storage_options=...). Keep secrets in this
-          #     # operator-controlled profile; they never enter artifacts/logs.
+          #     # lancedb.connect(storage_options=...). Held as secrets: kept in
+          #     # this operator-controlled profile, redacted from config dumps,
+          #     # and never written to artifacts/logs.
           #     google_service_account: /run/secrets/gcs-sa.json
+          #   # The single-host publisher lock has no local disk to live on for a
+          #   # cloud store, so it defaults to a fixed per-machine directory. If
+          #   # your publishers run in separate containers, point this at a volume
+          #   # mounted into every one of them so they actually share the lock.
+          #   # publisher_lock_dir: /var/run/dbt-ml/lancedb-locks

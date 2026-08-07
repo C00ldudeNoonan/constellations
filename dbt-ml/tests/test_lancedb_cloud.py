@@ -8,10 +8,12 @@ cloud stores while local-path behavior stays byte-for-byte the same.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import lancedb
 import pytest
+from pydantic import SecretStr
 
 from dbt_ml.retrieval import LanceDBStore, RetrievalError, parse_store_config
 from dbt_ml.retrieval.lancedb import LanceDBConfig
@@ -51,16 +53,37 @@ def test_storage_options_parsed() -> None:
         "gs://bucket/prefix",
         storage_options={"google_service_account": "/run/secrets/sa.json"},
     )
-    assert config.storage_options == {"google_service_account": "/run/secrets/sa.json"}
+    assert {k: v.get_secret_value() for k, v in config.storage_options.items()} == {
+        "google_service_account": "/run/secrets/sa.json"
+    }
 
 
 def test_storage_options_default_empty() -> None:
     assert _config("gs://bucket/prefix").storage_options == {}
 
 
+def test_storage_options_are_redacted_on_every_serialization_surface() -> None:
+    config = _config(
+        "gs://bucket/prefix",
+        storage_options={"aws_secret_access_key": "SUPERSECRET"},
+    )
+    # Values are SecretStr, so no diagnostic/serialization surface prints them.
+    assert "SUPERSECRET" not in repr(config)
+    assert "SUPERSECRET" not in str(config)
+    assert "SUPERSECRET" not in config.model_dump_json()
+    assert "SUPERSECRET" not in json.dumps(config.model_dump(mode="json"))
+    assert isinstance(config.storage_options["aws_secret_access_key"], SecretStr)
+
+
 def test_empty_path_rejected() -> None:
     with pytest.raises(Exception, match="non-empty local path or cloud URI"):
         _config("   ")
+
+
+@pytest.mark.parametrize("bad", ["s3://", "gs://", "gs:///prefix", "az:///c/p"])
+def test_malformed_cloud_uri_rejected_at_parse_time(bad: str) -> None:
+    with pytest.raises(Exception, match="must include a bucket/container"):
+        _config(bad)
 
 
 def test_absolutize_leaves_cloud_uri_untouched(tmp_path: Path) -> None:
@@ -139,12 +162,13 @@ def test_storage_options_absent_when_empty(
     assert captured["kwargs"] == {}
 
 
-def test_cloud_publisher_lock_uses_host_local_scratch(tmp_path: Path) -> None:
-    config = _config("gs://bucket/prefix")
+def test_cloud_publisher_lock_excludes_second_publisher(tmp_path: Path) -> None:
+    lock_dir = str(tmp_path / "shared-locks")
+    config = _config("gs://bucket/prefix", publisher_lock_dir=lock_dir)
     store = _store(config)
     other = _store(config)
     # A cloud store's fence must not try to mkdir a gs:// path; it serializes
-    # publishers on this host via a scratch lock, same guarantee as local.
+    # publishers on this host via the shared lock dir, same guarantee as local.
     with store.publisher_fence("demo__dev__context"):
         with pytest.raises(RetrievalError, match="publisher_lock_held"):
             with other.publisher_fence("demo__dev__context"):
@@ -161,6 +185,36 @@ def test_cloud_publisher_lock_dir_is_keyed_by_uri() -> None:
     assert a == same
     # Never a local mkdir on the object-store namespace.
     assert "bucket" not in a.as_posix()
+
+
+def test_cloud_lock_dir_is_independent_of_tmpdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-host lock is worthless if two publishers on one host resolve
+    to different dirs. A per-process TMPDIR must NOT move the default lock dir."""
+    store = _store(_config("gs://bucket/prefix"))
+    monkeypatch.setenv("TMPDIR", "/tmp/publisher-one")
+    monkeypatch.setenv("TMP", "/tmp/publisher-one")
+    monkeypatch.setenv("TEMP", "/tmp/publisher-one")
+    first = store._lock_dir()
+    monkeypatch.setenv("TMPDIR", "/tmp/publisher-two")
+    monkeypatch.setenv("TMP", "/tmp/publisher-two")
+    monkeypatch.setenv("TEMP", "/tmp/publisher-two")
+    second = store._lock_dir()
+    assert first == second
+
+
+def test_publisher_lock_dir_override_relocates_lock(tmp_path: Path) -> None:
+    override = tmp_path / "vol" / "locks"
+    store = _store(_config("gs://bucket/prefix", publisher_lock_dir=str(override)))
+    assert store._lock_dir().is_relative_to(override)
+
+
+def test_local_store_lock_stays_co_located_by_default(tmp_path: Path) -> None:
+    data = tmp_path / "lance"
+    store = _store(_config(str(data)))
+    # Backward-compatible: local publisher lock still lives in the data dir.
+    assert store._lock_dir() == data
 
 
 def test_safe_descriptor_stable_and_excludes_storage_options(tmp_path: Path) -> None:

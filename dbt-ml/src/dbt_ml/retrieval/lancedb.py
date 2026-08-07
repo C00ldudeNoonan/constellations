@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sys
-import tempfile
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
@@ -13,7 +13,7 @@ from types import TracebackType
 from typing import Any, Literal, Self
 
 import pyarrow as pa
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, SecretStr, field_validator
 
 from ..hashing import canonical_fingerprint
 from ..optional_dependencies import (
@@ -46,7 +46,14 @@ _CONFIG_KEY = b"dbt_ml.config_fingerprint"
 # Object-store schemes LanceDB connects to natively (Rust object_store cores).
 # A `path` carrying one of these bypasses local-filesystem resolution and the
 # local mkdir, and flows straight into `lancedb.connect()`.
-_CLOUD_URI_RE = re.compile(r"^(s3|s3a|gs|gcs|az|abfs|abfss)://", re.IGNORECASE)
+_CLOUD_SCHEMES = ("s3", "s3a", "gs", "gcs", "az", "abfs", "abfss")
+_CLOUD_URI_RE = re.compile(rf"^({'|'.join(_CLOUD_SCHEMES)})://", re.IGNORECASE)
+# scheme://authority[/path] — the authority (bucket/container/account) must be
+# present. Rejects `s3://` and `gs:///prefix` at parse time instead of failing
+# late inside lancedb.connect() after a publication lease is already held.
+_CLOUD_URI_AUTHORITY_RE = re.compile(
+    rf"^({'|'.join(_CLOUD_SCHEMES)})://([^/]+)(/.*)?$", re.IGNORECASE
+)
 
 
 class LanceDBConfig(RetrievalStoreConfig):
@@ -57,9 +64,15 @@ class LanceDBConfig(RetrievalStoreConfig):
     path: str
     # Credentials/region/endpoint passthrough for cloud backends, mirroring
     # lancedb.connect(storage_options=...). Lives in the operator-controlled
-    # profile; it may carry secrets, so it must never enter safe descriptors,
-    # fingerprints, artifacts, logs, or error text.
-    storage_options: dict[str, str] = Field(default_factory=dict)
+    # profile; values are secrets, held as SecretStr so repr()/model_dump()/
+    # model_dump_json() redact them and they never enter safe descriptors,
+    # fingerprints, artifacts, logs, or error text. Unwrapped only at connect().
+    storage_options: dict[str, SecretStr] = Field(default_factory=dict)
+    # Local directory hosting the publisher lock. Optional for local stores
+    # (defaults to the data dir); for a cloud store it names a host-shared path
+    # so the single-host publisher lock is actually shared across every
+    # publisher on the host (see `_lock_dir`).
+    publisher_lock_dir: str | None = None
     collection_template: str = "{project}__{target}__{collection}"
     timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     minimum_consistency: Literal["strong"] = "strong"
@@ -69,6 +82,11 @@ class LanceDBConfig(RetrievalStoreConfig):
     def _validate_path(cls, value: str) -> str:
         if not value or not value.strip():
             raise ValueError("path must be a non-empty local path or cloud URI")
+        if _CLOUD_URI_RE.match(value) and not _CLOUD_URI_AUTHORITY_RE.match(value):
+            raise ValueError(
+                "cloud object-store path must include a bucket/container, e.g. "
+                "gs://bucket/prefix or s3://bucket/prefix"
+            )
         return value
 
     @field_validator("collection_template")
@@ -189,9 +207,13 @@ class LanceDBStore(RetrievalStore):
         if self._config.is_cloud_uri:
             # No local .mkdir(): the object store owns the namespace, and
             # Path.mkdir() has no concept of a bucket. lancedb.connect() creates
-            # the prefix lazily on first write.
+            # the prefix lazily on first write. Secrets are unwrapped only here,
+            # at the SDK boundary.
             if self._config.storage_options:
-                connect_kwargs["storage_options"] = dict(self._config.storage_options)
+                connect_kwargs["storage_options"] = {
+                    key: secret.get_secret_value()
+                    for key, secret in self._config.storage_options.items()
+                }
         else:
             self._config.local_data_path().mkdir(parents=True, exist_ok=True)
         try:
@@ -232,15 +254,14 @@ class LanceDBStore(RetrievalStore):
         """OS-enforced exclusive publisher lock, valid on one host only.
 
         For a local store the lock file lives next to the LanceDB data, so every
-        dbt-ml publisher on the host contends on the same inode/handle. For a
-        cloud-backed store there is no local data directory, so the lock lives in
-        a host-local scratch directory keyed by the store URI — this keeps the
-        exact same single-host guarantee (all publishers on this host serialize)
-        and no more. This is the documented boundary from #152: the lock cannot
-        fence a publisher on another machine, whether they share a network
-        filesystem or the same object-store prefix. Cross-host publisher
-        exclusion for cloud stores would need provider-enforced fencing, which
-        this store does not advertise."""
+        dbt-ml publisher on the host contends on the same inode/handle. A
+        cloud-backed store has no local data directory, so the lock lives in a
+        host-stable local directory keyed by the store URI (see `_lock_dir`) —
+        this keeps the same single-host guarantee and no more. This is the
+        documented boundary from #152: the lock cannot fence a publisher on
+        another machine, whether they share a network filesystem or the same
+        object-store prefix. Cross-host publisher exclusion would need
+        provider-enforced fencing, which this store does not advertise."""
         if not _COLLECTION_RE.fullmatch(collection):
             raise RetrievalError("LanceDB collection name is invalid")
         lock_dir = self._lock_dir()
@@ -248,15 +269,29 @@ class LanceDBStore(RetrievalStore):
         return _PublisherLock(lock_dir / f"{collection}.dbt-ml-publisher.lock")
 
     def _lock_dir(self) -> Path:
-        """Directory holding this store's publisher lock files. Co-located with
-        the data for local stores; a per-URI host-local scratch dir for cloud
-        stores (the object store cannot host an OS file lock)."""
-        if not self._config.is_cloud_uri:
+        """Directory holding this store's publisher lock files.
+
+        Local store, no override: co-located with the data (unchanged). Anything
+        else is keyed by the store URI so publishers of the *same* store share a
+        directory while different stores don't collide.
+
+        For a cloud store the default base is deliberately NOT
+        `tempfile.gettempdir()`: TMPDIR is per-process/per-container, so two
+        publishers on one host could resolve to different directories and their
+        `flock`s would never contend — silently voiding the single-host lock.
+        The default is a fixed host-machine location instead. Publishers running
+        in isolated mount namespaces (separate containers) don't share any local
+        path automatically; those deployments must set `publisher_lock_dir` to a
+        volume mounted into every publisher, which is the only way a local file
+        lock can honestly back the single-host capability there."""
+        override = self._config.publisher_lock_dir
+        if override is None and not self._config.is_cloud_uri:
             return self._config.local_data_path()
+        base = Path(override) if override is not None else _default_host_lock_base()
         digest = hashlib.sha256(
             self._config.connect_target().encode("utf-8")
         ).hexdigest()[:32]
-        return Path(tempfile.gettempdir()) / "dbt-ml-lancedb-locks" / digest
+        return base / digest
 
     def safe_descriptor(self) -> SafeRetrievalTarget:
         identity = canonical_fingerprint(
@@ -551,6 +586,19 @@ def _identifier_piece(value: str) -> str:
     if not normalized or normalized[0].isdigit():
         normalized = f"_{normalized}"
     return normalized[:128]
+
+
+def _default_host_lock_base() -> Path:
+    """Fixed per-machine base for cloud-store publisher locks, independent of
+    TMPDIR/TEMP so every publisher on the host resolves to the same directory
+    (a `tempfile.gettempdir()` base would vary per process/container and let
+    two publishers' locks silently miss each other). Publishers in isolated
+    mount namespaces still need an explicit `publisher_lock_dir` on a shared
+    volume."""
+    if sys.platform == "win32":
+        base = os.environ.get("PROGRAMDATA") or "C:\\ProgramData"
+        return Path(base) / "dbt-ml" / "lancedb-locks"
+    return Path("/var/tmp/dbt-ml-lancedb-locks")
 
 
 def _sql_string(value: str) -> str:

@@ -1178,14 +1178,23 @@ documented single-host boundary.
 
 A cloud-backed LanceDB `path` (`s3://`, `gs://`, `az://`, issue #271) does not
 change this boundary. The object store has no local disk to host an OS file
-lock, so the lock relocates to a host-local scratch directory keyed by the
-store URI: it still serializes every publisher on one machine and nothing more.
-Two hosts writing to the same cloud prefix are not mutually excluded — that is
-the same limitation the single-host lock already carries for a shared network
-filesystem, and crossing it safely still requires the reserved
-provider-enforced fencing capability. Cloud paths are for sharing one index
-between the (single) build host and the serving hosts, not for concurrent
-multi-host publication.
+lock, so the lock lives in a fixed per-machine directory keyed by the store URI
+— deliberately not a `TMPDIR`-derived path, since that varies per
+process/container and would let two publishers' locks silently miss each other.
+It still serializes every publisher sharing that host filesystem and nothing
+more. Publishers in isolated mount namespaces (separate containers) share no
+local path automatically, so those deployments must set `publisher_lock_dir` to
+a volume mounted into every publisher — the only way a local file lock can
+honestly back the single-host capability there. Two *hosts* writing to the same
+cloud prefix are never mutually excluded: that is the same limitation the
+single-host lock already carries for a shared network filesystem, and crossing
+it safely still requires the reserved provider-enforced fencing capability.
+Cloud paths are for sharing one index between the (single) build host and the
+serving hosts, not for concurrent multi-host publication.
+
+`storage_options` values are held as secrets: they are redacted from
+`repr()`/`model_dump()`/`model_dump_json()` and every other diagnostic surface,
+and are unwrapped only at the `lancedb.connect()` call.
 
 ### Initial and incremental publication
 

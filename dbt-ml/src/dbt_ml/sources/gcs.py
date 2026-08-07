@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fnmatch
 import importlib
+import logging
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -27,6 +28,8 @@ from ..config.loader import ConfigError
 from ..config.source import SourceConfig
 from ..versioning import compute_document_id
 from .base import DocumentRef, DocumentSource, SourceError, SourceScan
+
+log = logging.getLogger(__name__)
 
 _INSTALL_HINT = (
     "GCS sources require google-cloud-storage. "
@@ -123,6 +126,12 @@ class GCSDocumentSource(DocumentSource):
         # so listing `raw/doc` would also return `raw/docs/…`. Normalizing
         # to a trailing slash keeps sibling prefixes out.
         list_prefix = f"{prefix.rstrip('/')}/" if prefix else ""
+        log.info(
+            "Source '%s': listing gs://%s/%s",
+            source.name,
+            bucket_name,
+            list_prefix,
+        )
         try:
             listed = list(
                 self._get_client(source.project).list_blobs(
@@ -135,6 +144,13 @@ class GCSDocumentSource(DocumentSource):
             raise
         except Exception as e:
             raise self._api_error(f"listing gs://{bucket_name}/{list_prefix}", e) from e
+        log.info(
+            "Source '%s': listed %d object(s) under gs://%s/%s",
+            source.name,
+            len(listed),
+            bucket_name,
+            list_prefix,
+        )
         if len(listed) > source.max_objects:
             raise SourceError(
                 f"Source '{source.name}': more than {source.max_objects} objects "

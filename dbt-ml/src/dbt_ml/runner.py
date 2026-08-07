@@ -51,6 +51,7 @@ from .profile import (
     apply_source_path_overrides,
     resolve_profile,
 )
+from .progress import get_reporter
 from .sources import SourceError, get_document_source
 
 log = logging.getLogger(__name__)
@@ -451,6 +452,7 @@ def _discover_sources(
     source_filter: Sequence[str] = (),
 ) -> dict[str, DiscoveredSource]:
     out: dict[str, DiscoveredSource] = {}
+    reporter = get_reporter()
     for source in sources:
         backend = get_document_source(source.path)
         try:
@@ -465,6 +467,7 @@ def _discover_sources(
                 for ref in refs
                 if any(fnmatch.fnmatch(ref.relative_path, pat) for pat in source_filter)
             ]
+        reporter.source_discovered(source.name, len(refs))
         out[source.name] = DiscoveredSource(backend=backend, refs=refs)
     return out
 
@@ -531,6 +534,8 @@ def _run_model(
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
 ) -> ModelRunResult:
+    kind = _model_kind_label(model)
+    log.info("starting %s (%s)", model.name, kind)
     start = time.monotonic()
     if model.extraction is not None:
         result = _run_extraction_model(
@@ -612,7 +617,35 @@ def _run_model(
             "llm, or search block configured"
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
+    log.info(
+        "finished %s: %d row(s) in %.3fs%s",
+        model.name,
+        result.rows_written,
+        result.duration_seconds,
+        f" [{result.status}]" if result.status else "",
+    )
+    get_reporter().model_finished(
+        model.name, result.rows_written, result.duration_seconds, result.status
+    )
     return result
+
+
+def _model_kind_label(model: ModelConfig) -> str:
+    if model.extraction is not None:
+        return "extraction"
+    if model.ml is not None:
+        return "ml"
+    if model.transform is not None:
+        return "transform"
+    if model.chunk is not None:
+        return "chunk"
+    if model.embed is not None:
+        return "embed"
+    if model.llm is not None:
+        return "llm"
+    if model.search is not None:
+        return "search"
+    return "unknown"
 
 
 def clean_project(

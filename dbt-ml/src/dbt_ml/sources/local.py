@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import logging
 import os
 import stat
 from collections.abc import Iterator
@@ -14,6 +15,8 @@ from ..hashing import HASH_DIGEST_SIZE
 from ..paths import resolve_within_project
 from ..versioning import compute_document_id
 from .base import DocumentRef, DocumentSource, SourceError, SourceScan
+
+log = logging.getLogger(__name__)
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -424,7 +427,9 @@ class LocalDocumentSource(DocumentSource):
     def discover(self, source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
         source_dir = _source_dir(source, project_dir)
         if not source_dir.exists():
+            log.info("Source '%s': path does not exist: %s", source.name, source_dir)
             return []
+        log.info("Source '%s': scanning %s", source.name, source_dir)
         refs: list[DocumentRef] = []
         for match in _matched_files(source, source_dir, include_hash=True):
             assert match.content_hash is not None
@@ -440,6 +445,7 @@ class LocalDocumentSource(DocumentSource):
                     source_uri=match.path.as_uri(),
                 )
             )
+        log.info("Source '%s': discovered %d document(s)", source.name, len(refs))
         return refs
 
     def fetch(self, ref: DocumentRef, work_dir: Path) -> Path:

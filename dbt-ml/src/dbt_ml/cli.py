@@ -33,6 +33,7 @@ from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
+from .logging_setup import configure_verbose_logging, resolve_verbosity
 from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
@@ -42,6 +43,7 @@ from .profile import (
     resolve_llm_options,
     resolve_profile,
 )
+from .progress import configure_progress
 from .providers import (
     get_inference_provider,
 )
@@ -98,6 +100,23 @@ def _context_override(
         return value
 
     return callback
+
+
+def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
+    """Repeatable ``-v`` for progress output. ``-v`` enables source-discovery
+    lines, per-model start/finish lines, and a progress bar on a TTY; ``-vv``
+    switches to DEBUG-level logs (no bar so lines don't collide). Also
+    honored via ``DBT_ML_VERBOSE`` for orchestrator-launched runs."""
+    return click.option(
+        "-v",
+        "--verbose",
+        "verbose",
+        count=True,
+        help=(
+            "Enable progress output (-v info + progress bar on TTY, -vv debug). "
+            "Also honored via DBT_ML_VERBOSE=1|2."
+        ),
+    )(command)
 
 
 def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
@@ -808,6 +827,7 @@ def _model_kind(model: ModelConfig) -> str:
     is_flag=True,
     help="Print the run_results.json payload to stdout instead of the table.",
 )
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def run(
@@ -820,11 +840,18 @@ def run(
     state: Path | None,
     source_filter: tuple[str, ...],
     json_output: bool,
+    verbose: int,
 ) -> None:
     """Extract and materialize selected models into the configured warehouse."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    verbosity = resolve_verbosity(verbose)
+    configure_verbose_logging(verbosity)
+    # Progress bar and log lines both go to stderr, so a --json stdout payload
+    # stays a clean single JSON document. Skip the TTY bar under -vv so the
+    # debug stream isn't shredded by carriage-return redraws.
+    configure_progress(verbosity if verbosity == 1 else 0)
 
     if watch:
         _run_watch(
@@ -1008,6 +1035,7 @@ def _usage_summary(
     is_flag=True,
     help="Print the run_results.json payload to stdout instead of the table.",
 )
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def build(
@@ -1020,12 +1048,16 @@ def build(
     state: Path | None,
     source_filter: tuple[str, ...],
     json_output: bool,
+    verbose: int,
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
     when an upstream model errors or fails a test."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    verbosity = resolve_verbosity(verbose)
+    configure_verbose_logging(verbosity)
+    configure_progress(verbosity if verbosity == 1 else 0)
     start = time.monotonic()
     try:
         result = build_project(

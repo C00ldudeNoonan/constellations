@@ -47,6 +47,7 @@ from ..config.model import INTERNAL_LINEAGE_FIELDS, ModelConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
 from ..paths import resolve_within_project
+from ..post_extract import LoadedPostExtract, load_post_extract
 from ..profile import ResolvedProfile, resolve_llm_options
 from ..progress import get_reporter
 from ..providers import InferenceProvider, get_inference_provider
@@ -328,6 +329,24 @@ def run_extraction_model(
     except BackendOptionsError as e:
         raise RunError(f"Extraction model '{model.name}' has {e}") from e
 
+    try:
+        post_extract = (
+            load_post_extract(
+                model.extraction.post_extract.module,
+                project_dir,
+                model.extraction.post_extract.options,
+            )
+            if model.extraction.post_extract is not None
+            else None
+        )
+    except (Exception, SystemExit):
+        # Compilation already validated the hook. If its file changes between
+        # compile and execution, fail the model without surfacing module-local
+        # exception text that could contain project-sensitive configuration.
+        module = model.extraction.post_extract
+        name = module.module if module is not None else "unknown"
+        raise RunError(f"Post-extract hook '{name}' could not be loaded") from None
+
     inference_provider: InferenceProvider | None = None
     provider_name: str | None = None
     provider_model: str | None = None
@@ -497,6 +516,10 @@ def run_extraction_model(
                         budget_guard.check_file_bytes(size)
                         budget_guard.charge_bytes(size)
                     result = backend.extract(local_path, options)
+                    if post_extract is not None:
+                        result = post_extract.apply(
+                            result, document=doc, local_path=local_path
+                        )
                     if budget_guard is not None:
                         budget_guard.charge_metrics(result.metrics)
                     return doc, result, None
@@ -535,6 +558,7 @@ def run_extraction_model(
                             options,
                             work_dir,
                             model.name,
+                            post_extract=post_extract,
                             budget=budget_guard,
                         )
                         for key, value in batch_metrics.items():
@@ -708,6 +732,7 @@ def _extract_batched(
     work_dir: Path,
     model_name: str,
     *,
+    post_extract: LoadedPostExtract | None = None,
     budget: BudgetGuard | None = None,
 ) -> tuple[
     list[tuple[DocumentRef, ExtractionResult | None, str | None]],
@@ -726,6 +751,7 @@ def _extract_batched(
             entries.append((doc, None, f"{type(e).__name__}: {e}"))
 
     fetched = [(doc, path) for doc, path, err in entries if path is not None]
+    out: list[tuple[DocumentRef, ExtractionResult | None, str | None]] = []
     try:
         try:
             batch_output = (
@@ -741,28 +767,47 @@ def _extract_batched(
             raise RunError(
                 f"Batch extraction failed for model '{model_name}': {e}"
             ) from e
+        batch_out = batch_output.items if batch_output is not None else []
+        by_doc_id: dict[
+            str, tuple[ExtractionResult | None, str | None]
+        ] = {}
+        for index, ((doc, path), result) in enumerate(
+            zip(fetched, batch_out, strict=True)
+        ):
+            if isinstance(result, Exception):
+                by_doc_id[doc.document_id] = (
+                    None,
+                    artifact_error_text(result),
+                )
+                # Drop any provider exception that could retain raw response
+                # state while the rest of a large batch is derived.
+                batch_out[index] = RuntimeError("batch item extraction failed")
+                continue
+            if post_extract is not None:
+                try:
+                    result = post_extract.apply(
+                        result, document=doc, local_path=path
+                    )
+                except Exception as e:
+                    by_doc_id[doc.document_id] = (None, artifact_error_text(e))
+                    batch_out[index] = RuntimeError("post-extract hook failed")
+                    continue
+                # Release the raw backend result as soon as this document has
+                # crossed the hook boundary; do not retain a window of raw
+                # payloads alongside the derived output.
+                batch_out[index] = result
+            by_doc_id[doc.document_id] = (result, None)
+        for doc, _path, err in entries:
+            if err is not None:
+                out.append((doc, None, err))
+                continue
+            result, extraction_error = by_doc_id[doc.document_id]
+            out.append((doc, result, extraction_error))
     finally:
-        # The submit/poll/fetch cycle above can run long (#149); once it
-        # returns — success, failure, or cancellation — the staged files have
-        # served their purpose and needn't wait for the whole run to end (#273).
+        # Keep snapshots through post-extract so the hook can inspect the
+        # verified bytes, then remove them before the window is published.
         for _doc, path in fetched:
             _cleanup_fetched(path, work_dir)
-    batch_out = batch_output.items if batch_output is not None else []
-    by_doc_id = {
-        doc.document_id: res
-        for (doc, _), res in zip(fetched, batch_out, strict=True)
-    }
-
-    out: list[tuple[DocumentRef, ExtractionResult | None, str | None]] = []
-    for doc, _path, err in entries:
-        if err is not None:
-            out.append((doc, None, err))
-            continue
-        res = by_doc_id[doc.document_id]
-        if isinstance(res, Exception):
-            out.append((doc, None, artifact_error_text(res)))
-        else:
-            out.append((doc, res, None))
     return out, batch_output.metrics if batch_output is not None else {}
 
 

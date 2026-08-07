@@ -158,6 +158,18 @@ def compute_code_version(
         else:
             payload["transform_code_hash"] = "missing"
 
+    if extraction and extraction.post_extract:
+        hook = extraction.post_extract
+        module_file = resolve_module_file(hook.module, project_dir)
+        extraction_identity = payload["extraction"]
+        assert isinstance(extraction_identity, dict)
+        extraction_identity["post_extract"] = {
+            **hook.model_dump(),
+            "code_hash": (
+                _hash_file(module_file) if module_file.is_file() else "missing"
+            ),
+        }
+
     if transform and transform.type == "sql" and transform.path:
         # Raw source-SQL content + template contract version drive state
         # selection; the compiled, target-specific SQL is recorded separately in

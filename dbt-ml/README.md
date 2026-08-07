@@ -199,9 +199,73 @@ unknown files, never calls an adapter-level database/schema/dataset reset,
 rejects project-root or source/model/transform overlap, and refuses symlinked
 paths. There is no `--force` option.
 
-Running a third-party project still executes its Python transforms and custom
-tests, and remote sources (`gs://…`) reach whatever your ambient credentials
-allow — review projects you didn't write before running them.
+Running a third-party project still executes its Python transforms, custom
+tests, and post-extract hooks, and remote sources (`gs://…`) reach whatever
+your ambient credentials allow — review projects you didn't write before
+running them.
+
+### Derive fields before warehouse publication
+
+When a source object is an envelope around a large payload, use a project-local
+`post_extract` hook to derive the useful representation before dbt-ml builds a
+warehouse row. The hook replaces the backend's field mapping; fields it omits
+never enter the staging frame or target table. This avoids a raw-payload table
+and a second warehouse transform pass:
+
+```yaml
+extraction:
+  backend: json
+  options:
+    fields: [accession_number, content]
+  post_extract:
+    module: post_extract.sec_text
+    options:
+      html_field: content
+      output_field: text
+```
+
+The dotted module is a `.py` file inside the project. For the configuration
+above, create `post_extract/sec_text.py`:
+
+```python
+from collections.abc import Mapping
+from typing import Any
+
+
+def validate_options(options: Mapping[str, Any]) -> None:
+    required = {"html_field", "output_field"}
+    if set(options) != required:
+        raise ValueError(f"options must be exactly {sorted(required)}")
+
+
+def run(fields: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    from bs4 import BeautifulSoup  # dbt-ml[html]
+
+    html = fields[ctx.options["html_field"]]
+    return {
+        "accession_number": fields["accession_number"],
+        ctx.options["output_field"]: BeautifulSoup(
+            html, "html.parser"
+        ).get_text("\n", strip=True),
+    }
+```
+
+`run` may accept `(fields)` or `(fields, ctx)` and must return a mapping with
+string field names. `fields` is a copy of the backend output. `ctx` exposes the
+document/source identity, source metadata, configured hook options, and the
+verified local snapshot path. Backend warnings and numeric usage metrics are
+preserved automatically. A shorthand without options is also valid:
+`post_extract: post_extract.sec_text`.
+
+dbt-ml imports the module and calls its optional `validate_options(options)`
+during compilation, before source discovery, credentials, or warehouse access.
+The hook runs once per successful backend result, including native-batch
+results, while the verified source snapshot still exists. Its module source and
+options participate in `code_version`, so an incremental model reprocesses
+documents when derivation logic changes. Hook failure details are sanitized
+because the hook may be holding raw document content or sensitive options.
+Hook option values are omitted from generated manifests; the artifact records
+the module and resulting `code_version`, not arbitrary project configuration.
 
 For scheduled/orchestrated runs, the `llm` backend can route uncached documents
 through a provider's native batch API. The built-in Anthropic provider applies

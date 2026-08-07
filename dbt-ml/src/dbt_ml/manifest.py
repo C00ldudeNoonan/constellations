@@ -313,7 +313,17 @@ def _model_dict(
         "tags": model.tags,
         "source": model.source,
         "depends_on": model.depends_on or [],
-        "extraction": model.extraction.model_dump() if model.extraction else None,
+        # Project-local hook options may contain prompts, environment-variable
+        # references, or other operator-sensitive configuration. Runtime and
+        # code-versioning consume them from the validated model, but artifacts
+        # expose only the hook module identity.
+        "extraction": (
+            model.extraction.model_dump(
+                exclude={"post_extract": {"options"}}
+            )
+            if model.extraction
+            else None
+        ),
         "transform": model.transform.model_dump() if model.transform else None,
         "ml": model.ml.model_dump(mode="json") if model.ml else None,
         "chunk": model.chunk.model_dump() if model.chunk else None,

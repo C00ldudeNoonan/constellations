@@ -44,6 +44,37 @@ repository-level `.github/workflows/` directory.
 7. Add an init template under `src/dbt_ml/templates/<backend>/` if a fresh-
    project starter makes sense.
 
+## Adding a project-local post-extract hook
+
+Use `extraction.post_extract` when a backend can parse the source envelope but
+the useful warehouse representation must be derived before publication (for
+example, JSON containing a large HTML field). Put the dotted module path in
+model YAML and the matching `.py` file inside the project.
+
+1. Expose `run(fields)` or `run(fields, ctx)` and return a mapping whose keys are
+   strings. The returned mapping replaces the backend fields, so explicitly
+   retain every field that belongs in the output and omit raw payloads.
+2. Treat `fields` as untrusted document data. Do not log it or interpolate it
+   into exceptions. Hook failures are intentionally surfaced without their raw
+   exception detail.
+3. Use `ctx.local_path` only when the verified fetched bytes are needed;
+   `ctx.document_id`, `source_name`, `source_path`, `source_uri`,
+   `source_metadata`, and configured `options` carry safe execution context.
+4. Expose `validate_options(options) -> None` when the hook takes options. The
+   compiler calls it before source discovery, credentials, or warehouse access.
+   Option values affect incremental code identity but are omitted from generated
+   manifests; validation failures surface only a stable, value-free diagnostic.
+5. Keep imports needed only by the hook lazy and document the required dbt-ml
+   extra. The hook is trusted project code, not a sandbox or provider boundary.
+6. Test that the raw input field is absent from the materialized schema, hook
+   source/options change `code_version`, and native batch mode applies the hook
+   before fetched-file cleanup when the model supports batching.
+
+Backend warnings and metrics are preserved by the runner; hooks only own the
+field mapping. Use a built-in backend plus this hook for project/domain-specific
+derivation. Add a package backend only when the parser is reusable and belongs
+in dbt-ml's installed backend registry.
+
 ## Adding a built-in Python transform
 
 1. Put the module under the appropriate package, such as

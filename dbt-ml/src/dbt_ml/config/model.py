@@ -141,11 +141,28 @@ def validate_extraction_field_names(options: Mapping[str, Any]) -> None:
         )
 
 
+class PostExtractConfig(BaseModel):
+    """Project-local field derivation applied before an extracted row is staged."""
+
+    model_config = _STRICT_CONFIG
+
+    module: str
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_module_shorthand(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"module": value}
+        return value
+
+
 class ExtractionConfig(BaseModel):
     model_config = _STRICT_CONFIG
 
     backend: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    post_extract: PostExtractConfig | None = None
     # Rows flush to the warehouse every N documents (issue #77) — bounds
     # memory and gives incremental runs per-flush crash recovery. Excluded
     # from code_version: it changes execution, never output content.

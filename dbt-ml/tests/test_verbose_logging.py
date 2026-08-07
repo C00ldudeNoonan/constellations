@@ -192,6 +192,46 @@ def test_enable_verbose_output_zero_installs_nothing(
     assert isinstance(get_reporter(), _NullReporter)
 
 
+def test_enable_verbose_output_bars_unsafe_forces_log_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`run --threads N` over multiple models runs them concurrently, each with
+    its own progress bar on one stderr. bars_safe=False must fall back to the
+    (atomic, interleave-safe) log handler even on a TTY, and leave no reporter."""
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr("sys.stderr", _FakeTTY())
+    _enable_verbose_output(1, bars_safe=False)
+    logger = logging.getLogger("dbt_ml")
+    assert getattr(logger, "_dbt_ml_verbose_handler", None) is not None
+    assert isinstance(get_reporter(), _NullReporter)
+
+
+def test_source_filter_selected_count_is_reported_on_log_channel(
+    tmp_path: Path, example_project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-TTY runs must report the post-filter selected count, not the larger
+    pre-filter discovery count, so an orchestrated run can't show hundreds
+    discovered while processing a filtered handful."""
+    monkeypatch.delenv("DBT_ML_VERBOSE", raising=False)
+    dst = _copy_example(tmp_path, example_project_dir)
+    generate_invoices(5, dst / "data" / "invoices", seed=1)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--project-dir", str(dst), "run", "-v",
+            "--source-filter", "invoice_0000[0-1].json",
+        ],
+    )
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+    # 2 of 5 match the glob; the selected line must show the filtered count.
+    assert "2 document(s) selected" in result.stderr
+
+
 def test_verbose_build_emits_progress_and_summary_to_stderr(
     tmp_path: Path, example_project_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

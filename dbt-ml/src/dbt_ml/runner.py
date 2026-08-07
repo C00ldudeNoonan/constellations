@@ -467,6 +467,12 @@ def _discover_sources(
                 for ref in refs
                 if any(fnmatch.fnmatch(ref.relative_path, pat) for pat in source_filter)
             ]
+        # The final selected count on both verbose channels: the bar reporter
+        # (TTY) and the INFO log (non-TTY). The per-source discover() log lines
+        # report the pre-filter — and for GCS pre-file-pattern — count, so
+        # without this a captured run could show hundreds discovered while
+        # processing zero after --source-filter.
+        log.info("Source '%s': %d document(s) selected", source.name, len(refs))
         reporter.source_discovered(source.name, len(refs))
         out[source.name] = DiscoveredSource(backend=backend, refs=refs)
     return out

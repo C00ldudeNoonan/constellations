@@ -390,10 +390,14 @@ summary table. Pass `-v` for per-source discovery lines, per-model
 start/finish lines, and a live per-model progress bar on a TTY; on
 non-TTY stderr (e.g. a Dagster capture) the same events land as plain
 INFO log lines instead. Exactly one channel is active at a time so the
-bar isn't corrupted by log lines writing over its redraws. For runs
-launched by an orchestrator, `DBT_ML_VERBOSE=1` enables verbose output
-without changing the CLI invocation. All progress output goes to stderr,
-so `--json` on stdout stays a single parseable payload.
+bar isn't corrupted by log lines writing over its redraws. `run --threads N`
+runs independent models concurrently, so it uses the log-line channel even on
+a TTY (parallel bars on one terminal would interleave). With `--source-filter`,
+the reported per-source count is the post-filter selected count, so it always
+reflects what is actually processed. For runs launched by an orchestrator,
+`DBT_ML_VERBOSE=1` enables verbose output without changing the CLI invocation.
+All progress output goes to stderr, so `--json` on stdout stays a single
+parseable payload.
 
 The verbose flag is deliberately capped at INFO. DEBUG-level log sites
 (transform failures, provider errors) carry unsanitized exception text

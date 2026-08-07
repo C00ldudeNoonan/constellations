@@ -263,7 +263,9 @@ The hook runs once per successful backend result, including native-batch
 results, while the verified source snapshot still exists. Its module source and
 options participate in `code_version`, so an incremental model reprocesses
 documents when derivation logic changes. Hook failure details are sanitized
-because the hook may be holding raw document content.
+because the hook may be holding raw document content or sensitive options.
+Hook option values are omitted from generated manifests; the artifact records
+the module and resulting `code_version`, not arbitrary project configuration.
 
 For scheduled/orchestrated runs, the `llm` backend can route uncached documents
 through a provider's native batch API. The built-in Anthropic provider applies

@@ -101,7 +101,8 @@ Backend warnings/metrics remain intact automatically; hook source and options
 invalidate incremental state when they change. Use `ctx.local_path` only when
 the verified fetched bytes are needed. Prefer this seam over a custom installed
 backend for project-specific envelope parsing, and verify with an output-schema
-test that the raw field is absent.
+test that the raw field is absent. Hook option values are intentionally omitted
+from generated manifests, and validation failures do not expose their values.
 
 ### 3. Make transforms explicit and testable
 

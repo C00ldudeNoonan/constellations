@@ -927,15 +927,23 @@ def _validate_post_extract(model: ModelConfig, project_dir: Path) -> None:
             f"'{hook.module}' is not a valid dotted Python module path",
             ("extraction", "post_extract", "module"),
         )
+    validation_failed = False
     try:
         validate_post_extract_contract(hook.module, project_dir, hook.options)
-    except (Exception, SystemExit) as e:
+    except (Exception, SystemExit):
+        # Hook options can contain prompts or other sensitive project values.
+        # Leave the except block before raising so neither the original
+        # exception nor its traceback survives as __context__.
+        validation_failed = True
+    if validation_failed:
         raise _model_error(
             model,
             f"Extraction model '{model.name}' post_extract module "
-            f"'{hook.module}' is invalid: {e}",
+            f"'{hook.module}' could not be loaded or validated; ensure the "
+            "project module exists, defines run(fields[, ctx]), and accepts "
+            "the configured options",
             ("extraction", "post_extract", "module"),
-        ) from e
+        ) from None
 
 
 def _model_error(

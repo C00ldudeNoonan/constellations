@@ -17,6 +17,7 @@ from dbt_ml.config.model import ExtractionConfig, ModelConfig
 from dbt_ml.config.project import ProjectConfig
 from dbt_ml.config.source import SourceConfig
 from dbt_ml.execution.extraction import _extract_batched
+from dbt_ml.manifest import write_manifest
 from dbt_ml.post_extract import PostExtractError, load_post_extract
 from dbt_ml.runner import run_project
 from dbt_ml.sources import DocumentRef, DocumentSource, SourceScan
@@ -162,6 +163,94 @@ models:
         run_project(tmp_path)
 
     assert not discovered
+
+
+def test_hook_validation_failure_severs_sensitive_exception_chain(
+    tmp_path: Path,
+) -> None:
+    sensitive_prompt = "private-hook-prompt-that-must-not-survive"
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: p\nsource-paths: [sources]\nmodel-paths: [models]\n"
+    )
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models" / "raw.yml").write_text(
+        f"""version: 2
+models:
+  - name: raw_docs
+    source: ref('docs')
+    extraction:
+      backend: json
+      post_extract:
+        module: post_extract.derive
+        options:
+          prompt: {sensitive_prompt}
+"""
+    )
+    _write_hook(
+        tmp_path,
+        """
+def validate_options(options):
+    raise ValueError(options["prompt"])
+
+def run(fields):
+    return fields
+""".lstrip(),
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        run_project(tmp_path)
+
+    error = exc_info.value
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert sensitive_prompt not in str(error)
+    assert sensitive_prompt not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_manifest_omits_sensitive_hook_options(tmp_path: Path) -> None:
+    sensitive_prompt = "private-manifest-hook-prompt"
+    credential_reference = "PRIVATE_HOOK_CREDENTIAL_ENV"
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_ml_project.yml").write_text(
+        "name: p\nsource-paths: [sources]\nmodel-paths: [models]\n"
+    )
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models" / "raw.yml").write_text(
+        f"""version: 2
+models:
+  - name: raw_docs
+    source: ref('docs')
+    extraction:
+      backend: json
+      post_extract:
+        module: post_extract.derive
+        options:
+          prompt: {sensitive_prompt}
+          api_key_env: {credential_reference}
+"""
+    )
+    _write_hook(tmp_path, "def run(fields):\n    return fields\n")
+
+    manifest_path = write_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    model = next(item for item in manifest["models"] if item["name"] == "raw_docs")
+    serialized = manifest_path.read_text()
+
+    assert model["extraction"]["post_extract"] == {
+        "module": "post_extract.derive"
+    }
+    assert sensitive_prompt not in serialized
+    assert credential_reference not in serialized
 
 
 class _BatchSource(DocumentSource):

@@ -13,6 +13,9 @@
   and native-batch extraction while verified snapshots still exist, participate
   in incremental `code_version`, preserve backend warnings/metrics, and sanitize
   failures that might otherwise reveal raw document content.
+- Generated manifests omit `post_extract.options`, and compiler diagnostics for
+  module/option validation failures use a stable message with the unsafe
+  exception chain severed.
 
 ## v0.6.0 - 2026-08-07
 

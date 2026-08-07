@@ -44,7 +44,7 @@ Use this ownership map. Do not solve a problem by adding an integration-specific
 - Advance state only after successful publication. Make failure/retry behavior explicit; do not claim atomicity beyond the active adapter's documented capability.
 - Canonicalize aliases before deriving state scope, cache identity, or lock names. Ensure locks are shared across the deployment boundary their capability claims to protect; expose configuration when a shared mount is required.
 - Bound scratch space and release fetched/staged resources per item or batch. Sweep only dbt-ml-owned stale artifacts using a narrow, verifiable predicate.
-- For `post_extract`, apply the hook to ordinary and native-batch successes while the verified snapshot still exists and before row construction. The returned mapping is the publication boundary: preserve backend warnings/metrics outside it, sanitize hook failures, and include hook source/options in incremental code identity.
+- For `post_extract`, apply the hook to ordinary and native-batch successes while the verified snapshot still exists and before row construction. The returned mapping is the publication boundary: preserve backend warnings/metrics outside it, sanitize hook failures, omit hook options from artifacts, sever validation exception chains, and include hook source/options in incremental code identity.
 
 ### Data and CLI behavior
 

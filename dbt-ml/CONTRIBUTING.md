@@ -62,6 +62,8 @@ model YAML and the matching `.py` file inside the project.
    `source_metadata`, and configured `options` carry safe execution context.
 4. Expose `validate_options(options) -> None` when the hook takes options. The
    compiler calls it before source discovery, credentials, or warehouse access.
+   Option values affect incremental code identity but are omitted from generated
+   manifests; validation failures surface only a stable, value-free diagnostic.
 5. Keep imports needed only by the hook lazy and document the required dbt-ml
    extra. The hook is trusted project code, not a sandbox or provider boundary.
 6. Test that the raw input field is absent from the materialized schema, hook

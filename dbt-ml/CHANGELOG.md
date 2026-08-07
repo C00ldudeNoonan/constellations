@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.6.0 - 2026-08-07
+
+### Cloud object-store retrieval stores (issue #271)
+
+- The `lancedb` retrieval store's `path` now accepts a cloud object-store URI
+  (`s3://`, `gs://`, `az://`, plus `s3a`/`gcs`/`abfs`/`abfss` aliases) as well as
+  a local path, so a `search:` index can be shared between the machine that runs
+  `dbt-ml build` and the machines that serve it (MCP server, search API) instead
+  of being pinned to one local disk. A cloud path bypasses project-relative
+  resolution and the local `mkdir`, and flows straight to `lancedb.connect()`.
+- Cloud credentials follow the repository's reference contract. `storage_options`
+  carries non-secret routing only (region, endpoint, …) and is part of the
+  store's physical identity, so a changed endpoint yields a distinct safe target
+  and state scope; secret-looking keys are rejected. Secrets are supplied through
+  `storage_options_env`, a map of option key to environment-variable *name* that
+  is redacted from every dump and resolved to its value only at
+  `lancedb.connect()`, never stored or fingerprinted.
+- Equivalent URI spellings (`s3://`≡`s3a://`, `gs://`≡`gcs://`, trailing slashes)
+  canonicalize to one physical target for both the store identity and the
+  publisher lock. Local-store identities are unchanged (byte-identical
+  fingerprint), so existing state scopes keep resolving.
+- The single-host publisher lock, which has no local disk to live on for a cloud
+  store, defaults to a fixed per-machine directory (not a `TMPDIR`-derived path,
+  which varies per process/container). Deployments whose publishers run in
+  separate mount namespaces set `publisher_lock_dir` to a shared volume. The
+  single-host boundary is unchanged: cross-host publication still requires the
+  reserved provider-enforced fencing capability.
+
+### Progress output for long-running builds (issue #268)
+
+- `dbt-ml run` and `dbt-ml build` accept `-v` (also `DBT_ML_VERBOSE=1` for
+  orchestrated runs) to emit per-source discovery counts, per-model start/finish
+  lines, and a live per-model progress bar on a TTY. Non-TTY stderr (e.g. a
+  Dagster capture) gets the same events as plain INFO log lines. Default output
+  is unchanged, and all progress goes to stderr so `--json` on stdout stays a
+  single parseable payload.
+- Exactly one verbose channel is active at a time (bar *or* log lines), so the
+  bar is never corrupted by overlapping log records and events are not
+  double-printed. `run --threads N` uses the log-line channel even on a TTY,
+  since parallel per-model bars on one terminal would interleave. With
+  `--source-filter`, the reported per-source count is the post-filter selected
+  count, so it reflects what is actually processed.
+- Verbose is deliberately capped at INFO; DEBUG-level log sites carry
+  unsanitized exception text and are not exposed through the flag.
+
+### Runtime partitioned extraction: `--source-filter` (issue #266)
+
+- `dbt-ml run`/`build` accept a repeatable `--source-filter GLOB` to process only
+  source documents whose relative path matches a glob (e.g. `--source-filter
+  'AAPL/*'`), for partitioned or backfill runs over a large corpus. A filtered
+  run is additive/upsert-only: it never deletes and cannot be combined with
+  `--full-refresh`.
+
+### Provider retry classification (issues #258, #263)
+
+- Inference provider errors now preserve the underlying HTTP status so the
+  runner can distinguish retryable (429/5xx) from permanent (4xx) failures
+  instead of treating every provider error alike.
+- Anthropic native-batch failures now carry the same retry-vs-permanent
+  classification rather than surfacing unclassified.
+
+### BigQuery incremental state at scale (issues #256, #260)
+
+- The BigQuery adapter's state and child-row methods no longer pass the full
+  key/record set as unbounded array query parameters, which failed at scale (a
+  ~75k-record corpus). `_merge_state`, `replace_children`,
+  `delete_rows_and_state`, `delete_rows`, `delete_state`, and
+  `_fetch_state_subset` now either batch by a bounded request size or stage the
+  keys/records into a temp table referenced inside the single transaction, so
+  the atomic multi-statement guarantees (#229) are preserved.
+
+### 3D concept cloud (issue #255)
+
+- Added an end-to-end proof-of-concept that renders a 3D concept cloud over the
+  dbt DAG (milestones 1–3).
+
+### Reliability and safety fixes
+
+- Harden GCS source error handling and resource cleanup, mapping SDK errors to
+  concise, response-body-free messages that surface the HTTP status (#265).
+- Keep raw warehouse text out of SQL-model error messages (#262).
+- Preserve the sanitized exception cause on generic snapshot/credential adapter
+  failures instead of dropping the chain (#261).
+- Bound and self-heal fetch-staging disk usage during extraction so a large or
+  interrupted run cannot leave unbounded scratch behind (#273).
+
 ## v0.5.0 - 2026-08-04
 
 ### Complete the data-quality checks: chi-squared, golden sets, LLM-judge (issue #10)

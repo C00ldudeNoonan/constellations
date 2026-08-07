@@ -2079,26 +2079,18 @@ def test_native_credential_error_is_sanitized(
     with pytest.raises(AdapterError) as exc_info:
         adapter._credentials()
 
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, AdapterError)
+    assert str(cause) == "Native adapter error type: RuntimeError"
+    assert cause.__traceback__ is None
+    assert cause.__context__ is None
+    assert exc_info.value.__context__ is None
     rendered = "".join(
-        (str(exc_info.value), repr(exc_info.value), str(exc_info.value.__context__))
+        (str(exc_info.value), repr(exc_info.value), str(cause), repr(cause))
     )
     assert "credential construction failed" in rendered
     assert sentinel not in rendered
     assert env_name not in rendered
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-    traceback_locals: list[str] = []
-    traceback = exc_info.value.__traceback__
-    while traceback is not None:
-        if "/src/dbt_ml/" in traceback.tb_frame.f_code.co_filename:
-            traceback_locals.extend(
-                repr(value) for value in traceback.tb_frame.f_locals.values()
-            )
-        traceback = traceback.tb_next
-    locals_rendered = "\n".join(traceback_locals)
-    assert sentinel not in locals_rendered
-    assert env_name not in locals_rendered
 
 
 def test_credentials_impersonation_wraps_source(

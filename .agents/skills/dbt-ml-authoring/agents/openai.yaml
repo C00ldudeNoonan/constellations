@@ -1,0 +1,4 @@
+interface:
+  display_name: "dbt-ml Authoring"
+  short_description: "Author safe, testable dbt-ml data projects"
+  default_prompt: "Use $dbt-ml-authoring to create this dbt-ml pipeline."

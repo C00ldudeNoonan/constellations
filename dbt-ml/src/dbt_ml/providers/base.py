@@ -98,7 +98,17 @@ class ProviderResponseError(ProviderError):
 
 
 class ProviderBatchError(ProviderError):
-    pass
+    def __init__(
+        self,
+        message: str = "provider batch operation failed",
+        *,
+        safe_for_display: bool = False,
+        retryable: bool = False,
+    ) -> None:
+        if not isinstance(retryable, bool):
+            raise ValueError("retryable must be boolean")
+        self.retryable = retryable
+        super().__init__(message, safe_for_display=safe_for_display)
 
 
 _DEBUG_EXCEPTION_LABELS: dict[type[BaseException], str] = {
@@ -228,10 +238,15 @@ def _sanitized_provider_error(
         )
     if isinstance(error, ProviderBatchError):
         if error.safe_for_display:
-            return ProviderBatchError(str(error), safe_for_display=True)
+            return ProviderBatchError(
+                str(error),
+                safe_for_display=True,
+                retryable=error.retryable,
+            )
         return ProviderBatchError(
             f"{safe_provider} {safe_operation} failed",
             safe_for_display=True,
+            retryable=error.retryable,
         )
     return ProviderRequestError(
         safe_provider,
@@ -284,6 +299,28 @@ def provider_request_error(
             retryable=status in RETRYABLE_HTTP_STATUSES,
         )
     return ProviderRequestError(provider, operation, code=type(error).__name__)
+
+
+def provider_batch_error(
+    provider: str, operation: str, error: BaseException
+) -> ProviderBatchError:
+    """Wrap an unexpected batch SDK error without retaining provider text.
+
+    When the SDK exposes an HTTP status, use the shared transient-status policy
+    to let callers distinguish retryable batch interruptions from permanent
+    failures. Errors without a status remain non-retryable.
+    """
+    status = http_status_of(error)
+    safe_provider = _safe_error_label(provider, fallback="provider")
+    safe_operation = _safe_error_label(operation, fallback="batch operation")
+    code = _safe_error_code(type(error).__name__)
+    return ProviderBatchError(
+        f"{safe_provider} {safe_operation} failed [{code}]",
+        safe_for_display=True,
+        retryable=(
+            status is not None and status in RETRYABLE_HTTP_STATUSES
+        ),
+    )
 
 
 ProviderCredential = ProtectedCredential

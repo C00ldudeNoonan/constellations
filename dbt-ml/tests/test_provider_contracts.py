@@ -745,6 +745,11 @@ def test_request_error_rejects_unsafe_provider_error_text() -> None:
             code="safe",
             retryable=cast(Any, 1),
         )
+    with pytest.raises(ValueError, match="retryable must be boolean"):
+        ProviderBatchError(
+            "safe batch failure",
+            retryable=cast(Any, 1),
+        )
 
 
 def test_provider_boundary_replaces_unsafe_provider_error_text() -> None:

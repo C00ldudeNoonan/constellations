@@ -48,6 +48,7 @@ from ..config.project import ProjectConfig
 from ..dag import parse_ref
 from ..paths import resolve_within_project
 from ..profile import ResolvedProfile, resolve_llm_options
+from ..progress import get_reporter
 from ..providers import InferenceProvider, get_inference_provider
 from ..sources import DocumentRef, DocumentSource
 from ..versioning import compute_model_code_version
@@ -468,6 +469,10 @@ def run_extraction_model(
         return chunk_rows, chunk_records
 
     run_status: str | None = None
+    progress_task = get_reporter().model_task(
+        model.name, "extraction", total_docs
+    )
+    progress_task.__enter__()
     try:
         if budget_guard is not None and docs_to_process:
             budget_guard.charge_documents(len(docs_to_process))
@@ -575,6 +580,7 @@ def run_extraction_model(
                         chunk_rows, chunk_records = _rows_for_chunk(extracted)
                         full_state_records.extend(chunk_records)
                         docs_flushed += len(extracted)
+                        progress_task.advance(len(extracted))
                         if chunk_rows:
                             log.info(
                                 "staged %d rows (%d/%d docs) for %s",
@@ -608,6 +614,7 @@ def run_extraction_model(
                 for extracted in _iter_extracted():
                     chunk_rows, chunk_records = _rows_for_chunk(extracted)
                     docs_flushed += len(extracted)
+                    progress_task.advance(len(extracted))
                     if not chunk_rows:
                         continue
                     try:
@@ -660,6 +667,8 @@ def run_extraction_model(
     except BatchCancelledError as e:
         run_status = "cancelled"
         errors.append(f"BatchCancelledError: {e}")
+    finally:
+        progress_task.__exit__(None, None, None)
 
     if usage_totals and options.get("batch"):
         usage_totals["batch"] = True

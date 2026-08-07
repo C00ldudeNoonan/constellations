@@ -33,6 +33,7 @@ from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
+from .logging_setup import configure_verbose_logging, resolve_verbosity
 from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
@@ -42,6 +43,7 @@ from .profile import (
     resolve_llm_options,
     resolve_profile,
 )
+from .progress import configure_progress
 from .providers import (
     get_inference_provider,
 )
@@ -98,6 +100,38 @@ def _context_override(
         return value
 
     return callback
+
+
+def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
+    """``-v`` for progress output. Enables per-source discovery lines,
+    per-model start/finish lines, and a live progress bar on a TTY (non-TTY
+    stderr gets plain log lines instead). Also honored via ``DBT_ML_VERBOSE``.
+    Extra ``v``s are silently capped — verbose is always INFO-level; the flag
+    intentionally does not expose DEBUG."""
+    return click.option(
+        "-v",
+        "--verbose",
+        "verbose",
+        count=True,
+        help=(
+            "Enable progress output: per-source discovery, per-model "
+            "start/finish, and a TTY progress bar. Also honored via "
+            "DBT_ML_VERBOSE=1."
+        ),
+    )(command)
+
+
+def _enable_verbose_output(verbose_count: int) -> None:
+    """Install exactly one verbose channel — the TTY progress bar/reporter when
+    stderr is a TTY, otherwise the INFO log handler. Both share stderr, so
+    running them together would corrupt the ``click.progressbar`` redraws and
+    double-print discovery / model boundary events (once from the log call,
+    once from the reporter callback)."""
+    verbosity = resolve_verbosity(verbose_count)
+    if configure_progress(verbosity):
+        configure_verbose_logging(0)
+    else:
+        configure_verbose_logging(verbosity)
 
 
 def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
@@ -808,6 +842,7 @@ def _model_kind(model: ModelConfig) -> str:
     is_flag=True,
     help="Print the run_results.json payload to stdout instead of the table.",
 )
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def run(
@@ -820,11 +855,13 @@ def run(
     state: Path | None,
     source_filter: tuple[str, ...],
     json_output: bool,
+    verbose: int,
 ) -> None:
     """Extract and materialize selected models into the configured warehouse."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    _enable_verbose_output(verbose)
 
     if watch:
         _run_watch(
@@ -1008,6 +1045,7 @@ def _usage_summary(
     is_flag=True,
     help="Print the run_results.json payload to stdout instead of the table.",
 )
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def build(
@@ -1020,12 +1058,14 @@ def build(
     state: Path | None,
     source_filter: tuple[str, ...],
     json_output: bool,
+    verbose: int,
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
     when an upstream model errors or fails a test."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    _enable_verbose_output(verbose)
     start = time.monotonic()
     try:
         result = build_project(

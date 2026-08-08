@@ -469,6 +469,14 @@ and traceback frames that the user-facing error path scrubs but a raw
 log stream would not — attach your own DEBUG handler if you need it for
 troubleshooting.
 
+Under verbose, each BigQuery incremental publication also logs safe
+telemetry (issue #292): the output relation, the BigQuery **job id**, bytes
+processed, and DML-affected row count. The job id lets you match dbt-ml's own
+jobs against BigQuery job history / `INFORMATION_SCHEMA.JOBS`, so many tiny
+dbt-ml flushes can be told apart from an overlapping orchestrator run. Only
+job-level statistics and the table name are logged — never SQL text or row
+values.
+
 ## Matrix model expansion (`for_each`)
 
 Declare `for_each` on any model to turn it into a template. dbt-ml expands

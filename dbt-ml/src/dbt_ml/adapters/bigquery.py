@@ -17,6 +17,7 @@ parameters, converted to BigQuery query parameters here.
 from __future__ import annotations
 
 import io
+import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime
@@ -82,10 +83,37 @@ from .base import (
 )
 from .registry import register
 
+log = logging.getLogger(__name__)
+
 _INSTALL_HINT = (
     "BigQuery support requires google-cloud-bigquery. "
     "Install it with: pip install 'dbt-ml[bigquery]'"
 )
+
+
+def _log_publication(
+    operation: str,
+    table_ref: str,
+    job: Any,
+    *,
+    key: str | None = None,
+) -> None:
+    """Emit safe, structured telemetry for one incremental publication job
+    (issue #292). The BigQuery job id, bytes processed, and DML-affected row
+    count let an operator match dbt-ml's own jobs against BigQuery job history
+    and INFORMATION_SCHEMA, distinguishing many tiny dbt-ml flushes from an
+    overlapping external orchestrator run. Only job-level statistics and the
+    output relation are logged — never SQL text or row values. Emitted at INFO
+    on the `dbt_ml` namespace, so it surfaces under `-v` / `DBT_ML_VERBOSE`."""
+    log.info(
+        "published %s: table=%s job_id=%s rows_affected=%s bytes_processed=%s%s",
+        operation,
+        table_ref,
+        getattr(job, "job_id", None),
+        getattr(job, "num_dml_affected_rows", None),
+        getattr(job, "total_bytes_processed", None),
+        f" key={key}" if key else "",
+    )
 
 
 _STATE_TABLE = "dbt_ml_state"
@@ -2075,6 +2103,9 @@ class BigQueryAdapter(WarehouseAdapter):
                     f"Incremental SQL model materialization for '{table}' "
                     f"failed [{type(e).__name__}]"
                 ) from e
+            _log_publication(
+                "incremental sql merge", self.table_ref(table), job, key=unique_key
+            )
             affected = int(job.num_dml_affected_rows or 0)
             job_metadata: dict[str, Any] = {}
             job_id = getattr(job, "job_id", None)
@@ -2318,11 +2349,17 @@ class BigQueryAdapter(WarehouseAdapter):
             self._load_parquet(staging, load_df, staging_config)
             if insert_overwrite:
                 assert layout is not None and layout.partition_by is not None
-                self._run_query(
+                job = self._run_query(
                     self._insert_overwrite_script(
                         table, staging, list(load_df.columns), layout.partition_by
                     ),
                     job_labels=job_labels,
+                )
+                _log_publication(
+                    "incremental insert_overwrite",
+                    self.table_ref(table),
+                    job,
+                    key=layout.partition_by.field,
                 )
             else:
                 final_columns = [*existing]
@@ -2355,7 +2392,7 @@ class BigQueryAdapter(WarehouseAdapter):
                         update_when_changed, self.quote_ident
                     )
                     when_matched = f"WHEN MATCHED AND ({changed}) THEN UPDATE SET"
-                self._run_query(
+                job = self._run_query(
                     f"MERGE {self.table_ref(table)} AS target "
                     f"USING {self.table_ref(staging)} AS source "
                     f"ON target.{self.quote_ident(key_col)} = "
@@ -2364,6 +2401,9 @@ class BigQueryAdapter(WarehouseAdapter):
                     f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
                     f"VALUES ({insert_values})",
                     job_labels=job_labels,
+                )
+                _log_publication(
+                    "incremental merge", self.table_ref(table), job, key=key_col
                 )
         except BaseException as error:
             try:

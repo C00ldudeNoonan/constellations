@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### `table_format: iceberg` for SQL models (issue #290)
+
+- SQL (`transform.type: sql`) models can now materialize a managed Iceberg
+  table, so a project can adopt Iceberg as a uniform storage policy without
+  carving out its SQL models with `warehouse_options: {inherit: false}`. Full
+  SQL materialization stages the query once, builds an explicit Iceberg
+  `CREATE TABLE` from its schema, and `INSERT…SELECT`s the rows across — the same
+  non-atomic drop → create → insert shape as the DataFrame Iceberg path, gated by
+  `iceberg_table_format`. The former compile-time rejection is removed; SQL
+  Iceberg models are now gated on the capability like any other Iceberg model.
+- The storage-format fail-fast from #289 now also covers SQL incremental models:
+  declaring Iceberg over an existing standard SQL-incremental target (or the
+  reverse) raises before staging or merging, naming `--full-refresh`.
+
 ### Security
 
 - Bump `pypdf` floor to `>=6.15.0` to clear CVE-2026-71852 and CVE-2026-71870

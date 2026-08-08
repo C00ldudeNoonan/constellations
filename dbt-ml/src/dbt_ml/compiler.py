@@ -258,16 +258,6 @@ def validate_warehouse_capabilities(
             if active_adapter is not None
             else model.warehouse_options.get("table_format") == "iceberg"
         )
-        if is_iceberg and model.transform is not None and model.transform.type == "sql":
-            # SQL models materialize through materialize_sql_full/_incremental,
-            # which do not honor table_format — accepting iceberg here would
-            # silently create an ordinary native table (issue #163).
-            raise _model_error(
-                model,
-                f"Model '{model.name}': `table_format: iceberg` is not supported "
-                "for SQL models; use a non-SQL model kind (extraction, transform, "
-                "embed, chunk) to materialize an Iceberg table.",
-            )
         if model.search is not None:
             required[WarehouseCapability.STREAMING_TABULAR_READS] = (
                 "bounded search-index publication reads"

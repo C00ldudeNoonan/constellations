@@ -150,7 +150,20 @@ def _bigquery_adapter_with_iceberg_defaults():
     return create_adapter(config)
 
 
-def test_capability_preflight_uses_effective_profile_defaults() -> None:
+def test_capability_preflight_uses_effective_profile_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The SQL model declares no table_format; the Iceberg format comes from the
+    # profile's warehouse_defaults. Stripping the Iceberg capability proves the
+    # effective default reached the preflight — the SQL model is now gated on
+    # ICEBERG_TABLE_FORMAT (issue #290: no longer a SQL-specific rejection) — and
+    # `inherit: false` opts back out to a plain table.
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ICEBERG_TABLE_FORMAT,
+    }
+    monkeypatch.setattr(
+        "dbt_ml.compiler.adapter_capabilities", lambda _adapter_type: available
+    )
     model = ModelConfig(
         name="sqlmod",
         materialization="full",
@@ -158,7 +171,7 @@ def test_capability_preflight_uses_effective_profile_defaults() -> None:
     )
     adapter = _bigquery_adapter_with_iceberg_defaults()
 
-    with pytest.raises(ConfigError, match="not supported for SQL models"):
+    with pytest.raises(ConfigError, match="iceberg_table_format"):
         validate_warehouse_capabilities([model], adapter)
 
     model.warehouse_options = {"inherit": False}
@@ -176,21 +189,24 @@ def test_capability_preflight_rejects_invalid_effective_options() -> None:
         )
 
 
-def test_iceberg_rejected_for_sql_models() -> None:
-    # SQL models materialize via materialize_sql_full, which ignores table_format,
-    # so iceberg must be rejected at compile rather than silently creating a
-    # native table.
-    model = ModelConfig(
-        name="sqlmod",
-        materialization="full",
-        transform={"type": "sql", "path": "models/sqlmod.sql"},
-        warehouse_options={
-            "table_format": "iceberg",
-            "storage_uri": "gs://b/t",
-            "connection": "p.us.c",
-        },
-    )
-    with pytest.raises(ConfigError, match="not supported for SQL models"):
+def test_iceberg_accepted_for_sql_models_on_bigquery() -> None:
+    # issue #290: SQL models now materialize Iceberg via
+    # _materialize_sql_full_iceberg, so a compile against an Iceberg-capable
+    # adapter passes instead of raising the old SQL-specific rejection. It is
+    # gated on the ICEBERG_TABLE_FORMAT capability like any other Iceberg model
+    # (covered by test_capability_preflight_requires_iceberg_capability).
+    for materialization in ("full", "incremental"):
+        model = ModelConfig(
+            name="sqlmod",
+            materialization=materialization,
+            unique_key="id" if materialization == "incremental" else None,
+            transform={"type": "sql", "path": "models/sqlmod.sql"},
+            warehouse_options={
+                "table_format": "iceberg",
+                "storage_uri": "gs://b/t",
+                "connection": "p.us.c",
+            },
+        )
         validate_warehouse_capabilities([model], "bigquery")
 
 

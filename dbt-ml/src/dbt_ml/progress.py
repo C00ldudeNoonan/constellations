@@ -38,6 +38,7 @@ class ProgressReporter(Protocol):
     def model_finished(
         self, model_name: str, rows: int, duration: float, status: str | None
     ) -> None: ...
+    def publication(self, message: str) -> None: ...
 
 
 class _NullTask:
@@ -66,6 +67,9 @@ class _NullReporter:
     def model_finished(
         self, model_name: str, rows: int, duration: float, status: str | None
     ) -> None:
+        return
+
+    def publication(self, message: str) -> None:
         return
 
 
@@ -135,6 +139,12 @@ class _TerminalReporter:
             f"[done]   {model_name}: {rows:,} row(s) in "
             f"{_format_duration(duration)}{status_suffix}"
         )
+
+    def publication(self, message: str) -> None:
+        # Detail line echoed above the active bar on the TTY channel, matching
+        # the log-channel telemetry so verbose runs see it regardless of which
+        # channel _enable_verbose_output selected (issue #292 review).
+        self._echo(f"[publish] {message}")
 
 
 def _format_duration(seconds: float) -> str:

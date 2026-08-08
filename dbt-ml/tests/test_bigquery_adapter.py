@@ -330,6 +330,35 @@ def test_incremental_merge_logs_safe_publication_telemetry(
     assert "'a'" not in line and "'b'" not in line
 
 
+def test_incremental_merge_telemetry_reaches_active_reporter() -> None:
+    # issue #292 review: on an interactive TTY, verbose output uses the progress
+    # reporter and the dbt_ml log handler is removed, so the telemetry must also
+    # reach the reporter — otherwise `run -v`/`build -v` show no job id.
+    from dbt_ml.progress import _NullReporter, set_reporter
+
+    received: list[str] = []
+
+    class _RecordingReporter(_NullReporter):
+        def publication(self, message: str) -> None:
+            received.append(message)
+
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    client.query_results = [_FakeJob(affected=1, job_id="job_z", total_bytes_processed=8)]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [1]})
+    set_reporter(_RecordingReporter())
+    try:
+        adapter.materialize_incremental("docs", df, key_col="document_id")
+    finally:
+        set_reporter(None)
+
+    assert len(received) == 1
+    assert "job_id=job_z" in received[0]
+    assert "table=`proj`.`ds`.`docs`" in received[0]
+    assert "MERGE" not in received[0]
+
+
 def test_incremental_sql_merge_logs_publication_telemetry(
     caplog: pytest.LogCaptureFixture, _fixed_staging_uuid
 ) -> None:

@@ -59,6 +59,10 @@ def configure_verbose_logging(verbosity: int) -> None:
         setattr(logger, _HANDLER_ATTR, None)
 
     if verbosity <= 0:
+        # Fully restore the default so disabling verbose leaves no lingering
+        # state — otherwise `propagate = False` (set below) would persist and
+        # silently drop `dbt_ml` records from any parent/root handler.
+        logger.propagate = True
         return
 
     handler = logging.StreamHandler(sys.stderr)

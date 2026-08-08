@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Security
+
+- Bump `pypdf` floor to `>=6.15.0` to clear CVE-2026-71852 and CVE-2026-71870
+  (fixed in 6.15.0).
+
 ### Fail fast on a BigQuery incremental storage-format mismatch (issue #289)
 
 - An `incremental` model that declares `table_format: iceberg` against a target

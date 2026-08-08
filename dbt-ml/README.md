@@ -886,6 +886,10 @@ Iceberg tables support neither `CREATE OR REPLACE` nor a truncating load, a
 atomic** (a failed run leaves the table empty and the next run repopulates it);
 this path is gated by the adapter's `iceberg_table_format` capability rather than
 `atomic_full_replace`. `incremental` models `MERGE`/`insert_overwrite` in place.
+Because an incremental merge cannot change a table's storage format, declaring
+`table_format: iceberg` against a target that already exists as a standard table
+(or the reverse) fails fast rather than silently leaving the format unchanged;
+`--full-refresh` rebuilds the table in the declared format (issue #289).
 Current limits: time partitioning only (no `int64` range), no `kms_key_name`, and
 BigQuery's unsupported Iceberg column types (`JSON`, `GEOGRAPHY`, `BIGNUMERIC`,
 `INTERVAL`) are rejected before any warehouse call.

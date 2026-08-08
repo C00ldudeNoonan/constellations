@@ -1621,6 +1621,8 @@ def test_incremental_iceberg_first_run_creates_then_appends() -> None:
 def test_incremental_iceberg_existing_table_merges() -> None:
     client = _FakeClient()
     client.tables["proj.ds.docs"] = ["document_id", "x"]
+    # An existing Iceberg target matching the declared format merges normally.
+    client.table_meta["proj.ds.docs"] = {"biglake_configuration": SimpleNamespace()}
     adapter = _adapter(client)
     df = pl.DataFrame({"document_id": ["a"], "x": [9]})
     adapter.materialize_incremental(
@@ -1635,6 +1637,7 @@ def test_incremental_iceberg_existing_table_merges() -> None:
 def test_incremental_iceberg_adds_columns_with_ddl() -> None:
     client = _FakeClient()
     client.tables["proj.ds.docs"] = ["document_id", "x"]
+    client.table_meta["proj.ds.docs"] = {"biglake_configuration": SimpleNamespace()}
     adapter = _adapter(client)
     df = pl.DataFrame({"document_id": ["a"], "x": [9], "y": ["new"]})
     adapter.materialize_incremental(
@@ -1647,6 +1650,52 @@ def test_incremental_iceberg_adds_columns_with_ddl() -> None:
 
     alter = next(q[0] for q in client.queries if q[0].startswith("ALTER TABLE"))
     assert alter == "ALTER TABLE `proj`.`ds`.`docs` ADD COLUMN `y` STRING"
+
+
+def test_incremental_iceberg_declared_but_target_is_standard_fails_fast() -> None:
+    # issue #289: declaring Iceberg against a pre-existing standard table used to
+    # silently keep writing to the standard table. It must fail fast, naming the
+    # fix, before any MERGE or load runs.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]  # no biglake meta = standard
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [9]})
+    with pytest.raises(
+        AdapterError,
+        match=r"exists as a standard table.*table_format: iceberg.*--full-refresh",
+    ):
+        adapter.materialize_incremental(
+            "docs", df, key_col="document_id", options=_parse_options(_ICEBERG)
+        )
+    assert client.queries == []
+    assert client.loads == []
+
+
+def test_incremental_standard_but_target_is_iceberg_fails_fast() -> None:
+    # The mirror drift: an Iceberg target with a config that no longer declares
+    # the format must not silently MERGE as if it were standard.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    client.table_meta["proj.ds.docs"] = {"biglake_configuration": SimpleNamespace()}
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [9]})
+    with pytest.raises(
+        AdapterError,
+        match=r"exists as an Iceberg table.*does not declare.*--full-refresh",
+    ):
+        adapter.materialize_incremental("docs", df, key_col="document_id")
+    assert client.queries == []
+    assert client.loads == []
+
+
+def test_incremental_standard_target_and_standard_config_still_merges() -> None:
+    # Matching (standard/standard) formats are unaffected by the guard.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [9]})
+    adapter.materialize_incremental("docs", df, key_col="document_id")
+    assert client.queries[-1][0].startswith("MERGE `proj`.`ds`.`docs` AS target")
 
 
 def test_materialize_full_iceberg_validates_schema_before_dropping() -> None:
@@ -1801,6 +1850,48 @@ def test_integration_update_when_changed_skips_unchanged_payload() -> None:
             ) == [("Z",)]
     finally:
         assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set DBT_ML_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_iceberg_declared_over_standard_target_fails_fast() -> None:
+    # issue #289 against real BigQuery: a real standard table must be detected as
+    # standard (via its actual metadata), so declaring Iceberg fails fast before
+    # any write rather than silently leaving the format unchanged. Needs no
+    # BigLake connection — the guard raises before the Iceberg path is reached.
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "dbt_ml_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, BigQueryAdapter)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "docs", pl.DataFrame({"document_id": ["a"], "x": [1]})
+            )
+            iceberg_opts = adapter.parse_warehouse_options(_ICEBERG, model_name="docs")
+            with pytest.raises(
+                AdapterError,
+                match=r"exists as a standard table.*--full-refresh",
+            ):
+                adapter.materialize_incremental(
+                    "docs",
+                    pl.DataFrame({"document_id": ["b"], "x": [2]}),
+                    key_col="document_id",
+                    options=iceberg_opts,
+                )
+            # The failed run neither wrote the new row nor changed the format.
+            assert adapter.rows(
+                f"SELECT document_id FROM {adapter.table_ref('docs')} "
+                "ORDER BY document_id"
+            ) == [("a",)]
+    finally:
         adapter._reset_storage_for_test()
 
 

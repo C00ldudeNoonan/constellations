@@ -1862,10 +1862,12 @@ class BigQueryAdapter(WarehouseAdapter):
         *,
         options: BaseModel | None = None,
     ) -> SqlMaterializationResult:
+        layout = self._layout(options)
+        if layout is not None and layout.table_format == "iceberg":
+            return self._materialize_sql_full_iceberg(table, select_sql, layout)
         # Pure DDL: a single CREATE OR REPLACE ... AS SELECT is atomic and,
         # unlike a load job, may also change the partition/cluster spec — so no
         # staging swap is needed. A failed statement leaves the target intact.
-        layout = self._layout(options)
         try:
             job = self._run_query(
                 f"CREATE OR REPLACE TABLE {self.table_ref(table)}"
@@ -1880,6 +1882,55 @@ class BigQueryAdapter(WarehouseAdapter):
                 f"SQL model materialization for '{table}' failed "
                 f"[{type(e).__name__}]"
             ) from e
+        num_rows = int(self.client.get_table(self._table_id(table)).num_rows or 0)
+        job_metadata: dict[str, Any] = {}
+        job_id = getattr(job, "job_id", None)
+        if job_id:
+            job_metadata["job_id"] = job_id
+        total_bytes = getattr(job, "total_bytes_processed", None)
+        if total_bytes is not None:
+            job_metadata["total_bytes_processed"] = total_bytes
+        return SqlMaterializationResult(
+            relation=self.table_ref(table),
+            rows_written=num_rows,
+            job_metadata=job_metadata,
+        )
+
+    def _materialize_sql_full_iceberg(
+        self, table: str, select_sql: str, layout: BigQueryWarehouseOptions
+    ) -> SqlMaterializationResult:
+        """Full SQL materialization into a managed Iceberg target (issue #290).
+        Iceberg supports neither CREATE OR REPLACE nor a truncating load, so the
+        query is staged once into a standard table, its schema drives an explicit
+        Iceberg CREATE TABLE, and the rows are INSERT…SELECTed across. Staging
+        once (rather than running select_sql inside INSERT) keeps a
+        nondeterministic query from producing a different rowset than the one the
+        schema was derived from. The drop→create→insert window is intentionally
+        not atomic — same tradeoff as the DataFrame Iceberg full path, gated by
+        ICEBERG_TABLE_FORMAT rather than ATOMIC_FULL_REPLACE."""
+        job_labels = layout.labels or None
+        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+        staging_ref = self.table_ref(staging)
+        try:
+            try:
+                self._run_query(f"CREATE TABLE {staging_ref} AS {select_sql}")
+            except Exception as e:
+                raise AdapterError(
+                    f"SQL model materialization for '{table}' failed "
+                    f"[{type(e).__name__}]"
+                ) from e
+            schema_df = self.query_df(f"SELECT * FROM {staging_ref} LIMIT 0")
+            # Build (and dtype-validate) the CREATE before dropping the target, so
+            # an unsupported Iceberg column type never destroys the last good table.
+            create_sql = self._iceberg_create_sql(table, schema_df, layout)
+            self.drop_table(table)
+            self._run_query(create_sql, job_labels=job_labels)
+            job = self._run_query(
+                f"INSERT INTO {self.table_ref(table)} SELECT * FROM {staging_ref}",
+                job_labels=job_labels,
+            )
+        finally:
+            self.drop_table(staging)
         num_rows = int(self.client.get_table(self._table_id(table)).num_rows or 0)
         job_metadata: dict[str, Any] = {}
         job_id = getattr(job, "job_id", None)
@@ -1920,6 +1971,20 @@ class BigQueryAdapter(WarehouseAdapter):
         options: BaseModel | None = None,
     ) -> SqlMaterializationResult:
         key = self.quote_ident(unique_key)
+        # Fail fast on a storage-format mismatch before staging anything (issue
+        # #289, now reachable for SQL models via #290): the MERGE writes in place
+        # regardless of the declared table_format, so an existing standard target
+        # under an iceberg config (or the reverse) would silently keep its format.
+        # --full-refresh routes through materialize_sql_full and rebuilds it.
+        existing_table = self._existing_table(table)
+        if existing_table is not None:
+            layout = self._layout(options)
+            self._check_incremental_format(
+                table,
+                existing_table,
+                declared_iceberg=layout is not None
+                and layout.table_format == "iceberg",
+            )
         # Materialize select_sql exactly once into a staging table, then
         # validate and merge that SAME rowset. Re-executing select_sql for the
         # key check and again inside the MERGE would let a nondeterministic

@@ -1749,6 +1749,58 @@ def test_full_chunks_iceberg_inserts_from_staging() -> None:
     assert "proj.ds.docs" in client.dropped
 
 
+def test_materialize_sql_full_iceberg_stages_creates_and_inserts() -> None:
+    # issue #290: a SQL model can materialize an Iceberg table. Iceberg supports
+    # neither CREATE OR REPLACE nor a truncating load, so the query is staged
+    # once, an explicit Iceberg CREATE is built from its schema, and the rows are
+    # INSERT…SELECTed across (drop → create → insert, non-atomic).
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["id", "x"]
+    client.table_meta["proj.ds.docs"] = {"num_rows": 1}
+    schema_df = pl.DataFrame(schema={"id": pl.String, "x": pl.Int64})
+
+    class _ArrowJob(_FakeJob):
+        def to_arrow(self) -> Any:
+            return schema_df.to_arrow()
+
+    # Query order: [0] CREATE staging AS SELECT, [1] the LIMIT 0 schema probe.
+    client.query_results.extend([_FakeJob(), _ArrowJob()])
+    adapter = _adapter(client)
+
+    result = adapter.materialize_sql_full(
+        "docs", "SELECT id, x FROM src", options=_parse_options(_ICEBERG)
+    )
+
+    assert client.queries[0][0].startswith(
+        "CREATE TABLE `proj`.`ds`.`dbt_ml_staging__docs__"
+    )
+    iceberg_create = next(
+        q[0] for q in client.queries if "table_format = 'ICEBERG'" in q[0]
+    )
+    assert iceberg_create.startswith("CREATE TABLE `proj`.`ds`.`docs` (")
+    insert = next(q[0] for q in client.queries if q[0].startswith("INSERT INTO"))
+    assert insert.startswith(
+        "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`dbt_ml_staging__docs__"
+    )
+    # Target dropped before recreate; staging always cleaned up.
+    assert "proj.ds.docs" in client.dropped
+    assert any("dbt_ml_staging__docs__" in d for d in client.dropped)
+    assert result.rows_written == 1
+
+
+def test_materialize_sql_full_standard_still_uses_create_or_replace() -> None:
+    # The non-Iceberg path is unchanged: a single atomic CREATE OR REPLACE.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["id"]
+    client.table_meta["proj.ds.docs"] = {"num_rows": 3}
+    adapter = _adapter(client)
+    adapter.materialize_sql_full("docs", "SELECT id FROM src")
+    assert client.queries[0][0].startswith(
+        "CREATE OR REPLACE TABLE `proj`.`ds`.`docs`"
+    )
+    assert not any("table_format = 'ICEBERG'" in q[0] for q in client.queries)
+
+
 # ─── optional integration (needs real GCP credentials) ─────────────────────
 
 _BQ_PROJECT = os.environ.get("DBT_ML_BQ_TEST_PROJECT")
@@ -2924,6 +2976,28 @@ def test_bigquery_materialize_sql_incremental_builds_merge(_fixed_staging_uuid) 
     assert "WHEN NOT MATCHED THEN INSERT (`id`, `v`) VALUES (S.`id`, S.`v`)" in merge_sql
     # The staging table is always dropped, success or failure.
     assert client.dropped == [_STAGING_ID]
+
+
+def test_bigquery_materialize_sql_incremental_fails_fast_on_format_mismatch(
+    _fixed_staging_uuid,
+) -> None:
+    # issue #290 + #289: declaring Iceberg on a SQL incremental model whose
+    # target already exists as a standard table must fail fast before staging
+    # anything, not silently MERGE and leave the format standard.
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]  # standard (no biglake meta)
+    adapter = _adapter(client)
+    with pytest.raises(
+        AdapterError, match=r"exists as a standard table.*--full-refresh"
+    ):
+        adapter.materialize_sql_incremental(
+            "tgt",
+            "SELECT id, v FROM src",
+            unique_key="id",
+            options=_parse_options(_ICEBERG),
+        )
+    assert client.queries == []  # raised before staging the query
+    assert client.dropped == []
 
 
 def test_bigquery_materialize_sql_incremental_rejects_bad_key(_fixed_staging_uuid) -> None:

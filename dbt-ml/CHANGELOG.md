@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fail fast on a BigQuery incremental storage-format mismatch (issue #289)
+
+- An `incremental` model that declares `table_format: iceberg` against a target
+  that already exists as a standard BigQuery table (or the reverse) no longer
+  writes silently through the standard MERGE path while leaving the stored
+  format unchanged. `materialize_incremental` now compares the declared format
+  against the target's actual `biglakeConfiguration` and raises before any
+  MERGE/load, naming the fix: re-run with `--full-refresh` to rebuild the table
+  in the declared format. Matching formats and fresh tables are unaffected.
+
 ## v0.7.0 - 2026-08-07
 
 ### Incremental change detection: `update_when_changed` (issue #281)

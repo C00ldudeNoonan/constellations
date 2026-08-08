@@ -2180,8 +2180,8 @@ class BigQueryAdapter(WarehouseAdapter):
         layout = self._layout(options)
         is_iceberg = layout is not None and layout.table_format == "iceberg"
 
-        existing = self._table_columns(table)
-        if existing is None:
+        existing_table = self._existing_table(table)
+        if existing_table is None:
             if is_iceberg:
                 assert layout is not None
                 self._create_iceberg_table(table, load_df, layout)
@@ -2196,6 +2196,16 @@ class BigQueryAdapter(WarehouseAdapter):
             self._apply_post_create_options(table, options)
             return df.height
 
+        # Fail fast on a storage-format mismatch (issue #289). An existing target
+        # is written through the standard MERGE/load path regardless of the
+        # declared `table_format`, so a config that declares Iceberg against a
+        # standard target (or vice versa) would silently leave the format
+        # unchanged and report success forever. Only --full-refresh (which routes
+        # through materialize_full → _iceberg_full_materialize) can change the
+        # stored format, so surface that instead of a silent no-op.
+        self._check_incremental_format(table, existing_table, declared_iceberg=is_iceberg)
+
+        existing = [f.name for f in existing_table.schema]
         if key_col not in existing:
             raise AdapterError(
                 f"Incremental target '{table}' is missing key column '{key_col}'"
@@ -2403,11 +2413,49 @@ class BigQueryAdapter(WarehouseAdapter):
         return total
 
     def _table_columns(self, table: str) -> list[str] | None:
+        bq_table = self._existing_table(table)
+        return None if bq_table is None else [f.name for f in bq_table.schema]
+
+    def _existing_table(self, table: str) -> Any | None:
+        """The target's BigQuery Table object, or None if it does not exist."""
         try:
-            bq_table = self.client.get_table(self._table_id(table))
+            return self.client.get_table(self._table_id(table))
         except _not_found_error():
             return None
-        return [f.name for f in bq_table.schema]
+
+    @staticmethod
+    def _table_is_iceberg(bq_table: Any) -> bool:
+        """Whether an existing target is actually stored as a managed Iceberg /
+        BigLake table. Derived from the target's real metadata, not the declared
+        config — the two can disagree (issue #289)."""
+        if getattr(bq_table, "biglake_configuration", None) is not None:
+            return True
+        properties = getattr(bq_table, "_properties", None)
+        return isinstance(properties, dict) and (
+            properties.get("biglakeConfiguration") is not None
+        )
+
+    def _check_incremental_format(
+        self, table: str, existing_table: Any, *, declared_iceberg: bool
+    ) -> None:
+        """Raise when the declared storage format disagrees with the existing
+        target's actual format (issue #289). Incremental publication cannot
+        change a table's format in place; --full-refresh rebuilds it."""
+        target_is_iceberg = self._table_is_iceberg(existing_table)
+        if target_is_iceberg == declared_iceberg:
+            return
+        if declared_iceberg:
+            raise AdapterError(
+                f"Incremental target '{table}' exists as a standard table but the "
+                "config declares `table_format: iceberg`. Re-run with "
+                "--full-refresh to rebuild it as Iceberg."
+            )
+        raise AdapterError(
+            f"Incremental target '{table}' exists as an Iceberg table but the "
+            "config does not declare `table_format: iceberg`. Re-run with "
+            "--full-refresh to rebuild it as a standard table, or add "
+            "`table_format: iceberg` to keep it as Iceberg."
+        )
 
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:
         if not keys or self._table_columns(table) is None:

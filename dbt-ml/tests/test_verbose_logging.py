@@ -149,6 +149,40 @@ def test_terminal_reporter_emits_source_and_finish_lines() -> None:
     assert "12,345" in text
 
 
+def test_terminal_reporter_defers_publication_during_active_bar() -> None:
+    # issue #292 review: publication telemetry fires per flush inside the live
+    # progress bar; echoing then would smear it. It must be buffered while the
+    # bar is active and flushed once the task exits.
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _FakeTTY()
+    reporter = _TerminalReporter(stream)
+    task = reporter.model_task("m", "extraction", 3)
+    with task:
+        reporter.publication("job_id=1")
+        reporter.publication("job_id=2")
+        # Nothing published to the stream while the bar is live.
+        assert "[publish]" not in stream.getvalue()
+    text = stream.getvalue()
+    # Flushed below the completed bar, in order.
+    assert "[publish] job_id=1" in text
+    assert "[publish] job_id=2" in text
+    assert text.index("job_id=1") < text.index("job_id=2")
+
+
+def test_terminal_reporter_publication_echoes_without_active_bar() -> None:
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _FakeTTY()
+    reporter = _TerminalReporter(stream)
+    reporter.publication("job_id=9")
+    assert "[publish] job_id=9" in stream.getvalue()
+
+
 def test_null_reporter_task_advances_no_op() -> None:
     task = _NullReporter().model_task("m", "extraction", 5)
     with task:

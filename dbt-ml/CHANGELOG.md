@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Safe BigQuery incremental-publication telemetry (issue #292)
+
+- Each BigQuery incremental publication (DataFrame `MERGE`/`insert_overwrite`
+  and SQL-model `MERGE`) now logs safe, structured telemetry at INFO: the output
+  relation, the BigQuery job id, bytes processed, and DML-affected row count.
+  The job id lets an operator match dbt-ml's own jobs against BigQuery job
+  history / `INFORMATION_SCHEMA.JOBS`, so many tiny dbt-ml flushes can be told
+  apart from an overlapping external orchestrator run. Only job-level statistics
+  and the table name are logged — never SQL text or row values. Surfaced under
+  `-v` / `DBT_ML_VERBOSE` like the rest of dbt-ml's progress output.
+
 ### `table_format: iceberg` for SQL models (issue #290)
 
 - SQL (`transform.type: sql`) models can now materialize a managed Iceberg

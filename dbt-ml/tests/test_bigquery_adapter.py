@@ -4,6 +4,7 @@ DBT_ML_BQ_TEST_PROJECT is set."""
 from __future__ import annotations
 
 import io
+import logging
 import os
 import pickle
 from datetime import UTC, datetime
@@ -140,9 +141,18 @@ class _FakeRow(tuple[Any, ...]):
 
 
 class _FakeJob:
-    def __init__(self, rows: list[tuple[Any, ...]] | None = None, affected: int | None = None):
+    def __init__(
+        self,
+        rows: list[tuple[Any, ...]] | None = None,
+        affected: int | None = None,
+        *,
+        job_id: str | None = None,
+        total_bytes_processed: int | None = None,
+    ):
         self._rows = [_FakeRow(r) for r in (rows or [])]
         self.num_dml_affected_rows = affected
+        self.job_id = job_id
+        self.total_bytes_processed = total_bytes_processed
         self.result_timeout: Any = "unset"
 
     def result(self, timeout: Any = None) -> list[_FakeRow]:
@@ -286,6 +296,94 @@ def test_incremental_upsert_uses_staging_merge() -> None:
     assert query_config is None
     assert len(client.loads) == 1
     assert client.dropped == [staging_id]
+
+
+def test_incremental_merge_logs_safe_publication_telemetry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # issue #292: each incremental publication logs its BigQuery job id, bytes
+    # processed, and DML-affected rows so an operator can match dbt-ml's own
+    # jobs against BigQuery job history and tell many tiny flushes apart from an
+    # overlapping orchestrator run. Only job stats + the output relation are
+    # logged — never SQL text or row values.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    job = _FakeJob(affected=2, job_id="job_abc123", total_bytes_processed=4096)
+    client.query_results = [job]  # answers the MERGE
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a", "b"], "x": [1, 2]})
+
+    with caplog.at_level(logging.INFO, logger="dbt_ml.adapters.bigquery"):
+        adapter.materialize_incremental("docs", df, key_col="document_id")
+
+    lines = [r.getMessage() for r in caplog.records if "published" in r.getMessage()]
+    assert len(lines) == 1
+    line = lines[0]
+    assert "table=`proj`.`ds`.`docs`" in line
+    assert "job_id=job_abc123" in line
+    assert "rows_affected=2" in line
+    assert "bytes_processed=4096" in line
+    assert "key=document_id" in line
+    # Safety: no SQL text or row values leak into the telemetry.
+    assert "MERGE" not in line
+    assert "SELECT" not in line
+    assert "'a'" not in line and "'b'" not in line
+
+
+def test_incremental_merge_telemetry_reaches_active_reporter() -> None:
+    # issue #292 review: on an interactive TTY, verbose output uses the progress
+    # reporter and the dbt_ml log handler is removed, so the telemetry must also
+    # reach the reporter — otherwise `run -v`/`build -v` show no job id.
+    from dbt_ml.progress import _NullReporter, set_reporter
+
+    received: list[str] = []
+
+    class _RecordingReporter(_NullReporter):
+        def publication(self, message: str) -> None:
+            received.append(message)
+
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    client.query_results = [_FakeJob(affected=1, job_id="job_z", total_bytes_processed=8)]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [1]})
+    set_reporter(_RecordingReporter())
+    try:
+        adapter.materialize_incremental("docs", df, key_col="document_id")
+    finally:
+        set_reporter(None)
+
+    assert len(received) == 1
+    assert "job_id=job_z" in received[0]
+    assert "table=`proj`.`ds`.`docs`" in received[0]
+    assert "MERGE" not in received[0]
+
+
+def test_incremental_sql_merge_logs_publication_telemetry(
+    caplog: pytest.LogCaptureFixture, _fixed_staging_uuid
+) -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]
+    _stage_schema(client, [("id", "INTEGER"), ("v", "STRING")])
+    merge_job = _FakeJob(affected=3, job_id="job_sql_9", total_bytes_processed=128)
+    client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging AS select_sql
+        _FakeJob(rows=[(0, 0)]),  # unique-key check
+        merge_job,  # the MERGE
+    ]
+    adapter = _adapter(client)
+
+    with caplog.at_level(logging.INFO, logger="dbt_ml.adapters.bigquery"):
+        adapter.materialize_sql_incremental(
+            "tgt", "SELECT id, v FROM src", unique_key="id"
+        )
+
+    lines = [r.getMessage() for r in caplog.records if "published" in r.getMessage()]
+    assert len(lines) == 1
+    assert "job_id=job_sql_9" in lines[0]
+    assert "bytes_processed=128" in lines[0]
+    assert "key=id" in lines[0]
+    assert "SELECT id, v FROM src" not in lines[0]
 
 
 def test_incremental_update_when_changed_guards_the_merge() -> None:

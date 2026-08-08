@@ -38,6 +38,7 @@ class ProgressReporter(Protocol):
     def model_finished(
         self, model_name: str, rows: int, duration: float, status: str | None
     ) -> None: ...
+    def publication(self, message: str) -> None: ...
 
 
 class _NullTask:
@@ -68,13 +69,25 @@ class _NullReporter:
     ) -> None:
         return
 
+    def publication(self, message: str) -> None:
+        return
+
 
 class _TerminalTask:
     """Wraps ``click.progressbar`` and skips the render entirely when total is 0
-    so an empty extraction doesn't leave a stale header on the screen."""
+    so an empty extraction doesn't leave a stale header on the screen. While the
+    bar is live it signals the reporter so per-flush detail lines (publication
+    telemetry) are deferred instead of smearing the partially rendered bar."""
 
-    def __init__(self, label: str, total: int, stream: TextIO) -> None:
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        stream: TextIO,
+        reporter: _TerminalReporter | None = None,
+    ) -> None:
         self._total = total
+        self._reporter = reporter
         self._bar: Any = None
         if total > 0:
             self._bar = click.progressbar(
@@ -95,6 +108,8 @@ class _TerminalTask:
         bar = self._bar
         if bar is not None:
             bar.__enter__()
+            if self._reporter is not None:
+                self._reporter._bar_started()
         return self
 
     def __exit__(
@@ -106,6 +121,8 @@ class _TerminalTask:
         bar = self._bar
         if bar is not None:
             bar.__exit__(exc_type, exc, tb)
+            if self._reporter is not None:
+                self._reporter._bar_finished()
 
 
 class _TerminalReporter:
@@ -114,9 +131,25 @@ class _TerminalReporter:
 
     def __init__(self, stream: TextIO) -> None:
         self._stream = stream
+        # A live per-model bar defers detail lines; >0 while one is active. Only
+        # one bar is ever active on this channel — verbose over multiple
+        # concurrent models (run --threads N) uses the log channel, not the
+        # reporter — so a single counter and buffer suffice.
+        self._bar_depth = 0
+        self._pending: list[str] = []
 
     def _echo(self, message: str) -> None:
         click.echo(message, file=self._stream)
+
+    def _bar_started(self) -> None:
+        self._bar_depth += 1
+
+    def _bar_finished(self) -> None:
+        self._bar_depth = max(0, self._bar_depth - 1)
+        if self._bar_depth == 0 and self._pending:
+            for message in self._pending:
+                self._echo(f"[publish] {message}")
+            self._pending.clear()
 
     def source_discovered(self, source_name: str, count: int) -> None:
         self._echo(f"[source] {source_name}: discovered {count:,} object(s)")
@@ -125,7 +158,7 @@ class _TerminalReporter:
         label = f"[{kind}] {model_name}"
         if total == 0:
             self._echo(f"{label}: 0 documents (nothing to process)")
-        return _TerminalTask(label, total, self._stream)
+        return _TerminalTask(label, total, self._stream, reporter=self)
 
     def model_finished(
         self, model_name: str, rows: int, duration: float, status: str | None
@@ -135,6 +168,16 @@ class _TerminalReporter:
             f"[done]   {model_name}: {rows:,} row(s) in "
             f"{_format_duration(duration)}{status_suffix}"
         )
+
+    def publication(self, message: str) -> None:
+        # Publication telemetry (issue #292) fires per flush, inside the model's
+        # live progress bar. click.echo does not clear/redraw the bar, so echoing
+        # now would smear it — buffer while a bar is active and flush the lines
+        # once the task exits; echo immediately when no bar is live.
+        if self._bar_depth > 0:
+            self._pending.append(message)
+        else:
+            self._echo(f"[publish] {message}")
 
 
 def _format_duration(seconds: float) -> str:

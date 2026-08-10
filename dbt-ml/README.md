@@ -830,25 +830,32 @@ natural fingerprint for extraction models. Leaving it unset keeps the
 always-overwrite behavior. It is a publication optimization, so it does
 not change `code_version` — enabling it never reprocesses documents.
 
-#### Bounding the incremental MERGE scan (`cluster_by` + `flush_every`)
+#### Reducing the incremental MERGE scan (clustering)
 
-`update_when_changed` bounds how much a MERGE *writes*; clustering bounds how
-much it *reads*. Each incremental flush issues one `MERGE` whose join can scan
-the whole target unless BigQuery can prune it. Clustering the target on the
-incremental/merge key lets BigQuery restrict the scan to the blocks holding the
-batch's keys, so a small flush against a large table reads far fewer bytes
-(issue #294). Declare it in `warehouse_options`, listing the model's key first:
+`update_when_changed` bounds how much a MERGE *writes*; clustering the target on
+the incremental/merge key can reduce how much it *reads*. Each incremental
+publication issues a `MERGE` joining the target to a staging table on the key;
+against a large target that join can scan a lot of data. Clustering the target
+on the merge key gives BigQuery's optimizer the option to prune that scan to the
+blocks holding the batch's keys (issue #294). Declare it in `warehouse_options`,
+listing the model's key first:
 
 ```yaml
   materialization: incremental          # keyed on document_id (chunk_id, …)
   warehouse_options:
-    cluster_by: [document_id]           # bounds the per-batch MERGE scan
+    cluster_by: [document_id]           # merge key first
   update_when_changed: [content_hash, code_version]
 ```
 
-The two compose: clustering keeps the read bounded, `update_when_changed` keeps
-the write bounded. Notes and boundaries:
+Notes and boundaries:
 
+- **Clustering helps the read; it is not a guaranteed bound.** dbt-ml emits a
+  column-to-column join (`ON target.key = source.key`), not a static
+  `WHERE key IN (…)` predicate, so pruning is an optimizer decision, not a
+  guarantee — a small batch can still scan more than its keys. Treat clustering
+  as a likely optimization and confirm the win with the bytes-processed
+  telemetry below rather than assuming it. `update_when_changed` (the write
+  side) composes with it.
 - **A layout change needs a rebuild.** Like all `warehouse_options`, `cluster_by`
   applies when the table is created; an existing table keeps its physical layout
   until `--full-refresh` rebuilds it. Adding or changing `cluster_by` on a table
@@ -859,16 +866,19 @@ the write bounded. Notes and boundaries:
   storage-format fail-fast — that guard fires only on an Iceberg-vs-standard
   mismatch, not on a partition/cluster change.
 - **`cluster_by` is a general layout knob.** dbt-ml does not force it to include
-  the merge key; cluster for your query patterns as well. It only bounds the
-  MERGE scan when the key is among the clustering columns (BigQuery prunes
-  left-to-right, so list the key first).
-- **Serializing external runs and sizing `flush_every` stay project
-  responsibilities.** Clustering and `update_when_changed` reduce per-flush cost,
-  but they do not coordinate overlapping orchestrator runs against the same
-  target, and they do not choose the flush size (`flush_every`, default 5000)
-  that determines how many MERGEs a run issues. The publication telemetry from
-  issue #292 (`-v` / `DBT_ML_VERBOSE`) surfaces each MERGE's job id and bytes so
-  you can size those against real cost.
+  the merge key; cluster for your query patterns as well. Pruning of the MERGE
+  scan is only possible when the key is among the clustering columns (BigQuery
+  prunes left-to-right, so list the key first).
+- **Run count and overlap stay project responsibilities.** For **extraction**
+  models, `flush_every` (default 5000) splits a run into flush-sized batches,
+  each issuing its own `MERGE`, so it governs how many MERGEs an extraction run
+  issues; other incremental kinds (`embed`, `llm`, SQL transforms) publish their
+  whole output in a single `MERGE` per run, and `chunk` models fully replace, so
+  `flush_every` does not apply to them. Neither clustering nor
+  `update_when_changed` coordinates overlapping orchestrator runs against the
+  same target. The publication telemetry from issue #292 (`-v` /
+  `DBT_ML_VERBOSE`) surfaces each MERGE's job id and bytes processed so you can
+  measure all of this against real cost.
 
 **BigLake managed Apache Iceberg tables** (issue #163) — set
 `table_format: iceberg` to store a model as Iceberg in Cloud Storage, queryable

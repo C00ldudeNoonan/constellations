@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Document clustering the BigQuery incremental key (issue #294)
+
+- Documented that clustering the target on the incremental/merge key can let
+  BigQuery prune the `MERGE` scan (the read side; `update_when_changed` bounds
+  the write side) — a likely optimizer optimization to measure, not a guarantee,
+  since dbt-ml emits a column-to-column join rather than a static key predicate.
+  Also pins the contract: a `cluster_by` change — like any `warehouse_options`
+  layout — is inert on an existing table until `--full-refresh` rebuilds it; a
+  layout change is not a storage-format change (so it never trips the #289
+  fail-fast); `flush_every` governs MERGE count for extraction models only; and
+  serializing external runs remains a project responsibility. Regression tests
+  lock in the incremental-path contract.
+
 ### Safe BigQuery incremental-publication telemetry (issue #292)
 
 - Each BigQuery incremental publication (DataFrame `MERGE`/`insert_overwrite`

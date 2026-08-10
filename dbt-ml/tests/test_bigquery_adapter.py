@@ -1796,6 +1796,44 @@ def test_incremental_standard_target_and_standard_config_still_merges() -> None:
     assert client.queries[-1][0].startswith("MERGE `proj`.`ds`.`docs` AS target")
 
 
+def test_incremental_cluster_by_is_inert_on_existing_target() -> None:
+    # issue #294: cluster_by on an existing incremental target is a layout knob,
+    # applied only at table creation. The MERGE path keeps the table's physical
+    # layout — no clustering DDL — until --full-refresh rebuilds it (the rebuild
+    # path applying CLUSTER BY is covered by
+    # test_materialize_full_applies_layout_and_replaces_atomically).
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [1]})
+    adapter.materialize_incremental(
+        "docs",
+        df,
+        key_col="document_id",
+        options=_parse_options({"cluster_by": ["document_id"]}),
+    )
+    assert any(q[0].startswith("MERGE `proj`.`ds`.`docs`") for q in client.queries)
+    assert not any("CLUSTER BY" in q[0] for q in client.queries)
+    assert not any(q[0].startswith("ALTER TABLE") for q in client.queries)
+
+
+def test_incremental_cluster_by_change_is_not_a_format_mismatch() -> None:
+    # issue #294 + #289: re-clustering a standard incremental target is a layout
+    # change, not a storage-format change, so it must not trip the #289
+    # format fail-fast — the MERGE proceeds normally.
+    client = _FakeClient()
+    client.tables["proj.ds.docs"] = ["document_id", "x"]  # standard table
+    adapter = _adapter(client)
+    df = pl.DataFrame({"document_id": ["a"], "x": [1]})
+    adapter.materialize_incremental(
+        "docs",
+        df,
+        key_col="document_id",
+        options=_parse_options({"cluster_by": ["document_id", "x"]}),
+    )
+    assert client.queries[-1][0].startswith("MERGE `proj`.`ds`.`docs`")
+
+
 def test_materialize_full_iceberg_validates_schema_before_dropping() -> None:
     # An unsupported dtype must fail before the existing target is dropped, so a
     # bad schema never destroys the last good table.

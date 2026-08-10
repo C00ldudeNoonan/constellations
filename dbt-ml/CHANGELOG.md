@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Document clustering the BigQuery incremental key (issue #294)
+
+- Documented that clustering the target on the incremental/merge key bounds the
+  per-batch `MERGE` scan (the read side; `update_when_changed` bounds the write
+  side), that a `cluster_by` change — like any `warehouse_options` layout — is
+  inert on an existing table until `--full-refresh` rebuilds it, that a layout
+  change is not a storage-format change (so it never trips the #289 fail-fast),
+  and that serializing external runs and sizing `flush_every` remain
+  project-level responsibilities. Regression tests lock in the incremental-path
+  contract.
+
 ### Safe BigQuery incremental-publication telemetry (issue #292)
 
 - Each BigQuery incremental publication (DataFrame `MERGE`/`insert_overwrite`

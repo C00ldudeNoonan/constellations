@@ -870,11 +870,12 @@ Notes and boundaries:
   scan is only possible when the key is among the clustering columns (BigQuery
   prunes left-to-right, so list the key first).
 - **Run count and overlap stay project responsibilities.** For **extraction**
-  models, `flush_every` (default 5000) splits a run into flush-sized batches,
-  each issuing its own `MERGE`, so it governs how many MERGEs an extraction run
-  issues; other incremental kinds (`embed`, `llm`, SQL transforms) publish their
-  whole output in a single `MERGE` per run, and `chunk` models fully replace, so
-  `flush_every` does not apply to them. Neither clustering nor
+  models, `flush_every` (default 5000) splits a run into flush-sized batches and
+  `publish_every` (default 1, issue #293) coalesces that many flushes per `MERGE`,
+  so together they govern how many MERGEs an extraction run issues; other
+  incremental kinds (`embed`, `llm`, SQL transforms) publish their whole output in
+  a single `MERGE` per run, and `chunk` models fully replace, so neither applies
+  to them. Neither clustering nor
   `update_when_changed` coordinates overlapping orchestrator runs against the
   same target. The publication telemetry from issue #292 (`-v` /
   `DBT_ML_VERBOSE`) surfaces each MERGE's job id and bytes processed so you can
@@ -1117,16 +1118,36 @@ Extraction streams rows to the warehouse every `flush_every` documents
   extraction:
     backend: html
     flush_every: 1000   # smaller = lower memory, finer crash recovery
+    publish_every: 20    # coalesce 20 flushes into one MERGE (issue #293)
   materialization: incremental
 ```
 
-Incremental writes are atomic per flush: DuckDB uses a transaction and
+Incremental writes are atomic per publication: DuckDB uses a transaction and
 BigQuery loads a unique staging table then executes one `MERGE`. Missing,
 NULL, or duplicate incremental keys are rejected before mutation. A killed
-run keeps successful earlier flushes and their state, and the re-run picks up
-the remainder. With BigQuery `append_new_columns`, schema addition happens
+run keeps successful earlier publications and their state, and the re-run picks
+up the remainder. With BigQuery `append_new_columns`, schema addition happens
 before the `MERGE`; a failed merge preserves all rows but can leave the new,
 nullable column in place.
+
+By default (`publish_every: 1`) every flush publishes on its own, so on
+BigQuery a run of many small flushes issues one billed `MERGE` per flush.
+`publish_every` coalesces that many flushes into a single upsert: chunks
+accumulate and one combined `MERGE` scans the target once instead of per
+flush, cutting BigQuery bytes billed roughly in proportion. It is a distinct
+lever from `flush_every` — `flush_every` bounds memory, `publish_every` bounds
+publication cost — so keep flushes small and raise `publish_every` to trade
+memory for fewer merges. Only flushes that share one schema coalesce: a
+schema-on-read model whose columns drift mid-run publishes at the boundary, so
+`on_schema_change` still applies exactly as it did per flush and a later flush's
+new column is never dropped — coalescing changes cadence, never output. The
+costs: peak resident rows grow to about `publish_every × flush_every`, and crash
+recovery is coarser — a crash or budget exhaustion with a partial buffer discards
+those unpublished flushes and re-extracts them next run (already-published
+batches always survive, and state never advances before publication). Like
+`flush_every`, changing `publish_every` never invalidates incremental state.
+Coordinating overlapping orchestrator runs against one target remains a project
+responsibility.
 
 Full models publish a unique staging table only after every document
 succeeds. A parser/backend error preserves the previous target and state.

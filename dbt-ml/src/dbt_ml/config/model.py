@@ -167,6 +167,14 @@ class ExtractionConfig(BaseModel):
     # memory and gives incremental runs per-flush crash recovery. Excluded
     # from code_version: it changes execution, never output content.
     flush_every: int = Field(default=5000, gt=0)
+    # Incremental publication coalesces this many flushes into one upsert (issue
+    # #293), so a run of many small flushes shares one warehouse MERGE instead of
+    # one per flush. `1` (default) publishes every flush, matching prior behavior.
+    # Higher values cut MERGE count (and BigQuery bytes billed) at the cost of
+    # ~publish_every× peak memory and coarser crash recovery — a partial buffer is
+    # discarded and re-extracted on the next run. Excluded from code_version like
+    # flush_every: it changes execution cadence, never output content.
+    publish_every: int = Field(default=1, gt=0)
 
     @classmethod
     def __get_pydantic_core_schema__(

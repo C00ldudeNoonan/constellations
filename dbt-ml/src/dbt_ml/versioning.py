@@ -102,7 +102,7 @@ def compute_code_version(
         "extraction": (
             dict(effective_extraction)
             if effective_extraction is not None
-            else extraction.model_dump(exclude={"flush_every"})
+            else extraction.model_dump(exclude={"flush_every", "publish_every"})
             if extraction
             else None
         ),

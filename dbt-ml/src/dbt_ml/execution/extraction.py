@@ -632,28 +632,49 @@ def run_extraction_model(
                 except AdapterError as e:
                     raise RunError(str(e)) from e
             else:
-                # Incremental: each flush upserts rows and its state immediately —
-                # a killed run keeps completed chunks, and the re-run skips them.
-                first_flush = True
-                for extracted in _iter_extracted():
-                    chunk_rows, chunk_records = _rows_for_chunk(extracted)
-                    docs_flushed += len(extracted)
-                    progress_task.advance(len(extracted))
-                    if not chunk_rows:
-                        continue
+                # Incremental: each flush upserts rows and advances its state.
+                # publish_every>1 coalesces that many flushes into one upsert
+                # (issue #293) so a run of many small flushes shares one warehouse
+                # MERGE. State advances only after a publication succeeds, so a
+                # crash or budget exhaustion with a partial buffer leaves those
+                # flushes unpublished and retryable; already-published batches
+                # stay. publish_every==1 buffers exactly one frame per publish, so
+                # the path is byte-for-byte the prior per-flush behavior.
+                publish_every = model.extraction.publish_every
+                buffered_frames: list[pl.DataFrame] = []
+                buffered_records: list[StateRecord] = []
+                buffered_flushes = 0
+                buffered_schema: dict[str, Any] | None = None
+                first_publication = True
+
+                def _publish() -> None:
+                    nonlocal rows_written, first_publication, buffered_flushes
+                    nonlocal buffered_schema
+                    if not buffered_frames:
+                        return
+                    combined = (
+                        buffered_frames[0]
+                        if len(buffered_frames) == 1
+                        # Every buffered frame shares one schema (see below), so a
+                        # plain vertical concat is exact — no column union or dtype
+                        # coercion is applied that a single flush would not have had.
+                        else pl.concat(buffered_frames)
+                    )
                     try:
                         rows_written += adapter.materialize_incremental(
                             model.name,
-                            _apply_extraction_contract(pl.DataFrame(chunk_rows), model),
+                            combined,
                             key_col="document_id",
                             # The model's policy governs run-over-run drift on the
-                            # first flush; later flushes union within-run drift,
-                            # matching what one whole-run DataFrame did.
+                            # first publication; later publications union within-run
+                            # drift, matching what the prior per-flush path did (it
+                            # applied the policy only to the first flush and
+                            # append_new_columns to every later one).
                             on_schema_change=(
                                 "append_new_columns"
-                                if first_flush and empty_incremental_target
+                                if first_publication and empty_incremental_target
                                 else model.on_schema_change
-                                if first_flush
+                                if first_publication
                                 else "append_new_columns"
                             ),
                             options=warehouse_opts,
@@ -663,15 +684,49 @@ def run_extraction_model(
                         # RunError so `build` fails this model and blocks
                         # descendants instead of aborting the whole invocation.
                         raise RunError(str(e)) from e
-                    first_flush = False
-                    adapter.upsert_state(state_scope, chunk_records)
+                    first_publication = False
+                    # State only after the merge lands (publish-then-state), so an
+                    # interrupted run never records unpublished documents.
+                    adapter.upsert_state(state_scope, buffered_records)
                     log.info(
-                        "flushed %d rows (%d/%d docs) for %s",
-                        len(chunk_rows),
+                        "published %d rows across %d flush(es) (%d/%d docs) for %s",
+                        combined.height,
+                        buffered_flushes,
                         docs_flushed,
                         total_docs,
                         model.name,
                     )
+                    buffered_frames.clear()
+                    buffered_records.clear()
+                    buffered_flushes = 0
+                    buffered_schema = None
+
+                for extracted in _iter_extracted():
+                    chunk_rows, chunk_records = _rows_for_chunk(extracted)
+                    docs_flushed += len(extracted)
+                    progress_task.advance(len(extracted))
+                    if not chunk_rows:
+                        continue
+                    frame = _apply_extraction_contract(pl.DataFrame(chunk_rows), model)
+                    frame_schema = dict(frame.schema)
+                    # Only coalesce flushes that share one schema. A schema-on-read
+                    # model can drift within a run; publishing at the boundary keeps
+                    # each publication uniform so `on_schema_change` applies exactly
+                    # as it did per flush — a later flush's new column is never
+                    # folded into (and dropped/failed by) the first publication's
+                    # policy, which would otherwise lose data under `ignore` (#293).
+                    if buffered_frames and frame_schema != buffered_schema:
+                        _publish()
+                    if not buffered_frames:
+                        buffered_schema = frame_schema
+                    buffered_frames.append(frame)
+                    buffered_records.extend(chunk_records)
+                    buffered_flushes += 1
+                    if buffered_flushes >= publish_every:
+                        _publish()
+                # Publish the trailing partial buffer on clean completion only; an
+                # exception leaves it unpublished (and thus retryable) by design.
+                _publish()
 
                 if not docs and model.name not in existing_tables:
                     try:

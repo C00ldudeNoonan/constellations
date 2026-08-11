@@ -194,6 +194,18 @@ def test_code_version_ignores_flush_every(tmp_path: Path) -> None:
     ) == compute_code_version(extraction=tuned, transform=None, project_dir=tmp_path)
 
 
+def test_code_version_ignores_publish_every(tmp_path: Path) -> None:
+    """publish_every shapes publication cadence, not output — changing it must
+    not invalidate incremental state (issue #293)."""
+    base = ExtractionConfig(backend="json", options={"fields": ["a"]})
+    tuned = ExtractionConfig(
+        backend="json", options={"fields": ["a"]}, publish_every=8
+    )
+    assert compute_code_version(
+        extraction=base, transform=None, project_dir=tmp_path
+    ) == compute_code_version(extraction=tuned, transform=None, project_dir=tmp_path)
+
+
 def test_update_when_changed_does_not_change_model_code_version(
     tmp_path: Path,
 ) -> None:

@@ -265,6 +265,77 @@ def test_crash_mid_run_keeps_completed_flushes(
     assert _state_count(flushing_project, "raw_invoices") == 5
 
 
+def test_publish_every_coalesces_flushes(
+    monkeypatch: pytest.MonkeyPatch, flushing_project: Path
+) -> None:
+    """publish_every>1 shares one MERGE across that many flushes (issue #293):
+    5 docs at flush_every=2 still stream in 3 flushes but publish in 2 upserts
+    (flushes 1-2 coalesced, flush 3 trailing), and state advances per publish."""
+    raw = flushing_project / "models" / "raw_invoices.yml"
+    raw.write_text(
+        raw.read_text().replace(
+            "      flush_every: 2", "      flush_every: 2\n      publish_every: 2", 1
+        )
+    )
+
+    calls = {"n": 0}
+    orig = DuckDBAdapter.materialize_incremental
+
+    def spy(self: DuckDBAdapter, table: str, df: Any, **kwargs: Any) -> int:
+        calls["n"] += 1
+        return orig(self, table, df, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", spy)
+
+    r = run_project(flushing_project, select="raw_invoices")[0]
+    assert calls["n"] == 2, "3 flushes at publish_every=2 → 2 coalesced upserts"
+    assert r.rows_written == 5
+    assert _table_count(flushing_project, "raw_invoices") == 5
+    assert _state_count(flushing_project, "raw_invoices") == 5
+
+    # State advanced only for published docs: the second run skips all five.
+    assert run_project(flushing_project, select="raw_invoices")[0].documents_skipped == 5
+
+
+def test_publish_every_crash_keeps_published_batch(
+    monkeypatch: pytest.MonkeyPatch, flushing_project: Path
+) -> None:
+    """A crash with a partial buffer discards only the unpublished flush; the
+    already-published (coalesced) batch and its state survive and the run stays
+    retryable — coarser than per-flush recovery but state-safe (issue #293)."""
+    raw = flushing_project / "models" / "raw_invoices.yml"
+    raw.write_text(
+        raw.read_text().replace(
+            "      flush_every: 2", "      flush_every: 2\n      publish_every: 2", 1
+        )
+    )
+
+    calls = {"n": 0}
+    orig = DuckDBAdapter.materialize_incremental
+
+    def failing(self: DuckDBAdapter, *args: Any, **kwargs: Any) -> int:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise AdapterError("simulated crash on second publication")
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", failing)
+    with pytest.raises(RunError, match="simulated crash"):
+        run_project(flushing_project, select="raw_invoices")
+
+    # Publication 1 coalesced flushes 1-2 (4 docs) — rows AND state survived;
+    # the buffered trailing flush was never published.
+    assert _table_count(flushing_project, "raw_invoices") == 4
+    assert _state_count(flushing_project, "raw_invoices") == 4
+
+    monkeypatch.undo()
+    r = run_project(flushing_project, select="raw_invoices")[0]
+    assert r.documents_skipped == 4
+    assert r.documents_processed == 1
+    assert _table_count(flushing_project, "raw_invoices") == 5
+    assert _state_count(flushing_project, "raw_invoices") == 5
+
+
 def test_full_materialization_streams_through_staging(
     monkeypatch: pytest.MonkeyPatch, flushing_project: Path
 ) -> None:

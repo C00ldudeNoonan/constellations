@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Coalesce small incremental flushes into one publication (issue #293)
+
+- Extraction models gain `extraction.publish_every` (default `1`), a flush
+  multiple that coalesces that many `flush_every`-sized flushes into a single
+  incremental upsert. On BigQuery this lets a run of many small flushes share one
+  `MERGE` — the combined batch scans the target once instead of once per flush,
+  cutting bytes billed roughly in proportion — while `flush_every` keeps its
+  memory-bounding role. It is generic: the executor buffers the contracted flush
+  frames and issues one combined `materialize_incremental`, so every adapter
+  benefits and the default (`1`, one frame per publish) is byte-for-byte the prior
+  per-flush path.
+- State advances only after a publication succeeds, so the invariant holds at the
+  coarser cadence: a crash or budget exhaustion with a partial buffer leaves those
+  flushes unpublished and retryable, and already-published batches survive. The
+  tradeoffs — peak memory grows to about `publish_every × flush_every`, and crash
+  recovery is coarser — are documented alongside the setting. `publish_every` is
+  excluded from `code_version` like `flush_every`: it changes execution cadence,
+  never output content.
+
 ### Document clustering the BigQuery incremental key (issue #294)
 
 - Documented that clustering the target on the incremental/merge key can let

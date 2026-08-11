@@ -711,6 +711,17 @@ def test_extraction_config_defers_backend_owned_option_names() -> None:
     assert defaulted_config.options == options
 
 
+def test_publish_every_defaults_to_one_and_rejects_non_positive() -> None:
+    """publish_every coalesces flushes into one upsert (issue #293); it defaults
+    to per-flush publication and must be a positive flush count."""
+    assert ExtractionConfig(backend="json").publish_every == 1
+    assert ExtractionConfig(backend="json", publish_every=20).publish_every == 20
+    with pytest.raises(ValidationError):
+        ExtractionConfig(backend="json", publish_every=0)
+    with pytest.raises(ValidationError):
+        ExtractionConfig(backend="json", publish_every=-1)
+
+
 def test_default_llm_model_is_protected_before_later_yaml_error(
     tmp_path: Path,
 ) -> None:

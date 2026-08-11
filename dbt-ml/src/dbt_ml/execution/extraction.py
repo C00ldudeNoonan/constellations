@@ -644,18 +644,21 @@ def run_extraction_model(
                 buffered_frames: list[pl.DataFrame] = []
                 buffered_records: list[StateRecord] = []
                 buffered_flushes = 0
+                buffered_schema: dict[str, Any] | None = None
                 first_publication = True
 
                 def _publish() -> None:
                     nonlocal rows_written, first_publication, buffered_flushes
+                    nonlocal buffered_schema
                     if not buffered_frames:
                         return
                     combined = (
                         buffered_frames[0]
                         if len(buffered_frames) == 1
-                        # Union intra-run schema/dtype drift across the coalesced
-                        # flushes, matching what one whole-run DataFrame gave.
-                        else pl.concat(buffered_frames, how="diagonal_relaxed")
+                        # Every buffered frame shares one schema (see below), so a
+                        # plain vertical concat is exact — no column union or dtype
+                        # coercion is applied that a single flush would not have had.
+                        else pl.concat(buffered_frames)
                     )
                     try:
                         rows_written += adapter.materialize_incremental(
@@ -664,7 +667,9 @@ def run_extraction_model(
                             key_col="document_id",
                             # The model's policy governs run-over-run drift on the
                             # first publication; later publications union within-run
-                            # drift, matching what one whole-run DataFrame did.
+                            # drift, matching what the prior per-flush path did (it
+                            # applied the policy only to the first flush and
+                            # append_new_columns to every later one).
                             on_schema_change=(
                                 "append_new_columns"
                                 if first_publication and empty_incremental_target
@@ -694,6 +699,7 @@ def run_extraction_model(
                     buffered_frames.clear()
                     buffered_records.clear()
                     buffered_flushes = 0
+                    buffered_schema = None
 
                 for extracted in _iter_extracted():
                     chunk_rows, chunk_records = _rows_for_chunk(extracted)
@@ -701,9 +707,19 @@ def run_extraction_model(
                     progress_task.advance(len(extracted))
                     if not chunk_rows:
                         continue
-                    buffered_frames.append(
-                        _apply_extraction_contract(pl.DataFrame(chunk_rows), model)
-                    )
+                    frame = _apply_extraction_contract(pl.DataFrame(chunk_rows), model)
+                    frame_schema = dict(frame.schema)
+                    # Only coalesce flushes that share one schema. A schema-on-read
+                    # model can drift within a run; publishing at the boundary keeps
+                    # each publication uniform so `on_schema_change` applies exactly
+                    # as it did per flush — a later flush's new column is never
+                    # folded into (and dropped/failed by) the first publication's
+                    # policy, which would otherwise lose data under `ignore` (#293).
+                    if buffered_frames and frame_schema != buffered_schema:
+                        _publish()
+                    if not buffered_frames:
+                        buffered_schema = frame_schema
+                    buffered_frames.append(frame)
                     buffered_records.extend(chunk_records)
                     buffered_flushes += 1
                     if buffered_flushes >= publish_every:

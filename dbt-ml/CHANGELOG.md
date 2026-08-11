@@ -15,11 +15,14 @@
   per-flush path.
 - State advances only after a publication succeeds, so the invariant holds at the
   coarser cadence: a crash or budget exhaustion with a partial buffer leaves those
-  flushes unpublished and retryable, and already-published batches survive. The
-  tradeoffs — peak memory grows to about `publish_every × flush_every`, and crash
-  recovery is coarser — are documented alongside the setting. `publish_every` is
-  excluded from `code_version` like `flush_every`: it changes execution cadence,
-  never output content.
+  flushes unpublished and retryable, and already-published batches survive. Only
+  same-schema flushes coalesce — a schema-on-read model whose columns drift mid-run
+  publishes at the boundary, so `on_schema_change` applies exactly as it did per
+  flush and a later flush's new column is never folded into (and dropped by) an
+  earlier publication's policy. The tradeoffs — peak memory grows to about
+  `publish_every × flush_every`, and crash recovery is coarser — are documented
+  alongside the setting. `publish_every` is excluded from `code_version` like
+  `flush_every`: it changes execution cadence, never output content.
 
 ### Document clustering the BigQuery incremental key (issue #294)
 

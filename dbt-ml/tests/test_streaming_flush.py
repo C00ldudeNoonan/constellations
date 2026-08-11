@@ -336,6 +336,83 @@ def test_publish_every_crash_keeps_published_batch(
     assert _state_count(flushing_project, "raw_invoices") == 5
 
 
+def test_publish_every_preserves_later_flush_schema_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, example_project_dir: Path
+) -> None:
+    """Coalescing must not fold a later flush's new column into the first
+    publication's `on_schema_change` policy (issue #293 review). A schema-on-read
+    model with `on_schema_change: ignore` that gains a column in a *later* flush
+    must still publish that column via `append_new_columns` — exactly as the
+    per-flush path did — instead of dropping it and advancing state (data loss).
+    The buffer is published at the schema boundary so each publication is uniform.
+    """
+    project = tmp_path / "drift_project"
+    shutil.copytree(
+        example_project_dir,
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    (project / "models" / "raw_invoices.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: raw_invoices\n"
+        "    source: ref('vendor_invoices')\n"
+        "    extraction:\n"
+        "      backend: json\n"
+        "      flush_every: 2\n"
+        "      publish_every: 10\n"
+        "    materialization: incremental\n"
+        "    on_schema_change: ignore\n"
+    )
+    docs = project / "data" / "invoices"
+    docs.mkdir(parents=True)
+    # document_id order follows the sorted relative path, so numeric prefixes fix
+    # flush grouping. Baseline run creates the target with schema {val}.
+    (docs / "01a.json").write_text('{"val": "a"}')
+    (docs / "02b.json").write_text('{"val": "b"}')
+    run_project(project, select="raw_invoices")
+
+    # Second run adds four new docs across two flushes: flush 1 = {03c, 04d}
+    # (schema {val}, matches the target), flush 2 = {05e, 06f} where 05e
+    # introduces `extra`. Coalescing them naively would subject `extra` to the
+    # first publication's `ignore` policy and drop it.
+    (docs / "03c.json").write_text('{"val": "c"}')
+    (docs / "04d.json").write_text('{"val": "d"}')
+    (docs / "05e.json").write_text('{"val": "e", "extra": "kept"}')
+    (docs / "06f.json").write_text('{"val": "f"}')
+
+    calls: list[tuple[list[str], str]] = []
+    orig = DuckDBAdapter.materialize_incremental
+
+    def spy(self: DuckDBAdapter, table: str, df: Any, **kwargs: Any) -> int:
+        calls.append((list(df.columns), str(kwargs.get("on_schema_change"))))
+        return orig(self, table, df, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", spy)
+    run_project(project, select="raw_invoices")
+
+    # Two publications split at the schema boundary: flush 1 under the model's
+    # `ignore` policy (no `extra`), then the drifting flush 2 under
+    # `append_new_columns` (carrying `extra`).
+    assert len(calls) == 2
+    assert "extra" not in calls[0][0] and calls[0][1] == "ignore"
+    assert "extra" in calls[1][0] and calls[1][1] == "append_new_columns"
+
+    # The later flush's column and value survive rather than being dropped.
+    assert "extra" in _table_types(project, "raw_invoices")
+    con = duckdb.connect(
+        str(project / "target" / "dbt_ml.duckdb"), read_only=True
+    )
+    try:
+        kept = con.execute(
+            'SELECT extra FROM "dbt_ml"."dbt_ml"."raw_invoices" WHERE val = ?',
+            ["e"],
+        ).fetchone()
+    finally:
+        con.close()
+    assert kept == ("kept",)
+
+
 def test_full_materialization_streams_through_staging(
     monkeypatch: pytest.MonkeyPatch, flushing_project: Path
 ) -> None:

@@ -1137,13 +1137,17 @@ accumulate and one combined `MERGE` scans the target once instead of per
 flush, cutting BigQuery bytes billed roughly in proportion. It is a distinct
 lever from `flush_every` — `flush_every` bounds memory, `publish_every` bounds
 publication cost — so keep flushes small and raise `publish_every` to trade
-memory for fewer merges. The costs: peak resident rows grow to about
-`publish_every × flush_every`, and crash recovery is coarser — a crash or
-budget exhaustion with a partial buffer discards those unpublished flushes and
-re-extracts them next run (already-published batches always survive, and state
-never advances before publication). Like `flush_every`, changing
-`publish_every` never invalidates incremental state. Coordinating overlapping
-orchestrator runs against one target remains a project responsibility.
+memory for fewer merges. Only flushes that share one schema coalesce: a
+schema-on-read model whose columns drift mid-run publishes at the boundary, so
+`on_schema_change` still applies exactly as it did per flush and a later flush's
+new column is never dropped — coalescing changes cadence, never output. The
+costs: peak resident rows grow to about `publish_every × flush_every`, and crash
+recovery is coarser — a crash or budget exhaustion with a partial buffer discards
+those unpublished flushes and re-extracts them next run (already-published
+batches always survive, and state never advances before publication). Like
+`flush_every`, changing `publish_every` never invalidates incremental state.
+Coordinating overlapping orchestrator runs against one target remains a project
+responsibility.
 
 Full models publish a unique staging table only after every document
 succeeds. A parser/backend error preserves the previous target and state.

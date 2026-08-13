@@ -98,8 +98,13 @@ write-up.
   shim, so dbt orders the dbt model first and `dbt docs` shows one lineage graph
   spanning both directions. These models run **only** in embedded mode — the
   standalone `dbt-ml run`/`build` rejects them, since only dbt can resolve the
-  ref. v1 is dbt_ref-only (one dbt-built table per transform; mixing with dbt-ml
-  `depends_on` is a follow-up).
+  ref. A `dbt_ref` transform may also declare `depends_on:` for additional
+  dbt-ml models in the same transform — see
+  [`examples/dbt_ref_roundtrip_dbt`](../dbt_ref_roundtrip_dbt) for a runnable
+  round trip proving the reverse direction end to end. One caveat: each
+  generated shim resolves `DBT_ML_PROJECT_DIR` as a single shared environment
+  variable, so today one `dbt build` can embed models from only **one**
+  dbt-ml project at a time.
 - **No dbt-ml-side incremental** in embedded mode; the LLM response cache still
   makes re-runs cheap under dbt full-refresh.
 - `DBT_ML_PROJECT_DIR` locates the colocated dbt-ml project because dbt-duckdb

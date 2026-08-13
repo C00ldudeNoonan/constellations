@@ -1,0 +1,7 @@
+version: 2
+
+sources:
+  - name: vendor_docs
+    description: "Synthetic per-vendor spend documents (JSON)"
+    path: "./data/vendors/"
+    file_pattern: "*.json"

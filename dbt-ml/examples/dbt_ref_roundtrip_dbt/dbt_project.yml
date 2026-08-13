@@ -1,0 +1,16 @@
+name: dbt_ref_roundtrip
+version: "0.1.0"
+config-version: 2
+
+profile: dbt_ref_roundtrip
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  dbt_ref_roundtrip:
+    marts:
+      +materialized: table

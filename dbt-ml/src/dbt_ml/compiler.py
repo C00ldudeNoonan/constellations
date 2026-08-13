@@ -565,11 +565,17 @@ def _validate_model_edges(
         # name dbt-ml models feeding the same transform — validated like any
         # other transform's below, since the dbt_ref alone already satisfies
         # "at least one input."
-        if model.transform is None:
+        if model.transform is None or model.transform.type != "python":
+            # SQL transforms execute via run_sql_model against warehouse-native
+            # relations (or the embedded CaptureAdapter's scratch database in
+            # dbt-duckdb mode); neither path resolves a dbt_ref/upstream frame
+            # the way run_transform_model's python-deps injection does, so this
+            # would compile but fail at dbt-build time (Codex review, #177).
             raise _model_error(
                 model,
                 f"{_kind_label(model)} model '{model.name}' may not use a "
-                "`dbt_ref(...)` source; it is supported only on transform models",
+                "`dbt_ref(...)` source; it is supported only on `type: python` "
+                "transform models",
                 ("source",),
             )
         assert model.source is not None

@@ -1286,8 +1286,29 @@ def test_dbt_ref_source_rejected_on_non_transform(tmp_path: Path) -> None:
     model = ModelConfig(
         name="raw", source="dbt_ref('vendor_dim')", extraction={"backend": "json"}
     )
-    with pytest.raises(ConfigError, match="only on transform models"):
+    with pytest.raises(ConfigError, match="only on `type: python` transform"):
         validate_project_contract(ProjectConfig(name="p"), [], [model], tmp_path)
+
+
+def test_dbt_ref_source_rejected_on_sql_transform(tmp_path: Path) -> None:
+    # run_sql_model resolves ref()s as warehouse-native (or CaptureAdapter
+    # scratch-database) relations, not injected upstream frames — a dbt_ref
+    # source would compile but fail at dbt-build time (Codex review, #177).
+    (tmp_path / "q.sql").write_text(
+        "select * from {{ ref('other') }}", encoding="utf-8"
+    )
+    other = ModelConfig(
+        name="other", source="ref('docs')", extraction={"backend": "json"}
+    )
+    model = ModelConfig(
+        name="enriched",
+        source="dbt_ref('vendor_dim')",
+        transform={"type": "sql", "path": "q.sql"},
+    )
+    with pytest.raises(ConfigError, match="only on `type: python` transform"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source("docs")], [other, model], tmp_path
+        )
 
 
 def test_dbt_ref_source_allows_additional_depends_on(tmp_path: Path) -> None:

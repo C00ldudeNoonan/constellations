@@ -557,24 +557,28 @@ def _validate_model_edges(
             "extraction/transform/ml/chunk/embed/llm/search",
         )
 
-    if model.source is not None and is_dbt_ref(model.source):
+    has_dbt_ref = model.source is not None and is_dbt_ref(model.source)
+    if has_dbt_ref:
         # A `dbt_ref('...')` source names a dbt-built table (reverse direction,
-        # #177). v1: transform-only, single input, resolved by dbt in embedded
-        # mode — never validated against the dbt-ml graph.
-        if model.transform is None:
+        # #177): transform-only, resolved by dbt in embedded mode, never
+        # validated against the dbt-ml graph. `depends_on:` may additionally
+        # name dbt-ml models feeding the same transform — validated like any
+        # other transform's below, since the dbt_ref alone already satisfies
+        # "at least one input."
+        if model.transform is None or model.transform.type != "python":
+            # SQL transforms execute via run_sql_model against warehouse-native
+            # relations (or the embedded CaptureAdapter's scratch database in
+            # dbt-duckdb mode); neither path resolves a dbt_ref/upstream frame
+            # the way run_transform_model's python-deps injection does, so this
+            # would compile but fail at dbt-build time (Codex review, #177).
             raise _model_error(
                 model,
                 f"{_kind_label(model)} model '{model.name}' may not use a "
-                "`dbt_ref(...)` source; it is supported only on transform models",
+                "`dbt_ref(...)` source; it is supported only on `type: python` "
+                "transform models",
                 ("source",),
             )
-        if model.depends_on is not None:
-            raise _model_error(
-                model,
-                f"Transform model '{model.name}' with a `dbt_ref(...)` source must "
-                "not also declare `depends_on:` (v1 reads a single dbt-built table)",
-                ("depends_on",),
-            )
+        assert model.source is not None
         target = parse_dbt_ref(model.source)
         if target in model_names or target in source_names or target in search_names:
             raise _model_error(
@@ -583,9 +587,7 @@ def _validate_model_edges(
                 "node; a dbt_ref must name a dbt-built table outside the dbt-ml graph",
                 ("source",),
             )
-        return
-
-    if model.extraction is not None:
+    elif model.extraction is not None:
         if not model.source:
             raise _model_error(
                 model,
@@ -613,8 +615,7 @@ def _validate_model_edges(
                 ("source",),
             )
         return
-
-    if model.source is not None:
+    elif model.source is not None:
         raise _model_error(
             model,
             f"{_kind_label(model)} model '{model.name}' must use `depends_on:`, "
@@ -629,7 +630,7 @@ def _validate_model_edges(
             f"Search resource '{model.name}' must declare exactly one `depends_on:` model",
             ("depends_on",),
         )
-    if model.transform is not None and not dependencies:
+    if model.transform is not None and not dependencies and not has_dbt_ref:
         raise _model_error(
             model,
             f"Transform model '{model.name}' must declare at least one `depends_on:` model",
@@ -897,15 +898,14 @@ def _validate_transform(model: ModelConfig, project_dir: Path) -> None:
             "valid dotted Python module path",
             ("transform", "module"),
         )
-    # A dbt_ref('...') source is the transform's single input (#177): it forms no
-    # dbt-ml DAG edge, but the module's declared_dependencies still name it, so it
-    # must be the dependency the contract is validated against.
-    if model.source is not None and is_dbt_ref(model.source):
-        declared_dependencies = [parse_dbt_ref(model.source)]
-    else:
-        declared_dependencies = [
-            parse_ref(dependency) for dependency in model.depends_on or []
-        ]
+    # A dbt_ref('...') source (#177) forms no dbt-ml DAG edge, but the module's
+    # declared_dependencies must still name it alongside any `depends_on:`
+    # dbt-ml models — run_transform_model resolves both into the same `deps`
+    # dict the transform receives, so the contract is validated against the
+    # union, not either alone.
+    declared_dependencies = (
+        [parse_dbt_ref(model.source)] if model.source and is_dbt_ref(model.source) else []
+    ) + [parse_ref(dependency) for dependency in model.depends_on or []]
     try:
         validate_transform_contract(
             transform.module,

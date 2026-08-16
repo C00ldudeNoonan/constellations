@@ -2263,6 +2263,13 @@ response cache all run locally. See
 [`examples/dbt_embed_duckdb`](examples/dbt_embed_duckdb) for a runnable
 three-level DAG (extraction → transforms → SQL mart).
 
+The direction can also reverse: a dbt-ml transform can declare
+`source: dbt_ref('<dbt_model>')` to read a **dbt-built** table back into dbt-ml
+— optionally alongside ordinary `depends_on:` dbt-ml models in the same
+transform — closing the loop in one `dbt build`. See
+[`examples/dbt_ref_roundtrip_dbt`](examples/dbt_ref_roundtrip_dbt) for a
+runnable dbt-ml → dbt → dbt-ml → dbt round trip.
+
 ## Concept cloud (visualization, proof of concept)
 
 `dbt-ml concept-cloud` renders extracted entities as an explorable 3D **concept

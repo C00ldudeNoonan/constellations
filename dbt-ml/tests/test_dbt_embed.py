@@ -239,3 +239,128 @@ def test_standalone_run_rejects_dbt_ref_models(dbt_ref_project: Path) -> None:
 
     with pytest.raises(RunError, match="embedded mode"):
         run_project(dbt_ref_project)
+
+
+# --- mixing a dbt_ref source with depends_on dbt-ml models (#177 follow-up) --
+
+
+@pytest.fixture
+def dbt_ref_mixed_project(tmp_path: Path) -> Path:
+    """Like `dbt_ref_project`, but `enriched_vendors` also `depends_on:` a
+    dbt-ml model (`region_lookup`), proving a transform can combine a
+    dbt-built input with dbt-ml inputs in the same model."""
+    proj = tmp_path / "dbt_ref_mixed_proj"
+    (proj / "models").mkdir(parents=True)
+    (proj / "sources").mkdir()
+    (proj / "transforms").mkdir()
+    (proj / "dbt_ml_project.yml").write_text(
+        "name: refproj\nversion: '0.1.0'\nprofile: refproj\n", encoding="utf-8"
+    )
+    (proj / "profiles.yml").write_text(
+        "refproj:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        "        path: ./target/db.duckdb\n"
+        "        schema: main\n",
+        encoding="utf-8",
+    )
+    (proj / "sources" / "region.yml").write_text(
+        "version: 2\nsources:\n  - name: region_data\n    path: './data/region/'\n",
+        encoding="utf-8",
+    )
+    (proj / "models" / "region_lookup.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: region_lookup\n"
+        "    source: ref('region_data')\n"
+        "    extraction:\n"
+        "      backend: json\n"
+        "    materialization: full\n",
+        encoding="utf-8",
+    )
+    (proj / "models" / "enriched_vendors.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: enriched_vendors\n"
+        "    source: dbt_ref('vendor_dim')\n"
+        "    depends_on: [ref('region_lookup')]\n"
+        "    materialization: full\n"
+        "    transform:\n"
+        "      type: python\n"
+        "      module: transforms.enrich\n"
+        "    fields:\n"
+        "      - {name: vendor, type: string}\n"
+        "      - {name: spend_doubled, type: float}\n"
+        "      - {name: region, type: string}\n",
+        encoding="utf-8",
+    )
+    (proj / "transforms" / "enrich.py").write_text(
+        "from __future__ import annotations\n\n"
+        "import polars as pl\n\n\n"
+        "def declared_dependencies(options):\n"
+        "    # Both the dbt_ref target and the depends_on model are declared:\n"
+        "    # run_transform_model resolves them into the same `deps` dict, so\n"
+        "    # the contract is validated against the union (#177 follow-up).\n"
+        "    return ('vendor_dim', 'region_lookup')\n\n\n"
+        "def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:\n"
+        "    vendor_dim = deps['vendor_dim']\n"
+        "    region = deps['region_lookup']\n"
+        "    return vendor_dim.with_columns(\n"
+        "        (pl.col('spend') * 2).alias('spend_doubled'),\n"
+        "        pl.lit(region['region'][0]).alias('region'),\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    return proj
+
+
+def test_dbt_ref_transform_with_depends_on_compiles(dbt_ref_mixed_project: Path) -> None:
+    from dbt_ml.compiler import validate_project_contract
+    from dbt_ml.config import load_project
+
+    project, sources, models = load_project(dbt_ref_mixed_project)
+    validate_project_contract(project, sources, models, dbt_ref_mixed_project)
+
+
+def test_dbt_ref_shim_combines_dbt_ref_and_depends_on_upstreams(
+    dbt_ref_mixed_project: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "gen"
+    generate_dbt_models(dbt_ref_mixed_project, out)
+    shim = (out / "enriched_vendors.py").read_text(encoding="utf-8")
+    assert "'vendor_dim': dbt.ref('vendor_dim').pl()," in shim
+    assert "'region_lookup': dbt.ref('region_lookup').pl()," in shim
+
+
+def test_materialize_dbt_ref_transform_with_extra_depends_on(
+    dbt_ref_mixed_project: Path,
+) -> None:
+    vendor_dim = pl.DataFrame({"vendor": ["Acme", "Globex"], "spend": [10.0, 7.0]})
+    region_lookup = pl.DataFrame({"region": ["EMEA"]})
+    result = materialize(
+        "enriched_vendors",
+        project_dir=dbt_ref_mixed_project,
+        upstreams={"vendor_dim": vendor_dim, "region_lookup": region_lookup},
+    )
+    rows = {r["vendor"]: r for r in result.to_dicts()}
+    assert rows["Acme"]["spend_doubled"] == pytest.approx(20.0)
+    assert rows["Acme"]["region"] == "EMEA"
+    assert rows["Globex"]["spend_doubled"] == pytest.approx(14.0)
+
+
+def test_dbt_ref_depends_on_target_must_exist(tmp_path: Path) -> None:
+    from dbt_ml.compiler import validate_project_contract
+    from dbt_ml.config import ConfigError
+    from dbt_ml.config.project import ProjectConfig
+
+    model = ModelConfig(
+        name="enriched",
+        source="dbt_ref('vendor_dim')",
+        depends_on=["ref('missing_model')"],
+        transform={"type": "python", "module": "transforms.enrich"},
+    )
+    with pytest.raises(ConfigError, match="unknown model"):
+        validate_project_contract(ProjectConfig(name="p"), [], [model], tmp_path)

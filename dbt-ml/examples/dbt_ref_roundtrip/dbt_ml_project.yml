@@ -1,0 +1,7 @@
+name: dbt_ref_roundtrip
+version: "0.1.0"
+profile: dbt_ref_roundtrip
+
+model-paths: ["models"]
+transform-paths: ["transforms"]
+target-path: "target"

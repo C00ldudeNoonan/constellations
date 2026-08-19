@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 # Fenced state replacement (WarehouseAdapter.replace_state_scope) verifies
 # claims against this same ledger, so the name is owned by adapters.base.
 LEDGER_TABLE = SERVING_LEDGER_TABLE
+# A third persisted warehouse table, owned here rather than by an adapter.
+# Frozen for the same reason as the names in adapters.base: renaming it strands
+# the live leases and every publisher loses sight of who holds what.
 LEASE_TABLE = "dbt_ml_serving_leases"
 
 STATUS_PUBLISHING = "publishing"

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 
 from ..adapters import WarehouseAdapter
+from ..adapters.base import TEST_FAILURES_TABLE_PREFIX
 
 if TYPE_CHECKING:
     from ..budget import BudgetLedger
@@ -177,10 +178,10 @@ def _slug(value: str) -> str:
 
 
 def _failures_table_name(model_name: str, test_name: str, column: str | None) -> str:
-    parts = ["dbt_ml_test_failures", _slug(model_name), _slug(test_name)]
+    parts = [_slug(model_name), _slug(test_name)]
     if column:
         parts.append(_slug(str(column)))
-    return "__".join(parts)
+    return TEST_FAILURES_TABLE_PREFIX + "__".join(parts)
 
 
 def _store(

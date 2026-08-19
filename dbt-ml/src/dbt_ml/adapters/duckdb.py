@@ -17,7 +17,9 @@ from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
 from ..sql_models import build_key_check_sql
 from .base import (
+    INTERNAL_TABLE_PREFIXES,
     SERVING_LEDGER_TABLE,
+    STAGING_TABLE_PREFIX,
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
@@ -48,9 +50,9 @@ from .base import (
     validate_state_records,
     validate_update_when_changed_columns,
 )
+from .base import STATE_TABLE as _STATE_TABLE
 from .registry import register
 
-_STATE_TABLE = "dbt_ml_state"
 _STATE_V1_COLUMNS = (
     ("model_name", "VARCHAR", "NO"),
     ("document_id", "VARCHAR", "NO"),
@@ -368,7 +370,7 @@ class DuckDBAdapter(WarehouseAdapter):
 
     def _migrate_v1_state(self) -> None:
         old_ref = f"{self.schema_ref}.{self.quote_ident(_STATE_TABLE)}"
-        migration_table = f"dbt_ml_staging__state_migration_v2__{uuid4().hex}"
+        migration_table = f"{STAGING_TABLE_PREFIX}state_migration_v2__{uuid4().hex}"
         migration_ref = f"{self.schema_ref}.{self.quote_ident(migration_table)}"
         with self._transaction():
             self.connection.execute(self._create_state_table_sql(migration_table))
@@ -696,7 +698,7 @@ class DuckDBAdapter(WarehouseAdapter):
         *,
         options: BaseModel | None = None,
     ) -> int:
-        staging = f"dbt_ml_staging__{table}__{uuid4().hex[:12]}"
+        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
         staging_ref = self.table_ref(staging)
         total = 0
         first = True
@@ -1102,19 +1104,14 @@ class DuckDBAdapter(WarehouseAdapter):
     def list_tables(self) -> list[str]:
         rows = self.connection.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_catalog = ? AND table_schema = ? AND table_name != 'dbt_ml_state' "
+            f"WHERE table_catalog = ? AND table_schema = ? AND table_name != '{_STATE_TABLE}' "
             "ORDER BY table_name",
             [self.catalog, self.schema],
         ).fetchall()
-        # `dbt_ml_test_failures__*` tables are --store-failures inspection
-        # artifacts and `dbt_ml_staging__*` are in-flight full loads (#77),
-        # not models; keep both out of the model namespace. (Filtered in
-        # Python because `_` is a LIKE wildcard in SQL.)
-        return [
-            r[0]
-            for r in rows
-            if not r[0].startswith(("dbt_ml_test_failures__", "dbt_ml_staging__"))
-        ]
+        # Test-failure and staging tables are dbt-ml internals, not models;
+        # keep both out of the model namespace. (Filtered in Python because
+        # `_` is a LIKE wildcard in SQL.)
+        return [r[0] for r in rows if not r[0].startswith(INTERNAL_TABLE_PREFIXES)]
 
     # ─── state CRUD ──────────────────────────────────────────────────────
 

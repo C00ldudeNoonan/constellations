@@ -26,6 +26,7 @@ from tempfile import mkdtemp
 from typing import Any, cast
 from uuid import uuid4
 
+from .._distribution import distribution_version
 from ..config.model import MLConfig, ModelConfig
 from ..config.project import ProjectConfig
 from ..hashing import HASH_DIGEST_SIZE
@@ -569,7 +570,7 @@ def _display_path(path: Path, project_dir: Path) -> str:
 def _runtime_versions(provider: str) -> dict[str, str]:
     return {
         "python": sys.version.split()[0],
-        "dbt_ml": _package_version("dbt-ml"),
+        "dbt_ml": distribution_version(),
         "polars": _package_version("polars"),
         "provider": provider,
     }

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .._distribution import distribution_version
 from ..budget import BudgetGuard
 from ..hashing import HASH_DIGEST_SIZE
 
@@ -80,14 +81,14 @@ class BaseBackend(ABC):
         """Parser identity recorded on every extracted row (issue #85), so a
         row can always be traced to the code that produced it. Backends built
         on a parsing library report that library's version."""
-        return f"dbt-ml/{_dbt_ml_version()}"
+        return f"dbt-ml/{distribution_version()}"
 
     def implementation_identity(self) -> str:
         """dbt-ml release and source identity for incremental invalidation."""
         backend_type = type(self)
         backend_module = inspect.getmodule(backend_type)
         payload = {
-            "dbt_ml_version": _dbt_ml_version(),
+            "dbt_ml_version": distribution_version(),
             "backend_class": f"{backend_type.__module__}.{backend_type.__qualname__}",
             "base_source": _source_digest(BaseBackend),
             "backend_class_source": _source_digest(backend_type),
@@ -102,15 +103,6 @@ class BaseBackend(ABC):
     def validate(self) -> None:
         """Raise if the backend's runtime deps are missing. Default: no-op."""
         return None
-
-
-def _dbt_ml_version() -> str:
-    from importlib.metadata import PackageNotFoundError, version
-
-    try:
-        return version("dbt-ml")
-    except PackageNotFoundError:
-        return "unknown"
 
 
 def _source_digest(obj: Any) -> str | None:

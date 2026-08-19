@@ -26,6 +26,7 @@ from dbt_ml.providers import (
     get_inference_provider,
     list_embedding_providers,
     list_inference_providers,
+    profile_options_fingerprint,
 )
 from dbt_ml.providers import vertex as vertex_module
 from dbt_ml.providers.vertex import (
@@ -680,6 +681,67 @@ def test_vertex_inference_folds_thinking_tokens_into_output_usage(
         runtime=ProviderRuntimeOptions(),
     )
     assert result.usage.output_tokens == 45
+    assert result.usage.thinking_tokens == 40
+
+
+def test_vertex_inference_thinking_budget_rejects_negative() -> None:
+    with pytest.raises(ProviderConfigurationError, match="rejected provider_options"):
+        _inference_provider(thinking_budget=-1)
+
+
+def test_vertex_inference_thinking_budget_participates_in_fingerprint() -> None:
+    default = _inference_provider()
+    explicit = _inference_provider(thinking_budget=1024)
+    assert profile_options_fingerprint(
+        default.profile_options
+    ) != profile_options_fingerprint(explicit.profile_options)
+
+
+def test_vertex_inference_defaults_thinking_budget_to_zero_for_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(_inference_response())
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+    schema = {"type": "object", "properties": {"relation_type": {"type": "string"}}}
+
+    _inference_provider().complete(
+        _inference_request(output_schema=schema),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+
+    assert fake.calls[0]["config"]["thinking_config"] == {"thinking_budget": 0}
+
+
+def test_vertex_inference_omits_thinking_config_without_declared_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(_inference_response())
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+
+    _inference_provider().complete(
+        _inference_request(),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+
+    assert "thinking_config" not in fake.calls[0]["config"]
+
+
+def test_vertex_inference_explicit_thinking_budget_overrides_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeInferenceGenAI(_inference_response())
+    monkeypatch.setattr(vertex_module, "_load_google_genai_inference", lambda: fake)
+    schema = {"type": "object", "properties": {"relation_type": {"type": "string"}}}
+
+    _inference_provider(thinking_budget=1024).complete(
+        _inference_request(output_schema=schema),
+        credential=None,
+        runtime=ProviderRuntimeOptions(),
+    )
+
+    assert fake.calls[0]["config"]["thinking_config"] == {"thinking_budget": 1024}
 
 
 def test_vertex_inference_billed_failure_includes_thinking_tokens(

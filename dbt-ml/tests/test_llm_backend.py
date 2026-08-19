@@ -718,6 +718,7 @@ def test_extract_with_usage_cache_hit_is_zero_tokens(tmp_path: Path) -> None:
         "output_tokens": 0,
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "thinking_tokens": 0,
     }
 
 

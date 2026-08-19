@@ -1380,7 +1380,12 @@ fan-out). The built-in `deterministic` provider runs offline for tests and
 examples; production providers implement the same `InferenceProvider`
 contract — `anthropic`, `vllm`, and `vertex` (Gemini models on Vertex AI via
 `google-genai`, ADC-only, selecting the GCP project and location under profile
-`llm:` configuration; install `dbt-ml[vertex]`). Manifest and run-results
+`llm:` configuration; install `dbt-ml[vertex]`). Gemini 2.5 models think by
+default and bill reasoning tokens as output on every row; `vertex` defaults
+`thinking_budget` to `0` whenever the model declares `fields:`, since a
+declared output schema is extraction, not open-ended reasoning. Set
+`provider_options: {thinking_budget: N}` to opt back into a reasoning budget.
+Manifest and run-results
 artifacts expose only the safe resolved
 identity and aggregate usage — prompts, input text, and credentials are never
 copied into artifacts. Native provider batch execution for `llm:` models is

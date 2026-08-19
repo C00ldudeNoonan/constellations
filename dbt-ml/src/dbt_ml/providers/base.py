@@ -360,6 +360,7 @@ class ProviderUsage:
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+    thinking_tokens: int = 0
     reported_cost_usd: float | None = None
 
     def __post_init__(self) -> None:
@@ -368,6 +369,7 @@ class ProviderUsage:
             "output_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
+            "thinking_tokens",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -391,6 +393,7 @@ class ProviderUsage:
             "output_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
+            "thinking_tokens",
             "reported_cost_usd",
         }
         unknown = set(values) - allowed
@@ -404,6 +407,7 @@ class ProviderUsage:
             "output_tokens": self.output_tokens,
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "thinking_tokens": self.thinking_tokens,
         }
         if self.reported_cost_usd is not None:
             metrics["reported_cost_usd"] = self.reported_cost_usd

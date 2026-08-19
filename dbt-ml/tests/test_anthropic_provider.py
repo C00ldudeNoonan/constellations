@@ -99,6 +99,7 @@ def test_anthropic_complete_maps_request_and_normalizes_response(
         "output_tokens": 3,
         "cache_read_input_tokens": 2,
         "cache_creation_input_tokens": 1,
+        "thinking_tokens": 0,
     }
     assert result.provider_request_id == "msg_1"
 

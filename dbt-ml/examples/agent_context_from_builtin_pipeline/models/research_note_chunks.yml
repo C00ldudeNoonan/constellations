@@ -1,0 +1,19 @@
+version: 2
+
+# The built-in chunk: primitive, splitting real text with the recursive
+# character splitter (issue #86). This model cannot declare agent_context: —
+# see docs/architecture/agent-context-v1.md — document_chunks.yml below wraps
+# its output in a thin transform that can.
+models:
+  - name: research_note_chunks
+    description: "Recursive character chunks of each research note"
+    depends_on: [ref('raw_research_notes')]
+    chunk:
+      strategy: recursive
+      text_field: text
+      chunk_size: 400
+      chunk_overlap: 50
+    materialization: full
+    tests:
+      - not_null: [chunk_id, document_id, text]
+      - unique: chunk_id

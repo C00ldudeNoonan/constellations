@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -191,6 +191,13 @@ _FRESHNESS_FIELDS = (
         nullable=True,
         description="UTC time after which the source version is stale.",
     ),
+)
+
+# Fields a document_chunks row must carry verbatim from its parent
+# document_registry row (validate_agent_context_relations enforces they match
+# via policy_fingerprint equality).
+_DOCUMENT_CARRY_FIELDS: tuple[str, ...] = tuple(
+    field.name for field in (*_TEMPORAL_FIELDS, *_POLICY_FIELDS, *_FRESHNESS_FIELDS)
 )
 
 _PROVENANCE_FIELDS = (
@@ -675,6 +682,210 @@ def project_entity_link(
         "recorded_to": recorded_to,
         "link_provenance_fingerprint": make_provenance_fingerprint(dict(provenance)),
     }
+
+
+def project_document_registry_row(
+    *,
+    text: str,
+    source_system: str,
+    source_key: str,
+    source_version: str,
+    upstream_unique_id: str,
+    invocation_id: str,
+    recorded_from: datetime,
+    ingested_at: datetime,
+    materialized_at: datetime,
+    source_uri: str | None = None,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+    recorded_to: datetime | None = None,
+    tenant_id: str | None = None,
+    is_public: bool = False,
+    access_groups: Iterable[str] = (),
+    classification: str | None = None,
+    policy_ref: str | None = None,
+    policy_version: str | None = None,
+    authorization_resolved: bool = False,
+    source_updated_at: datetime | None = None,
+    source_observed_at: datetime | None = None,
+    freshness_checked_at: datetime | None = None,
+    refresh_due_at: datetime | None = None,
+    stale_after: datetime | None = None,
+    parser_identity: str | None = None,
+    transform_identity: str | None = None,
+    prompt_fingerprint: str | None = None,
+    schema_fingerprint: str | None = None,
+    provider_identity: str | None = None,
+    model_identity: str | None = None,
+    provenance: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project a single extracted document's fields into a `document_registry`
+    row (issue #300). Computes `document_id`, `document_version_id`,
+    `source_content_hash`, and `provenance_fingerprint` with this module's own
+    id algorithms, so the result validates against
+    `validate_agent_context_frame`. `is_public`/`authorization_resolved`/
+    `access_groups` default deny-closed, matching the contract's policy
+    semantics; this is a pure projector, not a second validator —
+    `validate_agent_context_frame` still rejects an inconsistent combination.
+
+    Extraction's own built-in `document_id`/`content_hash` columns use a
+    different algorithm than this contract (they key incremental state and
+    cannot be repointed), so this helper always derives its own
+    `document_id`/`source_content_hash` from `source_system`/`source_key`/
+    `text` rather than accepting extraction's columns directly.
+    """
+    document_id = make_document_id(source_system, source_key)
+    source_content_hash = content_hash(text)
+    document_version_id = make_document_version_id(
+        document_id, source_version, source_content_hash
+    )
+    normalized_groups = tuple(sorted(set(access_groups)))
+    if provenance is None:
+        provenance = {
+            "document_id": document_id,
+            "source_version": source_version,
+            "upstream_unique_id": upstream_unique_id,
+            "invocation_id": invocation_id,
+            "transform_identity": transform_identity,
+        }
+    return {
+        "document_id": document_id,
+        "document_version_id": document_version_id,
+        "source_system": source_system,
+        "source_key": source_key,
+        "source_uri": source_uri,
+        "source_version": source_version,
+        "source_content_hash": source_content_hash,
+        "validity_known": valid_from is not None,
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "recorded_from": recorded_from,
+        "recorded_to": recorded_to,
+        "tenant_id": tenant_id,
+        "is_public": is_public,
+        "access_groups": normalized_groups,
+        "classification": classification,
+        "policy_ref": policy_ref,
+        "policy_version": policy_version,
+        "authorization_resolved": authorization_resolved,
+        "source_updated_at": source_updated_at,
+        "source_observed_at": source_observed_at,
+        "ingested_at": ingested_at,
+        "materialized_at": materialized_at,
+        "freshness_checked_at": freshness_checked_at,
+        "refresh_due_at": refresh_due_at,
+        "stale_after": stale_after,
+        "upstream_unique_id": upstream_unique_id,
+        "invocation_id": invocation_id,
+        "parser_identity": parser_identity,
+        "transform_identity": transform_identity,
+        "prompt_fingerprint": prompt_fingerprint,
+        "schema_fingerprint": schema_fingerprint,
+        "provider_identity": provider_identity,
+        "model_identity": model_identity,
+        "provenance_fingerprint": make_provenance_fingerprint(dict(provenance)),
+    }
+
+
+def project_document_chunk_row(
+    document_registry_row: Mapping[str, Any],
+    *,
+    chunk_index: int,
+    text: str,
+    upstream_unique_id: str,
+    invocation_id: str,
+    chunker_identity: str,
+    source_uri: str | None = None,
+    citation_page_number: int | None = None,
+    citation_section_path: Sequence[str] | None = None,
+    citation_char_start: int | None = None,
+    citation_char_end: int | None = None,
+    citation_speaker: str | None = None,
+    citation_start_seconds: float | None = None,
+    citation_end_seconds: float | None = None,
+    citation_locator: Mapping[str, Any] | None = None,
+    parser_identity: str | None = None,
+    transform_identity: str | None = None,
+    prompt_fingerprint: str | None = None,
+    schema_fingerprint: str | None = None,
+    provider_identity: str | None = None,
+    model_identity: str | None = None,
+    provenance: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project one chunk of a `document_registry_row` (as returned by
+    `project_document_registry_row`, or any mapping shaped like one — e.g. one
+    row from that model's materialized output) into a `document_chunks` row
+    (issue #300). Computes `chunk_id`, `context_id`, and `chunk_content_hash`
+    with this module's own id algorithms, and copies every bitemporal/policy/
+    freshness field from `document_registry_row` verbatim, so the
+    cross-relation equality `validate_agent_context_relations` requires holds
+    by construction rather than by caller discipline.
+
+    `chunk_index` alone always satisfies the "citation locator must not be
+    empty" rule (`citation_locator()` always includes it), so every
+    `citation_*` argument may be left `None` — no character-offset tracking in
+    the chunker is required for a chunk row built this way to validate.
+    """
+    document_id = document_registry_row["document_id"]
+    document_version_id = document_registry_row["document_version_id"]
+    chunk_id = make_chunk_id(document_id, chunk_index, text)
+    context_id = make_context_id(document_version_id, chunk_id)
+    resolved_source_uri = (
+        source_uri if source_uri is not None else document_registry_row.get("source_uri")
+    )
+    if provenance is None:
+        provenance = {
+            "document_version_id": document_version_id,
+            "chunk_index": chunk_index,
+            "upstream_unique_id": upstream_unique_id,
+            "invocation_id": invocation_id,
+            "transform_identity": transform_identity,
+        }
+    row: dict[str, Any] = {
+        name: document_registry_row[name] for name in _DOCUMENT_CARRY_FIELDS
+    }
+    row.update(
+        {
+            "context_id": context_id,
+            "chunk_id": chunk_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "chunk_index": chunk_index,
+            "text": text,
+            "chunk_content_hash": content_hash(text),
+            "source_uri": resolved_source_uri,
+            "citation_page_number": citation_page_number,
+            "citation_section_path": (
+                list(citation_section_path) if citation_section_path is not None else None
+            ),
+            "citation_char_start": citation_char_start,
+            "citation_char_end": citation_char_end,
+            "citation_speaker": citation_speaker,
+            "citation_start_seconds": citation_start_seconds,
+            "citation_end_seconds": citation_end_seconds,
+            "citation_locator": (
+                json.dumps(
+                    dict(citation_locator),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                if citation_locator is not None
+                else None
+            ),
+            "chunker_identity": chunker_identity,
+            "upstream_unique_id": upstream_unique_id,
+            "invocation_id": invocation_id,
+            "parser_identity": parser_identity,
+            "transform_identity": transform_identity,
+            "prompt_fingerprint": prompt_fingerprint,
+            "schema_fingerprint": schema_fingerprint,
+            "provider_identity": provider_identity,
+            "model_identity": model_identity,
+            "provenance_fingerprint": make_provenance_fingerprint(dict(provenance)),
+        }
+    )
+    return row
 
 
 def content_hash(text: str) -> str:

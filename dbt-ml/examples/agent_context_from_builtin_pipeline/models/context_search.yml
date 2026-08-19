@@ -1,0 +1,41 @@
+version: 2
+
+models:
+  - name: context_search
+    description: "Governed documentary evidence over economic research notes"
+    depends_on: [ref('chunk_embeddings')]
+    materialization: incremental
+    tags: [retrieval, agent-context]
+    search:
+      access: governed
+      store: local
+      collection: agent_context_builtin_pipeline
+      id_field: context_id
+      document_id_field: document_id
+      chunk_id_field: chunk_id
+      text_fields: [text]
+      return_text_fields: [text]
+      vector:
+        field: embedding
+        dimensions: 8
+        metric: cosine
+        search: exact
+        embedding: inherit
+      full_text:
+        fields: [text]
+      attributes:
+        - name: tenant_id
+          data_type: string
+          filter_role: policy
+        - name: classification
+          data_type: string
+          returned: true
+        - name: title
+          data_type: string
+          returned: true
+      display_fields: [title]
+      query:
+        modes: [vector, text, hybrid]
+        consistency: strong
+      on_index_change: fail
+      batch_size: 100

@@ -1,0 +1,11 @@
+{
+  "source_key": "notes/consumer-spending-resilience",
+  "canonical_uri": "https://research.example.test/notes/consumer-spending-resilience",
+  "source_version": "2026-07-15",
+  "title": "Consumer spending holds up despite sticky inflation",
+  "effective_date": "2026-07-15T00:00:00+00:00",
+  "is_public": false,
+  "access_groups": ["research-desk", "macro-strategy"],
+  "classification": "internal",
+  "text": "Real personal consumption expenditures rose at a firmer pace than expected last month, defying calls for a sharper pullback in the face of elevated borrowing costs and inflation that remains above the central bank's target. The strength was broad-based across durable goods, nondurable goods, and services, though the composition skewed toward experiences over merchandise, continuing a post-pandemic rotation that has proven more durable than many forecasters anticipated two years ago.\n\nThe saving rate ticked down as spending outpaced income growth, raising the perennial question of how long households can draw on accumulated savings and credit to sustain current consumption patterns. Credit card balances have continued to climb, and delinquency rates among lower-income borrowers have drifted higher, though they remain well contained relative to prior cycles. Higher-income households, who account for a disproportionate share of aggregate spending, continue to benefit from strong asset values in both equities and housing, providing a wealth-effect cushion that has partially offset the drag from tighter credit conditions elsewhere in the income distribution.\n\nOur internal tracking model, which blends card spending data with high-frequency mobility indicators, points to continued but moderating growth in the current quarter. We see this as consistent with a soft landing narrative but flag downside risk if labor income growth decelerates faster than spending adjusts, a combination that would mechanically require either a further drawdown in savings or a more abrupt consumption slowdown than currently embedded in our baseline forecast."
+}

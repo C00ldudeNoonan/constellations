@@ -1,0 +1,11 @@
+{
+  "source_key": "notes/manufacturing-pmi-contraction",
+  "canonical_uri": "https://research.example.test/notes/manufacturing-pmi-contraction",
+  "source_version": "2026-07-02",
+  "title": "Manufacturing PMI slips back into contraction territory",
+  "effective_date": "2026-07-02T00:00:00+00:00",
+  "is_public": false,
+  "access_groups": ["research-desk"],
+  "classification": "internal",
+  "text": "The headline manufacturing purchasing managers index fell below the fifty-point expansion threshold for the first time in four months, driven by declines in new orders and production that outweighed a modest improvement in supplier delivery times. The new orders subindex posted its steepest one-month drop of the year, and survey respondents cited softer export demand and continued destocking by downstream customers as the primary drags on activity.\n\nInventories of finished goods rose even as production slowed, an unwelcome combination that typically presages further output cuts in subsequent months as firms work down excess stock rather than commit to fresh production runs. The employment component of the survey also weakened, consistent with the broader softening seen in factory-sector payrolls over recent releases, though it has not yet fallen to levels associated with outright headcount reductions across the sector.\n\nPrices paid rose modestly, a reminder that input cost pressures have not fully abated even as demand cools, a combination that complicates the read-through for monetary policy. We view this release as consistent with our house call for a shallow manufacturing-led soft patch rather than a broader recession, but the breadth of the new-orders decline warrants close attention in next month's data before drawing firmer conclusions about the durability of the current slowdown."
+}

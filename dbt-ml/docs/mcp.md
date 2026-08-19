@@ -44,7 +44,13 @@ Those `document_registry`/`document_chunks` relations must come from
 `transform: {type: python}` models that declare `agent_context:` — the
 built-in `extraction:`/`chunk:` primitives cannot claim the contract, so a
 search index built directly on them will not surface here even once fully
-populated. See [Agent context contract
+populated. `dbt_ml.agent_context.project_document_registry_row`/
+`project_document_chunk_row` turn an existing `extraction:`/`chunk:` pipeline
+into a contract-emitting transform in roughly 15-20 lines each; see
+`examples/agent_context_from_builtin_pipeline/` for a complete project
+(`extraction:` → `chunk:` → two thin `transform:` wrappers → `embed:` →
+`search:`) that compiles, runs, and is discoverable through
+`list_context_models`. See [Agent context contract
 v1](architecture/agent-context-v1.md#runtime-and-artifact-integration) for why
 and how to wrap an existing extraction/chunk pipeline in a contract-emitting
 transform.

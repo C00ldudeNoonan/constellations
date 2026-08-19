@@ -20,6 +20,7 @@ from dbt_ml.agent_context import (
     citation_locator,
     content_hash,
     contract_descriptor,
+    empty_agent_context_frame,
     entity_link_method,
     freshness_status,
     interval_contains,
@@ -32,6 +33,8 @@ from dbt_ml.agent_context import (
     make_entity_id,
     make_provenance_fingerprint,
     policy_fingerprint,
+    project_document_chunk_row,
+    project_document_registry_row,
     project_entity_link,
     retrieval_projection_fingerprint,
     validate_agent_context_frame,
@@ -302,6 +305,187 @@ def test_project_entity_link_rejects_unresolved_and_out_of_range_inputs() -> Non
             recorded_from=_T0,
             confidence=1.5,
         )
+
+
+def _registry_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "text": "Enterprise refund policy body",
+        "source_system": "policy-repository",
+        "source_key": "refunds/enterprise",
+        "source_version": "v1",
+        "upstream_unique_id": "source.economic_data.policy_documents",
+        "invocation_id": "invocation-001",
+        "recorded_from": _T0,
+        "ingested_at": _T0,
+        "materialized_at": _T0,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_project_document_registry_row_computes_ids_like_the_direct_helpers() -> None:
+    kwargs = _registry_kwargs()
+    row = project_document_registry_row(**kwargs)
+
+    expected_document_id = make_document_id(kwargs["source_system"], kwargs["source_key"])
+    expected_content_hash = content_hash(kwargs["text"])
+    assert row["document_id"] == expected_document_id
+    assert row["source_content_hash"] == expected_content_hash
+    assert row["document_version_id"] == make_document_version_id(
+        expected_document_id, kwargs["source_version"], expected_content_hash
+    )
+
+
+def test_project_document_registry_row_derives_validity_known() -> None:
+    without_validity = project_document_registry_row(**_registry_kwargs())
+    assert without_validity["validity_known"] is False
+    assert without_validity["valid_from"] is None
+    assert without_validity["valid_to"] is None
+
+    with_validity = project_document_registry_row(**_registry_kwargs(valid_from=_T0))
+    assert with_validity["validity_known"] is True
+    assert with_validity["valid_from"] == _T0
+
+
+def test_project_document_registry_row_denies_by_default() -> None:
+    row = project_document_registry_row(**_registry_kwargs())
+    assert row["is_public"] is False
+    assert row["authorization_resolved"] is False
+    assert row["access_groups"] == ()
+
+
+def test_project_document_registry_row_normalizes_access_groups() -> None:
+    row = project_document_registry_row(
+        **_registry_kwargs(access_groups=["b", "a", "a"])
+    )
+    assert row["access_groups"] == ("a", "b")
+
+
+def test_project_document_registry_row_passes_frame_validation() -> None:
+    frame = pl.DataFrame(
+        [
+            project_document_registry_row(
+                **_registry_kwargs(
+                    is_public=True,
+                    authorization_resolved=True,
+                )
+            )
+        ]
+    ).with_columns(
+        pl.col("recorded_from").dt.replace_time_zone("UTC"),
+        pl.col("recorded_to").cast(pl.Datetime(time_unit="us", time_zone="UTC")),
+        pl.col("ingested_at").dt.replace_time_zone("UTC"),
+        pl.col("materialized_at").dt.replace_time_zone("UTC"),
+    )
+    validate_agent_context_frame(frame, AgentContextGrain.DOCUMENT_REGISTRY)
+
+
+def test_project_document_chunk_row_computes_ids_like_the_direct_helpers() -> None:
+    document = project_document_registry_row(**_registry_kwargs())
+    text = "Refunds require approval for enterprise accounts."
+    chunk = project_document_chunk_row(
+        document,
+        chunk_index=0,
+        text=text,
+        upstream_unique_id="model.economic_data.document_chunks",
+        invocation_id="invocation-001",
+        chunker_identity="recursive:1000:100",
+    )
+    expected_chunk_id = make_chunk_id(document["document_id"], 0, text)
+    assert chunk["chunk_id"] == expected_chunk_id
+    assert chunk["context_id"] == make_context_id(
+        document["document_version_id"], expected_chunk_id
+    )
+    assert chunk["chunk_content_hash"] == content_hash(text)
+
+
+def test_project_document_chunk_row_carries_parent_policy_fields_verbatim() -> None:
+    document = project_document_registry_row(
+        **_registry_kwargs(
+            tenant_id="economic-data",
+            access_groups=("analyst", "reviewer"),
+            classification="internal",
+            is_public=False,
+            authorization_resolved=True,
+        )
+    )
+    chunk = project_document_chunk_row(
+        document,
+        chunk_index=0,
+        text="chunk text",
+        upstream_unique_id="model.economic_data.document_chunks",
+        invocation_id="invocation-001",
+        chunker_identity="recursive:1000:100",
+    )
+    for name in (
+        "tenant_id",
+        "access_groups",
+        "classification",
+        "is_public",
+        "authorization_resolved",
+        "valid_from",
+        "recorded_from",
+    ):
+        assert chunk[name] == document[name]
+    assert policy_fingerprint(document) == policy_fingerprint(chunk)
+
+
+def test_project_document_chunk_row_citation_defaults_still_satisfy_locator_rule() -> None:
+    document = project_document_registry_row(
+        **_registry_kwargs(is_public=True, authorization_resolved=True)
+    )
+    chunk = project_document_chunk_row(
+        document,
+        chunk_index=0,
+        text="chunk text",
+        upstream_unique_id="model.economic_data.document_chunks",
+        invocation_id="invocation-001",
+        chunker_identity="recursive:1000:100",
+    )
+    assert citation_locator(chunk) == {"chunk_index": 0}
+
+
+def test_project_document_registry_and_chunk_rows_pass_full_relation_validation() -> None:
+    registry_rows = [
+        project_document_registry_row(
+            **_registry_kwargs(
+                source_key=f"doc-{doc_index}",
+                is_public=True,
+                authorization_resolved=True,
+            )
+        )
+        for doc_index in range(2)
+    ]
+    chunk_rows = [
+        project_document_chunk_row(
+            document,
+            chunk_index=chunk_index,
+            text=f"chunk {chunk_index} of {document['source_key']}",
+            upstream_unique_id="model.economic_data.document_chunks",
+            invocation_id="invocation-001",
+            chunker_identity="recursive:1000:100",
+        )
+        for document in registry_rows
+        for chunk_index in range(3)
+    ]
+
+    def _cast_temporal(frame: pl.DataFrame) -> pl.DataFrame:
+        return frame.with_columns(
+            pl.col("recorded_from").dt.replace_time_zone("UTC"),
+            pl.col("recorded_to").cast(pl.Datetime(time_unit="us", time_zone="UTC")),
+            pl.col("ingested_at").dt.replace_time_zone("UTC"),
+            pl.col("materialized_at").dt.replace_time_zone("UTC"),
+        )
+
+    registry_frame = _cast_temporal(pl.DataFrame(registry_rows))
+    chunks_frame = _cast_temporal(pl.DataFrame(chunk_rows))
+
+    validate_agent_context_relations(
+        registry_frame,
+        chunks_frame,
+        empty_agent_context_frame(AgentContextGrain.CONTEXT_ENTITY_LINKS),
+    )
+    assert chunks_frame.height == 6
 
 
 def test_contract_descriptor_is_versioned_and_machine_readable() -> None:

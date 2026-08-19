@@ -225,6 +225,15 @@ class VertexInferenceOptions(BaseModel):
         max_length=128,
         pattern=r"^[a-z0-9][a-z0-9-]*$",
     )
+    # Reasoning tokens change output and are billed like output tokens, so
+    # tuning this is semantic, not routing. None means "no override" — the
+    # effective value still defaults to 0 for structured-output requests on
+    # models that accept a disabled budget; see _effective_thinking_budget.
+    thinking_budget: int | None = provider_option(
+        "semantic",
+        default=None,
+        ge=0,
+    )
 
 
 @register_inference_provider
@@ -320,17 +329,21 @@ class VertexInferenceProvider(InferenceProvider):
         if options.project is not None:
             client_options["project"] = options.project
         client = genai.Client(**client_options)
+        generate_config: dict[str, Any] = {
+            "system_instruction": request.system_prompt,
+            "temperature": request.temperature,
+            "max_output_tokens": request.max_tokens,
+            "response_mime_type": "application/json",
+            "response_schema": dict(request.output_schema),
+        }
+        thinking_budget = _effective_thinking_budget(options, request)
+        if thinking_budget is not None:
+            generate_config["thinking_config"] = {"thinking_budget": thinking_budget}
         try:
             response = client.models.generate_content(
                 model=request.model,
                 contents=request.content,
-                config={
-                    "system_instruction": request.system_prompt,
-                    "temperature": request.temperature,
-                    "max_output_tokens": request.max_tokens,
-                    "response_mime_type": "application/json",
-                    "response_schema": dict(request.output_schema),
-                },
+                config=generate_config,
             )
             try:
                 return _parse_inference_response(response, request)
@@ -340,6 +353,36 @@ class VertexInferenceProvider(InferenceProvider):
                 ) from None
         finally:
             client.close()
+
+
+def _effective_thinking_budget(
+    options: VertexInferenceOptions, request: InferenceRequest
+) -> int | None:
+    """An explicit `thinking_budget` always wins, and is forwarded as-is so a
+    model that rejects the value reports its own error. Otherwise a request
+    that declares an output schema is structured extraction — reasoning tokens
+    buy little there and are billed as output on every row — so default to 0,
+    but only on models that accept a disabled budget. Anything else leaves the
+    model's own default in place and sends no `thinking_config` at all."""
+    if options.thinking_budget is not None:
+        return options.thinking_budget
+    if request.output_schema.get("properties") and _supports_disabled_thinking(
+        request.model
+    ):
+        return 0
+    return None
+
+
+# Gemini 2.5 Flash and Flash-Lite accept `thinking_budget: 0`. Gemini 2.5 Pro
+# cannot disable thinking (it enforces a minimum budget), pre-2.5 models reject
+# `thinking_config` outright, and Gemini 3 configures reasoning through
+# `thinking_level` instead — so none of them may be defaulted to 0.
+_DISABLED_THINKING_MODEL_PREFIXES = ("gemini-2.5-flash",)
+
+
+def _supports_disabled_thinking(model: str) -> bool:
+    model_name = model.rsplit("/", maxsplit=1)[-1].casefold()
+    return model_name.startswith(_DISABLED_THINKING_MODEL_PREFIXES)
 
 
 def _parse_inference_response(
@@ -436,10 +479,13 @@ def _inference_usage(response: Any, *, required: bool) -> ProviderUsage:
         return ProviderUsage()
     # Gemini thinking models bill reasoning tokens in a separate
     # `thoughts_token_count`; fold them into output usage so run metrics and
-    # `max_tokens`/budget enforcement account for the full billable spend.
-    output_tokens = _inference_usage_value(
-        raw_usage, "candidates_token_count", required=required
-    ) + _inference_usage_value(raw_usage, "thoughts_token_count")
+    # `max_tokens`/budget enforcement account for the full billable spend, and
+    # also surface them separately so that spend is attributable.
+    thinking_tokens = _inference_usage_value(raw_usage, "thoughts_token_count")
+    output_tokens = (
+        _inference_usage_value(raw_usage, "candidates_token_count", required=required)
+        + thinking_tokens
+    )
     return ProviderUsage(
         input_tokens=_inference_usage_value(
             raw_usage, "prompt_token_count", required=required
@@ -448,6 +494,7 @@ def _inference_usage(response: Any, *, required: bool) -> ProviderUsage:
         cache_read_input_tokens=_inference_usage_value(
             raw_usage, "cached_content_token_count"
         ),
+        thinking_tokens=thinking_tokens,
     )
 
 

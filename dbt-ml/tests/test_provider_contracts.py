@@ -581,6 +581,7 @@ def test_embedding_error_drops_native_exception_and_credential_locals() -> None:
     [
         ({"input_tokens": True}, "input_tokens"),
         ({"output_tokens": -1}, "output_tokens"),
+        ({"thinking_tokens": -1}, "thinking_tokens"),
         ({"reported_cost_usd": float("inf")}, "reported_cost_usd"),
         ({"unknown": 1}, "unknown provider usage fields"),
     ],
@@ -588,6 +589,21 @@ def test_embedding_error_drops_native_exception_and_credential_locals() -> None:
 def test_usage_validation(values: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         ProviderUsage.from_mapping(values)
+
+
+def test_usage_reports_thinking_tokens_only_when_billed() -> None:
+    # Providers that never bill reasoning tokens keep the metrics shape they
+    # already had, so run_results consumers see no new key.
+    assert "thinking_tokens" not in ProviderUsage(output_tokens=3).to_metrics()
+    assert ProviderUsage(thinking_tokens=7).to_metrics()["thinking_tokens"] == 7
+
+
+def test_usage_positional_signature_is_stable_for_v3_plugins() -> None:
+    # A separately installed v3 provider plugin may construct usage
+    # positionally; thinking_tokens is appended so cost stays the fifth arg.
+    usage = ProviderUsage(1, 2, 3, 4, 0.5)
+    assert usage.reported_cost_usd == 0.5
+    assert usage.thinking_tokens == 0
 
 
 @pytest.mark.parametrize(

@@ -40,6 +40,15 @@ An exposed search index must descend from `agent_context/v1`
 `context_id` or `chunk_id`. Optional `context_entity_links` descendants add dbt
 entity types and links to responses.
 
+Those `document_registry`/`document_chunks` relations must come from
+`transform: {type: python}` models that declare `agent_context:` — the
+built-in `extraction:`/`chunk:` primitives cannot claim the contract, so a
+search index built directly on them will not surface here even once fully
+populated. See [Agent context contract
+v1](architecture/agent-context-v1.md#runtime-and-artifact-integration) for why
+and how to wrap an existing extraction/chunk pipeline in a contract-emitting
+transform.
+
 ## Local principal
 
 The stdio MVP resolves one deterministic principal from operator-owned

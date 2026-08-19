@@ -786,7 +786,12 @@ class ModelConfig(BaseModel):
         if self.agent_context is not None and self.transform is None:
             raise ValueError(
                 f"Model '{self.name}' can declare agent_context only on a "
-                "warehouse transform model"
+                "warehouse transform model. The built-in extraction/chunk "
+                "primitives cannot derive the contract's trusted policy and "
+                "bitemporal fields, so this is an intentional v1 boundary, not "
+                "a missing kind — see docs/architecture/agent-context-v1.md. "
+                "Wrap the pipeline in a custom `transform: {type: python}` "
+                "model to make it MCP-discoverable."
             )
         if self.llm is not None:
             self._validate_llm_fields()

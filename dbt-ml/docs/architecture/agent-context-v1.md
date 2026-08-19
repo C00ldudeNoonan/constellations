@@ -18,6 +18,14 @@ The model must materialize every field for its grain. Nullable fields must still
 exist as columns. Timestamps are timezone-aware UTC values. Intervals are
 half-open: `from <= t < to`; a null upper bound is open-ended.
 
+Only a `transform: {type: python}` model may declare `agent_context:` —
+`ModelConfig` rejects it on every other kind. This contract *conceptually*
+extends the document-registry, chunk, extraction, and embedding grains that the
+built-in `extraction:`/`chunk:` primitives (#86) produce, but those primitives
+cannot themselves claim it: see [Runtime and artifact
+integration](#runtime-and-artifact-integration) below for why, and how to wrap
+one in a custom transform instead.
+
 ## Relational shape
 
 ### `document_registry`
@@ -257,11 +265,24 @@ For Python-backed transform models, dbt-ml validates contract columns,
 nullability, types, IDs, interval rules, freshness chronology, citation ranges,
 and policy shape before materialization. Built-in extraction and chunk models
 do not claim this contract because they cannot derive trusted policy and
-bitemporal fields. `validate_agent_context_relations()` additionally
-checks foreign keys and carried-policy equality for a complete relation set.
-The relations contain ordinary scalar, timestamp, array, and JSON columns so a
-future SQL transform from issue #141 can construct them without a Python data
-round trip.
+bitemporal fields — their generated columns (`chunk_id`, `document_id`,
+`chunk_index`, ...) are a different, narrower shape than the contract's
+(`context_id`, `document_version_id`, the bitemporal/policy/freshness/
+provenance fields, ...), and neither primitive resolves authorization or
+bitemporal validity on a document's behalf. `validate_agent_context_relations()`
+additionally checks foreign keys and carried-policy equality for a complete
+relation set. The relations contain ordinary scalar, timestamp, array, and JSON
+columns so a future SQL transform from issue #141 can construct them without a
+Python data round trip.
+
+A project built on the `extraction:`/`chunk:` primitives that wants to become
+MCP-discoverable needs a `transform: {type: python}` model in front of the
+warehouse relation it wants to expose: read the extraction/chunk output,
+compute the contract's identity, temporal, policy, freshness, and provenance
+columns (`dbt_ml.agent_context` provides the id-generation helpers), and
+declare `agent_context:` on that transform. The transform can `ref()` the
+existing extraction/chunk models, so no data pipeline is discarded — only the
+contract-shaped projection is new.
 
 The manifest exposes the contract version, grain, fields, primary and foreign
 keys, model `unique_id`, lineage, and safe fully qualified relation. Generated

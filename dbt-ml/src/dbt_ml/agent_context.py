@@ -701,7 +701,7 @@ def project_document_registry_row(
     recorded_to: datetime | None = None,
     tenant_id: str | None = None,
     is_public: bool = False,
-    access_groups: Iterable[str] = (),
+    access_groups: Iterable[str] | str = (),
     classification: str | None = None,
     policy_ref: str | None = None,
     policy_version: str | None = None,
@@ -733,20 +733,32 @@ def project_document_registry_row(
     cannot be repointed), so this helper always derives its own
     `document_id`/`source_content_hash` from `source_system`/`source_key`/
     `text` rather than accepting extraction's columns directly.
+
+    `access_groups` accepts either a list/tuple of group names or a
+    JSON-array-encoded string (`_string_array` handles both) — the built-in
+    extraction pipeline can scalarize a source list column to the latter
+    shape, and iterating a raw string character-by-character would silently
+    corrupt authorization data rather than raise.
     """
     document_id = make_document_id(source_system, source_key)
     source_content_hash = content_hash(text)
     document_version_id = make_document_version_id(
         document_id, source_version, source_content_hash
     )
-    normalized_groups = tuple(sorted(set(access_groups)))
+    normalized_groups = tuple(sorted(set(_string_array(access_groups, allow_none=False))))
     if provenance is None:
         provenance = {
             "document_id": document_id,
             "source_version": source_version,
+            "source_content_hash": source_content_hash,
             "upstream_unique_id": upstream_unique_id,
             "invocation_id": invocation_id,
+            "parser_identity": parser_identity,
             "transform_identity": transform_identity,
+            "prompt_fingerprint": prompt_fingerprint,
+            "schema_fingerprint": schema_fingerprint,
+            "provider_identity": provider_identity,
+            "model_identity": model_identity,
         }
     return {
         "document_id": document_id,
@@ -836,10 +848,18 @@ def project_document_chunk_row(
     if provenance is None:
         provenance = {
             "document_version_id": document_version_id,
-            "chunk_index": chunk_index,
+            # chunk_id is itself a hash of (document_id, chunk_index, text), so
+            # including it makes the fingerprint vary with chunk content too.
+            "chunk_id": chunk_id,
+            "chunker_identity": chunker_identity,
             "upstream_unique_id": upstream_unique_id,
             "invocation_id": invocation_id,
+            "parser_identity": parser_identity,
             "transform_identity": transform_identity,
+            "prompt_fingerprint": prompt_fingerprint,
+            "schema_fingerprint": schema_fingerprint,
+            "provider_identity": provider_identity,
+            "model_identity": model_identity,
         }
     row: dict[str, Any] = {
         name: document_registry_row[name] for name in _DOCUMENT_CARRY_FIELDS

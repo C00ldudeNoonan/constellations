@@ -361,6 +361,19 @@ def test_project_document_registry_row_normalizes_access_groups() -> None:
     assert row["access_groups"] == ("a", "b")
 
 
+def test_project_document_registry_row_parses_json_encoded_access_groups() -> None:
+    """The built-in extraction pipeline can scalarize a source list column to
+    a JSON-array string (e.g. '["research-desk"]'); naively iterating that
+    string char-by-char would corrupt authorization data instead of raising."""
+    row = project_document_registry_row(
+        **_registry_kwargs(access_groups='["research-desk", "macro-strategy"]')
+    )
+    assert row["access_groups"] == ("macro-strategy", "research-desk")
+
+    with pytest.raises(ValueError, match="array\\[string\\]"):
+        project_document_registry_row(**_registry_kwargs(access_groups="not json"))
+
+
 def test_project_document_registry_row_passes_frame_validation() -> None:
     frame = pl.DataFrame(
         [
@@ -486,6 +499,44 @@ def test_project_document_registry_and_chunk_rows_pass_full_relation_validation(
         empty_agent_context_frame(AgentContextGrain.CONTEXT_ENTITY_LINKS),
     )
     assert chunks_frame.height == 6
+
+
+def test_project_document_registry_row_default_provenance_varies_with_identity() -> None:
+    """The default provenance_fingerprint must reflect every identity input, not
+    just document_id/source_version — otherwise two rows derived by different
+    parsers/schemas/providers would collide on the same fingerprint."""
+    baseline = project_document_registry_row(**_registry_kwargs())["provenance_fingerprint"]
+    for overrides in (
+        {"parser_identity": "markdown/2"},
+        {"schema_fingerprint": "schema-v2"},
+        {"provider_identity": "anthropic/v1"},
+        {"model_identity": "claude/v1"},
+        {"prompt_fingerprint": "prompt-abc"},
+    ):
+        varied = project_document_registry_row(**_registry_kwargs(**overrides))
+        assert varied["provenance_fingerprint"] != baseline, overrides
+
+
+def test_project_document_chunk_row_default_provenance_varies_with_identity() -> None:
+    document = project_document_registry_row(**_registry_kwargs())
+
+    def _chunk_provenance(**overrides: Any) -> str:
+        kwargs: dict[str, Any] = {
+            "chunk_index": 0,
+            "text": "chunk text",
+            "upstream_unique_id": "model.economic_data.document_chunks",
+            "invocation_id": "invocation-001",
+            "chunker_identity": "recursive:1000:100",
+        }
+        kwargs.update(overrides)
+        return project_document_chunk_row(document, **kwargs)["provenance_fingerprint"]
+
+    baseline = _chunk_provenance()
+    assert _chunk_provenance(chunker_identity="recursive:500:50") != baseline
+    assert _chunk_provenance(parser_identity="markdown/2") != baseline
+    assert _chunk_provenance(schema_fingerprint="schema-v2") != baseline
+    # Different chunk content (different chunk_id) must also change the fingerprint.
+    assert _chunk_provenance(text="different chunk text") != baseline
 
 
 def test_contract_descriptor_is_versioned_and_machine_readable() -> None:

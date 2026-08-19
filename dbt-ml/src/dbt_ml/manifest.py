@@ -122,6 +122,12 @@ def write_manifest(
     return out
 
 
+# Key naming the producing release in run_results metadata. Dagster reads
+# this payload (#87), so the key is an external contract, not a label; its
+# presence is pinned in tests/test_characterization.py.
+RUN_RESULTS_VERSION_KEY = "dbt_ml_version"
+
+
 def build_run_results(
     project_dir: Path,
     results: list[ModelRunResult],
@@ -191,7 +197,7 @@ def build_run_results(
 
     overall = "error" if (n_error or skipped) else "success"
     metadata: dict[str, Any] = {
-        "dbt_ml_version": distribution_version(),
+        RUN_RESULTS_VERSION_KEY: distribution_version(),
         "generated_at": _now(),
         "invocation": invocation,
         "status": overall,

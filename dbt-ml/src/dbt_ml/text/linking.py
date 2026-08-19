@@ -42,6 +42,8 @@ ALIAS_RESOLVER_VERSION = "1"
 VECTOR_SIMILARITY_RESOLVER_VERSION = "1"
 FUZZY_RESOLVER_VERSION = "1"
 
+# Frozen fingerprint domains: mixed into persisted digests, so a change here
+# invalidates every stored one. See hashing._FINGERPRINT_PREFIX.
 ALIAS_SET_FINGERPRINT_DOMAIN = "dbt-ml.entity-alias-set"
 VECTOR_REFERENCE_FINGERPRINT_DOMAIN = "dbt-ml.entity-vector-reference-set"
 ENTITY_LINK_FINGERPRINT_DOMAIN = "dbt-ml.entity-link"

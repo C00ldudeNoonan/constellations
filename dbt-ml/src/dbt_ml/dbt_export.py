@@ -20,6 +20,12 @@ from .profile import resolve_profile
 
 DEFAULT_OUTPUT_FILENAME = "sources.yml"
 
+# `meta:` namespace in the emitted sources.yml. The generated file is
+# committed into the consumer's dbt project and read from there, so this key
+# is part of what dbt-ml hands to another tool — renaming it makes the
+# agent-context block invisible to anything already reading it.
+DBT_META_NAMESPACE = "dbt_ml"
+
 
 def build_dbt_sources(
     project_dir: Path,
@@ -133,7 +139,7 @@ def _table_for_model(
                 else contract_field.data_type
             )
             column["meta"] = {
-                "dbt_ml": {
+                DBT_META_NAMESPACE: {
                     "agent_context": {
                         "nullable": contract_field.nullable,
                     }
@@ -167,7 +173,7 @@ def _table_for_model(
     meta: dict[str, Any] = {}
     if model.agent_context is not None:
         relation = contract_relation(model.agent_context.grain)
-        meta["dbt_ml"] = {
+        meta[DBT_META_NAMESPACE] = {
             "agent_context": {
                 "contract": model.agent_context.contract,
                 "grain": relation.grain.value,

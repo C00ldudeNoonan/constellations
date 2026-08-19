@@ -527,6 +527,8 @@ def _empty_series(field: ContractField) -> pl.Series:
     raise AssertionError(f"Unsupported agent context type {field.data_type}")
 
 
+# The `domain=` values in the id constructors below are frozen: they are
+# mixed into ids already written to warehouses. See hashing._FINGERPRINT_PREFIX.
 def make_document_id(source_system: str, source_key: str) -> str:
     return canonical_fingerprint(
         {

@@ -39,9 +39,19 @@ from .base import (
 from .registry import register
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+# Arrow schema metadata written into every collection dbt-ml creates. These
+# names live in existing LanceDB collections, so they are data, not code.
+# `_OWNER_VALUE` in particular is an adoption gate, not a label: a collection
+# whose owner metadata does not match exactly is refused as external, so
+# changing this value makes every collection already published unreadable.
 _OWNER_KEY = b"dbt_ml.owner"
+_OWNER_VALUE = b"dbt-ml"
 _CONTRACT_KEY = b"dbt_ml.record_contract"
 _CONFIG_KEY = b"dbt_ml.config_fingerprint"
+# Recorded on published search indexes and compared on read to invalidate
+# state when the store implementation changes.
+_IMPLEMENTATION_IDENTITY_PREFIX = "dbt_ml.retrieval.lancedb:v1"
 
 # Object-store schemes LanceDB connects to natively (Rust object_store cores).
 # A `path` carrying one of these bypasses local-filesystem resolution and the
@@ -208,7 +218,7 @@ class LanceDBStore(RetrievalStore):
     @classmethod
     def implementation_identity(cls) -> str:
         version = optional_dependency_version("lancedb")
-        return f"dbt_ml.retrieval.lancedb:v1:lancedb-{version}"
+        return f"{_IMPLEMENTATION_IDENTITY_PREFIX}:lancedb-{version}"
 
     @classmethod
     def capabilities(cls) -> RetrievalCapabilities:
@@ -289,7 +299,7 @@ class LanceDBStore(RetrievalStore):
         if not _COLLECTION_RE.fullmatch(name):
             raise RetrievalError("LanceDB collection name is invalid")
         table = self._connection().open_table(name)
-        if (table.schema.metadata or {}).get(_OWNER_KEY) != b"dbt-ml":
+        if (table.schema.metadata or {}).get(_OWNER_KEY) != _OWNER_VALUE:
             raise RetrievalError(
                 "LanceDB collection is not owned by dbt-ml "
                 "(code=lancedb_external_collection)"
@@ -413,7 +423,7 @@ class LanceDBStore(RetrievalStore):
         metadata = dict(spec.arrow_schema.metadata or {})
         metadata.update(
             {
-                _OWNER_KEY: b"dbt-ml",
+                _OWNER_KEY: _OWNER_VALUE,
                 _CONTRACT_KEY: b"1",
                 _CONFIG_KEY: spec.config_fingerprint.encode(),
             }

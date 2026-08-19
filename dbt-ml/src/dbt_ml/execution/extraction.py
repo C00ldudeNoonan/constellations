@@ -66,7 +66,12 @@ log = logging.getLogger(__name__)
 # per-document cleanup below bounds a *live* run's peak disk use to in-flight
 # documents, and the startup sweep self-heals directories a *dead* run left
 # behind, which nothing else will ever clean up.
+#
+# The producer and the sweep filter must both use this constant. The sweep
+# only ever sees directories a *dead* process left behind, so a prefix that
+# drifts on one side disables the self-healing without failing anything.
 _FETCH_DIR_PREFIX = "dbt_ml_fetch_"
+
 # A directory's mtime is refreshed by every file *written* inside it, but a
 # single long native-batch submission (#149) can sit idle for hours without
 # creating any new entries while it waits on an external API — age alone
@@ -132,10 +137,10 @@ def _fetch_dir_is_live(entry: Path) -> bool:
 
 
 def _sweep_stale_fetch_dirs(root: Path, *, max_age_seconds: float) -> None:
-    """Best-effort removal of `dbt_ml_fetch_*` directories under `root` that
-    are both older than `max_age_seconds` and not owned by a still-running
-    process. Never raises: a sweep failure must not fail the run it happens to
-    run alongside."""
+    """Best-effort removal of `_FETCH_DIR_PREFIX`-prefixed directories under
+    `root` that are both older than `max_age_seconds` and not owned by a
+    still-running process. Never raises: a sweep failure must not fail the run
+    it happens to run alongside."""
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -499,7 +504,7 @@ def run_extraction_model(
         # documents that actually need processing. Extraction streams through in
         # `flush_every`-sized chunks (issue #77): rows never accumulate beyond
         # one chunk, so corpus size is bounded by the flush size, not memory.
-        with tempfile.TemporaryDirectory(prefix="dbt_ml_fetch_") as scratch:
+        with tempfile.TemporaryDirectory(prefix=_FETCH_DIR_PREFIX) as scratch:
             work_dir = Path(scratch)
             _write_owner_marker(work_dir)
 

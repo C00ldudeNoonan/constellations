@@ -42,6 +42,7 @@ from pydantic import (
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 
+from ..config.identifiers import DEFAULT_SCHEMA_NAME
 from ..config.profile import WarehouseConfig
 from ..credentials import (
     CredentialFreeUrl,
@@ -225,7 +226,7 @@ class BigQueryWarehouseConfig(WarehouseConfig):
     type: Literal["bigquery"] = "bigquery"
     project: str
     schema_name: str = Field(
-        default="dbt_ml",
+        default=DEFAULT_SCHEMA_NAME,
         validation_alias=AliasChoices("dataset", "schema", "schema_name"),
         serialization_alias="schema",
     )

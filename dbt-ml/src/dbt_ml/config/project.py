@@ -4,6 +4,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 
@@ -14,8 +15,8 @@ class DuckDBConfig(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    path: Path = Path("./target/dbt_ml.duckdb")
-    schema_name: str = Field(default="dbt_ml", alias="schema")
+    path: Path = Path("./target") / DEFAULT_DUCKDB_FILENAME
+    schema_name: str = Field(default=DEFAULT_SCHEMA_NAME, alias="schema")
 
 
 class ExtractionDefaults(BaseModel):

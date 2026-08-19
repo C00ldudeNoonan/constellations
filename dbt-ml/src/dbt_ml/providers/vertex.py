@@ -227,8 +227,8 @@ class VertexInferenceOptions(BaseModel):
     )
     # Reasoning tokens change output and are billed like output tokens, so
     # tuning this is semantic, not routing. None means "no override" — the
-    # effective value still defaults to 0 for structured-output requests;
-    # see _effective_thinking_budget.
+    # effective value still defaults to 0 for structured-output requests on
+    # models that accept a disabled budget; see _effective_thinking_budget.
     thinking_budget: int | None = provider_option(
         "semantic",
         default=None,
@@ -358,15 +358,31 @@ class VertexInferenceProvider(InferenceProvider):
 def _effective_thinking_budget(
     options: VertexInferenceOptions, request: InferenceRequest
 ) -> int | None:
-    """An explicit `thinking_budget` always wins. Otherwise, a request that
-    declares an output schema is structured extraction — reasoning tokens buy
-    little there and are billed as output on every row — so default to 0.
-    A schema-less request leaves the model's own default in place."""
+    """An explicit `thinking_budget` always wins, and is forwarded as-is so a
+    model that rejects the value reports its own error. Otherwise a request
+    that declares an output schema is structured extraction — reasoning tokens
+    buy little there and are billed as output on every row — so default to 0,
+    but only on models that accept a disabled budget. Anything else leaves the
+    model's own default in place and sends no `thinking_config` at all."""
     if options.thinking_budget is not None:
         return options.thinking_budget
-    if request.output_schema.get("properties"):
+    if request.output_schema.get("properties") and _supports_disabled_thinking(
+        request.model
+    ):
         return 0
     return None
+
+
+# Gemini 2.5 Flash and Flash-Lite accept `thinking_budget: 0`. Gemini 2.5 Pro
+# cannot disable thinking (it enforces a minimum budget), pre-2.5 models reject
+# `thinking_config` outright, and Gemini 3 configures reasoning through
+# `thinking_level` instead — so none of them may be defaulted to 0.
+_DISABLED_THINKING_MODEL_PREFIXES = ("gemini-2.5-flash",)
+
+
+def _supports_disabled_thinking(model: str) -> bool:
+    model_name = model.rsplit("/", maxsplit=1)[-1].casefold()
+    return model_name.startswith(_DISABLED_THINKING_MODEL_PREFIXES)
 
 
 def _parse_inference_response(

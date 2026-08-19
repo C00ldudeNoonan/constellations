@@ -1381,10 +1381,15 @@ examples; production providers implement the same `InferenceProvider`
 contract — `anthropic`, `vllm`, and `vertex` (Gemini models on Vertex AI via
 `google-genai`, ADC-only, selecting the GCP project and location under profile
 `llm:` configuration; install `dbt-ml[vertex]`). Gemini 2.5 models think by
-default and bill reasoning tokens as output on every row; `vertex` defaults
-`thinking_budget` to `0` whenever the model declares `fields:`, since a
-declared output schema is extraction, not open-ended reasoning. Set
-`provider_options: {thinking_budget: N}` to opt back into a reasoning budget.
+default and bill reasoning tokens as output on every row, so `vertex` defaults
+`thinking_budget` to `0` when the model declares `fields:` — a declared output
+schema is extraction, not open-ended reasoning. That automatic default applies
+only to models that accept a disabled budget (the Gemini 2.5 Flash family);
+every other model keeps its own default and is sent no thinking configuration.
+Set `provider_options: {thinking_budget: N}` to choose a budget explicitly,
+which is always forwarded as configured. Reasoning tokens are reported as
+`thinking_tokens` in run metrics when a provider bills them, and still count
+toward `output_tokens` for budget enforcement.
 Manifest and run-results
 artifacts expose only the safe resolved
 identity and aggregate usage — prompts, input text, and credentials are never

@@ -165,7 +165,6 @@ def test_llm_batch_skips_cached_documents(
             "output_tokens": 0,
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
-            "thinking_tokens": 0,
         }
 
 

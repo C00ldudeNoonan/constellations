@@ -360,8 +360,10 @@ class ProviderUsage:
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
-    thinking_tokens: int = 0
     reported_cost_usd: float | None = None
+    # Appended last so the v3 positional constructor signature keeps working
+    # for separately installed provider plugins built against this contract.
+    thinking_tokens: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -407,8 +409,12 @@ class ProviderUsage:
             "output_tokens": self.output_tokens,
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
-            "thinking_tokens": self.thinking_tokens,
         }
+        # Reported only when a provider actually bills reasoning tokens, so
+        # non-thinking providers and cache hits keep the metrics shape they
+        # already had (mirrors reported_cost_usd).
+        if self.thinking_tokens:
+            metrics["thinking_tokens"] = self.thinking_tokens
         if self.reported_cost_usd is not None:
             metrics["reported_cost_usd"] = self.reported_cost_usd
         return metrics

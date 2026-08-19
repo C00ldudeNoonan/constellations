@@ -277,12 +277,39 @@ Python data round trip.
 
 A project built on the `extraction:`/`chunk:` primitives that wants to become
 MCP-discoverable needs a `transform: {type: python}` model in front of the
-warehouse relation it wants to expose: read the extraction/chunk output,
-compute the contract's identity, temporal, policy, freshness, and provenance
-columns (`dbt_ml.agent_context` provides the id-generation helpers), and
-declare `agent_context:` on that transform. The transform can `ref()` the
-existing extraction/chunk models, so no data pipeline is discarded — only the
-contract-shaped projection is new.
+warehouse relation it wants to expose: read the extraction/chunk output and
+declare `agent_context:` on the transform. `dbt_ml.agent_context.
+project_document_registry_row`/`project_document_chunk_row` do the projection
+for you — pass the extraction/chunk output's fields as keyword arguments and
+they compute every id, fingerprint, and derived field (`validity_known`,
+`source_content_hash`, `chunk_content_hash`, `provenance_fingerprint`) with the
+same `make_*`/`content_hash` primitives the contract validates against.
+`project_document_chunk_row` additionally takes the parent `document_registry`
+row and copies its bitemporal/policy/freshness fields onto the chunk verbatim,
+so the cross-relation policy-equality check in `validate_agent_context_relations`
+holds by construction:
+
+```python
+# transforms/document_chunks.py (abridged) — wraps chunk:'s real output
+from dbt_ml.agent_context import project_document_chunk_row
+
+for chunk in deps["research_note_chunks"].iter_rows(named=True):
+    parent = registry_by_source_key[chunk["source_key"]]
+    row = project_document_chunk_row(
+        parent,
+        chunk_index=chunk["chunk_index"],
+        text=chunk["text"],
+        upstream_unique_id="model.my_project.research_note_chunks",
+        invocation_id="my-pipeline-v1",
+        chunker_identity=f"{chunk['chunk_strategy']}:400:50:v1",
+    )
+```
+
+The transform can `ref()` the existing extraction/chunk models, so no data
+pipeline is discarded — only the contract-shaped projection is new. See
+`examples/agent_context_from_builtin_pipeline/` for a complete runnable
+project built this way, including real `chunk:` splitting (not one chunk per
+document).
 
 The manifest exposes the contract version, grain, fields, primary and foreign
 keys, model `unique_id`, lineage, and safe fully qualified relation. Generated

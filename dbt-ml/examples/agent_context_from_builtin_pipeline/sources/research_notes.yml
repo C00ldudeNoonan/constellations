@@ -1,0 +1,7 @@
+version: 2
+
+sources:
+  - name: research_notes
+    description: "Synthetic economic research notes"
+    path: "./fixtures/research_notes/"
+    file_pattern: "*.json"

@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: raw_research_notes
+    description: "Synthetic economic research note fixtures"
+    source: ref('research_notes')
+    extraction:
+      backend: json
+      options:
+        fields:
+          - source_key
+          - canonical_uri
+          - source_version
+          - title
+          - effective_date
+          - is_public
+          - access_groups
+          - classification
+          - text
+    materialization: full
+    tests:
+      - not_null: [source_key, source_version, title, effective_date, text]
+      - unique: source_key

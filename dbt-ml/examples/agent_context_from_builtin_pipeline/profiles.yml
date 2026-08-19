@@ -1,0 +1,14 @@
+agent_context_from_builtin_pipeline:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/context.duckdb
+        schema: context
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb

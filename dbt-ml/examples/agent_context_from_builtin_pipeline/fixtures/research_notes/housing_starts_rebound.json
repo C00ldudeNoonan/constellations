@@ -1,0 +1,11 @@
+{
+  "source_key": "notes/housing-starts-rebound",
+  "canonical_uri": "https://research.example.test/notes/housing-starts-rebound",
+  "source_version": "2026-06-19",
+  "title": "Housing starts rebound as mortgage rates ease",
+  "effective_date": "2026-06-19T00:00:00+00:00",
+  "is_public": true,
+  "access_groups": [],
+  "classification": "public",
+  "text": "Single-family housing starts rose for a second consecutive month, recovering roughly half of the ground lost during the rate-driven slowdown earlier in the year. The rebound tracks closely with a decline in the average thirty-year mortgage rate, which has fallen more than half a percentage point from its recent peak as markets priced in a slower pace of policy tightening. Builder sentiment improved alongside the rate move, though it remains below the threshold that typically signals broad-based optimism across the industry.\n\nPermits, which lead starts by several months, rose more modestly, suggesting the current pickup in activity may not be fully sustained without further rate relief or a meaningful improvement in buyer affordability. Existing home inventory remains historically tight, a legacy of the lock-in effect from homeowners holding mortgages originated at much lower rates, and this continues to channel demand toward new construction even as overall transaction volumes stay subdued relative to the pre-pandemic decade.\n\nRegionally, the improvement was concentrated in the South and West, where builders have more readily used incentives such as rate buydowns to move inventory, while the Northeast and Midwest showed more limited gains. Homebuilder equities have rallied on the news, though analysts caution that a sustained recovery in starts likely requires mortgage rates to stabilize meaningfully below current levels rather than a single month of favorable data."
+}

@@ -22,6 +22,7 @@ from math import isfinite
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
+from uuid import uuid4
 
 import polars as pl
 import pyarrow as pa
@@ -168,6 +169,14 @@ SERVING_LEDGER_TABLE = "dbt_ml_serving_ledger"
 TEST_FAILURES_TABLE_PREFIX = "dbt_ml_test_failures__"
 STAGING_TABLE_PREFIX = "dbt_ml_staging__"
 INTERNAL_TABLE_PREFIXES = (TEST_FAILURES_TABLE_PREFIX, STAGING_TABLE_PREFIX)
+
+
+def staging_table_name(label: str) -> str:
+    """Name a single-use staging table. Both adapters spelled this inline at a
+    dozen sites; going through one function is what lets a test assert that what
+    the producers create is what `list_tables` hides."""
+    return f"{STAGING_TABLE_PREFIX}{label}__{uuid4().hex[:12]}"
+
 
 _MAX_STATE_CURSOR_CHARS = 8192
 _MAX_STATE_PAGE_SIZE = 100_000

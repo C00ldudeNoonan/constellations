@@ -3047,9 +3047,10 @@ def test_fenced_replace_maps_gate_errors_without_leaking() -> None:
 
 # ─── SQL incremental materialization (issue #142) ──────────────────────────
 
-# materialize_sql_incremental stages select_sql into a real table (named with a
-# uuid4 suffix) before validating/merging it, so the checked and merged rowsets
-# are always identical. Fixing uuid4 makes the staging table id predictable.
+# materialize_sql_incremental stages select_sql into a real table (named by
+# adapters.base.staging_table_name, with a uuid4 suffix) before
+# validating/merging it, so the checked and merged rowsets are always
+# identical. Fixing uuid4 makes the staging table id predictable.
 _STAGING_SUFFIX = "0" * 12
 _STAGING_TABLE = f"dbt_ml_staging__tgt__{_STAGING_SUFFIX}"
 _STAGING_ID = f"proj.ds.{_STAGING_TABLE}"
@@ -3059,9 +3060,7 @@ _STAGING_ID = f"proj.ds.{_STAGING_TABLE}"
 def _fixed_staging_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
     import uuid as uuid_module
 
-    monkeypatch.setattr(
-        "dbt_ml.adapters.bigquery.uuid4", lambda: uuid_module.UUID(int=0)
-    )
+    monkeypatch.setattr("dbt_ml.adapters.base.uuid4", lambda: uuid_module.UUID(int=0))
 
 
 def _stage_schema(client: _FakeClient, columns: list[tuple[str, str]]) -> None:

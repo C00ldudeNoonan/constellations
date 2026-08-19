@@ -80,6 +80,7 @@ from .base import (
     encode_state_cursor,
     plan_schema_change,
     sanitized_adapter_cause,
+    staging_table_name,
     validate_incremental_keys,
     validate_state_keys,
     validate_state_records,
@@ -1945,7 +1946,7 @@ class BigQueryAdapter(WarehouseAdapter):
         not atomic — same tradeoff as the DataFrame Iceberg full path, gated by
         ICEBERG_TABLE_FORMAT rather than ATOMIC_FULL_REPLACE."""
         job_labels = layout.labels or None
-        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+        staging = staging_table_name(table)
         staging_ref = self.table_ref(staging)
         try:
             try:
@@ -2027,7 +2028,7 @@ class BigQueryAdapter(WarehouseAdapter):
         # query — or an upstream table that changed between the two jobs —
         # merge a different, unvalidated rowset than the one that passed
         # validation (issue #142 review).
-        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+        staging = staging_table_name(table)
         staging_ref = self.table_ref(staging)
         try:
             try:
@@ -2182,7 +2183,7 @@ class BigQueryAdapter(WarehouseAdapter):
         # table — the load validates partition/cluster columns against the
         # data — then swap.
         self._apply_layout_to_load(job_config, options)
-        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+        staging = staging_table_name(table)
         target_dropped = False
         try:
             self._load_parquet(staging, df, job_config)
@@ -2348,7 +2349,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
                 self._load_parquet(table, load_df.head(0), schema_config)
 
-        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+        staging = staging_table_name(table)
         staging_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
@@ -2433,7 +2434,7 @@ class BigQueryAdapter(WarehouseAdapter):
         bigquery = _bigquery()
         layout = self._layout(options)
         job_labels = layout.labels if layout is not None else None
-        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+        staging = staging_table_name(table)
         replacement: str | None = None
         target_dropped = False
         total = 0
@@ -2497,7 +2498,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 # against real columns), then drop and rename. The target only
                 # drops after the replacement fully exists, so a bad layout
                 # never destroys the last good table.
-                replacement = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+                replacement = staging_table_name(table)
                 self._run_query(
                     f"CREATE TABLE {self.table_ref(replacement)}{layout_clauses} "
                     f"AS SELECT * FROM {self.table_ref(staging)}",
@@ -2680,7 +2681,7 @@ class BigQueryAdapter(WarehouseAdapter):
             ]
             params: list[Any] = []
             if target_exists:
-                target_staging = f"{STAGING_TABLE_PREFIX}delete_target__{uuid4().hex[:12]}"
+                target_staging = staging_table_name("delete_target")
                 self._load_keys(target_staging, target_keys, append)
                 statements.extend(
                     [
@@ -2695,7 +2696,7 @@ class BigQueryAdapter(WarehouseAdapter):
                     # scoped_keys IS target_keys — reuse the staged set, no reload.
                     state_source = target_staging
                 else:
-                    state_staging = f"{STAGING_TABLE_PREFIX}delete_state__{uuid4().hex[:12]}"
+                    state_staging = staging_table_name("delete_state")
                     self._load_keys(state_staging, scoped_keys, append)
                     state_source = state_staging
                 statements.append(
@@ -2818,17 +2819,17 @@ class BigQueryAdapter(WarehouseAdapter):
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         )
         staging: str | None = (
-            f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+            staging_table_name(table)
             if load_df.height > 0
             else None
         )
         parent_staging: str | None = (
-            f"{STAGING_TABLE_PREFIX}replace_parents__{uuid4().hex[:12]}"
+            staging_table_name("replace_parents")
             if parent_ids and len(parent_ids) > _STATE_MERGE_INLINE_MAX
             else None
         )
         state_staging: str | None = (
-            f"{STAGING_TABLE_PREFIX}replace_state__{uuid4().hex[:12]}"
+            staging_table_name("replace_state")
             if state_records and len(state_records) > _STATE_MERGE_INLINE_MAX
             else None
         )
@@ -3101,7 +3102,7 @@ class BigQueryAdapter(WarehouseAdapter):
         replace: bool,
     ) -> None:
         bigquery = _bigquery()
-        staging = f"{STAGING_TABLE_PREFIX}state_merge__{uuid4().hex[:12]}"
+        staging = staging_table_name("state_merge")
         append_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
@@ -3308,7 +3309,7 @@ class BigQueryAdapter(WarehouseAdapter):
         fence: StateScopeFence | None,
     ) -> int:
         bigquery = _bigquery()
-        staging = f"{STAGING_TABLE_PREFIX}state_replace__{uuid4().hex[:12]}"
+        staging = staging_table_name("state_replace")
         append_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,

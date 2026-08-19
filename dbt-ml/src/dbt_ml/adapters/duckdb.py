@@ -44,6 +44,7 @@ from .base import (
     encode_state_cursor,
     plan_schema_change,
     sanitized_adapter_cause,
+    staging_table_name,
     unchanged_predicate,
     validate_incremental_keys,
     validate_state_keys,
@@ -698,7 +699,7 @@ class DuckDBAdapter(WarehouseAdapter):
         *,
         options: BaseModel | None = None,
     ) -> int:
-        staging = f"{STAGING_TABLE_PREFIX}{table}__{uuid4().hex[:12]}"
+        staging = staging_table_name(table)
         staging_ref = self.table_ref(staging)
         total = 0
         first = True

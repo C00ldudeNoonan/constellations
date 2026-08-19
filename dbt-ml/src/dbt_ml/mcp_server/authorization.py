@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol
 
+from ..env import (
+    MCP_ACCESS_GROUPS_ENV,
+    MCP_POLICY_CLAIMS_ENV,
+    MCP_PRINCIPAL_ID_ENV,
+    MCP_TENANT_ID_ENV,
+    read_env,
+)
 from ..search import SearchFilter, SearchFilterOperator, SearchScalar
 
 
@@ -56,16 +62,16 @@ class EnvironmentPrincipalResolver:
     """Resolve one local stdio principal from operator-owned environment state."""
 
     def resolve(self) -> Principal | None:
-        subject_id = os.environ.get("DBT_ML_MCP_PRINCIPAL_ID", "").strip()
+        subject_id = read_env(MCP_PRINCIPAL_ID_ENV, default="").strip()
         if not subject_id:
             return None
-        tenant_id = os.environ.get("DBT_ML_MCP_TENANT_ID")
+        tenant_id = read_env(MCP_TENANT_ID_ENV)
         groups = tuple(
             value.strip()
-            for value in os.environ.get("DBT_ML_MCP_ACCESS_GROUPS", "").split(",")
+            for value in read_env(MCP_ACCESS_GROUPS_ENV, default="").split(",")
             if value.strip()
         )
-        claims = _parse_policy_claims(os.environ.get("DBT_ML_MCP_POLICY_CLAIMS"))
+        claims = _parse_policy_claims(read_env(MCP_POLICY_CLAIMS_ENV))
         return Principal(
             subject_id=subject_id,
             tenant_id=tenant_id.strip() if tenant_id and tenant_id.strip() else None,
@@ -204,9 +210,11 @@ def _parse_policy_claims(
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:
-        raise AuthorizationError("DBT_ML_MCP_POLICY_CLAIMS must be a JSON object") from None
+        raise AuthorizationError(
+            f"{MCP_POLICY_CLAIMS_ENV} must be a JSON object"
+        ) from None
     if not isinstance(decoded, dict):
-        raise AuthorizationError("DBT_ML_MCP_POLICY_CLAIMS must be a JSON object")
+        raise AuthorizationError(f"{MCP_POLICY_CLAIMS_ENV} must be a JSON object")
     claims: dict[str, SearchScalar | tuple[SearchScalar, ...]] = {}
     for name, value in decoded.items():
         if not isinstance(name, str) or not name:

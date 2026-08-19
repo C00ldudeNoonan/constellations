@@ -19,11 +19,14 @@ DEBUG for troubleshooting should attach their own handler.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 
-_VERBOSE_ENV_VAR = "DBT_ML_VERBOSE"
+from .env import VERBOSE_ENV, read_env
+
 _HANDLER_ATTR = "_dbt_ml_verbose_handler"
+# Must stay equal to the top-level package name: a handler attached to a
+# namespace no module logs under silences `-v` without failing. Pinned in
+# tests/test_frozen_names.py.
 _ROOT_LOGGER = "dbt_ml"
 
 
@@ -36,7 +39,7 @@ def resolve_verbosity(cli_count: int) -> int:
     """
     if cli_count > 0:
         return 1
-    raw = os.environ.get(_VERBOSE_ENV_VAR, "").strip()
+    raw = read_env(VERBOSE_ENV, default="").strip()
     if not raw:
         return 0
     try:

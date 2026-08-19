@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import sys
 import time
@@ -28,6 +27,7 @@ from ..credentials import (
     ProtectedCredential,
 )
 from ..endpoints import EndpointUrlError, OpenAICompatibleBaseUrl
+from ..env import PROVIDER_DEBUG_ENV, read_env
 from ..hashing import HASH_DIGEST_SIZE, canonical_fingerprint
 
 log = logging.getLogger(__name__)
@@ -131,8 +131,6 @@ _DEBUG_EXCEPTION_LABELS: dict[type[BaseException], str] = {
 }
 
 
-PROVIDER_DEBUG_ENV = "DBT_ML_DEBUG_PROVIDER_ERRORS"
-
 
 def provider_error_debug_enabled() -> bool:
     """Whether operators opted into allowlisted SDK diagnostics in debug logs.
@@ -142,7 +140,7 @@ def provider_error_debug_enabled() -> bool:
     aggregators. Diagnostics contain only exception types and stack locations;
     the switch exists for local diagnosis.
     """
-    value = os.environ.get(PROVIDER_DEBUG_ENV, "")
+    value = read_env(PROVIDER_DEBUG_ENV, default="")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 

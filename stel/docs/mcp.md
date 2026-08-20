@@ -118,7 +118,7 @@ can then combine dbt metrics with stel citations without either server
 assuming ownership of the other's domain.
 
 For a source checkout, replace the `--with stel[...]` portion with
-`--project C:/path/to/stel/stel`.
+`--project C:/path/to/<checkout>/stel`.
 
 ## Limits and errors
 

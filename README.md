@@ -160,8 +160,8 @@ uv add 'stel[bigquery,gcs]'
 ## Quickstart
 
 ```bash
-git clone https://github.com/C00ldudeNoonan/dbt-ml
-cd stel/stel
+git clone https://github.com/C00ldudeNoonan/dbt-ml constellations
+cd constellations/stel
 uv sync
 uv run stel --project-dir examples/invoice_pipeline seed --count 5
 uv run stel --project-dir examples/invoice_pipeline run

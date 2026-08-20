@@ -5,8 +5,8 @@ stel is a small, focused Python project. Contributions welcome.
 ## Setup
 
 ```bash
-git clone https://github.com/C00ldudeNoonan/dbt-ml
-cd stel/stel
+git clone https://github.com/C00ldudeNoonan/dbt-ml constellations
+cd constellations/stel
 uv sync --all-extras --dev --locked
 uv run pytest -q
 ```

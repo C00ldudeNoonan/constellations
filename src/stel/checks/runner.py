@@ -11,6 +11,7 @@ from ..profile import ResolvedProfile, resolve_profile
 from ..test_specs import (
     declared_accepted_values,
     enum_test_specs,
+    has_model_tests,
     uses_llm_judge,
 )
 from .schema import TestResult, UnknownTestError, evaluate_test_spec
@@ -84,7 +85,11 @@ def run_project_tests(
         for model in models:
             if model.name not in selected_names:
                 continue
-            if not model.tests:
+            # Not `model.tests`: an enum field carries a derived check with no
+            # `tests:` entry to see (issue #304), and skipping here would let
+            # `stel test` silently accept an invalid label set that the same
+            # model fails on the run path.
+            if not has_model_tests(model):
                 continue
             results.extend(
                 run_model_tests(

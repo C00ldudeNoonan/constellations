@@ -934,12 +934,13 @@ class InferenceProvider(BaseProvider):
     max_batch_requests: ClassVar[int | None] = None
     batch_cost_multiplier: ClassVar[float] = 1.0
     # Whether this provider's structured-output surface can carry an `enum`
-    # constraint (issue #304). Every shipped provider forwards a JSON-Schema
-    # -shaped payload that can, so the default is True; a provider whose
-    # schema cannot express one sets this False and gets the closed set
-    # rendered into the prompt instead, which communicates the taxonomy even
-    # where it cannot enforce it.
-    supports_schema_enum: ClassVar[bool] = True
+    # constraint (issue #304). Opt-in, and deliberately so: a provider written
+    # before this existed cannot have declared it, and sending a keyword its
+    # API may reject is a hard failure, where the default path — the closed set
+    # rendered into the prompt — still communicates the taxonomy. So an
+    # undeclared provider degrades instead of breaking, and every shipped
+    # provider opts in explicitly below.
+    supports_schema_enum: ClassVar[bool] = False
 
     @abstractmethod
     def complete(

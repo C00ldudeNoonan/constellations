@@ -45,6 +45,8 @@ from .sql_models import (
 from .test_specs import (
     TestSpecError,
     declared_accepted_values,
+    enum_test_drift,
+    has_model_tests,
     parse_test_spec,
 )
 from .transforms import transform_requires_llm, validate_transform_contract
@@ -306,7 +308,10 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
             )
-        if model.tests and model.search is None:
+        # Derived enum checks count: they are schema tests the adapter must
+        # support, and finding that out after materialization would move a
+        # predictable configuration failure past warehouse mutation (#304).
+        if has_model_tests(model) and model.search is None:
             required[WarehouseCapability.SQL_SCHEMA_TESTS] = "model tests"
         if (
             model.materialization == "incremental"
@@ -536,21 +541,16 @@ def _warn_on_enum_test_drift(model: ModelConfig) -> None:
     one of the two lists has drifted. Which one is right is the author's call,
     so this reports rather than decides.
     """
-    declared = declared_accepted_values(model.tests)
-    for field in model.fields:
-        if not field.values or field.name not in declared:
-            continue
-        explicit = declared[field.name]
-        if set(explicit) == set(field.values):
-            continue
+    drift = enum_test_drift(model.fields, declared_accepted_values(model.tests))
+    for name, values, explicit in drift:
         log.warning(
-            "Model '%s' field '%s' declares `values: %s` but its "
+            "Model '%s' field '%s' declares `values: %s` but an "
             "accepted_values test allows %s. The declared set is what the "
             "provider schema and the prompt use, so the test is checking a "
             "different taxonomy than the model was asked for.",
             model.name,
-            field.name,
-            sorted(field.values),
+            name,
+            sorted(values),
             sorted(map(str, explicit)),
         )
 

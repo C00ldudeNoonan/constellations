@@ -239,3 +239,158 @@ def test_shipped_providers_can_carry_schema_enums() -> None:
         VLLMInferenceProvider,
     ):
         assert provider.supports_schema_enum
+
+
+# ─── review follow-ups (PR #327) ────────────────────────────────────────────
+
+
+def test_enum_has_a_warehouse_dtype() -> None:
+    """The declared-data_type mapping has to know `enum`.
+
+    It is shared by extraction and `_llm_output_schema`, and a missing entry is
+    a KeyError before any row — or the typed empty relation — is written.
+    """
+    import polars as pl
+
+    from stel.execution.extraction import EXTRACTION_FIELD_DTYPES
+
+    assert EXTRACTION_FIELD_DTYPES["enum"] is pl.String
+
+
+def test_enum_only_model_counts_as_having_tests() -> None:
+    """`stel test` selects on this, and so does the capability preflight.
+
+    Reading `model.tests` directly would skip a model whose only check is
+    derived, and silently accept an invalid label set already in the warehouse.
+    """
+    from stel.test_specs import has_model_tests
+
+    assert has_model_tests(_model())
+    assert not has_model_tests(
+        ModelConfig(name="plain", fields=[FieldConfig(name="signal")])
+    )
+
+
+def test_enum_only_model_requires_schema_test_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Predictable configuration failures belong before warehouse mutation.
+
+    Both shipped adapters support schema tests, so the capability set is
+    stubbed to exercise the gate rather than the adapters.
+    """
+    from stel import compiler
+    from stel.adapters import WarehouseCapability
+
+    monkeypatch.setattr(
+        compiler,
+        "adapter_capabilities",
+        lambda _adapter_type: frozenset(
+            capability
+            for capability in WarehouseCapability
+            if capability is not WarehouseCapability.SQL_SCHEMA_TESTS
+        ),
+    )
+
+    with pytest.raises(Exception, match="model tests"):
+        compiler.validate_warehouse_capabilities([_model()], "duckdb")
+
+
+def test_extraction_backend_llm_carries_the_enum_to_the_provider() -> None:
+    """The same declaration works on the `backend: llm` extraction path.
+
+    That path builds its schema from `extraction.options.fields`, never from
+    top-level `fields:`, so without this the documented single declaration
+    would not reach the provider here at all.
+    """
+    from stel.backends.llm_backend import _fields_spec
+
+    spec = _fields_spec(
+        {
+            "fields": [
+                {"name": "signal", "type": "enum", "values": ["a", "b"]},
+                {"name": "n", "type": "integer"},
+                {"name": "tags", "type": "array", "items": {"type": "string"}},
+            ]
+        }
+    )
+
+    assert _input_schema(spec)["properties"] == {
+        # `enum` is normalized to the string it constrains...
+        "signal": {"type": "string", "enum": ["a", "b"]},
+        # ...and every other type is untouched.
+        "n": {"type": "integer"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    }
+
+
+def test_llm_option_field_enum_is_validated_like_the_model_field() -> None:
+    from stel.backends.options import LLMFieldSpec
+
+    with pytest.raises(ValueError, match="declares no `values:`"):
+        LLMFieldSpec(name="signal", type="enum")
+    with pytest.raises(ValueError, match="use `type: enum`"):
+        LLMFieldSpec(name="signal", type="string", values=["a"])
+
+
+def test_schema_enum_support_is_opt_in() -> None:
+    """A provider written before this existed cannot have declared it.
+
+    Defaulting to True would send a keyword its API may reject; defaulting to
+    False degrades to the prompt fallback, which still communicates the set.
+    """
+    from stel.providers.base import InferenceProvider
+
+    assert InferenceProvider.supports_schema_enum is False
+
+
+def test_the_deterministic_provider_picks_a_declared_value() -> None:
+    """Offline enum pipelines must not fail their own derived check.
+
+    A generated `det-…` string would be outside the declared set by
+    construction, so every example and contract test using an enum would fail.
+    """
+    from stel.providers.base import InferenceRequest, ProviderRuntimeOptions
+    from stel.providers.deterministic import DeterministicInferenceProvider
+
+    provider = DeterministicInferenceProvider()
+    schema = _input_schema(build_fields_spec([_signal_field()]))
+
+    seen = {
+        provider.complete(
+            InferenceRequest(
+                content=f"document {i}",
+                system_prompt="",
+                output_schema=schema,
+                model="deterministic-v1",
+            ),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        ).output["signal"]
+        for i in range(25)
+    }
+
+    assert seen
+    assert seen <= set(_LABELS)
+
+
+def test_every_conflicting_accepted_values_declaration_is_reported(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A matching later test must not hide a conflicting earlier one.
+
+    Both of them run, so both are compared.
+    """
+    from stel.compiler import _validate_tests
+
+    model = _model(
+        [
+            {"accepted_values": {"column": "signal", "values": ["churn_risk", "gone"]}},
+            {"accepted_values": {"column": "signal", "values": list(_LABELS)}},
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _validate_tests(model, set(), {"classified"}, tmp_path)
+
+    assert "checking a different taxonomy" in caplog.text

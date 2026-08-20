@@ -210,6 +210,11 @@ EXTRACTION_FIELD_DTYPES: dict[str, Any] = {
     "date": pl.Date,
     "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
     "json": pl.String,
+    # An `enum` field materializes as the string it constrains (issue #304);
+    # `enum` is stel's declaration, not a warehouse column type. Shared with
+    # `_llm_output_schema` in execution/llm.py, so a missing entry here is a
+    # KeyError before any row or typed empty relation is written.
+    "enum": pl.String,
 }
 
 

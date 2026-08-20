@@ -106,9 +106,18 @@ def _fields_spec(options: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(
                 "llm backend requires `options.fields: [{name, type, ...}]`"
             )
-        fields.append(
-            {key: value for key, value in field.items() if isinstance(key, str)}
-        )
+        spec = {key: value for key, value in field.items() if isinstance(key, str)}
+        # `type: enum` is stel's declaration, not a JSON Schema type: normalize
+        # it to the string it constrains, carrying the closed set as `enum` so
+        # it reaches the provider schema on this path too (issue #304).
+        if spec.pop("type", None) == "enum" or spec.get("values"):
+            spec["type"] = "string"
+            values = spec.pop("values", None)
+            if values:
+                spec["enum"] = list(values)
+        elif "type" in field:
+            spec["type"] = field["type"]
+        fields.append(spec)
     return fields
 
 

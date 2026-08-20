@@ -17,7 +17,6 @@ from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
 from ..sql_models import build_key_check_sql
 from .base import (
-    INTERNAL_TABLE_PREFIXES,
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
     AdapterError,
@@ -320,7 +319,7 @@ class DuckDBAdapter(WarehouseAdapter):
 
         shape = ", ".join(name for name, _type, _nullable in columns)
         raise AdapterError(
-            "Unsupported dbt_ml_state schema; expected the legacy v1 or current "
+            f"Unsupported {_STATE_TABLE} schema; expected the legacy v1 or current "
             f"v2 shape, found columns: {shape or '(none)'}. Back up the table and "
             "run --full-refresh after resolving the state schema."
         )
@@ -1102,17 +1101,30 @@ class DuckDBAdapter(WarehouseAdapter):
             path.unlink()
         return str(path)
 
-    def list_tables(self) -> list[str]:
+    def list_all_tables(self, schema: str | None = None) -> list[str]:
         rows = self.connection.execute(
             "SELECT table_name FROM information_schema.tables "
-            f"WHERE table_catalog = ? AND table_schema = ? AND table_name != '{_STATE_TABLE}' "
+            "WHERE table_catalog = ? AND table_schema = ? "
             "ORDER BY table_name",
-            [self.catalog, self.schema],
+            [self.catalog, schema if schema is not None else self.schema],
         ).fetchall()
-        # Test-failure and staging tables are stel internals, not models;
-        # keep both out of the model namespace. (Filtered in Python because
-        # `_` is a LIKE wildcard in SQL.)
-        return [r[0] for r in rows if not r[0].startswith(INTERNAL_TABLE_PREFIXES)]
+        # A schema that does not exist simply has no rows here, which is the
+        # empty result the guards want rather than an error.
+        return [str(r[0]) for r in rows]
+
+    def rename_table(self, old: str, new: str) -> None:
+        old_ref = f"{self.schema_ref}.{self.quote_ident(old)}"
+        try:
+            # DuckDB DDL is transactional, so the rename either lands or does
+            # not; there is no half-renamed table to reason about.
+            with self._transaction():
+                self.connection.execute(
+                    f"ALTER TABLE {old_ref} RENAME TO {self.quote_ident(new)}"
+                )
+        except Exception as error:
+            raise AdapterError(
+                f"DuckDB could not rename '{old}' to '{new}'"
+            ) from sanitized_adapter_cause(error)
 
     # ─── state CRUD ──────────────────────────────────────────────────────
 

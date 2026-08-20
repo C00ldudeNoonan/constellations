@@ -342,11 +342,11 @@ def test_extraction_rows_carry_contract_columns(
     generate_invoices(3, project / "data" / "invoices", seed=1)
     run_project(project, select="raw_invoices")
 
-    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
     try:
         rows = con.execute(
             "SELECT document_id, source_uri, backend_name, backend_version, "
-            'extracted_at, content_hash FROM "dbt_ml".dbt_ml.raw_invoices'
+            'extracted_at, content_hash FROM "stel".stel.raw_invoices'
         ).fetchall()
     finally:
         con.close()

@@ -32,7 +32,7 @@ uv run dbt build --profiles-dir .
 After it succeeds, both the stel tables and dbt tables live in one DuckDB file:
 
 ```bash
-duckdb ../invoice_pipeline/target/dbt_ml.duckdb -c "SHOW ALL TABLES"
+duckdb ../invoice_pipeline/target/stel.duckdb -c "SHOW ALL TABLES"
 ```
 
 ## What this proves

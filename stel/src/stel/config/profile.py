@@ -119,6 +119,16 @@ class WarehouseConfig(BaseModel):
     type: str = "duckdb"
     schema_name: str = Field(default=DEFAULT_SCHEMA_NAME, alias="schema")
 
+    def schema_is_default(self) -> bool:
+        """True only when the operator never named a schema.
+
+        The #313 legacy-schema guard fires on this: an operator who wrote
+        `schema:` chose where their data lives and is not being surprised by a
+        changed default, so the guard must stay out of their way even when the
+        value they chose happens to equal the current default.
+        """
+        return "schema_name" not in self.model_fields_set
+
     def bind_target_name(self, target_name: str) -> None:
         """Attach resolved runtime target identity without making it profile YAML."""
         self._target_name = target_name

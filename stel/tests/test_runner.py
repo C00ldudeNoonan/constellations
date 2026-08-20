@@ -105,9 +105,9 @@ def test_end_to_end_run(fresh_project: Path) -> None:
     assert by_name["raw_invoices"].rows_written == 10
     assert by_name["invoice_summary"].kind == "transform"
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
+    db = fresh_project / "target" / "stel.duckdb"
     assert db.exists()
-    rows = _query(db, 'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.raw_invoices')
+    rows = _query(db, 'SELECT COUNT(*) FROM "stel".stel.raw_invoices')
     assert rows[0][0] == 10
 
 
@@ -242,10 +242,10 @@ def test_changed_doc_is_reprocessed(fresh_project: Path) -> None:
     assert raw.documents_processed == 1
     assert raw.documents_skipped == 4
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
+    db = fresh_project / "target" / "stel.duckdb"
     rows = _query(
         db,
-        'SELECT vendor FROM "dbt_ml".dbt_ml.raw_invoices '
+        'SELECT vendor FROM "stel".stel.raw_invoices '
         "WHERE source_path = 'invoice_00002.json'",
     )
     assert rows[0][0] == "MUTATED_VENDOR"
@@ -264,18 +264,18 @@ def test_removed_doc_is_pruned_on_incremental(fresh_project: Path) -> None:
     assert raw.documents_skipped == 4
     assert raw.documents_deleted == 1
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
-    rows = _query(db, 'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.raw_invoices')
+    db = fresh_project / "target" / "stel.duckdb"
+    rows = _query(db, 'SELECT COUNT(*) FROM "stel".stel.raw_invoices')
     assert rows[0][0] == 4
     gone = _query(
         db,
-        'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.raw_invoices '
+        'SELECT COUNT(*) FROM "stel".stel.raw_invoices '
         "WHERE source_path = 'invoice_00002.json'",
     )
     assert gone[0][0] == 0
     state = _query(
         db,
-        "SELECT COUNT(*) FROM \"dbt_ml\".dbt_ml.dbt_ml_state "
+        "SELECT COUNT(*) FROM \"stel\".stel.stel_state "
         "WHERE model_name = 'raw_invoices'",
     )
     assert state[0][0] == 4
@@ -310,13 +310,13 @@ def test_transform_aggregates_dependency(fresh_project: Path) -> None:
     generate_invoices(20, invoices_dir, seed=1)
     run_project(fresh_project)
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
+    db = fresh_project / "target" / "stel.duckdb"
     rows = _query(
         db,
-        'SELECT SUM(invoice_count), SUM(total_spend) FROM "dbt_ml".dbt_ml.invoice_summary',
+        'SELECT SUM(invoice_count), SUM(total_spend) FROM "stel".stel.invoice_summary',
     )
     raw_rows = _query(
-        db, 'SELECT COUNT(*), SUM(total) FROM "dbt_ml".dbt_ml.raw_invoices'
+        db, 'SELECT COUNT(*), SUM(total) FROM "stel".stel.raw_invoices'
     )
     assert rows[0][0] == raw_rows[0][0]
     assert rows[0][1] == pytest.approx(raw_rows[0][1])
@@ -326,8 +326,8 @@ def test_llm_transform_reports_provider_provenance(fresh_project: Path) -> None:
     profiles = fresh_project / "profiles.yml"
     profiles.write_text(
         profiles.read_text().replace(
-            "        schema: dbt_ml",
-            "        schema: dbt_ml\n"
+            "        schema: stel",
+            "        schema: stel\n"
             "      llm:\n"
             "        provider: anthropic\n"
             "        model: provenance-model",
@@ -419,8 +419,8 @@ def test_run_with_threads_produces_same_results(fresh_project: Path) -> None:
     raw_parallel = next(r for r in results_parallel if r.model_name == "raw_invoices")
     assert raw_parallel.rows_written == 20
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
-    rows = _query(db, 'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.raw_invoices')
+    db = fresh_project / "target" / "stel.duckdb"
+    rows = _query(db, 'SELECT COUNT(*) FROM "stel".stel.raw_invoices')
     assert rows[0][0] == 20
 
 
@@ -438,9 +438,9 @@ def test_threaded_run_parallelizes_independent_branches(fresh_project: Path) -> 
     assert parallel_rows == serial_rows
     assert set(parallel_rows) == {"raw_invoices", "invoice_summary", "monthly_totals"}
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
-    summary = _query(db, 'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.invoice_summary')
-    monthly = _query(db, 'SELECT COUNT(*) FROM "dbt_ml".dbt_ml.monthly_totals')
+    db = fresh_project / "target" / "stel.duckdb"
+    summary = _query(db, 'SELECT COUNT(*) FROM "stel".stel.invoice_summary')
+    monthly = _query(db, 'SELECT COUNT(*) FROM "stel".stel.monthly_totals')
     assert summary[0][0] > 0
     assert monthly[0][0] > 0
 
@@ -483,7 +483,7 @@ def test_clean_preserves_duckdb(fresh_project: Path) -> None:
     invoices_dir = fresh_project / "data" / "invoices"
     generate_invoices(2, invoices_dir, seed=1)
     run_project(fresh_project)
-    db = fresh_project / "target" / "dbt_ml.duckdb"
+    db = fresh_project / "target" / "stel.duckdb"
     assert db.exists()
 
     clean_project(fresh_project)
@@ -527,11 +527,11 @@ def test_classic_ml_tfidf_end_to_end(tmp_path: Path) -> None:
     registry = json.loads(registry_path.read_text())
     assert registry["artifacts"]["ticket_tfidf"]["artifact_version"] == ml_result.artifact_version
 
-    db = project / "target" / "dbt_ml.duckdb"
+    db = project / "target" / "stel.duckdb"
     rows = _query(
         db,
         'SELECT COUNT(*), COUNT(DISTINCT row_id) FROM '
-        '"dbt_ml".classic_text_ml.ticket_tfidf',
+        '"stel".classic_text_ml.ticket_tfidf',
     )
     assert rows[0][0] == ml_result.rows_written
     assert rows[0][1] == 8
@@ -637,11 +637,11 @@ def test_classic_ml_naive_bayes_classifier_end_to_end(tmp_path: Path) -> None:
     model_payload = json.loads((artifact / "model.json").read_text())
     assert model_payload["classes"] == ["high", "low"]
 
-    db = project / "target" / "dbt_ml.duckdb"
+    db = project / "target" / "stel.duckdb"
     rows = _query(
         db,
         'SELECT COUNT(*), SUM(CASE WHEN correct THEN 1 ELSE 0 END) '
-        'FROM "dbt_ml".classic_text_ml.ticket_priority_classifier',
+        'FROM "stel".classic_text_ml.ticket_priority_classifier',
     )
     assert rows == [(4, 4)]
 
@@ -823,10 +823,10 @@ def test_classic_ml_count_vectorizer_options(tmp_path: Path) -> None:
     assert count.rows_written == 4
     assert count.metrics["vocabulary_size"] == 3
 
-    db = project / "target" / "dbt_ml.duckdb"
+    db = project / "target" / "stel.duckdb"
     rows = _query(
         db,
-        'SELECT term, SUM(count), SUM(value) FROM "dbt_ml".classic_text_ml.ticket_count '
+        'SELECT term, SUM(count), SUM(value) FROM "stel".classic_text_ml.ticket_count '
         "GROUP BY term ORDER BY term",
     )
     assert rows == [
@@ -873,11 +873,11 @@ def test_classic_ml_hashing_vectorizer(tmp_path: Path) -> None:
     assert hashing.metrics["hash_buckets"] == 8
     assert hashing.metrics["vocabulary_size"] == 0
 
-    db = project / "target" / "dbt_ml.duckdb"
+    db = project / "target" / "stel.duckdb"
     rows = _query(
         db,
         'SELECT MIN(hash_bucket), MAX(hash_bucket), COUNT(DISTINCT term) '
-        'FROM "dbt_ml".classic_text_ml.ticket_hashing',
+        'FROM "stel".classic_text_ml.ticket_hashing',
     )
     assert rows[0][0] >= 0
     assert rows[0][1] < 8
@@ -919,10 +919,10 @@ def test_classic_ml_tfidf_character_ngrams(tmp_path: Path) -> None:
 
     run_project(project)
 
-    db = project / "target" / "dbt_ml.duckdb"
+    db = project / "target" / "stel.duckdb"
     rows = _query(
         db,
-        'SELECT term, COUNT(*) FROM "dbt_ml".classic_text_ml.ticket_char_tfidf '
+        'SELECT term, COUNT(*) FROM "stel".classic_text_ml.ticket_char_tfidf '
         "WHERE term = 'abc' GROUP BY term",
     )
     assert rows == [("abc", 1)]
@@ -1045,10 +1045,10 @@ def test_incremental_schema_change_append_policy(fresh_project: Path) -> None:
     # config change bumps code_version, so every doc reprocesses
     assert raw.documents_processed == 5
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
+    db = fresh_project / "target" / "stel.duckdb"
     rows = _query(
         db,
-        'SELECT COUNT(*), COUNT(currency) FROM "dbt_ml".dbt_ml.raw_invoices',
+        'SELECT COUNT(*), COUNT(currency) FROM "stel".stel.raw_invoices',
     )
     assert rows[0] == (5, 0)
 
@@ -1062,10 +1062,10 @@ def test_full_refresh_clears_schema_drift(fresh_project: Path) -> None:
     raw = next(r for r in results if r.model_name == "raw_invoices")
     assert raw.documents_processed == 5
 
-    db = fresh_project / "target" / "dbt_ml.duckdb"
+    db = fresh_project / "target" / "stel.duckdb"
     cols = _query(
         db,
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'dbt_ml' AND table_name = 'raw_invoices'",
+        "WHERE table_schema = 'stel' AND table_name = 'raw_invoices'",
     )
     assert ("currency",) not in cols

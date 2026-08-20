@@ -64,7 +64,7 @@ cd my_project
 uv run stel run
 
 # 4. Query the result
-duckdb target/dbt_ml.duckdb -c "SELECT * FROM my_project.raw_pdf_text LIMIT 5"
+duckdb target/stel.duckdb -c "SELECT * FROM my_project.raw_pdf_text LIMIT 5"
 ```
 
 That's the whole loop. Everything else (selectors, profiles, tests, LLM
@@ -387,6 +387,7 @@ stel docs serve [--port N]                               # local http.server ove
 stel emit-dbt-sources [--output PATH]                    # write dbt-compatible sources.yml
 stel codegen --output DIR                                # generate dbt Python-model shims + schema.yml (embedded path)
 stel clean                                               # remove known target artifacts; preserve warehouses
+stel migrate [--dry-run]                                 # one-time: rename pre-#313 internal warehouse tables
 
 # Global flags (work on every command):
 stel --project-dir <dir> --profiles-dir <dir> --target <name> <command>
@@ -424,6 +425,52 @@ declaration. Configuration failures exit 2.
   filtered run is **additive/upsert-only**: it never deletes, requires
   incremental extraction models, and is rejected with `--full-refresh`. Deletion
   of removed documents is reconciled by a periodic unfiltered full run.
+
+### Upgrading a warehouse built before the rename
+
+stel's internal warehouse objects are named after the tool, so renaming the
+tool renamed them: `dbt_ml_state` became `stel_state`, the serving ledger and
+leases followed, the default schema went from `dbt_ml` to `stel`, and the
+zero-config DuckDB file from `target/dbt_ml.duckdb` to `target/stel.duckdb`.
+
+Those tables are data. `stel_state` holds every incremental fingerprint, so a
+run that cannot find it concludes that every document is new and reprocesses
+the whole corpus at provider cost — with no error, because that is exactly
+what a genuine first run looks like. Nothing is allowed to reach that state
+silently, so each way of arriving at it is a hard stop with the fix named.
+
+**Internal tables under their old names.** Run the migration once per target:
+
+```
+stel migrate --dry-run   # what would be renamed
+stel migrate             # rename in place, rows preserved
+```
+
+It renames only the tables stel owns, only inside the schema the target
+already points at. If it finds both spellings of the same object it refuses
+rather than choosing which one holds the live rows.
+
+**A schema you never named.** A project with no `schema:` in its profile used
+to get `dbt_ml` and now gets `stel`. If the old schema still holds your data,
+say so explicitly — moving a whole schema is your call, not the migration's:
+
+```yaml
+warehouse:
+  type: duckdb
+  path: ./target/stel.duckdb
+  schema: dbt_ml
+```
+
+An explicit `schema:` is never second-guessed, so a project that already had
+one is unaffected either way.
+
+**A zero-config project.** Same shape: a project with no `profile:` that never
+set `duckdb.path` now defaults to `target/stel.duckdb`. Config load refuses to
+open it while `target/dbt_ml.duckdb` exists; point `path:` at the existing file
+(then `stel migrate`), or delete it if you meant to start over.
+
+Model names beginning with `stel_` are now reserved alongside `dbt_ml_`, which
+stays reserved even though no internal table uses it any more.
 
 ## Selectors
 
@@ -551,7 +598,7 @@ my_project:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
+        path: ./target/stel.duckdb
         schema: my_project
       source_paths:
         filings: ./data/dev/filings
@@ -567,7 +614,7 @@ my_project:
     prod:
       warehouse:
         type: duckdb
-        path: "{{ env_var('STEL_PROD_DB', '/data/prod/dbt_ml.duckdb') }}"
+        path: "{{ env_var('STEL_PROD_DB', '/data/prod/stel.duckdb') }}"
         schema: my_project_prod
       source_paths:
         filings: "{{ env_var('STEL_FILINGS_ROOT', '/data/prod/filings') }}"
@@ -662,7 +709,7 @@ my_project:
       warehouse:
         type: bigquery
         project: my-gcp-project
-        dataset: dbt_ml
+        dataset: stel
       embedding:
         provider: vertex
         timeout_seconds: 60
@@ -727,7 +774,7 @@ my_project:
       warehouse:
         type: bigquery
         project: my-gcp-project
-        dataset: dbt_ml                # `schema:` works too
+        dataset: stel                  # `schema:` works too
         location: US                   # optional
         # Omit auth fields for ADC, or choose exactly one auth family:
         # keyfile: ./secrets/service-account.json
@@ -1410,7 +1457,7 @@ my_project:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
+        path: ./target/stel.duckdb
         schema: my_project
       retrieval:
         default: local
@@ -2183,7 +2230,7 @@ collapse — both invisible to `not_null`.
 
 **Inspecting failures.** Pass `--store-failures` to `stel test` or `stel
 build` to persist the offending rows of each failing test to a
-`dbt_ml_test_failures__<model>__<test>[__<column>]` table (replaced each run).
+`stel_test_failures__<model>__<test>[__<column>]` table (replaced each run).
 The test output reports the table name and row count. These tables are
 inspection artifacts and are kept out of the model namespace (they don't show up
 in `stel ls` or `emit-dbt-sources`).

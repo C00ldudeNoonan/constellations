@@ -77,7 +77,7 @@ def test_manifest_emits_safe_effective_inference_descriptor(
                 "    dev:",
                 "      warehouse:",
                 "        type: duckdb",
-                "        path: ./target/dbt_ml.duckdb",
+                "        path: ./target/stel.duckdb",
                 "      llm:",
                 "        provider: anthropic",
                 "        model: effective-model",
@@ -305,7 +305,7 @@ def test_run_results_metadata_and_relations(fresh_project: Path) -> None:
         "warnings": 0,
     }
     assert meta["target"]["adapter_type"] == "duckdb"
-    assert meta["target"]["schema"] == "dbt_ml"
+    assert meta["target"]["schema"] == "stel"
 
     for row in payload["results"]:
         assert row["status"] == "success"

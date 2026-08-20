@@ -4,8 +4,8 @@ sql_governed_chunks:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
-        schema: dbt_ml
+        path: ./target/stel.duckdb
+        schema: stel
 
     # MotherDuck is the same DuckDB adapter over the network (issue #186).
     # `stel run --target motherduck` with MOTHERDUCK_TOKEN set in the
@@ -15,4 +15,4 @@ sql_governed_chunks:
         type: duckdb
         path: md:sql_governed_chunks
         token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
-        schema: dbt_ml
+        schema: stel

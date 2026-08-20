@@ -126,7 +126,7 @@ def test_store_failures_sql_test_persists_rows(populated_db: WarehouseAdapter) -
     )
     r = results[0]
     assert not r.passed
-    assert r.failures_table == "dbt_ml_test_failures__items__not_null__total"
+    assert r.failures_table == "stel_test_failures__items__not_null__total"
     assert r.failure_count == 1
     stored = populated_db.query_df(
         f"SELECT * FROM {populated_db.table_ref(r.failures_table)}"

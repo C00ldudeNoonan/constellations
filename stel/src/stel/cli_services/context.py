@@ -12,6 +12,7 @@ from pathlib import Path
 
 import click
 
+from ..adapters import LegacyWarehouseNamesError
 from ..config import ConfigError, load_project
 from ..config.model import ModelConfig
 from ..config.project import ProjectConfig
@@ -35,6 +36,9 @@ class ConfigClickError(click.ClickException):
 # (a run that started but a model failed hard) stays a plain ClickException → 1.
 CONFIG_ERRORS = (
     ConfigError,
+    # Pointed at pre-#313 warehouse names: a setup problem with a config
+    # or `stel migrate` fix, never a model that started and failed.
+    LegacyWarehouseNamesError,
     DAGError,
     SelectionError,
     ProfileError,

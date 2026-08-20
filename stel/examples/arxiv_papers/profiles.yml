@@ -4,5 +4,5 @@ arxiv_papers:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
+        path: ./target/stel.duckdb
         schema: arxiv

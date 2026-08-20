@@ -28,6 +28,7 @@ import polars as pl
 import pyarrow as pa
 from pydantic import BaseModel, ValidationError
 
+from ..config.identifiers import DEFAULT_SCHEMA_NAME, LEGACY_SCHEMA_NAME
 from ..config.profile import WarehouseConfig
 from ..hashing import canonical_fingerprint
 
@@ -151,24 +152,72 @@ def validate_state_keys(record_keys: Sequence[str]) -> None:
 # it points at: the next run finds no prior state, reports every document as
 # new, and reprocesses the corpus at provider cost, with no error to notice.
 # Change these only with a migration that carries the existing objects over.
+#
+# #313 did exactly that: every name here moved from `dbt_ml_*` to `stel_*`,
+# carried by `stel migrate` (adapters/migration.py) and fenced by the
+# connect-time guard in `WarehouseAdapter.__enter__`, so a warehouse that
+# still holds the old objects raises instead of starting over.
 
 # Incremental state. Hoisted from the DuckDB and BigQuery adapters, which
 # declared it separately with nothing asserting the two agreed.
-STATE_TABLE = "dbt_ml_state"
+STATE_TABLE = "stel_state"
+LEGACY_STATE_TABLE = "dbt_ml_state"
 
 # Serving-ledger table name shared with retrieval.coordination: fenced state
 # replacement must verify a publication claim in the same warehouse that owns
 # the state rows, without adapters importing retrieval code.
-SERVING_LEDGER_TABLE = "dbt_ml_serving_ledger"
+SERVING_LEDGER_TABLE = "stel_serving_ledger"
+LEGACY_SERVING_LEDGER_TABLE = "dbt_ml_serving_ledger"
+
+# Serving leases, aliased by retrieval.coordination, which owns the protocol.
+# The name lives here so migration planning can see all three persisted tables
+# without adapters importing retrieval code.
+SERVING_LEASE_TABLE = "stel_serving_leases"
+LEGACY_SERVING_LEASE_TABLE = "dbt_ml_serving_leases"
+
+# Every persisted internal table, oldest name first, as (legacy, current)
+# pairs. `stel migrate` renames each pair it finds; nothing else may.
+MIGRATED_TABLE_NAMES: tuple[tuple[str, str], ...] = (
+    (LEGACY_STATE_TABLE, STATE_TABLE),
+    (LEGACY_SERVING_LEDGER_TABLE, SERVING_LEDGER_TABLE),
+    (LEGACY_SERVING_LEASE_TABLE, SERVING_LEASE_TABLE),
+)
 
 # `--store-failures` inspection tables and in-flight full-load staging tables
 # (#77). Both are stel-internal and must stay out of the model namespace, so
 # the producers that create them and the `list_tables` filters that hide them
 # derive from the same prefixes — a prefix that drifts on one side only would
 # leak internal tables into every catalog listing and test sweep.
-TEST_FAILURES_TABLE_PREFIX = "dbt_ml_test_failures__"
-STAGING_TABLE_PREFIX = "dbt_ml_staging__"
-INTERNAL_TABLE_PREFIXES = (TEST_FAILURES_TABLE_PREFIX, STAGING_TABLE_PREFIX)
+TEST_FAILURES_TABLE_PREFIX = "stel_test_failures__"
+STAGING_TABLE_PREFIX = "stel_staging__"
+LEGACY_TEST_FAILURES_TABLE_PREFIX = "dbt_ml_test_failures__"
+LEGACY_STAGING_TABLE_PREFIX = "dbt_ml_staging__"
+
+# `stel migrate` renames the failure tables it finds, but staging tables are
+# in-flight debris from a crashed run and orphaned ones are left where they
+# are. Either way the filter must keep hiding the old spellings: dropping them
+# would surface pre-rename internals as if they were models.
+MIGRATED_TABLE_PREFIXES: tuple[tuple[str, str], ...] = (
+    (LEGACY_TEST_FAILURES_TABLE_PREFIX, TEST_FAILURES_TABLE_PREFIX),
+)
+INTERNAL_TABLE_PREFIXES = (
+    TEST_FAILURES_TABLE_PREFIX,
+    STAGING_TABLE_PREFIX,
+    LEGACY_TEST_FAILURES_TABLE_PREFIX,
+    LEGACY_STAGING_TABLE_PREFIX,
+)
+
+# Named internal tables `list_tables()` hides, for the same reason as the
+# prefixes above. The ledger and lease tables were never filtered before #313
+# and showed up in `stel ls`/`stel show` as if a user had modeled them.
+INTERNAL_TABLE_NAMES = (
+    STATE_TABLE,
+    SERVING_LEDGER_TABLE,
+    SERVING_LEASE_TABLE,
+    LEGACY_STATE_TABLE,
+    LEGACY_SERVING_LEDGER_TABLE,
+    LEGACY_SERVING_LEASE_TABLE,
+)
 
 
 def staging_table_name(label: str) -> str:
@@ -185,6 +234,11 @@ _MAX_STATE_SUBSET_KEYS = 100_000
 
 class StaleStateFenceError(AdapterError):
     """A fenced state mutation observed a reassigned serving-ledger claim."""
+
+
+class LegacyWarehouseNamesError(AdapterError):
+    """The target still holds pre-#313 names, or is pointed at a schema that
+    does. Raised instead of silently treating the project as new."""
 
 
 @dataclass(frozen=True)
@@ -867,11 +921,20 @@ class WarehouseAdapter(ABC):
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
+    #: Set by `stel migrate` only. Suppresses the legacy-name guards below and
+    #: the schema/state-table creation they protect, because the migration is
+    #: the one operation that must be able to open a warehouse still holding
+    #: pre-#313 names — and must not create the new empty objects it is about
+    #: to rename the old ones into.
+    migration_mode: bool = False
+
     def __enter__(self) -> Self:
         self._connect()
         try:
-            self._ensure_schema()
-            self._ensure_state_table()
+            if not self.migration_mode:
+                self._guard_legacy_names()
+                self._ensure_schema()
+                self._ensure_state_table()
         except BaseException as error:
             try:
                 self._close()
@@ -902,6 +965,65 @@ class WarehouseAdapter(ABC):
 
     @abstractmethod
     def _ensure_state_table(self) -> None: ...
+
+    # ─── legacy-name guards (#313) ────────────────────────────────────────
+
+    def _guard_legacy_names(self) -> None:
+        """Refuse to start over on a warehouse still holding pre-#313 names.
+
+        Both failures below look identical to a fresh project from inside the
+        run — no state rows, so every document is new — and both would then
+        reprocess the whole corpus at provider cost without an error. That is
+        the one outcome the rename was not allowed to cause, so each is a hard
+        stop naming the exact fix.
+        """
+        present = set(self.list_all_tables())
+        self._guard_legacy_schema(present)
+        self._guard_legacy_tables(present)
+
+    def _guard_legacy_schema(self, present: set[str]) -> None:
+        if not self.config.schema_is_default():
+            return
+        if present & set(INTERNAL_TABLE_NAMES):
+            return
+        legacy_present = set(self.list_all_tables(LEGACY_SCHEMA_NAME))
+        if not legacy_present & set(INTERNAL_TABLE_NAMES):
+            return
+        raise LegacyWarehouseNamesError(
+            f"The default schema is now '{DEFAULT_SCHEMA_NAME}', but this "
+            f"target's stel objects are in '{LEGACY_SCHEMA_NAME}' - the schema "
+            f"stel defaulted to before it was renamed (#313). Continuing would "
+            f"treat every model as new and reprocess the corpus at provider "
+            f"cost."
+            f"""
+
+Keep using the existing data by pinning the schema explicitly:
+
+    warehouse:
+      schema: {LEGACY_SCHEMA_NAME}
+
+Or set `schema: {DEFAULT_SCHEMA_NAME}` to declare that starting fresh is
+what you want."""
+        )
+
+    def _guard_legacy_tables(self, present: set[str]) -> None:
+        stranded = [
+            (legacy, current)
+            for legacy, current in MIGRATED_TABLE_NAMES
+            if legacy in present and current not in present
+        ]
+        if not stranded:
+            return
+        names = ", ".join(f"'{legacy}'" for legacy, _current in stranded)
+        raise LegacyWarehouseNamesError(
+            f"Schema '{self.schema}' holds stel's pre-#313 internal tables "
+            f"({names}). Continuing would create empty replacements beside them "
+            f"and reprocess every model's corpus at provider cost."
+            """
+
+Run `stel migrate` to rename them in place, or `stel migrate --dry-run`
+to see the plan first."""
+        )
 
     # ─── identity / SQL references ────────────────────────────────────────
 
@@ -1225,7 +1347,34 @@ class WarehouseAdapter(ABC):
         )
 
     @abstractmethod
-    def list_tables(self) -> list[str]: ...
+    def list_all_tables(self, schema: str | None = None) -> list[str]:
+        """Every table in `schema` (default: the configured one), unfiltered.
+
+        Internal tables included, which is what separates this from
+        `list_tables`. Migration planning and the legacy-name guards need to
+        see the objects the model namespace deliberately hides, and the guards
+        must be able to look into a schema the adapter is not connected to —
+        so an unknown or absent schema returns an empty list rather than
+        raising.
+        """
+
+    def list_tables(self) -> list[str]:
+        """Tables in the model namespace: everything stel does not own."""
+        return [
+            name
+            for name in self.list_all_tables()
+            if name not in INTERNAL_TABLE_NAMES
+            and not name.startswith(INTERNAL_TABLE_PREFIXES)
+        ]
+
+    @abstractmethod
+    def rename_table(self, old: str, new: str) -> None:
+        """Rename a table within the configured schema, preserving its rows.
+
+        Only `stel migrate` calls this. Adapters must make it atomic to the
+        extent their engine allows: a half-renamed internal table is state
+        that neither the old name nor the new one accounts for.
+        """
 
     # ─── incremental state CRUD ───────────────────────────────────────────
 

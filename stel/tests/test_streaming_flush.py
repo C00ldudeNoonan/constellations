@@ -79,10 +79,10 @@ models:
 
 
 def _table_count(project: Path, table: str) -> int:
-    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
     try:
         row = con.execute(
-            f'SELECT COUNT(*) FROM "dbt_ml"."dbt_ml"."{table}"'
+            f'SELECT COUNT(*) FROM "stel"."stel"."{table}"'
         ).fetchone()
         return int(row[0]) if row else 0
     finally:
@@ -90,10 +90,10 @@ def _table_count(project: Path, table: str) -> int:
 
 
 def _state_count(project: Path, model: str) -> int:
-    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
     try:
         row = con.execute(
-            'SELECT COUNT(*) FROM "dbt_ml"."dbt_ml"."dbt_ml_state" '
+            'SELECT COUNT(*) FROM "stel"."stel"."stel_state" '
             "WHERE model_name = ?",
             [model],
         ).fetchone()
@@ -103,22 +103,22 @@ def _state_count(project: Path, model: str) -> int:
 
 
 def _table_snapshot(project: Path, table: str) -> list[tuple[Any, ...]]:
-    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
     try:
         return con.execute(
-            f'SELECT * FROM "dbt_ml"."dbt_ml"."{table}" ORDER BY document_id'
+            f'SELECT * FROM "stel"."stel"."{table}" ORDER BY document_id'
         ).fetchall()
     finally:
         con.close()
 
 
 def _table_types(project: Path, table: str) -> dict[str, str]:
-    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
     try:
         return dict(
             con.execute(
                 "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_schema = 'dbt_ml' AND table_name = ?",
+                "WHERE table_schema = 'stel' AND table_name = ?",
                 [table],
             ).fetchall()
         )
@@ -174,12 +174,12 @@ def test_incremental_typed_empty_then_nonempty_preserves_types(
     assert types["event_date"] == "DATE"
     assert types["event_at"] == "TIMESTAMP WITH TIME ZONE"
     con = duckdb.connect(
-        str(typed_empty_project / "target" / "dbt_ml.duckdb"), read_only=True
+        str(typed_empty_project / "target" / "stel.duckdb"), read_only=True
     )
     try:
         row = con.execute(
             'SELECT invoice_id, total, quantity, paid, note, payload '
-            'FROM "dbt_ml"."dbt_ml"."raw_invoices"'
+            'FROM "stel"."stel"."raw_invoices"'
         ).fetchone()
     finally:
         con.close()
@@ -401,11 +401,11 @@ def test_publish_every_preserves_later_flush_schema_drift(
     # The later flush's column and value survive rather than being dropped.
     assert "extra" in _table_types(project, "raw_invoices")
     con = duckdb.connect(
-        str(project / "target" / "dbt_ml.duckdb"), read_only=True
+        str(project / "target" / "stel.duckdb"), read_only=True
     )
     try:
         kept = con.execute(
-            'SELECT extra FROM "dbt_ml"."dbt_ml"."raw_invoices" WHERE val = ?',
+            'SELECT extra FROM "stel"."stel"."raw_invoices" WHERE val = ?',
             ["e"],
         ).fetchone()
     finally:

@@ -36,8 +36,8 @@ def test_basic_shape(fresh_project: Path) -> None:
     assert len(payload["sources"]) == 1
     src = payload["sources"][0]
     assert src["name"] == "dbt_ml_invoice_pipeline"
-    assert src["database"] == "dbt_ml"  # from duckdb path stem
-    assert src["schema"] == "dbt_ml"
+    assert src["database"] == "stel"  # from duckdb path stem
+    assert src["schema"] == "stel"
     table_names = {t["name"] for t in src["tables"]}
     assert table_names == {"raw_invoices", "invoice_summary", "monthly_totals"}
 

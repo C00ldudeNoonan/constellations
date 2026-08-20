@@ -4,7 +4,7 @@ pdf_invoice_pipeline:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
+        path: ./target/stel.duckdb
         schema: pdf_invoices
       llm:
         provider: anthropic

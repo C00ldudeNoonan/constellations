@@ -20,7 +20,7 @@ from stel.credentials import CredentialReference
 def test_load_example_project(example_project_dir: Path) -> None:
     project, sources, models = load_project(example_project_dir)
     assert project.name == "invoice_pipeline"
-    assert project.duckdb.schema_name == "dbt_ml"
+    assert project.duckdb.schema_name == "stel"
     assert project.extraction.default_backend == "json"
     assert {s.name for s in sources} == {"vendor_invoices"}
     assert {m.name for m in models} == {"raw_invoices", "invoice_summary", "monthly_totals"}

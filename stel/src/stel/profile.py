@@ -232,13 +232,14 @@ def _implicit_local_profile(project: ProjectConfig) -> ResolvedProfile:
     DuckDB database named by its inline `duckdb:` block. This is a supported
     convenience for local and test projects; declare a `profile:` + profiles.yml
     for warehouse targets, credentials, retrieval, or LLM configuration."""
-    warehouse = parse_warehouse_config(
-        {
-            "type": "duckdb",
-            "path": project.duckdb.path,
-            "schema": project.duckdb.schema_name,
-        }
-    )
+    raw: dict[str, Any] = {"type": "duckdb", "path": project.duckdb.path}
+    # Forward the inline block's *defaultedness*, not just its value: passing
+    # `schema` unconditionally would make every inline project look like it
+    # had named its schema, and the #313 legacy-schema guard would never fire
+    # for the zero-config path that needs it most.
+    if "schema_name" in project.duckdb.model_fields_set:
+        raw["schema"] = project.duckdb.schema_name
+    warehouse = parse_warehouse_config(raw)
     warehouse.bind_target_name("<inline>")
     return ResolvedProfile(
         profile_name="<inline>",

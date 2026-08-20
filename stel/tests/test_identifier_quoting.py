@@ -129,10 +129,29 @@ def test_model_name_charset_rejected(bad_name: str) -> None:
         ModelConfig(name=bad_name)
 
 
-@pytest.mark.parametrize("reserved", ["dbt_ml_state", "dbt_ml_staging", "DBT_ML_thing"])
+# Both prefixes, deliberately. #313 moved the internal tables from `dbt_ml_`
+# to `stel_`, but dropping the old reservation would newly *allow* model names
+# that existing projects have always been told are ours.
+@pytest.mark.parametrize(
+    "reserved",
+    [
+        "stel_state",
+        "stel_serving_leases",
+        "STEL_thing",
+        "dbt_ml_staging",
+        "dbt_ml_state",
+        "DBT_ML_thing",
+    ],
+)
 def test_model_name_reserved_prefix_rejected(reserved: str) -> None:
     with pytest.raises(ValidationError, match="reserved"):
         ModelConfig(name=reserved)
+
+
+def test_model_name_merely_containing_a_reserved_prefix_is_allowed() -> None:
+    # The reservation is on the prefix, not the substring: widening it would
+    # retroactively invalidate legal model names.
+    assert ModelConfig(name="hotel_stel_rooms").name == "hotel_stel_rooms"
 
 
 def test_model_name_reserved_word_allowed() -> None:

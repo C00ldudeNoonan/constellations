@@ -12,6 +12,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .identifiers import LEGACY_DUCKDB_FILENAME
 from .model import ModelConfig, protect_model_llm_credential_option
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
@@ -361,6 +362,41 @@ def _load_model_yaml_dir(
     return out
 
 
+def _guard_legacy_inline_duckdb(project: ProjectConfig, project_dir: Path) -> None:
+    """Refuse to open an empty default database next to the pre-#313 one.
+
+    The zero-config path's default file moved with the rename. Connecting to
+    the new name would create it, find no state, and reprocess every model's
+    corpus at provider cost - silently, because an absent DuckDB file is
+    indistinguishable from a first run. Only fires when the operator never
+    wrote `path:`; whoever named their database chose it.
+    """
+    if "path" in project.duckdb.model_fields_set:
+        return
+    default_path = project_dir / project.duckdb.path
+    if default_path.exists():
+        return
+    legacy_path = default_path.with_name(LEGACY_DUCKDB_FILENAME)
+    if not legacy_path.exists():
+        return
+    raise ConfigError(
+        f"The default inline DuckDB database is now "
+        f"`{project.duckdb.path.as_posix()}`, but this project's data is in "
+        f"`{legacy_path.relative_to(project_dir).as_posix()}` - the name stel "
+        f"used before it was renamed (#313). Opening the new default would "
+        f"create an empty database and reprocess every model at provider cost."
+        f"""
+
+Point the project at the existing database:
+
+    duckdb:
+      path: {legacy_path.relative_to(project_dir).as_posix()}
+
+Then run `stel migrate` to bring its internal table names up to date.
+Or delete the old file if starting fresh is what you want."""
+    )
+
+
 def load_project(
     project_dir: Path,
 ) -> tuple[ProjectConfig, list[SourceConfig], list[ModelConfig]]:
@@ -403,6 +439,7 @@ def load_project(
             surface="Inline `duckdb.path`",
             hint="Declare a profile and put external warehouse paths in profiles.yml.",
         )
+        _guard_legacy_inline_duckdb(project, project_dir)
 
     sources: list[SourceConfig] = []
     for source_dir in project.source_paths:

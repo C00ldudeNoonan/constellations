@@ -3,7 +3,7 @@ sources:
 - name: dbt_ml_invoice_pipeline
   description: Tables materialized by stel project 'invoice_pipeline'.
   database: stel
-  schema: dbt_ml
+  schema: stel
   tables:
   - name: invoice_summary
     description: Per-vendor aggregation

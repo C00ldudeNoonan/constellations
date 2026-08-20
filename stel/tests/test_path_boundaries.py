@@ -474,7 +474,7 @@ def test_clean_removes_only_known_artifacts_and_preserves_warehouse(
     generate_invoices(2, dst / "data" / "invoices", seed=1)
     run_project(dst, select="raw_invoices")
     target = dst / "target"
-    warehouse = target / "dbt_ml.duckdb"
+    warehouse = target / "stel.duckdb"
     (target / "manifest.json").write_text("{}")
     (target / "run_results.json").write_text("{}")
     (target / "sources.yml").write_text("version: 2\n")
@@ -512,7 +512,7 @@ def test_clean_never_deletes_external_warehouse(
     profiles = dst / "profiles.yml"
     profiles.write_text(
         profiles.read_text().replace(
-            "path: ./target/dbt_ml.duckdb", f"path: {wh.as_posix()}"
+            "path: ./target/stel.duckdb", f"path: {wh.as_posix()}"
         )
     )
 

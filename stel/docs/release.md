@@ -5,15 +5,19 @@ Actions when a version tag is pushed.
 
 ## One-time setup
 
-Create a GitHub Actions secret named `PYPI_API_TOKEN` with a PyPI API token that
-can publish the `stel` package.
+Create a secret named `PYPI_API_TOKEN` holding a PyPI API token that can publish
+the `stel` package.
 
-Recommended location:
+It must be an **environment** secret on the `pypi` environment, not a plain
+repository secret: the publish job declares `environment: name: pypi`
+(`release.yml:72`), so it resolves secrets from that environment. A token stored
+only at the repository level is not visible to it.
 
-- Repository settings -> Secrets and variables -> Actions -> Repository secrets
+- Repository settings -> Environments -> `pypi` -> Environment secrets
 
-If you want extra release controls, create a `pypi` environment in GitHub and
-move the secret there as an environment secret.
+The token must be scoped to the `stel` project. A token scoped to a different
+project fails at the publish step, after the whole build and test matrix has
+already run.
 
 ## Cut a release
 

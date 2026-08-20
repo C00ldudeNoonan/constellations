@@ -26,6 +26,25 @@ DEFAULT_OUTPUT_FILENAME = "sources.yml"
 # agent-context block invisible to anything already reading it.
 DBT_META_NAMESPACE = "dbt_ml"
 
+# Default `sources:` name in the emitted sources.yml: `dbt_ml_<project>`.
+#
+# Frozen, and for the same reason as the namespace above: the generated file is
+# committed into the consumer's dbt project and referenced by their `source()`
+# calls, so a new default silently breaks their models. It kept the pre-#313
+# spelling deliberately.
+#
+# Every producer of this name must go through the helper. Three call sites
+# spelled it inline, which is exactly how `concept-cloud` drifted: it
+# reconstructed the default and ignored `--source-name` entirely, so a project
+# that had overridden the name got a linking node that silently matched
+# nothing.
+DEFAULT_SOURCE_NAME_PREFIX = "dbt_ml_"
+
+
+def default_dbt_source_name(project_name: str) -> str:
+    """The `sources:` name a project's emitted dbt sources use by default."""
+    return f"{DEFAULT_SOURCE_NAME_PREFIX}{project_name}"
+
 
 def build_dbt_sources(
     project_dir: Path,
@@ -61,7 +80,7 @@ def build_dbt_sources(
         if model.name in projected_names and model.search is None
     ]
 
-    name = source_name or f"dbt_ml_{project.name}"
+    name = source_name or default_dbt_source_name(project.name)
     catalog = _derive_catalog(resolved.warehouse)
 
     return {

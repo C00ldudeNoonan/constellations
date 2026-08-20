@@ -68,7 +68,11 @@ from stel.config.identifiers import (
     RESERVED_PREFIXES,
 )
 from stel.config.profile import WarehouseConfig
-from stel.dbt_export import DBT_META_NAMESPACE
+from stel.dbt_export import (
+    DBT_META_NAMESPACE,
+    DEFAULT_SOURCE_NAME_PREFIX,
+    default_dbt_source_name,
+)
 from stel.execution import extraction as extraction_module
 from stel.manifest import RUN_RESULTS_VERSION_KEY
 from stel.providers import base as provider_base  # registers providers
@@ -222,6 +226,14 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
         "dbt_ml",
         "the emitted sources.yml is committed into the consumer's dbt project and "
         "read from there",
+    ),
+    (
+        "dbt_export.DEFAULT_SOURCE_NAME_PREFIX",
+        DEFAULT_SOURCE_NAME_PREFIX,
+        "dbt_ml_",
+        "the emitted `sources:` name is committed into the consumer's dbt "
+        "project and named by every `source()` call in it, so a new default "
+        "breaks their models rather than ours",
     ),
     (
         "classic_ml.artifacts.ARTIFACT_RUNTIME_VERSION_KEY",
@@ -610,6 +622,29 @@ def test_env_scan_recognizes_every_form_the_code_could_regress_to() -> None:
         for argument in _env_read_arguments(node)
     ]
     assert matched.count("STEL_VERBOSE") == 4
+
+
+def test_every_producer_of_the_dbt_source_name_uses_the_shared_helper() -> None:
+    """The default source name was spelled inline at three sites, and one of
+    them (`concept_cloud.export`) reconstructed it in a way that ignored
+    `--source-name` — a silent empty DAG join rather than an error. A pin on
+    the value alone would not have caught that, because every copy agreed."""
+    offenders: list[str] = []
+    for path in _source_files():
+        if path.name == "dbt_export.py":
+            continue  # the owner
+        text = path.read_text(encoding="utf-8")
+        if 'f"dbt_ml_{' in text or "f'dbt_ml_{" in text:
+            offenders.append(_module_name(path))
+    assert offenders == [], (
+        "These modules build the dbt source name themselves instead of calling "
+        f"dbt_export.default_dbt_source_name: {offenders}. Every producer must "
+        "go through the helper so a --source-name override reaches all of them."
+    )
+
+
+def test_the_helper_still_produces_the_frozen_name() -> None:
+    assert default_dbt_source_name("economic_data") == "dbt_ml_economic_data"
 
 
 # --- lockstep behavior -----------------------------------------------------

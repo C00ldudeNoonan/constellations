@@ -258,6 +258,15 @@ class ChunkConfig(BaseModel):
                    tokens.
     chunk_overlap: overlap carried between adjacent chunks, same unit.
     encoding:      tiktoken encoding name for the tokens strategy.
+    in_text_metadata:
+                   upstream columns to render into the chunk text itself, as a
+                   small block ahead of it (issue #308). Additive: the columns
+                   are still carried onto every chunk row, because SQL reads
+                   columns and the embedding model reads only the text, and a
+                   rendering aimed at one reader must never remove the copy the
+                   other depends on. The block counts against `chunk_size`, so
+                   a chunk never exceeds the size the embedder was configured
+                   for.
     """
 
     model_config = _STRICT_CONFIG
@@ -267,7 +276,23 @@ class ChunkConfig(BaseModel):
     chunk_size: int = 1000
     chunk_overlap: int = 100
     encoding: str = "cl100k_base"
+    in_text_metadata: list[str] = Field(default_factory=list)
     options: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("in_text_metadata")
+    @classmethod
+    def _validate_in_text_metadata(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for name in v:
+            if not name.strip():
+                raise ValueError("chunk.in_text_metadata entries must not be empty")
+            if name in seen:
+                raise ValueError(
+                    f"chunk.in_text_metadata lists '{name}' twice; the block is "
+                    "rendered in declared order, so a repeat is a typo"
+                )
+            seen.add(name)
+        return v
 
     @model_validator(mode="after")
     def _validate_sizes(self) -> ChunkConfig:
@@ -277,6 +302,11 @@ class ChunkConfig(BaseModel):
             raise ValueError("chunk.chunk_overlap must be non-negative")
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk.chunk_overlap must be smaller than chunk_size")
+        if self.text_field in self.in_text_metadata:
+            raise ValueError(
+                f"chunk.in_text_metadata must not name the text field "
+                f"'{self.text_field}'; the block is prepended to that text"
+            )
         return self
 
 

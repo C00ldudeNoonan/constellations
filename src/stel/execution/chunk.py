@@ -13,7 +13,13 @@ from ..adapters import (
     StateValue,
     WarehouseAdapter,
 )
-from ..chunking import chunk_id, split_text
+from ..chunking import (
+    ChunkingError,
+    chunk_id,
+    measure,
+    render_metadata_block,
+    split_text,
+)
 from ..config.model import ModelConfig
 from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
@@ -63,6 +69,17 @@ def run_chunk_model(
             f"Chunk model '{model.name}': upstream '{upstream}' has no "
             "`document_id`; chunk models read extraction outputs."
         )
+    missing_metadata = [
+        column
+        for column in chunk_config.in_text_metadata
+        if column not in frame.columns
+    ]
+    if missing_metadata:
+        raise RunError(
+            f"Chunk model '{model.name}': `chunk.in_text_metadata` names "
+            f"{missing_metadata}, which upstream '{upstream}' does not have. "
+            f"Available: {sorted(frame.columns)}"
+        )
     document_ids = chunk_document_ids(frame, model.name)
 
     code_version = compute_code_version(
@@ -108,7 +125,17 @@ def run_chunk_model(
             if prior is not None:
                 changed_ids.append(document_id)
         processed += 1
-        pieces = split_text(text, chunk_config)
+        # Rendered per document, because the values are the document's. The
+        # block is charged against chunk_size before splitting and prepended
+        # after, so every emitted chunk — block included — stays within the
+        # size the embedder was configured for (issue #308).
+        block = render_metadata_block(record, chunk_config.in_text_metadata)
+        try:
+            pieces = split_text(
+                text, chunk_config, reserved=measure(block, chunk_config) if block else 0
+            )
+        except ChunkingError as error:
+            raise RunError(f"Chunk model '{model.name}': {error}") from error
         carried = {column: record[column] for column in carry_columns}
         for piece in pieces:
             rows.append(
@@ -117,7 +144,7 @@ def run_chunk_model(
                     document_id=document_id,
                     piece_index=piece.index,
                     chunk_count=len(pieces),
-                    text=piece.text,
+                    text=block + piece.text,
                     strategy=chunk_config.strategy,
                     code_version=code_version,
                     chunked_at=chunked_at,

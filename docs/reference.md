@@ -1318,6 +1318,64 @@ for incremental MERGE into a warehouse or keyed publish to a retrieval store).
   materialization: incremental
 ```
 
+### Metadata the embedder can actually see
+
+Carried columns serve SQL perfectly — filtering, joining, building a citation.
+But the embedding model and the LLM read only what is inside the text field.
+For them, metadata in a sibling column does not exist, and a chunk from the
+middle of a document embeds with no idea which document it came from. That is
+exactly the ambiguity that hurts retrieval on short chunks: "the rate rose 40
+basis points" is far more findable when the vector also encodes which report
+and which quarter it came from.
+
+`in_text_metadata` renders upstream columns into the chunk text itself:
+
+```yaml
+  chunk:
+    strategy: tokens
+    text_field: text
+    chunk_size: 800
+    in_text_metadata: [title, published_date, source_uri]
+```
+
+producing
+
+```text
+title: Q3 Monetary Policy Report
+published_date: 2026-03-14
+source_uri: gs://raw/reports/q3.pdf
+---
+<original chunk text follows>
+```
+
+**Additive, never a mode switch.** The columns are still emitted on every chunk
+row; the block is a second copy inside the text. The same metadata serves two
+readers with different eyes, and a rendering aimed at one must never remove the
+structured copy the other depends on — otherwise downstream SQL has to regex
+values back out of prose.
+
+Fields render in declared order, and null values are skipped rather than
+written as `None`. Naming a column the upstream model does not have fails
+before any document is processed.
+
+**The block counts against `chunk_size`**, in whichever unit the strategy uses,
+so it does not push chunks past the size the embedder was configured for. (The
+recursive splitter's own overlap merging can still exceed `chunk_size` on a
+hard cut, as it always could; the block does not add to that.) Providers
+configured without truncation reject an oversized request rather than quietly
+shortening it, so the alternative — adding the block on top — would turn a
+retrieval-quality feature into a runtime failure. If the block leaves no room
+for text, or pushes `chunk_overlap` to or past the remaining budget, the model
+fails with the numbers named.
+
+Because the block is part of the emitted `text`, `chunk_id` tracks it like any
+other text change: turning `in_text_metadata` on, off, or editing its field
+list re-keys that document's chunks and invalidates anything downstream keyed
+on them (embeddings, retrieval-store rows). This is the documented rule, not an
+exception to it — and it is why `chunk_id` stays consistent with the
+`agent_context` `document_chunks` contract, which recomputes the id from the
+stored text and rejects a mismatch.
+
 Each chunk row carries `chunk_id`, `document_id`, `chunk_index`,
 `chunk_count`, `text`, `chunk_strategy`, `chunked_at`, plus every upstream
 column except the split text field — so document lineage (`source_uri`,

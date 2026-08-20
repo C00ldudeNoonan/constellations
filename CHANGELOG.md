@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Flattened the repository layout
+
+- The Python project moved from `stel/` to the repository root, so `uv sync`,
+  `pytest`, `ruff`, `ty`, and `uv build` all run from where you already are.
+  The nesting was an artifact of the pre-#313 repo holding a differently named
+  package; with the repo and the package finally agreeing, a subdirectory only
+  bought an extra `cd`.
+- The two READMEs no longer collide, which is what deferred this. The root
+  `README.md` stays the landing page; the 2,400-line reference that lived at
+  `stel/README.md` is now `docs/reference.md`.
+- `.gitignore` is a single file again, and CI drops its `working-directory`.
+- Nothing in the package moved: `src/stel/` is still `src/stel/`, so imports,
+  the wheel contents, and the frozen `stel/<version>` backend identity string
+  are untouched.
+
 ### A redirect on the old `dbt-ml` PyPI project
 
 - `compat/dbt-ml/` builds a standalone `dbt-ml` 0.8.1 that depends on `stel` and

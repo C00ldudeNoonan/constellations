@@ -1,4 +1,5 @@
-# repo-root catch-alls — package-level gitignores under docbt/ are more thorough
+# One .gitignore for the whole repo: the Python project lives at the root now,
+# so the package-level file that used to sit under the nested directory is gone.
 
 # database files (never commit these anywhere)
 *.duckdb
@@ -32,3 +33,11 @@ docs/private/
 # local credentials — never commit (note: `*.env` does NOT match a literal `.env`)
 .env
 *.env
+
+# build output (the package root, and the standalone dbt-ml redirect)
+dist/
+
+# generated synthetic data + DuckDB output from the examples
+target/
+examples/**/data/
+examples/**/target/

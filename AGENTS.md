@@ -9,17 +9,15 @@ stel is a standalone, dbt-shaped Python CLI for turning unstructured data
 into warehouse tables. It is not a dbt package or adapter, and similarly named
 artifacts are not dbt-core contracts unless that compatibility is explicit.
 
-The Python project is nested under `stel/`. Run Git and GitHub commands from
-the repository root, but run Python, uv, test, lint, type-check, and build
-commands from `stel/`.
-
-Package paths written without a `stel/` prefix are relative to `stel/`.
+The Python project lives at the repository root. Run every command — Git,
+GitHub, Python, uv, test, lint, type-check, build — from there.
 
 Use these maintained references rather than copying volatile feature lists:
 
-- `README.md` and `stel/README.md` — shipped behavior and user guidance.
-- `stel/CONTRIBUTING.md` — extension contracts and contributor workflow.
-- `stel/docs/release.md` — release process.
+- `README.md` (landing page) and `docs/reference.md` (full reference) —
+  shipped behavior and user guidance.
+- `CONTRIBUTING.md` — extension contracts and contributor workflow.
+- `docs/release.md` — release process.
 - GitHub issues labeled `roadmap` — planning context. Verify every claim against
   current code, tests, and user docs before describing it as implemented.
 
@@ -77,7 +75,6 @@ Use these maintained references rather than copying volatile feature lists:
 From the repository root:
 
 ```bash
-cd stel
 uv sync --all-extras --dev --locked
 uv run pip-audit --skip-editable
 uv run ruff check

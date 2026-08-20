@@ -12,9 +12,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: stel
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +59,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: stel/dist/*
+          path: dist/*
           if-no-files-found: error
 
   publish:

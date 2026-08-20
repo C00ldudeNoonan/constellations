@@ -66,7 +66,7 @@ Add focused regression tests for the exact defect and its nearest boundary. Favo
 
 ## Validate and hand off
 
-Run commands from `stel/`. Use focused tests while iterating; before handoff, run the maintained suite unless an environmental limitation prevents it:
+Run commands from the repository root. Use focused tests while iterating; before handoff, run the maintained suite unless an environmental limitation prevents it:
 
 ```powershell
 uv sync --all-extras --dev --locked

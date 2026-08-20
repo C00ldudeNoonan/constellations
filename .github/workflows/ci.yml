@@ -12,9 +12,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: stel   # the Python project lives in this subdir
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

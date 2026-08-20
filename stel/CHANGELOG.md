@@ -1,6 +1,80 @@
 # Changelog
 
-## Unreleased
+## v0.9.0 - 2026-08-20
+
+### Vertex `thinking_budget`, off by default for structured output (issue #307)
+
+- Gemini 2.5 models run dynamic thinking by default and bill reasoning tokens at
+  the output rate. For the one-shot structured extraction stel sends over a
+  relation that budget buys little, and it was charged on every row with no
+  visibility in the YAML. `provider_options.thinking_budget` now exposes it: `0`
+  disables thinking, a positive integer sets a budget, and an explicit value is
+  always forwarded as configured.
+- Omitted, it defaults to `0` only when the request declares an output schema
+  (`fields:`) *and* the model accepts a disabled budget — a declared schema is
+  the signal that this is extraction or classification, not open-ended
+  reasoning. Every other case sends no `thinking_config` at all and leaves the
+  model's own default alone: schema-less requests, Gemini 2.5 Pro (which
+  enforces a minimum), pre-2.5 models (which reject `thinking_config`), and
+  Gemini 3 (which configures reasoning through `thinking_level`). The capability
+  check fails safe — an unrecognized model loses the cost optimization rather
+  than gaining a failure.
+- `thinking_budget` is a semantic provider option, so it rides the existing
+  `profile_options_fingerprint` already folded into both the native `llm:`
+  config hash and the `backend: llm` extraction cache key.
+- `ProviderUsage` gained `thinking_tokens`, appended after `reported_cost_usd`
+  so the positional constructor signature separately installed provider plugins
+  rely on keeps working. It is reported only when non-zero, so non-thinking
+  providers and cache hits keep byte-identical run-results metrics. Thinking
+  tokens stay folded into `output_tokens`, so budget enforcement still sees full
+  billable spend.
+
+### `agent_context:` projection helpers and a built-in-pipeline example (issue #300)
+
+- `agent_context.project_document_registry_row` and `project_document_chunk_row`
+  build contract-shaped rows from an `extraction:`/`chunk:` pipeline. Wrapping
+  those primitives in a `transform:` already worked, but it meant
+  hand-assembling ~30 contract fields per row across 75-90 lines of Python with
+  no reusable helper. Both compute every id and fingerprint through
+  `agent_context`'s own `make_*`/`content_hash` functions rather than
+  reimplementing them, and the chunk helper copies the parent registry row's
+  bitemporal, policy, and freshness fields verbatim — so the cross-relation
+  equality `validate_agent_context_relations` requires holds by construction
+  instead of by caller discipline. Policy fields are deny-by-default.
+- `examples/agent_context_from_builtin_pipeline/` runs the whole path with no
+  credentials: `extraction:` → `chunk:` (the real recursive splitter, 4
+  documents into 25 chunks) → two short `transform:` wrappers → `embed:`
+  (deterministic) → `search:`. The previous worked example treated each document
+  as exactly one chunk, so the multi-chunk shape most real pipelines have was
+  never exercised.
+- **`agent_context:` stays transform-only, and that is intentional** — now
+  documented at the point a reader hits it, in
+  `docs/architecture/agent-context-v1.md`, `docs/mcp.md`, and the validation
+  error itself. Letting `extraction:`/`chunk:` declare it directly is blocked on
+  a real conflict, not an oversight: the contract's `document_id` must equal
+  `agent_context.make_document_id(source_system, source_key)`, while
+  extraction's `document_id` is a different reserved pipeline-generated field
+  used as the incremental-state key throughout. Reconciling them would change
+  the id algorithm for every extraction model and invalidate existing
+  incremental state on upgrade.
+
+### `dbt_ref()` transforms can also declare `depends_on:` (issue #177)
+
+- A transform reading `dbt_ref('...')` was rejected if it also declared
+  `depends_on:`. The restriction lived only in `compiler.py`'s validation —
+  `execution/transform.py`, `dag.py`, and `dbt_embed/codegen.py` already
+  resolved both into one upstream set with no exclusivity assumption. Such a
+  model now falls through to the same existence, duplicate, and kind checks any
+  other transform's `depends_on` gets, and `declared_dependencies` unions the
+  `dbt_ref` target with `depends_on` so the transform contract check matches
+  what `run_transform_model` actually puts in the `deps` dict.
+- `examples/dbt_ref_roundtrip` + `examples/dbt_ref_roundtrip_dbt` are a
+  self-contained pair proving the full round trip in one `dbt build`: stel
+  extraction → dbt SQL → stel transform via `dbt_ref` → dbt SQL. Both READMEs
+  document the constraint that made a self-contained pair necessary — every
+  generated shim resolves its stel project through one shared
+  `STEL_PROJECT_DIR`, so a single `dbt build` embeds models from one stel
+  project at a time.
 
 ### Renamed the project to Constellations, installed as `stel` (issue #313)
 

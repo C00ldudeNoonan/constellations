@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### A redirect on the old `dbt-ml` PyPI project
+
+- `compat/dbt-ml/` builds a standalone `dbt-ml` 0.8.1 that depends on `stel` and
+  warns on import, so an old pin or a stale link resolves to something that says
+  where the project went rather than a version frozen at 0.8.0 with no
+  explanation. The old `dbt-ml` console script is kept only to print the same
+  message and exit non-zero, so a job still shelling out to it fails visibly
+  instead of appearing to succeed at nothing.
+- It carries no functionality deliberately. Aliasing stel's submodules so
+  `import dbt_ml.adapters` kept working would hide the rename behind a facade
+  that then has to be maintained and removed.
+- `dbt-ml` 0.8.0 is **not** yanked. It still works, and yanking would break
+  exactly the pinned user this redirect exists for. Publishing is a one-time
+  manual step documented in `docs/release.md`; it is not part of the `stel`
+  release workflow and needs a separately scoped PyPI token.
+
 ### `concept-cloud --source-name`, and a loud failure when it does not resolve
 
 - `concept-cloud --dbt-manifest` reconstructed the emitted dbt source name as

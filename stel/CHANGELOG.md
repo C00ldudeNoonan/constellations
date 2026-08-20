@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### `concept-cloud --source-name`, and a loud failure when it does not resolve
+
+- `concept-cloud --dbt-manifest` reconstructed the emitted dbt source name as
+  `dbt_ml_<project>` and ignored `--source-name` entirely, so any project that
+  had overridden the name got a linking node id matching nothing in the
+  manifest. The concept-to-DAG edges are the only reason to pass a manifest, and
+  they were built only for a node that resolved — so the export reported success
+  and rendered a cloud quietly missing them. `--source-name` now plumbs through,
+  and a linking node absent from the manifest raises, naming what it looked for
+  and which sources the manifest actually declares.
+- The default source name now has one owner, `dbt_export.default_dbt_source_name`.
+  It was spelled inline at three call sites; a pin on the value would not have
+  caught the drift, because all three copies agreed on the string and disagreed
+  only about honoring the override. `test_frozen_names.py` pins the prefix and
+  scans `src/` for any module rebuilding it by hand.
+
+### `stel --version`
+
+- The CLI had no version flag at all. It reports the installed distribution
+  version through the same `_distribution` lookup used everywhere else.
+
+### Docs
+
+- `docs/release.md` said to put `PYPI_API_TOKEN` in repository secrets, with the
+  `pypi` environment as an optional extra. The publish job declares
+  `environment: name: pypi`, so an environment secret is the only place it
+  resolves from — a repository-level token is invisible to it, and the failure
+  lands after the full build and test matrix has run.
+
 ## v0.9.0 - 2026-08-20
 
 ### Vertex `thinking_budget`, off by default for structured output (issue #307)

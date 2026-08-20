@@ -293,12 +293,18 @@ def export_concept_cloud(
     relation_model: str | None = None,
     entity_model: str | None = None,
     dbt_manifest: str | Path | None = None,
+    source_name: str | None = None,
     target: str | None = None,
     profiles_dir: str | Path | None = None,
     top_n: int = 200,
 ) -> ConceptCloudExport:
-    """Read the project's tables through the active adapter and build a bundle."""
+    """Read the project's tables through the active adapter and build a bundle.
+
+    `source_name` must match whatever `emit-dbt-sources --source-name` wrote
+    into the downstream project, since that is the name its manifest records.
+    """
     from ..adapters import create_adapter
+    from ..dbt_export import default_dbt_source_name
     from ..profile import resolve_profile
 
     project_path = Path(project_dir)
@@ -311,7 +317,25 @@ def export_concept_cloud(
     if dbt_manifest is not None:
         manifest = json.loads(Path(dbt_manifest).read_text())
         dag_plane = dag_plane_from_dbt_manifest(manifest)
-        linking_node_id = f"source.dbt_ml_{project.name}.{linking_model}"
+        source = source_name or default_dbt_source_name(project.name)
+        linking_node_id = f"source.{source}.{linking_model}"
+        # The cross-layer edges are the entire reason to pass a dbt manifest,
+        # and they are built only for a node id that resolves. A name that does
+        # not match what the consumer's project actually declares used to
+        # render a cloud with the DAG join silently missing, which looks like a
+        # working export.
+        if linking_node_id not in {node.id for node in dag_plane.nodes}:
+            declared = sorted(
+                node.id.split(".")[1]
+                for node in dag_plane.nodes
+                if node.id.startswith("source.")
+            )
+            raise ConceptCloudExportError(
+                f"'{linking_node_id}' is not in the dbt manifest, so the "
+                f"concept-to-DAG edges would be empty. Pass --source-name to "
+                f"match what `emit-dbt-sources --source-name` wrote into that "
+                f"project. Sources it declares: {sorted(set(declared)) or '(none)'}."
+            )
     else:
         target_dir = (project_path / project.target_path).resolve()
         manifest_path = target_dir / MANIFEST_FILENAME

@@ -9,6 +9,7 @@ from typing import Any, TypedDict
 
 import click
 
+from ._distribution import distribution_version
 from .adapters import (
     AdapterError,
     apply_name_migration,
@@ -188,6 +189,11 @@ def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
     help="Directory containing profiles.yml. Overrides discovery.",
 )
 @click.option("--target", default=None, help="Target name within the active profile.")
+@click.version_option(
+    version=distribution_version(),
+    prog_name="stel",
+    message="%(prog)s %(version)s",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -1522,6 +1528,14 @@ def mcp_serve(
     help="Downstream dbt manifest.json to use as the DAG plane.",
 )
 @click.option(
+    "--source-name",
+    default=None,
+    help=(
+        "dbt source name the manifest declares, when it differs from the "
+        "default (default: dbt_ml_<project-name>)."
+    ),
+)
+@click.option(
     "--top-n",
     default=200,
     show_default=True,
@@ -1538,6 +1552,7 @@ def concept_cloud(
     relation_model: str | None,
     entity_model: str | None,
     dbt_manifest: Path | None,
+    source_name: str | None,
     top_n: int,
 ) -> None:
     """Render the self-contained 3D concept-cloud artifact (#255).
@@ -1567,6 +1582,7 @@ def concept_cloud(
             relation_model=relation_model,
             entity_model=entity_model,
             dbt_manifest=dbt_manifest,
+            source_name=source_name,
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
             top_n=top_n,

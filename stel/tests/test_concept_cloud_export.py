@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import pathlib
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
 from stel.concept_cloud import (
+    ConceptCloudExportError,
     DagNode,
     DagPlane,
     build_concept_cloud,
@@ -16,6 +19,7 @@ from stel.concept_cloud import (
     render_concept_cloud,
 )
 from stel.config import load_project
+from stel.dbt_export import default_dbt_source_name
 from stel.profile import resolve_profile
 
 _LINKING_NODE = "model.p.link_entities"
@@ -236,3 +240,91 @@ def test_export_concept_cloud_wrapper_stitches_a_dbt_manifest(tmp_path: Path) ->
     assert export.concept_edges  # canonicalized from the relation table
     # A rendered artifact from a real export is still self-contained.
     assert "3d-force-graph - https://github.com/vasturiano" in render_concept_cloud(export)
+
+
+def _manifest_project(tmp_path: pathlib.Path) -> None:
+    """A project whose two tables are already materialized, ready to export."""
+    (tmp_path / "stel_project.yml").write_text(
+        "name: economic_data\nversion: '0.1.0'\nprofile: economic_data\n",
+        encoding="utf-8",
+    )
+    warehouse_path = tmp_path / "w.duckdb"
+    (tmp_path / "profiles.yml").write_text(
+        "economic_data:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        f"        path: {warehouse_path}\n"
+        "        schema: main\n",
+        encoding="utf-8",
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        adapter.materialize_full("link_entities", _links())
+
+
+def _write_manifest(tmp_path: pathlib.Path, linking_source: str) -> pathlib.Path:
+    manifest = {
+        "sources": {
+            linking_source: {"name": "link_entities", "resource_type": "source"}
+        },
+        "nodes": {},
+        "exposures": {},
+        "parent_map": {},
+    }
+    path = tmp_path / "dbt_manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return path
+
+
+def test_source_name_override_reaches_the_dbt_manifest_lookup(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`emit-dbt-sources --source-name` renames what the consumer's manifest
+    records, so the concept-cloud lookup has to be told the same name. It used
+    to reconstruct the default and ignore the override entirely."""
+    _manifest_project(tmp_path)
+    linking_source = "source.econ_custom.link_entities"
+    manifest_path = _write_manifest(tmp_path, linking_source)
+
+    export = export_concept_cloud(
+        tmp_path,
+        linking_model="link_entities",
+        dbt_manifest=manifest_path,
+        source_name="econ_custom",
+    )
+    assert {e.dag_node for e in export.cross_layer_edges} == {linking_source}
+
+
+def test_a_source_name_that_does_not_resolve_is_an_error_not_an_empty_join(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cross-layer edges are the only reason to pass a manifest. Building
+    zero of them and reporting success renders a cloud that looks fine and is
+    missing the feature that was asked for."""
+    _manifest_project(tmp_path)
+    manifest_path = _write_manifest(tmp_path, "source.econ_custom.link_entities")
+
+    with pytest.raises(ConceptCloudExportError) as excinfo:
+        export_concept_cloud(
+            tmp_path,
+            linking_model="link_entities",
+            dbt_manifest=manifest_path,
+        )
+    message = str(excinfo.value)
+    assert "source.dbt_ml_economic_data.link_entities" in message
+    assert "--source-name" in message
+    # The message has to name what the manifest does declare, or the operator
+    # has nothing to correct it to.
+    assert "econ_custom" in message
+
+
+def test_the_default_source_name_matches_what_emit_dbt_sources_writes(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Both sides derive the name from one helper. Asserting they agree is the
+    point: the drift this fixes was two call sites spelling it separately."""
+    assert default_dbt_source_name("economic_data") == "dbt_ml_economic_data"

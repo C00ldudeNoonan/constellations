@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: dbt-ml did something unexpected
+about: stel did something unexpected
 title: ""
 labels: bug
 ---
@@ -22,7 +22,7 @@ What you thought would happen.
 **Versions**
 
 ```bash
-uv run dbt-ml --help | head -1   # or your install method
+uv run stel --help | head -1   # or your install method
 python --version
 uv --version
 ```

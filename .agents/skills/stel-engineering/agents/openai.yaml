@@ -1,0 +1,4 @@
+interface:
+  display_name: "stel Engineering"
+  short_description: "Build stel safely from its real contracts"
+  default_prompt: "Use $stel-engineering to implement this stel change safely."

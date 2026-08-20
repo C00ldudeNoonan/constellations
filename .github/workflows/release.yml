@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: dbt-ml
+        working-directory: stel
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +62,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dbt-ml/dist/*
+          path: stel/dist/*
           if-no-files-found: error
 
   publish:
@@ -71,7 +71,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: pypi
-      url: https://pypi.org/project/dbt-ml/
+      url: https://pypi.org/project/stel/
     permissions:
       contents: write
     steps:

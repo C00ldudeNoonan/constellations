@@ -1,0 +1,9 @@
+dbt_ref_roundtrip:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      # dbt owns this database; stel writes nothing here directly — the
+      # stel models run in-process and hand dbt a frame to materialize.
+      path: ./target/embedded.duckdb
+      schema: main

@@ -1,0 +1,58 @@
+version: 2
+sources:
+- name: dbt_ml_invoice_pipeline
+  description: Tables materialized by stel project 'invoice_pipeline'.
+  database: stel
+  schema: dbt_ml
+  tables:
+  - name: invoice_summary
+    description: Per-vendor aggregation
+    tags:
+    - agg
+    - invoices
+    columns:
+    - name: vendor
+      tests:
+      - not_null
+    - name: invoice_count
+      tests:
+      - not_null
+    - name: total_spend
+      tests:
+      - not_null
+  - name: monthly_totals
+    description: Per-month invoice volume and spend
+    tags:
+    - agg
+    - invoices
+    - monthly
+    columns:
+    - name: month
+      description: First-of-month timestamp (YYYY-MM-01)
+      tests:
+      - not_null
+      - unique
+    - name: invoice_count
+      tests:
+      - not_null
+    - name: total_spend
+      tests:
+      - not_null
+  - name: raw_invoices
+    description: Project synthetic invoice JSON into a typed table
+    tags:
+    - raw
+    - invoices
+    columns:
+    - name: invoice_id
+      tests:
+      - unique
+    - name: vendor
+      tests:
+      - not_null
+    - name: issue_date
+    - name: total
+      tests:
+      - not_null
+    - name: line_items
+    - name: currency

@@ -1,0 +1,14 @@
+[project]
+name = "dbt_embed_duckdb"
+version = "0.1.0"
+description = "dbt-duckdb project that embeds stel via a Python model (#177 prototype)"
+requires-python = ">=3.12"
+dependencies = [
+    "dbt-duckdb>=1.9",
+    # A real user's dbt project installs stel alongside dbt-duckdb in the same
+    # venv so a dbt Python model can import it. Here it's a local editable path.
+    "stel",
+]
+
+[tool.uv.sources]
+stel = { path = "../..", editable = true }

@@ -1,25 +1,25 @@
-# AGENTS.md — dbt-ml
+# AGENTS.md — stel
 
 ## Scope and sources of truth
 
 This file applies to the whole repository. A more specific `AGENTS.md`
 supplements these rules and overrides only conflicting guidance in its subtree.
 
-dbt-ml is a standalone, dbt-shaped Python CLI for turning unstructured data
+stel is a standalone, dbt-shaped Python CLI for turning unstructured data
 into warehouse tables. It is not a dbt package or adapter, and similarly named
 artifacts are not dbt-core contracts unless that compatibility is explicit.
 
-The Python project is nested under `dbt-ml/`. Run Git and GitHub commands from
+The Python project is nested under `stel/`. Run Git and GitHub commands from
 the repository root, but run Python, uv, test, lint, type-check, and build
-commands from `dbt-ml/`.
+commands from `stel/`.
 
-Package paths written without a `dbt-ml/` prefix are relative to `dbt-ml/`.
+Package paths written without a `stel/` prefix are relative to `stel/`.
 
 Use these maintained references rather than copying volatile feature lists:
 
-- `README.md` and `dbt-ml/README.md` — shipped behavior and user guidance.
-- `dbt-ml/CONTRIBUTING.md` — extension contracts and contributor workflow.
-- `dbt-ml/docs/release.md` — release process.
+- `README.md` and `stel/README.md` — shipped behavior and user guidance.
+- `stel/CONTRIBUTING.md` — extension contracts and contributor workflow.
+- `stel/docs/release.md` — release process.
 - GitHub issues labeled `roadmap` — planning context. Verify every claim against
   current code, tests, and user docs before describing it as implemented.
 
@@ -28,10 +28,10 @@ Use these maintained references rather than copying volatile feature lists:
 - Python 3.12+ only. Do not introduce Rust or PyO3 without an explicitly
   accepted design and scoped task.
 - Keep warehouse-specific SQL/dialect behavior, materialization, quoting, and
-  incremental state behind `src/dbt_ml/adapters/`. State belongs to the active
+  incremental state behind `src/stel/adapters/`. State belongs to the active
   adapter; do not add new DuckDB assumptions to orchestration.
-- Keep document discovery and fetch behind `src/dbt_ml/sources/`, extraction
-  behind `src/dbt_ml/backends/`, and vendor inference behavior behind a provider
+- Keep document discovery and fetch behind `src/stel/sources/`, extraction
+  behind `src/stel/backends/`, and vendor inference behavior behind a provider
   registry/contract. Establish that seam before adding another vendor; avoid
   integration-specific branches in `runner.py`.
 - Configuration uses strict Pydantic v2 models. Compiler/preflight validation
@@ -40,7 +40,7 @@ Use these maintained references rather than copying volatile feature lists:
 - Keep the core installation lean. Optional integrations must import lazily,
   declare the appropriate extra, and fail with an actionable install command
   when the extra is absent.
-- Treat dbt-ml artifact shapes as explicit contracts and version schema
+- Treat stel artifact shapes as explicit contracts and version schema
   changes. Do not imply generic dbt artifact, test, state, or selector
   compatibility that is not implemented.
 - Update user docs, config examples, templates, and artifact fixtures when a
@@ -67,7 +67,7 @@ Use these maintained references rather than copying volatile feature lists:
 - Validate incremental keys before mutation. Use each adapter's declared
   publication guarantees, and advance state only after successful publication;
   do not assume cross-operation transactions where the adapter lacks them.
-- Cleanup commands may remove only dbt-ml-owned local artifacts. Do not hide
+- Cleanup commands may remove only stel-owned local artifacts. Do not hide
   warehouse-wide reset behavior behind a familiar dbt command.
 - PII redaction is not sufficient when raw sensitive input columns remain in the
   output. Tests, examples, and docs must project or drop retained originals.
@@ -77,7 +77,7 @@ Use these maintained references rather than copying volatile feature lists:
 From the repository root:
 
 ```bash
-cd dbt-ml
+cd stel
 uv sync --all-extras --dev --locked
 uv run pip-audit --skip-editable
 uv run ruff check
@@ -120,5 +120,5 @@ and exclude unrelated resolution churn.
 - Use Pydantic v2 for configuration and Click for CLI behavior.
 - Comments explain non-obvious reasons or constraints, not line-by-line
   mechanics.
-- Keep `dbt` and `dbt-ml` lowercase, including at the start of a sentence.
+- Keep `dbt` and `stel` lowercase, including at the start of a sentence.
   Write `dbt Labs` for the company.

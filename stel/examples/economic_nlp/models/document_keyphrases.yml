@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: document_keyphrases
+    description: "Top-ranked keyphrases per document, extracted from the token child table"
+    depends_on: [ref('document_tokens')]
+    transform:
+      type: python
+      module: stel.text.transforms.extract_keyphrases
+      options:
+        tokens: document_tokens
+        document_id_field: document_id
+        language: en
+        min_phrase_length: 1
+        max_phrase_length: 3
+        top_k: 15
+        min_score: 0.0
+        # include_phrase_text: true  # opt-in: phrase text is a verbatim excerpt
+    materialization: full
+    tags: [economic_data, keyphrases]
+    tests:
+      - not_null: [phrase_id, document_id, rank, score, phrase_lemma, extractor, extractor_version]
+      - unique: [phrase_id]
+      - relationships:
+          column: document_id
+          to: ref('document_tokens')
+          field: document_id

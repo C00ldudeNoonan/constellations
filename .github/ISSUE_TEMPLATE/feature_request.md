@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest a capability dbt-ml should grow
+about: Suggest a capability stel should grow
 title: ""
 labels: enhancement
 ---
@@ -12,7 +12,7 @@ support?
 
 **The proposed change**
 
-What you think dbt-ml should add or change. YAML examples welcome.
+What you think stel should add or change. YAML examples welcome.
 
 **Alternatives considered**
 

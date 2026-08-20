@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 10
     defaults:
       run:
-        working-directory: dbt-ml   # the Python project lives in this subdir
+        working-directory: stel   # the Python project lives in this subdir
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

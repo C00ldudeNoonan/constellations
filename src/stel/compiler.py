@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -41,8 +42,14 @@ from .sql_models import (
     read_sql_source,
     validate_single_select,
 )
-from .test_specs import TestSpecError, parse_test_spec
+from .test_specs import (
+    TestSpecError,
+    declared_accepted_values,
+    parse_test_spec,
+)
 from .transforms import transform_requires_llm, validate_transform_contract
+
+log = logging.getLogger(__name__)
 
 _MODULE_PATTERN = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
 
@@ -518,6 +525,34 @@ def _validate_tests(
                 f"'{target}'",
                 ("tests", index),
             )
+    _warn_on_enum_test_drift(model)
+
+
+def _warn_on_enum_test_drift(model: ModelConfig) -> None:
+    """Warn when a hand-written accepted_values disagrees with a field's enum.
+
+    An explicit check on an `enum` field is redundant — the derived one already
+    covers it (issue #304) — so the only thing a disagreement can mean is that
+    one of the two lists has drifted. Which one is right is the author's call,
+    so this reports rather than decides.
+    """
+    declared = declared_accepted_values(model.tests)
+    for field in model.fields:
+        if not field.values or field.name not in declared:
+            continue
+        explicit = declared[field.name]
+        if set(explicit) == set(field.values):
+            continue
+        log.warning(
+            "Model '%s' field '%s' declares `values: %s` but its "
+            "accepted_values test allows %s. The declared set is what the "
+            "provider schema and the prompt use, so the test is checking a "
+            "different taxonomy than the model was asked for.",
+            model.name,
+            field.name,
+            sorted(field.values),
+            sorted(map(str, explicit)),
+        )
 
 
 def _validate_python_test(

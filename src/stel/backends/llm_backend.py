@@ -266,6 +266,7 @@ class LLMBackend(BaseBackend):
             )
         fields_spec = _fields_spec(options)
         system = options.get("system_prompt", _DEFAULT_SYSTEM)
+        fields_spec, system = _apply_enum_portability(provider, fields_spec, system)
         temperature = float(options.get("temperature", _DEFAULT_TEMPERATURE))
         max_tokens = int(options.get("max_tokens", _DEFAULT_MAX_TOKENS))
         poll_seconds = float(
@@ -596,6 +597,9 @@ def extract_fields_with_usage(
     )
     resolved_model = resolve_provider_model(provider_instance, model)
     resolved_base_url = provider_instance.resolve_base_url(base_url)
+    fields_spec, system = _apply_enum_portability(
+        provider_instance, fields_spec, system
+    )
     content_hash = hashlib.blake2b(
         text.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
@@ -1016,6 +1020,10 @@ def _input_schema(
             prop["description"] = f["description"]
         if ftype == "array":
             prop["items"] = f.get("items", {"type": "string"})
+        if f.get("enum"):
+            # Constrains the field at the API boundary rather than asking the
+            # model politely for one of the labels (issue #304).
+            prop["enum"] = list(f["enum"])
         properties[name] = prop
     object_schema = {"type": "object", "properties": properties}
     if output_cardinality == "many":
@@ -1027,6 +1035,38 @@ def _input_schema(
             "required": ["items"],
         }
     return object_schema
+
+
+def _apply_enum_portability(
+    provider: Any, fields_spec: list[dict[str, Any]], system: str
+) -> tuple[list[dict[str, Any]], str]:
+    """Move enum constraints into the prompt for providers whose schema can't carry them.
+
+    The declared value set is enforced as far as the provider allows and
+    communicated regardless (issue #304). Where the structured-output surface
+    accepts an `enum`, that is the constraint and the prompt says nothing extra
+    — asking politely on top of a hard constraint only spends tokens. Where it
+    cannot, the key is stripped rather than sent to be ignored or rejected, and
+    the labels are rendered into the system prompt instead.
+
+    Applied before the schema hash is taken, so the two paths cache separately:
+    they are genuinely different requests.
+    """
+    if provider.supports_schema_enum:
+        return fields_spec, system
+    constrained = [spec for spec in fields_spec if spec.get("enum")]
+    if not constrained:
+        return fields_spec, system
+    stripped = [
+        {key: value for key, value in spec.items() if key != "enum"}
+        for spec in fields_spec
+    ]
+    lines = "\n".join(
+        f"- {spec['name']}: use exactly one of "
+        + ", ".join(str(value) for value in spec["enum"])
+        for spec in constrained
+    )
+    return stripped, f"{system}\n\nAllowed values:\n{lines}"
 
 
 def _hash_schema(

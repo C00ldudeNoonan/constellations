@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -465,3 +466,43 @@ def _rate(name: str, options: dict[str, Any], key: str) -> float:
     if not 0.0 <= rate <= 1.0:
         raise TestSpecError(f"Test '{name}' {key} must be between 0 and 1")
     return rate
+
+
+def declared_accepted_values(specs: Sequence[Any]) -> dict[str, list[Any]]:
+    """Columns an explicit `accepted_values` test already covers, and its list.
+
+    Used to keep a derived enum check from duplicating a hand-written one, and
+    to notice when the two disagree (issue #304).
+    """
+    out: dict[str, list[Any]] = {}
+    for spec in specs:
+        try:
+            parsed = parse_test_spec(spec)
+        except TestSpecError:
+            # Invalid specs are reported by the compiler's own validation; this
+            # helper must not raise a second, less specific error.
+            continue
+        if parsed.name != "accepted_values" or not isinstance(parsed.argument, dict):
+            continue
+        column = parsed.argument.get("column")
+        values = parsed.argument.get("values")
+        if isinstance(column, str) and isinstance(values, list):
+            out[column] = values
+    return out
+
+
+def enum_test_specs(
+    fields: Sequence[Any], declared: Mapping[str, list[Any]]
+) -> list[dict[str, Any]]:
+    """Derive an `accepted_values` check for every field declaring a value set.
+
+    The declaration on the field is the single source of truth (issue #304), so
+    there is no hand-typed list here to drift from the prompt or the provider
+    schema. A column a user already wrote an explicit check for is skipped —
+    theirs runs, not two of them.
+    """
+    return [
+        {"accepted_values": {"column": field.name, "values": list(field.values)}}
+        for field in fields
+        if getattr(field, "values", None) and field.name not in declared
+    ]

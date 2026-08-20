@@ -659,11 +659,43 @@ class FieldConfig(BaseModel):
     name: str
     description: str | None = None
     data_type: Literal[
-        "string", "integer", "float", "boolean", "date", "timestamp", "json"
+        "string", "integer", "float", "boolean", "date", "timestamp", "json", "enum"
     ] | None = Field(
         default=None,
         validation_alias=AliasChoices("data_type", "data-type", "type", "dtype"),
     )
+    # The closed set a `type: enum` field may take (issue #304). Declared once
+    # here and derived everywhere else: the provider's output schema, the
+    # implicit accepted_values check, and — where a provider's structured
+    # output cannot carry an enum — the rendered prompt. A label list written
+    # out in several places is a list that drifts.
+    values: list[str] = Field(default_factory=list)
+
+    @field_validator("values")
+    @classmethod
+    def _validate_values(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for value in v:
+            if not value.strip():
+                raise ValueError("field values must not be empty")
+            if value in seen:
+                raise ValueError(f"field values list '{value}' twice")
+            seen.add(value)
+        return v
+
+    @model_validator(mode="after")
+    def _validate_enum(self) -> FieldConfig:
+        if self.data_type == "enum" and not self.values:
+            raise ValueError(
+                f"Field '{self.name}' is `type: enum` but declares no `values:`; "
+                "an enum with no closed set constrains nothing"
+            )
+        if self.values and self.data_type != "enum":
+            raise ValueError(
+                f"Field '{self.name}' declares `values:` but is "
+                f"`type: {self.data_type or 'string'}`; use `type: enum`"
+            )
+        return self
 
     @field_validator("data_type", mode="before")
     @classmethod

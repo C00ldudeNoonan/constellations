@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Enum fields: declare the label set once (issue #304)
+
+- **`type: enum` with `values:`** on a model field declares a closed set in one
+  place. A classification task used to write its labels into the prompt, an
+  `accepted_values` test, and the provider schema separately, with nothing to
+  catch the three drifting apart.
+- **The provider output schema** now carries a real `enum`, constraining the
+  field at the API boundary rather than asking the model politely.
+- **An `accepted_values` check is derived** from the declaration, so an enum
+  field is checked without a `tests:` entry and with no hand-typed list to
+  drift. An explicit `accepted_values` on the same column is honoured instead
+  of duplicated; when the two lists disagree, compile time says so.
+- **Prompt injection is the portability fallback.** Where a provider's
+  structured output cannot carry an enum, the constraint is stripped from the
+  schema and the labels are rendered into the system prompt, so the taxonomy is
+  enforced as far as the provider allows and communicated regardless. Every
+  shipped provider carries enums natively; a provider declares this with
+  `supports_schema_enum`.
+- The column materializes as a string, and `emit-dbt-sources` exports it as
+  `string` — `enum` is stel's declaration, not a warehouse column type.
+- A no-op for existing models: fields without `values:` derive nothing, and
+  no cache keys move.
+
 ### `chunk:` can put document context where the embedder can see it (issue #308)
 
 - **`in_text_metadata:` on a `chunk:` model** renders upstream columns into the

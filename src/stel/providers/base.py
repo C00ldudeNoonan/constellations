@@ -933,6 +933,13 @@ class InferenceProvider(BaseProvider):
     supports_native_batch: ClassVar[bool] = False
     max_batch_requests: ClassVar[int | None] = None
     batch_cost_multiplier: ClassVar[float] = 1.0
+    # Whether this provider's structured-output surface can carry an `enum`
+    # constraint (issue #304). Every shipped provider forwards a JSON-Schema
+    # -shaped payload that can, so the default is True; a provider whose
+    # schema cannot express one sets this False and gets the closed set
+    # rendered into the prompt instead, which communicates the taxonomy even
+    # where it cannot enforce it.
+    supports_schema_enum: ClassVar[bool] = True
 
     @abstractmethod
     def complete(

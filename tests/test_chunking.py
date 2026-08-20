@@ -14,7 +14,13 @@ import duckdb
 import polars as pl
 import pytest
 
-from stel.chunking import chunk_id, split_text
+from stel.chunking import (
+    ChunkingError,
+    chunk_id,
+    measure,
+    render_metadata_block,
+    split_text,
+)
 from stel.config.model import ChunkConfig
 from stel.hashing import HASH_DIGEST_SIZE
 from stel.runner import (
@@ -239,7 +245,9 @@ def test_chunk_document_identity_is_validated_before_mutation(
 # ─── end to end: registry → chunks ──────────────────────────────────────────
 
 
-def _chunk_project(tmp_path: Path, *, chunk_size: int = 120) -> Path:
+def _chunk_project(
+    tmp_path: Path, *, chunk_size: int = 120, in_text_metadata: str | None = None
+) -> Path:
     project = tmp_path / "proj"
     project.mkdir()
     (project / "stel_project.yml").write_text("name: docs\nversion: '0.1.0'\nprofile: docs\n")
@@ -260,11 +268,17 @@ def _chunk_project(tmp_path: Path, *, chunk_size: int = 120) -> Path:
         "        fields: [title, body, tenant, access_groups, effective_date]\n"
         "    materialization: incremental\n"
     )
+    metadata_line = (
+        f"      in_text_metadata: [{in_text_metadata}]\n"
+        if in_text_metadata is not None
+        else ""
+    )
     (project / "models" / "chunks.yml").write_text(
         "version: 2\nmodels:\n  - name: document_chunks\n"
         "    depends_on: [ref('document_registry')]\n    chunk:\n"
         "      strategy: recursive\n      text_field: body\n"
         f"      chunk_size: {chunk_size}\n      chunk_overlap: 20\n"
+        f"{metadata_line}"
         "    materialization: incremental\n"
     )
     docs = project / "data" / "docs"
@@ -671,3 +685,157 @@ def test_ls_reports_chunk_kind() -> None:
         chunk=ChunkConfig(),
     )
     assert _model_kind(model) == "chunk"
+
+
+# ─── in-text metadata (issue #308) ──────────────────────────────────────────
+
+
+def test_metadata_block_renders_in_declared_order() -> None:
+    # Declared order, not sorted: it is the author's, and a stable rendering is
+    # what keeps chunk ids stable.
+    record = {"title": "Q3 Report", "published_date": "2026-03-14", "body": "..."}
+
+    block = render_metadata_block(record, ["published_date", "title"])
+
+    assert block == "published_date: 2026-03-14\ntitle: Q3 Report\n---\n"
+
+
+def test_metadata_block_skips_null_values() -> None:
+    record = {"title": "Q3 Report", "published_date": None}
+
+    block = render_metadata_block(record, ["title", "published_date"])
+
+    assert block == "title: Q3 Report\n---\n"
+    assert "None" not in block
+
+
+def test_metadata_block_is_empty_when_every_value_is_null() -> None:
+    # No lines means no separator either — an empty block must not prepend a
+    # bare rule to the text.
+    assert render_metadata_block({"title": None}, ["title"]) == ""
+
+
+def test_reserved_budget_shrinks_chunks_so_the_block_still_fits() -> None:
+    config = ChunkConfig(strategy="recursive", chunk_size=100, chunk_overlap=0)
+    text = "x" * 500
+    block = "title: T\n---\n"
+
+    pieces = split_text(text, config, reserved=len(block))
+
+    assert pieces
+    for piece in pieces:
+        assert len(block + piece.text) <= config.chunk_size
+
+
+def test_reserved_budget_leaving_no_room_for_text_raises() -> None:
+    config = ChunkConfig(strategy="recursive", chunk_size=20, chunk_overlap=0)
+
+    with pytest.raises(ChunkingError, match="leaving no room for text"):
+        split_text("some text", config, reserved=20)
+
+
+def test_overlap_at_or_above_the_remaining_budget_raises() -> None:
+    # chunk_overlap validated against chunk_size at config load, but the block
+    # moves the ceiling it has to stay under.
+    config = ChunkConfig(strategy="recursive", chunk_size=100, chunk_overlap=60)
+
+    with pytest.raises(ChunkingError, match="chunk_overlap"):
+        split_text("some text", config, reserved=50)
+
+
+def test_in_text_metadata_config_rejects_duplicates_and_the_text_field() -> None:
+    with pytest.raises(ValueError, match="twice"):
+        ChunkConfig(in_text_metadata=["title", "title"])
+    with pytest.raises(ValueError, match="must not name the text field"):
+        ChunkConfig(text_field="body", in_text_metadata=["body"])
+
+
+def test_in_text_metadata_is_additive(tmp_path: Path) -> None:
+    """The block goes into the text *and* the columns stay.
+
+    The design rule (#308): SQL reads columns, the embedding model reads only
+    the text, and a rendering aimed at one reader must never remove the copy
+    the other depends on.
+    """
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path, in_text_metadata="title")
+    _write_doc(project, "a.json", "Doc A", ". ".join(f"sentence {i}" for i in range(30)))
+
+    run_project(project)
+
+    rows = _chunks(project)
+    assert rows
+    for _cid, _doc_id, _idx, _count, text, title, _source_uri, _strategy in rows:
+        # in the text, for the embedder...
+        assert text.startswith("title: Doc A\n---\n")
+        # ...and still in its own column, for SQL.
+        assert title == "Doc A"
+
+
+def test_in_text_metadata_chunks_stay_within_chunk_size(tmp_path: Path) -> None:
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path, chunk_size=120, in_text_metadata="title")
+    _write_doc(project, "a.json", "Doc A", ". ".join(f"sentence {i}" for i in range(40)))
+
+    run_project(project)
+
+    rows = _chunks(project)
+    assert len(rows) > 1
+    for row in rows:
+        assert len(row[4]) <= 120
+
+
+def test_chunk_id_tracks_the_text_that_is_stored(tmp_path: Path) -> None:
+    """chunk_id must derive from the text the row actually carries.
+
+    The agent_context document_chunks contract recomputes it from the stored
+    `text` and rejects a mismatch, so deriving the id from the pre-block text
+    while storing the post-block text would fail validation downstream.
+    """
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path, in_text_metadata="title")
+    _write_doc(project, "a.json", "Doc A", ". ".join(f"sentence {i}" for i in range(30)))
+
+    run_project(project)
+
+    for cid, doc_id, idx, _count, text, *_rest in _chunks(project):
+        assert cid == chunk_id(doc_id, idx, text)
+
+
+def test_in_text_metadata_naming_a_missing_column_fails_fast(tmp_path: Path) -> None:
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path, in_text_metadata="nonexistent_column")
+    _write_doc(project, "a.json", "Doc A", "short body")
+
+    with pytest.raises(RunError, match="nonexistent_column"):
+        run_project(project)
+
+
+def test_tokens_strategy_charges_the_block_against_chunk_size() -> None:
+    """The reservation is exact in the unit the strategy splits by.
+
+    Tokenizers can merge across a concatenation boundary, so measuring the
+    block alone and adding it to a piece is not obviously safe — this asserts
+    the combined text really does fit, rather than assuming it.
+    """
+    tiktoken = pytest.importorskip("tiktoken")
+    config = ChunkConfig(
+        strategy="tokens",
+        chunk_size=64,
+        chunk_overlap=8,
+        in_text_metadata=["title", "published_date"],
+    )
+    record = {"title": "Q3 Monetary Policy Report", "published_date": "2026-03-14"}
+    block = render_metadata_block(record, config.in_text_metadata)
+    text = ". ".join(f"sentence number {i} about rates" for i in range(120))
+
+    pieces = split_text(text, config, reserved=measure(block, config))
+
+    encoding = tiktoken.get_encoding(config.encoding)
+    assert len(pieces) > 1
+    for piece in pieces:
+        assert len(encoding.encode(block + piece.text)) <= config.chunk_size

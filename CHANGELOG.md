@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### `chunk:` can put document context where the embedder can see it (issue #308)
+
+- **`in_text_metadata:` on a `chunk:` model** renders upstream columns into the
+  chunk text as a small block ahead of it, so a chunk from the middle of a
+  document no longer embeds with no idea which document it came from. Fields
+  render in declared order; nulls are skipped; naming a column the upstream
+  does not have fails before any document is processed.
+- **Additive, never a mode switch.** The columns are still carried onto every
+  chunk row. SQL reads columns and the model reads only text, and a rendering
+  aimed at one reader must never remove the copy the other depends on.
+- **The block counts against `chunk_size`**, in the unit the strategy splits
+  by, so it does not push chunks past the size the embedder was configured
+  for.
+  Adding it on top would have pushed chunks past provider input limits, which
+  a provider configured without truncation rejects outright. A block that
+  leaves no room for text — or that pushes `chunk_overlap` to or past the
+  remaining budget — fails with the numbers named.
+- **`chunk_id` tracks the rendered text**, like any other text change. Turning
+  the option on or editing its field list re-keys that document's chunks and
+  invalidates anything downstream keyed on them. That keeps it consistent with
+  the `agent_context` `document_chunks` contract, which recomputes the id from
+  the stored text and rejects a mismatch. Worth landing before a corpus is
+  embedded at scale rather than after.
+- `embed:` needs no change: it reads the chunk model's text field, so the block
+  reaches the embedding provider on its own.
+
 ### The upgrade path explains itself at the first step (issue #324)
 
 - **A missing `stel_project.yml` now looks for a `dbt_ml_project.yml` beside

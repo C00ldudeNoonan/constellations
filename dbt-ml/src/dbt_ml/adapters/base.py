@@ -22,6 +22,7 @@ from math import isfinite
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
+from uuid import uuid4
 
 import polars as pl
 import pyarrow as pa
@@ -143,10 +144,39 @@ def validate_state_keys(record_keys: Sequence[str]) -> None:
         raise AdapterError("State record keys contain duplicate values")
 
 
+# ─── frozen warehouse object names ───────────────────────────────────────
+#
+# Every name below identifies something that already exists in users'
+# warehouses, so its value is data rather than code. Renaming one orphans what
+# it points at: the next run finds no prior state, reports every document as
+# new, and reprocesses the corpus at provider cost, with no error to notice.
+# Change these only with a migration that carries the existing objects over.
+
+# Incremental state. Hoisted from the DuckDB and BigQuery adapters, which
+# declared it separately with nothing asserting the two agreed.
+STATE_TABLE = "dbt_ml_state"
+
 # Serving-ledger table name shared with retrieval.coordination: fenced state
 # replacement must verify a publication claim in the same warehouse that owns
 # the state rows, without adapters importing retrieval code.
 SERVING_LEDGER_TABLE = "dbt_ml_serving_ledger"
+
+# `--store-failures` inspection tables and in-flight full-load staging tables
+# (#77). Both are dbt-ml-internal and must stay out of the model namespace, so
+# the producers that create them and the `list_tables` filters that hide them
+# derive from the same prefixes — a prefix that drifts on one side only would
+# leak internal tables into every catalog listing and test sweep.
+TEST_FAILURES_TABLE_PREFIX = "dbt_ml_test_failures__"
+STAGING_TABLE_PREFIX = "dbt_ml_staging__"
+INTERNAL_TABLE_PREFIXES = (TEST_FAILURES_TABLE_PREFIX, STAGING_TABLE_PREFIX)
+
+
+def staging_table_name(label: str) -> str:
+    """Name a single-use staging table. Both adapters spelled this inline at a
+    dozen sites; going through one function is what lets a test assert that what
+    the producers create is what `list_tables` hides."""
+    return f"{STAGING_TABLE_PREFIX}{label}__{uuid4().hex[:12]}"
+
 
 _MAX_STATE_CURSOR_CHARS = 8192
 _MAX_STATE_PAGE_SIZE = 100_000

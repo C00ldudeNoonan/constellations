@@ -1,6 +1,3 @@
-from importlib.metadata import PackageNotFoundError, version
+from ._distribution import distribution_version
 
-try:
-    __version__ = version("dbt-ml")
-except PackageNotFoundError:
-    __version__ = "unknown"
+__version__ = distribution_version()

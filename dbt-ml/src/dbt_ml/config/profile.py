@@ -22,6 +22,7 @@ from ..credentials import (
     ProtectedCredential,
 )
 from ..endpoints import OpenAICompatibleBaseUrl
+from .identifiers import DEFAULT_SCHEMA_NAME
 
 DEFAULT_LLM_API_KEY_ENV = "ANTHROPIC_API_KEY"
 DEFAULT_LLM_PROVIDER = "anthropic"
@@ -116,7 +117,7 @@ class WarehouseConfig(BaseModel):
     _target_name: str | None = PrivateAttr(default=None)
 
     type: str = "duckdb"
-    schema_name: str = Field(default="dbt_ml", alias="schema")
+    schema_name: str = Field(default=DEFAULT_SCHEMA_NAME, alias="schema")
 
     def bind_target_name(self, target_name: str) -> None:
         """Attach resolved runtime target identity without making it profile YAML."""

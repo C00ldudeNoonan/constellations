@@ -15,6 +15,13 @@ from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 HASH_DIGEST_SIZE = 16
 
+# Frozen. Every incremental decision dbt-ml makes compares a stored digest
+# against a recomputed one, so one byte different here changes every digest, no
+# stored digest matches, and the next run reprocesses every document — at full
+# provider cost, reporting success. Nothing about that is visible in a diff or a
+# relative-property test, which is why tests/test_frozen_names.py pins real
+# digests. The same applies to every `domain=` value passed below: each is a
+# contract string recorded in a warehouse, not a description.
 _FINGERPRINT_PREFIX = b"dbt-ml-canonical-fingerprint"
 
 
@@ -34,7 +41,12 @@ def canonical_fingerprint(
     version: int = 1,
     digest_size: int = HASH_DIGEST_SIZE,
 ) -> str:
-    """Hash a canonical value in an explicit semantic domain."""
+    """Hash a canonical value in an explicit semantic domain.
+
+    `domain` and `version` are frozen: they are mixed into the digest, so a
+    caller that changes either invalidates every digest already stored under
+    the old pair. See the note on `_FINGERPRINT_PREFIX`.
+    """
     if not domain:
         raise ValueError("Fingerprint domain must not be empty")
     if version < 1:
@@ -141,5 +153,11 @@ def _canonical_value(value: Any) -> Any:
 
 
 def _type_identity(value: Any) -> str:
+    # Frozen, and coupled to the package name: fingerprinting a value that
+    # contains a dbt-ml-defined pydantic model or enum records
+    # `dbt_ml.<module>.<Class>` inside the digest. No production call site
+    # does that today — every one passes primitives — but one that did would
+    # silently bind stored digests to the module path. Pinned in
+    # tests/test_frozen_names.py.
     value_type = type(value)
     return f"{value_type.__module__}.{value_type.__qualname__}"

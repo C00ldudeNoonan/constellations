@@ -180,6 +180,28 @@ Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one
 3. Raise `click.ClickException` from any `*Error` exception you catch.
 4. Update README's CLI section.
 
+## Changing a persisted name or a fingerprint domain
+
+Some strings dbt-ml uses are data, not code: warehouse table names and prefixes,
+the default schema, LanceDB collection metadata, artifact keys, the fingerprint
+prefix, and every `canonical_fingerprint(domain=...)` value. They are written
+into places that outlive a run, so changing one does not fail — it points the
+tool at something that is not there, and the next run reprocesses the corpus at
+provider cost while reporting success.
+
+`tests/test_frozen_names.py` pins them, including a real digest per fingerprint
+domain. If it fails, read the `why_frozen` text in the assertion message before
+updating the table.
+
+1. Adding a fingerprint domain: add a golden digest row. The completeness scan
+   fails until you do.
+2. Changing a persisted name: it needs a migration that carries the existing
+   objects over, in the same change. Updating the pin alone strands the data.
+3. Naming a new internal warehouse table: derive it from
+   `adapters.base.INTERNAL_TABLE_PREFIXES` so `list_tables()` hides it.
+4. Reading an environment variable: declare it in `src/dbt_ml/env.py` and read
+   it with `read_env`. A bare `DBT_ML_*` literal fails the scan.
+
 ## Security and correctness invariants
 
 - Route paths from project YAML through the boundary helpers in `paths.py`.

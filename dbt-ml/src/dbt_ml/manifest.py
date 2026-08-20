@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
+from ._distribution import distribution_version
 from .adapters import StateScope
 from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
@@ -123,6 +122,12 @@ def write_manifest(
     return out
 
 
+# Key naming the producing release in run_results metadata. Dagster reads
+# this payload (#87), so the key is an external contract, not a label; its
+# presence is pinned in tests/test_characterization.py.
+RUN_RESULTS_VERSION_KEY = "dbt_ml_version"
+
+
 def build_run_results(
     project_dir: Path,
     results: list[ModelRunResult],
@@ -192,7 +197,7 @@ def build_run_results(
 
     overall = "error" if (n_error or skipped) else "success"
     metadata: dict[str, Any] = {
-        "dbt_ml_version": _dbt_ml_version(),
+        RUN_RESULTS_VERSION_KEY: distribution_version(),
         "generated_at": _now(),
         "invocation": invocation,
         "status": overall,
@@ -275,13 +280,6 @@ def _relation(
         "name": name,
         "fully_qualified": ".".join(parts),
     }
-
-
-def _dbt_ml_version() -> str:
-    try:
-        return _pkg_version("dbt-ml")
-    except PackageNotFoundError:
-        return "unknown"
 
 
 def _model_dict(

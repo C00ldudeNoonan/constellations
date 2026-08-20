@@ -26,6 +26,7 @@ from tempfile import mkdtemp
 from typing import Any, cast
 from uuid import uuid4
 
+from .._distribution import distribution_version
 from ..config.model import MLConfig, ModelConfig
 from ..config.project import ProjectConfig
 from ..hashing import HASH_DIGEST_SIZE
@@ -35,6 +36,11 @@ from .contracts import ClassifierProvider, FeatureProvider
 ARTIFACT_SCHEMA_VERSION = 2
 
 ARTIFACT_REGISTRY_FILENAME = "registry.json"
+
+# Required key in every fitted artifact's `metadata.json` runtime block, and
+# validated on load. It is written into artifacts already on disk, so renaming
+# it fails every one of them with an incompatible-runtime error.
+ARTIFACT_RUNTIME_VERSION_KEY = "dbt_ml"
 
 
 @dataclass
@@ -117,7 +123,7 @@ def _validate_metadata(
             f"{list(expected_files)!r}, found {files!r}"
         )
     runtime = metadata.get("runtime")
-    required_runtime_fields = ("python", "dbt_ml", "polars", "provider")
+    required_runtime_fields = ("python", ARTIFACT_RUNTIME_VERSION_KEY, "polars", "provider")
     if not isinstance(runtime, dict) or any(
         not isinstance(runtime.get(field), str) or not runtime[field]
         for field in required_runtime_fields
@@ -569,7 +575,7 @@ def _display_path(path: Path, project_dir: Path) -> str:
 def _runtime_versions(provider: str) -> dict[str, str]:
     return {
         "python": sys.version.split()[0],
-        "dbt_ml": _package_version("dbt-ml"),
+        ARTIFACT_RUNTIME_VERSION_KEY: distribution_version(),
         "polars": _package_version("polars"),
         "provider": provider,
     }

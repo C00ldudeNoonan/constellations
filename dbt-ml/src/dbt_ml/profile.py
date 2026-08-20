@@ -41,6 +41,7 @@ from .config.yaml_diagnostics import (
     parse_yaml_document,
 )
 from .credentials import CredentialReference
+from .env import PROFILES_DIR_ENV, read_env
 from .providers import (
     ProviderConfigurationError,
     ProviderNotFoundError,
@@ -59,7 +60,6 @@ from .retrieval import (
 )
 
 PROFILES_FILENAME = "profiles.yml"
-PROFILES_DIR_ENV = "DBT_ML_PROFILES_DIR"
 
 
 class ProfileError(Exception):
@@ -360,7 +360,7 @@ def _discover_profiles_file(
     trusted_candidates: list[Path] = []
     if profiles_dir is not None:
         trusted_candidates.append(profiles_dir / PROFILES_FILENAME)
-    env_dir = os.environ.get(PROFILES_DIR_ENV)
+    env_dir = read_env(PROFILES_DIR_ENV)
     if env_dir:
         trusted_candidates.append(Path(env_dir) / PROFILES_FILENAME)
 

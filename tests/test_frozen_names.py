@@ -63,8 +63,12 @@ from stel.classic_ml.artifacts import ARTIFACT_RUNTIME_VERSION_KEY
 from stel.config.identifiers import (
     DEFAULT_DUCKDB_FILENAME,
     DEFAULT_SCHEMA_NAME,
+    GLOBAL_PROFILES_DIRNAME,
     LEGACY_DUCKDB_FILENAME,
+    LEGACY_GLOBAL_PROFILES_DIRNAME,
+    LEGACY_PROJECT_FILENAME,
     LEGACY_SCHEMA_NAME,
+    PROJECT_FILENAME,
     RESERVED_PREFIXES,
 )
 from stel.config.profile import WarehouseConfig
@@ -206,6 +210,33 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
         "dbt_ml.duckdb",
         "the file pre-#313 zero-config projects defaulted to; config load looks "
         "for it before opening an empty database under the new name",
+    ),
+    (
+        "config.identifiers.PROJECT_FILENAME",
+        PROJECT_FILENAME,
+        "stel_project.yml",
+        "every existing project has this file on disk under this exact name",
+    ),
+    (
+        "config.identifiers.LEGACY_PROJECT_FILENAME",
+        LEGACY_PROJECT_FILENAME,
+        "dbt_ml_project.yml",
+        "what a pre-rename project still has on disk, and the only reason the "
+        "missing-file error can explain itself instead of just reporting an "
+        "absence",
+    ),
+    (
+        "config.identifiers.GLOBAL_PROFILES_DIRNAME",
+        GLOBAL_PROFILES_DIRNAME,
+        ".stel",
+        "the global profile lives here; a new name silently finds no profile",
+    ),
+    (
+        "config.identifiers.LEGACY_GLOBAL_PROFILES_DIRNAME",
+        LEGACY_GLOBAL_PROFILES_DIRNAME,
+        ".dbt_ml",
+        "where a pre-rename global profile still sits, and what the not-found "
+        "error points at",
     ),
     (
         "_distribution.DISTRIBUTION_NAME",

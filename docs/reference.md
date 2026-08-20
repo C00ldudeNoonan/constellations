@@ -439,6 +439,24 @@ the whole corpus at provider cost — with no error, because that is exactly
 what a genuine first run looks like. Nothing is allowed to reach that state
 silently, so each way of arriving at it is a hard stop with the fix named.
 
+The rename also moved two files you own, and both come *before* the warehouse
+in the order things fail.
+
+**The project file.** `dbt_ml_project.yml` is now `stel_project.yml`. This is
+the first thing an upgrading project hits, so the missing-file error looks for
+the old name beside it and gives you the rename:
+
+```
+git mv dbt_ml_project.yml stel_project.yml
+```
+
+**A global profile.** If yours lives in your home directory rather than the
+project, it moved from `~/.dbt_ml/profiles.yml` to `~/.stel/profiles.yml`. The
+"no profiles.yml was found" error names the old path when it is still there.
+
+Neither old name is ever loaded — only reported. Two spellings that both work
+is how the old one never dies, so these stay one-time, visible steps.
+
 **Internal tables under their old names.** Run the migration once per target:
 
 ```

@@ -31,6 +31,7 @@ from .concept_cloud import (
     write_concept_cloud,
 )
 from .config import ConfigError
+from .config.identifiers import PROJECT_FILENAME
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
@@ -44,6 +45,7 @@ from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
 from .profile import (
+    PROFILES_FILENAME,
     ProfileError,
     apply_source_path_overrides,
     resolve_llm_options,
@@ -371,7 +373,7 @@ def init(name: str, template: str) -> None:
     for path in target.rglob(".gitkeep"):
         path.unlink()
 
-    for filename in ("stel_project.yml", "profiles.yml"):
+    for filename in (PROJECT_FILENAME, PROFILES_FILENAME):
         path = target / filename
         if path.exists():
             path.write_text(path.read_text().replace("__PROJECT_NAME__", name))

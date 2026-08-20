@@ -1,9 +1,0 @@
-dbt_ref_roundtrip:
-  target: dev
-  outputs:
-    dev:
-      type: duckdb
-      # dbt owns this database; dbt-ml writes nothing here directly — the
-      # dbt-ml models run in-process and hand dbt a frame to materialize.
-      path: ./target/embedded.duckdb
-      schema: main

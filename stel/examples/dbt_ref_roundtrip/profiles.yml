@@ -1,0 +1,10 @@
+dbt_ref_roundtrip:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        # Unused in embedded mode (dbt owns materialization; stel writes
+        # nothing here), but a profile is still required to compile.
+        type: duckdb
+        path: ./target/dbt_ml.duckdb
+        schema: dbt_ml

@@ -1,9 +1,0 @@
-dbt_embed_duckdb:
-  target: dev
-  outputs:
-    dev:
-      type: duckdb
-      # dbt owns this database; dbt-ml writes nothing here directly — the
-      # dbt-ml model runs in-process and hands dbt a frame to materialize.
-      path: ./target/embedded.duckdb
-      schema: main

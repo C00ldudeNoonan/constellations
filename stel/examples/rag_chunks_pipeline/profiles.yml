@@ -1,0 +1,40 @@
+rag_chunks_pipeline:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/dbt_ml.duckdb
+        schema: rag
+      retrieval:
+        default: local
+        allow_public_indexes: true
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb
+          # A cloud-backed store shares one index across the machine that runs
+          # `stel build` and the machines that serve it (MCP server, search
+          # API). lancedb connects to s3://, gs://, and az:// natively; a cloud
+          # `path` skips local-path resolution and passes straight through.
+          # Uncomment and set `default: cloud` to use it.
+          # cloud:
+          #   type: lancedb
+          #   path: gs://my-bucket/stel/lancedb
+          #   storage_options:
+          #     # NON-secret routing only (region, endpoint, …), forwarded to
+          #     # lancedb.connect(storage_options=...). These are part of the
+          #     # store's identity. Secrets are rejected here — use
+          #     # storage_options_env below or the object store's own credential
+          #     # chain (ADC / instance profile / env vars).
+          #     region: us-central1
+          #   storage_options_env:
+          #     # option-key -> environment-variable NAME holding the secret.
+          #     # The reference is resolved only at connect(), redacted from
+          #     # config dumps, and never written to artifacts/logs.
+          #     aws_secret_access_key: STEL_LANCEDB_AWS_SECRET
+          #   # The single-host publisher lock has no local disk to live on for a
+          #   # cloud store, so it defaults to a fixed per-machine directory. If
+          #   # your publishers run in separate containers, point this at a volume
+          #   # mounted into every one of them so they actually share the lock.
+          #   # publisher_lock_dir: /var/run/stel/lancedb-locks

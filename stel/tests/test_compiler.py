@@ -1,0 +1,1354 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Literal
+
+import pytest
+from click.testing import CliRunner
+
+from stel.adapters import (
+    WarehouseCapability,
+    create_adapter,
+    parse_warehouse_config,
+)
+from stel.cli import cli
+from stel.compiler import (
+    validate_project_contract,
+    validate_warehouse_capabilities,
+    validate_warehouse_operation_capabilities,
+)
+from stel.config import ConfigError, load_project
+from stel.config.model import ModelConfig
+from stel.config.project import ProjectConfig
+from stel.config.source import SourceConfig
+from stel.credentials import CredentialReference
+from stel.dag import ProjectDAG
+from stel.runner import build_project
+from stel.test_specs import TestSpecError as SpecError
+from stel.test_specs import parse_test_spec
+
+
+def _source(name: str = "docs") -> SourceConfig:
+    return SourceConfig(name=name, path=f"data/{name}")
+
+
+def _extraction(
+    name: str, source: str = "docs", *, backend: str = "json"
+) -> ModelConfig:
+    return ModelConfig(
+        name=name,
+        source=f"ref('{source}')",
+        extraction={"backend": backend},
+    )
+
+
+def test_capability_preflight_rejects_missing_typed_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = ModelConfig(
+        name="chunks",
+        depends_on=["ref('raw')"],
+        chunk={"text_field": "text"},
+    )
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.TABULAR_READS,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(ConfigError, match=r"tabular_reads.*chunk input reads"):
+        validate_warehouse_capabilities([model], "vector_only")
+
+
+def test_capability_preflight_rejects_sql_tests_without_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _extraction("raw")
+    model.tests = ["not_empty"]
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.SQL_SCHEMA_TESTS,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(ConfigError, match=r"sql_schema_tests.*model tests"):
+        validate_warehouse_capabilities([model], "non_sql")
+
+
+def _iceberg_model(
+    materialization: Literal["full", "incremental"] = "full",
+) -> ModelConfig:
+    model = _extraction("raw")
+    model.materialization = materialization
+    model.warehouse_options = {
+        "table_format": "iceberg",
+        "storage_uri": "gs://b/t",
+        "connection": "p.us.c",
+    }
+    return model
+
+
+def test_capability_preflight_requires_iceberg_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ICEBERG_TABLE_FORMAT,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities", lambda _adapter_type: available
+    )
+
+    with pytest.raises(ConfigError, match="iceberg_table_format"):
+        validate_warehouse_capabilities([_iceberg_model()], "no_iceberg")
+    with pytest.raises(ConfigError, match="iceberg_table_format"):
+        validate_warehouse_capabilities([_iceberg_model("incremental")], "no_iceberg")
+
+
+def test_iceberg_full_is_gated_by_iceberg_not_atomic_full_replace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An adapter with the Iceberg capability but no ATOMIC_FULL_REPLACE can still
+    # run an Iceberg full model, while a standard full model on it cannot.
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ATOMIC_FULL_REPLACE,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities", lambda _adapter_type: available
+    )
+
+    validate_warehouse_capabilities([_iceberg_model()], "iceberg_only")
+    standard = _extraction("raw")
+    standard.materialization = "full"
+    with pytest.raises(ConfigError, match="atomic_full_replace"):
+        validate_warehouse_capabilities([standard], "iceberg_only")
+
+
+def test_iceberg_models_pass_on_bigquery() -> None:
+    validate_warehouse_capabilities([_iceberg_model()], "bigquery")
+    validate_warehouse_capabilities([_iceberg_model("incremental")], "bigquery")
+
+
+def _bigquery_adapter_with_iceberg_defaults():
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "dataset": "docs_dev",
+            "warehouse_defaults": {
+                "table_format": "iceberg",
+                "connection": "proj.us.biglake",
+                "external_volume": "gs://iceberg-bucket/tables",
+            },
+        }
+    )
+    config.bind_target_name("dev")
+    return create_adapter(config)
+
+
+def test_capability_preflight_uses_effective_profile_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The SQL model declares no table_format; the Iceberg format comes from the
+    # profile's warehouse_defaults. Stripping the Iceberg capability proves the
+    # effective default reached the preflight — the SQL model is now gated on
+    # ICEBERG_TABLE_FORMAT (issue #290: no longer a SQL-specific rejection) — and
+    # `inherit: false` opts back out to a plain table.
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ICEBERG_TABLE_FORMAT,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities", lambda _adapter_type: available
+    )
+    model = ModelConfig(
+        name="sqlmod",
+        materialization="full",
+        transform={"type": "sql", "path": "models/sqlmod.sql"},
+    )
+    adapter = _bigquery_adapter_with_iceberg_defaults()
+
+    with pytest.raises(ConfigError, match="iceberg_table_format"):
+        validate_warehouse_capabilities([model], adapter)
+
+    model.warehouse_options = {"inherit": False}
+    validate_warehouse_capabilities([model], adapter)
+
+
+def test_capability_preflight_rejects_invalid_effective_options() -> None:
+    model = _extraction("raw")
+    model.warehouse_options = {"inherit": "not-a-boolean"}
+
+    with pytest.raises(ConfigError, match="inherit must be true or false"):
+        validate_warehouse_capabilities(
+            [model],
+            _bigquery_adapter_with_iceberg_defaults(),
+        )
+
+
+def test_iceberg_accepted_for_sql_models_on_bigquery() -> None:
+    # issue #290: SQL models now materialize Iceberg via
+    # _materialize_sql_full_iceberg, so a compile against an Iceberg-capable
+    # adapter passes instead of raising the old SQL-specific rejection. It is
+    # gated on the ICEBERG_TABLE_FORMAT capability like any other Iceberg model
+    # (covered by test_capability_preflight_requires_iceberg_capability).
+    for materialization in ("full", "incremental"):
+        model = ModelConfig(
+            name="sqlmod",
+            materialization=materialization,
+            unique_key="id" if materialization == "incremental" else None,
+            transform={"type": "sql", "path": "models/sqlmod.sql"},
+            warehouse_options={
+                "table_format": "iceberg",
+                "storage_uri": "gs://b/t",
+                "connection": "p.us.c",
+            },
+        )
+        validate_warehouse_capabilities([model], "bigquery")
+
+
+def test_operation_preflight_rejects_missing_streaming_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.STREAMING_TABULAR_READS,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(ConfigError, match=r"streaming_tabular_reads.*search publication"):
+        validate_warehouse_operation_capabilities(
+            "eager_only",
+            {
+                WarehouseCapability.STREAMING_TABULAR_READS: (
+                    "search publication snapshot"
+                )
+            },
+            operation="search-index publication",
+        )
+
+
+def test_capability_preflight_rejects_search_without_paged_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = ModelConfig(
+        name="idx",
+        depends_on=["ref('chunks')"],
+        materialization="incremental",
+        search={
+            "access": "public",
+            "id_field": "chunk_id",
+            "document_id_field": "document_id",
+            "chunk_id_field": "chunk_id",
+            "text_fields": ["text"],
+            "return_text_fields": ["text"],
+            "full_text": {"fields": ["text"]},
+            "query": {"modes": ["text"]},
+        },
+    )
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.PAGED_STATE_RECONCILIATION,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"paged_state_reconciliation.*publication-state reconciliation",
+    ):
+        validate_warehouse_capabilities([model], "eager_only")
+
+
+def test_bigquery_full_preflight_accepts_atomic_replacement() -> None:
+    # BigQuery declares atomic_full_replace (CREATE OR REPLACE), so a
+    # full-materialization model passes preflight without monkeypatching.
+    validate_warehouse_capabilities([_extraction("raw")], "bigquery")
+
+
+def test_full_preflight_rejects_missing_atomic_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.ATOMIC_FULL_REPLACE,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+    with pytest.raises(ConfigError, match=r"atomic_full_replace.*full materialization"):
+        validate_warehouse_capabilities([_extraction("raw")], "no_full_replace")
+
+
+@pytest.mark.parametrize("command", ["compile", "run", "build", "test"])
+def test_invalid_backend_is_exit_2_before_profile_resolution(
+    tmp_path: Path, command: str
+) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: invalid_backend\nprofile: deliberately_missing\n"
+        "extraction:\n  default_backend: typo_backend\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction: {}\n"
+    )
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), command])
+
+    assert result.exit_code == 2, result.output
+    assert "typo_backend" in result.output
+    assert "not registered" in result.output
+    assert "stel_project.yml:4:20" in result.output
+    assert "[extraction.default_backend]" in result.output
+    assert "no profiles.yml" not in result.output
+
+
+def test_compile_validates_effective_warehouse_options_before_manifest_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: effective_warehouse_options\nprofile: project\n"
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "project:\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: bigquery\n"
+        "        project: econ\n"
+        "        dataset: documents_dev\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction: {}\n"
+        "    warehouse_options:\n      inherit: not-a-boolean\n"
+    )
+
+    def unexpected_manifest(*_args: Any, **_kwargs: Any) -> Path:
+        pytest.fail("invalid effective warehouse options must fail before manifest write")
+
+    monkeypatch.setattr("stel.cli.write_manifest", unexpected_manifest)
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(tmp_path), "compile"])
+
+    assert result.exit_code == 2, result.output
+    assert "inherit must be true or false" in result.output
+
+
+def test_explicit_unregistered_backend_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="unregistered backend 'missing'"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw", backend="missing")],
+            tmp_path,
+        )
+
+
+def test_unregistered_inference_provider_is_rejected(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "provider": "missing-provider",
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"Inference provider 'missing-provider' is not registered",
+    ):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [model],
+            tmp_path,
+        )
+
+
+@pytest.mark.parametrize("explicit_backend", [True, False])
+def test_model_owned_llm_credential_error_drops_reference_from_traceback(
+    tmp_path: Path,
+    explicit_backend: bool,
+) -> None:
+    reference_name = "MODEL_CREDENTIAL_REFERENCE_SENTINEL_154"
+    extraction: dict[str, object] = {
+        "options": {
+            "api_key_env": reference_name,
+            "fields": [{"name": "title", "type": "string"}],
+        }
+    }
+    if explicit_backend:
+        extraction["backend"] = "llm"
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction=extraction,
+    )
+    project = ProjectConfig(
+        name="p",
+        extraction={"default_backend": "llm"},
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        validate_project_contract(project, [_source()], [model], tmp_path)
+
+    error = exc_info.value
+    assert reference_name not in str(error)
+    assert reference_name not in repr(model)
+    assert reference_name not in repr(model.model_dump())
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("stel"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_loaded_model_credential_error_retains_only_position_provenance(
+    tmp_path: Path,
+) -> None:
+    reference_name = "LOADED_MODEL_CREDENTIAL_REFERENCE_SENTINEL_154"
+    (tmp_path / "stel_project.yml").write_text(
+        "name: p\nextraction:\n  default_backend: llm\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw\n"
+        "    source: ref('docs')\n"
+        "    extraction:\n"
+        "      options:\n"
+        f"        api_key_env: {reference_name}\n"
+        "        fields:\n"
+        "          - name: title\n"
+    )
+    project, sources, models = load_project(tmp_path)
+    provenance = models[0].yaml_provenance
+    assert provenance is not None
+    assert provenance._document.data is None
+    assert models[0].extraction is not None
+    assert isinstance(
+        models[0].extraction.options["api_key_env"], CredentialReference
+    )
+    rendered = (
+        repr(models[0])
+        + repr(models[0].model_dump())
+        + models[0].model_dump_json()
+    )
+    assert reference_name not in rendered
+
+    with pytest.raises(ConfigError) as exc_info:
+        validate_project_contract(project, sources, models, tmp_path)
+
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("stel"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_default_llm_credential_is_protected_before_earlier_model_error(
+    tmp_path: Path,
+) -> None:
+    reference_name = "EARLY_MODEL_ERROR_REFERENCE_SENTINEL_154"
+    model = ModelConfig(
+        name="raw",
+        source="ref('missing')",
+        extraction={
+            "options": {
+                "api_key_env": reference_name,
+                "fields": [{"name": "title", "type": "string"}],
+            }
+        },
+    )
+    project = ProjectConfig(
+        name="p",
+        extraction={"default_backend": "llm"},
+    )
+
+    with pytest.raises(ConfigError, match="unknown source") as exc_info:
+        validate_project_contract(project, [_source()], [model], tmp_path)
+
+    assert model.extraction is not None
+    assert isinstance(
+        model.extraction.options["api_key_env"], CredentialReference
+    )
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        module = traceback.tb_frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("stel"):
+            assert reference_name not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_provider_without_native_batch_is_rejected_at_compile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "stel.compiler.get_inference_provider",
+        lambda _name: SimpleNamespace(supports_native_batch=False),
+    )
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "provider": "sync-only",
+                "batch": True,
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    with pytest.raises(ConfigError, match="does not support native batch"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [model],
+            tmp_path,
+        )
+
+
+def test_provider_checks_defer_to_profile_when_model_does_not_pin_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a model-pinned provider the effective provider is profile
+    configuration, so registration and batch capability are validated in
+    resolve_llm_options — not against the canonical default here."""
+
+    def _forbidden(_name: str) -> None:
+        raise AssertionError("provider registry must not be consulted")
+
+    monkeypatch.setattr("stel.compiler.get_inference_provider", _forbidden)
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction={
+            "backend": "llm",
+            "options": {
+                "batch": True,
+                "fields": [{"name": "title", "type": "string"}],
+            },
+        },
+    )
+
+    validate_project_contract(
+        ProjectConfig(name="p"),
+        [_source()],
+        [model],
+        tmp_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["compile"],
+        ["run"],
+        ["build"],
+        ["test"],
+        ["run", "--watch"],
+    ],
+)
+def test_invalid_backend_options_fail_before_profile_or_source_access(
+    tmp_path: Path, command: list[str]
+) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: invalid_options\nprofile: deliberately_missing\n"
+        "extraction:\n  default_backend: json\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: gs://bucket/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction:\n"
+        "      options:\n        include_text: true\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), *command]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid options for extraction backend 'json'" in result.output
+    assert "options.include_text" in result.output
+    assert "raw.yml:7:23" in result.output
+    assert "models.0.extraction.options.include_text" in result.output
+    assert "no profiles.yml" not in result.output
+
+
+def test_model_llm_cache_path_escape_fails_before_profile_resolution(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: invalid_cache\nprofile: deliberately_missing\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: gs://bucket/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "raw.yml").write_text(
+        "version: 2\nmodels:\n  - name: raw_docs\n"
+        "    source: ref('docs')\n    extraction:\n      backend: llm\n"
+        "      options:\n        cache_path: ../outside.duckdb\n"
+        "        fields:\n          - {name: title, type: string}\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), "run"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "llm cache_path" in result.output
+    assert "outside the project directory" in result.output
+    assert "raw.yml:8:21" in result.output
+    assert "models.0.extraction.options.cache_path" in result.output
+    assert "no profiles.yml" not in result.output
+
+
+@pytest.mark.parametrize("command", [["compile"], ["run"], ["build"], ["test"]])
+def test_non_executable_ml_contract_fails_before_profile_resolution(
+    tmp_path: Path, command: list[str]
+) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: invalid_ml\nprofile: deliberately_missing\n"
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "models.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: raw_docs\n    source: ref('docs')\n"
+        "    extraction:\n      backend: json\n"
+        "  - name: unsupported_regression\n"
+        "    depends_on: [ref('raw_docs')]\n"
+        "    ml:\n      task: regressor\n      text_field: text\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(tmp_path), *command]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "task 'regressor' is not executable" in result.output
+    assert "models.yml:10:13" in result.output
+    assert "models.1.ml.task" in result.output
+    assert "no profiles.yml" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("model", "message"),
+    [
+        (
+            ModelConfig(name="raw", extraction={"backend": "json"}),
+            "must declare exactly one `source:`",
+        ),
+        (
+            ModelConfig(
+                name="raw",
+                source="ref('upstream')",
+                extraction={"backend": "json"},
+            ),
+            "source 'upstream' is a model",
+        ),
+        (
+            ModelConfig(
+                name="raw",
+                source="ref('docs')",
+                depends_on=["ref('upstream')"],
+                extraction={"backend": "json"},
+            ),
+            "must use `source:`, not `depends_on:`",
+        ),
+        (
+            ModelConfig(
+                name="chunked",
+                depends_on=["ref('docs')"],
+                chunk={"text_field": "text"},
+            ),
+            "dependency 'docs' is a source",
+        ),
+        (
+            ModelConfig(name="chunked", chunk={"text_field": "text"}),
+            "exactly one `depends_on:`",
+        ),
+        (
+            ModelConfig(
+                name="features",
+                ml={"task": "features", "text_field": "text"},
+            ),
+            "at least one `depends_on:`",
+        ),
+        (
+            ModelConfig(
+                name="derived",
+                depends_on=["ref('upstream')", "upstream"],
+                ml={"task": "features", "text_field": "text"},
+            ),
+            "duplicate dependencies",
+        ),
+    ],
+)
+def test_model_edge_contracts_fail_before_execution(
+    tmp_path: Path, model: ModelConfig, message: str
+) -> None:
+    upstream = _extraction("upstream")
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [upstream, model], tmp_path
+        )
+
+
+def test_ml_model_rejects_incremental_materialization(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        ml={"task": "features", "text_field": "text"},
+        materialization="incremental",
+    )
+    with pytest.raises(ConfigError, match="only supports `materialization: full`"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+        )
+
+
+def test_python_transform_incremental_requires_contract(tmp_path: Path) -> None:
+    # A python transform may be incremental (issue #218) only when it declares
+    # an IncrementalContract; without the hook it is rejected at compile time.
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+        materialization="incremental",
+    )
+    with pytest.raises(ConfigError, match="declared_incremental_contract"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+        )
+
+
+def test_python_transform_incremental_contract_validated_against_deps(
+    tmp_path: Path,
+) -> None:
+    # A declared contract whose parent_source is not a dependency is a compile
+    # error, not a wrong-key delete at build time.
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "from stel.transforms import IncrementalContract\n\n"
+        "def declared_incremental_contract(options):\n"
+        "    return IncrementalContract(\n"
+        "        parent_key='document_id', child_key='token_id',\n"
+        "        parent_source='not_a_dep', parent_source_key='document_id')\n\n"
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+        materialization="incremental",
+    )
+    with pytest.raises(ConfigError, match="parent_source 'not_a_dep' is not in"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+        )
+
+
+def test_python_transform_incremental_contract_accepts_valid(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "from stel.transforms import IncrementalContract\n\n"
+        "def declared_incremental_contract(options):\n"
+        "    return IncrementalContract(\n"
+        "        parent_key='document_id', child_key='token_id',\n"
+        "        parent_source_key='document_id')\n\n"
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+        materialization="incremental",
+    )
+    dag = validate_project_contract(
+        ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+    )
+    assert dag.execution_order() == ["raw", "derived"]
+
+
+@pytest.mark.parametrize(
+    ("transform", "module_source", "message"),
+    [
+        ({"type": "javascript", "module": "transforms.derived"}, None, "unsupported type"),
+        ({"type": "python"}, None, "requires a `module:`"),
+        (
+            {"type": "python", "module": "transforms.missing"},
+            None,
+            "not found",
+        ),
+        (
+            {"type": "python", "module": "transforms.derived"},
+            "run = 1\n",
+            "must define a top-level",
+        ),
+        (
+            {"type": "python", "module": "transforms.derived"},
+            "def run():\n    return None\n",
+            "must accept either",
+        ),
+        (
+            {"type": "python", "module": "transforms.derived"},
+            "async def run(deps):\n    return None\n",
+            "async transform functions are not supported",
+        ),
+        (
+            {"type": "python", "module": "transforms.derived"},
+            "async def validate_options(options):\n    return None\n\n"
+            "def run(deps):\n    return deps['raw']\n",
+            "async transform option validators are not supported",
+        ),
+    ],
+)
+def test_transform_contract_is_validated_at_compile_time(
+    tmp_path: Path,
+    transform: dict[str, object],
+    module_source: str | None,
+    message: str,
+) -> None:
+    if module_source is not None:
+        (tmp_path / "transforms").mkdir()
+        (tmp_path / "transforms" / "derived.py").write_text(module_source)
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform=transform,
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+        )
+
+
+def test_transform_with_deps_and_optional_context_is_valid(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "def run(deps, ctx=None):\n    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+    )
+
+    dag = validate_project_contract(
+        ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+    )
+
+    assert dag.execution_order() == ["raw", "derived"]
+
+
+def test_transform_options_are_validated_at_compile_time(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "def validate_options(options):\n"
+        "    if options.get('mode') != 'supported':\n"
+        "        raise ValueError('mode must be supported')\n\n"
+        "def run(deps, ctx):\n"
+        "    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={
+            "type": "python",
+            "module": "transforms.derived",
+            "options": {"mode": "invalid"},
+        },
+    )
+
+    with pytest.raises(ConfigError, match="mode must be supported"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), model],
+            tmp_path,
+        )
+
+
+def _declaring_transform(tmp_path: Path, returns: str) -> None:
+    (tmp_path / "transforms").mkdir(exist_ok=True)
+    (tmp_path / "transforms" / "derived.py").write_text(
+        f"def declared_dependencies(options):\n    return {returns}\n\n"
+        "def run(deps, ctx):\n    return deps['raw']\n"
+    )
+
+
+def _declaring_model(*depends_on: str) -> ModelConfig:
+    return ModelConfig(
+        name="derived",
+        depends_on=[f"ref('{name}')" for name in depends_on],
+        transform={"type": "python", "module": "transforms.derived"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("returns", "depends_on", "message"),
+    [
+        (
+            "(options['left'],)",
+            ("raw",),
+            "referenced by options but not in depends_on",
+        ),
+        (
+            "('raw',)",
+            ("raw", "other"),
+            "in depends_on but unused by options",
+        ),
+        ("'raw'", ("raw",), "must return an iterable of model names"),
+        ("['raw', '']", ("raw",), "non-empty model-name strings"),
+        ("[1]", ("raw",), "non-empty model-name strings"),
+    ],
+)
+def test_declared_dependencies_are_reconciled_at_compile_time(
+    tmp_path: Path,
+    returns: str,
+    depends_on: tuple[str, ...],
+    message: str,
+) -> None:
+    _declaring_transform(tmp_path, returns)
+    model = _declaring_model(*depends_on)
+    assert model.transform is not None
+    model.transform.options = {"left": "typo"}
+
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), _extraction("other"), model],
+            tmp_path,
+        )
+
+
+def test_matching_declared_dependencies_compile_cleanly(tmp_path: Path) -> None:
+    _declaring_transform(tmp_path, "('raw',)")
+
+    dag = validate_project_contract(
+        ProjectConfig(name="p"),
+        [_source()],
+        [_extraction("raw"), _declaring_model("raw")],
+        tmp_path,
+    )
+
+    assert dag.execution_order() == ["raw", "derived"]
+
+
+def test_declared_dependencies_must_be_callable(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "declared_dependencies = 1\n\ndef run(deps, ctx):\n    return deps['raw']\n"
+    )
+
+    with pytest.raises(ConfigError, match=r"declared_dependencies.*must be callable"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), _declaring_model("raw")],
+            tmp_path,
+        )
+
+
+def test_transform_options_validator_must_be_callable(tmp_path: Path) -> None:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").write_text(
+        "validate_options = 1\n\n"
+        "def run(deps, ctx):\n"
+        "    return deps['raw']\n"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+    )
+
+    with pytest.raises(ConfigError, match=r"validate_options.*must be callable"):
+        validate_project_contract(
+            ProjectConfig(name="p"),
+            [_source()],
+            [_extraction("raw"), model],
+            tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("module_path", "module_source", "message"),
+    [
+        ("tests.missing", None, "module not found"),
+        ("../outside", None, "valid dotted Python module path"),
+        ("tests.custom", "value = 1\n", "must define `run"),
+        (
+            "tests.custom",
+            "def run(connection):\n    return None\n",
+            "must accept `\\(con, table_ref\\)`",
+        ),
+        (
+            "tests.custom",
+            "async def run(connection, table_ref):\n    return None\n",
+            "Async custom test functions are not supported",
+        ),
+        ("tests.custom", "raise RuntimeError('boom')\n", "could not be imported"),
+    ],
+)
+def test_python_test_contract_is_validated_at_compile_time(
+    tmp_path: Path,
+    module_path: str,
+    module_source: str | None,
+    message: str,
+) -> None:
+    if module_source is not None:
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "custom.py").write_text(module_source)
+    model = _extraction("raw")
+    model.tests = [{"python": module_path}]
+
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(ProjectConfig(name="p"), [_source()], [model], tmp_path)
+
+
+def test_valid_python_test_contract_compiles(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "custom.py").write_text(
+        "def run(connection, table_ref):\n    return None\n"
+    )
+    model = _extraction("raw")
+    model.tests = [{"python": "tests.custom"}]
+
+    dag = validate_project_contract(ProjectConfig(name="p"), [_source()], [model], tmp_path)
+
+    assert dag.execution_order() == ["raw"]
+
+
+@pytest.mark.parametrize("kind", ["transform", "python_test"])
+@pytest.mark.parametrize("link_style", ["leaf", "intermediate"])
+def test_executable_module_symlink_cannot_escape_project(
+    tmp_path: Path, kind: str, link_style: str
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "code.py").write_text(
+        "def run(first, second=None):\n    return None\n"
+    )
+    module_dir_name = "transforms" if kind == "transform" else "tests"
+    module_dir = project_dir / module_dir_name
+    if link_style == "intermediate":
+        module_dir.symlink_to(outside, target_is_directory=True)
+        module_path = f"{module_dir_name}.code"
+    else:
+        module_dir.mkdir()
+        (module_dir / "code.py").symlink_to(outside / "code.py")
+        module_path = f"{module_dir_name}.code"
+
+    if kind == "transform":
+        model = ModelConfig(
+            name="derived",
+            depends_on=["ref('raw')"],
+            transform={"type": "python", "module": module_path},
+        )
+        models = [_extraction("raw"), model]
+    else:
+        model = _extraction("raw")
+        model.tests = [{"python": module_path}]
+        models = [model]
+
+    with pytest.raises(ConfigError, match="outside the project directory"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], models, project_dir
+        )
+
+
+def test_executable_module_symlink_within_project_is_allowed(tmp_path: Path) -> None:
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "shared" / "derived.py").write_text(
+        "def run(deps):\n    return deps['raw']\n"
+    )
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "derived.py").symlink_to(
+        tmp_path / "shared" / "derived.py"
+    )
+    model = ModelConfig(
+        name="derived",
+        depends_on=["ref('raw')"],
+        transform={"type": "python", "module": "transforms.derived"},
+    )
+
+    dag = validate_project_contract(
+        ProjectConfig(name="p"), [_source()], [_extraction("raw"), model], tmp_path
+    )
+
+    assert dag.execution_order() == ["raw", "derived"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "not_empty",
+        {"not_null": ["id", "name"]},
+        {"unique": "id"},
+        {"min_rows": 1},
+        {"python": "tests.custom_check"},
+        {"matches_regex": {"column": "id", "pattern": r"^A\d+$"}},
+        {"accepted_values": {"column": "status", "values": ["open", "closed"]}},
+        {"accepted_range": {"column": "score", "min": 0, "max": 1}},
+        {"null_rate": {"column": "name", "max": 0.1}},
+        {"grounded_in": {"value": "answer", "source": "body", "method": "exact"}},
+        {
+            "relationships": {
+                "column": "parent_id",
+                "to": "ref('parent')",
+                "field": "id",
+            }
+        },
+    ],
+)
+def test_every_builtin_test_shape_has_a_valid_form(spec: object) -> None:
+    assert parse_test_spec(spec).name
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ({"unknown": "id"}, "Unknown test"),
+        ({"not_null": []}, "non-empty list"),
+        ({"min_rows": -1}, "non-negative integer"),
+        ({"matches_regex": {"column": "id", "pattern": "["}}, "invalid pattern"),
+        ({"accepted_values": {"column": "x", "values": []}}, "non-empty values"),
+        ({"accepted_range": {"column": "x"}}, "at least one"),
+        ({"null_rate": {"column": "x", "max": 2}}, "between 0 and 1"),
+        (
+            {"grounded_in": {"value": "x", "source": "body", "method": "semantic"}},
+            "method must be",
+        ),
+        (
+            {"grounded_in": {"value": "x", "source": "body", "method": []}},
+            "method must be",
+        ),
+        (
+            {"relationships": {"column": "x", "to": "ref('parent')"}},
+            "relationships requires",
+        ),
+        ({"unique": "id", "severity": "fatal"}, "Unknown severity"),
+        ({"unique": "id", "severity": []}, "Unknown severity"),
+        (
+            {"null_rate": {"column": "x", 1: "not-an-option-name"}},
+            "option names must be strings",
+        ),
+    ],
+)
+def test_invalid_builtin_test_shapes_are_rejected(
+    spec: object, message: str
+) -> None:
+    with pytest.raises(SpecError, match=message):
+        parse_test_spec(spec)
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [("missing", "unknown model"), ("docs", "target 'docs' is a source")],
+)
+def test_relationship_target_must_be_a_known_model(
+    tmp_path: Path, target: str, message: str
+) -> None:
+    child = _extraction("child")
+    child.tests = [
+        {
+            "relationships": {
+                "column": "parent_id",
+                "to": f"ref('{target}')",
+                "field": "id",
+            }
+        }
+    ]
+
+    with pytest.raises(ConfigError, match=message):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source()], [child], tmp_path
+        )
+
+
+def test_relationship_predecessor_preserves_selectors_and_source_ancestry() -> None:
+    sources = [_source("parent_docs"), _source("child_docs")]
+    parent = _extraction("parent", "parent_docs")
+    child = _extraction("child", "child_docs")
+    child.tests = [
+        {
+            "relationships": {
+                "column": "parent_id",
+                "to": "ref('parent')",
+                "field": "id",
+            }
+        }
+    ]
+
+    dag = ProjectDAG(sources, [child, parent])
+
+    assert dag.execution_order() == ["parent", "child"]
+    assert set(dag.select_models(select="+child")) == {"parent", "child"}
+    assert set(dag.required_sources(["child"])) == {"parent_docs", "child_docs"}
+
+
+def test_build_materializes_relationship_target_before_running_child_test(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "stel_project.yml").write_text("name: relationship_order\n")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "docs.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+        "    file_pattern: '*.json'\n"
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "a_child.yml").write_text(
+        "version: 2\nmodels:\n  - name: child\n"
+        "    source: ref('docs')\n    extraction:\n      backend: json\n"
+        "      options:\n        fields: [id, parent_id]\n"
+        "    tests:\n      - relationships:\n          column: parent_id\n"
+        "          to: ref('parent')\n          field: id\n"
+    )
+    (tmp_path / "models" / "z_parent.yml").write_text(
+        "version: 2\nmodels:\n  - name: parent\n"
+        "    source: ref('docs')\n    extraction:\n      backend: json\n"
+        "      options:\n        fields: [id]\n"
+    )
+    data = tmp_path / "data" / "docs"
+    data.mkdir(parents=True)
+    (data / "one.json").write_text('{"id": 1, "parent_id": 1}')
+
+    result = build_project(tmp_path)
+
+    assert [run.model_name for run in result.run_results] == ["parent", "child"]
+    relationship = next(test for test in result.test_results if test.test_name == "relationships")
+    assert relationship.passed
+
+
+# --- dbt_ref source validation (#177) ----------------------------------------
+
+
+def _dbt_ref_transform(
+    name: str = "enriched", ref: str = "vendor_dim", deps: list[str] | None = None
+) -> ModelConfig:
+    return ModelConfig(
+        name=name,
+        source=f"dbt_ref('{ref}')",
+        depends_on=[f"ref('{d}')" for d in deps] if deps else None,
+        transform={"type": "python", "module": "transforms.enrich"},
+    )
+
+
+def test_dbt_ref_source_rejected_on_non_transform(tmp_path: Path) -> None:
+    model = ModelConfig(
+        name="raw", source="dbt_ref('vendor_dim')", extraction={"backend": "json"}
+    )
+    with pytest.raises(ConfigError, match="only on `type: python` transform"):
+        validate_project_contract(ProjectConfig(name="p"), [], [model], tmp_path)
+
+
+def test_dbt_ref_source_rejected_on_sql_transform(tmp_path: Path) -> None:
+    # run_sql_model resolves ref()s as warehouse-native (or CaptureAdapter
+    # scratch-database) relations, not injected upstream frames — a dbt_ref
+    # source would compile but fail at dbt-build time (Codex review, #177).
+    (tmp_path / "q.sql").write_text(
+        "select * from {{ ref('other') }}", encoding="utf-8"
+    )
+    other = ModelConfig(
+        name="other", source="ref('docs')", extraction={"backend": "json"}
+    )
+    model = ModelConfig(
+        name="enriched",
+        source="dbt_ref('vendor_dim')",
+        transform={"type": "sql", "path": "q.sql"},
+    )
+    with pytest.raises(ConfigError, match="only on `type: python` transform"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source("docs")], [other, model], tmp_path
+        )
+
+
+def test_dbt_ref_source_allows_additional_depends_on(tmp_path: Path) -> None:
+    # A dbt_ref transform may also depend on stel models (#177 follow-up):
+    # the dbt_ref alone already satisfies "at least one input," and
+    # run_transform_model resolves both into the same `deps` dict.
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "enrich.py").write_text(
+        "def run(deps):\n    return deps['vendor_dim']\n", encoding="utf-8"
+    )
+    other = ModelConfig(
+        name="other", source="ref('docs')", extraction={"backend": "json"}
+    )
+    model = _dbt_ref_transform(deps=["other"])
+    validate_project_contract(
+        ProjectConfig(name="p"), [_source("docs")], [other, model], tmp_path
+    )
+
+
+def test_dbt_ref_source_depends_on_target_must_exist(tmp_path: Path) -> None:
+    model = _dbt_ref_transform(deps=["missing"])
+    with pytest.raises(ConfigError, match="unknown model"):
+        validate_project_contract(ProjectConfig(name="p"), [], [model], tmp_path)
+
+
+def test_dbt_ref_source_depends_on_rejects_a_source(tmp_path: Path) -> None:
+    # `depends_on:` alongside a dbt_ref must still name stel models, not
+    # stel sources — the general depends_on validation applies unchanged.
+    model = _dbt_ref_transform(deps=["docs"])
+    with pytest.raises(ConfigError, match="non-extraction models must depend on models"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source("docs")], [model], tmp_path
+        )
+
+
+def test_dbt_ref_must_not_name_a_stel_node(tmp_path: Path) -> None:
+    # A dbt_ref names a dbt-built table outside the stel graph; colliding with
+    # a stel source (or model) is a configuration error.
+    model = _dbt_ref_transform(ref="vendor_dim")
+    with pytest.raises(ConfigError, match="names a stel node"):
+        validate_project_contract(
+            ProjectConfig(name="p"), [_source("vendor_dim")], [model], tmp_path
+        )

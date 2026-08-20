@@ -1,20 +1,20 @@
-# dbt-ml
+# Constellations
 
-**dbt for unstructured data.** dbt-ml brings the dbt workflow — declarative
-models, a dependency DAG, `ref()`, tests, incremental builds, lineage, and a
-manifest artifact — to folders of documents: PDFs, markdown, HTML, JSON,
-email, and free-form text.
+**dbt for unstructured data.** Constellations — installed and invoked as
+`stel` — brings the dbt workflow of declarative models, a dependency DAG,
+`ref()`, tests, incremental builds, lineage, and a manifest artifact to
+folders of documents: PDFs, markdown, HTML, JSON, email, and free-form text.
 
 dbt users will recognize the workflow: declare sources and models in YAML,
 build a DAG, materialize incrementally, test the results, and emit artifacts.
-dbt-ml is a standalone CLI rather than a dbt package or dbt adapter.
+`stel` is a standalone CLI rather than a dbt package or dbt adapter.
 
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
 > and BigQuery warehouses, local and GCS sources, metadata-aware deterministic
 > chunk models, record-scoped incremental state, bounded projected warehouse
 > snapshots, an incremental local LanceDB search sink, classic text ML, and six
 > extraction backends. See
-> [`dbt-ml/README.md`](dbt-ml/README.md) for the full reference.
+> [`stel/README.md`](stel/README.md) for the full reference.
 
 ## Platform scope
 
@@ -93,12 +93,12 @@ models:
 ### Run it
 
 ```bash
-uv run dbt-ml init invoices --template pdf   # scaffold a project
-# drop your PDFs into ./invoices/data/invoices_pdf/  (or `dbt-ml seed` synthetic ones)
+uv run stel init invoices --template pdf   # scaffold a project
+# drop your PDFs into ./invoices/data/invoices_pdf/  (or `stel seed` synthetic ones)
 cd invoices
-uv run dbt-ml run                            # build the DAG into DuckDB
-uv run dbt-ml test                           # run the schema tests
-uv run dbt-ml show raw_pdf_text               # peek at the scaffolded result
+uv run stel run                            # build the DAG into DuckDB
+uv run stel test                           # run the schema tests
+uv run stel show raw_pdf_text               # peek at the scaffolded result
 ```
 
 ```
@@ -107,9 +107,9 @@ model                 kind        mater.         processed   skipped  deleted   
 raw_pdf_text          extraction  incremental            5         0        0       5     0.31
 ```
 
-## Why dbt-ml
+## Why stel
 
-| | Imperative Python (LlamaIndex) | Managed RAG (Cortex Search, Bedrock KB) | **dbt-ml** |
+| | Imperative Python (LlamaIndex) | Managed RAG (Cortex Search, Bedrock KB) | **stel** |
 |---|---|---|---|
 | Declarative models + DAG | ✗ | partial | ✓ |
 | Tests on extracted data | ✗ | ✗ | ✓ |
@@ -119,7 +119,7 @@ raw_pdf_text          extraction  incremental            5         0        0   
 | Reviewable like a dbt PR | ✗ | ✗ | ✓ |
 | Composes with existing dbt | ✗ | partial | ✓ |
 
-dbt-ml isn't trying to win on time-to-first-demo (managed services do) or raw
+stel isn't trying to win on time-to-first-demo (managed services do) or raw
 flexibility (LlamaIndex does). It wins on **reproducibility, testability, and
 fitting the workflow analytics engineers already use.**
 
@@ -146,29 +146,29 @@ fitting the workflow analytics engineers already use.**
 - **Artifacts** — `manifest.json`, `run_results.json`, a static docs site, and
   `emit-dbt-sources` to hand tables to a dbt project using the matching
   DuckDB or BigQuery adapter.
-- **Composes with dbt** — dbt-ml does the unstructured → structured "E"; dbt
-  does the SQL "T", reading dbt-ml's tables as native sources.
+- **Composes with dbt** — stel does the unstructured → structured "E"; dbt
+  does the SQL "T", reading stel's tables as native sources.
 
 ## Install
 
 ```bash
-uv add dbt-ml
+uv add stel
 # Optional cloud integrations:
-uv add 'dbt-ml[bigquery,gcs]'
+uv add 'stel[bigquery,gcs]'
 ```
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/C00ldudeNoonan/dbt-ml
-cd dbt-ml/dbt-ml
+cd stel/stel
 uv sync
-uv run dbt-ml --project-dir examples/invoice_pipeline seed --count 5
-uv run dbt-ml --project-dir examples/invoice_pipeline run
-uv run dbt-ml --project-dir examples/invoice_pipeline test
+uv run stel --project-dir examples/invoice_pipeline seed --count 5
+uv run stel --project-dir examples/invoice_pipeline run
+uv run stel --project-dir examples/invoice_pipeline test
 ```
 
-Fifteen examples live in [`dbt-ml/examples/`](dbt-ml/examples/), covering
+Fifteen examples live in [`stel/examples/`](stel/examples/), covering
 invoices, blog posts, support tickets, arXiv quality checks, PDF and direct LLM
 extraction, classic text ML, document clustering, RAG chunks, governed SQL
 chunks, dbt handoff and embedded execution, and a metric-plus-evidence agent.
@@ -176,7 +176,7 @@ chunks, dbt handoff and embedded execution, and a metric-plus-evidence agent.
 ## Security model
 
 Only run projects you trust: Python transforms and custom tests execute in the
-dbt-ml process. Project-controlled paths are confined to the project unless an
+stel process. Project-controlled paths are confined to the project unless an
 explicit `external: true` boundary is supported; local source patterns cannot
 traverse parents or symlinks. Profiles select destinations and opaque credential
 references and must be reviewed as trusted configuration; credential values and
@@ -184,28 +184,28 @@ reference names stay out of artifacts and diagnostics. The LLM backend sends
 document text to Anthropic using the configured environment variable, and the PII
 transform retains non-target input columns unless you explicitly project or
 drop them.
-`dbt-ml clean` removes known local artifacts without resetting a warehouse. See
-the [full security notes](dbt-ml/README.md#security-notes) before running
+`stel clean` removes known local artifacts without resetting a warehouse. See
+the [full security notes](stel/README.md#security-notes) before running
 third-party projects or sensitive documents.
 
 ## Documentation
 
-- **[Full reference](dbt-ml/README.md)** — every backend, command, config block,
+- **[Full reference](stel/README.md)** — every backend, command, config block,
   and the roadmap.
-- **[Contributing](dbt-ml/CONTRIBUTING.md)** — how to add a backend, test, or
+- **[Contributing](stel/CONTRIBUTING.md)** — how to add a backend, test, or
   command.
-- **[Semantic retrieval architecture](dbt-ml/docs/architecture/semantic-retrieval.md)**
+- **[Semantic retrieval architecture](stel/docs/architecture/semantic-retrieval.md)**
   — the `search:` resource and retrieval-store contract, including the shipped
   local LanceDB proof of concept and its fail-closed boundaries.
-- **[Provider abstraction](dbt-ml/docs/architecture/provider-abstraction.md)**
+- **[Provider abstraction](stel/docs/architecture/provider-abstraction.md)**
   — the inference/embedding provider contract, plus the accepted plugin
   discovery, provider-owned configuration, and failed-outcome accounting
   design (issue #71).
-- **[Warehouse-native SQL models](dbt-ml/docs/architecture/sql-models.md)**
+- **[Warehouse-native SQL models](stel/docs/architecture/sql-models.md)**
   — implemented `transform.type: sql` contract (compiled `ref()`, the SQL/Jinja
   trust boundary, and full/incremental adapter materialization).
-- **[Changelog](dbt-ml/CHANGELOG.md)**
+- **[Changelog](stel/CHANGELOG.md)**
 
 ## License
 
-[MIT](dbt-ml/LICENSE)
+[MIT](stel/LICENSE)

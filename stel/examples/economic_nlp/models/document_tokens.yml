@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: document_tokens
+    description: "One row per non-space token in each economic document"
+    depends_on: [ref('raw_documents')]
+    transform:
+      type: python
+      module: stel.text.transforms.nlp_tokens
+      options:
+        document_id_field: economic_id
+        text_field: text
+        model: en_core_web_sm
+        language: en
+        batch_size: 32
+        include_fields: [publisher, published_at]
+    materialization: full
+    tags: [economic_data, nlp, tokens]
+    tests:
+      - not_null: [token_id, document_id, token_index, token_text]
+      - unique: token_id

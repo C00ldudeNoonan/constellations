@@ -1,0 +1,4 @@
+interface:
+  display_name: "stel Authoring"
+  short_description: "Author safe, testable stel data projects"
+  default_prompt: "Use $stel-authoring to create this stel pipeline."

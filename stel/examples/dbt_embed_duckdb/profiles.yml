@@ -1,0 +1,9 @@
+dbt_embed_duckdb:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      # dbt owns this database; stel writes nothing here directly — the
+      # stel model runs in-process and hands dbt a frame to materialize.
+      path: ./target/embedded.duckdb
+      schema: main

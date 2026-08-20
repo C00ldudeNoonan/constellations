@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: raw_golden_queries
+    description: "Hand-labeled golden queries for chunk_search evaluation (#137)"
+    path: "./golden/"
+    file_pattern: "*.json"
+  - name: raw_golden_queries_degraded
+    description: >-
+      One deliberately mislabeled query (asserts the security-policy chunk is
+      relevant to a paid-time-off query) — proves stel eval catches a
+      retrieval-quality regression instead of only demonstrating a passing run.
+    path: "./golden_degraded/"
+    file_pattern: "*.json"

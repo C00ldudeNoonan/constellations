@@ -691,3 +691,77 @@ def test_internal_table_producers_and_filter_agree(tmp_path: pathlib.Path) -> No
         assert adapter.list_tables() == ["model_a"]
         assert failures_table.startswith(TEST_FAILURES_TABLE_PREFIX)
         assert staging_table.startswith(STAGING_TABLE_PREFIX)
+
+
+# The keys of the payload `BaseBackend.implementation_identity` canonicalizes,
+# in the order they must hash to. `json.dumps(..., sort_keys=True)` means the
+# key spellings are themselves hashed, so this tuple is data: renaming a key,
+# adding one, or dropping one re-keys every backend identity at once, with no
+# behavior change to explain it.
+#
+# The blast radius is re-extraction, not automatically re-spend: `_cache_key`
+# in backends/llm_backend.py is keyed on the *provider* contract identity
+# rather than the backend, precisely so cached responses survive routine
+# upgrades. So a re-key costs wall-clock against a warm response cache, and
+# real provider spend only where that cache is cold or absent (a fresh
+# machine, CI, a non-LLM backend has no cache to miss). Still not something to
+# spend by accident, and nothing else in the suite notices: the identity test
+# in test_backend_options.py asserts only distinctness and the `stel/` prefix,
+# both of which survive a rename.
+_BACKEND_IDENTITY_PAYLOAD_KEYS = (
+    "backend_class",
+    "backend_class_source",
+    "backend_module_source",
+    "base_source",
+    "dbt_ml_version",
+)
+
+
+def _backend_identity_payload_keys() -> tuple[str, ...]:
+    """The payload keys, read from the source rather than by calling it.
+
+    `implementation_identity()` returns a digest, so calling it cannot show
+    which keys went in — and a golden digest would be the wrong pin, because
+    the payload carries source digests that are *supposed* to move whenever
+    backend code changes. The key names are the part that must not.
+    """
+    tree = ast.parse((SRC_ROOT / "backends" / "base.py").read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "implementation_identity":
+            continue
+        for statement in ast.walk(node):
+            if not isinstance(statement, ast.Assign):
+                continue
+            target = statement.targets[0]
+            if not isinstance(target, ast.Name) or target.id != "payload":
+                continue
+            assert isinstance(statement.value, ast.Dict), (
+                "implementation_identity's `payload` is no longer a dict "
+                "literal; this scan can no longer see the keys that are hashed"
+            )
+            keys = []
+            for key in statement.value.keys:
+                assert isinstance(key, ast.Constant) and isinstance(key.value, str), (
+                    f"implementation_identity payload has a non-literal key "
+                    f"({ast.dump(key) if key else 'None'}); keep them literals "
+                    "so they stay pinnable"
+                )
+                keys.append(key.value)
+            return tuple(sorted(keys))
+    raise AssertionError(
+        "BaseBackend.implementation_identity was not found in backends/base.py"
+    )
+
+
+def test_backend_identity_payload_keys_are_frozen() -> None:
+    assert _backend_identity_payload_keys() == _BACKEND_IDENTITY_PAYLOAD_KEYS, (
+        "The backend implementation-identity payload keys changed. Those keys "
+        "are hashed (sort_keys=True), and the digest gates incremental "
+        "invalidation for every `extraction:` model — so this change reports "
+        "every document as new and re-extracts every corpus, green the whole "
+        "way. Cached provider responses survive (they key on the provider "
+        "contract identity, not the backend), so the bill is wall-clock on a "
+        "warm cache and real provider spend on a cold one. `dbt_ml_version` "
+        "in particular keeps its pre-#313 spelling on purpose, for the same "
+        "reason `providers.base._IDENTITY_PACKAGE` does."
+    )

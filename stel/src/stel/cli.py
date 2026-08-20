@@ -9,7 +9,12 @@ from typing import Any, TypedDict
 
 import click
 
-from .adapters import AdapterError, create_adapter
+from .adapters import (
+    AdapterError,
+    apply_name_migration,
+    create_adapter,
+    plan_name_migration,
+)
 from .checks import TestResult, run_project_tests
 from .cli_services.context import CONFIG_ERRORS as _CONFIG_ERRORS
 from .cli_services.context import ConfigClickError
@@ -1032,7 +1037,7 @@ def _usage_summary(
 @click.option(
     "--store-failures",
     is_flag=True,
-    help="Persist failing test rows to dbt_ml_test_failures__* tables.",
+    help="Persist failing test rows to stel_test_failures__* tables.",
 )
 @click.option(
     "--state",
@@ -1177,7 +1182,7 @@ def _test_failure_label(t: TestResult) -> str:
 @click.option(
     "--store-failures",
     is_flag=True,
-    help="Persist failing test rows to dbt_ml_test_failures__* tables.",
+    help="Persist failing test rows to stel_test_failures__* tables.",
 )
 @click.option(
     "--state",
@@ -1823,6 +1828,63 @@ def clean(ctx: click.Context) -> None:
     except (ConfigError, RunError) as e:
         raise ConfigClickError(str(e)) from e
     click.echo(f"Cleaned generated artifacts under {path}")
+
+
+@cli.command()
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the renames without performing them.",
+)
+@_project_context_options
+@click.pass_context
+def migrate(ctx: click.Context, dry_run: bool) -> None:
+    """Rename stel's internal warehouse tables to their current names.
+
+    Needed once per target built before the #313 rename, which moved every
+    internal table from `dbt_ml_*` to `stel_*`. Those tables hold incremental
+    state and live publication claims, so until they are carried over every
+    other command refuses to run rather than treat the project as new and
+    reprocess its corpus at provider cost.
+
+    Only tables stel owns are touched, and only inside the schema the target
+    already points at. Moving a whole schema is not done here: pin `schema:`
+    in the profile to keep using a pre-rename one.
+    """
+    project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    project, _, _ = _load(project_dir)
+    try:
+        resolved = resolve_profile(
+            project, project_dir, target=target, profiles_dir=profiles_dir
+        )
+    except ProfileError as e:
+        raise ConfigClickError(str(e)) from e
+
+    adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+    # The one caller allowed past the legacy-name guards: they exist to stop
+    # everything else from running against the objects this is here to rename.
+    adapter.migration_mode = True
+    try:
+        with adapter:
+            renames = plan_name_migration(adapter)
+            if not renames:
+                click.echo(
+                    f"Nothing to migrate: schema '{adapter.schema}' in the "
+                    f"{adapter.adapter_type()} target already uses the current "
+                    "internal table names."
+                )
+                return
+            for rename in renames:
+                click.echo(f"  {rename.old} -> {rename.new}")
+            if dry_run:
+                click.echo(f"{len(renames)} table(s) would be renamed. (--dry-run)")
+                return
+            applied = apply_name_migration(adapter, renames)
+    except AdapterError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"Renamed {len(applied)} table(s) in schema '{adapter.schema}'.")
 
 
 def _backend_for_source(source: SourceConfig, models: list[ModelConfig]) -> str:

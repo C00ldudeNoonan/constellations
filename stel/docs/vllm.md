@@ -30,7 +30,7 @@ my_project:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
+        path: ./target/stel.duckdb
         schema: documents
       llm:
         provider: vllm

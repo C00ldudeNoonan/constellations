@@ -145,12 +145,12 @@ def test_duckdb_creates_schema_and_state(tmp_path: Path) -> None:
         # state table is in the configured schema
         cnt = adapter.scalar(
             "SELECT COUNT(*) FROM information_schema.tables "
-            "WHERE table_schema = 'testns' AND table_name = 'dbt_ml_state'"
+            "WHERE table_schema = 'testns' AND table_name = 'stel_state'"
         )
         assert cnt == 1
         columns = adapter.rows(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = 'testns' AND table_name = 'dbt_ml_state' "
+            "WHERE table_schema = 'testns' AND table_name = 'stel_state' "
             "ORDER BY ordinal_position"
         )
         assert [row[0] for row in columns] == [
@@ -168,11 +168,11 @@ def test_list_tables_excludes_failures_tables(tmp_path: Path) -> None:
     with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
         adapter.materialize_full("model_a", pl.DataFrame({"x": [1]}))
         adapter.materialize_full(
-            "dbt_ml_test_failures__model_a__not_null__x", pl.DataFrame({"x": [1]})
+            "stel_test_failures__model_a__not_null__x", pl.DataFrame({"x": [1]})
         )
         tables = adapter.list_tables()
         assert "model_a" in tables
-        assert all(not t.startswith("dbt_ml_test_failures__") for t in tables)
+        assert all(not t.startswith("stel_test_failures__") for t in tables)
 
 
 def test_typed_table_reads_support_limits_and_counts(tmp_path: Path) -> None:
@@ -289,7 +289,7 @@ def test_target_descriptor_scope_stores_only_fingerprint(tmp_path: Path) -> None
     )
     with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
         adapter.upsert_state(scope, [_state("chunk-1", "input", "v1")])
-        stored = adapter.rows(f"SELECT target_identity FROM {adapter.table_ref('dbt_ml_state')}")
+        stored = adapter.rows(f"SELECT target_identity FROM {adapter.table_ref('stel_state')}")
 
     assert stored == [(scope.target_identity,)]
     assert len(scope.target_identity) == 32
@@ -320,7 +320,7 @@ def test_duckdb_migrates_v1_state_without_discarding_rows(tmp_path: Path) -> Non
         connection.execute("CREATE SCHEMA testns")
         connection.execute(
             """
-            CREATE TABLE testns.dbt_ml_state (
+            CREATE TABLE testns.stel_state (
                 model_name VARCHAR NOT NULL,
                 document_id VARCHAR NOT NULL,
                 content_hash VARCHAR NOT NULL,
@@ -331,15 +331,15 @@ def test_duckdb_migrates_v1_state_without_discarding_rows(tmp_path: Path) -> Non
             """
         )
         connection.execute(
-            "INSERT INTO testns.dbt_ml_state VALUES "
+            "INSERT INTO testns.stel_state VALUES "
             "('m1', 'doc-1', 'hash-a', 'v1', TIMESTAMP '2026-07-01 12:00:00'), "
             "('m1', 'doc-2', 'hash-b', 'v1', TIMESTAMP '2026-07-02 12:00:00')"
         )
         connection.execute(
-            "CREATE TABLE testns.dbt_ml_state__migration_v2 (note VARCHAR)"
+            "CREATE TABLE testns.stel_state__migration_v2 (note VARCHAR)"
         )
         connection.execute(
-            "INSERT INTO testns.dbt_ml_state__migration_v2 VALUES ('user-owned')"
+            "INSERT INTO testns.stel_state__migration_v2 VALUES ('user-owned')"
         )
     finally:
         connection.close()
@@ -350,7 +350,7 @@ def test_duckdb_migrates_v1_state_without_discarding_rows(tmp_path: Path) -> Non
             "doc-2": StateValue("hash-b", "v1"),
         }
         timestamps = adapter.rows(
-            f"SELECT record_key, last_run_at FROM {adapter.table_ref('dbt_ml_state')} "
+            f"SELECT record_key, last_run_at FROM {adapter.table_ref('stel_state')} "
             "ORDER BY record_key"
         )
         assert [row[1].isoformat() for row in timestamps] == [
@@ -358,12 +358,12 @@ def test_duckdb_migrates_v1_state_without_discarding_rows(tmp_path: Path) -> Non
             "2026-07-02T12:00:00",
         ]
         assert adapter.rows(
-            f"SELECT note FROM {adapter.table_ref('dbt_ml_state__migration_v2')}"
+            f"SELECT note FROM {adapter.table_ref('stel_state__migration_v2')}"
         ) == [("user-owned",)]
         staging = adapter.rows(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = 'testns' "
-            "AND table_name LIKE 'dbt_ml_staging__state_migration_v2__%'"
+            "AND table_name LIKE 'stel_staging__state_migration_v2__%'"
         )
         assert staging == []
 
@@ -373,19 +373,19 @@ def test_duckdb_rejects_unknown_state_schema(tmp_path: Path) -> None:
     connection = duckdb.connect(str(path))
     try:
         connection.execute("CREATE SCHEMA testns")
-        connection.execute("CREATE TABLE testns.dbt_ml_state (model_name VARCHAR NOT NULL)")
+        connection.execute("CREATE TABLE testns.stel_state (model_name VARCHAR NOT NULL)")
     finally:
         connection.close()
 
     adapter = create_adapter(_wh(path))
-    with pytest.raises(AdapterError, match="Unsupported dbt_ml_state schema"):
+    with pytest.raises(AdapterError, match="Unsupported stel_state schema"):
         adapter.__enter__()
     with pytest.raises(AdapterError, match="context manager"):
         adapter.scalar("SELECT 1")
 
     reopened = duckdb.connect(str(path))
     try:
-        assert reopened.execute("SELECT COUNT(*) FROM testns.dbt_ml_state").fetchone() == (
+        assert reopened.execute("SELECT COUNT(*) FROM testns.stel_state").fetchone() == (
             0,
         )
     finally:
@@ -660,8 +660,8 @@ def test_delete_rows_and_state_rolls_back_target_when_state_delete_fails(
         )
         adapter.upsert_state(scope, [_state("a", "ha", "v1")])
         adapter.execute(
-            f"ALTER TABLE {adapter.table_ref('dbt_ml_state')} "
-            "RENAME TO dbt_ml_state_unavailable"
+            f"ALTER TABLE {adapter.table_ref('stel_state')} "
+            "RENAME TO stel_state_unavailable"
         )
 
         with pytest.raises(duckdb.CatalogException):
@@ -684,7 +684,7 @@ def test_list_tables_excludes_state(tmp_path: Path) -> None:
             "second", pl.DataFrame({"x": [1]})
         )
         names = adapter.list_tables()
-        assert "dbt_ml_state" not in names
+        assert "stel_state" not in names
         assert set(names) == {"first", "second"}
 
 
@@ -842,7 +842,7 @@ def test_full_chunks_concatenates_and_replaces(tmp_path: Path) -> None:
             "ORDER BY document_id"
         )
         assert rows == [("a", 1), ("b", 2), ("c", 3)]
-        assert "dbt_ml_staging__widgets" not in adapter.rows(
+        assert "stel_staging__widgets" not in adapter.rows(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = 'testns'"
         )
@@ -945,5 +945,5 @@ def test_full_chunks_typed_empty_frame_creates_relation(tmp_path: Path) -> None:
 def test_list_tables_excludes_staging_tables(tmp_path: Path) -> None:
     with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
         adapter.materialize_full("model_a", pl.DataFrame({"x": [1]}))
-        adapter.materialize_full("dbt_ml_staging__model_a", pl.DataFrame({"x": [1]}))
+        adapter.materialize_full("stel_staging__model_a", pl.DataFrame({"x": [1]}))
         assert adapter.list_tables() == ["model_a"]

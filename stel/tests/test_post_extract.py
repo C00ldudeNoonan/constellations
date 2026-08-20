@@ -392,8 +392,8 @@ target-path: target
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
-        schema: dbt_ml
+        path: ./target/stel.duckdb
+        schema: stel
 """
     )
     (tmp_path / "sources" / "filings.yml").write_text(
@@ -445,9 +445,9 @@ def run(fields, ctx):
     result = run_project(tmp_path, select="filing_text")
 
     assert result[0].errors == []
-    database = tmp_path / "target" / "dbt_ml.duckdb"
+    database = tmp_path / "target" / "stel.duckdb"
     with duckdb.connect(str(database), read_only=True) as connection:
-        cursor = connection.execute('SELECT * FROM "dbt_ml".dbt_ml.filing_text')
+        cursor = connection.execute('SELECT * FROM "stel".stel.filing_text')
         columns = [description[0] for description in cursor.description]
         row = cursor.fetchone()
     assert "content" not in columns

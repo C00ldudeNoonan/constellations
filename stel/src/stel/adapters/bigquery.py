@@ -1,7 +1,7 @@
 """BigQuery warehouse adapter (issue #83).
 
 Materializes stel tables into a BigQuery dataset; incremental state lives
-in the same dataset (`dbt_ml_state`), so a project can run against BigQuery
+in the same dataset (`stel_state`), so a project can run against BigQuery
 with no DuckDB involvement in materialization or state.
 
 The google-cloud-bigquery dependency is an optional extra — this module
@@ -53,7 +53,6 @@ from ..hashing import canonical_fingerprint
 from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
 from .base import (
-    INTERNAL_TABLE_PREFIXES,
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
     AdapterError,
@@ -219,7 +218,7 @@ class BigQueryWarehouseConfig(WarehouseConfig):
     warehouse:
       type: bigquery
       project: my-gcp-project
-      dataset: dbt_ml            # `schema:` works too
+      dataset: stel              # `schema:` works too
       location: US               # optional BigQuery region
       keyfile: ./sa.json         # service-account file auth; omit for ADC
     """
@@ -1102,7 +1101,7 @@ class BigQueryAdapter(WarehouseAdapter):
 
         shape = ", ".join(name for name, _type, _mode in columns)
         raise AdapterError(
-            "Unsupported dbt_ml_state schema; expected the legacy v1 or current "
+            f"Unsupported {_STATE_TABLE} schema; expected the legacy v1 or current "
             f"v2 shape, found columns: {shape or '(none)'}. Back up the table and "
             "run --full-refresh after resolving the state schema."
         )
@@ -1162,7 +1161,7 @@ class BigQueryAdapter(WarehouseAdapter):
         )
         if int(duplicate_count or 0):
             raise AdapterError(
-                "Cannot migrate BigQuery dbt_ml_state because legacy "
+                f"Cannot migrate BigQuery {_STATE_TABLE} because legacy "
                 "(model_name, document_id) keys contain duplicates. Back up and "
                 "deduplicate the state table before retrying."
             )
@@ -1518,16 +1517,30 @@ class BigQueryAdapter(WarehouseAdapter):
         arrow = self._run_query(sql, params).to_arrow()
         return cast(pl.DataFrame, pl.from_arrow(arrow))
 
-    def list_tables(self) -> list[str]:
-        names = sorted(
-            t.table_id
-            for t in self.client.list_tables(f"{self._cfg.project}.{self.schema}")
-        )
-        return [
-            n
-            for n in names
-            if n != _STATE_TABLE and not n.startswith(INTERNAL_TABLE_PREFIXES)
-        ]
+    def list_all_tables(self, schema: str | None = None) -> list[str]:
+        dataset = schema if schema is not None else self.schema
+        try:
+            tables = list(self.client.list_tables(f"{self._cfg.project}.{dataset}"))
+        except _not_found_error():
+            # A dataset that is not there has no tables, which is what the
+            # legacy-schema guard asks about before anything creates one.
+            return []
+        return sorted(str(t.table_id) for t in tables)
+
+    def rename_table(self, old: str, new: str) -> None:
+        # BigQuery has no ALTER TABLE ... RENAME across all editions, so this
+        # mirrors the v1 state migration below: copy under the new name, then
+        # drop the old one only once the copy exists. A failed copy therefore
+        # leaves the original where it was, and re-running resumes.
+        try:
+            self.execute(
+                f"CREATE TABLE {self.table_ref(new)} COPY {self.table_ref(old)}"
+            )
+            self.client.delete_table(self._table_id(old), not_found_ok=True)
+        except Exception as error:
+            raise AdapterError(
+                f"BigQuery could not rename '{old}' to '{new}'"
+            ) from sanitized_adapter_cause(error)
 
     # ─── materialization ─────────────────────────────────────────────────
 

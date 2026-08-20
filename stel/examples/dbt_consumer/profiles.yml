@@ -3,5 +3,5 @@ dbt_consumer:
   outputs:
     dev:
       type: duckdb
-      path: ../invoice_pipeline/target/dbt_ml.duckdb
+      path: ../invoice_pipeline/target/stel.duckdb
       schema: dbt_marts

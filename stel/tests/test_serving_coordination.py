@@ -179,7 +179,7 @@ def _insert_ledger_row(
     publication_id: str | None = None,
 ) -> None:
     adapter = coordinator._adapter
-    ledger = f"{adapter.schema_ref}.{adapter.quote_ident('dbt_ml_serving_ledger')}"
+    ledger = f"{adapter.schema_ref}.{adapter.quote_ident('stel_serving_ledger')}"
     adapter.execute(
         f"""
         INSERT INTO {ledger} (

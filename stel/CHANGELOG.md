@@ -12,16 +12,13 @@
   and the `stel[...]` extras. There is no compatibility shim — a single known
   user, per `docs/compatibility.md`, so a deprecation window would cost more to
   maintain than it could repay.
-- **Nothing in a warehouse moves.** The state table, serving ledger and lease
-  tables, internal table prefixes, the default `dbt_ml` schema, the default
-  `target/dbt_ml.duckdb` file, and every fingerprint domain keep their names, so
-  an existing project's state rows are still found rather than orphaned.
-  Renaming those needs a migration that carries the objects over, which is a
-  separate change (`stel migrate`), not a find-and-replace. LanceDB collection
-  metadata, the validated classic-ML artifact runtime key, the run_results
-  version key that Dagster reads, and the emitted dbt source name
-  (`dbt_ml_<project>`, still overridable with `--source-name`) are unchanged for
-  the same reason.
+- **The package rename moved nothing in a warehouse.** The visible internal
+  names moved separately, under `stel migrate` — see the next section. What
+  stays put permanently: every fingerprint domain, LanceDB collection metadata,
+  the validated classic-ML artifact runtime key, the run_results version key
+  that Dagster reads, and the emitted dbt source name (`dbt_ml_<project>`, still
+  overridable with `--source-name`). Those are invisible to anyone browsing a
+  warehouse, and renaming them would cost a full reprocess to buy nothing.
 - Provider implementation identity is pinned across the rename. It deliberately
   excludes the release version so cached provider responses survive an upgrade,
   and it was the one identity that tracked our own module layout — letting the
@@ -40,8 +37,46 @@
   location, rename any `DBT_ML_*` environment variables to `STEL_*`, and re-run
   `stel codegen` for embedded-dbt projects — the generated shims now import
   `stel.dbt_embed` and read `STEL_PROJECT_DIR`, so commit the regenerated files
-  before the next `dbt build`. Leave `schema:`, `path:`, and `--source-name`
-  values alone.
+  before the next `dbt build`. Leave `--source-name` values alone, and see the
+  next section for `schema:` and `path:`.
+
+### Migrated the visible warehouse names, behind loud failures (issue #313)
+
+- **`stel migrate`** renames stel's persisted internal tables in place:
+  `dbt_ml_state` → `stel_state`, `dbt_ml_serving_ledger` →
+  `stel_serving_ledger`, `dbt_ml_serving_leases` → `stel_serving_leases`, and
+  any `dbt_ml_test_failures__*` inspection tables. Rows are preserved — DuckDB
+  uses a transactional `ALTER TABLE ... RENAME TO`, BigQuery a `CREATE TABLE ...
+  COPY` that only drops the original once the copy exists. `--dry-run` prints
+  the plan. It touches only tables stel owns, only inside the schema the target
+  already points at, and refuses rather than guessing if it finds both spellings
+  of the same object.
+- **Nothing runs against an unmigrated warehouse.** Connecting to a schema that
+  holds the old tables raises and names `stel migrate`, exiting 2 as a setup
+  error. Without that guard the run would create empty replacements beside the
+  old tables, find no prior state, report every document as new, and reprocess
+  the corpus at provider cost — green the whole way, because that is exactly
+  what a genuine first run looks like.
+- **The default schema is now `stel`** (was `dbt_ml`), and the zero-config
+  DuckDB file is `target/stel.duckdb` (was `target/dbt_ml.duckdb`). Neither is
+  adopted automatically: a project that never wrote `schema:` and connects to an
+  empty `stel` schema while a populated `dbt_ml` one exists is refused, with the
+  exact `schema: dbt_ml` line to add. The zero-config path is refused at config
+  load for the same reason. A project that names its schema or path explicitly —
+  every shipped example does — is unaffected and never second-guessed. Moving a
+  whole schema stays the operator's decision, not the migration's.
+- **`stel_` is now a reserved model-name prefix, added alongside `dbt_ml_`.**
+  The old prefix stays reserved even though no internal table uses it any more:
+  dropping it would newly *allow* model names existing projects have always been
+  told are stel's.
+- `list_tables()` now hides the serving ledger and lease tables. They were never
+  filtered, so they appeared in `stel ls` and `stel show` as if a user had
+  modeled them. It also still hides the pre-rename `dbt_ml_*` internals, so
+  debris a crashed pre-upgrade run left behind does not surface as a model.
+- To upgrade an existing target: run `stel migrate` once. If your profile never
+  named a schema, add `schema: dbt_ml` first (or move the objects yourself and
+  keep the new default).
+
 
 ## v0.8.0 - 2026-08-11
 

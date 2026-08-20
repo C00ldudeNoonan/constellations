@@ -4,5 +4,5 @@ economic_nlp:
     dev:
       warehouse:
         type: duckdb
-        path: ./target/dbt_ml.duckdb
+        path: ./target/stel.duckdb
         schema: economic_nlp

@@ -70,7 +70,7 @@ def evaluate_test_spec(
         {python: my.module.path}                     -> custom Python test
 
     When `store_failures` is set, supporting tests persist their failing rows to
-    a `dbt_ml_test_failures__…` table and record it on the result.
+    a `stel_test_failures__…` table and record it on the result.
     """
     parsed = parse_test_spec(spec)
     return _apply_severity(

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from ..adapters.base import SERVING_LEDGER_TABLE
+from ..adapters.base import SERVING_LEASE_TABLE, SERVING_LEDGER_TABLE
 from .base import RetrievalError
 
 if TYPE_CHECKING:
@@ -36,10 +36,12 @@ if TYPE_CHECKING:
 # Fenced state replacement (WarehouseAdapter.replace_state_scope) verifies
 # claims against this same ledger, so the name is owned by adapters.base.
 LEDGER_TABLE = SERVING_LEDGER_TABLE
-# A third persisted warehouse table, owned here rather than by an adapter.
-# Frozen for the same reason as the names in adapters.base: renaming it strands
-# the live leases and every publisher loses sight of who holds what.
-LEASE_TABLE = "dbt_ml_serving_leases"
+# The lease table's name moved to adapters.base with #313, for the same reason
+# as the ledger's: `stel migrate` plans the rename of all three persisted
+# tables together, and it cannot import retrieval code to learn this one.
+# Frozen for the same reason as the names there: renaming it strands the live
+# leases and every publisher loses sight of who holds what.
+LEASE_TABLE = SERVING_LEASE_TABLE
 
 STATUS_PUBLISHING = "publishing"
 STATUS_READY = "ready"

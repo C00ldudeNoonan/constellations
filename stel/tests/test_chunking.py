@@ -358,7 +358,7 @@ def test_legacy_chunk_state_migrates_then_rewrites_once(tmp_path: Path) -> None:
     try:
         con.execute(
             """
-            CREATE TABLE "db".docs.dbt_ml_state_v1 (
+            CREATE TABLE "db".docs.stel_state_v1 (
                 model_name VARCHAR NOT NULL,
                 document_id VARCHAR NOT NULL,
                 content_hash VARCHAR NOT NULL,
@@ -370,18 +370,18 @@ def test_legacy_chunk_state_migrates_then_rewrites_once(tmp_path: Path) -> None:
         )
         con.execute(
             """
-            INSERT INTO "db".docs.dbt_ml_state_v1
+            INSERT INTO "db".docs.stel_state_v1
             SELECT model_name, record_key,
                    CASE WHEN model_name = 'document_chunks' THEN ?
                         ELSE input_fingerprint END,
                    code_version, last_run_at
-            FROM "db".docs.dbt_ml_state
+            FROM "db".docs.stel_state
             """,
             [old_chunk_hash],
         )
-        con.execute('DROP TABLE "db".docs.dbt_ml_state')
+        con.execute('DROP TABLE "db".docs.stel_state')
         con.execute(
-            'ALTER TABLE "db".docs.dbt_ml_state_v1 RENAME TO dbt_ml_state'
+            'ALTER TABLE "db".docs.stel_state_v1 RENAME TO stel_state'
         )
     finally:
         con.close()
@@ -504,7 +504,7 @@ def test_failed_chunk_replacement_cannot_leave_old_state_current(
             len(original_ids),
         )
         assert con.execute(
-            "SELECT COUNT(*) FROM \"db\".docs.dbt_ml_state WHERE model_name = 'document_chunks'"
+            "SELECT COUNT(*) FROM \"db\".docs.stel_state WHERE model_name = 'document_chunks'"
         ).fetchone() == (1,)
         # Restore the title so the document hash matches the pre-failure state.
         con.execute(

@@ -47,7 +47,7 @@ def test_test_store_failures_persists_and_reports(
     )
     assert result.exit_code == 1, result.output
     assert "stored" in result.output
-    table = "dbt_ml_test_failures__raw_invoices__accepted_values__currency"
+    table = "stel_test_failures__raw_invoices__accepted_values__currency"
     assert table in result.output
 
     show = runner.invoke(cli, ["--project-dir", str(dst), "ls"])

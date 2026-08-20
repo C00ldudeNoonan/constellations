@@ -185,11 +185,11 @@ def test_llm_pipeline_end_to_end(
     assert raw.documents_processed == 3
     assert raw.rows_written == 3
 
-    db = project / "target" / "dbt_ml.duckdb"
+    db = project / "target" / "stel.duckdb"
     con = duckdb.connect(str(db), read_only=True)
     try:
         rows = con.execute(
-            'SELECT vendor, total FROM "dbt_ml"."llm_invoices".raw_invoices_llm'
+            'SELECT vendor, total FROM "stel"."llm_invoices".raw_invoices_llm'
         ).fetchall()
     finally:
         con.close()

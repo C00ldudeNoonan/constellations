@@ -119,7 +119,7 @@ def _state_keys(project: Path) -> set[str]:
     con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
     try:
         rows = con.execute(
-            "SELECT record_key FROM \"db\".docs.dbt_ml_state "
+            "SELECT record_key FROM \"db\".docs.stel_state "
             "WHERE model_name = 'word_tokens'"
         ).fetchall()
     finally:

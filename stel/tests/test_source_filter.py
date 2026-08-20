@@ -113,12 +113,12 @@ def test_filter_rejects_profile_default_insert_overwrite_strategy() -> None:
 
 
 def _source_uris(project: Path) -> list[str]:
-    con = duckdb.connect(str(project / "target" / "dbt_ml.duckdb"), read_only=True)
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
     try:
         return [
             r[0]
             for r in con.execute(
-                'SELECT source_uri FROM "dbt_ml".dbt_ml.raw_invoices'
+                'SELECT source_uri FROM "stel".stel.raw_invoices'
             ).fetchall()
         ]
     finally:

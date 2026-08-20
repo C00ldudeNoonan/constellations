@@ -6,6 +6,7 @@ from .base import (
     AdapterCapabilityError,
     AdapterConfigError,
     AdapterError,
+    LegacyWarehouseNamesError,
     ReadOrdering,
     ReadPredicate,
     ReadPredicateOperator,
@@ -24,6 +25,12 @@ from .base import (
     WarehouseAdapter,
     WarehouseCapability,
 )
+from .migration import (
+    MigrationConflictError,
+    TableRename,
+    apply_name_migration,
+    plan_name_migration,
+)
 from .registry import (
     UnknownAdapterError,
     adapter_capabilities,
@@ -38,6 +45,8 @@ __all__ = [
     "AdapterCapabilityError",
     "AdapterConfigError",
     "AdapterError",
+    "LegacyWarehouseNamesError",
+    "MigrationConflictError",
     "ReadOrdering",
     "ReadPredicate",
     "ReadPredicateOperator",
@@ -53,13 +62,16 @@ __all__ = [
     "StateValue",
     "TableReadRequest",
     "TableReadSnapshot",
+    "TableRename",
     "UnknownAdapterError",
     "WarehouseAdapter",
     "WarehouseCapability",
     "adapter_capabilities",
+    "apply_name_migration",
     "create_adapter",
     "list_adapter_types",
     "parse_warehouse_config",
+    "plan_name_migration",
     "prepare_warehouse_profile_input",
     "register",
 ]

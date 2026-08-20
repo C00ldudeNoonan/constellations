@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from stel.adapters import (
     AdapterError,
+    LegacyWarehouseNamesError,
     StaleStateFenceError,
     StateAbsenceProbe,
     StateRecord,
@@ -29,6 +30,18 @@ from stel.adapters import (
     create_adapter,
     list_adapter_types,
     parse_warehouse_config,
+    plan_name_migration,
+)
+from stel.adapters.base import (
+    LEGACY_SERVING_LEASE_TABLE,
+    LEGACY_SERVING_LEDGER_TABLE,
+    LEGACY_STAGING_TABLE_PREFIX,
+    LEGACY_STATE_TABLE,
+    LEGACY_TEST_FAILURES_TABLE_PREFIX,
+    SERVING_LEASE_TABLE,
+    SERVING_LEDGER_TABLE,
+    STATE_TABLE,
+    TEST_FAILURES_TABLE_PREFIX,
 )
 from stel.adapters.bigquery import (
     BigQueryAdapter,
@@ -36,6 +49,7 @@ from stel.adapters.bigquery import (
     BigQueryWarehouseOptions,
     to_query_parameters,
 )
+from stel.config.identifiers import LEGACY_SCHEMA_NAME
 from stel.credentials import ProtectedCredential
 
 # ─── config ─────────────────────────────────────────────────────────────────
@@ -68,11 +82,11 @@ def test_config_dataset_alias() -> None:
 def test_config_schema_alias_and_defaults() -> None:
     cfg = parse_warehouse_config({"type": "bigquery", "project": "my-proj"})
     assert isinstance(cfg, BigQueryWarehouseConfig)
-    assert cfg.schema_name == "dbt_ml"
+    assert cfg.schema_name == "stel"
     assert cfg.location is None
     assert cfg.keyfile is None
     assert cfg.catalog_name() == "my-proj"
-    assert cfg.storage_location() == "my-proj.dbt_ml"
+    assert cfg.storage_location() == "my-proj.stel"
 
 
 def test_config_requires_project() -> None:
@@ -197,6 +211,7 @@ class _FakeClient:
         self.tables: dict[str, list[Any]] = {}
         self.table_meta: dict[str, dict[str, Any]] = {}
         self.listing: list[str] = []
+        self.other_datasets: dict[str, list[str]] = {}
         self.dropped: list[str] = []
         self.query_results: list[_FakeJob] = []
 
@@ -225,7 +240,19 @@ class _FakeClient:
         return SimpleNamespace(schema=schema, **self.table_meta.get(table_id, {}))
 
     def list_tables(self, dataset_id: str) -> list[Any]:
-        return [SimpleNamespace(table_id=n) for n in self.listing]
+        # `listing` is the configured dataset. `other_datasets` covers the
+        # cross-dataset lookup the #313 legacy-schema guard makes, including
+        # the common case of the dataset not existing at all.
+        name = dataset_id.split(".")[-1]
+        if name == "ds":
+            return [SimpleNamespace(table_id=n) for n in self.listing]
+        if name in self.other_datasets:
+            return [
+                SimpleNamespace(table_id=n) for n in self.other_datasets[name]
+            ]
+        from google.api_core.exceptions import NotFound
+
+        raise NotFound(dataset_id)
 
     def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
         self.dropped.append(table_id)
@@ -284,7 +311,7 @@ def test_incremental_upsert_uses_staging_merge() -> None:
     adapter.materialize_incremental("docs", df, key_col="document_id")
 
     payload, staging_id, job_config = client.loads[0]
-    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
+    assert staging_id.startswith("proj.ds.stel_staging__docs__")
     assert job_config.write_disposition == "WRITE_TRUNCATE"
     assert pl.read_parquet(io.BytesIO(payload)).rows() == [("a", 1), ("b", 2)]
 
@@ -435,7 +462,7 @@ def test_incremental_append_new_columns_sets_schema_update() -> None:
         bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
     ]
     data_payload, staging_id, staging_config = client.loads[1]
-    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
+    assert staging_id.startswith("proj.ds.stel_staging__docs__")
     assert staging_config.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
     assert pl.read_parquet(io.BytesIO(data_payload)).rows() == [("a", "new")]
 
@@ -491,7 +518,7 @@ def test_incremental_merge_failure_keeps_target_and_cleans_staging() -> None:
     assert sql.startswith("MERGE")
     assert "DELETE FROM" not in sql
     assert len(client.dropped) == 1
-    assert client.dropped[0].startswith("proj.ds.dbt_ml_staging__docs__")
+    assert client.dropped[0].startswith("proj.ds.stel_staging__docs__")
 
 
 def test_incremental_fail_policy_raises_before_writing() -> None:
@@ -528,7 +555,7 @@ def test_state_table_create_uses_v2_schema() -> None:
 
     assert len(client.queries) == 1
     sql, _ = client.queries[0]
-    assert "CREATE TABLE IF NOT EXISTS `proj`.`ds`.`dbt_ml_state`" in sql
+    assert "CREATE TABLE IF NOT EXISTS `proj`.`ds`.`stel_state`" in sql
     assert "state_scope STRING NOT NULL" in sql
     assert "target_identity STRING NOT NULL" in sql
     assert "record_key STRING NOT NULL" in sql
@@ -539,7 +566,7 @@ def test_state_table_create_uses_v2_schema() -> None:
 
 def test_state_table_v2_schema_is_an_exact_noop() -> None:
     client = _FakeClient()
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V2_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
     adapter = _adapter(client)
 
     adapter._ensure_state_table()
@@ -550,13 +577,13 @@ def test_state_table_v2_schema_is_an_exact_noop() -> None:
 
 def test_state_table_rejects_unrecognized_schema_without_mutation() -> None:
     client = _FakeClient()
-    client.tables["proj.ds.dbt_ml_state"] = [
+    client.tables["proj.ds.stel_state"] = [
         *_STATE_V2_SCHEMA,
         SimpleNamespace(name="unexpected", field_type="STRING", mode="NULLABLE"),
     ]
     adapter = _adapter(client)
 
-    with pytest.raises(AdapterError, match="Unsupported dbt_ml_state schema"):
+    with pytest.raises(AdapterError, match="Unsupported stel_state schema"):
         adapter._ensure_state_table()
 
     assert client.queries == []
@@ -565,10 +592,10 @@ def test_state_table_rejects_unrecognized_schema_without_mutation() -> None:
 
 def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
     client = _FakeClient()
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V1_SCHEMA)
     protected_table_ids = {
-        "proj.ds.dbt_ml_staging__state_migration_v2",
-        "proj.ds.dbt_ml_staging__state_migration_v2__user_owned",
+        "proj.ds.stel_staging__state_migration_v2",
+        "proj.ds.stel_staging__state_migration_v2__user_owned",
     }
     for table_id in protected_table_ids:
         client.tables[table_id] = ["user_data"]
@@ -589,8 +616,8 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
     assert len(client.dropped) == 1
     migration_id = client.dropped[0]
     migration_table = migration_id.removeprefix("proj.ds.")
-    assert migration_table.startswith("dbt_ml_staging__state_migration_v2__")
-    suffix = migration_table.removeprefix("dbt_ml_staging__state_migration_v2__")
+    assert migration_table.startswith("stel_staging__state_migration_v2__")
+    suffix = migration_table.removeprefix("stel_staging__state_migration_v2__")
     assert len(suffix) == 32
     assert set(suffix) <= set("0123456789abcdef")
     migration_ref = f"`proj`.`ds`.`{migration_table}`"
@@ -608,18 +635,18 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
     assert count_sql.count("SELECT COUNT(*)") == 2
     assert migration_ref in count_sql
     copy_sql = client.queries[3][0]
-    assert copy_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`dbt_ml_state` COPY")
+    assert copy_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`stel_state` COPY")
     assert copy_sql.endswith(f"COPY {migration_ref}")
     assert protected_table_ids.isdisjoint(client.dropped)
 
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V2_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
     adapter._ensure_state_table()
     assert len(client.queries) == 4
 
 
 def test_state_table_migration_count_mismatch_keeps_legacy_table() -> None:
     client = _FakeClient()
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V1_SCHEMA)
     client.query_results = [
         _FakeJob(rows=[(0,)]),
         _FakeJob(),
@@ -634,13 +661,13 @@ def test_state_table_migration_count_mismatch_keeps_legacy_table() -> None:
     assert all(" COPY " not in sql for sql, _ in client.queries)
     assert len(client.dropped) == 1
     assert client.dropped[0].startswith(
-        "proj.ds.dbt_ml_staging__state_migration_v2__"
+        "proj.ds.stel_staging__state_migration_v2__"
     )
 
 
 def test_state_table_migration_rejects_duplicate_legacy_keys_before_writes() -> None:
     client = _FakeClient()
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V1_SCHEMA)
     client.query_results = [_FakeJob(rows=[(1,)])]
     adapter = _adapter(client)
 
@@ -657,10 +684,10 @@ def test_state_table_migration_collision_never_deletes_existing_table(
 ) -> None:
     collision_hex = "a" * 32
     collision_id = (
-        "proj.ds.dbt_ml_staging__state_migration_v2__" + collision_hex
+        "proj.ds.stel_staging__state_migration_v2__" + collision_hex
     )
     client = _FakeClient()
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V1_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V1_SCHEMA)
     client.tables[collision_id] = ["user_data"]
     client.query_results = [_FakeJob(rows=[(0,)]), _FailingJob()]
     adapter = _adapter(client)
@@ -750,14 +777,14 @@ def test_state_upsert_stages_and_merges_at_scale(
     assert len(client.loads) == 3
     staging_ids = {table_id for _, table_id, _ in client.loads}
     assert len(staging_ids) == 1
-    assert "dbt_ml_staging__state_merge__" in next(iter(staging_ids))
+    assert "stel_staging__state_merge__" in next(iter(staging_ids))
 
     merge_sqls = [sql for sql, _ in client.queries if sql.strip().startswith("MERGE")]
     assert len(merge_sqls) == 1
     merge_sql, merge_config = next(
         q for q in client.queries if q[0].strip().startswith("MERGE")
     )
-    assert "dbt_ml_staging__state_merge__" in merge_sql  # reads the staging table
+    assert "stel_staging__state_merge__" in merge_sql  # reads the staging table
     assert "OFFSET" not in merge_sql                     # not the inline array form
     assert "WHEN NOT MATCHED BY SOURCE" not in merge_sql  # upsert: no delete
     # No array parameters — only the three scope scalars ride inline.
@@ -768,7 +795,7 @@ def test_state_upsert_stages_and_merges_at_scale(
         for p in merge_config.query_parameters
     )
     # Staging table is cleaned up.
-    assert any("dbt_ml_staging__state_merge__" in t for t in client.dropped)
+    assert any("stel_staging__state_merge__" in t for t in client.dropped)
 
 
 def test_state_replace_stages_with_delete_at_scale(
@@ -784,11 +811,11 @@ def test_state_replace_stages_with_delete_at_scale(
     merge_sql = next(
         sql for sql, _ in client.queries if sql.strip().startswith("MERGE")
     )
-    assert "dbt_ml_staging__state_merge__" in merge_sql
+    assert "stel_staging__state_merge__" in merge_sql
     assert "OFFSET" not in merge_sql
     # Replace still deletes rows absent from the staged snapshot, atomically.
     assert "WHEN NOT MATCHED BY SOURCE" in merge_sql
-    assert any("dbt_ml_staging__state_merge__" in t for t in client.dropped)
+    assert any("stel_staging__state_merge__" in t for t in client.dropped)
 
 
 def test_fetch_state_round_trip_shape() -> None:
@@ -879,7 +906,7 @@ def test_delete_rows_and_state_uses_one_scoped_transaction() -> None:
     assert "BEGIN TRANSACTION;" in sql
     assert "COMMIT TRANSACTION;" in sql
     assert "DELETE FROM `proj`.`ds`.`docs`" in sql
-    assert "DELETE FROM `proj`.`ds`.`dbt_ml_state`" in sql
+    assert "DELETE FROM `proj`.`ds`.`stel_state`" in sql
     assert "model_name = ? AND state_scope = ? AND target_identity = ?" in sql
     params = job_config.query_parameters
     assert params[0].values == ["doc-1"]
@@ -893,7 +920,7 @@ def test_delete_rows_and_state_uses_one_scoped_transaction() -> None:
 
 def test_list_tables_filters_internal() -> None:
     client = _FakeClient()
-    client.listing = ["docs", "dbt_ml_state", "dbt_ml_test_failures__docs__not_null"]
+    client.listing = ["docs", "stel_state", "stel_test_failures__docs__not_null"]
     adapter = _adapter(client)
     assert adapter.list_tables() == ["docs"]
 
@@ -1121,7 +1148,7 @@ def test_materialize_full_applies_layout_and_replaces_atomically() -> None:
     # Replacement is staged with the layout (validating it), then one
     # CREATE OR REPLACE swaps it in atomically — the target never disappears.
     _, staging_id, job_config = client.loads[0]
-    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
+    assert staging_id.startswith("proj.ds.stel_staging__docs__")
     assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
     assert job_config.time_partitioning.type_ == "DAY"
     assert job_config.time_partitioning.field == "filing_date"
@@ -1256,7 +1283,7 @@ def test_full_chunks_ctas_carries_partition_and_cluster_clauses() -> None:
         "CLUSTER BY `cik`, `form_type` AS SELECT" in create_sql
     )
     assert len(client.queries) == 1
-    assert all(d.startswith("proj.ds.dbt_ml_staging__docs__") for d in client.dropped)
+    assert all(d.startswith("proj.ds.stel_staging__docs__") for d in client.dropped)
 
 
 def test_full_chunks_partition_migration_falls_back_to_staged_swap() -> None:
@@ -1272,7 +1299,7 @@ def test_full_chunks_partition_migration_falls_back_to_staged_swap() -> None:
     )
     create_sql = client.queries[0][0]
     # the replacement is created (validating the layout) before any drop
-    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
+    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`stel_staging__docs__")
     assert client.dropped[0] == "proj.ds.docs"
     assert "RENAME TO `docs`" in client.queries[1][0]
 
@@ -1289,7 +1316,7 @@ def test_full_chunks_bad_layout_keeps_target() -> None:
     assert "proj.ds.docs" not in client.dropped  # last good table survives
     # the staging table is cleaned up; the failed CREATE OR REPLACE never
     # touched the target
-    assert all(d.startswith("proj.ds.dbt_ml_staging__docs__") for d in client.dropped)
+    assert all(d.startswith("proj.ds.stel_staging__docs__") for d in client.dropped)
     assert len(client.dropped) == 1
 
 
@@ -1365,7 +1392,7 @@ def test_partition_migration_configures_staging_before_swap() -> None:
 
     alter_sql, _ = client.queries[0]
     # options are configured on the staging replacement before the swap
-    assert alter_sql.startswith("ALTER TABLE `proj`.`ds`.`dbt_ml_staging__docs__")
+    assert alter_sql.startswith("ALTER TABLE `proj`.`ds`.`stel_staging__docs__")
     assert " SET OPTIONS (" in alter_sql
     assert "require_partition_filter = TRUE" in alter_sql
     assert "kms_key_name" not in alter_sql  # set at create, never re-keyed
@@ -1880,7 +1907,7 @@ def test_full_chunks_iceberg_inserts_from_staging() -> None:
     assert "table_format = 'ICEBERG'" in create
     insert = next(q[0] for q in client.queries if q[0].startswith("INSERT INTO"))
     assert insert.startswith(
-        "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`dbt_ml_staging__docs__"
+        "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`stel_staging__docs__"
     )
     assert "proj.ds.docs" in client.dropped
 
@@ -1908,7 +1935,7 @@ def test_materialize_sql_full_iceberg_stages_creates_and_inserts() -> None:
     )
 
     assert client.queries[0][0].startswith(
-        "CREATE TABLE `proj`.`ds`.`dbt_ml_staging__docs__"
+        "CREATE TABLE `proj`.`ds`.`stel_staging__docs__"
     )
     iceberg_create = next(
         q[0] for q in client.queries if "table_format = 'ICEBERG'" in q[0]
@@ -1916,11 +1943,11 @@ def test_materialize_sql_full_iceberg_stages_creates_and_inserts() -> None:
     assert iceberg_create.startswith("CREATE TABLE `proj`.`ds`.`docs` (")
     insert = next(q[0] for q in client.queries if q[0].startswith("INSERT INTO"))
     assert insert.startswith(
-        "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`dbt_ml_staging__docs__"
+        "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`stel_staging__docs__"
     )
     # Target dropped before recreate; staging always cleaned up.
     assert "proj.ds.docs" in client.dropped
-    assert any("dbt_ml_staging__docs__" in d for d in client.dropped)
+    assert any("stel_staging__docs__" in d for d in client.dropped)
     assert result.rows_written == 1
 
 
@@ -2756,7 +2783,7 @@ def test_full_chunks_stages_then_swaps() -> None:
 
     # Chunk 1 truncates the staging table; chunk 2 appends with field addition.
     _, staging_id, cfg1 = client.loads[0]
-    assert staging_id.startswith("proj.ds.dbt_ml_staging__docs__")
+    assert staging_id.startswith("proj.ds.stel_staging__docs__")
     assert cfg1.write_disposition == bigquery.WriteDisposition.WRITE_TRUNCATE
     _, _, cfg2 = client.loads[1]
     assert cfg2.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
@@ -2805,7 +2832,7 @@ def test_full_chunks_typed_empty_frame_loads_and_swaps() -> None:
 
 def test_list_tables_excludes_staging() -> None:
     client = _FakeClient()
-    client.listing = ["docs", "dbt_ml_staging__docs", "dbt_ml_state"]
+    client.listing = ["docs", "stel_staging__docs", "stel_state"]
     adapter = _adapter(client)
     assert adapter.list_tables() == ["docs"]
 # ─── paged state reconciliation (issue #153) ────────────────────────────────
@@ -2963,18 +2990,18 @@ def test_replace_state_scope_stages_batches_and_merges_once() -> None:
     assert written == 2
     assert len(client.loads) == 2
     staging_id = client.loads[0][1]
-    assert staging_id.startswith("proj.ds.dbt_ml_staging__state_replace__")
+    assert staging_id.startswith("proj.ds.stel_staging__state_replace__")
     assert client.loads[1][1] == staging_id
     assert all(
         load[2].write_disposition == "WRITE_APPEND" for load in client.loads
     )
     sql, _ = client.queries[0]
-    assert sql.strip().startswith("MERGE `proj`.`ds`.`dbt_ml_state` AS target")
+    assert sql.strip().startswith("MERGE `proj`.`ds`.`stel_state` AS target")
     assert "UNION ALL" in sql and "is_sentinel" in sql
     assert "WHEN NOT MATCHED BY SOURCE" in sql
     assert "stel-state-replace-invalid" in sql
     # Unfenced replacement must not consult the serving ledger.
-    assert "dbt_ml_serving_ledger" not in sql
+    assert "stel_serving_ledger" not in sql
     assert client.dropped == [staging_id]
 
 
@@ -2984,7 +3011,7 @@ def test_replace_state_scope_empty_input_still_replaces_atomically() -> None:
     assert adapter.replace_state_scope(StateScope("m"), iter([])) == 0
     assert client.loads == []
     create_sql, _ = client.queries[0]
-    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`dbt_ml_staging__")
+    assert create_sql.startswith("CREATE TABLE `proj`.`ds`.`stel_staging__")
     merge_sql, _ = client.queries[1]
     assert "WHEN NOT MATCHED BY SOURCE" in merge_sql
     assert len(client.dropped) == 1
@@ -3000,7 +3027,7 @@ def test_fenced_replace_conditions_on_the_serving_ledger() -> None:
         fence=fence,
     )
     sql, job_config = client.queries[0]
-    assert "`proj`.`ds`.`dbt_ml_serving_ledger`" in sql
+    assert "`proj`.`ds`.`stel_serving_ledger`" in sql
     assert "publication_id = ? AND fencing_token = ?" in sql
     assert "stel-stale-state-fence" in sql
     values = _param_values(job_config)
@@ -3036,7 +3063,7 @@ def test_fenced_replace_maps_gate_errors_without_leaking() -> None:
 
     client = _FakeClient()
     client.query_results = [
-        _MessageFailingJob("404 Not found: Table proj:ds.dbt_ml_serving_ledger")
+        _MessageFailingJob("404 Not found: Table proj:ds.stel_serving_ledger")
     ]
     adapter = _adapter(client)
     with pytest.raises(StaleStateFenceError, match="serving ledger"):
@@ -3052,7 +3079,7 @@ def test_fenced_replace_maps_gate_errors_without_leaking() -> None:
 # validating/merging it, so the checked and merged rowsets are always
 # identical. Fixing uuid4 makes the staging table id predictable.
 _STAGING_SUFFIX = "0" * 12
-_STAGING_TABLE = f"dbt_ml_staging__tgt__{_STAGING_SUFFIX}"
+_STAGING_TABLE = f"stel_staging__tgt__{_STAGING_SUFFIX}"
 _STAGING_ID = f"proj.ds.{_STAGING_TABLE}"
 
 
@@ -3300,7 +3327,7 @@ def test_delete_rows_and_state_stages_at_scale(monkeypatch: pytest.MonkeyPatch) 
     assert deleted == 3
     # Keys were staged via a Parquet load, not shipped as an array param.
     staged = {tbl for _, tbl, _ in client.loads}
-    assert any("dbt_ml_staging__delete_target__" in t for t in staged)
+    assert any("stel_staging__delete_target__" in t for t in staged)
     from google.cloud import bigquery
 
     script, cfg = client.queries[-1]
@@ -3313,7 +3340,7 @@ def test_delete_rows_and_state_stages_at_scale(monkeypatch: pytest.MonkeyPatch) 
     # scoped_keys defaulted to target_keys, so the state delete reuses one staging
     # table (no second load).
     assert len(staged) == 1
-    assert any("dbt_ml_staging__delete_target__" in t for t in client.dropped)
+    assert any("stel_staging__delete_target__" in t for t in client.dropped)
 
 
 def test_replace_children_stages_parents_and_state_at_scale(
@@ -3322,7 +3349,7 @@ def test_replace_children_stages_parents_and_state_at_scale(
     monkeypatch.setattr("stel.adapters.bigquery._STATE_MERGE_INLINE_MAX", 2)
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = ["parent_id", "child_id"]  # existing target
-    client.tables["proj.ds.dbt_ml_state"] = list(_STATE_V2_SCHEMA)
+    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
     adapter = _adapter(client)
 
     empty = pl.DataFrame(schema={"parent_id": pl.String, "child_id": pl.String})
@@ -3336,16 +3363,16 @@ def test_replace_children_stages_parents_and_state_at_scale(
         state_records=[StateRecord(f"p{i}", f"h{i}", "v1") for i in range(3)],
     )
     staged = {tbl for _, tbl, _ in client.loads}
-    assert any("dbt_ml_staging__replace_parents__" in t for t in staged)
-    assert any("dbt_ml_staging__replace_state__" in t for t in staged)
+    assert any("stel_staging__replace_parents__" in t for t in staged)
+    assert any("stel_staging__replace_state__" in t for t in staged)
 
     script = next(sql for sql, _ in client.queries if "BEGIN TRANSACTION" in sql)
     assert "IN (SELECT k FROM" in script  # parent delete reads the staging table
-    assert "dbt_ml_staging__replace_state__" in script  # state MERGE reads staging
+    assert "stel_staging__replace_state__" in script  # state MERGE reads staging
     assert "UNNEST(?)" not in script and "GENERATE_ARRAY" not in script
     # Both staging tables are cleaned up.
-    assert any("dbt_ml_staging__replace_parents__" in t for t in client.dropped)
-    assert any("dbt_ml_staging__replace_state__" in t for t in client.dropped)
+    assert any("stel_staging__replace_parents__" in t for t in client.dropped)
+    assert any("stel_staging__replace_state__" in t for t in client.dropped)
 
 
 def test_delete_rows_and_state_staging_preserves_native_key_dtype(
@@ -3400,3 +3427,102 @@ def test_bigquery_sql_error_omits_raw_warehouse_text() -> None:
     cause = excinfo.value.__cause__
     assert cause is not None
     assert "SECRET_VALUE" in str(cause)
+
+
+# ─── internal-name migration (#313) ─────────────────────────────────────────
+
+
+def test_list_tables_hides_the_serving_ledger_and_leases() -> None:
+    """Neither was filtered before #313, so both showed up in `stel ls` as if a
+    user had modeled them."""
+    client = _FakeClient()
+    client.listing = [
+        "docs",
+        SERVING_LEDGER_TABLE,
+        SERVING_LEASE_TABLE,
+        LEGACY_SERVING_LEDGER_TABLE,
+        LEGACY_SERVING_LEASE_TABLE,
+    ]
+    assert _adapter(client).list_tables() == ["docs"]
+
+
+def test_list_tables_still_hides_pre_rename_internals() -> None:
+    client = _FakeClient()
+    client.listing = [
+        "docs",
+        LEGACY_STATE_TABLE,
+        LEGACY_TEST_FAILURES_TABLE_PREFIX + "docs__not_null",
+        LEGACY_STAGING_TABLE_PREFIX + "docs",
+    ]
+    assert _adapter(client).list_tables() == ["docs"]
+
+
+def test_list_all_tables_shows_what_the_model_namespace_hides() -> None:
+    client = _FakeClient()
+    client.listing = ["docs", STATE_TABLE]
+    assert _adapter(client).list_all_tables() == ["docs", STATE_TABLE]
+
+
+def test_list_all_tables_treats_a_missing_dataset_as_empty() -> None:
+    """The legacy-schema guard asks about a dataset that usually is not there;
+    an exception would turn every fresh project into a hard failure."""
+    assert _adapter(_FakeClient()).list_all_tables("nope") == []
+
+
+def test_rename_table_copies_before_dropping_the_original() -> None:
+    """BigQuery has no portable ALTER TABLE ... RENAME, so the copy has to
+    succeed before anything is deleted."""
+    client = _FakeClient()
+    adapter = _adapter(client)
+    adapter.rename_table(LEGACY_STATE_TABLE, STATE_TABLE)
+    sql = client.queries[0][0]
+    assert f"CREATE TABLE `proj`.`ds`.`{STATE_TABLE}`" in sql
+    assert f"COPY `proj`.`ds`.`{LEGACY_STATE_TABLE}`" in sql
+    assert client.dropped == [f"proj.ds.{LEGACY_STATE_TABLE}"]
+
+
+def test_a_failed_copy_leaves_the_original_in_place() -> None:
+    client = _FakeClient()
+    client.query_results = [_FailingJob()]
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError):
+        adapter.rename_table(LEGACY_STATE_TABLE, STATE_TABLE)
+    assert client.dropped == []
+
+
+def test_plan_finds_the_pre_rename_tables() -> None:
+    client = _FakeClient()
+    client.listing = [
+        "docs",
+        LEGACY_STATE_TABLE,
+        LEGACY_SERVING_LEDGER_TABLE,
+        LEGACY_TEST_FAILURES_TABLE_PREFIX + "docs__not_null",
+    ]
+    planned = {(r.old, r.new) for r in plan_name_migration(_adapter(client))}
+    assert planned == {
+        (LEGACY_STATE_TABLE, STATE_TABLE),
+        (LEGACY_SERVING_LEDGER_TABLE, SERVING_LEDGER_TABLE),
+        (
+            LEGACY_TEST_FAILURES_TABLE_PREFIX + "docs__not_null",
+            TEST_FAILURES_TABLE_PREFIX + "docs__not_null",
+        ),
+    }
+
+
+def test_connect_refuses_a_dataset_holding_pre_rename_tables() -> None:
+    client = _FakeClient()
+    client.listing = [LEGACY_STATE_TABLE]
+    adapter = _adapter(client)
+    with pytest.raises(LegacyWarehouseNamesError, match="stel migrate"):
+        adapter._guard_legacy_names()
+
+
+def test_a_defaulted_dataset_beside_a_populated_legacy_one_refuses() -> None:
+    client = _FakeClient()
+    client.other_datasets = {LEGACY_SCHEMA_NAME: [LEGACY_STATE_TABLE]}
+    cfg = parse_warehouse_config({"type": "bigquery", "project": "proj"})
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, BigQueryAdapter)
+    adapter._client = client
+    with pytest.raises(LegacyWarehouseNamesError, match=f"schema: {LEGACY_SCHEMA_NAME}"):
+        adapter._guard_legacy_names()

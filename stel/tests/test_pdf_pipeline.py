@@ -64,11 +64,11 @@ def test_pdf_pipeline_end_to_end(
     assert by_name["extracted_invoices"].rows_written == 3
     assert call_count["n"] == 3, "expected one API call per row on first run"
 
-    db = pdf_project / "target" / "dbt_ml.duckdb"
+    db = pdf_project / "target" / "stel.duckdb"
     con = duckdb.connect(str(db), read_only=True)
     try:
         rows = con.execute(
-            'SELECT vendor, total FROM "dbt_ml"."pdf_invoices".extracted_invoices'
+            'SELECT vendor, total FROM "stel"."pdf_invoices".extracted_invoices'
         ).fetchall()
     finally:
         con.close()

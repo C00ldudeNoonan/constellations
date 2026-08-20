@@ -197,8 +197,15 @@ updating the table.
    fails until you do.
 2. Changing a persisted name: it needs a migration that carries the existing
    objects over, in the same change. Updating the pin alone strands the data.
-3. Naming a new internal warehouse table: derive it from
-   `adapters.base.INTERNAL_TABLE_PREFIXES` so `list_tables()` hides it.
+   `stel migrate` (`adapters/migration.py`) is the worked example — a
+   `(legacy, current)` pair in `adapters.base.MIGRATED_TABLE_NAMES`, a guard in
+   `WarehouseAdapter._guard_legacy_names` so an unmigrated warehouse fails loudly
+   instead of starting over, and pins for *both* spellings. Keep the legacy pin
+   forever: it is what the migration and the guard look for.
+3. Naming a new internal warehouse table: add it to
+   `adapters.base.INTERNAL_TABLE_NAMES`, or derive it from
+   `INTERNAL_TABLE_PREFIXES`, so `list_tables()` hides it. If it is persisted
+   rather than in-flight, it also needs a migration path.
 4. Reading an environment variable: declare it in `src/stel/env.py` and read
    it with `read_env`. A bare `STEL_*` literal fails the scan.
 

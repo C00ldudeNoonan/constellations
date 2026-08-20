@@ -17,6 +17,14 @@ A deliberate contract change must update the tables here, and that conscious
 update is the point: the `why_frozen` text is carried into the assertion
 message so a failure explains what breaks rather than just which byte moved.
 See #313.
+
+#313 is also the one time this happened on purpose. The internal warehouse
+table names moved from `dbt_ml_*` to `stel_*`, carried by `stel migrate` and
+fenced by the connect-time guard in `WarehouseAdapter._guard_legacy_names`.
+Both spellings are pinned below: the current one because it is what live
+warehouses hold now, and the `LEGACY_*` one because it is what pre-rename
+warehouses still hold and what the migration and the guards look for. Losing
+a legacy value would leave that data unreachable and unmentioned.
 """
 
 from __future__ import annotations
@@ -38,6 +46,12 @@ from stel.adapters import (
     parse_warehouse_config,
 )
 from stel.adapters.base import (
+    LEGACY_SERVING_LEASE_TABLE,
+    LEGACY_SERVING_LEDGER_TABLE,
+    LEGACY_STAGING_TABLE_PREFIX,
+    LEGACY_STATE_TABLE,
+    LEGACY_TEST_FAILURES_TABLE_PREFIX,
+    SERVING_LEASE_TABLE,
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
     STATE_TABLE,
@@ -49,7 +63,9 @@ from stel.classic_ml.artifacts import ARTIFACT_RUNTIME_VERSION_KEY
 from stel.config.identifiers import (
     DEFAULT_DUCKDB_FILENAME,
     DEFAULT_SCHEMA_NAME,
-    RESERVED_PREFIX,
+    LEGACY_DUCKDB_FILENAME,
+    LEGACY_SCHEMA_NAME,
+    RESERVED_PREFIXES,
 )
 from stel.config.profile import WarehouseConfig
 from stel.dbt_export import DBT_META_NAMESPACE
@@ -76,58 +92,116 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
     (
         "adapters.base.STATE_TABLE",
         STATE_TABLE,
-        "dbt_ml_state",
+        "stel_state",
         "holds every incremental fingerprint; a new name is an empty state table, "
         "so every model reprocesses its whole corpus at provider cost",
     ),
     (
+        "adapters.base.LEGACY_STATE_TABLE",
+        LEGACY_STATE_TABLE,
+        "dbt_ml_state",
+        "the pre-#313 spelling still present in warehouses built before the "
+        "rename; `stel migrate` and the connect guard find that state by this "
+        "name and lose it if the value drifts",
+    ),
+    (
         "adapters.base.SERVING_LEDGER_TABLE",
         SERVING_LEDGER_TABLE,
-        "dbt_ml_serving_ledger",
+        "stel_serving_ledger",
         "fenced state replacement verifies publication claims against this table; "
         "a new name strands every live claim",
     ),
     (
-        "retrieval.coordination.LEASE_TABLE",
-        coordination.LEASE_TABLE,
-        "dbt_ml_serving_leases",
+        "adapters.base.LEGACY_SERVING_LEDGER_TABLE",
+        LEGACY_SERVING_LEDGER_TABLE,
+        "dbt_ml_serving_ledger",
+        "the pre-#313 spelling `stel migrate` carries over; a drift here strands "
+        "the claims it was supposed to move",
+    ),
+    (
+        "adapters.base.SERVING_LEASE_TABLE",
+        SERVING_LEASE_TABLE,
+        "stel_serving_leases",
         "a new name strands the live leases and publishers lose sight of who "
         "holds what",
     ),
     (
+        "adapters.base.LEGACY_SERVING_LEASE_TABLE",
+        LEGACY_SERVING_LEASE_TABLE,
+        "dbt_ml_serving_leases",
+        "the pre-#313 spelling `stel migrate` carries over; a drift here strands "
+        "the leases it was supposed to move",
+    ),
+    (
+        "retrieval.coordination.LEASE_TABLE",
+        coordination.LEASE_TABLE,
+        SERVING_LEASE_TABLE,
+        "coordination owns the lease protocol but not its name: migration "
+        "planning lives in adapters and cannot import retrieval to learn it",
+    ),
+    (
         "adapters.base.TEST_FAILURES_TABLE_PREFIX",
         TEST_FAILURES_TABLE_PREFIX,
-        "dbt_ml_test_failures__",
+        "stel_test_failures__",
         "list_tables() hides this prefix; a producer/filter mismatch leaks "
         "--store-failures tables into the model namespace",
     ),
     (
         "adapters.base.STAGING_TABLE_PREFIX",
         STAGING_TABLE_PREFIX,
-        "dbt_ml_staging__",
+        "stel_staging__",
         "list_tables() hides this prefix; a producer/filter mismatch leaks "
         "in-flight load tables into the model namespace",
     ),
     (
-        "config.identifiers.RESERVED_PREFIX",
-        RESERVED_PREFIX,
-        "dbt_ml_",
-        "existing projects rely on this prefix staying rejected, and reserving a "
-        "different one newly forbids model names that were legal before",
+        "adapters.base.LEGACY_TEST_FAILURES_TABLE_PREFIX",
+        LEGACY_TEST_FAILURES_TABLE_PREFIX,
+        "dbt_ml_test_failures__",
+        "still hidden by list_tables() and renamed by `stel migrate`; dropping "
+        "it surfaces pre-rename internals as if a user had modeled them",
+    ),
+    (
+        "adapters.base.LEGACY_STAGING_TABLE_PREFIX",
+        LEGACY_STAGING_TABLE_PREFIX,
+        "dbt_ml_staging__",
+        "still hidden by list_tables(); orphaned pre-rename staging tables from "
+        "a crashed run would otherwise appear in every catalog listing",
+    ),
+    (
+        "config.identifiers.RESERVED_PREFIXES",
+        RESERVED_PREFIXES,
+        ("dbt_ml_", "stel_"),
+        "existing projects rely on dbt_ml_ staying rejected even though the "
+        "internals moved off it, and reserving a prefix newly forbids model "
+        "names that were legal before, so this list only ever grows",
     ),
     (
         "config.identifiers.DEFAULT_SCHEMA_NAME",
         DEFAULT_SCHEMA_NAME,
-        "dbt_ml",
+        "stel",
         "holds every table a project materializes; a deployment that never set "
         "`schema:` explicitly loses sight of all of them at once",
     ),
     (
+        "config.identifiers.LEGACY_SCHEMA_NAME",
+        LEGACY_SCHEMA_NAME,
+        "dbt_ml",
+        "the schema pre-#313 deployments defaulted into; the connect guard reads "
+        "it to tell a fresh project apart from one pointed at the wrong schema",
+    ),
+    (
         "config.identifiers.DEFAULT_DUCKDB_FILENAME",
         DEFAULT_DUCKDB_FILENAME,
-        "dbt_ml.duckdb",
+        "stel.duckdb",
         "a new default silently points the legacy no-profile path at an empty "
         "database",
+    ),
+    (
+        "config.identifiers.LEGACY_DUCKDB_FILENAME",
+        LEGACY_DUCKDB_FILENAME,
+        "dbt_ml.duckdb",
+        "the file pre-#313 zero-config projects defaulted to; config load looks "
+        "for it before opening an empty database under the new name",
     ),
     (
         "_distribution.DISTRIBUTION_NAME",
@@ -563,14 +637,19 @@ def test_internal_table_producers_and_filter_agree(tmp_path: pathlib.Path) -> No
             [StateRecord("doc-1", "fingerprint", "code-v1")],
         )
 
-        physical = {
-            row[0]
-            for row in adapter.rows(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = ?",
-                ["frozen"],
-            )
-        }
+        # The serving ledger and leases are created by retrieval.coordination,
+        # which needs a whole publication to run. Their names are what is under
+        # test here, so materialize them directly.
+        adapter.materialize_full(SERVING_LEDGER_TABLE, frame)
+        adapter.materialize_full(SERVING_LEASE_TABLE, frame)
+        # Debris a pre-#313 run could have left behind. list_tables() has to go
+        # on hiding it, or upgrading surfaces old internals as if they were
+        # models a user had written.
+        adapter.materialize_full(LEGACY_STATE_TABLE, frame)
+        adapter.materialize_full(LEGACY_TEST_FAILURES_TABLE_PREFIX + "old", frame)
+        adapter.materialize_full(LEGACY_STAGING_TABLE_PREFIX + "old__abc", frame)
+
+        physical = set(adapter.list_all_tables())
         # Guard against the test passing because nothing was created.
         assert {"model_a", failures_table, staging_table, STATE_TABLE} <= physical
 

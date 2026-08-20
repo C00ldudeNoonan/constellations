@@ -131,6 +131,7 @@ _DEBUG_EXCEPTION_LABELS: dict[type[BaseException], str] = {
 }
 
 
+
 def provider_error_debug_enabled() -> bool:
     """Whether operators opted into allowlisted SDK diagnostics in debug logs.
 
@@ -1297,9 +1298,7 @@ def _implementation_identity(provider_type: type[BaseProvider]) -> str:
     # bump implementation_version; contract-wide changes bump the contract.
     payload = {
         "contract_version": PROVIDER_CONTRACT_VERSION,
-        "provider_class": (
-            f"{provider_type.__module__}.{provider_type.__qualname__}"
-        ),
+        "provider_class": _identity_qualname(provider_type),
         "provider_implementation_version": provider_type.implementation_version,
         "provider_dependency_versions": {
             package: _distribution_version(package)
@@ -1311,6 +1310,26 @@ def _implementation_identity(provider_type: type[BaseProvider]) -> str:
         canonical.encode(), digest_size=HASH_DIGEST_SIZE
     ).hexdigest()
     return f"provider-v{PROVIDER_CONTRACT_VERSION}/{digest}"
+
+
+# Frozen: the package this project used to be called. `provider_class` above is
+# the one part of the provider identity that tracks our own module layout, and
+# the identity is designed to stay stable across releases so cached provider
+# responses survive an upgrade. Letting the #313 rename move it would have
+# re-keyed every cache and every `llm:`/`embed:` model's state at once — a full
+# reprocess at provider cost, which is exactly what the identity exists to
+# avoid. In-tree providers keep reporting their original module path; a
+# third-party provider's path is untouched either way.
+_IDENTITY_PACKAGE = "dbt_ml"
+_PACKAGE = __name__.split(".")[0]
+
+
+def _identity_qualname(provider_type: type[BaseProvider]) -> str:
+    module = provider_type.__module__
+    head, separator, tail = module.partition(".")
+    if head == _PACKAGE:
+        module = _IDENTITY_PACKAGE + separator + tail
+    return f"{module}.{provider_type.__qualname__}"
 
 
 def _distribution_version(package: str) -> str:

@@ -55,6 +55,15 @@ from stel.config.profile import WarehouseConfig
 from stel.dbt_export import DBT_META_NAMESPACE
 from stel.execution import extraction as extraction_module
 from stel.manifest import RUN_RESULTS_VERSION_KEY
+from stel.providers import base as provider_base  # registers providers
+from stel.providers.anthropic import AnthropicInferenceProvider
+from stel.providers.base import BaseProvider, implementation_identity_for
+from stel.providers.deterministic import (
+    DeterministicEmbeddingProvider,
+    DeterministicInferenceProvider,
+)
+from stel.providers.vertex import VertexEmbeddingProvider, VertexInferenceProvider
+from stel.providers.vllm import VLLMInferenceProvider
 from stel.retrieval import coordination, lancedb
 
 SRC_ROOT = pathlib.Path(stel.__file__).parent
@@ -272,6 +281,51 @@ def test_type_identity_is_qualified_by_module() -> None:
     # ever renamed.
     assert (
         hashing._type_identity(WarehouseConfig()) == "stel.config.profile.WarehouseConfig"
+    )
+
+
+# --- provider identity -----------------------------------------------------
+
+# Provider implementation identity keys cached provider responses and the state
+# of every `llm:`/`embed:` model. It deliberately excludes the release version
+# and module source digests so those caches survive an upgrade — which makes it
+# the one identity a package rename must not move. Digests captured before the
+# #313 rename; `_identity_qualname` is what keeps them.
+_PROVIDER_IDENTITIES: tuple[tuple[str, str], ...] = (
+    ("anthropic-inference", "provider-v3/5c08808d1ce2631b38df9019744a80fe"),
+    ("deterministic-embedding", "provider-v3/525af5c1b28b0dd4e9fd2038b89315d2"),
+    ("deterministic-inference", "provider-v3/5ebfdb5a1ba32560062b0d962c86f057"),
+    ("vertex-embedding", "provider-v3/da9e3b794607ec572d78ce1954240d90"),
+    ("vertex-inference", "provider-v3/9e1c7a01973ce064223209be19ccf7a9"),
+    ("vllm-inference", "provider-v3/091d89d921dfbd7116acfa1d1c962785"),
+)
+
+
+def test_provider_identities_survive_the_package_rename() -> None:
+    # Enumerated explicitly rather than by walking __subclasses__: other test
+    # modules define their own providers, so a discovery-based list depends on
+    # import order.
+    providers: dict[str, type[BaseProvider]] = {
+        "anthropic-inference": AnthropicInferenceProvider,
+        "deterministic-embedding": DeterministicEmbeddingProvider,
+        "deterministic-inference": DeterministicInferenceProvider,
+        "vertex-embedding": VertexEmbeddingProvider,
+        "vertex-inference": VertexInferenceProvider,
+        "vllm-inference": VLLMInferenceProvider,
+    }
+    pinned = dict(_PROVIDER_IDENTITIES)
+    assert set(providers) == set(pinned)
+
+    # Other tests monkeypatch the dependency-version lookup this identity reads.
+    provider_base._implementation_identity.cache_clear()
+    actual = {label: implementation_identity_for(cls) for label, cls in providers.items()}
+
+    assert actual == pinned, (
+        "A provider implementation identity changed. That re-keys every cached "
+        "provider response and the state of every llm:/embed: model, so the next "
+        "run re-calls the provider for rows it already has. The identity excludes "
+        "the release version on purpose; if this failed after a module move, see "
+        "providers.base._identity_qualname."
     )
 
 

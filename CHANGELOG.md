@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### The upgrade path explains itself at the first step (issue #324)
+
+- **A missing `stel_project.yml` now looks for a `dbt_ml_project.yml` beside
+  it** and, when it finds one, names it and gives the `git mv` — rather than
+  reporting only that a file is absent. This is the first thing a pre-rename
+  project hits on upgrade, before any of the warehouse-name guards can run, so
+  it was the one #313 hazard whose error explained nothing.
+- **The "no profiles.yml was found" error names `~/.dbt_ml/profiles.yml`** when
+  that is where the global profile still sits. Moving it to `~/.stel/` is a
+  manual upgrade step, so the error now points at it.
+- Both are **detection only**. Nothing loads a `dbt_ml_project.yml` or reads a
+  profile from `~/.dbt_ml/`: two spellings that both work is how the old one
+  never dies, and these need to stay one-time, visible steps.
+
 ### Flattened the repository layout
 
 - The Python project moved from `stel/` to the repository root, so `uv sync`,

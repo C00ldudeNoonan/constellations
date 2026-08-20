@@ -47,6 +47,21 @@ LEGACY_SCHEMA_NAME = "dbt_ml"
 DEFAULT_DUCKDB_FILENAME = "stel.duckdb"
 LEGACY_DUCKDB_FILENAME = "dbt_ml.duckdb"
 
+# The project file, and the name it carried before the rename. This is the
+# first thing an upgrading project trips over, before any of the warehouse
+# guards get a chance to run, so the missing-file error looks for the old
+# spelling next door and says so. Detection only, per this module's rule:
+# nothing loads a `dbt_ml_project.yml`, because two filenames that both work is
+# how the old one never dies (issue #324).
+PROJECT_FILENAME = "stel_project.yml"
+LEGACY_PROJECT_FILENAME = "dbt_ml_project.yml"
+
+# Global profiles directory under the user's home, and its pre-rename name.
+# Moving it is a manual upgrade step, so discovery names the legacy location
+# when it is the only one present — and, again, never reads from it.
+GLOBAL_PROFILES_DIRNAME = ".stel"
+LEGACY_GLOBAL_PROFILES_DIRNAME = ".dbt_ml"
+
 
 def validate_node_name(name: str, *, kind: str, reserve_internal: bool = False) -> str:
     if not _IDENT_RE.match(name):

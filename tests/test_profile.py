@@ -154,6 +154,44 @@ def test_missing_profiles_file_raises(tmp_path: Path) -> None:
         resolve_profile(project, tmp_path)
 
 
+def test_missing_profiles_file_names_the_pre_rename_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The global profile moved from ~/.dbt_ml/ to ~/.stel/ in #313, and that
+    # move is a manual upgrade step, so the not-found error names it (#324).
+    fake_home = tmp_path / "home"
+    legacy_dir = fake_home / ".dbt_ml"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "profiles.yml").write_text("irrelevant: true")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    _write_project(tmp_path, profile="test_proj")
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(ProfileError) as excinfo:
+        resolve_profile(project, tmp_path)
+
+    message = str(excinfo.value)
+    assert ".dbt_ml" in message
+    assert ".stel" in message
+
+
+def test_missing_profiles_file_without_a_legacy_home_stays_plain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    _write_project(tmp_path, profile="test_proj")
+    project, _, _ = load_project(tmp_path)
+
+    with pytest.raises(ProfileError) as excinfo:
+        resolve_profile(project, tmp_path)
+
+    assert ".dbt_ml" not in str(excinfo.value)
+
+
 def test_unknown_profile_raises(tmp_path: Path) -> None:
     _write_project(tmp_path, profile="not_there")
     _write_profiles(tmp_path, name="something_else")

@@ -31,6 +31,46 @@ def test_missing_project_file(tmp_path: Path) -> None:
         load_project(tmp_path)
 
 
+def test_missing_project_file_names_the_pre_rename_one_next_to_it(
+    tmp_path: Path,
+) -> None:
+    # The first error an upgrading project hits (#324). Every other #313
+    # hazard explains itself; this one used to just say the file was absent.
+    (tmp_path / "dbt_ml_project.yml").write_text("name: x")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_project(tmp_path)
+
+    message = str(excinfo.value)
+    assert "dbt_ml_project.yml" in message
+    assert "git mv dbt_ml_project.yml stel_project.yml" in message
+    assert "stel migrate" in message
+
+
+def test_legacy_project_file_is_reported_but_never_loaded(tmp_path: Path) -> None:
+    # Detection only: two filenames that both work is how the old one never
+    # dies, so the legacy file's contents must not reach the config.
+    # A sentinel that cannot collide with the tmp_path directory name.
+    (tmp_path / "dbt_ml_project.yml").write_text("name: n0tth3pr0j3ctnam3")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_project(tmp_path)
+
+    assert "n0tth3pr0j3ctnam3" not in str(excinfo.value)
+
+
+def test_missing_project_file_without_a_legacy_one_stays_plain(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load_project(tmp_path)
+
+    message = str(excinfo.value)
+    assert "stel_project.yml" in message
+    assert "dbt_ml_project.yml" not in message
+    assert "git mv" not in message
+
+
 def test_invalid_yaml_reports_path(tmp_path: Path) -> None:
     (tmp_path / "stel_project.yml").write_text("name: x\n")
     (tmp_path / "sources").mkdir()

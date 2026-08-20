@@ -26,6 +26,10 @@ from .adapters import (
     parse_warehouse_config,
     prepare_warehouse_profile_input,
 )
+from .config.identifiers import (
+    GLOBAL_PROFILES_DIRNAME,
+    LEGACY_GLOBAL_PROFILES_DIRNAME,
+)
 from .config.profile import (
     DEFAULT_LLM_PROVIDER,
     EmbeddingProfileConfig,
@@ -113,9 +117,11 @@ def resolve_profile(
     if profiles_path is None:
         raise ProfileError(
             f"Project '{project.name}' references profile '{project.profile}' "
-            f"but no profiles.yml was found. Looked in: "
-            f"--profiles-dir, ${PROFILES_DIR_ENV}, {project_dir}/profiles.yml, "
-            f"~/.stel/profiles.yml."
+            f"but no {PROFILES_FILENAME} was found. Looked in: "
+            f"--profiles-dir, ${PROFILES_DIR_ENV}, {project_dir}/"
+            f"{PROFILES_FILENAME}, "
+            f"~/{GLOBAL_PROFILES_DIRNAME}/{PROFILES_FILENAME}."
+            + _legacy_global_profiles_hint()
         )
 
     profiles, profiles_document = _load_profiles_file(profiles_path)
@@ -355,6 +361,23 @@ def _is_local_path(path: str) -> bool:
     return "://" not in path
 
 
+def _legacy_global_profiles_hint() -> str:
+    """Name the pre-rename global profiles location when it is the only one.
+
+    Reported, never read: the global profile moved from `~/.dbt_ml/` to
+    `~/.stel/` in #313, and silently loading the old path would make that
+    manual upgrade step permanent (issue #324).
+    """
+    legacy = Path.home() / LEGACY_GLOBAL_PROFILES_DIRNAME / PROFILES_FILENAME
+    if not (legacy.exists() or legacy.is_symlink()):
+        return ""
+    return (
+        f" A profile exists at {legacy}, the location stel used before it was "
+        f"renamed (#313); move it to "
+        f"~/{GLOBAL_PROFILES_DIRNAME}/{PROFILES_FILENAME}."
+    )
+
+
 def _discover_profiles_file(
     project_dir: Path, profiles_dir: Path | None
 ) -> Path | None:
@@ -383,7 +406,7 @@ def _discover_profiles_file(
             )
         return project_local
 
-    global_profile = Path.home() / ".stel" / PROFILES_FILENAME
+    global_profile = Path.home() / GLOBAL_PROFILES_DIRNAME / PROFILES_FILENAME
     if global_profile.exists():
         return global_profile
     return None

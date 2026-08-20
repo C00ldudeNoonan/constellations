@@ -12,7 +12,11 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .identifiers import LEGACY_DUCKDB_FILENAME
+from .identifiers import (
+    LEGACY_DUCKDB_FILENAME,
+    LEGACY_PROJECT_FILENAME,
+    PROJECT_FILENAME,
+)
 from .model import ModelConfig, protect_model_llm_credential_option
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
@@ -397,12 +401,37 @@ Or delete the old file if starting fresh is what you want."""
     )
 
 
+def _raise_for_missing_project_file(project_dir: Path, project_path: Path) -> None:
+    """Explain a missing project file, naming the pre-rename one if it is there.
+
+    This is the first error an upgrading project hits, before any of the
+    warehouse-name guards can run, so it is worth as much as they get. The
+    legacy file is only ever *reported* — never loaded (issue #324).
+    """
+    legacy_path = project_dir / LEGACY_PROJECT_FILENAME
+    if legacy_path.exists() or legacy_path.is_symlink():
+        raise ConfigError(
+            f"No {PROJECT_FILENAME} found at {project_path}, but "
+            f"{LEGACY_PROJECT_FILENAME} is right beside it - the name stel "
+            f"used before it was renamed (#313)."
+            f"""
+
+Rename it:
+
+    git mv {LEGACY_PROJECT_FILENAME} {PROJECT_FILENAME}
+
+Then run `stel migrate` to bring the warehouse's internal table names up to
+date."""
+        )
+    raise ConfigError(f"No {PROJECT_FILENAME} found at {project_path}")
+
+
 def load_project(
     project_dir: Path,
 ) -> tuple[ProjectConfig, list[SourceConfig], list[ModelConfig]]:
-    project_path = project_dir / "stel_project.yml"
+    project_path = project_dir / PROJECT_FILENAME
     if not project_path.exists() and not project_path.is_symlink():
-        raise ConfigError(f"No stel_project.yml found at {project_path}")
+        _raise_for_missing_project_file(project_dir, project_path)
     _validate_config_file(
         project_path,
         allowed_root=project_dir,

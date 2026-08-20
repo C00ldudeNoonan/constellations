@@ -19,6 +19,29 @@ The token must be scoped to the `stel` project. A token scoped to a different
 project fails at the publish step, after the whole build and test matrix has
 already run.
 
+## The `dbt-ml` redirect package (one-time)
+
+`compat/dbt-ml/` is not part of the `stel` release and is not built by the
+release workflow. It is a standalone redirect published once to the old PyPI
+project so an old pin or a stale link resolves to something that says where the
+project went.
+
+It carries no functionality by design. A shim that aliased stel's submodules so
+`import dbt_ml.adapters` kept working would hide the rename behind a facade that
+then has to be maintained and eventually removed, for a user base of one.
+
+Publishing it needs a PyPI token scoped to **`dbt-ml`**, not the `stel` token
+the release workflow uses:
+
+```bash
+cd compat/dbt-ml
+uv build
+uv publish --token <dbt-ml-scoped-token>
+```
+
+Do not yank `dbt-ml` 0.8.0. It still works, and yanking breaks anyone pinned to
+it — which is precisely the person this redirect is for.
+
 ## Cut a release
 
 1. Merge all release-bound PRs to `master`.

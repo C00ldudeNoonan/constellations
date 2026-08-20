@@ -37,4 +37,4 @@ the tool: the emitted dbt source name (`dbt_ml_<project>`), the `meta:`
 namespace in generated `sources.yml`, fingerprint domains, and the classic-ML
 artifact runtime key.
 
-Full notes: [CHANGELOG](https://github.com/C00ldudeNoonan/constellations/blob/master/stel/CHANGELOG.md).
+Full notes: [CHANGELOG](https://github.com/C00ldudeNoonan/constellations/blob/master/CHANGELOG.md).

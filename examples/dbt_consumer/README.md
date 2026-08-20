@@ -7,7 +7,7 @@ read from stel sources via `{{ source('dbt_ml_invoice_pipeline', 'raw_invoices')
 
 ## Run it
 
-From the repo root (`stel/`):
+From the repo root:
 
 ```bash
 # 1. Materialize stel

@@ -14,7 +14,7 @@ build a DAG, materialize incrementally, test the results, and emit artifacts.
 > chunk models, record-scoped incremental state, bounded projected warehouse
 > snapshots, an incremental local LanceDB search sink, classic text ML, and six
 > extraction backends. See
-> [`stel/README.md`](stel/README.md) for the full reference.
+> [`docs/reference.md`](docs/reference.md) for the full reference.
 
 ## Platform scope
 
@@ -168,7 +168,7 @@ uv run stel --project-dir examples/invoice_pipeline run
 uv run stel --project-dir examples/invoice_pipeline test
 ```
 
-Fifteen examples live in [`stel/examples/`](stel/examples/), covering
+Fifteen examples live in [`examples/`](examples/), covering
 invoices, blog posts, support tickets, arXiv quality checks, PDF and direct LLM
 extraction, classic text ML, document clustering, RAG chunks, governed SQL
 chunks, dbt handoff and embedded execution, and a metric-plus-evidence agent.
@@ -185,27 +185,27 @@ document text to Anthropic using the configured environment variable, and the PI
 transform retains non-target input columns unless you explicitly project or
 drop them.
 `stel clean` removes known local artifacts without resetting a warehouse. See
-the [full security notes](stel/README.md#security-notes) before running
+the [full security notes](docs/reference.md#security-notes) before running
 third-party projects or sensitive documents.
 
 ## Documentation
 
-- **[Full reference](stel/README.md)** — every backend, command, config block,
+- **[Full reference](docs/reference.md)** — every backend, command, config block,
   and the roadmap.
-- **[Contributing](stel/CONTRIBUTING.md)** — how to add a backend, test, or
+- **[Contributing](CONTRIBUTING.md)** — how to add a backend, test, or
   command.
-- **[Semantic retrieval architecture](stel/docs/architecture/semantic-retrieval.md)**
+- **[Semantic retrieval architecture](docs/architecture/semantic-retrieval.md)**
   — the `search:` resource and retrieval-store contract, including the shipped
   local LanceDB proof of concept and its fail-closed boundaries.
-- **[Provider abstraction](stel/docs/architecture/provider-abstraction.md)**
+- **[Provider abstraction](docs/architecture/provider-abstraction.md)**
   — the inference/embedding provider contract, plus the accepted plugin
   discovery, provider-owned configuration, and failed-outcome accounting
   design (issue #71).
-- **[Warehouse-native SQL models](stel/docs/architecture/sql-models.md)**
+- **[Warehouse-native SQL models](docs/architecture/sql-models.md)**
   — implemented `transform.type: sql` contract (compiled `ref()`, the SQL/Jinja
   trust boundary, and full/incremental adapter materialization).
-- **[Changelog](stel/CHANGELOG.md)**
+- **[Changelog](CHANGELOG.md)**
 
 ## License
 
-[MIT](stel/LICENSE)
+[MIT](LICENSE)

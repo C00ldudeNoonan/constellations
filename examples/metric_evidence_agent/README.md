@@ -24,7 +24,7 @@ flowchart LR
 
 ## Run it
 
-From the `stel/` package directory:
+From the repository root:
 
 ```bash
 uv run --extra mcp --extra lancedb \

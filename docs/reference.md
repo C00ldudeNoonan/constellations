@@ -84,7 +84,7 @@ The core install stays lean. Add only the feature groups a project uses:
 | `gcs` | Google Cloud Storage document sources |
 | `vertex` | Google Vertex AI text embeddings (`google-genai`) |
 | `lancedb` | Local LanceDB search-index publication and queries |
-| [`mcp`](docs/mcp.md) | Read-only governed context server over MCP stdio |
+| [`mcp`](mcp.md) | Read-only governed context server over MCP stdio |
 | `all` | Every optional feature above |
 
 For example, `uv add 'stel[pdf,text]'` installs PDF and text processing,
@@ -328,7 +328,7 @@ already committed with their state. Token and spend caps are measured from
 responses, so the stopping call may overshoot the cap by at most one response.
 
 The built-in `vllm` provider supports local, Docker, Kubernetes, and remote
-OpenAI-compatible endpoints. See the [vLLM provider guide](docs/vllm.md) for
+OpenAI-compatible endpoints. See the [vLLM provider guide](vllm.md) for
 server startup, profile configuration, authentication, timeout, model-name,
 and concurrency recommendations.
 
@@ -681,7 +681,7 @@ classified: `credential` fields are protected references that never enter
 artifacts or fingerprints, `semantic` fields join the response-cache key and
 model identity, `execution` fields never invalidate state, and
 `artifact-safe` fields may appear in manifest descriptors. See
-[docs/architecture/provider-abstraction.md](docs/architecture/provider-abstraction.md).
+[docs/architecture/provider-abstraction.md](architecture/provider-abstraction.md).
 
 ### Vertex AI embeddings
 
@@ -1739,7 +1739,7 @@ example projects materialize incrementally.
 
 To join documentary evidence to governed structured metrics, project matched
 links into the agent-context `context_entity_links` grain (see
-[agent-context](docs/architecture/agent-context-v1.md)) with
+[agent-context](architecture/agent-context-v1.md)) with
 `stel.agent_context.project_entity_link`: the `canonical_id` becomes the row's
 `entity_key`, so a governed metric keyed on the same namespace/name/canonical id
 resolves to the identical `entity_id` — the cross-plane join key. Record the
@@ -2257,7 +2257,7 @@ stops before it pollutes everything downstream.
 | `examples/economic_entity_links/`   | entity mentions → canonical CIK/ticker/agency IDs via an alias table   |
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
 | `examples/sql_governed_chunks/`     | warehouse-native SQL model applying document permissions               |
-| [`examples/metric_evidence_agent/`](examples/metric_evidence_agent/) | dbt metric + governed, cited stel evidence over two MCP servers |
+| [`examples/metric_evidence_agent/`](../examples/metric_evidence_agent/) | dbt metric + governed, cited stel evidence over two MCP servers |
 
 The stel-native examples run with
 `uv run stel --project-dir examples/<name> ...`. The two dbt composition
@@ -2317,14 +2317,14 @@ STEL_PROJECT_DIR=path/to/stel_project dbt build
 Each generated Python model imports `stel.dbt_embed.materialize` lazily at run
 time; dbt-duckdb executes it in-process, so extraction, LLM calls, and the LLM
 response cache all run locally. See
-[`examples/dbt_embed_duckdb`](examples/dbt_embed_duckdb) for a runnable
+[`examples/dbt_embed_duckdb`](../examples/dbt_embed_duckdb) for a runnable
 three-level DAG (extraction → transforms → SQL mart).
 
 The direction can also reverse: a stel transform can declare
 `source: dbt_ref('<dbt_model>')` to read a **dbt-built** table back into stel
 — optionally alongside ordinary `depends_on:` stel models in the same
 transform — closing the loop in one `dbt build`. See
-[`examples/dbt_ref_roundtrip_dbt`](examples/dbt_ref_roundtrip_dbt) for a
+[`examples/dbt_ref_roundtrip_dbt`](../examples/dbt_ref_roundtrip_dbt) for a
 runnable stel → dbt → stel → dbt round trip.
 
 ## Concept cloud (visualization, proof of concept)
@@ -2393,7 +2393,7 @@ consume these. `run`/`build` exit `0` on success, `1` on run failure, and `2` on
 a configuration error, so an orchestrator can branch on the cause. Because
 stel tables are dbt sources, they wire natively into the `dagster-dbt`
 integration — see
-[`docs/orchestration-dagster.md`](docs/orchestration-dagster.md) (use
+[`docs/orchestration-dagster.md`](orchestration-dagster.md) (use
 `emit-dbt-sources --dagster-meta` to pin the Dagster asset keys).
 
 ## Benchmarks
@@ -2452,7 +2452,7 @@ retrieval adapters and unrelated warehouse/provider integrations are not on
 the current roadmap. Retrieval evaluation remains active work. Incremental
 state stays adapter-owned. Rust, PyO3, and Metaxy remain explicitly deferred.
 
-The accepted [semantic retrieval architecture](docs/architecture/semantic-retrieval.md)
+The accepted [semantic retrieval architecture](architecture/semantic-retrieval.md)
 defines the `search:` DAG resource, `RetrievalStore` boundary, typed filters,
 incremental publication state, and serving-resource artifacts. The local
 LanceDB publication and portable Python/`stel search` query surfaces ship
@@ -2463,7 +2463,7 @@ single-host boundary. Atomic full replacement and distributed-store fencing
 remain unsupported and fail closed; no hosted retrieval adapter is currently
 planned.
 
-The versioned [agent context contract](docs/architecture/agent-context-v1.md)
+The versioned [agent context contract](architecture/agent-context-v1.md)
 defines the document registry, chunk, and dbt-entity link grains used to carry
 bitemporal validity, policy, freshness, provenance, and exact citations from
 warehouse models into governed retrieval projections.

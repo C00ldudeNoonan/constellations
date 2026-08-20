@@ -10,7 +10,7 @@ dependencies = ["stel>=0.9.0"]
 [project.urls]
 Homepage = "https://github.com/C00ldudeNoonan/constellations"
 Repository = "https://github.com/C00ldudeNoonan/constellations"
-Changelog = "https://github.com/C00ldudeNoonan/constellations/blob/master/stel/CHANGELOG.md"
+Changelog = "https://github.com/C00ldudeNoonan/constellations/blob/master/CHANGELOG.md"
 
 # 0.8.0 shipped a `dbt-ml` console script. Dropping it outright would make the
 # command vanish with no explanation; this one exists only to say where it went.

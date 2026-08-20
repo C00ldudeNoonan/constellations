@@ -45,13 +45,13 @@ it — which is precisely the person this redirect is for.
 ## Cut a release
 
 1. Merge all release-bound PRs to `master`.
-2. Update `stel/pyproject.toml` with the new package version. Re-run
+2. Update `pyproject.toml` with the new package version. Re-run
    `uv sync` so `uv.lock` records the same version.
-3. Move the top `stel/CHANGELOG.md` entries from `Unreleased` to a dated
+3. Move the top `CHANGELOG.md` entries from `Unreleased` to a dated
    version heading, for example `## v0.2.7 - 2026-07-10`. Confirm every merged
    PR since the previous tag has an entry — a feature PR that skipped the
    changelog is easy to miss.
-4. Run the local checks from `stel/`:
+4. Run the local checks from the repository root:
 
    ```bash
    uv sync --all-extras --dev --locked

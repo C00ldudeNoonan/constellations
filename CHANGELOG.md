@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Fixed: DuckDB sessions are pinned to UTC (issue #339)
+
+- **A genuinely-UTC timestamp read back bearing the developer's local
+  offset.** DuckDB defaults `TimeZone` to the host's zone and converts
+  `TIMESTAMP WITH TIME ZONE` values into it on read, so the publish-time
+  "search timestamp attributes must be UTC" check rejected valid data — making
+  `timestamp` search attributes unusable for anyone not sitting in UTC, and
+  invisible in CI, whose runners are UTC.
+- Every session stel opens is now pinned to UTC, **including cursors**:
+  `connection.cursor()` starts a fresh session rather than inheriting the
+  parent's, so the Arrow snapshot path stayed host-local until it was pinned
+  too. Cursors are created through one helper so the next one cannot
+  reintroduce it.
+- **Content fingerprints were never affected**, verified before changing
+  anything: `hashing.canonical_json` normalizes aware datetimes with
+  `astimezone(UTC)` before serializing, so incremental state and content
+  hashes are identical either way. A hash that differed by developer timezone
+  would have been a far worse bug than the one reported.
+- The per-`data_type` filter round-trip test now covers `timestamp` too, which
+  it could not while publication rejected the value.
+
 ### `chunk_overlap` now snaps to a separator boundary (issue #331)
 
 - **Overlap stepped back an exact number of characters**, landing wherever the

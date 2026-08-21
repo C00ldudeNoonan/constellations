@@ -72,6 +72,12 @@ _STATE_V2_COLUMNS = (
 _STATE_V1_KEY = ("model_name", "document_id")
 _STATE_V2_KEY = ("model_name", "state_scope", "target_identity", "record_key")
 
+# Every DuckDB session stel opens is pinned to UTC (issue #339). DuckDB
+# otherwise defaults to the host's local zone and converts
+# `TIMESTAMP WITH TIME ZONE` values into it on read, so what stel read back
+# depended on where the developer sat.
+_SESSION_TIME_ZONE = "UTC"
+
 _READ_BINARY_OPERATORS = {
     ReadPredicateOperator.EQUAL: "=",
     ReadPredicateOperator.NOT_EQUAL: "!=",
@@ -293,8 +299,35 @@ class DuckDBAdapter(WarehouseAdapter):
             db_path = self._resolved_path()
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self._con = duckdb.connect(str(db_path))
+        # Pin the session to UTC (issue #339). DuckDB defaults `TimeZone` to
+        # the host's local zone and converts `TIMESTAMP WITH TIME ZONE` values
+        # into it on read, so a genuinely-UTC timestamp came back bearing the
+        # developer's offset — and the publish-time "search timestamp
+        # attributes must be UTC" check rejected it. What stel reads back is
+        # now what the warehouse stores, rather than a host-local rendering,
+        # which keeps that invariant meaningful instead of geographic.
+        #
+        # Content fingerprints were never affected: `hashing.canonical_json`
+        # normalizes aware datetimes with `astimezone(UTC)` before
+        # serializing, so incremental state and content hashes are identical
+        # either way. Verified before making this change, because a hash that
+        # differed by developer timezone would have been a far worse bug.
+        self._con.execute(f"SET TimeZone='{_SESSION_TIME_ZONE}'")
         row = self._con.execute("SELECT current_database()").fetchone()
         self._catalog = row[0] if row else "memory"
+
+    def _cursor(self) -> Any:
+        """A cursor with this adapter's session settings applied.
+
+        `connection.cursor()` starts a *fresh* session rather than inheriting
+        the parent's, so a `TimeZone` pinned at connect does not reach it —
+        which is why pinning only in `_connect` left the Arrow snapshot path
+        still returning host-local timestamps (issue #339). Every cursor goes
+        through here so the next one added cannot reintroduce that.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute(f"SET TimeZone='{_SESSION_TIME_ZONE}'")
+        return cursor
 
     def _close(self) -> None:
         if self._con is not None:
@@ -939,7 +972,7 @@ class DuckDBAdapter(WarehouseAdapter):
     # ─── querying ────────────────────────────────────────────────────────
 
     def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
-        cursor = self.connection.cursor()
+        cursor = self._cursor()
         reader: pa.RecordBatchReader | None = None
         params: list[Any] = []
         transaction_open = False
@@ -1076,7 +1109,7 @@ class DuckDBAdapter(WarehouseAdapter):
         raise AssertionError("unreachable DuckDB table snapshot state")
 
     def _current_table_digest(self, request: TableReadRequest) -> str:
-        cursor = self.connection.cursor()
+        cursor = self._cursor()
         params: list[Any] = []
         reader: pa.RecordBatchReader | None = None
         transaction_open = False

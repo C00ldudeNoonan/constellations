@@ -52,6 +52,13 @@ from .profile import (
     resolve_profile,
 )
 from .progress import configure_progress
+from .prompts import (
+    PromptLockError,
+    check_lock,
+    lock_path,
+    read_lock,
+    write_lock,
+)
 from .providers import (
     get_inference_provider,
 )
@@ -1779,6 +1786,61 @@ def serving_recover(
         f"Recovered serving scope for '{model_name}': status={entry.status}, "
         f"fencing_token={entry.fencing_token}. Re-run `stel run` to publish."
     )
+
+
+@cli.group()
+def prompts() -> None:
+    """Manage versioned prompt artifacts (issue #303)."""
+
+
+@prompts.command("lock")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Re-lock released versions whose contents changed. Deliberate only.",
+)
+@_project_context_options
+@click.pass_context
+def prompts_lock(ctx: click.Context, force: bool) -> None:
+    """Record every prompt version's contents in `prompts/lock.json`.
+
+    Commit the lock: its diff is what makes a changed prompt visible in review,
+    and `stel prompts check` is what makes it fail a build.
+    """
+    project_dir: Path = ctx.obj["project_dir"]
+    try:
+        added, rewritten = write_lock(project_dir, force=force)
+    except PromptLockError as error:
+        raise ConfigClickError(str(error)) from error
+    total = len(read_lock(project_dir))
+    click.echo(
+        f"Locked {total} prompt version(s) in "
+        f"{lock_path(project_dir).relative_to(project_dir).as_posix()} "
+        f"({added} added"
+        + (f", {rewritten} re-locked" if rewritten else "")
+        + ")."
+    )
+
+
+@prompts.command("check")
+@_project_context_options
+@click.pass_context
+def prompts_check(ctx: click.Context) -> None:
+    """Fail if a released prompt version changed, or the lock is stale.
+
+    The CI gate for prompt immutability: editing a released version should be
+    a failed build, not a silent reprocess. The fix is to add the next version.
+    """
+    project_dir: Path = ctx.obj["project_dir"]
+    try:
+        drift = check_lock(project_dir)
+    except PromptLockError as error:
+        raise ConfigClickError(str(error)) from error
+    if not drift:
+        click.echo(f"{len(read_lock(project_dir))} prompt version(s) unchanged.")
+        return
+    lines = "\n".join(item.describe() for item in drift)
+    raise ConfigClickError(f"Prompt lock check failed:\n{lines}")
 
 
 @cli.group()

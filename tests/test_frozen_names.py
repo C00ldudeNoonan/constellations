@@ -79,6 +79,7 @@ from stel.dbt_export import (
 )
 from stel.execution import extraction as extraction_module
 from stel.manifest import RUN_RESULTS_VERSION_KEY
+from stel.prompts import LOCK_FILENAME
 from stel.providers import base as provider_base  # registers providers
 from stel.providers.anthropic import AnthropicInferenceProvider
 from stel.providers.base import BaseProvider, implementation_identity_for
@@ -210,6 +211,13 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
         "dbt_ml.duckdb",
         "the file pre-#313 zero-config projects defaulted to; config load looks "
         "for it before opening an empty database under the new name",
+    ),
+    (
+        "prompts.LOCK_FILENAME",
+        LOCK_FILENAME,
+        "lock.json",
+        "the prompt lock is committed to a project and read by the CI gate; "
+        "a new name silently starts an empty lock beside the real one",
     ),
     (
         "config.profile.RunLogConfig.relation",
@@ -512,6 +520,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("dbt_ml/retrieval_eval/golden_set", 1, "9305ca078ff6376cce65b750ebaf21cf"),
     ("eval-metric-id", 1, "a857cb0a824c56aa011e6b9b88cbba6e"),
     ("mcp-query", 1, "2d7492cf337d83575a18003a001c1453"),
+    ("prompt-content", 1, "98ade683542f3583c91fa382abe73a69"),
     ("warehouse-source-row", 1, "362b1a57365cd242b114e1e95a647e79"),
     ("embedding-config", 1, "a1f45bc702e4875dad7d01e066f92374"),
     ("embedding-input-row", 1, "4c7f5bfe371485b0aa73c4b777011d4f"),

@@ -339,6 +339,152 @@ def test_editing_a_version_in_place_still_invalidates(tmp_path: Path) -> None:
     assert before != after
 
 
+# ─── the immutability gate (issue #303) ─────────────────────────────────────
+
+
+def test_a_clean_tree_passes_the_gate(tmp_path: Path) -> None:
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+
+    assert check_lock(tmp_path) == []
+
+
+def test_editing_a_released_version_fails_the_gate(tmp_path: Path) -> None:
+    """The point of the feature: a failed build, not a silent reprocess."""
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "Edited in place.")
+    drift = check_lock(tmp_path)
+
+    assert [(d.name, d.version, d.kind) for d in drift] == [
+        ("signal_classify", "v1", "changed")
+    ]
+    assert "Add the next version" in drift[0].describe()
+
+
+def test_adding_the_next_version_is_the_frictionless_path(tmp_path: Path) -> None:
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+
+    _write_prompt(tmp_path, "signal_classify", "v2", "Second instruction.")
+    added, rewritten = write_lock(tmp_path)
+
+    assert (added, rewritten) == (1, 0)
+    assert check_lock(tmp_path) == []
+
+
+def test_lock_refuses_to_launder_an_edit(tmp_path: Path) -> None:
+    """`lock` must not be a one-command bypass of the gate.
+
+    If re-locking silently accepted a changed release, the gate would teach
+    exactly the workflow it exists to prevent.
+    """
+    from stel.prompts import PromptLockError, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+    _write_prompt(tmp_path, "signal_classify", "v1", "Edited in place.")
+
+    with pytest.raises(PromptLockError, match="Add the next version instead"):
+        write_lock(tmp_path)
+
+
+def test_force_relocks_and_reports_what_it_did(tmp_path: Path) -> None:
+    # Deliberate and reviewed: the lock diff is the review artifact.
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+    _write_prompt(tmp_path, "signal_classify", "v1", "Edited in place.")
+
+    added, rewritten = write_lock(tmp_path, force=True)
+
+    assert (added, rewritten) == (0, 1)
+    assert check_lock(tmp_path) == []
+
+
+def test_an_unlocked_version_is_reported(tmp_path: Path) -> None:
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First.")
+    write_lock(tmp_path)
+    _write_prompt(tmp_path, "signal_classify", "v2", "Second.")
+
+    drift = check_lock(tmp_path)
+
+    assert [(d.version, d.kind) for d in drift] == [("v2", "unlocked")]
+    assert "stel prompts lock" in drift[0].describe()
+
+
+def test_deleting_a_released_version_is_reported(tmp_path: Path) -> None:
+    """Rows already produced under it record that version."""
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First.")
+    write_lock(tmp_path)
+    (tmp_path / "prompts" / "signal_classify" / "v1.md").unlink()
+
+    drift = check_lock(tmp_path)
+
+    assert [(d.version, d.kind) for d in drift] == [("v1", "missing_file")]
+
+
+def test_trailing_whitespace_is_not_an_edit(tmp_path: Path) -> None:
+    # The instruction is what is protected, not the file's whitespace — an
+    # editor adding a final newline must not read as a released-prompt edit.
+    from stel.prompts import check_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.\n\n")
+
+    assert check_lock(tmp_path) == []
+
+
+def test_a_hand_corrupted_lock_says_how_to_recover(tmp_path: Path) -> None:
+    from stel.prompts import PromptLockError, lock_path, read_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First.")
+    write_lock(tmp_path)
+    lock_path(tmp_path).write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(PromptLockError, match="stel prompts lock"):
+        read_lock(tmp_path)
+
+
+def test_no_prompts_directory_is_not_a_failure(tmp_path: Path) -> None:
+    # A project with only inline prompts must not be told to run a lock.
+    from stel.prompts import check_lock
+
+    assert check_lock(tmp_path) == []
+
+
+def test_the_cli_gate_exits_nonzero_on_a_changed_release(tmp_path: Path) -> None:
+    """CI runs this; the exit code is the contract."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.prompts import write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First instruction.")
+    write_lock(tmp_path)
+    _write_prompt(tmp_path, "signal_classify", "v1", "Edited in place.")
+
+    result = CliRunner().invoke(
+        cli, ["prompts", "check", "--project-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code != 0
+    assert "was released and has since changed" in result.output
+
 # ─── review follow-ups (PR #334) ────────────────────────────────────────────
 
 

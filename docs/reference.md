@@ -1676,9 +1676,43 @@ makes "did v4 cost more per row than v3" a query rather than an investigation.
 name and version only. Changing a version file still invalidates incremental
 state, because the resolved text is part of the model's config hash.
 
-> Not yet implemented: a CI gate asserting that a released version file's
-> content hash never changes. Until it lands, editing `v3` in place is a
-> silent reprocess rather than a failed build — the fix is still to add `v4`.
+#### The immutability gate
+
+Versions are only immutable if something enforces it. `prompts/lock.json`
+records what each released version contained, and is committed — its diff is
+what makes a changed prompt visible in review:
+
+```bash
+stel prompts lock     # record every version; commit the result
+stel prompts check    # CI gate: fails if a released version changed
+```
+
+`check` exits non-zero and names the offender:
+
+```
+Error: Prompt lock check failed:
+  signal_classify/v1 was released and has since changed. Add the next version
+  instead of editing this one.
+```
+
+It also reports a version present in the tree but not the lock (run `lock`),
+and one in the lock whose file is gone — rows already produced under a version
+record it, so deleting it strands their provenance.
+
+**`lock` refuses to launder an edit.** Re-locking a released version whose
+contents changed requires `--force`, and says what it re-locked. Without that
+refusal, `lock` would be a one-command bypass and would teach exactly the
+workflow the gate exists to prevent: the fix for a prompt that needs changing
+is a new version, not a new hash.
+
+The hash covers the stripped text, so an editor adding a trailing newline is
+not a released-prompt edit.
+
+Add it to CI beside the other checks:
+
+```bash
+uv run stel prompts check
+```
 
 ## Search indexes (local proof of concept)
 

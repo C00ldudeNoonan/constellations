@@ -33,9 +33,17 @@
 - Append-only logs widen rather than break when a later stel adds a column, so
   a `stel_run_log` created before this release gains `prompt_name`/
   `prompt_version` on the next write instead of failing every write silently.
-- Not yet implemented: the CI gate asserting a released version's content hash
-  never changes. Editing a version in place still invalidates incremental state
-  correctly; making it a failed build is a follow-up.
+- **`stel prompts lock` / `stel prompts check`** enforce immutability.
+  `prompts/lock.json` records what each released version contained and is
+  committed, so its diff surfaces a changed prompt in review; `check` is the CI
+  gate and exits non-zero when a released version changed, when a version is
+  unlocked, or when a locked version's file is gone.
+- **`lock` refuses to re-lock a changed release or launder a deletion** without
+  `--force`. Otherwise it would be a one-command bypass that teaches the
+  workflow the gate exists to prevent — the fix is a new version, not a new
+  hash. The content hash covers the stripped text, so a trailing newline is not
+  an edit. A lock whose format version is unrecognized fails closed rather than
+  reporting success on a schema it does not understand.
 
 
 ### Append-only logs: run history and MCP query history (issues #306, #329)

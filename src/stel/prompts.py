@@ -26,12 +26,15 @@ nothing rather than costing a corpus.
 
 from __future__ import annotations
 
+import json
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .config.model import LLMTransformConfig, PromptRef
+from .hashing import canonical_fingerprint
 from .paths import is_within_project
 
 # Where versioned prompts live, relative to the project directory.
@@ -44,8 +47,24 @@ PROMPT_SUFFIX = ".md"
 _SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
+# The committed record of what each released version contained. Named `.lock`
+# by analogy with `uv.lock`: it is generated, committed, and its diff is the
+# review artifact.
+LOCK_FILENAME = "lock.json"
+LOCK_VERSION = 1
+
+# Fingerprint domain for a prompt file's contents. Pinned in
+# tests/test_frozen_names.py: the hash is committed to a project's lock file,
+# so a drift would report every released prompt as edited.
+PROMPT_CONTENT_DOMAIN = "prompt-content"
+
+
 class PromptError(Exception):
     """A prompt reference could not be resolved."""
+
+
+class PromptLockError(Exception):
+    """A released prompt version changed, or the lock is out of date."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,3 +184,182 @@ def _available_versions(name: str, project_dir: Path) -> list[str]:
         for item in directory.iterdir()
         if item.is_file() and item.suffix == PROMPT_SUFFIX
     )
+
+
+# ─── immutability gate (issue #303) ─────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class LockDrift:
+    """One way the tree and the lock disagree."""
+
+    name: str
+    version: str
+    kind: Literal["changed", "missing_file", "unlocked"]
+
+    def describe(self) -> str:
+        if self.kind == "changed":
+            return (
+                f"  {self.name}/{self.version} was released and has since "
+                "changed. Add the next version instead of editing this one."
+            )
+        if self.kind == "missing_file":
+            return (
+                f"  {self.name}/{self.version} is in the lock but its file is "
+                "gone. Rows already produced under it record that version."
+            )
+        return (
+            f"  {self.name}/{self.version} is not in the lock yet. "
+            "Run `stel prompts lock`."
+        )
+
+
+def content_hash(path: Path) -> str:
+    """Identity of a prompt file's contents.
+
+    Hashes the stripped text rather than raw bytes, so a trailing-newline
+    change from an editor is not a released-prompt edit — the thing being
+    protected is the instruction, not the file's whitespace.
+    """
+    return canonical_fingerprint(
+        {"text": path.read_text(encoding="utf-8").strip()},
+        domain=PROMPT_CONTENT_DOMAIN,
+    )
+
+
+def lock_path(project_dir: Path) -> Path:
+    return project_dir / PROMPTS_DIRNAME / LOCK_FILENAME
+
+
+def _verified_lock_path(project_dir: Path) -> Path:
+    """The lock path, refused if any component is a symlink.
+
+    Raises `PromptLockError` rather than letting `verify_project_path`'s
+    `PromptError` escape: the CLI's prompt commands catch the lock error, so
+    the path error would have reached a user as an unhandled traceback rather
+    than a clean message. Linux CI caught that; the symlink tests skip on
+    Windows.
+    """
+    try:
+        path = verify_project_path(
+            lock_path(project_dir), project_dir, what="the prompt lock"
+        )
+    except PromptError as error:
+        raise PromptLockError(str(error)) from error
+    return path
+
+
+def discover_prompts(project_dir: Path) -> dict[str, str]:
+    """Every `<name>/<version>` in the tree, mapped to its content hash."""
+    root = project_dir / PROMPTS_DIRNAME
+    if not root.is_dir():
+        return {}
+    found: dict[str, str] = {}
+    for directory in sorted(item for item in root.iterdir() if item.is_dir()):
+        for file in sorted(directory.glob(f"*{PROMPT_SUFFIX}")):
+            if file.is_symlink() or not file.is_file():
+                continue
+            found[f"{directory.name}/{file.stem}"] = content_hash(file)
+    return found
+
+
+def read_lock(project_dir: Path) -> dict[str, str]:
+    path = _verified_lock_path(project_dir)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        version = payload["version"]
+        entries = payload["prompts"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise PromptLockError(
+            f"Could not read the prompt lock at {path} "
+            f"[{type(error).__name__}]. Delete it and re-run "
+            "`stel prompts lock` if it was hand-edited."
+        ) from error
+    # Fail closed on a format this stel does not recognize: a gate that
+    # reports success on a schema it cannot read is worse than no gate
+    # (Codex review, #336).
+    if version != LOCK_VERSION:
+        raise PromptLockError(
+            f"The prompt lock at {path} declares format version {version!r}, "
+            f"but this stel understands version {LOCK_VERSION}. Upgrade stel, "
+            "or delete the lock and re-run `stel prompts lock`."
+        )
+    if not isinstance(entries, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in entries.items()
+    ):
+        raise PromptLockError(
+            f"The prompt lock at {path} has a malformed `prompts` mapping. "
+            "Delete it and re-run `stel prompts lock`."
+        )
+    return dict(entries)
+
+
+def check_lock(project_dir: Path) -> list[LockDrift]:
+    """Compare the tree against the lock. Empty means the gate passes."""
+    locked = read_lock(project_dir)
+    found = discover_prompts(project_dir)
+    drift: list[LockDrift] = []
+    for key, digest in sorted(locked.items()):
+        name, _, version = key.partition("/")
+        if key not in found:
+            drift.append(LockDrift(name, version, "missing_file"))
+        elif found[key] != digest:
+            drift.append(LockDrift(name, version, "changed"))
+    for key in sorted(found.keys() - locked.keys()):
+        name, _, version = key.partition("/")
+        drift.append(LockDrift(name, version, "unlocked"))
+    return drift
+
+
+def write_lock(project_dir: Path, *, force: bool = False) -> tuple[int, int]:
+    """Record the current tree. Returns (added, rewritten).
+
+    Refuses to silently rewrite an entry whose content changed: re-locking a
+    released version is exactly the act the gate exists to surface, so it
+    takes `force` and says what it did. Without that, `lock` would be a
+    one-command bypass and would teach the wrong workflow — the fix for a
+    prompt that needs changing is a new version, not a new hash.
+    """
+    locked = read_lock(project_dir)
+    found = discover_prompts(project_dir)
+    changed = sorted(
+        key for key, digest in found.items() if key in locked and locked[key] != digest
+    )
+    # A locked version whose file is gone must not be quietly dropped when the
+    # lock is rebuilt — otherwise deleting a release and then locking anything
+    # else launders the deletion, and `check` passes with the missing-file
+    # protection silently gone (Codex review, #336).
+    removed = sorted(locked.keys() - found.keys())
+    if (changed or removed) and not force:
+        problems = []
+        if changed:
+            problems.append(
+                f"contents changed: {', '.join(changed)} — add the next "
+                "version instead."
+            )
+        if removed:
+            problems.append(
+                f"file(s) gone: {', '.join(removed)} — rows already produced "
+                "under a version record it, so its provenance outlives the "
+                "file."
+            )
+        raise PromptLockError(
+            "Refusing to rewrite the lock for released prompt version(s). "
+            + " ".join(problems)
+            + " Pass --force only when the change is deliberate and reviewed."
+        )
+    added = len(found.keys() - locked.keys())
+    path = _verified_lock_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"version": LOCK_VERSION, "prompts": dict(sorted(found.items()))},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return added, len(changed)

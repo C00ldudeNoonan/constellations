@@ -69,6 +69,15 @@ def run_chunk_model(
             f"Chunk model '{model.name}': upstream '{upstream}' has no "
             "`document_id`; chunk models read extraction outputs."
         )
+    if chunk_config.headings is not None:
+        column = chunk_config.headings.column
+        if column in frame.columns:
+            raise RunError(
+                f"Chunk model '{model.name}': `chunk.headings.column` is "
+                f"'{column}', which upstream '{upstream}' already has. The "
+                "attribution would overwrite it; name the heading column "
+                "something else."
+            )
     missing_metadata = [
         column
         for column in chunk_config.in_text_metadata
@@ -145,6 +154,12 @@ def run_chunk_model(
                     piece_index=piece.index,
                     chunk_count=len(pieces),
                     text=block + piece.text,
+                    section_column=(
+                        chunk_config.headings.column
+                        if chunk_config.headings is not None
+                        else None
+                    ),
+                    section=piece.section,
                     strategy=chunk_config.strategy,
                     code_version=code_version,
                     chunked_at=chunked_at,
@@ -252,6 +267,8 @@ def chunk_row(
     strategy: str,
     code_version: str,
     chunked_at: str,
+    section_column: str | None = None,
+    section: str | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         column: scalarize(value) for column, value in carried.items()
@@ -268,4 +285,6 @@ def chunk_row(
             "chunked_at": chunked_at,
         }
     )
+    if section_column is not None:
+        row[section_column] = section
     return row

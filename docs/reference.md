@@ -1425,6 +1425,55 @@ target rather than an exact count; snapping is bounded to between half and
 twice the requested overlap, and falls back to an exact slice when no
 boundary exists in that band (one very long token, say).
 
+### Heading attribution
+
+For a long structured document — a filing, a contract, a report — "which
+section" is the most useful retrieval filter there is. The splitter is the
+only place that sees both the full document and every boundary position, so
+it can answer that exactly:
+
+```yaml
+  chunk:
+    strategy: recursive
+    chunk_size: 1600
+    headings:
+      pattern: '^(Item\s+\d{1,2}[A-C]?)[.:]'   # line-anchored on the source
+      column: section                           # default
+```
+
+Each chunk gets a `section` column: **the last heading at or before the
+chunk's start**. That column rides the embed step's passthrough onto the
+search index like any other, turning "risk factors mentioning tariffs" into
+`section = 'Item 1A'` plus similarity, rather than similarity alone.
+
+The pattern is matched with `re.MULTILINE` against the source text. **A
+capture group names the section**; without one the whole match is used — so
+`^(Item\s+\d+[A-C]?)[.:]` yields `Item 1A` while `^Item\s+\d+[A-C]?[.:]`
+yields `Item 1A.`. That keeps the choice about trailing punctuation with the
+author instead of stel guessing.
+
+Two behaviors worth knowing:
+
+- **A chunk that straddles a boundary belongs to where it starts.** A chunk
+  can carry the next section's heading in its tail and still be mostly the
+  previous section's content; it is attributed to the previous one. (This is
+  the case a downstream transform re-deriving sections from chunk text gets
+  wrong — it sees the heading and claims the whole chunk.)
+- **Text before the first heading has no section** (`NULL`), rather than being
+  attributed to a heading that comes after it.
+
+`headings:` requires `strategy: recursive`: attribution works from source
+character offsets, which the token splitter does not produce. Declaring it
+with `strategy: tokens` fails at config load rather than silently emitting
+nulls. Naming a `column:` the upstream already has fails before any document
+is processed, rather than overwriting it.
+
+This complements [in-text metadata](#metadata-the-embedder-can-actually-see)
+rather than overlapping it: that puts document context *into the embedded
+text* so the vector carries identity; this is a structured, filterable
+*attribute*. A corpus generally wants both — one helps unfiltered semantic
+queries, the other makes scoped queries exact.
+
 ### Metadata the embedder can actually see
 
 Carried columns serve SQL perfectly — filtering, joining, building a citation.

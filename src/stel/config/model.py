@@ -253,6 +253,46 @@ class AgentContextConfig(BaseModel):
     grain: AgentContextGrain
 
 
+class HeadingConfig(BaseModel):
+    r"""Detect section headings while splitting, and attribute chunks to them.
+
+    The splitter knows the document's full text and every boundary position,
+    so it can say exactly which heading a chunk falls under (issue #332). A
+    downstream transform can only re-derive that from chunk fragments, and
+    misses the edge cases — a heading in a chunk's tail, a chunk starting
+    mid-heading — that offsets settle outright.
+
+    `pattern` is matched line-anchored (`re.MULTILINE`) against the source
+    text. A capture group names the section; without one the whole match is
+    used — so `^(Item\s+\d{1,2}[A-C]?)[.:]` yields `Item 1A` while
+    `^Item\s+\d{1,2}[A-C]?[.:]` yields `Item 1A.`.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    pattern: str = Field(min_length=1)
+    column: str = "section"
+
+    @field_validator("pattern")
+    @classmethod
+    def _validate_pattern(cls, v: str) -> str:
+        try:
+            compiled = re.compile(v, re.MULTILINE)
+        except re.error as error:
+            raise ValueError(f"chunk.headings.pattern is not a valid regex: {error}") from None
+        if compiled.groups > 1:
+            raise ValueError(
+                "chunk.headings.pattern must have at most one capture group; "
+                "the group names the section, and more than one is ambiguous"
+            )
+        return v
+
+    @field_validator("column")
+    @classmethod
+    def _validate_column(cls, v: str) -> str:
+        return validate_node_name(v, kind="Heading column")
+
+
 class ChunkConfig(BaseModel):
     """Split an upstream document's text into one row per chunk (issue #86).
 
@@ -282,6 +322,8 @@ class ChunkConfig(BaseModel):
     chunk_overlap: int = 100
     encoding: str = "cl100k_base"
     in_text_metadata: list[str] = Field(default_factory=list)
+    # Attribute each chunk to the heading it falls under (issue #332).
+    headings: HeadingConfig | None = None
     options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("in_text_metadata")
@@ -307,6 +349,17 @@ class ChunkConfig(BaseModel):
             raise ValueError("chunk.chunk_overlap must be non-negative")
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk.chunk_overlap must be smaller than chunk_size")
+        if self.headings is not None and self.strategy != "recursive":
+            raise ValueError(
+                "chunk.headings requires `strategy: recursive`: attribution "
+                "works from the source character offsets the recursive "
+                "splitter produces, which the token splitter does not have"
+            )
+        if self.headings is not None and self.headings.column == self.text_field:
+            raise ValueError(
+                f"chunk.headings.column must not be the text field "
+                f"'{self.text_field}'"
+            )
         if self.text_field in self.in_text_metadata:
             raise ValueError(
                 f"chunk.in_text_metadata must not name the text field "

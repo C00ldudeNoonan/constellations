@@ -142,6 +142,8 @@ def _run_named_test(
         return [_accepted_values(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "accepted_range":
         return [_accepted_range(model_name, table_ref, adapter, arg, store_failures)]
+    if test_name == "min_metric":
+        return [_min_metric(model_name, table_ref, adapter, arg)]
     if test_name == "null_rate":
         return [_null_rate(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "grounded_in":
@@ -390,6 +392,57 @@ def _accepted_values(
             f"SELECT * FROM {table_ref} WHERE {where}", list(allowed), result,
         )
     return result
+
+
+def _min_metric(
+    model_name: str, table_ref: str, adapter: WarehouseAdapter, arg: Any,
+) -> TestResult:
+    """One metric row from a classification eval is at or above `min` (#309).
+
+    `accepted_range` cannot express this: it bounds every row of a column, and
+    a long-format eval relation mixes rates with counts, so bounding `value`
+    would test `support` against a threshold meant for `recall`. Gating a
+    specific label's recall is the whole point of the eval, so it gets a form
+    that can name one.
+    """
+    opts = _require_dict("min_metric", arg)
+    metric = opts["metric"]
+    label = opts.get("label")
+    minimum = opts["min"]
+
+    metric_col = adapter.quote_ident("metric")
+    label_col = adapter.quote_ident("label")
+    value_col = adapter.quote_ident("value")
+    params: list[Any] = [metric]
+    where = f"{metric_col} = ?"
+    # A label-less metric (accuracy, macro_f1) is stored with a null label, so
+    # an omitted `label:` matches that row rather than every label's row.
+    where += f" AND {label_col} = ?" if label is not None else f" AND {label_col} IS NULL"
+    if label is not None:
+        params.append(label)
+
+    observed = adapter.scalar(
+        f"SELECT MIN({value_col}) FROM {table_ref} WHERE {where}", params
+    )
+    described = f"{metric}[{label}]" if label is not None else metric
+    if observed is None:
+        # An absent metric is a failure, not a pass: a label that stopped being
+        # reported is exactly the regression this test exists to catch.
+        return TestResult(
+            test_name="min_metric",
+            model_name=model_name,
+            column=described,
+            status="fail",
+            message=f"no {described} row to check; expected one at or above {minimum}",
+        )
+    passed = float(observed) >= float(minimum)
+    return TestResult(
+        test_name="min_metric",
+        model_name=model_name,
+        column=described,
+        status="pass" if passed else "fail",
+        message="" if passed else f"{described} is {observed:.4f}, below {minimum}",
+    )
 
 
 def _accepted_range(

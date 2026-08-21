@@ -12,6 +12,7 @@ from .config.model import (
     AgentContextConfig,
     ChunkConfig,
     EmbedConfig,
+    EvalConfig,
     ExtractionConfig,
     FieldConfig,
     LLMTransformConfig,
@@ -81,6 +82,7 @@ def compute_code_version(
     embed: EmbedConfig | None = None,
     llm: LLMTransformConfig | None = None,
     search: SearchConfig | None = None,
+    eval_config: EvalConfig | None = None,
     depends_on: list[str] | None = None,
     fields: list[FieldConfig] | None = None,
     effective_extraction: Mapping[str, Any] | None = None,
@@ -119,6 +121,9 @@ def compute_code_version(
         if ml
         else None,
         "chunk": chunk.model_dump() if chunk else None,
+        # Scoring configuration changes what the metric rows mean, so it
+        # invalidates them like any other row-content change (issue #309).
+        "eval": eval_config.model_dump() if eval_config else None,
         "embed": (
             dict(effective_embedding)
             if effective_embedding is not None
@@ -269,6 +274,7 @@ def compute_model_code_version(
         transform=model.transform,
         ml=model.ml,
         chunk=model.chunk,
+        eval_config=model.eval,
         embed=model.embed,
         llm=model.llm,
         search=model.search,

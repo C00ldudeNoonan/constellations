@@ -507,6 +507,50 @@ class SearchQueryConfig(BaseModel):
         return modes
 
 
+class EvalConfig(BaseModel):
+    """Score a model's predictions against labelled ground truth (issue #309).
+
+    Reads two already-materialized relations and emits metric rows, so it costs
+    no inference and can run in CI on every change. `golden` answers "identical
+    or not"; this answers "which labels moved, and by how much", which is the
+    question a prompt or model change actually raises.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    # Only single-label classification today. Multi-label and regression are
+    # different metric families, so they get their own `kind:` rather than
+    # overloading this one.
+    kind: Literal["classification"] = "classification"
+    predictions: str
+    predicted_field: str
+    expected: str
+    expected_field: str
+    key: str
+    # Overrides the taxonomy taken from the predicted field's `enum` (#304).
+    # Only needed when the predictions model does not declare one.
+    labels: list[str] = Field(default_factory=list)
+
+    @field_validator("predicted_field", "expected_field", "key")
+    @classmethod
+    def _validate_column(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("eval column names must not be empty")
+        return v
+
+    @field_validator("labels")
+    @classmethod
+    def _validate_labels(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for label in v:
+            if not label.strip():
+                raise ValueError("eval labels must not be empty")
+            if label in seen:
+                raise ValueError(f"eval labels list '{label}' twice")
+            seen.add(label)
+        return v
+
+
 class SearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -740,6 +784,7 @@ class ModelConfig(BaseModel):
     embed: EmbedConfig | None = None
     llm: LLMTransformConfig | None = None
     search: SearchConfig | None = None
+    eval: EvalConfig | None = None
     # Golden-set retrieval evaluations over this search index (issue #137);
     # only meaningful — and only allowed — when `search` is set.
     retrieval_tests: list[RetrievalTestConfig] = Field(default_factory=list)
@@ -943,6 +988,7 @@ class ModelConfig(BaseModel):
                 self.embed,
                 self.llm,
                 self.search,
+                self.eval,
             )
         )
 

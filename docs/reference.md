@@ -2202,6 +2202,82 @@ The first supervised provider is `builtin.naive_bayes`, which trains a
 deterministic text classifier from `text_field` and `label_field`, persists a
 model artifact, and materializes prediction rows with scores/probabilities.
 
+## Classification eval models
+
+An `eval:` model scores a classifier against labelled ground truth and
+publishes metric rows. It reads two relations that already exist, so it costs
+no inference and is cheap enough to run on every change.
+
+It answers a different question from the surfaces beside it. `golden` compares
+to expected rows and fails on any mismatch — "is this exactly right", a
+pass/fail gate that cannot tell you *how* wrong. `stel eval` scores ranked
+document lists for **retrieval**. This scores predicted labels, which is what a
+prompt or model change actually raises: did per-label recall move, and which
+labels regressed.
+
+```yaml
+- name: signal_eval
+  eval:
+    kind: classification
+    predictions: ref('signals')          # the model under test
+    predicted_field: signal
+    expected: ref('signals_labeled')     # ground truth
+    expected_field: expected_signal
+    key: chunk_id                        # joins the two
+  tests:
+    - min_metric: { metric: recall, label: churn_risk, min: 0.70 }
+```
+
+Output is **long format** — one row per metric, so adding a metric never
+changes the schema and `WHERE metric = 'recall'` works:
+
+| metric | label | value |
+|---|---|---|
+| accuracy | | 0.87 |
+| macro_f1 | | 0.71 |
+| evaluated_rows | | 1430 |
+| unmatched_rows | | 12 |
+| precision | churn_risk | 0.91 |
+| recall | churn_risk | 0.72 |
+| f1 | churn_risk | 0.80 |
+| support | churn_risk | 143 |
+
+`macro_f1` is the unweighted mean over labels: a collapsed rare label moves it
+where accuracy hides that behind the majority class, so it is usually the
+number worth gating on. `unmatched_rows` counts expected rows with no
+prediction to join to — an inner join alone would report a model that stopped
+emitting rows as a smaller but equally good one.
+
+Every row also carries `metric_id`, `predictions_version`, `code_version`, and
+`evaluated_at`. With `materialization: incremental`, `metric_id` keys on the
+metric, the label, and the version of the predictions scored — so re-running
+the same predictions replaces the row and a new predictions version appends
+one. That is a quality time series, and it makes a prompt change a measured
+decision rather than a guess. (`predictions_version` reads the upstream
+relation's `code_version`; it is null when the relation carries none, or
+carries more than one.)
+
+### Two conventions worth knowing
+
+**Zero denominators score 0.0; they do not vanish.** A label nothing predicted
+has no precision in the mathematical sense. Dropping those rows would make a
+collapsed label disappear from the report exactly when it most needs reading,
+so they are emitted as 0.0 and `support` tells you which kind of zero it is.
+This matches scikit-learn's `zero_division=0`.
+
+**The label universe is declared, not observed.** It comes from the predicted
+field's `enum` values (see [enum fields](#enum-fields-declare-the-label-set-once)),
+so a label the model stopped predicting reports `recall: 0.0` rather than
+leaving the report. Set `labels:` explicitly when the predictions model does
+not declare an enum.
+
+The two relations become ordinary `depends_on` edges, so selectors, lineage,
+and run ordering treat an eval like any other model. Declaring `depends_on:`
+yourself is rejected — the edges have one source of truth.
+
+Single-label classification only. Multi-label and regression are different
+metric families and would get their own `kind:`.
+
 ## Tests
 
 **Structural:**
@@ -2228,6 +2304,7 @@ tests:
   - matches_regex: { column: arxiv_id, pattern: '^\d{4}\.\d{4,5}$' }
   - accepted_values: { column: primary_category, values: [cs.LG, cs.CL, stat.ML] }
   - accepted_range: { column: n_authors, min: 1, max: 30 }
+  - min_metric: { metric: recall, label: churn_risk, min: 0.70 }   # classification eval only
   - null_rate: { column: title, max: 0.0 }       # silent-extraction-failure guard
   # deterministic faithfulness — extracted value must appear in the source text,
   # catching hallucinated values with zero LLM calls:

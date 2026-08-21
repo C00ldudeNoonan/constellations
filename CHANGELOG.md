@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Classification eval models (issue #309)
+
+- **A new `eval:` model kind** scores a classifier against labelled ground
+  truth and publishes metric rows: accuracy, macro-F1, and per-label
+  precision/recall/F1/support. It reads two already-materialized relations, so
+  it costs no inference and can run on every change.
+- **Long format** — one row per metric, so adding a metric never changes the
+  schema and `WHERE metric = 'recall'` works.
+- **`min_metric`** thresholds one metric, optionally for one label, so a
+  regression on a single label gates a build. `accepted_range` cannot express
+  this: it bounds every row of a column, and a long-format eval relation mixes
+  rates with counts. An absent metric row fails rather than passing — a label
+  that stopped being reported is the regression, not a clean sheet.
+- **The label universe comes from the predicted field's `enum`** (issue #304),
+  so a label the model stopped predicting reports `recall: 0.0` instead of
+  vanishing from the report. `labels:` overrides when there is no enum.
+- **`unmatched_rows` is published**, counting expected rows with no prediction
+  to join to. An inner join alone would report a model that stopped emitting
+  rows as a smaller but equally good one.
+- Rows carry `predictions_version`, so an incremental eval keyed on `metric_id`
+  replaces a re-run of the same predictions and appends a new version — a
+  quality time series rather than a single snapshot.
+- The scored relations become ordinary `depends_on` edges, so selectors,
+  lineage, and ordering need no knowledge of evals.
+
+
 ### Enum fields: declare the label set once (issue #304)
 
 - **`type: enum` with `values:`** on a model field declares a closed set in one

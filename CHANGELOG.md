@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.10.0 - 2026-08-21
 
 ### `chunk:` attributes each chunk to its heading (issue #332)
 
@@ -360,6 +360,18 @@
 
 - The CLI had no version flag at all. It reports the installed distribution
   version through the same `_distribution` lookup used everywhere else.
+
+### Tests
+
+- **Budgets are now observed tripping end to end (issue #310).** Accounting had
+  unit coverage; enforcement did not, and those are different claims — "the
+  ledger raises past the cap" versus "`stel run` exits non-zero, stops before
+  the next provider call, and keeps what it already committed". Eight tests
+  drive the real CLI over a real project on the offline `deterministic`
+  provider, covering the exit code, no overshoot past the api-call cap, token
+  and cost caps, resume-after-stop with published rows and state intact, and
+  per-model versus run-wide ledger scoping. Mutation-checked, so a guardrail
+  that stopped guarding would fail rather than pass quietly.
 
 ### Docs
 

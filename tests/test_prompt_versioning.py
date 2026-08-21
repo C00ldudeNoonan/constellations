@@ -392,7 +392,7 @@ def test_lock_refuses_to_launder_an_edit(tmp_path: Path) -> None:
     write_lock(tmp_path)
     _write_prompt(tmp_path, "signal_classify", "v1", "Edited in place.")
 
-    with pytest.raises(PromptLockError, match="Add the next version instead"):
+    with pytest.raises(PromptLockError, match="add the next version instead"):
         write_lock(tmp_path)
 
 
@@ -577,3 +577,64 @@ def test_an_append_only_log_widens_instead_of_breaking(tmp_path: Path) -> None:
         {"model_name": "a", "prompt_version": None},
         {"model_name": "b", "prompt_version": "v3"},
     ]
+
+
+# ─── review follow-ups (PR #336) ────────────────────────────────────────────
+
+
+def test_lock_refuses_to_launder_a_deletion(tmp_path: Path) -> None:
+    """Deleting a release and locking something else must not erase it.
+
+    Otherwise the missing-file protection is one unrelated `lock` away from
+    gone, and `check` then reports success.
+    """
+    from stel.prompts import PromptLockError, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First.")
+    write_lock(tmp_path)
+    (tmp_path / "prompts" / "signal_classify" / "v1.md").unlink()
+    _write_prompt(tmp_path, "signal_classify", "v2", "Second.")
+
+    with pytest.raises(PromptLockError, match=r"file\(s\) gone"):
+        write_lock(tmp_path)
+
+
+def test_an_unrecognized_lock_format_fails_closed(tmp_path: Path) -> None:
+    """A gate that passes on a schema it cannot read is worse than none."""
+    from stel.prompts import PromptLockError, lock_path, read_lock, write_lock
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "First.")
+    write_lock(tmp_path)
+    payload = json.loads(lock_path(tmp_path).read_text())
+    payload["version"] = 999
+    lock_path(tmp_path).write_text(json.dumps(payload))
+
+    with pytest.raises(PromptLockError, match="format version"):
+        read_lock(tmp_path)
+
+
+def test_a_malformed_prompts_mapping_fails_closed(tmp_path: Path) -> None:
+    from stel.prompts import PromptLockError, lock_path, read_lock
+
+    (tmp_path / "prompts").mkdir()
+    lock_path(tmp_path).write_text(
+        json.dumps({"version": 1, "prompts": {"a/v1": 5}})
+    )
+
+    with pytest.raises(PromptLockError, match="malformed"):
+        read_lock(tmp_path)
+
+
+def test_a_symlinked_lock_is_never_written_through(tmp_path: Path) -> None:
+    """`write_text` follows a symlink and would truncate its target."""
+    from stel.prompts import PromptLockError, lock_path, write_lock
+
+    victim = tmp_path / "important.txt"
+    victim.write_text("do not truncate me")
+    _write_prompt(tmp_path, "signal_classify", "v1", "First.")
+    _skip_without_symlinks(victim, lock_path(tmp_path))
+
+    with pytest.raises(PromptLockError, match="symlink"):
+        write_lock(tmp_path)
+
+    assert victim.read_text() == "do not truncate me"

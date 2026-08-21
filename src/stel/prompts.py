@@ -246,18 +246,43 @@ def discover_prompts(project_dir: Path) -> dict[str, str]:
 
 
 def read_lock(project_dir: Path) -> dict[str, str]:
-    path = lock_path(project_dir)
+    path = verify_project_path(
+        lock_path(project_dir), project_dir, what="the prompt lock"
+    )
+    if path.is_symlink():
+        raise PromptLockError(
+            f"Refusing to read the prompt lock at {path}: it is a symlink."
+        )
     if not path.exists():
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return dict(payload["prompts"])
+        version = payload["version"]
+        entries = payload["prompts"]
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise PromptLockError(
             f"Could not read the prompt lock at {path} "
             f"[{type(error).__name__}]. Delete it and re-run "
             "`stel prompts lock` if it was hand-edited."
         ) from error
+    # Fail closed on a format this stel does not recognize: a gate that
+    # reports success on a schema it cannot read is worse than no gate
+    # (Codex review, #336).
+    if version != LOCK_VERSION:
+        raise PromptLockError(
+            f"The prompt lock at {path} declares format version {version!r}, "
+            f"but this stel understands version {LOCK_VERSION}. Upgrade stel, "
+            "or delete the lock and re-run `stel prompts lock`."
+        )
+    if not isinstance(entries, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in entries.items()
+    ):
+        raise PromptLockError(
+            f"The prompt lock at {path} has a malformed `prompts` mapping. "
+            "Delete it and re-run `stel prompts lock`."
+        )
+    return dict(entries)
 
 
 def check_lock(project_dir: Path) -> list[LockDrift]:
@@ -291,15 +316,39 @@ def write_lock(project_dir: Path, *, force: bool = False) -> tuple[int, int]:
     changed = sorted(
         key for key, digest in found.items() if key in locked and locked[key] != digest
     )
-    if changed and not force:
+    # A locked version whose file is gone must not be quietly dropped when the
+    # lock is rebuilt — otherwise deleting a release and then locking anything
+    # else launders the deletion, and `check` passes with the missing-file
+    # protection silently gone (Codex review, #336).
+    removed = sorted(locked.keys() - found.keys())
+    if (changed or removed) and not force:
+        problems = []
+        if changed:
+            problems.append(
+                f"contents changed: {', '.join(changed)} — add the next "
+                "version instead."
+            )
+        if removed:
+            problems.append(
+                f"file(s) gone: {', '.join(removed)} — rows already produced "
+                "under a version record it, so its provenance outlives the "
+                "file."
+            )
         raise PromptLockError(
-            "Refusing to re-lock released prompt version(s) whose contents "
-            f"changed: {', '.join(changed)}. Add the next version instead. "
-            "Pass --force only when the change is deliberate and reviewed."
+            "Refusing to rewrite the lock for released prompt version(s). "
+            + " ".join(problems)
+            + " Pass --force only when the change is deliberate and reviewed."
         )
     added = len(found.keys() - locked.keys())
-    path = lock_path(project_dir)
+    path = verify_project_path(
+        lock_path(project_dir), project_dir, what="the prompt lock"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        # write_text() follows a symlink and would truncate its target.
+        raise PromptLockError(
+            f"Refusing to write the prompt lock at {path}: it is a symlink."
+        )
     path.write_text(
         json.dumps(
             {"version": LOCK_VERSION, "prompts": dict(sorted(found.items()))},

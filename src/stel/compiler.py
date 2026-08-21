@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -41,8 +42,16 @@ from .sql_models import (
     read_sql_source,
     validate_single_select,
 )
-from .test_specs import TestSpecError, parse_test_spec
+from .test_specs import (
+    TestSpecError,
+    declared_accepted_values,
+    enum_test_drift,
+    has_model_tests,
+    parse_test_spec,
+)
 from .transforms import transform_requires_llm, validate_transform_contract
+
+log = logging.getLogger(__name__)
 
 _MODULE_PATTERN = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
 
@@ -299,7 +308,10 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
             )
-        if model.tests and model.search is None:
+        # Derived enum checks count: they are schema tests the adapter must
+        # support, and finding that out after materialization would move a
+        # predictable configuration failure past warehouse mutation (#304).
+        if has_model_tests(model) and model.search is None:
             required[WarehouseCapability.SQL_SCHEMA_TESTS] = "model tests"
         if (
             model.materialization == "incremental"
@@ -518,6 +530,29 @@ def _validate_tests(
                 f"'{target}'",
                 ("tests", index),
             )
+    _warn_on_enum_test_drift(model)
+
+
+def _warn_on_enum_test_drift(model: ModelConfig) -> None:
+    """Warn when a hand-written accepted_values disagrees with a field's enum.
+
+    An explicit check on an `enum` field is redundant — the derived one already
+    covers it (issue #304) — so the only thing a disagreement can mean is that
+    one of the two lists has drifted. Which one is right is the author's call,
+    so this reports rather than decides.
+    """
+    drift = enum_test_drift(model.fields, declared_accepted_values(model.tests))
+    for name, values, explicit in drift:
+        log.warning(
+            "Model '%s' field '%s' declares `values: %s` but an "
+            "accepted_values test allows %s. The declared set is what the "
+            "provider schema and the prompt use, so the test is checking a "
+            "different taxonomy than the model was asked for.",
+            model.name,
+            name,
+            sorted(values),
+            sorted(map(str, explicit)),
+        )
 
 
 def _validate_python_test(

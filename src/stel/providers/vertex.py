@@ -250,6 +250,8 @@ class VertexInferenceProvider(InferenceProvider):
     implementation_packages = ("google-genai",)
     requires_credentials = False
     accepts_api_key_env = False
+    # `response_schema` is a Gemini Schema, which expresses `enum` for strings.
+    supports_schema_enum = True
 
     @classmethod
     def profile_options_model(cls) -> type[BaseModel] | None:

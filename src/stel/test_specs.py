@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -465,3 +466,79 @@ def _rate(name: str, options: dict[str, Any], key: str) -> float:
     if not 0.0 <= rate <= 1.0:
         raise TestSpecError(f"Test '{name}' {key} must be between 0 and 1")
     return rate
+
+
+def declared_accepted_values(specs: Sequence[Any]) -> dict[str, list[list[Any]]]:
+    """Every explicit `accepted_values` list, grouped by column.
+
+    Used to keep a derived enum check from duplicating a hand-written one, and
+    to notice when the two disagree (issue #304). A column may carry more than
+    one such test, and each of them runs — so each is collected. Keeping only
+    the last would hide a conflicting earlier declaration behind a matching
+    later one while the conflicting check still executed.
+    """
+    out: dict[str, list[list[Any]]] = {}
+    for spec in specs:
+        try:
+            parsed = parse_test_spec(spec)
+        except TestSpecError:
+            # Invalid specs are reported by the compiler's own validation; this
+            # helper must not raise a second, less specific error.
+            continue
+        if parsed.name != "accepted_values" or not isinstance(parsed.argument, dict):
+            continue
+        column = parsed.argument.get("column")
+        values = parsed.argument.get("values")
+        if isinstance(column, str) and isinstance(values, list):
+            out.setdefault(column, []).append(values)
+    return out
+
+
+def has_model_tests(model: Any) -> bool:
+    """Whether a model has any check to run — declared or derived.
+
+    An enum field carries an `accepted_values` check with no `tests:` entry to
+    see (issue #304), so anything deciding "does this model get tested" has to
+    ask here rather than looking at `model.tests` directly. Two things do: the
+    `stel test` selection loop, and the warehouse-capability preflight, which
+    must know a schema test is coming *before* the warehouse is mutated.
+    """
+    if model.tests:
+        return True
+    return any(getattr(field, "values", None) for field in model.fields)
+
+
+def enum_test_specs(
+    fields: Sequence[Any], declared: Mapping[str, list[list[Any]]]
+) -> list[dict[str, Any]]:
+    """Derive an `accepted_values` check for every field declaring a value set.
+
+    The declaration on the field is the single source of truth (issue #304), so
+    there is no hand-typed list here to drift from the prompt or the provider
+    schema. A column a user already wrote an explicit check for is skipped —
+    theirs runs, not two of them.
+    """
+    return [
+        {"accepted_values": {"column": field.name, "values": list(field.values)}}
+        for field in fields
+        if getattr(field, "values", None) and field.name not in declared
+    ]
+
+
+def enum_test_drift(
+    fields: Sequence[Any], declared: Mapping[str, list[list[Any]]]
+) -> list[tuple[str, list[Any], list[Any]]]:
+    """Explicit accepted_values lists that disagree with a field's declared set.
+
+    Returns (field name, declared values, the disagreeing explicit list) per
+    offending declaration — every one of them, since every one of them runs.
+    """
+    out: list[tuple[str, list[Any], list[Any]]] = []
+    for field in fields:
+        values = getattr(field, "values", None)
+        if not values:
+            continue
+        for explicit in declared.get(field.name, []):
+            if set(explicit) != set(values):
+                out.append((field.name, list(values), explicit))
+    return out

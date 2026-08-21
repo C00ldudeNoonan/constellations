@@ -42,6 +42,9 @@ _JSON_SCHEMA_TYPES: dict[str, str] = {
     "date": "string",
     "timestamp": "string",
     "json": "object",
+    # An enum is a string the provider is constrained to choose from; the
+    # closed set rides alongside as `enum` (issue #304).
+    "enum": "string",
 }
 
 
@@ -102,6 +105,8 @@ def _build_field_spec(field: FieldConfig) -> dict[str, Any]:
     spec: dict[str, Any] = {"name": field.name, "type": schema_type}
     if field.description:
         spec["description"] = field.description
+    if field.values:
+        spec["enum"] = list(field.values)
     return spec
 
 

@@ -1108,13 +1108,54 @@ fields:
 ```
 
 Supported types are `string`, `integer`, `float`, `boolean`, `date`,
-`timestamp`, and `json` (`type:` and `dtype:` are accepted input aliases for
-`data_type:`). A successful zero-document run materializes a typed, zero-row
+`timestamp`, `json`, and `enum` (`type:` and `dtype:` are accepted input
+aliases for `data_type:`). A successful zero-document run materializes a typed, zero-row
 relation from this contract, so downstream tests and models see a real table.
 Type changes participate in `code_version`; invalid casts fail without
 publishing a full-model staging table. A declared field without `data_type`
 defaults to string. Omitting `fields:` retains legacy dynamic backend output,
 but cannot type payload columns for an initially empty corpus.
+
+#### Enum fields: declare the label set once
+
+A classification field is a closed set of values, and writing that set out in
+several places is how a taxonomy rots — add a label to the prompt and forget
+the test and invented labels pass silently; add it to the test and forget the
+prompt and the model never produces it.
+
+`type: enum` declares the set once:
+
+```yaml
+fields:
+  - name: signal
+    type: enum
+    values: [churn_risk, expansion, pricing, support, none]
+  - name: evidence
+    type: string
+```
+
+Three things derive from that one declaration:
+
+1. **The provider's output schema** carries a real `enum` constraint, so the
+   model is constrained at the API boundary rather than asked politely for one
+   of the labels.
+2. **An `accepted_values` check** runs on the column, with no hand-typed list
+   to drift. It needs no `tests:` entry — the field is the declaration. An
+   explicit `accepted_values` on the same column is honoured instead (yours
+   runs, not two), and a disagreement between the two lists is reported at
+   compile time: the declared set is what the schema and prompt use, so a
+   test allowing something else is checking a different taxonomy.
+3. **The prompt, as a portability fallback.** Where a provider's structured
+   output cannot carry an enum, the constraint is stripped from the schema and
+   the labels are rendered into the system prompt instead, so the taxonomy is
+   enforced as far as the provider allows and communicated regardless. Every
+   shipped provider carries enums natively, so this is for third-party
+   providers; a provider declares its ability with `supports_schema_enum`.
+
+`values:` requires `type: enum`, and an `enum` with no `values:` is rejected —
+it would constrain nothing. The column materializes as a string; `enum` is
+stel's declaration, not a warehouse column type, and `emit-dbt-sources`
+exports it as `string`.
 
 Structure-preserving options for document parsing:
 

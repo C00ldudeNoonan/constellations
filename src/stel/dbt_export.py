@@ -172,10 +172,13 @@ def _table_for_model(
         if model_field.description:
             column["description"] = model_field.description
         if model_field.data_type:
-            # Adapters receive nested values after they are flattened to JSON text.
+            # Adapters receive nested values after they are flattened to JSON
+            # text, and an `enum` field materializes as the string it
+            # constrains — `enum` is stel's declaration, not a column type any
+            # warehouse or dbt adapter would recognize (issue #304).
             column["data_type"] = (
                 "string"
-                if model_field.data_type == "json"
+                if model_field.data_type in {"json", "enum"}
                 else model_field.data_type
             )
 

@@ -60,6 +60,8 @@ class VLLMInferenceProvider(InferenceProvider):
     requires_credentials = False
     supports_custom_base_url = True
     requires_base_url = True
+    # Guided decoding takes a JSON Schema, which carries `enum`.
+    supports_schema_enum = True
 
     def resolve_credential(
         self,

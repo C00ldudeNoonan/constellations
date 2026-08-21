@@ -37,6 +37,10 @@ _JsonSchemaType = Literal[
     "number",
     "object",
     "string",
+    # Not a JSON Schema type — stel's declaration that the field is a closed
+    # set (issue #304). The backend normalizes it to a string carrying an
+    # `enum` constraint before the schema reaches a provider.
+    "enum",
 ]
 
 _LLM_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
@@ -261,6 +265,36 @@ class LLMFieldSpec(_BackendOptions):
     # The backend forwards an array's item schema to providers unchanged. Keep
     # extension keywords available while validating the part stel consumes.
     items: dict[str, Any] | None = None
+    # The closed set a `type: enum` field may take (issue #304), declared here
+    # for `backend: llm` extraction the same way top-level `fields:` declares
+    # it for native `llm:` models — one authoring syntax across both paths.
+    values: list[str] = Field(default_factory=list)
+
+    @field_validator("values")
+    @classmethod
+    def _validate_values(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for value in v:
+            if not value.strip():
+                raise ValueError("field values must not be empty")
+            if value in seen:
+                raise ValueError(f"field values list '{value}' twice")
+            seen.add(value)
+        return v
+
+    @model_validator(mode="after")
+    def _validate_enum(self) -> LLMFieldSpec:
+        if self.type == "enum" and not self.values:
+            raise ValueError(
+                f"Field '{self.name}' is `type: enum` but declares no "
+                "`values:`; an enum with no closed set constrains nothing"
+            )
+        if self.values and self.type != "enum":
+            raise ValueError(
+                f"Field '{self.name}' declares `values:` but is "
+                f"`type: {self.type}`; use `type: enum`"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_items(self) -> LLMFieldSpec:

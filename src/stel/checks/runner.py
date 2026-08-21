@@ -8,7 +8,12 @@ from ..compiler import validate_project_contract, validate_warehouse_capabilitie
 from ..config import load_project
 from ..config.model import ModelConfig
 from ..profile import ResolvedProfile, resolve_profile
-from ..test_specs import uses_llm_judge
+from ..test_specs import (
+    declared_accepted_values,
+    enum_test_specs,
+    has_model_tests,
+    uses_llm_judge,
+)
 from .schema import TestResult, UnknownTestError, evaluate_test_spec
 
 
@@ -80,7 +85,11 @@ def run_project_tests(
         for model in models:
             if model.name not in selected_names:
                 continue
-            if not model.tests:
+            # Not `model.tests`: an enum field carries a derived check with no
+            # `tests:` entry to see (issue #304), and skipping here would let
+            # `stel test` silently accept an invalid label set that the same
+            # model fails on the run path.
+            if not has_model_tests(model):
                 continue
             results.extend(
                 run_model_tests(
@@ -102,7 +111,13 @@ def run_model_tests(
     resolved: ResolvedProfile | None = None,
     run_budget: BudgetLedger | None = None,
 ) -> list[TestResult]:
-    if not model.tests:
+    # Enum fields carry their own accepted_values check, derived from the one
+    # declaration on the field (issue #304), so a model can have tests to run
+    # without declaring any.
+    specs = list(model.tests) + enum_test_specs(
+        model.fields, declared_accepted_values(model.tests)
+    )
+    if not specs:
         return []
     adapter.require_capability(
         WarehouseCapability.SQL_SCHEMA_TESTS,
@@ -125,7 +140,7 @@ def run_model_tests(
 
     table_ref = adapter.table_ref(model.name)
     out: list[TestResult] = []
-    for spec in model.tests:
+    for spec in specs:
         try:
             out.extend(
                 evaluate_test_spec(

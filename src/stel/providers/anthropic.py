@@ -45,6 +45,8 @@ class AnthropicInferenceProvider(InferenceProvider):
     supports_native_batch = True
     max_batch_requests = 100_000
     batch_cost_multiplier = 0.5
+    # Tool `input_schema` is JSON Schema; `enum` rides through unchanged.
+    supports_schema_enum = True
 
     def complete(
         self,

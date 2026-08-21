@@ -64,6 +64,9 @@ class DeterministicInferenceProvider(InferenceProvider):
     requires_credentials = False
     accepts_api_key_env = False
     default_model = "deterministic-v1"
+    # Honours `enum` by choosing from the declared set, so offline enum
+    # pipelines produce values their own derived check accepts (issue #304).
+    supports_schema_enum = True
 
     def complete(
         self,
@@ -125,6 +128,17 @@ def _deterministic_object(
             )
             for index in range(_DETERMINISTIC_ARRAY_ITEMS)
         ]
+    choices = schema.get("enum")
+    if isinstance(choices, list) and choices:
+        # Choose from the declared set rather than inventing a `det-…` string
+        # (issue #304): a generated value fails the field's own derived
+        # accepted_values check, which would make every offline enum pipeline
+        # broken by construction. Same digest as the scalar path, so the choice
+        # is reproducible and spread across the labels.
+        digest = hashlib.blake2b(
+            f"{model}\0{content}\0{path}".encode(), digest_size=8
+        ).digest()
+        return choices[int.from_bytes(digest, "big") % len(choices)]
     return _deterministic_scalar(node_type, model=model, content=content, path=path)
 
 

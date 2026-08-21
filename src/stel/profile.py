@@ -349,11 +349,24 @@ def apply_source_path_overrides(
         if override is None:
             out.append(source)
             continue
-        out.append(
-            source.model_copy(
-                update={"path": override, "external": source.external or _is_local_path(override)}
-            )
-        )
+        # Rebuilt through validation, not model_copy: an update bypasses the
+        # model's validators, so a bad override (`warehouse://bad-name`) or a
+        # scheme change that leaves `key_column:` inconsistent would otherwise
+        # surface mid-discovery instead of at resolve time (Codex review,
+        # #330). exclude_unset preserves which fields the project actually
+        # declared, which the warehouse-source validator reads.
+        payload = source.model_dump(exclude_unset=True, by_alias=True)
+        payload["name"] = source.name
+        payload["path"] = override
+        if source.external or _is_local_path(override):
+            payload["external"] = True
+        try:
+            out.append(SourceConfig.model_validate(payload))
+        except ValidationError as error:
+            raise ProfileError(
+                f"Profile target '{resolved.target_name}' source_paths override "
+                f"for '{source.name}' is invalid: {error}"
+            ) from error
     return out
 
 

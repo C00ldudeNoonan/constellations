@@ -224,7 +224,7 @@ def test_duplicate_keys_are_a_hard_error(
     )
     con.close()
 
-    with pytest.raises(SourceError, match="duplicate document path"):
+    with pytest.raises(SourceError, match="duplicate `post_id`"):
         _discover(warehouse, tmp_path, _source())
 
 
@@ -379,3 +379,139 @@ def test_source_filter_scopes_rows_by_path_columns(tmp_path: Path) -> None:
 
     assert results["post_registry"].documents_processed == 2
     assert set(_registry(project)["subreddit"].to_list()) == {"wallstreetbets"}
+
+
+# ─── review follow-ups (PR #330) ────────────────────────────────────────────
+
+
+def test_read_relation_limit_bounds_the_query(tmp_path: Path) -> None:
+    """The cap bounds the transfer, not just the post-hoc height check."""
+    cfg = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "b.duckdb"), "schema": "main"}
+    )
+    with create_adapter(cfg) as adapter:
+        adapter.execute("CREATE TABLE main.wide AS SELECT * FROM range(100)")
+
+        assert adapter.read_relation("main.wide", limit=5).height == 5
+
+
+def test_a_missing_relation_is_a_source_error_not_a_traceback(
+    warehouse: WarehouseConfig, tmp_path: Path
+) -> None:
+    """Native driver exceptions must not reach users raw.
+
+    DuckDB's CatalogException carries SQL text and engine suggestions; the
+    boundary converts it to an actionable message that names the relation
+    without replaying the engine's diagnostics.
+    """
+    source = _source(path="warehouse://rawdata.nonexistent")
+
+    with pytest.raises(SourceError, match=r"cannot read 'rawdata\.nonexistent'"):
+        _discover(warehouse, tmp_path, source)
+
+
+def test_a_bare_relation_name_addresses_the_active_schema(
+    tmp_path: Path,
+) -> None:
+    """`warehouse://events` means the target's schema, not the connection
+    default — otherwise the resolution would depend on driver defaults the
+    profile never chose."""
+    db = tmp_path / "sch.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.events AS SELECT 'e1' AS event_id")
+    con.close()
+    warehouse = parse_warehouse_config(
+        {"type": "duckdb", "path": str(db), "schema": "raw"}
+    )
+    source = _source(path="warehouse://events", key_column="event_id")
+
+    _, refs = _discover(warehouse, tmp_path, source)
+
+    assert [r.relative_path for r in refs] == ["e1"]
+
+
+def test_duplicate_keys_across_partitions_are_still_duplicates(
+    warehouse: WarehouseConfig, tmp_path: Path
+) -> None:
+    """`path_columns` must not launder a duplicate key into two documents."""
+    con = duckdb.connect(str(tmp_path / "wh.duckdb"))
+    con.execute(
+        "INSERT INTO rawdata.reddit_posts VALUES ('p1', 'finance', 'crosspost')"
+    )
+    con.close()
+
+    with pytest.raises(SourceError, match="duplicate `post_id`"):
+        _discover(warehouse, tmp_path, _source(path_columns=["subreddit"]))
+
+
+def test_an_invalid_source_path_override_fails_at_resolve_time(
+    tmp_path: Path,
+) -> None:
+    """A target override reruns source validation.
+
+    `model_copy(update=...)` skips validators, so a bad override would
+    otherwise surface mid-discovery — after credentials — instead of at
+    profile resolution.
+    """
+    from stel.config import load_project
+    from stel.profile import ProfileError, resolve_profile
+
+    project = tmp_path / "proj"
+    (project / "sources").mkdir(parents=True)
+    (project / "stel_project.yml").write_text(
+        "name: ov\nversion: '0.1.0'\nprofile: ov\n"
+    )
+    (project / "sources" / "src.yml").write_text(
+        "version: 2\nsources:\n  - name: rows\n"
+        "    path: warehouse://rawdata.posts\n    key_column: post_id\n"
+    )
+    (project / "profiles.yml").write_text(
+        "ov:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
+        "        type: duckdb\n        path: ./target/db.duckdb\n"
+        "        schema: main\n"
+        "      source_paths:\n        rows: warehouse://bad-table-name\n"
+    )
+    proj, _, _ = load_project(project)
+
+    from stel.profile import apply_source_path_overrides
+
+    resolved = resolve_profile(proj, project)
+    _, sources, _ = load_project(project)
+
+    with pytest.raises(ProfileError, match="override for 'rows' is invalid"):
+        apply_source_path_overrides(sources, resolved)
+
+
+def test_a_scheme_changing_override_revalidates_the_knobs(
+    tmp_path: Path,
+) -> None:
+    # warehouse:// -> gs:// leaves `key_column:` meaningless; that must fail
+    # at resolve time, not be silently ignored by the object source.
+    from stel.config.source import SourceConfig as SC
+    from stel.profile import (
+        ProfileError,
+        ResolvedProfile,
+        apply_source_path_overrides,
+    )
+
+    source = SC.model_validate(
+        {
+            "name": "rows",
+            "path": "warehouse://rawdata.posts",
+            "key_column": "post_id",
+        }
+    )
+    resolved = ResolvedProfile(
+        profile_name="p",
+        target_name="dev",
+        warehouse=parse_warehouse_config(
+            {"type": "duckdb", "path": str(tmp_path / "x.duckdb")}
+        ),
+        llm=None,
+        source_paths={"rows": "gs://bucket/prefix"},
+        profiles_path=None,
+    )
+
+    with pytest.raises(ProfileError, match="override for 'rows' is invalid"):
+        apply_source_path_overrides([source], resolved)

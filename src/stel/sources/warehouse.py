@@ -96,7 +96,12 @@ class WarehouseDocumentSource(DocumentSource):
             with create_adapter(
                 self._warehouse, project_dir=self._project_dir
             ) as adapter:
-                frame = adapter.read_relation(relation)
+                # cap+1 bounds the query itself: an oversized relation is
+                # refused after transferring one row past the cap, not after
+                # materializing millions (Codex review, #330).
+                frame = adapter.read_relation(
+                    relation, limit=source.max_objects + 1
+                )
         except AdapterError as error:
             raise SourceError(
                 f"Source '{source.name}': cannot read '{relation}': {error}"
@@ -122,6 +127,8 @@ class WarehouseDocumentSource(DocumentSource):
 
         refs: list[DocumentRef] = []
         by_path: dict[str, str] = {}
+        seen_keys: set[str] = set()
+        duplicate_keys: set[str] = set()
         null_keys = 0
         duplicates: set[str] = set()
         self._rows = {}
@@ -130,6 +137,14 @@ class WarehouseDocumentSource(DocumentSource):
             if key_value is None:
                 null_keys += 1
                 continue
+            # Checked on the key itself, not the rendered path: the same key
+            # under two different path_columns prefixes renders two distinct
+            # paths, and the contract is that the key identifies one row
+            # (Codex review, #330).
+            if str(key_value) in seen_keys:
+                duplicate_keys.add(str(key_value))
+                continue
+            seen_keys.add(str(key_value))
             segments = [str(row[column]) for column in source.path_columns]
             if any(row[column] is None for column in source.path_columns):
                 raise SourceError(
@@ -155,13 +170,23 @@ class WarehouseDocumentSource(DocumentSource):
                     source_uri=f"{source.path}#{key}={key_value}",
                 )
             )
+        if duplicate_keys:
+            sample = ", ".join(sorted(duplicate_keys)[:5])
+            raise SourceError(
+                f"Source '{source.name}': {len(duplicate_keys)} duplicate "
+                f"`{key}` value(s) in '{relation}' (e.g. {sample}). The key "
+                "identifies one row across runs — which duplicate became the "
+                "document would depend on warehouse row order."
+            )
         if duplicates:
+            # Distinct keys can still render colliding paths when a
+            # path_columns value contains '/' ("x/1"+"y" vs "x"+"1/y").
             sample = ", ".join(sorted(duplicates)[:5])
             raise SourceError(
-                f"Source '{source.name}': {len(duplicates)} duplicate document "
-                f"path(s) in '{relation}' (e.g. {sample}). `{key}` must be "
-                "unique — which duplicate row became the document would depend "
-                "on warehouse row order."
+                f"Source '{source.name}': {len(duplicates)} colliding document "
+                f"path(s) in '{relation}' (e.g. {sample}). A `path_columns:` "
+                "value containing '/' renders the same path for different "
+                "keys; clean the column or drop it from path_columns."
             )
         if null_keys:
             raise SourceError(

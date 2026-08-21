@@ -1305,20 +1305,55 @@ to see the plan first."""
         an upstream loader put them — `economics_raw.reddit_comments_raw`, not
         stel's own schema — so this is the one place a cross-schema name from
         project YAML becomes SQL. Parts are re-validated here (defense in
-        depth with config-load validation) and quoted per dialect.
+        depth with config-load validation) and quoted per dialect. A one-part
+        name addresses the **active target schema**, not the connection's
+        default — otherwise `warehouse://events` would resolve somewhere the
+        profile never pointed at (Codex review, #330).
         """
         from ..config.source import validate_relation_name
 
         validate_relation_name(qualified)
-        return ".".join(self.quote_ident(part) for part in qualified.split("."))
+        parts = qualified.split(".")
+        if len(parts) == 1:
+            return f"{self.schema_ref}.{self.quote_ident(parts[0])}"
+        return ".".join(self.quote_ident(part) for part in parts)
 
-    def read_relation(self, qualified: str) -> pl.DataFrame:
-        """Read a relation by qualified name, wherever it lives (issue #322)."""
+    def _guard_relation_read(self, qualified: str, error: Exception) -> AdapterError:
+        # Native driver exceptions (DuckDB CatalogException, BigQuery client
+        # errors) carry SQL text and engine diagnostics that must not reach
+        # users as a raw traceback; the class name locates the failure without
+        # replaying the engine's message (Codex review, #330).
+        return AdapterError(
+            f"cannot read relation '{qualified}' ({type(error).__name__}); "
+            "check that the relation exists and the target's credentials can "
+            "read it"
+        )
+
+    def read_relation(
+        self, qualified: str, *, limit: int | None = None
+    ) -> pl.DataFrame:
+        """Read a relation by qualified name, wherever it lives (issue #322).
+
+        `limit` bounds the query itself, not just the frame: warehouse-table
+        sources pass their row cap here so an oversized relation is refused
+        after transferring cap+1 rows, not after materializing all of them.
+        """
         self.require_capability(
             WarehouseCapability.TABULAR_READS,
             operation="reading warehouse source relations",
         )
-        return self.query_df(f"SELECT * FROM {self.relation_ref(qualified)}")
+        if limit is not None and limit < 0:
+            raise AdapterError("Relation read limit must be non-negative")
+        suffix = f" LIMIT {limit}" if limit is not None else ""
+        # Validation runs outside the guard: its errors are stel's own safe
+        # messages and must reach the user verbatim, not be sanitized away.
+        ref = self.relation_ref(qualified)
+        try:
+            return self.query_df(f"SELECT * FROM {ref}{suffix}")
+        except AdapterError:
+            raise
+        except Exception as error:
+            raise self._guard_relation_read(qualified, error) from error
 
     def relation_row_count(self, qualified: str) -> int:
         """Row count of a qualified relation, for source freshness scans."""
@@ -1326,7 +1361,13 @@ to see the plan first."""
             WarehouseCapability.TABULAR_READS,
             operation="counting warehouse source relation rows",
         )
-        value = self.scalar(f"SELECT COUNT(*) FROM {self.relation_ref(qualified)}")
+        ref = self.relation_ref(qualified)
+        try:
+            value = self.scalar(f"SELECT COUNT(*) FROM {ref}")
+        except AdapterError:
+            raise
+        except Exception as error:
+            raise self._guard_relation_read(qualified, error) from error
         return int(value or 0)
 
     def row_count(self, table: str) -> int:

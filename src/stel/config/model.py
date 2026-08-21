@@ -253,6 +253,24 @@ class AgentContextConfig(BaseModel):
     grain: AgentContextGrain
 
 
+# Columns a `chunk:` model produces itself. Declared here rather than in
+# execution so config validation can reject a heading column that would
+# overwrite one (issue #343); `execution/chunk.py` imports it as the single
+# definition.
+CHUNK_GENERATED_FIELDS = frozenset(
+    {
+        "chunk_id",
+        "document_id",
+        "chunk_index",
+        "chunk_count",
+        "text",
+        "chunk_strategy",
+        "code_version",
+        "chunked_at",
+    }
+)
+
+
 class HeadingConfig(BaseModel):
     r"""Detect section headings while splitting, and attribute chunks to them.
 
@@ -359,6 +377,17 @@ class ChunkConfig(BaseModel):
             raise ValueError(
                 f"chunk.headings.column must not be the text field "
                 f"'{self.text_field}'"
+            )
+        if self.headings is not None and self.headings.column in CHUNK_GENERATED_FIELDS:
+            # The upstream-column guard cannot catch these: an extraction
+            # model has no `chunk_id`, so `column: chunk_id` passed validation
+            # and then overwrote every generated chunk id with a section name
+            # — duplicate identifiers on a full materialization, and failed
+            # key validation on an incremental one (Codex review, #343).
+            raise ValueError(
+                f"chunk.headings.column '{self.headings.column}' is a column "
+                "the chunk model generates; naming it would overwrite that "
+                f"value. Generated columns: {', '.join(sorted(CHUNK_GENERATED_FIELDS))}"
             )
         if self.text_field in self.in_text_metadata:
             raise ValueError(

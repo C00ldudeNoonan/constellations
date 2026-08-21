@@ -1465,8 +1465,9 @@ Two behaviors worth knowing:
 `headings:` requires `strategy: recursive`: attribution works from source
 character offsets, which the token splitter does not produce. Declaring it
 with `strategy: tokens` fails at config load rather than silently emitting
-nulls. Naming a `column:` the upstream already has fails before any document
-is processed, rather than overwriting it.
+nulls. Naming a `column:` the upstream already has — or one the chunk model
+generates itself, such as `chunk_id` — fails at config load rather than
+overwriting it.
 
 This complements [in-text metadata](#metadata-the-embedder-can-actually-see)
 rather than overlapping it: that puts document context *into the embedded

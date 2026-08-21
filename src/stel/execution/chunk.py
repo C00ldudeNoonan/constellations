@@ -20,7 +20,7 @@ from ..chunking import (
     render_metadata_block,
     split_text,
 )
-from ..config.model import ModelConfig
+from ..config.model import CHUNK_GENERATED_FIELDS, ModelConfig
 from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
 from ..versioning import compute_code_version
@@ -28,18 +28,7 @@ from .contracts import ModelRunResult, RunError
 from .values import scalarize
 from .warehouse import warehouse_options
 
-_CHUNK_GENERATED_FIELDS = frozenset(
-    {
-        "chunk_id",
-        "document_id",
-        "chunk_index",
-        "chunk_count",
-        "text",
-        "chunk_strategy",
-        "code_version",
-        "chunked_at",
-    }
-)
+_CHUNK_GENERATED_FIELDS = CHUNK_GENERATED_FIELDS
 _CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
 
 
@@ -184,7 +173,19 @@ def run_chunk_model(
             deleted = len(removed)
 
     rows_written = 0
-    chunk_frame = pl.DataFrame(rows) if rows else pl.DataFrame()
+    # An explicit dtype for the section column: a first batch whose pattern
+    # matched no headings supplies only nulls, which polars infers as `Null`
+    # and DuckDB materializes as an integer column — so the next batch that
+    # does find a heading fails converting a string into it (Codex review,
+    # #343, and the same failure mode as the append-only logs in #333).
+    section_schema = (
+        {chunk_config.headings.column: pl.String}
+        if chunk_config.headings is not None
+        else None
+    )
+    chunk_frame = (
+        pl.DataFrame(rows, schema_overrides=section_schema) if rows else pl.DataFrame()
+    )
     if model.materialization == "full" or full_refresh:
         rows_written = adapter.materialize_full(
             model.name,

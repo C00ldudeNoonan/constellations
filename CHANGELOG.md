@@ -17,8 +17,12 @@
   whether trailing punctuation belongs to it rather than stel guessing.
 - Text before the first heading has no section. `headings:` requires
   `strategy: recursive` (attribution needs source offsets the token splitter
-  does not produce), and naming a column the upstream already has fails before
-  any document is processed rather than overwriting it.
+  does not produce); naming a column the upstream already has, or one the
+  chunk model generates itself (`chunk_id`, `chunk_index`, …), fails at config
+  load rather than overwriting it.
+- The section column is created with an explicit string type, so a first batch
+  whose pattern matches no headings cannot fix it as an integer column and
+  strand every later batch that does find one.
 - Complements in-text metadata (#308) rather than overlapping it: that puts
   document context into the embedded text; this is a structured, filterable
   attribute.

@@ -25,10 +25,6 @@ _RECURSIVE_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 # and it is what separates the block's lines from the document's own.
 METADATA_SEPARATOR = "---"
 
-# Sorts after any real heading name at the same offset, so a heading starting
-# exactly at a chunk's first character counts as covering that chunk.
-_AFTER_EVERY_NAME = "￿"
-
 
 class ChunkingError(ValueError):
     """A chunk model's sizes leave no room to split text (issue #308)."""
@@ -143,10 +139,18 @@ def _find_headings(
 
 
 def _section_at(headings: list[tuple[int, str]], start: int) -> str | None:
-    """The last heading at or before `start`. None before the first heading."""
+    """The last heading at or before `start`. None before the first heading.
+
+    Bisects the offsets alone. Comparing `(offset, name)` tuples against a
+    sentinel name needs that sentinel to sort after every possible heading,
+    and no string does: `"￿"` sorts before an astral character, so a
+    chunk opening a heading like "🚀 Overview" would land in the previous
+    section (Codex review, #343). Offsets are the thing being searched, so
+    search them.
+    """
     if not headings:
         return None
-    index = bisect_right(headings, (start, _AFTER_EVERY_NAME)) - 1
+    index = bisect_right([offset for offset, _ in headings], start) - 1
     return headings[index][1] if index >= 0 else None
 
 

@@ -1123,3 +1123,126 @@ def test_a_chunk_straddling_a_boundary_belongs_where_it_starts() -> None:
     assert straddling, "expected a chunk carrying the next heading in its tail"
     # And the heading text itself is never dropped from the corpus.
     assert any("Item 1A." in c.text for c in chunks)
+
+
+# ─── review follow-ups (PR #343) ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("column", ["chunk_id", "text", "chunk_index"])
+def test_a_generated_column_is_never_a_heading_column(column: str) -> None:
+    """The upstream-column guard cannot catch these.
+
+    An extraction model has no `chunk_id`, so `column: chunk_id` passed that
+    check and then overwrote every generated chunk id with a section name —
+    duplicate identifiers on a full materialization, failed key validation on
+    an incremental one.
+    """
+    # `text` is additionally the default `text_field`, so it trips that guard
+    # first — either refusal is correct, the point is that none of these can
+    # silently overwrite a generated value.
+    with pytest.raises(
+        ValueError, match=r"chunk model generates|must not be the text field"
+    ):
+        ChunkConfig(headings={"pattern": "^x", "column": column})
+
+
+def test_a_heading_above_the_bmp_attributes_correctly() -> None:
+    """Attribution bisects offsets, not `(offset, name)` tuples.
+
+    Comparing tuples needs a sentinel name sorting after every possible
+    heading, and none exists: "\uffff" sorts before an astral character, so a
+    chunk opening "🚀 Overview" landed in the previous section.
+    """
+    document = (
+        "\U0001F680 Overview\n\n"
+        + "Body text here. " * 6
+        + "\n\n\U0001F30D Global\n\n"
+        + "More body text. " * 6
+    )
+
+    chunks = split_text(
+        document,
+        ChunkConfig(
+            chunk_size=110, chunk_overlap=0, headings={"pattern": r"^(\S+ \w+)$"}
+        ),
+    )
+
+    opening = next(c for c in chunks if c.text.startswith("\U0001F30D"))
+    assert opening.section == "\U0001F30D Global"
+    assert chunks[0].section == "\U0001F680 Overview"
+
+
+def test_a_heading_less_first_batch_does_not_fix_the_column_type(
+    tmp_path: Path,
+) -> None:
+    """Explicit dtype, not one inferred from the first batch.
+
+    A first document whose pattern matches nothing supplies only nulls, which
+    polars infers as `Null` and DuckDB materializes as an integer column — so
+    the next document that *does* find a heading fails converting a string
+    into it. Same failure mode as the append-only logs in #333.
+    """
+    from stel.runner import run_project
+
+    project = _heading_project(tmp_path)
+    _write_document(project, "a", "Plain prose with no heading at all. " * 6)
+    run_project(project)
+
+    _write_document(
+        project, "b", "Item 1. Business\n\n" + "Real content here. " * 6
+    )
+    run_project(project)
+
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        dtype = con.execute(
+            "SELECT section FROM main.filing_chunks LIMIT 0"
+        ).description[0][1]
+        sections = {
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT section FROM main.filing_chunks"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert dtype == "VARCHAR"
+    assert sections == {None, "Item 1"}
+
+
+def _heading_project(tmp_path: Path) -> Path:
+    project = tmp_path / "proj"
+    (project / "models").mkdir(parents=True)
+    (project / "sources").mkdir()
+    (project / "data" / "docs").mkdir(parents=True)
+    (project / "stel_project.yml").write_text(
+        "name: ns\nversion: '0.1.0'\nprofile: ns\n"
+    )
+    (project / "profiles.yml").write_text(
+        "ns:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
+        "        type: duckdb\n        path: ./target/db.duckdb\n"
+        "        schema: main\n"
+    )
+    (project / "sources" / "s.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+        "    file_pattern: '*.json'\n"
+    )
+    (project / "models" / "m.yml").write_text(
+        "version: 2\nmodels:\n  - name: filings\n    source: ref('docs')\n"
+        "    extraction:\n      backend: json\n      options:\n"
+        "        fields: [doc_id, body]\n    materialization: incremental\n"
+        "  - name: filing_chunks\n    depends_on: [ref('filings')]\n"
+        "    chunk:\n      strategy: recursive\n      text_field: body\n"
+        "      chunk_size: 120\n      chunk_overlap: 0\n"
+        "      headings:\n        pattern: '^(Item\s+\d+)[.:]'\n"
+        "    materialization: incremental\n"
+    )
+    return project
+
+
+def _write_document(project: Path, name: str, body: str) -> None:
+    import json
+
+    (project / "data" / "docs" / f"{name}.json").write_text(
+        json.dumps({"doc_id": name, "body": body})
+    )

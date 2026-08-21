@@ -1037,6 +1037,57 @@ names from project YAML; values replace only `source.path`, leaving
 `document_id` and incremental identity based on the source-relative object path
 and content/generation hash.
 
+## Warehouse-table sources
+
+A `warehouse://` source treats each **row** of a relation as a document, so
+text that arrived in the warehouse — Fivetran/Airbyte/dlt loads, upstream dbt
+models — enters an `extraction:` pipeline the same way files do:
+
+```yaml
+sources:
+  - name: reddit_rows
+    path: warehouse://economics_raw.reddit_comments_raw
+    key_column: comment_id          # the row's identity across runs
+    path_columns: [subreddit]       # optional: prefix the document path
+```
+
+The relation is read through the **active adapter**, so warehouse dialect
+stays behind `adapters/`, and per-target `source_paths` overrides point each
+target at its own copy — dev at a sampled table, prod at the real one. The
+name may be `table`, `schema.table`, or `project.dataset.table`; each part is
+validated at config load and quoted per dialect.
+
+**Identity.** `key_column` is the row-grain analogue of an object path: its
+value becomes the final segment of the document's source-relative path
+(prefixed by `path_columns` values), and `document_id` derives from that path
+exactly as it does for files. The content hash fingerprints the whole row, so
+the incremental machinery works unchanged: a changed row re-extracts, an
+unchanged row skips, a deleted row prunes its documents — and its chunks.
+Null keys and duplicate keys are hard errors, not guesses: a row without a
+key has no identity, and which duplicate became the document would depend on
+warehouse row order. Filter with a view when the raw table is imperfect.
+
+**`--source-filter` composes unchanged.** The globs address the document
+path, so with `path_columns: [subreddit]`, `--source-filter 'economics/*'`
+scopes a run to those rows the way `'AAPL/*'` scopes an object prefix — the
+same partition seam orchestrators already use.
+
+**Fetch and extraction.** Each discovered row is served to the backend as a
+plain JSON object (timestamps as ISO strings, decimals as strings at their
+declared scale, binary as base64), so `backend: json` with declared `fields:`
+is the natural pairing. Discovery snapshots the relation once and extraction
+consumes that snapshot, never a re-query of a table that may have moved —
+the row-grain analogue of the object sources' verified-snapshot rule.
+`max_objects` (default 5000) bounds the read and refuses rather than
+truncates; narrow with a view or raise it deliberately.
+
+**Not `dbt_ref()`.** The two answer different questions: `dbt_ref('model')`
+lets a *transform* consume a dbt-built table, resolved by dbt in embedded
+(dbt-duckdb) mode. A `warehouse://` source starts a *document pipeline* from
+rows, resolved by the active adapter in standalone mode. Source freshness
+reports row counts but no modification time — rows carry none a listing could
+read; a declared watermark column is future work.
+
 ## GCS sources
 
 Sources can point at Google Cloud Storage instead of local directories —

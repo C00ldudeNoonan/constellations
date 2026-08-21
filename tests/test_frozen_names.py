@@ -497,6 +497,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("dbt-ml.transform-incremental-reference", 1, "9f69628fa9a3e1f668ec869219282eb0"),
     ("dbt_ml/retrieval_eval/golden_set", 1, "9305ca078ff6376cce65b750ebaf21cf"),
     ("eval-metric-id", 1, "a857cb0a824c56aa011e6b9b88cbba6e"),
+    ("warehouse-source-row", 1, "362b1a57365cd242b114e1e95a647e79"),
     ("embedding-config", 1, "a1f45bc702e4875dad7d01e066f92374"),
     ("embedding-input-row", 1, "4c7f5bfe371485b0aa73c4b777011d4f"),
     ("embedding-input-text", 1, "d3bff0761e0d18692fd51fa87dc379cd"),

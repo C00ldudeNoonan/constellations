@@ -1298,6 +1298,37 @@ to see the plan first."""
         suffix = f" LIMIT {limit}" if limit is not None else ""
         return self.query_df(f"SELECT * FROM {self.table_ref(table)}{suffix}")
 
+    def relation_ref(self, qualified: str) -> str:
+        """Validated, quoted reference for a relation outside stel's schema.
+
+        Warehouse-table sources (issue #322) name relations that live wherever
+        an upstream loader put them — `economics_raw.reddit_comments_raw`, not
+        stel's own schema — so this is the one place a cross-schema name from
+        project YAML becomes SQL. Parts are re-validated here (defense in
+        depth with config-load validation) and quoted per dialect.
+        """
+        from ..config.source import validate_relation_name
+
+        validate_relation_name(qualified)
+        return ".".join(self.quote_ident(part) for part in qualified.split("."))
+
+    def read_relation(self, qualified: str) -> pl.DataFrame:
+        """Read a relation by qualified name, wherever it lives (issue #322)."""
+        self.require_capability(
+            WarehouseCapability.TABULAR_READS,
+            operation="reading warehouse source relations",
+        )
+        return self.query_df(f"SELECT * FROM {self.relation_ref(qualified)}")
+
+    def relation_row_count(self, qualified: str) -> int:
+        """Row count of a qualified relation, for source freshness scans."""
+        self.require_capability(
+            WarehouseCapability.TABULAR_READS,
+            operation="counting warehouse source relation rows",
+        )
+        value = self.scalar(f"SELECT COUNT(*) FROM {self.relation_ref(qualified)}")
+        return int(value or 0)
+
     def row_count(self, table: str) -> int:
         """Return the relation row count through a typed core operation."""
         self.require_capability(

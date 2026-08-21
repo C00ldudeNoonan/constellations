@@ -147,18 +147,69 @@ def _merge_with_overlap(
     splits: list[str], chunk_size: int, overlap: int
 ) -> list[str]:
     """Greedily pack fine-grained splits into chunks under `chunk_size`,
-    carrying `overlap` trailing characters from each chunk into the next."""
+    carrying roughly `overlap` trailing characters from each chunk into the
+    next — snapped to a separator boundary (issue #331)."""
     chunks: list[str] = []
     current = ""
     for split in splits:
         if current and len(current) + len(split) > chunk_size:
             chunks.append(current.strip())
-            current = (current[-overlap:] if overlap else "") + split
+            current = _overlap_tail(current, overlap) + split
         else:
             current += split
     if current.strip():
         chunks.append(current.strip())
     return [c for c in chunks if c]
+
+
+def _overlap_tail(text: str, overlap: int) -> str:
+    """The trailing text carried into the next chunk, starting on a boundary.
+
+    A fixed `text[-overlap:]` slice starts wherever the count lands, which is
+    mid-word almost every time — measured at 81.5% of chunks on a real 10-K,
+    against 4.2% with overlap disabled. That single term dominated everything
+    else: work upstream to emit real paragraph structure showed almost no
+    boundary improvement because the overlap was reintroducing arbitrary
+    offsets on its own (issue #331).
+
+    So step back *approximately* `overlap` and snap to the nearest boundary
+    from the same separator hierarchy the splitter already walks. The overlap
+    then carries whole sentences or paragraphs, and the next chunk starts on a
+    real boundary. `chunk_size` is already a target rather than an exact cap,
+    so treating `chunk_overlap` the same way matches the existing contract.
+    """
+    if overlap <= 0 or not text:
+        return ""
+    if overlap >= len(text):
+        return text
+
+    target = len(text) - overlap
+    # Bound how far snapping may move the boundary: at most twice the
+    # requested overlap, at least half of it. Outside that band
+    # "approximately `overlap`" stops meaning anything, and a plain cut is the
+    # more honest answer.
+    earliest = max(0, len(text) - 2 * overlap)
+    latest = len(text) - max(1, overlap // 2)
+
+    for separator in _RECURSIVE_SEPARATORS:
+        if not separator:
+            continue
+        # A chunk can start just *after* a separator, so that is the candidate
+        # position rather than the separator's own index.
+        candidates: list[int] = []
+        position = text.find(separator, earliest)
+        while position != -1 and position < latest:
+            candidates.append(position + len(separator))
+            position = text.find(separator, position + 1)
+        if candidates:
+            # Highest-priority separator with any candidate wins, and within
+            # it the position closest to the requested overlap — so a
+            # paragraph break is preferred to a sentence break, which is
+            # preferred to a word break, exactly as when splitting.
+            return text[min(candidates, key=lambda p: abs(p - target)) :]
+    # No boundary in the band (one very long token, say): the fixed slice is
+    # what it always was.
+    return text[-overlap:]
 
 
 def _encoding(name: str) -> Any:

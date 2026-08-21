@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from math import isfinite
+from threading import Lock
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -41,6 +42,78 @@ _VERTEX_FEATURE = "Vertex AI embeddings"
 _VERTEX_INFERENCE_FEATURE = "Vertex AI inference"
 _RETRYABLE_STATUS_CODES = [408, 409, 425, 429, 500, 502, 503, 504]
 
+
+class _ClientCache:
+    """Reuse `genai.Client` instances across requests (issue #335).
+
+    Every request built a fresh client, and each construction re-runs
+    `google.auth.default()` — under end-user ADC that includes a token refresh
+    round trip. Measured at a 1:1 construction-to-request ratio: 4,252
+    redundant credential resolutions in one inference run, and enough fixed
+    overhead per embed batch to turn a 3.93M-chunk backfill into days of wall
+    time rather than hours. Cost is unaffected; wall time is the blocker.
+
+    Keyed rather than a single cached client, because `client_options` mixes
+    profile values (project, location) with per-request runtime values
+    (timeout, retries). A lone cached client would silently serve the first
+    request's timeout to every later one; keying on the resolved options
+    reuses a client exactly when reuse is correct.
+
+    Module-level rather than per provider instance, which is the detail that
+    makes this work at all: `get_embedding_provider`/`get_inference_provider`
+    build a **fresh provider** on every call, and `embed_texts` calls one per
+    batch. A cache living on the instance would never see a second hit — which
+    is precisely the 1:1 construction-to-request ratio the issue measured.
+    The key holds no secret: Vertex authenticates through ambient ADC, never a
+    stel-managed credential. (`anthropic.py` keeps constructing per request for
+    the opposite reason; see the note there.)
+
+    `genai.Client` is documented as safe to share across concurrent requests,
+    which matters because the embedding path runs several in flight.
+    """
+
+    def __init__(self) -> None:
+        self._clients: dict[tuple[Any, ...], Any] = {}
+        self._lock = Lock()
+
+    @staticmethod
+    def key(client_options: Mapping[str, Any]) -> tuple[Any, ...]:
+        """A hashable identity for the options a client was built from."""
+        http = client_options.get("http_options", {})
+        retry = http.get("retry_options", {})
+        return (
+            client_options.get("vertexai"),
+            client_options.get("project"),
+            client_options.get("location"),
+            http.get("api_version"),
+            http.get("timeout"),
+            retry.get("attempts"),
+        )
+
+    def clear(self) -> None:
+        """Drop every cached client.
+
+        Process-global state needs an explicit reset: tests substitute a fake
+        `genai` module per case, and a client built from a previous fake would
+        otherwise be served to the next one.
+        """
+        with self._lock:
+            self._clients.clear()
+
+    def get(self, genai: Any, client_options: dict[str, Any]) -> Any:
+        cache_key = self.key(client_options)
+        client = self._clients.get(cache_key)
+        if client is not None:
+            return client
+        with self._lock:
+            # Re-check under the lock: two concurrent first requests would
+            # otherwise both construct, which is the cost being removed.
+            client = self._clients.get(cache_key)
+            if client is None:
+                client = genai.Client(**client_options)
+                self._clients[cache_key] = client
+            return client
+
 VertexTaskType = Literal[
     "RETRIEVAL_QUERY",
     "RETRIEVAL_DOCUMENT",
@@ -51,6 +124,9 @@ VertexTaskType = Literal[
     "FACT_VERIFICATION",
     "CODE_RETRIEVAL_QUERY",
 ]
+
+
+_CLIENTS = _ClientCache()
 
 
 class VertexEmbeddingOptions(BaseModel):
@@ -147,7 +223,7 @@ class VertexEmbeddingProvider(EmbeddingProvider):
         }
         if options.project is not None:
             client_options["project"] = options.project
-        client = genai.Client(**client_options)
+        client = _CLIENTS.get(genai, client_options)
         vectors: list[tuple[float, ...]] = []
         usage = ProviderUsage()
         provider_requests = _split_requests(request)
@@ -186,7 +262,11 @@ class VertexEmbeddingProvider(EmbeddingProvider):
                 vectors.extend(parsed.vectors)
                 usage = _add_usage(usage, parsed.usage)
         finally:
-            client.close()
+            # Deliberately not closed: the client is shared across requests
+            # now, and closing it here would leave the cached entry unusable
+            # for every later call (issue #335). Its connection pool lives for
+            # the process, which is the point of reusing it.
+            pass
         try:
             return EmbeddingResult(
                 vectors=tuple(vectors),
@@ -330,7 +410,7 @@ class VertexInferenceProvider(InferenceProvider):
         }
         if options.project is not None:
             client_options["project"] = options.project
-        client = genai.Client(**client_options)
+        client = _CLIENTS.get(genai, client_options)
         generate_config: dict[str, Any] = {
             "system_instruction": request.system_prompt,
             "temperature": request.temperature,
@@ -354,7 +434,11 @@ class VertexInferenceProvider(InferenceProvider):
                     error, response, request, self
                 ) from None
         finally:
-            client.close()
+            # Deliberately not closed: the client is shared across requests
+            # now, and closing it here would leave the cached entry unusable
+            # for every later call (issue #335). Its connection pool lives for
+            # the process, which is the point of reusing it.
+            pass
 
 
 def _effective_thinking_budget(

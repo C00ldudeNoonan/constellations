@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Vertex reuses its API client instead of rebuilding it per request (#335)
+
+- **The Vertex provider constructed a fresh `genai.Client` on every embed
+  batch and every inference call.** Each construction re-runs
+  `google.auth.default()`, which under end-user ADC includes a token refresh
+  round trip — measured at a 1:1 construction-to-request ratio, 4,252
+  redundant credential resolutions in a single production inference run. Cost
+  was unaffected; wall time was the blocker, enough to put a 3.93M-chunk
+  backfill at days rather than hours.
+- Clients are now cached and reused, keyed on their resolved options so a
+  request with a different timeout or retry count still gets its own client
+  rather than silently inheriting the first one's.
+- The cache is **process-wide, not per provider instance** — which is what
+  makes it work at all: `get_embedding_provider`/`get_inference_provider`
+  build a fresh provider on every call, and `embed_texts` calls one per batch,
+  so a per-instance cache would never see a second hit.
+- A shared client is no longer closed after each request; doing so would leave
+  the cached entry unusable for every later call.
+- Audited the other providers, as the issue suggested: Anthropic keeps
+  constructing per request deliberately (no auth round trip to amortize, and
+  caching would hold a resolved credential in a long-lived object), and vLLM
+  issues stateless `urllib` requests with nothing to cache.
+
+
 ### Fixed: date and timestamp search filters (issue #337)
 
 - **A `data_type: date` or `timestamp` search attribute accepted filters that

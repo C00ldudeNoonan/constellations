@@ -203,6 +203,12 @@ def _complete_with_sdk(
     from anthropic import Anthropic
 
     api_key = _credential_value(credential)
+    # Constructed per request on purpose, unlike the Vertex client (issue
+    # #335). Two reasons: `Anthropic(...)` resolves nothing remotely — the key
+    # arrives already resolved, so there is no auth round trip to amortize —
+    # and caching would hold a resolved credential inside a long-lived object,
+    # against the rule that credential values surface only at native SDK
+    # construction.
     client = Anthropic(
         api_key=api_key,
         max_retries=runtime.max_retries,

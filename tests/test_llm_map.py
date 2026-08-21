@@ -165,8 +165,13 @@ def test_identity_is_artifact_safe() -> None:
         "implementation",
         "output_cardinality",
         "config_hash",
+        # Prompt *identity* is artifact-safe and deliberately included
+        # (issue #303); the text below asserts the text itself is not.
+        "prompt_name",
+        "prompt_version",
     }
     assert "api_key" not in str(identity)
+    assert runtime.system_prompt not in str(identity)
 
 
 def _llm_project(tmp_path: Any, *, provider: str = "deterministic", extra: str = "") -> Any:

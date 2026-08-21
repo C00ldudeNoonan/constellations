@@ -23,6 +23,7 @@ from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
 from .post_extract import validate_post_extract_contract
 from .profile import ResolvedProfile
+from .prompts import PromptError, resolve_prompt
 from .providers import (
     ProviderConfigurationError,
     ProviderNotFoundError,
@@ -99,6 +100,7 @@ def validate_project_contract(
             _prepare_sql_transform(model, project_dir)
 
     for model in models:
+        _validate_prompt(model, project_dir)
         _validate_tests(model, source_names, model_names, project_dir)
         _validate_model_edges(model, source_names, model_names, search_names)
         _validate_materialization(model)
@@ -485,6 +487,23 @@ def validate_warehouse_operation_capabilities(
         f"Warehouse adapter '{adapter_type}' cannot execute {operation}; "
         f"missing capabilities: {details}"
     )
+
+
+def _validate_prompt(model: ModelConfig, project_dir: Path) -> None:
+    """Resolve a versioned prompt reference at compile time (issue #303).
+
+    Deliberately not left to run time: the artifact-safe descriptor path
+    swallows resolution failures so offline docs tooling still works, so a
+    misspelled version would otherwise survive `compile` and surface only
+    after source discovery and credentials — a typo that costs a corpus
+    instead of nothing.
+    """
+    if model.llm is None or isinstance(model.llm.prompt, str):
+        return
+    try:
+        resolve_prompt(model.llm, project_dir, model_name=model.name)
+    except PromptError as error:
+        raise _model_error(model, str(error), ("llm", "prompt")) from error
 
 
 def _validate_tests(

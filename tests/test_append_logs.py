@@ -207,8 +207,12 @@ def test_run_log_rows_carry_no_text_or_credentials() -> None:
 
     serialized = json.dumps(rows[0])
     assert "a very specific failure message" not in serialized
+    # Prompt *identity* is recorded (issue #303) and is safe; the rule is that
+    # no prompt or document *text* lands here, and no credential reference.
+    assert set(rows[0]) & {"prompt_name", "prompt_version"}
     assert not any(
-        "prompt" in key or "text" in key or "key" in key for key in rows[0]
+        key.endswith("_text") or "api_key" in key or "credential" in key
+        for key in rows[0]
     )
 
 

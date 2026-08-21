@@ -62,6 +62,11 @@ RUN_LOG_SCHEMA: dict[str, Any] = {
     "provider_model": pl.String,
     "provider_implementation": pl.String,
     "backend": pl.String,
+    # Which prompt this model ran under (issue #303). #306 specified these
+    # columns; they stayed null until versioned prompts existed to fill them,
+    # which is what makes "did v4 cost more per row than v3" a query.
+    "prompt_name": pl.String,
+    "prompt_version": pl.String,
     "rows_processed": pl.Int64,
     "rows_skipped": pl.Int64,
     "rows_written": pl.Int64,
@@ -201,6 +206,8 @@ def run_log_rows(
                 "provider_model": result.provider_model,
                 "provider_implementation": result.provider_implementation,
                 "backend": result.backend,
+                "prompt_name": result.prompt_name,
+                "prompt_version": result.prompt_version,
                 "rows_processed": result.documents_processed,
                 "rows_skipped": result.documents_skipped,
                 "rows_written": result.rows_written,

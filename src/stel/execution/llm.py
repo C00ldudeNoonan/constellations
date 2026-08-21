@@ -53,6 +53,8 @@ _LLM_METADATA_COLUMNS = (
     "llm_provider_implementation",
     "llm_input_hash",
     "llm_config_hash",
+    "prompt_name",
+    "prompt_version",
     "generated_at",
 )
 
@@ -153,6 +155,10 @@ def _llm_output_rows(
                 "llm_provider_implementation": runtime.implementation,
                 "llm_input_hash": item.input_fingerprint,
                 "llm_config_hash": runtime.config_hash,
+                # Which prompt produced this row, readable and groupable —
+                # `llm_config_hash` only says that something changed (#303).
+                "prompt_name": runtime.prompt_name,
+                "prompt_version": runtime.prompt_version,
                 "generated_at": generated_at,
             }
         )
@@ -233,7 +239,13 @@ def run_llm_model(
         )
 
     try:
-        runtime = resolve_llm_runtime(config, model.fields, resolved)
+        runtime = resolve_llm_runtime(
+            config,
+            model.fields,
+            resolved,
+            project_dir=project_dir,
+            model_name=model.name,
+        )
     except LLMMapError as e:
         raise RunError(f"llm model '{model.name}': {e}") from e
 
@@ -440,6 +452,8 @@ def run_llm_model(
         provider=runtime.provider,
         provider_model=runtime.model,
         provider_implementation=runtime.implementation,
+        prompt_name=runtime.prompt_name,
+        prompt_version=runtime.prompt_version,
         documents_processed=len(work),
         documents_skipped=skipped,
         documents_deleted=len(removed),

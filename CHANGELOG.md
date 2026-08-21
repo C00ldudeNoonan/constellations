@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Warehouse-table sources: start a pipeline from a table (issue #322)
+
+- **`path: warehouse://<relation>`** on a source treats each row of a
+  warehouse relation as a document, so text loaded by Fivetran/Airbyte/dlt or
+  built by dbt enters `extraction:` pipelines without an export-to-object-store
+  hop. Read through the active adapter — dialect stays behind `adapters/`, and
+  per-target `source_paths` overrides point each target at its own copy.
+- **`key_column` is the row's identity**: its value ends the document path,
+  `document_id` derives from that path exactly as for files, and the content
+  hash fingerprints the whole row — so the incremental machinery works
+  unchanged (changed row re-extracts, unchanged skips, deleted prunes through
+  to chunks). Null or duplicate keys are hard errors, not guesses.
+- **`path_columns` compose with `--source-filter`**: the declared columns
+  prefix the document path, so `--source-filter 'economics/*'` scopes rows the
+  way it scopes object prefixes — the existing orchestrator partition seam,
+  no new concept.
+- Rows are served to backends as plain JSON (ISO timestamps, decimals as
+  strings at declared scale, binary as base64); `backend: json` with declared
+  `fields:` is the natural pairing. Discovery snapshots the relation once and
+  extraction consumes the snapshot. `max_objects` refuses rather than
+  truncates.
+- Adapters grew `relation_ref`/`read_relation`/`relation_row_count` for
+  validated, quoted cross-schema reads; relation names from project YAML are
+  validated per part at config load and again at the adapter.
+
+
 ### Classification eval models (issue #309)
 
 - **A new `eval:` model kind** scores a classifier against labelled ground

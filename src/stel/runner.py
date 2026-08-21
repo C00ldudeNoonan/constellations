@@ -29,6 +29,7 @@ from .config import load_project
 from .config.model import (
     ModelConfig,
 )
+from .config.profile import WarehouseConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .dag import ProjectDAG, is_dbt_ref
@@ -249,6 +250,7 @@ def run_project(
         [source for source in sources if source.name in required_sources],
         project_dir,
         source_filter=source_filter,
+        warehouse=resolved.warehouse,
     )
 
     models_by_name = {m.name: m for m in models}
@@ -375,6 +377,7 @@ def build_project(
         [source for source in sources if source.name in required_sources],
         project_dir,
         source_filter=source_filter,
+        warehouse=resolved.warehouse,
     )
     models_by_name = {m.name: m for m in models}
 
@@ -470,11 +473,14 @@ def _discover_sources(
     project_dir: Path,
     *,
     source_filter: Sequence[str] = (),
+    warehouse: WarehouseConfig | None = None,
 ) -> dict[str, DiscoveredSource]:
     out: dict[str, DiscoveredSource] = {}
     reporter = get_reporter()
     for source in sources:
-        backend = get_document_source(source.path)
+        backend = get_document_source(
+            source.path, warehouse=warehouse, project_dir=project_dir
+        )
         try:
             refs = backend.discover(source, project_dir)
         except SourceError as e:

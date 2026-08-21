@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import load_project
+from .config.profile import WarehouseConfig
 from .config.source import SourceConfig
 from .profile import apply_source_path_overrides, resolve_profile
 from .sources import SourceScan, get_document_source
@@ -38,12 +39,21 @@ def check_freshness(
     sources = apply_source_path_overrides(sources, resolved)
     results: list[FreshnessResult] = []
     for source in sources:
-        results.append(_check_one(source, project_dir))
+        results.append(
+            _check_one(source, project_dir, warehouse=resolved.warehouse)
+        )
     return results
 
 
-def _check_one(source: SourceConfig, project_dir: Path) -> FreshnessResult:
-    backend = get_document_source(source.path)
+def _check_one(
+    source: SourceConfig,
+    project_dir: Path,
+    *,
+    warehouse: WarehouseConfig | None = None,
+) -> FreshnessResult:
+    backend = get_document_source(
+        source.path, warehouse=warehouse, project_dir=project_dir
+    )
     # SourceError (bad path, auth, max_objects cap) propagates: a broken
     # source must fail the command, not report a passing no_data. Close the
     # backend either way so a remote source's client is released.

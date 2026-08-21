@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Versioned prompts (issue #303)
+
+- **`prompt: { name, version }`** on an `llm:` model resolves
+  `prompts/<name>/<version>.md`. Inline `prompt: "..."` keeps working — this is
+  an additional form, not a replacement.
+- **Resolution is explicit and compile-time.** No `latest` pointer (a moving
+  reference reintroduces the mutable-prompt problem), and a missing or
+  misspelled version fails `compile` — before source discovery, credentials, or
+  any provider call — listing the versions that do exist.
+- **`prompt_name` and `prompt_version` are stamped on every output row**,
+  alongside the existing `llm_*` provenance columns, and on the run log. That
+  is what makes "which prompt produced this row" and "did v4 cost more per row
+  than v3" queries rather than investigations; `llm_config_hash` could only say
+  that *something* changed.
+- **Prompt text never enters an artifact.** `manifest.json` records the
+  resolved name and version. This also fixes a pre-existing leak: a native
+  `llm:` model's inline prompt was being written into `manifest.json`
+  verbatim, contradicting the documented rule.
+- Name and version are charset-validated at config load (they become path
+  segments), and no component of the path may be a symlink — a symlinked
+  `prompts/` or `prompts/<name>/` would otherwise let a versioned prompt read
+  operator-local data and send it to a provider.
+- **Upgrade note for existing `materialization: incremental` `llm:` models.**
+  The two new output columns change the target's schema the next time the
+  model publishes rows. With the default `on_schema_change: fail`, that
+  publication is rejected. Set `on_schema_change: append_new_columns`, or run
+  once with `--full-refresh`, before it next reprocesses. The upgrade itself
+  reprocesses nothing: an inline prompt's config hash is unchanged.
+- Append-only logs widen rather than break when a later stel adds a column, so
+  a `stel_run_log` created before this release gains `prompt_name`/
+  `prompt_version` on the next write instead of failing every write silently.
+- Not yet implemented: the CI gate asserting a released version's content hash
+  never changes. Editing a version in place still invalidates incremental state
+  correctly; making it a failed build is a follow-up.
+
+
 ### Append-only logs: run history and MCP query history (issues #306, #329)
 
 - **`run_log:`** on a profile target records one row per model per invocation —

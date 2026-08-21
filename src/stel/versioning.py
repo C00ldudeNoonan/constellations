@@ -249,7 +249,11 @@ def compute_model_code_version(
     if model.llm is not None:
         try:
             effective_llm = resolve_llm_runtime(
-                model.llm, model.fields, resolved
+                model.llm,
+                model.fields,
+                resolved,
+                project_dir=project_dir,
+                model_name=model.name,
             ).identity()
         except LLMMapError:
             # Provider unresolved (e.g. offline docs tooling) — fall back to the
@@ -337,12 +341,19 @@ def describe_model_llm(
     model: ModelConfig,
     *,
     resolved: ResolvedProfile | None = None,
+    project_dir: Path | None = None,
 ) -> dict[str, str] | None:
     """Artifact-safe resolved-inference descriptor for a native `llm:` model."""
     if model.llm is None:
         return None
     try:
-        return resolve_llm_runtime(model.llm, model.fields, resolved).identity()
+        return resolve_llm_runtime(
+            model.llm,
+            model.fields,
+            resolved,
+            project_dir=project_dir,
+            model_name=model.name,
+        ).identity()
     except LLMMapError:
         return None
 

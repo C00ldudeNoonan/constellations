@@ -20,6 +20,10 @@ class ModelRunResult:
     provider: str | None = None
     provider_model: str | None = None
     provider_implementation: str | None = None
+    # Resolved prompt identity for `llm:` models (issue #303), carried so the
+    # run log can group cost and throughput by prompt version.
+    prompt_name: str | None = None
+    prompt_version: str | None = None
     documents_processed: int = 0
     documents_skipped: int = 0
     documents_deleted: int = 0

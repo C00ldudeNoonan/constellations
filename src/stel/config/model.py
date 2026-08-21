@@ -59,6 +59,11 @@ LLM_METADATA_FIELDS = frozenset(
         "llm_provider_implementation",
         "llm_input_hash",
         "llm_config_hash",
+        # Which prompt produced the row, in a form a human reads and a query
+        # groups by — `llm_config_hash` records that something changed but
+        # cannot say what (issue #303).
+        "prompt_name",
+        "prompt_version",
         "generated_at",
     }
 )
@@ -341,6 +346,35 @@ class EmbedConfig(BaseModel):
         return self
 
 
+class PromptRef(BaseModel):
+    """A named, versioned prompt file: `prompts/<name>/<version>.md` (#303).
+
+    Both parts become path segments, so they are charset-validated here rather
+    than sanitized at read time. There is deliberately no `latest` — a moving
+    reference would make two runs of the same committed project resolve to
+    different text, which is the mutable-prompt problem versions exist to fix.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        from ..prompts import validate_prompt_segment
+
+        return validate_prompt_segment(v, label="name")
+
+    @field_validator("version")
+    @classmethod
+    def _validate_version(cls, v: str) -> str:
+        from ..prompts import validate_prompt_segment
+
+        return validate_prompt_segment(v, label="version")
+
+
 class LLMTransformConfig(BaseModel):
     """Map an LLM prompt over an upstream warehouse relation (issue #144).
 
@@ -358,7 +392,9 @@ class LLMTransformConfig(BaseModel):
     input_field: str = Field(min_length=1)
     id_field: str = Field(default="id", min_length=1)
     output_cardinality: Literal["one", "many"] = "one"
-    prompt: str = Field(min_length=1)
+    # Inline text, or a reference to a versioned prompt file (issue #303).
+    # Inline stays supported: it is right for quick projects and examples.
+    prompt: str | PromptRef = Field(union_mode="left_to_right")
     provider: str = Field(default="default", min_length=1)
     model: str = Field(default="default", min_length=1)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -369,6 +405,15 @@ class LLMTransformConfig(BaseModel):
     # (f"{id_value}__{ordinal}") and its position within the parent's output.
     row_id_field: str = Field(default="llm_row_id", min_length=1)
     ordinal_field: str = Field(default="ordinal", min_length=1)
+
+    @field_validator("prompt")
+    @classmethod
+    def _validate_inline_prompt(cls, v: str | PromptRef) -> str | PromptRef:
+        # The union dropped `min_length`, and an empty instruction is a typo
+        # rather than a prompt.
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("llm.prompt must not be empty")
+        return v
 
     @model_validator(mode="after")
     def _validate_reserved_fields(self) -> LLMTransformConfig:

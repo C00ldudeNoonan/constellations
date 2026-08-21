@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +12,7 @@ from .adapters import StateScope
 from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
-from .config.model import ModelConfig
+from .config.model import LLMTransformConfig, ModelConfig
 from .config.project import ProjectConfig
 from .dag import NodeKind, ProjectDAG, parse_ref
 from .embedding import (
@@ -282,6 +283,22 @@ def _relation(
     }
 
 
+def _llm_dict(config: LLMTransformConfig | None) -> dict[str, Any] | None:
+    if config is None:
+        return None
+    block = config.model_dump()
+    prompt = block.pop("prompt", None)
+    if isinstance(prompt, Mapping):
+        block["prompt_name"] = prompt.get("name")
+        block["prompt_version"] = prompt.get("version")
+    else:
+        # An inline prompt has no identity to record — only the fact that one
+        # was configured, which `llm_config_hash` already covers per row.
+        block["prompt_name"] = None
+        block["prompt_version"] = None
+    return block
+
+
 def _model_dict(
     model: ModelConfig,
     project: ProjectConfig,
@@ -328,7 +345,12 @@ def _model_dict(
         "ml": model.ml.model_dump(mode="json") if model.ml else None,
         "chunk": model.chunk.model_dump() if model.chunk else None,
         "embed": model.embed.model_dump() if model.embed else None,
-        "llm": model.llm.model_dump() if model.llm else None,
+        # Prompt text never enters an artifact (issue #303, rule 5). This
+        # was already the documented rule and the `backend: llm` behavior,
+        # but a native `llm:` model's inline prompt reached manifest.json
+        # verbatim — verified before fixing. The reference form records name
+        # and version, which is what a reader needs and all they need.
+        "llm": _llm_dict(model.llm),
         "eval": model.eval.model_dump() if model.eval else None,
         "fields": [f.model_dump() for f in model.fields],
         "tests": model.tests,
@@ -345,7 +367,9 @@ def _model_dict(
     embedding = describe_model_embedding(model, resolved=resolved)
     if embedding is not None:
         model_dict["embedding"] = embedding
-    llm_identity = describe_model_llm(model, resolved=resolved)
+    llm_identity = describe_model_llm(
+        model, resolved=resolved, project_dir=project_dir
+    )
     if llm_identity is not None:
         model_dict["llm_identity"] = llm_identity
     if model.agent_context is not None:

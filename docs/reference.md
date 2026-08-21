@@ -1559,7 +1559,8 @@ An `llm:` model maps a prompt over one upstream warehouse relation, turning
 unstructured text into typed, agent-ready rows — the first-class path for
 transformations that need semantic interpretation, while SQL and Python stay
 the deterministic surfaces. The model's `fields:` are the structured output
-schema; the prompt is inline. It shares one execution core with `backend: llm`
+schema; the prompt is inline or a
+[versioned reference](#versioned-prompts). It shares one execution core with `backend: llm`
 extraction, so provider resolution, caching, retries, and usage accounting live
 in one place. Credentials stay operator-owned in `profiles.yml`/environment —
 the `llm:` block never carries an api key.
@@ -1610,6 +1611,74 @@ artifacts expose only the safe resolved
 identity and aggregate usage — prompts, input text, and credentials are never
 copied into artifacts. Native provider batch execution for `llm:` models is
 deferred (issue #149 covers the batch machinery `backend: llm` already uses).
+
+### Versioned prompts
+
+A prompt is a program input that changes the output, exactly like the SQL in a
+transform, so it can have what code has: a name, a version, and a diff in
+review. Reference one instead of inlining it:
+
+```yaml
+  llm:
+    prompt: { name: signal_classify, version: v3 }   # prompts/signal_classify/v3.md
+```
+
+The useful analogy is a database migration. Each version is a file, referenced
+explicitly, and improving one means writing the next version rather than
+editing a released one.
+
+**Inline `prompt: "..."` keeps working** — it is right for quick projects and
+examples. This is an additional form, not a replacement.
+
+**Version resolution is explicit and required.** There is deliberately no
+`latest` pointer: a moving reference would make two runs of the same committed
+project resolve to different text, which is the mutable-prompt problem
+versions exist to solve.
+
+**Resolved at compile time.** A missing or misspelled version fails `compile`,
+before source discovery, credentials, or any provider call — and the error
+lists the versions that do exist:
+
+```
+Model 'classified' references prompt signal_classify/v9, but
+prompts/signal_classify/v9.md does not exist. Available versions of
+'signal_classify': v1, v2.
+```
+
+Name and version are path segments, so they are charset-validated at config
+load; a traversal never parses. Prompt files must be regular, non-symlink
+files inside the project, the same rule project configuration follows.
+
+**Every row records which prompt produced it.** `prompt_name` and
+`prompt_version` join the existing `llm_*` provenance columns, so a query can
+group by them:
+
+```sql
+select prompt_version, count(*), avg(...) from classified group by 1
+```
+
+`llm_config_hash` records that *something* changed — prompt, schema, provider,
+and model identity mixed into one opaque value. These columns say *what ran*.
+An inline prompt leaves both null: there is no stable identity to record,
+which is precisely the gap versioned prompts close, and the config hash omits
+prompt identity entirely in that case so existing models are not re-keyed.
+
+> **Upgrading an existing incremental `llm:` model.** The two columns change
+> the target's schema the next time it publishes rows, which the default
+> `on_schema_change: fail` rejects. Set `on_schema_change: append_new_columns`
+> or run once with `--full-refresh` before it next reprocesses. The upgrade
+> itself reprocesses nothing.
+
+The [run log](#append-only-logs) carries the same two columns, which is what
+makes "did v4 cost more per row than v3" a query rather than an investigation.
+
+**Prompt text never enters an artifact.** `manifest.json` records the resolved
+name and version only. Changing a version file still invalidates incremental
+state, because the resolved text is part of the model's config hash.
+
+> Not yet implemented: a CI gate asserting that a released version file's
+> content hash never changes. Until it lands, editing `v3` in place is a
+> silent reprocess rather than a failed build — the fix is still to add `v4`.
 
 ## Search indexes (local proof of concept)
 

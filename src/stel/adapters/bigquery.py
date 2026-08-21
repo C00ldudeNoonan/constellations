@@ -2448,6 +2448,13 @@ class BigQueryAdapter(WarehouseAdapter):
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            # A log outlives the release that created it, so a later stel
+            # adding a column must widen the table rather than fail every
+            # write — silently, given best-effort log writes (Codex review,
+            # #334). Addition only: nothing is dropped or retyped.
+            schema_update_options=[
+                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+            ],
         )
         self._load_parquet(table, df, job_config)
         return df.height

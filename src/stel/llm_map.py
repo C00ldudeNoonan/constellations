@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from .backends.llm_backend import extract_fields_with_usage
@@ -25,6 +26,7 @@ from .config.profile import DEFAULT_LLM_PROVIDER
 from .credentials import CredentialReference
 from .hashing import canonical_fingerprint
 from .profile import ResolvedProfile
+from .prompts import PromptError, ResolvedPrompt, resolve_prompt
 from .providers import (
     get_inference_provider,
     profile_options_fingerprint,
@@ -79,6 +81,11 @@ class LLMMapRuntime:
     timeout_seconds: float | None
     provider_options: tuple[tuple[str, Any], ...] | None
     config_hash: str
+    # Which prompt produced these rows (issue #303). None for an inline
+    # prompt: there is no stable identity to record, which is the gap
+    # versioned prompts close.
+    prompt_name: str | None = None
+    prompt_version: str | None = None
 
     def identity(self) -> dict[str, str]:
         """Artifact-safe descriptor for manifest/docs and code_version."""
@@ -88,6 +95,9 @@ class LLMMapRuntime:
             "implementation": self.implementation,
             "output_cardinality": self.output_cardinality,
             "config_hash": self.config_hash,
+            # Name and version only — never the text (issue #303, rule 5).
+            "prompt_name": self.prompt_name or "",
+            "prompt_version": self.prompt_version or "",
         }
 
     def _fields_spec(self) -> list[dict[str, Any]]:
@@ -129,12 +139,21 @@ def resolve_llm_runtime(
     config: LLMTransformConfig,
     fields: Sequence[FieldConfig],
     resolved: ResolvedProfile | None,
+    *,
+    project_dir: Path | None = None,
+    model_name: str = "<unnamed>",
 ) -> LLMMapRuntime:
     """Resolve the concrete provider/model/credential context for an `llm:` model.
 
     Node-level `provider`/`model` of ``"default"`` fall back to the profile's
     LLM configuration; operator-owned base URL, cache path, timeout, provider
     options, and api-key reference come from the profile only.
+
+    A `prompt: {name, version}` reference reads `prompts/<name>/<version>.md`
+    under `project_dir` (issue #303). `project_dir` is optional so callers that
+    only need provider identity — docs tooling, an offline `identity()` — still
+    work with inline prompts; a versioned reference without it is a caller
+    wiring error and says so.
     """
     provider_name = _resolve_provider_name(config, resolved)
     profile_llm = resolved.llm if resolved is not None else None
@@ -182,12 +201,27 @@ def resolve_llm_runtime(
     )
 
     fields_spec = build_fields_spec(fields)
+    prompt = _resolved_prompt(config, project_dir, model_name)
     config_hash = canonical_fingerprint(
         {
             "provider": provider_name,
             "model": model,
             "implementation": implementation,
-            "prompt": config.prompt,
+            # The resolved *text*, so editing a version file still invalidates
+            # incremental state. The immutability gate makes that edit a failed
+            # build; the hash makes it correct in the meantime.
+            "prompt": prompt.text,
+            # Identity too — but only when there is any: two versions with
+            # identical text are still different provenance. Omitted entirely
+            # for an inline prompt, so every existing `llm:` model keeps the
+            # config hash it already had. Adding two null keys would have
+            # re-keyed every one of them for no semantic change, reprocessing
+            # corpora to record that nothing was named (Codex review, #334).
+            **(
+                {"prompt_name": prompt.name, "prompt_version": prompt.version}
+                if prompt.name is not None
+                else {}
+            ),
             "output_cardinality": config.output_cardinality,
             "temperature": config.temperature,
             "max_tokens": config.max_tokens,
@@ -209,7 +243,7 @@ def resolve_llm_runtime(
         model=model,
         implementation=implementation,
         output_cardinality=config.output_cardinality,
-        system_prompt=config.prompt,
+        system_prompt=prompt.text,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         max_retries=config.max_retries,
@@ -224,7 +258,26 @@ def resolve_llm_runtime(
             tuple(provider_options.items()) if provider_options else None
         ),
         config_hash=config_hash,
+        prompt_name=prompt.name,
+        prompt_version=prompt.version,
     )
+
+
+def _resolved_prompt(
+    config: LLMTransformConfig, project_dir: Path | None, model_name: str
+) -> ResolvedPrompt:
+    if isinstance(config.prompt, str):
+        return ResolvedPrompt(text=config.prompt)
+    if project_dir is None:
+        raise LLMMapError(
+            f"Model '{model_name}' uses a versioned prompt "
+            f"({config.prompt.name}/{config.prompt.version}), which needs the "
+            "project directory to resolve; this caller did not provide one"
+        )
+    try:
+        return resolve_prompt(config, project_dir, model_name=model_name)
+    except PromptError as error:
+        raise LLMMapError(str(error)) from error
 
 
 def _project_object(obj: Mapping[str, Any], field_names: Sequence[str]) -> dict[str, Any]:

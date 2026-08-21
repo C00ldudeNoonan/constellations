@@ -6,7 +6,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from time import monotonic
@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..adapters.base import ReadPredicate, ReadPredicateOperator
 from ..agent_context import citation_locator, freshness_status
+from ..append_log import query_fingerprint
 from ..search import (
     SearchError,
     SearchFilter,
@@ -270,10 +271,19 @@ class ContextService:
         )
 
     def search_context(self, request: SearchContextRequest) -> SearchContextResponse:
-        return self._respond(
-            lambda: self._search_context(request),
+        # The log row is collected inside the guarded operation but written
+        # after it returns, so a slow warehouse cannot spend the request
+        # deadline and turn a served answer into a TIMEOUT (Codex review,
+        # #333). A per-call list keeps this thread-safe under the limiter's
+        # concurrency.
+        pending: list[Mapping[str, Any]] = []
+        response = self._respond(
+            lambda: self._search_context(request, pending),
             lambda error: SearchContextResponse(error=error),
         )
+        for row in pending:
+            self._repository.log_query(row)
+        return response
 
     def get_document(self, request: GetDocumentRequest) -> GetDocumentResponse:
         return self._respond(
@@ -406,7 +416,12 @@ class ContextService:
             next_cursor=next_cursor,
         )
 
-    def _search_context(self, request: SearchContextRequest) -> SearchContextResponse:
+    def _search_context(
+        self,
+        request: SearchContextRequest,
+        pending_log: list[Mapping[str, Any]] | None = None,
+    ) -> SearchContextResponse:
+        started = monotonic()
         authorized = self._authorize_resource(request.model)
         resource = authorized.resource
         if request.limit > self._settings.max_results:
@@ -463,7 +478,58 @@ class ContextService:
             self._search_result(resource, hit, row, registry, links)
             for hit, row, registry in readable[: request.limit]
         )
+        if pending_log is not None:
+            pending_log.append(
+                self._query_log_row(
+                    request,
+                    authorized.principal,
+                    resource_name=resource.name,
+                    results=results,
+                    elapsed_ms=round((monotonic() - started) * 1000, 3),
+                )
+            )
         return SearchContextResponse(results=results)
+
+    def _query_log_row(
+        self,
+        request: SearchContextRequest,
+        principal: Principal,
+        *,
+        resource_name: str,
+        results: tuple[SearchContextResult, ...],
+        elapsed_ms: float,
+    ) -> Mapping[str, Any]:
+        """Build one served query's log row.
+
+        Built after authorization and policy filtering, so the row reflects
+        what the caller was actually allowed to see — a log of pre-filter hits
+        would leak the existence of documents the principal cannot read.
+
+        The query fingerprint is always recorded and the text never is unless
+        the target separately opted in: "which questions repeat, and which
+        return nothing" is answerable without keeping what anyone typed.
+        """
+        return {
+            "logged_at": datetime.now(UTC).isoformat(),
+            "principal_id": principal.subject_id,
+            "tenant_id": principal.tenant_id,
+            "model_name": resource_name,
+            "mode": request.mode,
+            "query_fingerprint": query_fingerprint(request.query),
+            "query_text": (
+                request.query
+                if self._repository.query_log_captures_text()
+                else None
+            ),
+            "requested_limit": request.limit,
+            "result_count": len(results),
+            # The cheapest quality signal there is, materialized as a column
+            # so it is a WHERE clause rather than a computation.
+            "zero_results": not results,
+            "returned_chunk_ids": [result.chunk_id for result in results],
+            "top_score": results[0].score if results else None,
+            "elapsed_ms": elapsed_ms,
+        }
 
     def _get_document(self, request: GetDocumentRequest) -> GetDocumentResponse:
         authorized = self._authorize_resource(request.model)

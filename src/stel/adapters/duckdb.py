@@ -445,6 +445,26 @@ class DuckDBAdapter(WarehouseAdapter):
             self.connection.unregister("stel_staging")
         return df.height
 
+    def append_rows(self, table: str, df: pl.DataFrame) -> int:
+        if df.height == 0:
+            return 0
+        full = self.table_ref(table)
+        self.connection.register("stel_append", df)
+        try:
+            # BY NAME tolerates a log whose column order differs from an
+            # older table's; a genuinely new column still fails loudly rather
+            # than silently dropping history.
+            self.connection.execute(
+                f"CREATE TABLE IF NOT EXISTS {full} AS "
+                "SELECT * FROM stel_append WHERE false"
+            )
+            self.connection.execute(
+                f"INSERT INTO {full} BY NAME SELECT * FROM stel_append"
+            )
+        finally:
+            self.connection.unregister("stel_append")
+        return df.height
+
     def materialize_sql_full(
         self,
         table: str,

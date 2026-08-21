@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -54,9 +55,24 @@ MISSING_ID = "0" * 32
 
 
 class FakeRepository:
-    def __init__(self, rows: Mapping[str, Sequence[Mapping[str, Any]]]) -> None:
+    def __init__(
+        self,
+        rows: Mapping[str, Sequence[Mapping[str, Any]]],
+        *,
+        capture_query_text: bool = False,
+    ) -> None:
         self.rows = rows
         self.calls: list[tuple[str, tuple[ReadPredicate, ...]]] = []
+        # Query-log rows the service handed us (issue #329), so tests can
+        # assert what a served query records without a warehouse.
+        self.logged: list[Mapping[str, Any]] = []
+        self._capture_query_text = capture_query_text
+
+    def log_query(self, row: Mapping[str, Any]) -> None:
+        self.logged.append(row)
+
+    def query_log_captures_text(self) -> bool:
+        return self._capture_query_text
 
     def read_rows(
         self,
@@ -430,11 +446,12 @@ def _service(
     *,
     principal: Principal | None = None,
     settings: ContextServerSettings | None = None,
+    repository: FakeRepository | None = None,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = FakeSearch()
     service = ContextService(
         catalog=_artifact_catalog(),
-        repository=FakeRepository(_fixture_rows()),
+        repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
         principal_resolver=StaticPrincipalResolver(
             principal
@@ -746,3 +763,161 @@ async def test_mcp_protocol_discovers_exactly_four_read_only_tools() -> None:
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+# ─── MCP query log (issue #329 phase 1) ─────────────────────────────────────
+
+
+def _searched(repository: FakeRepository, query: str = "inflation and employment"):
+    service, _ = _service(repository=repository)
+    try:
+        return service.search_context(
+            SearchContextRequest(model="context_search", query=query, mode="text")
+        )
+    finally:
+        service.close()
+
+
+def test_a_served_query_is_logged_with_a_fingerprint_not_its_text() -> None:
+    """The privacy default: fingerprint always, text never unless opted in.
+
+    "Which questions repeat, and which return nothing" is answerable without
+    storing what anyone typed.
+    """
+    from stel.append_log import query_fingerprint
+
+    repository = FakeRepository(_fixture_rows())
+
+    response = _searched(repository)
+
+    assert response.error is None
+    assert len(repository.logged) == 1
+    row = repository.logged[0]
+    assert row["query_fingerprint"] == query_fingerprint("inflation and employment")
+    assert row["query_text"] is None
+    assert "inflation" not in json.dumps(row)
+
+
+def test_capture_query_text_is_a_separate_opt_in() -> None:
+    repository = FakeRepository(_fixture_rows(), capture_query_text=True)
+
+    _searched(repository)
+
+    assert repository.logged[0]["query_text"] == "inflation and employment"
+
+
+def test_the_log_records_the_principal_and_what_was_served() -> None:
+    repository = FakeRepository(_fixture_rows())
+
+    _searched(repository)
+
+    row = repository.logged[0]
+    assert row["principal_id"] == "local-user"
+    assert row["tenant_id"] == "research"
+    assert row["model_name"] == "context_search"
+    assert row["result_count"] == 1
+    assert row["zero_results"] is False
+    # Post-authorization: only chunks this principal was allowed to see.
+    assert row["returned_chunk_ids"] == [CHUNK_ALLOWED_1]
+
+
+class EmptySearch(FakeSearch):
+    def execute(
+        self,
+        request: SearchRequest,
+        *,
+        policy_filters: Sequence[SearchFilter],
+    ) -> Sequence[SearchResult]:
+        del request, policy_filters
+        return ()
+
+
+def test_a_zero_result_query_is_logged_as_such() -> None:
+    """The cheapest quality signal there is, materialized as a column.
+
+    A question the index cannot answer is exactly what a chunking or metadata
+    gap looks like from outside, so it has to be a `WHERE` clause rather than
+    something reconstructed from an empty id list.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service = ContextService(
+        catalog=_artifact_catalog(),
+        repository=repository,
+        context_search=EmptySearch(),
+        principal_resolver=StaticPrincipalResolver(
+            Principal(
+                "local-user",
+                tenant_id="research",
+                policy_claims={"classification": "internal"},
+            )
+        ),
+        authorization=ClaimAuthorizationProvider(),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="nothing answers this", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.results == ()
+    row = repository.logged[0]
+    assert row["zero_results"] is True
+    assert row["result_count"] == 0
+    assert row["returned_chunk_ids"] == []
+    assert row["top_score"] is None
+
+
+def test_a_denied_request_logs_nothing() -> None:
+    # Logging happens after authorization, so a refused request leaves no row
+    # — and cannot be used to probe which models exist.
+    service, _ = _service(
+        principal=Principal("intruder", tenant_id="other"),
+        repository=(repository := FakeRepository(_fixture_rows())),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(model="context_search", query="x", mode="text")
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert repository.logged == []
+
+
+def test_a_slow_log_write_cannot_time_out_a_served_answer() -> None:
+    """Logging happens outside the request deadline.
+
+    The limiter times the guarded operation; a synchronous append inside it
+    meant a stalled warehouse could turn an otherwise successful search into
+    a TIMEOUT, contradicting the best-effort guarantee (Codex review, #333).
+    """
+
+    class SlowLogRepository(FakeRepository):
+        def log_query(self, row: Mapping[str, Any]) -> None:
+            time.sleep(0.3)
+            super().log_query(row)
+
+    repository = SlowLogRepository(_fixture_rows())
+    # A deadline far shorter than the log write: if the write were inside it,
+    # this search would fail.
+    service, _ = _service(
+        repository=repository,
+        settings=ContextServerSettings(timeout_seconds=0.15),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert len(response.results) == 1
+    assert len(repository.logged) == 1

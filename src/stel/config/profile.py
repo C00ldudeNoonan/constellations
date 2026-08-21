@@ -11,6 +11,7 @@ from pydantic import (
     GetCoreSchemaHandler,
     GetJsonSchemaHandler,
     PrivateAttr,
+    field_validator,
 )
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
@@ -22,7 +23,7 @@ from ..credentials import (
     ProtectedCredential,
 )
 from ..endpoints import OpenAICompatibleBaseUrl
-from .identifiers import DEFAULT_SCHEMA_NAME
+from .identifiers import DEFAULT_SCHEMA_NAME, validate_node_name
 
 DEFAULT_LLM_API_KEY_ENV = "ANTHROPIC_API_KEY"
 DEFAULT_LLM_PROVIDER = "anthropic"
@@ -338,6 +339,46 @@ class RetrievalProfileConfig(BaseModel):
     stores: dict[str, dict[str, Any]]
 
 
+class AppendLogConfig(BaseModel):
+    """An opt-in, append-only history table for this target.
+
+    Shared by the run log (issue #306) and the MCP query log (issue #329):
+    both are the same primitive — rows added, never rewritten, in a relation
+    stel creates on first write. Off by default, because a log is data the
+    operator chose to keep.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    enabled: bool = False
+    relation: str
+
+    @field_validator("relation")
+    @classmethod
+    def _validate_relation(cls, v: str) -> str:
+        return validate_node_name(v, kind="Log relation")
+
+
+class QueryLogConfig(AppendLogConfig):
+    """The MCP query log (issue #329, phase 1).
+
+    `capture_query_text` is a *second* opt-in beyond `enabled`, and stays off
+    even when the log is on: a query fingerprint answers "which questions
+    repeat, and which return nothing" without storing what anyone typed.
+    Turning it on records user-authored text in the warehouse, so it is a
+    deliberate, separate decision.
+    """
+
+    relation: str = "stel_mcp_query_log"
+    capture_query_text: bool = False
+
+
+class RunLogConfig(AppendLogConfig):
+    """The per-run inference usage log (issue #306)."""
+
+    relation: str = "stel_run_log"
+
+
 class TargetConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -351,6 +392,10 @@ class TargetConfig(BaseModel):
     llm: LLMConfig | None = None
     embedding: EmbeddingProfileConfig | None = None
     retrieval: RetrievalProfileConfig | None = None
+    run_log: RunLogConfig | None = Field(default=None, alias="run-log")
+    mcp_query_log: QueryLogConfig | None = Field(
+        default=None, alias="mcp-query-log"
+    )
     # Operator-owned source roots for this target. Keys are source names from
     # project YAML; values replace SourceConfig.path after target resolution.
     source_paths: dict[str, str] = Field(default_factory=dict, alias="source-paths")

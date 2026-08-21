@@ -1370,6 +1370,24 @@ to see the plan first."""
             raise self._guard_relation_read(qualified, error) from error
         return int(value or 0)
 
+    def append_rows(self, table: str, df: pl.DataFrame) -> int:
+        """Append `df` to `table`, creating the relation on first write.
+
+        The primitive behind stel's append-only logs (issues #306, #329): a
+        run log and an MCP query log are histories, never rewritten, so they
+        need adding-without-replacing rather than the upsert
+        `materialize_incremental` provides. Creating on first write keeps the
+        logs opt-in with no separate provisioning step.
+
+        Adapters implement this natively; there is no portable SQL fallback,
+        because the create-or-insert split and its concurrency behavior are
+        dialect-specific.
+        """
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' does not implement "
+            "append_rows, so append-only logs cannot be written to it"
+        )
+
     def row_count(self, table: str) -> int:
         """Return the relation row count through a typed core operation."""
         self.require_capability(

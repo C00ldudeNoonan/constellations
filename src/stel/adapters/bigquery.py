@@ -2437,6 +2437,21 @@ class BigQueryAdapter(WarehouseAdapter):
             self.drop_table(staging)
         return df.height
 
+    def append_rows(self, table: str, df: pl.DataFrame) -> int:
+        if df.height == 0:
+            return 0
+        bigquery = _bigquery()
+        # WRITE_APPEND with the default CREATE_IF_NEEDED disposition both
+        # creates the log on first write and adds to it thereafter, in one
+        # job — no existence probe, so concurrent writers cannot race between
+        # the check and the insert.
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        self._load_parquet(table, df, job_config)
+        return df.height
+
     def materialize_full_chunks(
         self,
         table: str,

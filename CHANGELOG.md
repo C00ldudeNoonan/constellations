@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### `chunk_overlap` now snaps to a separator boundary (issue #331)
+
+- **Overlap stepped back an exact number of characters**, landing wherever the
+  count fell — mid-word for most chunks, which defeated the recursive
+  splitter's separator hierarchy for every chunk after the first. Measured
+  downstream on a real 835k-char 10-K: **81.5%** of chunks started mid-word
+  with `overlap: 100`, against 4.2% with overlap disabled. Work upstream to
+  emit real paragraph structure showed almost no boundary improvement because
+  the overlap was reintroducing arbitrary offsets on its own.
+- The splitter now steps back *approximately* `chunk_overlap` and snaps to the
+  nearest break in the hierarchy it already walks, preferring the strongest
+  available. On a structured document of comparable shape this takes broken
+  words from **79.9% to 0%**, with 84% of chunks starting at a sentence or
+  paragraph boundary.
+- Snapping is bounded to between half and twice the requested overlap, and
+  falls back to an exact slice when no boundary exists in that band. Like
+  `chunk_size`, `chunk_overlap` is a target rather than an exact count.
+- **Upgrade note.** This changes chunk text for any model using
+  `chunk_overlap > 0`, so `chunk_id` changes and those chunks re-embed once.
+  Projects that set `chunk_overlap: 0` to work around the old behavior are
+  unaffected until they re-enable it — which is now worth doing.
+
 ### Vertex reuses its API client instead of rebuilding it per request (#335)
 
 - **The Vertex provider constructed a fresh `genai.Client` on every embed

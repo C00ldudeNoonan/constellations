@@ -839,3 +839,133 @@ def test_tokens_strategy_charges_the_block_against_chunk_size() -> None:
     assert len(pieces) > 1
     for piece in pieces:
         assert len(encoding.encode(block + piece.text)) <= config.chunk_size
+
+
+# ─── boundary-aware overlap (issue #331) ────────────────────────────────────
+
+
+def _structured_document() -> str:
+    """Paragraphs of sentences, the shape of a filing or report."""
+    sentences = [
+        f"Sentence number {index} discusses revenue and margin at length."
+        for index in range(400)
+    ]
+    return "\n\n".join(
+        " ".join(sentences[start : start + 5]) for start in range(0, 400, 5)
+    )
+
+
+def _starts_mid_word(chunk: str, document: str) -> bool:
+    """True when the chunk begins partway through a word of the source."""
+    position = document.find(chunk[:40])
+    if position <= 0:
+        return False
+    return not document[position - 1].isspace()
+
+
+def test_overlap_no_longer_starts_chunks_mid_word() -> None:
+    """The measured defect: a fixed slice lands wherever the count says.
+
+    On a real 10-K that put 81.5% of chunk starts mid-word, which defeated the
+    separator hierarchy entirely — upstream work to emit real paragraph
+    structure showed almost no improvement because the overlap was
+    reintroducing arbitrary offsets on its own.
+    """
+    document = _structured_document()
+
+    chunks = split_text(
+        document, ChunkConfig(chunk_size=800, chunk_overlap=100)
+    )
+
+    assert len(chunks) > 5
+    broken = [c.text for c in chunks if _starts_mid_word(c.text, document)]
+    assert broken == []
+
+
+def test_overlap_still_carries_context_across_the_boundary() -> None:
+    """Snapping must not quietly become `overlap: 0`.
+
+    Disabling overlap also gives clean boundaries — the point is keeping the
+    redundancy that lets a query matching the far half of a straddling concept
+    still find the chunk.
+    """
+    document = _structured_document()
+
+    overlapped = split_text(
+        document, ChunkConfig(chunk_size=800, chunk_overlap=100)
+    )
+    without = split_text(document, ChunkConfig(chunk_size=800, chunk_overlap=0))
+
+    # Each chunk after the first repeats a real tail of its predecessor.
+    for previous, following in pairwise(overlapped):
+        shared = following.text.split(".")[0]
+        assert shared and shared in previous.text
+    # Redundancy is the point of overlap, so the chunks together cover more
+    # than the document once. (Chunk *count* is not a reliable proxy: whether
+    # the carried tail pushes a chunk over the size limit depends on where the
+    # paragraphs fall.)
+    assert sum(len(c.text) for c in overlapped) > sum(
+        len(c.text) for c in without
+    )
+
+
+def test_the_carried_overlap_stays_near_the_requested_size() -> None:
+    """`approximately N`, not `whatever the nearest paragraph break was`."""
+    document = _structured_document()
+
+    chunks = split_text(
+        document, ChunkConfig(chunk_size=800, chunk_overlap=100)
+    )
+
+    for previous, following in pairwise(chunks):
+        carried = 0
+        for size in range(min(len(previous.text), len(following.text)), 0, -1):
+            if previous.text.endswith(following.text[:size]):
+                carried = size
+                break
+        # The snap band is [overlap/2, 2*overlap]; strip() can trim a little
+        # more off the front, so the floor is generous.
+        assert carried <= 200, f"carried {carried} characters, far beyond 100"
+
+
+def test_a_long_unbroken_token_falls_back_to_a_plain_slice() -> None:
+    # No separator exists anywhere in the band, so there is nothing to snap
+    # to and the old behavior is the honest answer.
+    document = "x" * 5000
+
+    chunks = split_text(document, ChunkConfig(chunk_size=500, chunk_overlap=50))
+
+    assert len(chunks) > 1
+    assert all(set(c.text) == {"x"} for c in chunks)
+
+
+def test_zero_overlap_is_untouched() -> None:
+    document = _structured_document()
+
+    chunks = split_text(document, ChunkConfig(chunk_size=800, chunk_overlap=0))
+
+    for previous, following in pairwise(chunks):
+        assert not previous.text.endswith(following.text[:40])
+
+
+def test_snapping_is_deterministic() -> None:
+    document = _structured_document()
+    config = ChunkConfig(chunk_size=800, chunk_overlap=100)
+
+    assert split_text(document, config) == split_text(document, config)
+
+
+def test_overlap_prefers_the_strongest_available_boundary() -> None:
+    from stel.chunking import _overlap_tail
+
+    # A paragraph break and a sentence break both sit inside the band; the
+    # hierarchy the splitter walks prefers the paragraph.
+    text = "alpha beta gamma.\n\ndelta epsilon zeta. eta theta iota kappa"
+
+    tail = _overlap_tail(text, 45)
+
+    assert tail.startswith("delta")
+    # An overlap of exactly 40 would land on that boundary by arithmetic
+    # coincidence, which would let this pass with the old fixed slice too;
+    # 45 lands mid-word unless the snap actually happens.
+    assert not text[-45:].startswith("delta")

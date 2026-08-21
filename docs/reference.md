@@ -1410,6 +1410,21 @@ for incremental MERGE into a warehouse or keyed publish to a retrieval store).
   materialization: incremental
 ```
 
+`chunk_overlap` carries the tail of each chunk into the next, so a concept
+straddling a boundary is findable from either side. The carried text **starts
+on a separator boundary**: the splitter steps back approximately
+`chunk_overlap` characters and snaps to the nearest break in the same
+hierarchy it splits on (`
+
+` → `
+` → sentence → word), preferring the
+strongest available. A fixed step back would land wherever the count fell —
+mid-word for most chunks — which defeats the separator hierarchy for every
+chunk after the first. Like `chunk_size`, `chunk_overlap` is therefore a
+target rather than an exact count; snapping is bounded to between half and
+twice the requested overlap, and falls back to an exact slice when no
+boundary exists in that band (one very long token, say).
+
 ### Metadata the embedder can actually see
 
 Carried columns serve SQL perfectly — filtering, joining, building a citation.

@@ -1794,6 +1794,19 @@ against the attribute's declared type, and only attributes with
 `filter_role: user` can be supplied by a caller. Multiple filters are combined
 with AND.
 
+Every declared `data_type` is filterable, temporal types included:
+
+```bash
+stel search --model chunk_search --query "tariffs" --mode vector   --filter filing_date_dt ge 2020-01-01
+```
+
+Date and timestamp values are rendered as typed SQL literals (`DATE '…'`,
+`TIMESTAMP '…'`) rather than quoted strings, because a quoted string is text
+to the query engine and will not compare against a `date32` or timestamp
+column. A round-trip test executes one filter per declared type against a real
+store, so a filter that validates at authoring time cannot fail at query time
+on the caller.
+
 The same request is available as a provider-neutral Python API:
 
 ```python

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed: date and timestamp search filters (issue #337)
+
+- **A `data_type: date` or `timestamp` search attribute accepted filters that
+  always failed at query time.** The predicate compiler rendered temporal
+  values as quoted strings, which the query engine reads as text and refuses
+  to compare against a `date32`/timestamp column — so config validation and
+  index build both passed and the failure landed on the querying agent as an
+  opaque `lancedb_vector_search_failed`. Temporal values are now typed
+  literals (`DATE '…'`, `TIMESTAMP '…'`).
+- Date scoping ("filings since 2020") is the most natural filter for any dated
+  corpus, and the only previous workaround was declaring the column as a
+  string and relying on ISO-8601 lexical ordering.
+- A regression test now round-trips one filtered query per declared
+  `data_type` against a real LanceDB store, plus a compiler-level test that
+  executes temporal predicates against real `date32`/timestamp columns —
+  asserting on the generated SQL text alone would not have caught this.
+
+
 ### Versioned prompts (issue #303)
 
 - **`prompt: { name, version }`** on an `llm:` model resolves

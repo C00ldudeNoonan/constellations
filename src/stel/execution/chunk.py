@@ -20,7 +20,7 @@ from ..chunking import (
     render_metadata_block,
     split_text,
 )
-from ..config.model import ModelConfig
+from ..config.model import CHUNK_GENERATED_FIELDS, ModelConfig
 from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
 from ..versioning import compute_code_version
@@ -28,18 +28,7 @@ from .contracts import ModelRunResult, RunError
 from .values import scalarize
 from .warehouse import warehouse_options
 
-_CHUNK_GENERATED_FIELDS = frozenset(
-    {
-        "chunk_id",
-        "document_id",
-        "chunk_index",
-        "chunk_count",
-        "text",
-        "chunk_strategy",
-        "code_version",
-        "chunked_at",
-    }
-)
+_CHUNK_GENERATED_FIELDS = CHUNK_GENERATED_FIELDS
 _CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
 
 
@@ -69,6 +58,15 @@ def run_chunk_model(
             f"Chunk model '{model.name}': upstream '{upstream}' has no "
             "`document_id`; chunk models read extraction outputs."
         )
+    if chunk_config.headings is not None:
+        column = chunk_config.headings.column
+        if column in frame.columns:
+            raise RunError(
+                f"Chunk model '{model.name}': `chunk.headings.column` is "
+                f"'{column}', which upstream '{upstream}' already has. The "
+                "attribution would overwrite it; name the heading column "
+                "something else."
+            )
     missing_metadata = [
         column
         for column in chunk_config.in_text_metadata
@@ -145,6 +143,12 @@ def run_chunk_model(
                     piece_index=piece.index,
                     chunk_count=len(pieces),
                     text=block + piece.text,
+                    section_column=(
+                        chunk_config.headings.column
+                        if chunk_config.headings is not None
+                        else None
+                    ),
+                    section=piece.section,
                     strategy=chunk_config.strategy,
                     code_version=code_version,
                     chunked_at=chunked_at,
@@ -169,7 +173,19 @@ def run_chunk_model(
             deleted = len(removed)
 
     rows_written = 0
-    chunk_frame = pl.DataFrame(rows) if rows else pl.DataFrame()
+    # An explicit dtype for the section column: a first batch whose pattern
+    # matched no headings supplies only nulls, which polars infers as `Null`
+    # and DuckDB materializes as an integer column — so the next batch that
+    # does find a heading fails converting a string into it (Codex review,
+    # #343, and the same failure mode as the append-only logs in #333).
+    section_schema = (
+        {chunk_config.headings.column: pl.String}
+        if chunk_config.headings is not None
+        else None
+    )
+    chunk_frame = (
+        pl.DataFrame(rows, schema_overrides=section_schema) if rows else pl.DataFrame()
+    )
     if model.materialization == "full" or full_refresh:
         rows_written = adapter.materialize_full(
             model.name,
@@ -252,6 +268,8 @@ def chunk_row(
     strategy: str,
     code_version: str,
     chunked_at: str,
+    section_column: str | None = None,
+    section: str | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         column: scalarize(value) for column, value in carried.items()
@@ -268,4 +286,6 @@ def chunk_row(
             "chunked_at": chunked_at,
         }
     )
+    if section_column is not None:
+        row[section_column] = section
     return row

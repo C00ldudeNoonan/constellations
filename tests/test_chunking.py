@@ -969,3 +969,280 @@ def test_overlap_prefers_the_strongest_available_boundary() -> None:
     # coincidence, which would let this pass with the old fixed slice too;
     # 45 lands mid-word unless the snap actually happens.
     assert not text[-45:].startswith("delta")
+
+
+# ─── heading attribution (issue #332) ───────────────────────────────────────
+
+_FILING = (
+    "Item 1. Business\n\n"
+    + "We operate in several segments. " * 6
+    + "\n\nItem 1A. Risk Factors\n\n"
+    + "Tariffs could affect margins. " * 6
+    + "\n\nItem 7. Discussion\n\n"
+    + "Revenue grew modestly. " * 6
+)
+_ITEM_PATTERN = r"^(Item\s+\d{1,2}[A-C]?)[.:]"
+
+
+def _sectioned(**overrides: Any) -> list[Any]:
+    config = ChunkConfig(
+        chunk_size=overrides.pop("chunk_size", 150),
+        chunk_overlap=overrides.pop("chunk_overlap", 20),
+        headings={"pattern": _ITEM_PATTERN, **overrides},
+    )
+    return split_text(_FILING, config)
+
+
+def test_every_chunk_is_attributed_to_its_heading() -> None:
+    """The splitter knows the full text and every boundary; use that.
+
+    A downstream transform re-derives section membership from chunk fragments
+    and misses the cases offsets settle outright.
+    """
+    chunks = _sectioned()
+
+    assert len(chunks) > 3
+    for chunk in chunks:
+        expected = None
+        for name in ("Item 7", "Item 1A", "Item 1"):
+            if _FILING.index(f"{name}.") <= _FILING.index(chunk.text[:30]):
+                expected = name
+                break
+        assert chunk.section == expected
+
+
+def test_a_chunk_opening_a_section_belongs_to_it() -> None:
+    # The heading sits at the chunk's very first character; it covers that
+    # chunk rather than the previous section.
+    chunks = _sectioned()
+
+    opening = next(c for c in chunks if c.text.startswith("Item 1A."))
+    assert opening.section == "Item 1A"
+
+
+def test_text_before_the_first_heading_has_no_section() -> None:
+    preamble = "Cover page text here.\n\nItem 1. Business\n\nBody follows here."
+
+    chunks = split_text(
+        preamble,
+        ChunkConfig(
+            chunk_size=40, chunk_overlap=0, headings={"pattern": _ITEM_PATTERN}
+        ),
+    )
+
+    assert chunks[0].section is None
+    assert chunks[-1].section == "Item 1"
+
+
+def test_a_capture_group_names_the_section() -> None:
+    # Without a group the whole match is the name, so the author chooses
+    # whether trailing punctuation is part of it rather than stel guessing.
+    with_group = _sectioned()[0].section
+    without_group = split_text(
+        _FILING,
+        ChunkConfig(
+            chunk_size=150,
+            chunk_overlap=20,
+            headings={"pattern": r"^Item\s+\d{1,2}[A-C]?[.:]"},
+        ),
+    )[0].section
+
+    assert with_group == "Item 1"
+    assert without_group == "Item 1."
+
+
+def test_no_headings_configured_leaves_the_section_unset() -> None:
+    chunks = split_text(_FILING, ChunkConfig(chunk_size=150, chunk_overlap=20))
+
+    assert all(chunk.section is None for chunk in chunks)
+
+
+def test_a_pattern_matching_nothing_attributes_nothing() -> None:
+    chunks = split_text(
+        _FILING,
+        ChunkConfig(
+            chunk_size=150, chunk_overlap=20, headings={"pattern": r"^Section\s+\d+"}
+        ),
+    )
+
+    assert all(chunk.section is None for chunk in chunks)
+
+
+def test_attribution_survives_overlap() -> None:
+    """The carried tail moves a chunk's start earlier, and the offset with it.
+
+    A chunk whose overlap reaches back into the previous section still belongs
+    to the section its own start falls in.
+    """
+    without = _sectioned(chunk_overlap=0)
+    with_overlap = _sectioned(chunk_overlap=40)
+
+    assert [c.section for c in without].count("Item 1A") > 0
+    assert [c.section for c in with_overlap].count("Item 1A") > 0
+    for chunk in with_overlap:
+        assert chunk.section in {"Item 1", "Item 1A", "Item 7"}
+
+
+def test_headings_require_the_recursive_strategy() -> None:
+    # Token splitting has no source offsets, so attribution would be a guess.
+    with pytest.raises(ValueError, match="requires `strategy: recursive`"):
+        ChunkConfig(strategy="tokens", headings={"pattern": _ITEM_PATTERN})
+
+
+def test_an_invalid_heading_pattern_is_rejected_at_config_load() -> None:
+    with pytest.raises(ValueError, match="not a valid regex"):
+        ChunkConfig(headings={"pattern": "["})
+    with pytest.raises(ValueError, match="at most one capture group"):
+        ChunkConfig(headings={"pattern": "^(a)(b)"})
+
+
+def test_a_chunk_straddling_a_boundary_belongs_where_it_starts() -> None:
+    """The rule is "the last heading at or before the chunk's start".
+
+    A chunk can contain the *next* section's heading in its tail while still
+    being mostly the previous section's content, and it belongs to the
+    previous one. Pinned because it is a semantics choice a reader has to
+    know, and the case a downstream transform re-deriving from fragments gets
+    wrong — it sees the heading text and claims the whole chunk.
+    """
+    document = (
+        "Item 1. Business\n\n"
+        + "Body sentence here. " * 4
+        + "\n\nItem 1A. Risk Factors\n\n"
+        + "Risk sentence here. " * 4
+    )
+
+    chunks = split_text(
+        document,
+        ChunkConfig(
+            chunk_size=170, chunk_overlap=0, headings={"pattern": _ITEM_PATTERN}
+        ),
+    )
+
+    straddling = [c for c in chunks if "Item 1A." in c.text and c.section == "Item 1"]
+    assert straddling, "expected a chunk carrying the next heading in its tail"
+    # And the heading text itself is never dropped from the corpus.
+    assert any("Item 1A." in c.text for c in chunks)
+
+
+# ─── review follow-ups (PR #343) ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("column", ["chunk_id", "text", "chunk_index"])
+def test_a_generated_column_is_never_a_heading_column(column: str) -> None:
+    """The upstream-column guard cannot catch these.
+
+    An extraction model has no `chunk_id`, so `column: chunk_id` passed that
+    check and then overwrote every generated chunk id with a section name —
+    duplicate identifiers on a full materialization, failed key validation on
+    an incremental one.
+    """
+    # `text` is additionally the default `text_field`, so it trips that guard
+    # first — either refusal is correct, the point is that none of these can
+    # silently overwrite a generated value.
+    with pytest.raises(
+        ValueError, match=r"chunk model generates|must not be the text field"
+    ):
+        ChunkConfig(headings={"pattern": "^x", "column": column})
+
+
+def test_a_heading_above_the_bmp_attributes_correctly() -> None:
+    """Attribution bisects offsets, not `(offset, name)` tuples.
+
+    Comparing tuples needs a sentinel name sorting after every possible
+    heading, and none exists: "\uffff" sorts before an astral character, so a
+    chunk opening "🚀 Overview" landed in the previous section.
+    """
+    document = (
+        "\U0001F680 Overview\n\n"
+        + "Body text here. " * 6
+        + "\n\n\U0001F30D Global\n\n"
+        + "More body text. " * 6
+    )
+
+    chunks = split_text(
+        document,
+        ChunkConfig(
+            chunk_size=110, chunk_overlap=0, headings={"pattern": r"^(\S+ \w+)$"}
+        ),
+    )
+
+    opening = next(c for c in chunks if c.text.startswith("\U0001F30D"))
+    assert opening.section == "\U0001F30D Global"
+    assert chunks[0].section == "\U0001F680 Overview"
+
+
+def test_a_heading_less_first_batch_does_not_fix_the_column_type(
+    tmp_path: Path,
+) -> None:
+    """Explicit dtype, not one inferred from the first batch.
+
+    A first document whose pattern matches nothing supplies only nulls, which
+    polars infers as `Null` and DuckDB materializes as an integer column — so
+    the next document that *does* find a heading fails converting a string
+    into it. Same failure mode as the append-only logs in #333.
+    """
+    from stel.runner import run_project
+
+    project = _heading_project(tmp_path)
+    _write_document(project, "a", "Plain prose with no heading at all. " * 6)
+    run_project(project)
+
+    _write_document(
+        project, "b", "Item 1. Business\n\n" + "Real content here. " * 6
+    )
+    run_project(project)
+
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        dtype = con.execute(
+            "SELECT section FROM main.filing_chunks LIMIT 0"
+        ).description[0][1]
+        sections = {
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT section FROM main.filing_chunks"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert dtype == "VARCHAR"
+    assert sections == {None, "Item 1"}
+
+
+def _heading_project(tmp_path: Path) -> Path:
+    project = tmp_path / "proj"
+    (project / "models").mkdir(parents=True)
+    (project / "sources").mkdir()
+    (project / "data" / "docs").mkdir(parents=True)
+    (project / "stel_project.yml").write_text(
+        "name: ns\nversion: '0.1.0'\nprofile: ns\n"
+    )
+    (project / "profiles.yml").write_text(
+        "ns:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
+        "        type: duckdb\n        path: ./target/db.duckdb\n"
+        "        schema: main\n"
+    )
+    (project / "sources" / "s.yml").write_text(
+        "version: 2\nsources:\n  - name: docs\n    path: data/docs\n"
+        "    file_pattern: '*.json'\n"
+    )
+    (project / "models" / "m.yml").write_text(
+        "version: 2\nmodels:\n  - name: filings\n    source: ref('docs')\n"
+        "    extraction:\n      backend: json\n      options:\n"
+        "        fields: [doc_id, body]\n    materialization: incremental\n"
+        "  - name: filing_chunks\n    depends_on: [ref('filings')]\n"
+        "    chunk:\n      strategy: recursive\n      text_field: body\n"
+        "      chunk_size: 120\n      chunk_overlap: 0\n"
+        "      headings:\n        pattern: '^(Item\s+\d+)[.:]'\n"
+        "    materialization: incremental\n"
+    )
+    return project
+
+
+def _write_document(project: Path, name: str, body: str) -> None:
+    import json
+
+    (project / "data" / "docs" / f"{name}.json").write_text(
+        json.dumps({"doc_id": name, "body": body})
+    )

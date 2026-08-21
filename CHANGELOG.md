@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### `chunk:` attributes each chunk to its heading (issue #332)
+
+- **`chunk.headings.pattern`** detects section headings while splitting and
+  emits a `section` column: the last heading at or before each chunk's start.
+  The column rides the embed step's passthrough onto the search index, turning
+  "risk factors mentioning tariffs" into `section = 'Item 1A'` plus similarity
+  rather than similarity alone.
+- **Attribution is exact, not heuristic.** The splitter sees the full document
+  and every boundary offset; a downstream transform sees only chunk texts and
+  has to re-derive membership from fragments — missing the cases offsets
+  settle outright, such as a chunk carrying the next heading in its tail.
+- A capture group in the pattern names the section, so the author decides
+  whether trailing punctuation belongs to it rather than stel guessing.
+- Text before the first heading has no section. `headings:` requires
+  `strategy: recursive` (attribution needs source offsets the token splitter
+  does not produce); naming a column the upstream already has, or one the
+  chunk model generates itself (`chunk_id`, `chunk_index`, …), fails at config
+  load rather than overwriting it.
+- The section column is created with an explicit string type, so a first batch
+  whose pattern matches no headings cannot fix it as an integer column and
+  strand every later batch that does find one.
+- Complements in-text metadata (#308) rather than overlapping it: that puts
+  document context into the embedded text; this is a structured, filterable
+  attribute.
+
 ### Fixed: DuckDB sessions are pinned to UTC (issue #339)
 
 - **A genuinely-UTC timestamp read back bearing the developer's local

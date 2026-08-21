@@ -6,12 +6,14 @@ yields identical IDs (a hard requirement for incremental MERGE downstream).
 """
 from __future__ import annotations
 
+import re
+from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .agent_context import make_chunk_id
-from .config.model import ChunkConfig
+from .config.model import ChunkConfig, HeadingConfig
 
 # Separator hierarchy for the recursive splitter: try to break on the largest
 # semantic boundary that keeps a chunk under the size limit, falling back to
@@ -32,6 +34,9 @@ class ChunkingError(ValueError):
 class Chunk:
     index: int
     text: str
+    # The heading this chunk falls under, when the model declares detection
+    # (issue #332). None when no heading precedes it, or none is configured.
+    section: str | None = None
 
 
 def chunk_id(document_id: str, index: int, text: str) -> str:
@@ -91,17 +96,78 @@ def split_text(text: str, config: ChunkConfig, *, reserved: int = 0) -> list[Chu
             f"{reserved} of chunk_size {config.chunk_size}."
         )
     if config.strategy == "tokens":
-        pieces = _split_tokens(text, size, config.chunk_overlap, config.encoding)
-    else:
-        pieces = _split_recursive(text, size, config.chunk_overlap)
-    return [Chunk(index=i, text=piece) for i, piece in enumerate(pieces)]
+        # No source offsets, so no heading attribution — rejected at config
+        # load rather than silently emitting nulls (issue #332).
+        return [
+            Chunk(index=index, text=piece)
+            for index, piece in enumerate(
+                _split_tokens(text, size, config.chunk_overlap, config.encoding)
+            )
+        ]
+
+    placed = _split_recursive(text, size, config.chunk_overlap)
+    headings = _find_headings(text, config.headings)
+    return [
+        Chunk(index=index, text=piece, section=_section_at(headings, start))
+        for index, (start, piece) in enumerate(placed)
+    ]
+
+
+def _find_headings(
+    text: str, config: HeadingConfig | None
+) -> list[tuple[int, str]]:
+    """Every heading in the document, as (offset, name), in order.
+
+    Detected once against the full source rather than per chunk: the splitter
+    is the only place that sees both the whole document and every boundary,
+    so a heading sitting in a chunk's tail — or a chunk starting mid-heading —
+    resolves by position instead of by guessing from fragments (issue #332).
+    """
+    if config is None:
+        return []
+    pattern = re.compile(config.pattern, re.MULTILINE)
+    found: list[tuple[int, str]] = []
+    for match in pattern.finditer(text):
+        # A capture group names the section; without one the whole match is
+        # the name. That is what lets `^(Item\s+\d+[A-C]?)[.:]` yield
+        # "Item 1A" rather than "Item 1A." without stel guessing at
+        # punctuation.
+        name = match.group(1) if pattern.groups else match.group(0)
+        if name and name.strip():
+            found.append((match.start(), name.strip()))
+    return found
+
+
+def _section_at(headings: list[tuple[int, str]], start: int) -> str | None:
+    """The last heading at or before `start`. None before the first heading.
+
+    Bisects the offsets alone. Comparing `(offset, name)` tuples against a
+    sentinel name needs that sentinel to sort after every possible heading,
+    and no string does: `"￿"` sorts before an astral character, so a
+    chunk opening a heading like "🚀 Overview" would land in the previous
+    section (Codex review, #343). Offsets are the thing being searched, so
+    search them.
+    """
+    if not headings:
+        return None
+    index = bisect_right([offset for offset, _ in headings], start) - 1
+    return headings[index][1] if index >= 0 else None
 
 
 def _unit(config: ChunkConfig) -> str:
     return "tokens" if config.strategy == "tokens" else "characters"
 
 
-def _split_recursive(text: str, chunk_size: int, overlap: int) -> list[str]:
+def _split_recursive(
+    text: str, chunk_size: int, overlap: int
+) -> list[tuple[int, str]]:
+    """Split, returning each chunk with its start offset in `text`.
+
+    The offset is what makes exact heading attribution possible (issue #332):
+    `_recurse` produces pieces that concatenate back to the source, so their
+    cumulative lengths give every boundary position, and the merge carries
+    those through.
+    """
     splits = _recurse(text, chunk_size, _RECURSIVE_SEPARATORS)
     return _merge_with_overlap(splits, chunk_size, overlap)
 
@@ -145,21 +211,44 @@ def _recurse(text: str, chunk_size: int, separators: list[str]) -> list[str]:
 
 def _merge_with_overlap(
     splits: list[str], chunk_size: int, overlap: int
-) -> list[str]:
+) -> list[tuple[int, str]]:
     """Greedily pack fine-grained splits into chunks under `chunk_size`,
     carrying roughly `overlap` trailing characters from each chunk into the
-    next — snapped to a separator boundary (issue #331)."""
-    chunks: list[str] = []
+    next — snapped to a separator boundary (issue #331).
+
+    Each chunk comes back with its start offset in the source. `_recurse`
+    guarantees the splits concatenate back to the document, so tracking a
+    running position through the pack is exact rather than a search.
+    """
+    chunks: list[tuple[int, str]] = []
     current = ""
+    current_start = 0
+    position = 0
     for split in splits:
         if current and len(current) + len(split) > chunk_size:
-            chunks.append(current.strip())
-            current = _overlap_tail(current, overlap) + split
+            _append_chunk(chunks, current_start, current)
+            tail = _overlap_tail(current, overlap)
+            # The carried tail sits immediately before this split in the
+            # source, so the new chunk starts that many characters earlier.
+            current_start = position - len(tail)
+            current = tail + split
         else:
+            if not current:
+                current_start = position
             current += split
-    if current.strip():
-        chunks.append(current.strip())
-    return [c for c in chunks if c]
+        position += len(split)
+    _append_chunk(chunks, current_start, current)
+    return chunks
+
+
+def _append_chunk(chunks: list[tuple[int, str]], start: int, text: str) -> None:
+    stripped = text.strip()
+    if not stripped:
+        return
+    # `strip()` moves the chunk's first character, so the offset moves with it
+    # — otherwise a chunk beginning after a paragraph break would be
+    # attributed to whatever heading preceded that whitespace.
+    chunks.append((start + (len(text) - len(text.lstrip())), stripped))
 
 
 def _overlap_tail(text: str, overlap: int) -> str:

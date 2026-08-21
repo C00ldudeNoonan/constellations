@@ -98,6 +98,19 @@ def _provider(**options: Any) -> VertexEmbeddingProvider:
     return provider
 
 
+@pytest.fixture(autouse=True)
+def _reset_vertex_client_cache() -> Any:
+    """Clients are cached process-wide (issue #335).
+
+    Each test substitutes its own fake `genai`, so a client cached by an
+    earlier test would be reused here and record its calls against the wrong
+    fake.
+    """
+    vertex_module._CLIENTS.clear()
+    yield
+    vertex_module._CLIENTS.clear()
+
+
 def test_vertex_provider_is_registered_with_strict_typed_options() -> None:
     assert "vertex" in list_embedding_providers()
     provider = _provider(
@@ -165,7 +178,9 @@ def test_vertex_provider_maps_batch_dimensions_ids_and_runtime(
             },
         }
     ]
-    assert fake.close_count == 1
+    # Not closed: the client is shared across requests now, and closing
+    # it here would leave the cached entry unusable (issue #335).
+    assert fake.close_count == 0
 
 
 def test_vertex_gemini_model_splits_multi_input_batches(
@@ -194,7 +209,9 @@ def test_vertex_gemini_model_splits_multi_input_batches(
     assert len(result.vectors) == 2
     assert result.usage.input_tokens == 4
     assert result.provider_requests == 2
-    assert fake.close_count == 1
+    # Not closed: the client is shared across requests now, and closing
+    # it here would leave the cached entry unusable (issue #335).
+    assert fake.close_count == 0
 
 
 @pytest.mark.parametrize(
@@ -234,7 +251,9 @@ def test_vertex_text_models_split_batches_at_five_inputs(
     assert len(result.vectors) == 6
     assert result.usage.input_tokens == 18
     assert result.provider_requests == 2
-    assert fake.close_count == 1
+    # Not closed: the client is shared across requests now, and closing
+    # it here would leave the cached entry unusable (issue #335).
+    assert fake.close_count == 0
 
 
 def test_vertex_provider_uses_query_task_type(
@@ -662,7 +681,9 @@ def test_vertex_inference_maps_request_runtime_and_parses_output(
     assert call["config"]["max_output_tokens"] == 256
     assert call["config"]["response_mime_type"] == "application/json"
     assert call["config"]["response_schema"] == schema
-    assert fake.close_count == 1
+    # Not closed: the client is shared across requests now, and closing
+    # it here would leave the cached entry unusable (issue #335).
+    assert fake.close_count == 0
 
 
 def test_vertex_inference_folds_thinking_tokens_into_output_usage(
@@ -1028,6 +1049,10 @@ def test_vertex_inference_surfaces_http_status_for_retry_triage(
     assert excinfo.value.code == "http_429"
     assert excinfo.value.retryable is True
 
+    # Clients are cached on their resolved options (issue #335), so swapping
+    # the SDK underneath mid-test needs an explicit reset — in production
+    # there is one SDK and one client per configuration, which is the point.
+    vertex_module._CLIENTS.clear()
     monkeypatch.setattr(
         vertex_module, "_load_google_genai_inference", lambda: _raising(403)
     )
@@ -1037,3 +1062,114 @@ def test_vertex_inference_surfaces_http_status_for_retry_triage(
         )
     assert excinfo.value.code == "http_403"
     assert excinfo.value.retryable is False
+
+
+# ─── client reuse (issue #335) ──────────────────────────────────────────────
+
+
+def test_one_client_serves_many_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The measured defect: one client construction per request.
+
+    Each construction re-runs `google.auth.default()`, which under end-user
+    ADC includes a token refresh round trip — 4,252 of them in one production
+    inference run, and enough fixed overhead per embed batch to turn a
+    3.93M-chunk backfill into days rather than hours.
+
+    Deliberately built through `get_embedding_provider` per batch, the way
+    `embed_texts` does: providers are constructed fresh on every call, so a
+    cache living on the provider instance would never see a second hit.
+    """
+    fake = _FakeGenAI()
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
+
+    for _ in range(10):
+        provider = get_embedding_provider(
+            "vertex",
+            profile_options={
+                "project": "p",
+                "location": "global",
+                "task_type": "RETRIEVAL_DOCUMENT",
+                "query_task_type": "RETRIEVAL_QUERY",
+                "auto_truncate": False,
+            },
+        )
+        provider.embed(
+            EmbeddingRequest(
+                model="text-embedding-005",
+                texts=("a", "b"),
+                dimensions=3,
+                input_ids=("x", "y"),
+            ),
+            credential=None,
+            runtime=ProviderRuntimeOptions(max_retries=4, timeout_seconds=60.0),
+        )
+
+    assert len(fake.client_options) == 1
+
+
+def test_a_different_runtime_gets_its_own_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse only where reuse is correct.
+
+    `client_options` mixes profile values with per-request timeout and retry
+    counts, so a single cached client would serve the first request's timeout
+    to every later one.
+    """
+    fake = _FakeGenAI()
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
+    request = EmbeddingRequest(
+        model="text-embedding-005",
+        texts=("a",),
+        dimensions=3,
+        input_ids=("x",),
+    )
+
+    for timeout in (60.0, 60.0, 12.5):
+        _provider(project="p", location="global").embed(
+            request,
+            credential=None,
+            runtime=ProviderRuntimeOptions(max_retries=4, timeout_seconds=timeout),
+        )
+
+    timeouts = [
+        options["http_options"]["timeout"] for options in fake.client_options
+    ]
+    assert timeouts == [60_000, 12_500]
+
+
+def test_concurrent_first_requests_construct_one_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The embedding path runs several requests in flight.
+
+    Without the double-check under the lock, concurrent first requests would
+    each construct — reintroducing the cost being removed, just less often.
+    """
+    import threading
+
+    fake = _FakeGenAI()
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
+    request = EmbeddingRequest(
+        model="text-embedding-005",
+        texts=("a",),
+        dimensions=3,
+        input_ids=("x",),
+    )
+    barrier = threading.Barrier(5)
+
+    def _embed() -> None:
+        barrier.wait()
+        _provider(project="p", location="global").embed(
+            request,
+            credential=None,
+            runtime=ProviderRuntimeOptions(max_retries=4, timeout_seconds=60.0),
+        )
+
+    threads = [threading.Thread(target=_embed) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(fake.client_options) == 1

@@ -15,7 +15,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from stel.config.model import LLMTransformConfig, PromptRef
+from stel.config.model import FieldConfig, LLMTransformConfig, PromptRef
 from stel.prompts import PromptError, ResolvedPrompt, resolve_prompt
 
 # ─── the reference ──────────────────────────────────────────────────────────
@@ -332,3 +332,97 @@ def test_editing_a_version_in_place_still_invalidates(tmp_path: Path) -> None:
     ).config_hash
 
     assert before != after
+
+
+# ─── review follow-ups (PR #334) ────────────────────────────────────────────
+
+
+def _skip_without_symlinks(target: Path, link: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError:  # pragma: no cover - Windows without privilege
+        pytest.skip("symlink creation not permitted")
+
+
+def test_a_symlinked_prompt_directory_is_refused(tmp_path: Path) -> None:
+    """The leaf check is not enough.
+
+    A symlinked `prompts/<name>/` leaves `<version>.md` an ordinary regular
+    file, so checking only the final component passes while the read lands
+    outside the project — and that text goes to an inference provider.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "v1.md").write_text("operator-local data")
+    project = tmp_path / "project"
+    (project / "prompts").mkdir(parents=True)
+    _skip_without_symlinks(outside, project / "prompts" / "sneaky")
+
+    with pytest.raises(PromptError, match="is a symlink"):
+        resolve_prompt(_ref_config("sneaky", "v1"), project, model_name="m")
+
+
+def test_an_inline_prompt_keeps_its_existing_config_hash() -> None:
+    """Adding prompt identity must not re-key every existing `llm:` model.
+
+    Two null keys in the hash payload would have reprocessed every corpus to
+    record that nothing was named — the same class of churn the backend
+    identity pin exists to prevent. Pinned to the value master produces,
+    verified against a master worktree.
+    """
+    from stel.llm_map import resolve_llm_runtime
+
+    config = LLMTransformConfig(
+        input_field="t",
+        prompt="classify",
+        provider="deterministic",
+        model="deterministic-v1",
+    )
+    runtime = resolve_llm_runtime(
+        config, [FieldConfig(name="x", data_type="string")], None
+    )
+
+    assert runtime.config_hash == "1483ec56eb703c4d242c4686bbc0b0ae"
+
+
+def test_a_versioned_prompt_does_change_the_hash(tmp_path: Path) -> None:
+    from stel.llm_map import resolve_llm_runtime
+
+    _write_prompt(tmp_path, "signal_classify", "v1", "classify")
+    versioned = resolve_llm_runtime(
+        _ref_config("signal_classify", "v1"),
+        [FieldConfig(name="x", data_type="string")],
+        None,
+        project_dir=tmp_path,
+        model_name="m",
+    )
+
+    assert versioned.config_hash != "1483ec56eb703c4d242c4686bbc0b0ae"
+
+
+def test_an_append_only_log_widens_instead_of_breaking(tmp_path: Path) -> None:
+    """A log created by an earlier release must survive a new column.
+
+    Log writes are best-effort, so a rejected write is silent — the durable
+    history would simply stop at the upgrade.
+    """
+    import polars as pl
+
+    from stel.adapters import create_adapter, parse_warehouse_config
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "l.duckdb"), "schema": "main"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.append_rows("stel_run_log", pl.DataFrame([{"model_name": "a"}]))
+
+        adapter.append_rows(
+            "stel_run_log",
+            pl.DataFrame([{"model_name": "b", "prompt_version": "v3"}]),
+        )
+
+        rows = adapter.read_table("stel_run_log").sort("model_name").to_dicts()
+    assert rows == [
+        {"model_name": "a", "prompt_version": None},
+        {"model_name": "b", "prompt_version": "v3"},
+    ]

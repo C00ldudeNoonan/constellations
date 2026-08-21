@@ -1660,7 +1660,14 @@ select prompt_version, count(*), avg(...) from classified group by 1
 `llm_config_hash` records that *something* changed — prompt, schema, provider,
 and model identity mixed into one opaque value. These columns say *what ran*.
 An inline prompt leaves both null: there is no stable identity to record,
-which is precisely the gap versioned prompts close.
+which is precisely the gap versioned prompts close, and the config hash omits
+prompt identity entirely in that case so existing models are not re-keyed.
+
+> **Upgrading an existing incremental `llm:` model.** The two columns change
+> the target's schema the next time it publishes rows, which the default
+> `on_schema_change: fail` rejects. Set `on_schema_change: append_new_columns`
+> or run once with `--full-refresh` before it next reprocesses. The upgrade
+> itself reprocesses nothing.
 
 The [run log](#append-only-logs) carries the same two columns, which is what
 makes "did v4 cost more per row than v3" a query rather than an investigation.

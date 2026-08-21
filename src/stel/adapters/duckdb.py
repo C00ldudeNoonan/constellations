@@ -458,12 +458,45 @@ class DuckDBAdapter(WarehouseAdapter):
                 f"CREATE TABLE IF NOT EXISTS {full} AS "
                 "SELECT * FROM stel_append WHERE false"
             )
+            self._evolve_append_target(full, df)
             self.connection.execute(
                 f"INSERT INTO {full} BY NAME SELECT * FROM stel_append"
             )
         finally:
             self.connection.unregister("stel_append")
         return df.height
+
+    def _evolve_append_target(self, full: str, df: pl.DataFrame) -> None:
+        """Add columns a log has grown since the table was created.
+
+        An append-only log outlives the release that created it, so a later
+        stel adding a column (`prompt_name`, say) would otherwise make every
+        write fail — silently, because log writes are best-effort by contract,
+        stopping the durable history at the upgrade (Codex review, #334).
+        Widening is the only evolution allowed: columns are added, never
+        dropped or retyped, so existing history stays readable.
+        """
+        existing = {
+            str(row[0])
+            for row in self.connection.execute(
+                f"SELECT column_name FROM (DESCRIBE {full})"
+            ).fetchall()
+        }
+        # The registered frame already has DuckDB-side types; asking for them
+        # beats maintaining a polars→DuckDB map that would drift.
+        incoming = {
+            str(row[0]): str(row[1])
+            for row in self.connection.execute(
+                "SELECT column_name, column_type FROM (DESCRIBE stel_append)"
+            ).fetchall()
+        }
+        for name in df.columns:
+            if name in existing:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE {full} ADD COLUMN {self.quote_ident(name)} "
+                f"{incoming.get(name, 'VARCHAR')}"
+            )
 
     def materialize_sql_full(
         self,

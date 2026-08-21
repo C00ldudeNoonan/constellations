@@ -21,8 +21,18 @@
   `llm:` model's inline prompt was being written into `manifest.json`
   verbatim, contradicting the documented rule.
 - Name and version are charset-validated at config load (they become path
-  segments), and prompt files must be regular non-symlink files inside the
-  project.
+  segments), and no component of the path may be a symlink — a symlinked
+  `prompts/` or `prompts/<name>/` would otherwise let a versioned prompt read
+  operator-local data and send it to a provider.
+- **Upgrade note for existing `materialization: incremental` `llm:` models.**
+  The two new output columns change the target's schema the next time the
+  model publishes rows. With the default `on_schema_change: fail`, that
+  publication is rejected. Set `on_schema_change: append_new_columns`, or run
+  once with `--full-refresh`, before it next reprocesses. The upgrade itself
+  reprocesses nothing: an inline prompt's config hash is unchanged.
+- Append-only logs widen rather than break when a later stel adds a column, so
+  a `stel_run_log` created before this release gains `prompt_name`/
+  `prompt_version` on the next write instead of failing every write silently.
 - Not yet implemented: the CI gate asserting a released version's content hash
   never changes. Editing a version in place still invalidates incremental state
   correctly; making it a failed build is a follow-up.

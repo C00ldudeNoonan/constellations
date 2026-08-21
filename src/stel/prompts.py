@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config.model import LLMTransformConfig, PromptRef
+from .paths import is_within_project
 
 # Where versioned prompts live, relative to the project directory.
 PROMPTS_DIRNAME = "prompts"
@@ -74,6 +75,36 @@ def validate_prompt_segment(value: str, *, label: str) -> str:
     return value
 
 
+def verify_project_path(path: Path, project_dir: Path, *, what: str) -> Path:
+    """Reject a path that leaves the project, by any route.
+
+    Checking only the final component is not enough: a symlinked `prompts/` or
+    `prompts/<name>/` leaves the `<version>.md` inside it an ordinary regular
+    file, so the leaf check passes while the read lands outside the reviewed
+    tree — and that text goes to an inference provider (Codex review, #334).
+    Every component from the project root down is checked, and the resolved
+    path must still be inside the project.
+    """
+    current = project_dir
+    try:
+        parts = path.relative_to(project_dir).parts
+    except ValueError:
+        parts = ()
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise PromptError(
+                f"Refusing to use {what} at {path}: '{part}' is a symlink. "
+                "stel confines project-configured paths to the project."
+            )
+    if not is_within_project(path.parent, project_dir):
+        raise PromptError(
+            f"Refusing to use {what} at {path}: it resolves outside the "
+            "project directory."
+        )
+    return path
+
+
 def prompt_path(ref: PromptRef, project_dir: Path) -> Path:
     """The file a reference names. Charset-validated at config load."""
     return (
@@ -93,7 +124,11 @@ def resolve_prompt(
     if isinstance(prompt, str):
         return ResolvedPrompt(text=prompt)
 
-    path = prompt_path(prompt, project_dir)
+    path = verify_project_path(
+        prompt_path(prompt, project_dir),
+        project_dir,
+        what=f"prompt {prompt.name}/{prompt.version}",
+    )
     if not path.exists() and not path.is_symlink():
         available = _available_versions(prompt.name, project_dir)
         hint = (

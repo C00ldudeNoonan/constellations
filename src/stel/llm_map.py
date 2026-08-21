@@ -211,10 +211,17 @@ def resolve_llm_runtime(
             # incremental state. The immutability gate makes that edit a failed
             # build; the hash makes it correct in the meantime.
             "prompt": prompt.text,
-            # Identity too: two versions with identical text are still
-            # different provenance, and rows must record which one ran.
-            "prompt_name": prompt.name,
-            "prompt_version": prompt.version,
+            # Identity too — but only when there is any: two versions with
+            # identical text are still different provenance. Omitted entirely
+            # for an inline prompt, so every existing `llm:` model keeps the
+            # config hash it already had. Adding two null keys would have
+            # re-keyed every one of them for no semantic change, reprocessing
+            # corpora to record that nothing was named (Codex review, #334).
+            **(
+                {"prompt_name": prompt.name, "prompt_version": prompt.version}
+                if prompt.name is not None
+                else {}
+            ),
             "output_cardinality": config.output_cardinality,
             "temperature": config.temperature,
             "max_tokens": config.max_tokens,

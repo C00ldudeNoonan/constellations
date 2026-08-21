@@ -15,6 +15,7 @@ SUPPORTED_TESTS = {
     "matches_regex",
     "accepted_values",
     "accepted_range",
+    "min_metric",
     "null_rate",
     "grounded_in",
     "relationships",
@@ -143,6 +144,15 @@ def _validate_argument(name: str, argument: Any) -> None:
         values = options["values"]
         if not isinstance(values, list) or not values:
             raise TestSpecError("Test 'accepted_values' expects a non-empty values list")
+        return
+    if name == "min_metric":
+        options = _options(
+            name, argument, required={"metric", "min"}, optional={"label"}
+        )
+        _require_nonempty_string(name, options["metric"], "metric")
+        if "label" in options:
+            _require_nonempty_string(name, options["label"], "label")
+        _finite_number(name, options["min"], "min")
         return
     if name == "accepted_range":
         options = _options(

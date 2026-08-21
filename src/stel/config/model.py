@@ -507,6 +507,63 @@ class SearchQueryConfig(BaseModel):
         return modes
 
 
+# `ref('name')` or a bare name — the same grammar `dag.parse_ref` accepts.
+# Duplicated here because config is imported by dag and cannot import it back;
+# the eval tests assert the two stay in agreement.
+_REF_EXPRESSION = re.compile(r"^\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*$")
+
+
+def _parse_ref_expression(value: str) -> str:
+    match = _REF_EXPRESSION.match(value)
+    if match:
+        return match.group(1)
+    return value.strip()
+
+
+class EvalConfig(BaseModel):
+    """Score a model's predictions against labelled ground truth (issue #309).
+
+    Reads two already-materialized relations and emits metric rows, so it costs
+    no inference and can run in CI on every change. `golden` answers "identical
+    or not"; this answers "which labels moved, and by how much", which is the
+    question a prompt or model change actually raises.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    # Only single-label classification today. Multi-label and regression are
+    # different metric families, so they get their own `kind:` rather than
+    # overloading this one.
+    kind: Literal["classification"] = "classification"
+    predictions: str
+    predicted_field: str
+    expected: str
+    expected_field: str
+    key: str
+    # Overrides the taxonomy taken from the predicted field's `enum` (#304).
+    # Only needed when the predictions model does not declare one.
+    labels: list[str] = Field(default_factory=list)
+
+    @field_validator("predicted_field", "expected_field", "key")
+    @classmethod
+    def _validate_column(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("eval column names must not be empty")
+        return v
+
+    @field_validator("labels")
+    @classmethod
+    def _validate_labels(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for label in v:
+            if not label.strip():
+                raise ValueError("eval labels must not be empty")
+            if label in seen:
+                raise ValueError(f"eval labels list '{label}' twice")
+            seen.add(label)
+        return v
+
+
 class SearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -740,6 +797,7 @@ class ModelConfig(BaseModel):
     embed: EmbedConfig | None = None
     llm: LLMTransformConfig | None = None
     search: SearchConfig | None = None
+    eval: EvalConfig | None = None
     # Golden-set retrieval evaluations over this search index (issue #137);
     # only meaningful — and only allowed — when `search` is set.
     retrieval_tests: list[RetrievalTestConfig] = Field(default_factory=list)
@@ -827,6 +885,7 @@ class ModelConfig(BaseModel):
                 ("embed", self.embed),
                 ("llm", self.llm),
                 ("search", self.search),
+                ("eval", self.eval),
             )
             if block is not None
         ]
@@ -834,7 +893,7 @@ class ModelConfig(BaseModel):
             raise ValueError(
                 f"Model '{self.name}' declares multiple kind blocks "
                 f"({', '.join(kinds)}); exactly one of "
-                "extraction/transform/ml/chunk/embed/llm/search is allowed"
+                "extraction/transform/ml/chunk/embed/llm/search/eval is allowed"
             )
         if self.search is not None and "materialization" not in self.model_fields_set:
             raise ValueError(
@@ -931,6 +990,36 @@ class ModelConfig(BaseModel):
                 f"columns: {', '.join(sorted(reserved))}"
             )
 
+    @model_validator(mode="after")
+    def _derive_eval_edges(self) -> ModelConfig:
+        # An eval's inputs are its two scored relations, derived here rather
+        # than in a compiler pass so every ProjectDAG construction path — the
+        # runner, `stel ls`, manifest and run_results generation — sees the
+        # same edges (Codex review, #328). Declaring `depends_on:` directly is
+        # rejected so the edges keep one source of truth.
+        if self.eval is None:
+            return self
+        if self.depends_on:
+            raise ValueError(
+                f"Eval model '{self.name}' must not declare `depends_on:`; its "
+                "inputs are `predictions:` and `expected:`"
+            )
+        refs: list[str] = []
+        for label, expression in (
+            ("predictions", self.eval.predictions),
+            ("expected", self.eval.expected),
+        ):
+            name = _parse_ref_expression(expression)
+            if not name:
+                raise ValueError(
+                    f"Eval model '{self.name}' `{label}:` must name a model"
+                )
+            refs.append(name)
+        # Deduplicate: scoring a relation against itself is degenerate but the
+        # DAG must not carry the same edge twice.
+        self.depends_on = [f"ref('{name}')" for name in dict.fromkeys(refs)]
+        return self
+
     @property
     def kind_block_count(self) -> int:
         return sum(
@@ -943,6 +1032,7 @@ class ModelConfig(BaseModel):
                 self.embed,
                 self.llm,
                 self.search,
+                self.eval,
             )
         )
 

@@ -38,6 +38,7 @@ from .execution import chunk as _chunk_execution
 from .execution import cost as _cost_execution
 from .execution import embed as _embed_execution
 from .execution import errors as _errors_execution
+from .execution import eval as _eval_execution
 from .execution import extraction as _extraction_execution
 from .execution import llm as _llm_execution
 from .execution import ml as _ml_execution
@@ -80,6 +81,7 @@ _run_embed_model = _embed_execution.run_embed_model
 _add_provider_usage = _usage_execution.add_provider_usage
 
 _run_llm_model = _llm_execution.run_llm_model
+_run_eval_model = _eval_execution.run_eval_model
 
 _run_search_model = _search_execution.run_search_model
 _run_ml_model = _ml_execution.run_ml_model
@@ -645,10 +647,18 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
         )
+    elif model.eval is not None:
+        result = _run_eval_model(
+            model=model,
+            models_by_name=models_by_name,
+            project_dir=project_dir,
+            adapter=adapter,
+            full_refresh=full_refresh,
+        )
     else:
         raise RunError(
             f"Model '{model.name}' has no extraction, transform, ml, chunk, embed, "
-            "llm, or search block configured"
+            "llm, search, or eval block configured"
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     log.info(
@@ -679,6 +689,8 @@ def _model_kind_label(model: ModelConfig) -> str:
         return "llm"
     if model.search is not None:
         return "search"
+    if model.eval is not None:
+        return "eval"
     return "unknown"
 
 

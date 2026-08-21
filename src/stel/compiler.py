@@ -589,7 +589,7 @@ def _validate_model_edges(
         raise _model_error(
             model,
             f"Model '{model.name}' must declare exactly one of "
-            "extraction/transform/ml/chunk/embed/llm/search",
+            "extraction/transform/ml/chunk/embed/llm/search/eval",
         )
 
     has_dbt_ref = model.source is not None and is_dbt_ref(model.source)
@@ -1022,4 +1022,6 @@ def _kind_label(model: ModelConfig) -> str:
         return "llm"
     if model.search is not None:
         return "Search"
+    if model.eval is not None:
+        return "Eval"
     return "Unknown"

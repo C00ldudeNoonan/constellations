@@ -92,7 +92,13 @@ def test_rows_are_long_format() -> None:
 
     assert {"metric", "label", "value"} == set(rows[0])
     overall = {row["metric"] for row in rows if row["label"] is None}
-    assert overall == {"accuracy", "macro_f1", "evaluated_rows", "unmatched_rows"}
+    assert overall == {
+        "accuracy",
+        "macro_f1",
+        "evaluated_rows",
+        "unmatched_rows",
+        "unusable_expected_rows",
+    }
     per_label = {row["metric"] for row in rows if row["label"] is not None}
     assert per_label == {"precision", "recall", "f1", "support"}
 
@@ -131,16 +137,15 @@ def test_empty_column_names_are_rejected() -> None:
 # ─── compiler wiring ────────────────────────────────────────────────────────
 
 
-def test_depends_on_is_derived_from_the_scored_relations() -> None:
-    """An eval's inputs become ordinary DAG edges.
+def test_depends_on_is_derived_at_construction() -> None:
+    """An eval's inputs become ordinary DAG edges the moment the model exists.
 
-    That is what makes selectors, lineage, and ordering work without any of
-    them needing to know what an eval is.
+    Derived in ModelConfig validation rather than a compiler pass, because
+    `stel ls`, manifest generation, and run_results all construct ProjectDAG
+    straight from loaded models — an edge that appears only after contract
+    validation would be missing there (Codex review, #328).
     """
-    from stel.compiler import _prepare_eval
-
     model = ModelConfig(name="signal_eval", eval=_eval_config())
-    _prepare_eval(model)
 
     assert model.depends_on == ["ref('signals')", "ref('signals_labeled')"]
 
@@ -148,33 +153,54 @@ def test_depends_on_is_derived_from_the_scored_relations() -> None:
 def test_a_bare_model_name_is_accepted_like_depends_on() -> None:
     # `parse_ref` takes either form everywhere else in stel; an eval is not the
     # place to invent a stricter spelling rule.
-    from stel.compiler import _prepare_eval
-
     model = ModelConfig(name="signal_eval", eval=_eval_config(predictions="signals"))
-    _prepare_eval(model)
 
     assert model.depends_on == ["ref('signals')", "ref('signals_labeled')"]
 
 
+def test_config_ref_parsing_agrees_with_dag_parse_ref() -> None:
+    # The pattern is duplicated in config (which dag imports, so config cannot
+    # import it back); this is the pin holding the two grammars together.
+    from stel.config.model import _parse_ref_expression
+    from stel.dag import parse_ref
+
+    for expression in ("ref('signals')", 'ref("signals")', "signals", " padded "):
+        assert _parse_ref_expression(expression) == parse_ref(expression)
+
+
 def test_an_empty_relation_name_is_rejected() -> None:
-    from stel.compiler import _prepare_eval
-
-    model = ModelConfig(name="signal_eval", eval=_eval_config(predictions="  "))
-
     with pytest.raises(Exception, match="must name a model"):
-        _prepare_eval(model)
+        ModelConfig(name="signal_eval", eval=_eval_config(predictions="  "))
 
 
 def test_declaring_depends_on_directly_is_rejected() -> None:
     # Two sources of truth for the same edges is how they drift.
-    from stel.compiler import _prepare_eval
-
-    model = ModelConfig(
-        name="signal_eval", eval=_eval_config(), depends_on=["ref('something')"]
-    )
-
     with pytest.raises(Exception, match="must not declare `depends_on:`"):
-        _prepare_eval(model)
+        ModelConfig(
+            name="signal_eval", eval=_eval_config(), depends_on=["ref('something')"]
+        )
+
+
+def test_eval_participates_in_single_kind_validation() -> None:
+    with pytest.raises(Exception, match="multiple kind blocks"):
+        ModelConfig(
+            name="signal_eval",
+            eval=_eval_config(),
+            chunk={"strategy": "recursive"},
+        )
+
+
+def test_public_serializers_know_the_eval_kind() -> None:
+    # `stel ls` and the manifest each classify models independently of the
+    # runner; `kind: unknown` there means docs and artifact consumers cannot
+    # describe a valid model (Codex review, #328).
+    from stel.cli import _model_kind
+    from stel.runner import _model_kind_label
+
+    model = ModelConfig(name="signal_eval", eval=_eval_config())
+
+    assert _model_kind(model) == "eval"
+    assert _model_kind_label(model) == "eval"
 
 
 # ─── end to end ─────────────────────────────────────────────────────────────
@@ -189,7 +215,9 @@ _PREDICTED = {
 }
 
 
-def _eval_project(tmp_path: Path, *, tests: str = "") -> Path:
+def _eval_project(
+    tmp_path: Path, *, tests: str = "", materialization: str | None = None
+) -> Path:
     project = tmp_path / "proj"
     (project / "models").mkdir(parents=True)
     (project / "sources").mkdir()
@@ -232,7 +260,8 @@ def _eval_project(tmp_path: Path, *, tests: str = "") -> Path:
         "      predictions: ref('signals')\n      predicted_field: signal\n"
         "      expected: ref('signals_labeled')\n"
         "      expected_field: expected_signal\n      key: chunk_id\n"
-        f"{tests}"
+        + (f"    materialization: {materialization}\n" if materialization else "")
+        + tests
     )
     return project
 
@@ -326,3 +355,150 @@ def test_min_metric_fails_when_the_metric_row_is_absent(tmp_path: Path) -> None:
 
     assert [r.status for r in failures] == ["fail"]
     assert "no recall[not_a_label] row" in failures[0].message
+
+
+# ─── review follow-ups (PR #328) ────────────────────────────────────────────
+
+
+def test_unusable_expected_rows_are_counted_not_dropped(tmp_path: Path) -> None:
+    """A partially malformed labelled set must not silently inflate quality.
+
+    Rows with a null key or null label cannot be scored; dropping them without
+    a trace reports metrics over the survivors as if they were the whole set.
+    """
+    from stel.runner import run_project
+
+    project = _eval_project(tmp_path)
+    # Two defective ground-truth rows: one null label, one null key.
+    (project / "labels.sql").write_text(
+        "SELECT chunk_id, CASE WHEN chunk_id = 'c3' THEN 'expansion' "
+        "WHEN chunk_id = 'c5' THEN NULL ELSE signal END AS expected_signal "
+        "FROM {{ ref('signals') }} UNION ALL "
+        "SELECT NULL AS chunk_id, 'pricing' AS expected_signal\n"
+    )
+
+    run_project(project)
+
+    metrics = _metrics(project)
+    assert metrics[("unusable_expected_rows", None)] == 2.0
+    # And the scored set shrank accordingly: c5's row is unusable, not wrong.
+    assert metrics[("evaluated_rows", None)] == 4.0
+
+
+def test_duplicate_keys_are_a_hard_error(tmp_path: Path) -> None:
+    """Which duplicate wins would depend on warehouse row order."""
+    from stel.execution.contracts import RunError
+    from stel.runner import run_project
+
+    project = _eval_project(tmp_path)
+    (project / "labels.sql").write_text(
+        "SELECT chunk_id, signal AS expected_signal FROM {{ ref('signals') }} "
+        "UNION ALL SELECT 'c1' AS chunk_id, 'pricing' AS expected_signal\n"
+    )
+
+    with pytest.raises(RunError, match="duplicate 'chunk_id'"):
+        run_project(project)
+
+
+def test_min_metric_reads_only_the_latest_evaluation(tmp_path: Path) -> None:
+    """A historical dip must not fail the gate forever.
+
+    An incremental eval keeps one metric set per predictions version; the gate
+    reads the newest set only, so a recovered classifier passes and a stale
+    row cannot satisfy the existence check.
+    """
+    import duckdb as _duckdb
+
+    from stel.runner import build_project
+
+    project = _eval_project(
+        tmp_path,
+        tests=(
+            "    tests:\n"
+            "      - min_metric: { metric: accuracy, min: 0.9 }\n"
+        ),
+    )
+    run_first = build_project(project)
+    assert [
+        r.status for r in run_first.test_results if r.test_name == "min_metric"
+    ] == ["fail"]  # accuracy 0.8 on the current evaluation
+
+    # Plant an older, better evaluation. If the gate aggregated history, the
+    # planted 1.0 row would be the MIN comparison's rescuer — assert it isn't.
+    con = _duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        con.execute(
+            "INSERT INTO main.signal_eval "
+            "SELECT 'planted', metric, label, 1.0, predictions_version, "
+            "code_version, '2000-01-01T00:00:00+00:00' "
+            "FROM main.signal_eval WHERE metric = 'accuracy'"
+        )
+    finally:
+        con.close()
+
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.checks.runner import run_model_tests
+
+    cfg = parse_warehouse_config(
+        {
+            "type": "duckdb",
+            "path": str(project / "target" / "db.duckdb"),
+            "schema": "main",
+        }
+    )
+    model = ModelConfig(
+        name="signal_eval",
+        eval=_eval_config(),
+        tests=[{"min_metric": {"metric": "accuracy", "min": 0.9}}],
+    )
+    with create_adapter(cfg) as adapter:
+        results = run_model_tests(model, adapter)
+
+    # Still fails: the planted historical 1.0 is not the latest evaluation.
+    assert [r.status for r in results if r.test_name == "min_metric"] == ["fail"]
+
+
+def test_incremental_rerun_removes_stale_metric_rows(tmp_path: Path) -> None:
+    """Shrinking the label universe must not leave the removed label behind.
+
+    Same predictions version, so the stale rows share it: an upsert alone would
+    keep `expansion`'s four per-label rows forever, with an old code_version,
+    contradicting the report's declared universe and feeding min_metric stale
+    results.
+    """
+    from stel.runner import run_project
+
+    project = _eval_project(tmp_path, materialization="incremental")
+    run_project(project)
+    assert ("recall", "expansion") in _metrics(project)
+
+    # Correct the ground truth (c3 really was churn_risk) and drop the label
+    # from the enum: `expansion` now exists nowhere — not declared, not in
+    # either relation — so its rows must vanish rather than linger.
+    (project / "labels.sql").write_text(
+        "SELECT chunk_id, signal AS expected_signal FROM {{ ref('signals') }}\n"
+    )
+    models_yml = (project / "models" / "models.yml").read_text()
+    (project / "models" / "models.yml").write_text(
+        models_yml.replace(
+            "values: [churn_risk, expansion, pricing, support, none]",
+            "values: [churn_risk, pricing, support, none]",
+        )
+    )
+    run_project(project)
+
+    metrics = _metrics(project)
+    assert ("recall", "expansion") not in metrics
+    # Fully replaced, not duplicated: one physical row per metric.
+    assert _metric_row_count(project) == len(metrics)
+    assert metrics[("accuracy", None)] == 1.0
+
+
+def _metric_row_count(project: Path) -> int:
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        row = con.execute("SELECT COUNT(*) FROM main.signal_eval").fetchone()
+        assert row is not None
+        return int(row[0])
+    finally:
+        con.close()

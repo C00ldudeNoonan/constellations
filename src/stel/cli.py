@@ -814,6 +814,8 @@ def _model_kind(model: ModelConfig) -> str:
         return "llm"
     if model.search is not None:
         return "search"
+    if model.eval is not None:
+        return "eval"
     return "unknown"
 
 

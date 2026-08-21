@@ -2228,6 +2228,14 @@ labels regressed.
     - min_metric: { metric: recall, label: churn_risk, min: 0.70 }
 ```
 
+`min_metric` reads the **latest evaluation only** (the rows sharing the newest
+`evaluated_at`). An incremental eval keeps one metric set per predictions
+version — that history is the point — but a gate must read the classifier's
+current state, not the worst it has ever been: aggregating history would fail
+forever after one bad version, and a stale row could satisfy the existence
+check for a label the current version no longer reports. An absent metric row
+in the latest evaluation fails the test.
+
 Output is **long format** — one row per metric, so adding a metric never
 changes the schema and `WHERE metric = 'recall'` works:
 
@@ -2237,6 +2245,7 @@ changes the schema and `WHERE metric = 'recall'` works:
 | macro_f1 | | 0.71 |
 | evaluated_rows | | 1430 |
 | unmatched_rows | | 12 |
+| unusable_expected_rows | | 3 |
 | precision | churn_risk | 0.91 |
 | recall | churn_risk | 0.72 |
 | f1 | churn_risk | 0.80 |
@@ -2246,7 +2255,12 @@ changes the schema and `WHERE metric = 'recall'` works:
 where accuracy hides that behind the majority class, so it is usually the
 number worth gating on. `unmatched_rows` counts expected rows with no
 prediction to join to — an inner join alone would report a model that stopped
-emitting rows as a smaller but equally good one.
+emitting rows as a smaller but equally good one. `unusable_expected_rows`
+counts ground-truth rows that could not be scored at all (a null key or a null
+label): defects in the labelled set itself, reported rather than silently
+inflating quality over the rows that survived. A duplicate `key` value in
+either relation is a hard error — which duplicate would be scored depends on
+warehouse row order, which silently corrupts an experiment.
 
 Every row also carries `metric_id`, `predictions_version`, `code_version`, and
 `evaluated_at`. With `materialization: incremental`, `metric_id` keys on the

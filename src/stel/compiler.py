@@ -97,8 +97,6 @@ def validate_project_contract(
     for model in models:
         if model.transform is not None and model.transform.type == "sql":
             _prepare_sql_transform(model, project_dir)
-        if model.eval is not None:
-            _prepare_eval(model)
 
     for model in models:
         _validate_tests(model, source_names, model_names, project_dir)
@@ -907,44 +905,6 @@ def _prepare_sql_transform(model: ModelConfig, project_dir: Path) -> None:
             )
     # Canonical ref() form so parse_ref and the DAG treat it uniformly.
     model.depends_on = [f"ref('{name}')" for name in refs]
-
-
-def _prepare_eval(model: ModelConfig) -> None:
-    """Derive an eval model's `depends_on` from the relations it scores (#309).
-
-    Same move as a SQL transform's `ref()` discovery: the two relations are the
-    model's inputs, so making them ordinary edges means the DAG, selectors,
-    lineage, and `stel docs` treat an eval like any other node rather than
-    needing to know what an eval is.
-    """
-    assert model.eval is not None
-    config = model.eval
-    refs: list[str] = []
-    for label, expression in (
-        ("predictions", config.predictions),
-        ("expected", config.expected),
-    ):
-        # `ref('name')` or a bare name, matching `depends_on:` everywhere else.
-        # A name that matches no model is caught by edge validation, which
-        # already words that error well.
-        name = parse_ref(expression)
-        if not name:
-            raise _model_error(
-                model,
-                f"Eval model '{model.name}' `{label}:` must name a model",
-                ("eval", label),
-            )
-        refs.append(name)
-    if model.depends_on:
-        raise _model_error(
-            model,
-            f"Eval model '{model.name}' must not declare `depends_on:`; its "
-            "inputs are `predictions:` and `expected:`",
-            ("depends_on",),
-        )
-    # Deduplicate: scoring a relation against itself is degenerate but the DAG
-    # must not carry the same edge twice.
-    model.depends_on = [f"ref('{name}')" for name in dict.fromkeys(refs)]
 
 
 def _validate_transform(model: ModelConfig, project_dir: Path) -> None:

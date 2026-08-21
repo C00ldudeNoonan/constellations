@@ -24,8 +24,18 @@
 - Rows carry `predictions_version`, so an incremental eval keyed on `metric_id`
   replaces a re-run of the same predictions and appends a new version — a
   quality time series rather than a single snapshot.
-- The scored relations become ordinary `depends_on` edges, so selectors,
-  lineage, and ordering need no knowledge of evals.
+- The scored relations become ordinary `depends_on` edges — derived when the
+  model is validated, so every DAG consumer (`stel ls`, the manifest,
+  run_results) sees them, not just the runner.
+- **Malformed ground truth is loud.** Duplicate `key` values in either relation
+  are a hard error (which duplicate wins would depend on warehouse row order);
+  expected rows with a null key or label are counted in a
+  `unusable_expected_rows` metric rather than silently dropped.
+- **`min_metric` gates on the latest evaluation only**, so a historical dip
+  cannot fail the test forever and a stale row cannot vouch for a label the
+  current version stopped reporting. An incremental re-run of the same
+  predictions version fully replaces that version's metric set — a removed
+  label's rows are deleted, not left behind with an old `code_version`.
 
 
 ### Enum fields: declare the label set once (issue #304)

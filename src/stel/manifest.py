@@ -300,6 +300,8 @@ def _model_dict(
         kind = "embed"
     elif model.llm is not None:
         kind = "llm"
+    elif model.eval is not None:
+        kind = "eval"
     else:
         kind = "unknown"
 
@@ -327,6 +329,7 @@ def _model_dict(
         "chunk": model.chunk.model_dump() if model.chunk else None,
         "embed": model.embed.model_dump() if model.embed else None,
         "llm": model.llm.model_dump() if model.llm else None,
+        "eval": model.eval.model_dump() if model.eval else None,
         "fields": [f.model_dump() for f in model.fields],
         "tests": model.tests,
         "code_version": compute_model_code_version(

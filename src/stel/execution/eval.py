@@ -51,19 +51,44 @@ def _column(frame: pl.DataFrame, name: str, model: str, relation: str) -> None:
 
 
 def _labels_by_key(
-    frame: pl.DataFrame, *, key: str, value: str
-) -> dict[str, str]:
+    frame: pl.DataFrame,
+    *,
+    key: str,
+    value: str,
+    model: str,
+    relation: str,
+) -> tuple[dict[str, str], int]:
+    """Key→label mapping, plus how many rows could not enter it.
+
+    A null key cannot be joined and a null label is not a class; those rows
+    are counted and returned rather than silently dropped, because metrics
+    computed over the rows that happened to survive are inflated, not smaller
+    (Codex review, #328). A duplicate key is a hard error: keeping the last
+    row would make support and accuracy depend on warehouse row order, which
+    silently corrupts an experiment.
+    """
     out: dict[str, str] = {}
+    duplicates: set[str] = set()
+    dropped = 0
     for row in frame.iter_rows(named=True):
         row_key = row[key]
         label = row[value]
         if row_key is None or label is None:
-            # A null key cannot be joined and a null label is not a class.
-            # Both are counted as unmatched by the caller rather than being
-            # silently scored as some default class.
+            dropped += 1
             continue
-        out[str(row_key)] = str(label)
-    return out
+        row_key = str(row_key)
+        if row_key in out:
+            duplicates.add(row_key)
+        out[row_key] = str(label)
+    if duplicates:
+        sample = ", ".join(sorted(duplicates)[:5])
+        raise RunError(
+            f"Eval model '{model}': relation '{relation}' has "
+            f"{len(duplicates)} duplicate '{key}' value(s) (e.g. {sample}). "
+            "Which row would be scored depends on warehouse row order; "
+            "deduplicate the relation or evaluate at a different key."
+        )
+    return out, dropped
 
 
 def _predictions_version(frame: pl.DataFrame) -> str | None:
@@ -106,11 +131,22 @@ def run_eval_model(
     _column(expected, config.key, model.name, expected_name)
     _column(expected, config.expected_field, model.name, expected_name)
 
-    predicted_by_key = _labels_by_key(
-        predictions, key=config.key, value=config.predicted_field
+    # Predictions-side null-row loss needs no separate metric: a prediction
+    # that cannot be joined leaves its expected counterpart unmatched, which
+    # is already counted below.
+    predicted_by_key, _ = _labels_by_key(
+        predictions,
+        key=config.key,
+        value=config.predicted_field,
+        model=model.name,
+        relation=predictions_name,
     )
-    expected_by_key = _labels_by_key(
-        expected, key=config.key, value=config.expected_field
+    expected_by_key, unusable_expected = _labels_by_key(
+        expected,
+        key=config.key,
+        value=config.expected_field,
+        model=model.name,
+        relation=expected_name,
     )
     if not expected_by_key:
         raise RunError(
@@ -131,7 +167,12 @@ def run_eval_model(
                 declared_labels_for(config.predicted_field, upstream.fields)
             )
 
-    report = score(pairs, declared_labels=declared, unmatched_rows=unmatched)
+    report = score(
+        pairs,
+        declared_labels=declared,
+        unmatched_rows=unmatched,
+        unusable_expected_rows=unusable_expected,
+    )
 
     code_version = compute_code_version(
         extraction=None,
@@ -170,6 +211,30 @@ def run_eval_model(
             model.name, frame, options=parsed_options
         )
     else:
+        # A re-run of the same predictions version must fully replace that
+        # version's metric set, not just upsert into it: shrink the taxonomy
+        # and the removed label's rows would otherwise survive with a stale
+        # code_version, contradicting the declared universe and feeding
+        # min_metric stale results (Codex review, #328). History for *other*
+        # versions is untouched — that is the time series.
+        current_ids = set(frame["metric_id"].to_list())
+        if model.name in set(adapter.list_tables()):
+            existing = adapter.read_table(model.name)
+            if "predictions_version" in existing.columns:
+                same_version = existing.filter(
+                    pl.col("predictions_version") == predictions_version
+                    if predictions_version is not None
+                    else pl.col("predictions_version").is_null()
+                )
+                stale = [
+                    metric_id
+                    for metric_id in same_version["metric_id"].to_list()
+                    if metric_id not in current_ids
+                ]
+                if stale:
+                    adapter.delete_rows(
+                        model.name, key_col="metric_id", keys=stale
+                    )
         outcome = adapter.materialize_incremental(
             model.name,
             frame,

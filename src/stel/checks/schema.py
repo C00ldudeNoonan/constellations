@@ -413,6 +413,7 @@ def _min_metric(
     metric_col = adapter.quote_ident("metric")
     label_col = adapter.quote_ident("label")
     value_col = adapter.quote_ident("value")
+    evaluated_col = adapter.quote_ident("evaluated_at")
     params: list[Any] = [metric]
     where = f"{metric_col} = ?"
     # A label-less metric (accuracy, macro_f1) is stored with a null label, so
@@ -420,6 +421,14 @@ def _min_metric(
     where += f" AND {label_col} = ?" if label is not None else f" AND {label_col} IS NULL"
     if label is not None:
         params.append(label)
+    # Latest evaluation only. An incremental eval keeps one row per
+    # predictions version — that history is the point — but a gate must read
+    # the current state of the classifier, not the worst it has ever been: a
+    # historical dip would fail the test forever, and a stale row could
+    # satisfy the existence check for a label the current version no longer
+    # reports (Codex review, #328). All rows of one evaluation share an
+    # `evaluated_at`, so the max selects the newest complete metric set.
+    where += f" AND {evaluated_col} = (SELECT MAX({evaluated_col}) FROM {table_ref})"
 
     observed = adapter.scalar(
         f"SELECT MIN({value_col}) FROM {table_ref} WHERE {where}", params

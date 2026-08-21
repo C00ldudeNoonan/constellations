@@ -33,6 +33,7 @@ OVERALL_METRICS = (
     "macro_f1",
     "evaluated_rows",
     "unmatched_rows",
+    "unusable_expected_rows",
 )
 # Metric names emitted once per label.
 PER_LABEL_METRICS = ("precision", "recall", "f1", "support")
@@ -53,6 +54,11 @@ class ClassificationReport:
     macro_f1: float
     evaluated_rows: int
     unmatched_rows: int
+    # Expected rows that could not be scored at all — a null key or a null
+    # label. Distinct from `unmatched_rows` (scoreable ground truth with no
+    # prediction): these are defects in the labelled set itself, and folding
+    # them into either bucket would hide them (Codex review, #328).
+    unusable_expected_rows: int
     labels: tuple[LabelScore, ...]
 
 
@@ -65,13 +71,16 @@ def score(
     *,
     declared_labels: Iterable[str] = (),
     unmatched_rows: int = 0,
+    unusable_expected_rows: int = 0,
 ) -> ClassificationReport:
     """Score `(predicted, expected)` pairs.
 
     `declared_labels` is the taxonomy the model was asked for; the report covers
     it whether or not the data uses every label. `unmatched_rows` is expected
-    rows that had no prediction to join to — carried through so the caller can
-    publish it rather than leaving a silent join loss.
+    rows that had no prediction to join to, and `unusable_expected_rows` is
+    expected rows dropped before joining (null key or null label) — both are
+    carried through so the caller publishes the loss instead of silently
+    inflating quality over the rows that happened to survive.
     """
     universe = set(declared_labels)
     for predicted, expected in pairs:
@@ -115,6 +124,7 @@ def score(
         ),
         evaluated_rows=len(pairs),
         unmatched_rows=unmatched_rows,
+        unusable_expected_rows=unusable_expected_rows,
         labels=tuple(scores),
     )
 
@@ -137,6 +147,11 @@ def as_rows(report: ClassificationReport) -> list[dict[str, object]]:
             "metric": "unmatched_rows",
             "label": None,
             "value": float(report.unmatched_rows),
+        },
+        {
+            "metric": "unusable_expected_rows",
+            "label": None,
+            "value": float(report.unusable_expected_rows),
         },
     ]
     for item in report.labels:

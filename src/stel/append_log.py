@@ -44,6 +44,54 @@ log = logging.getLogger(__name__)
 QUERY_FINGERPRINT_DOMAIN = "mcp-query"
 
 
+# Explicit column types for each log, because the first batch must not decide
+# the persisted schema (Codex review, #333). A first invocation with no LLM
+# model leaves `provider` null, and polars infers `Null` — which DuckDB
+# materializes as an integer column that every later row containing an actual
+# provider name then fails to convert into. Combined with the best-effort
+# catch, that failure is silent and the history sticks at its first row
+# forever. Declaring the types up front is the fix; changing one is a schema
+# change to an existing table, so treat these tuples as a contract.
+RUN_LOG_SCHEMA: dict[str, Any] = {
+    "invocation_id": pl.String,
+    "profile_target": pl.String,
+    "model_name": pl.String,
+    "kind": pl.String,
+    "status": pl.String,
+    "provider": pl.String,
+    "provider_model": pl.String,
+    "provider_implementation": pl.String,
+    "backend": pl.String,
+    "rows_processed": pl.Int64,
+    "rows_skipped": pl.Int64,
+    "rows_written": pl.Int64,
+    "api_calls": pl.Int64,
+    "cache_hits": pl.Int64,
+    "input_tokens": pl.Int64,
+    "output_tokens": pl.Int64,
+    "estimated_cost_usd": pl.Float64,
+    "duration_seconds": pl.Float64,
+    "started_at": pl.String,
+    "completed_at": pl.String,
+}
+
+QUERY_LOG_SCHEMA: dict[str, Any] = {
+    "logged_at": pl.String,
+    "principal_id": pl.String,
+    "tenant_id": pl.String,
+    "model_name": pl.String,
+    "mode": pl.String,
+    "query_fingerprint": pl.String,
+    "query_text": pl.String,
+    "requested_limit": pl.Int64,
+    "result_count": pl.Int64,
+    "zero_results": pl.Boolean,
+    "returned_chunk_ids": pl.List(pl.String),
+    "top_score": pl.Float64,
+    "elapsed_ms": pl.Float64,
+}
+
+
 class SupportsAppend(Protocol):
     """The one adapter capability a log writer needs.
 
@@ -71,6 +119,7 @@ def write_rows(
     config: AppendLogConfig | None,
     rows: list[dict[str, Any]],
     *,
+    schema: dict[str, Any],
     what: str,
 ) -> int:
     """Append `rows` to the configured log relation. Best-effort by contract.
@@ -82,7 +131,9 @@ def write_rows(
     if config is None or not config.enabled or not rows:
         return 0
     try:
-        return adapter.append_rows(config.relation, pl.DataFrame(rows))
+        return adapter.append_rows(
+            config.relation, pl.DataFrame(rows, schema=schema)
+        )
     except Exception as error:
         # Deliberately broad, and deliberately not re-raised: see the module
         # docstring. The class name locates the failure without echoing
@@ -128,7 +179,16 @@ def run_log_rows(
     rows: list[dict[str, Any]] = []
     for result in results:
         metrics = result.metrics or {}
-        cost = metrics.get("reported_cost_usd", metrics.get("cost_usd"))
+        # `estimated_cost_usd` is what extraction publishes once the profile
+        # sets `pricing:` — it already folds in provider-reported spend where
+        # the provider gives it. `reported_cost_usd` is the per-call provider
+        # figure and only stands in when no estimate was computed. Reading
+        # only the latter left the column null on the normal path, which is
+        # precisely the cross-run spend query this log exists for (Codex
+        # review, #333).
+        cost = metrics.get("estimated_cost_usd")
+        if cost is None:
+            cost = metrics.get("reported_cost_usd")
         rows.append(
             {
                 "invocation_id": invocation_id,

@@ -20,7 +20,7 @@ from .adapters import (
     WarehouseAdapter,
     create_adapter,
 )
-from .append_log import run_log_rows, write_rows
+from .append_log import RUN_LOG_SCHEMA, run_log_rows, write_rows
 from .budget import BudgetLedger
 from .checks import TestResult, run_model_tests, validate_test_requirements
 from .compiler import (
@@ -296,6 +296,7 @@ def run_project(
                 completed_at=datetime.now(UTC).isoformat(),
                 profile_target=resolved.target_name,
             ),
+            schema=RUN_LOG_SCHEMA,
             what="the run log",
         )
 

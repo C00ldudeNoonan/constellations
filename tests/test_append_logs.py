@@ -19,6 +19,8 @@ import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
 from stel.append_log import (
+    QUERY_LOG_SCHEMA,
+    RUN_LOG_SCHEMA,
     query_fingerprint,
     run_log_rows,
     write_rows,
@@ -86,7 +88,11 @@ def test_a_failed_log_write_does_not_raise(caplog: pytest.LogCaptureFixture) -> 
     config = RunLogConfig(enabled=True, relation="stel_run_log")
 
     written = write_rows(
-        _BrokenAdapter(), config, [{"n": 1}], what="the run log"
+        _BrokenAdapter(),
+        config,
+        [{"n": 1}],
+        schema={"n": pl.Int64},
+        what="the run log",
     )
 
     assert written == 0
@@ -99,8 +105,14 @@ def test_a_disabled_log_writes_nothing() -> None:
     disabled = RunLogConfig(enabled=False, relation="stel_run_log")
 
     # The broken adapter proves it is never called.
-    assert write_rows(_BrokenAdapter(), disabled, [{"n": 1}], what="x") == 0
-    assert write_rows(_BrokenAdapter(), None, [{"n": 1}], what="x") == 0
+    schema = {"n": pl.Int64}
+    assert (
+        write_rows(_BrokenAdapter(), disabled, [{"n": 1}], schema=schema, what="x")
+        == 0
+    )
+    assert (
+        write_rows(_BrokenAdapter(), None, [{"n": 1}], schema=schema, what="x") == 0
+    )
 
 
 def test_logs_are_off_by_default() -> None:
@@ -286,3 +298,121 @@ def test_query_log_config_defaults_to_fingerprint_only() -> None:
 
     assert config.relation == "stel_mcp_query_log"
     assert config.capture_query_text is False
+
+
+# ─── review follow-ups (PR #333) ────────────────────────────────────────────
+
+
+def test_a_first_all_null_batch_does_not_poison_the_schema(tmp_path: Path) -> None:
+    """The first invocation must not decide the persisted column types.
+
+    A first run with no LLM model leaves `provider` null. Inferred, that
+    becomes an integer column in DuckDB, and every later row carrying an
+    actual provider name fails to convert — silently, because the write is
+    best-effort, leaving the history stuck at its first row forever.
+    """
+    config = RunLogConfig(enabled=True, relation="stel_run_log")
+    first = run_log_rows(
+        [_result()],  # no provider, no metrics: every optional column null
+        invocation_id="one",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+    )
+    second = run_log_rows(
+        [_result(provider="vertex", metrics={"api_calls": 3})],
+        invocation_id="two",
+        started_at="t2",
+        completed_at="t3",
+        profile_target="dev",
+    )
+
+    with _adapter(tmp_path) as adapter:
+        assert write_rows(
+            adapter, config, first, schema=RUN_LOG_SCHEMA, what="the run log"
+        ) == 1
+        assert write_rows(
+            adapter, config, second, schema=RUN_LOG_SCHEMA, what="the run log"
+        ) == 1
+
+        rows = adapter.read_table("stel_run_log").sort("invocation_id")
+        assert rows.height == 2
+        assert rows["provider"].to_list() == [None, "vertex"]
+
+
+def test_a_zero_result_query_row_does_not_poison_the_schema(
+    tmp_path: Path,
+) -> None:
+    """Same hazard on the query log: the first query returning nothing.
+
+    `returned_chunk_ids: []` and a null `top_score` would infer an empty list
+    and an integer, so the first successful search afterwards could never be
+    logged.
+    """
+    config = QueryLogConfig(enabled=True)
+    empty = {
+        "logged_at": "t0",
+        "principal_id": "p",
+        "tenant_id": None,
+        "model_name": "m",
+        "mode": "text",
+        "query_fingerprint": "f",
+        "query_text": None,
+        "requested_limit": 5,
+        "result_count": 0,
+        "zero_results": True,
+        "returned_chunk_ids": [],
+        "top_score": None,
+        "elapsed_ms": 1.0,
+    }
+    populated = {
+        **empty,
+        "logged_at": "t1",
+        "result_count": 1,
+        "zero_results": False,
+        "returned_chunk_ids": ["chunk-a"],
+        "top_score": 0.75,
+    }
+
+    with _adapter(tmp_path) as adapter:
+        write_rows(
+            adapter, config, [empty], schema=QUERY_LOG_SCHEMA, what="q"
+        )
+        written = write_rows(
+            adapter, config, [populated], schema=QUERY_LOG_SCHEMA, what="q"
+        )
+
+        assert written == 1
+        rows = adapter.read_table("stel_mcp_query_log").sort("logged_at")
+        assert rows.height == 2
+        assert rows["returned_chunk_ids"].to_list() == [[], ["chunk-a"]]
+        assert rows["top_score"].to_list() == [None, 0.75]
+
+
+def test_the_estimated_cost_metric_is_the_one_extraction_publishes() -> None:
+    """`estimated_cost_usd` is what a priced run actually stores.
+
+    Reading only `reported_cost_usd` left the column null on the normal
+    estimator path — the exact query this log exists to answer.
+    """
+    rows = run_log_rows(
+        [_result(metrics={"estimated_cost_usd": 0.0421, "api_calls": 2})],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+    )
+
+    assert rows[0]["estimated_cost_usd"] == pytest.approx(0.0421)
+
+
+def test_provider_reported_cost_stands_in_when_no_estimate_exists() -> None:
+    rows = run_log_rows(
+        [_result(metrics={"reported_cost_usd": 0.5})],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+    )
+
+    assert rows[0]["estimated_cost_usd"] == pytest.approx(0.5)

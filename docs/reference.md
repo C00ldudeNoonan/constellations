@@ -2678,7 +2678,14 @@ outside, so it is a column rather than something to reconstruct.
 **A log never fails the thing it logs.** Writes are best-effort: a warehouse
 that rejects one, a permission an operator forgot, a relation someone renamed
 — none of that turns a successful run into a failed one, or a served MCP
-answer into an error. Failures are a single warning naming the exception class.
+answer into an error. Failures are a single warning naming the exception
+class. The query-log write also happens *outside* the MCP request deadline,
+so a stalled warehouse cannot spend a caller's timeout budget.
+
+Both relations are created with **explicit column types** rather than types
+inferred from the first batch — otherwise a first run with no LLM model (or a
+first query returning nothing) would fix a column as the wrong type and every
+later row would fail to append, silently, given the best-effort rule above.
 
 **`capture_query_text` is a second opt-in.** It stays off even when the query
 log is on. The fingerprint is always recorded and answers "which questions

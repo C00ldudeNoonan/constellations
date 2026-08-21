@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from ..adapters import create_adapter
 from ..adapters.base import AdapterError, ReadPredicate
-from ..append_log import write_rows
+from ..append_log import QUERY_LOG_SCHEMA, write_rows
 from ..config import load_project
 from ..profile import resolve_profile
 
@@ -80,7 +80,13 @@ class WarehouseContextRepository:
                 self._resolved.warehouse,
                 project_dir=self._project_dir,
             ) as adapter:
-                write_rows(adapter, config, [dict(row)], what="the MCP query log")
+                write_rows(
+                    adapter,
+                    config,
+                    [dict(row)],
+                    schema=QUERY_LOG_SCHEMA,
+                    what="the MCP query log",
+                )
         except Exception as error:
             log.warning(
                 "Could not open the warehouse to write the MCP query log [%s]; "

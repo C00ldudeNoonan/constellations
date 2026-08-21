@@ -23,7 +23,11 @@
   new `WarehouseAdapter.append_rows`.
 - **A log never fails the thing it logs.** Writes are best-effort; a failure is
   one warning naming the exception class, and the run or MCP response is
-  unaffected.
+  unaffected. The query-log write happens outside the MCP request deadline, so
+  a stalled warehouse cannot turn a served answer into a timeout.
+- Both relations are created with explicit column types rather than types
+  inferred from the first batch, so a first run with nulls in optional columns
+  cannot fix them as the wrong type and strand every later append.
 
 
 ### Warehouse-table sources: start a pipeline from a table (issue #322)

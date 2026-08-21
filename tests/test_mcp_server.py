@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -886,3 +887,37 @@ def test_a_denied_request_logs_nothing() -> None:
 
     assert response.error is not None
     assert repository.logged == []
+
+
+def test_a_slow_log_write_cannot_time_out_a_served_answer() -> None:
+    """Logging happens outside the request deadline.
+
+    The limiter times the guarded operation; a synchronous append inside it
+    meant a stalled warehouse could turn an otherwise successful search into
+    a TIMEOUT, contradicting the best-effort guarantee (Codex review, #333).
+    """
+
+    class SlowLogRepository(FakeRepository):
+        def log_query(self, row: Mapping[str, Any]) -> None:
+            time.sleep(0.3)
+            super().log_query(row)
+
+    repository = SlowLogRepository(_fixture_rows())
+    # A deadline far shorter than the log write: if the write were inside it,
+    # this search would fail.
+    service, _ = _service(
+        repository=repository,
+        settings=ContextServerSettings(timeout_seconds=0.15),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert len(response.results) == 1
+    assert len(repository.logged) == 1

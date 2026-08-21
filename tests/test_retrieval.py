@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,71 @@ def _write_project(tmp_path: Path, *, allow_public: bool = True) -> None:
                 "      batch_size: 2",
             ]
         )
+    )
+
+
+def _write_typed_attribute_project(tmp_path: Path) -> None:
+    """A project declaring one filterable attribute per `data_type` (#337).
+
+    The bug this guards: a `date` attribute validated, built, and returned
+    fine, but every filter on it failed at query time — the declared surface
+    accepted a filter the query path could not execute, so the failure landed
+    on the querying agent rather than the author.
+    """
+    _write_project(tmp_path)
+    models = tmp_path / "models" / "retrieval.yml"
+    models.write_text(
+        models.read_text().replace(
+            "\n".join(
+                [
+                    "      attributes:",
+                    "        - name: category",
+                    "          data_type: string",
+                    "          filter_role: user",
+                    "          returned: true",
+                ]
+            ),
+            "\n".join(
+                [
+                    "      attributes:",
+                    "        - name: category",
+                    "          data_type: string",
+                    "          filter_role: user",
+                    "          returned: true",
+                    "        - name: filing_date_dt",
+                    "          data_type: date",
+                    "          nullable: true",
+                    "          filter_role: user",
+                    "          returned: true",
+                    "        - name: page_count",
+                    "          data_type: integer",
+                    "          nullable: true",
+                    "          filter_role: user",
+                    "          returned: true",
+                    "        - name: is_amended",
+                    "          data_type: boolean",
+                    "          nullable: true",
+                    "          filter_role: user",
+                    "          returned: true",
+                ]
+            ),
+        )
+    )
+
+
+def _typed_rows() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "chunk_id": ["c1", "c2"],
+            "document_id": ["d1", "d2"],
+            "text": ["inflation slowed", "employment increased"],
+            "embedding": [[1.0, 0.0], [0.0, 1.0]],
+            "category": ["prices", "labor"],
+            "title": ["CPI", "Payrolls"],
+            "filing_date_dt": [date(2019, 1, 1), date(2023, 2, 13)],
+            "page_count": [10, 20],
+            "is_amended": [False, True],
+        }
     )
 
 
@@ -925,3 +991,143 @@ def test_lancedb_query_api_rejects_unowned_collections(tmp_path: Path) -> None:
         )
     assert "sensitive" not in str(raised.value)
     assert "external content" not in str(raised.value)
+
+
+def test_every_declared_attribute_type_round_trips_a_filter(tmp_path: Path) -> None:
+    """One filtered query per declared `data_type`, against a real store (#337).
+
+    Date filters validated at authoring and exploded at query time, because
+    the predicate compiler rendered temporal values as quoted strings — Utf8
+    to the query engine, which will not compare them to a date32 or timestamp
+    column. Config validation and index build both passed, so the only place
+    it surfaced was the querying agent.
+
+    `timestamp` is covered by the compiler-level test below instead: DuckDB
+    returns timestamps in the session timezone, which trips an unrelated UTC
+    check at publish time and would make this test about that instead.
+    """
+    _write_typed_attribute_project(tmp_path)
+    _materialize_upstream(tmp_path, _typed_rows())
+    run_project(tmp_path, select="context_search")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.retrieval is not None
+    store = create_store(
+        resolved.retrieval.stores["primary"],
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias="primary",
+    )
+
+    # (attribute, operator, value, expected chunk_ids) — one per data_type.
+    cases: list[tuple[str, RetrievalPredicateOperator, Any, list[str]]] = [
+        ("category", RetrievalPredicateOperator.EQUAL, "prices", ["c1"]),
+        (
+            "filing_date_dt",
+            RetrievalPredicateOperator.GREATER_THAN_OR_EQUAL,
+            date(2020, 1, 1),
+            ["c2"],
+        ),
+        (
+            "filing_date_dt",
+            RetrievalPredicateOperator.EQUAL,
+            date(2023, 2, 13),
+            ["c2"],
+        ),
+        ("page_count", RetrievalPredicateOperator.LESS_THAN, 15, ["c1"]),
+        ("is_amended", RetrievalPredicateOperator.EQUAL, True, ["c2"]),
+    ]
+    with store:
+        metadata = store.inspect_collection("retrieval_demo__dev__context")
+        assert metadata is not None
+        for field, operator, value, expected in cases:
+            result = store.vector_search(
+                metadata.physical_name,
+                [1.0, 0.0],
+                vector_field="embedding",
+                limit=10,
+                columns=["chunk_id"],
+                predicates=[RetrievalPredicate(field, operator, value)],
+            )
+            assert sorted(result.column("chunk_id").to_pylist()) == expected, (
+                f"filter on {field} ({operator}) did not round-trip"
+            )
+
+
+def test_temporal_predicates_execute_against_lancedb(tmp_path: Path) -> None:
+    """The compiled predicate must run, not just look right (#337).
+
+    Exercises `_compile_predicates` output against a real LanceDB table with
+    real date32/timestamp columns — the layer where the bug lived. A quoted
+    string literal is Utf8 to the query engine and is rejected outright, so
+    asserting on the SQL text alone would not have caught this.
+    """
+    from stel.retrieval.lancedb import _compile_predicates
+
+    db = lancedb.connect(str(tmp_path / "raw"))
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("filing_date_dt", pa.date32()),
+            ("observed_at", pa.timestamp("us")),
+            ("vector", pa.list_(pa.float32(), 2)),
+        ]
+    )
+    table = db.create_table(
+        "t",
+        pa.table(
+            {
+                "id": ["a", "b"],
+                "filing_date_dt": [date(2019, 1, 1), date(2023, 2, 13)],
+                "observed_at": [
+                    datetime(2019, 1, 1, 9, 30),
+                    datetime(2023, 2, 13, 14, 0),
+                ],
+                "vector": [[0.1, 0.2], [0.3, 0.4]],
+            },
+            schema=schema,
+        ),
+    )
+
+    cases = [
+        (
+            "filing_date_dt",
+            RetrievalPredicateOperator.GREATER_THAN_OR_EQUAL,
+            date(2020, 1, 1),
+        ),
+        ("filing_date_dt", RetrievalPredicateOperator.EQUAL, date(2023, 2, 13)),
+        (
+            "observed_at",
+            RetrievalPredicateOperator.GREATER_THAN_OR_EQUAL,
+            datetime(2020, 1, 1),
+        ),
+        (
+            "observed_at",
+            RetrievalPredicateOperator.EQUAL,
+            datetime(2023, 2, 13, 14, 0, tzinfo=UTC),
+        ),
+    ]
+    for field, operator, value in cases:
+        where = _compile_predicates([RetrievalPredicate(field, operator, value)])
+        assert where is not None
+        rows = (
+            table.search([0.1, 0.2])
+            .where(where, prefilter=True)
+            .limit(10)
+            .to_list()
+        )
+        assert [row["id"] for row in rows] == ["b"], f"{where} matched the wrong rows"
+
+
+def test_temporal_literals_are_typed_not_quoted_strings() -> None:
+    from stel.retrieval.lancedb import _sql_literal
+
+    assert _sql_literal(date(2020, 1, 1)) == "DATE '2020-01-01'"
+    assert _sql_literal(datetime(2020, 1, 1, 9, 30)) == (
+        "TIMESTAMP '2020-01-01T09:30:00'"
+    )
+    # `datetime` is a `date` subclass, so ordering matters.
+    assert _sql_literal(datetime(2020, 1, 1, tzinfo=UTC)).startswith("TIMESTAMP")
+    # A value with a quote still escapes; the type prefix is not an opening.
+    assert _sql_literal("o'brien") == "'o''brien'"

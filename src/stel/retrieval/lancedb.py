@@ -744,8 +744,16 @@ def _sql_literal(value: Any) -> str:
         return _sql_string(value)
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
-    if isinstance(value, datetime | date):
-        return _sql_string(value.isoformat())
+    # Temporal values need a *typed* literal, not a quoted string (issue
+    # #337). A bare `'2020-01-01'` is Utf8 to the query engine, which will not
+    # compare it to a date32/timestamp column — the filter is rejected at
+    # query time, after config validation and index build have both passed, so
+    # the failure lands on the querying agent rather than the author.
+    # `datetime` is a `date` subclass, so it is matched first.
+    if isinstance(value, datetime):
+        return f"TIMESTAMP {_sql_string(value.isoformat())}"
+    if isinstance(value, date):
+        return f"DATE {_sql_string(value.isoformat())}"
     if isinstance(value, int | float):
         return str(value)
     raise RetrievalError("Retrieval predicate contains an unsupported value")

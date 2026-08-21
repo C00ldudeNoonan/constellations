@@ -35,6 +35,8 @@ from .config.profile import (
     EmbeddingProfileConfig,
     LLMConfig,
     ProfileConfig,
+    QueryLogConfig,
+    RunLogConfig,
     WarehouseConfig,
 )
 from .config.project import ProjectConfig
@@ -89,6 +91,9 @@ class ResolvedProfile:
     profiles_path: Path | None  # None when using inline-legacy fallback
     retrieval: ResolvedRetrievalConfig | None = None
     embedding: EmbeddingProfileConfig | None = None
+    # Opt-in append-only histories for this target (issues #306, #329).
+    run_log: RunLogConfig | None = None
+    mcp_query_log: QueryLogConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +225,8 @@ def resolve_profile(
         llm=llm,
         embedding=embedding,
         retrieval=retrieval,
+        run_log=selected.run_log,
+        mcp_query_log=selected.mcp_query_log,
         source_paths=selected.source_paths,
         profiles_path=profiles_path,
     )

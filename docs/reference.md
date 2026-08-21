@@ -2629,6 +2629,68 @@ operator opted into it upstream. The bundle is a versioned contract
 (`ConceptCloudExport`, `schema_version`), so the static viewer and the export job
 evolve independently.
 
+## Append-only logs
+
+Artifacts are per-run files, replaced each run, so any question spanning more
+than one run means scraping a directory of JSON. Two opt-in warehouse tables
+make those questions queries instead. Both are **append-only** (the history is
+the artifact), both create their relation on first write, and both are **off by
+default**.
+
+```yaml
+my_project:
+  outputs:
+    dev:
+      warehouse: { type: duckdb, path: ./target/stel.duckdb }
+      run_log:
+        enabled: true
+        relation: stel_run_log        # default
+      mcp_query_log:
+        enabled: true
+        relation: stel_mcp_query_log  # default
+        capture_query_text: false     # default — see below
+```
+
+**`run_log`** (issue #306) — one row per model per invocation: `invocation_id`,
+`model_name`, `kind`, `status`, resolved `provider`/`provider_model`/
+`provider_implementation`, `rows_processed`/`rows_skipped`/`rows_written`,
+`api_calls`, `cache_hits`, `input_tokens`, `output_tokens`,
+`estimated_cost_usd` (when the profile sets `pricing:`), `duration_seconds`,
+`started_at`, `completed_at`. This is a durable sink for numbers stel already
+meters, not a second meter. A `status: budget_exceeded` row makes a tripped
+budget visible after the fact rather than only in the terminal output of the
+run that hit it.
+
+**`mcp_query_log`** (issue #329) — one row per served `search_context` call:
+`logged_at`, `principal_id`, `tenant_id`, `model_name`, `mode`,
+`query_fingerprint`, `requested_limit`, `result_count`, `zero_results`,
+`returned_chunk_ids`, `top_score`, `elapsed_ms`. Written **after**
+authorization and policy filtering, so a row reflects what the caller was
+allowed to see — a log of pre-filter hits would leak the existence of
+documents the principal cannot read — and a denied request logs nothing.
+
+`zero_results` is the cheapest retrieval-quality signal there is: a question
+the index cannot answer is what a chunking or metadata gap looks like from
+outside, so it is a column rather than something to reconstruct.
+
+### Two rules worth knowing
+
+**A log never fails the thing it logs.** Writes are best-effort: a warehouse
+that rejects one, a permission an operator forgot, a relation someone renamed
+— none of that turns a successful run into a failed one, or a served MCP
+answer into an error. Failures are a single warning naming the exception class.
+
+**`capture_query_text` is a second opt-in.** It stays off even when the query
+log is on. The fingerprint is always recorded and answers "which questions
+repeat, and which return nothing" without storing what anyone typed; turning
+the text on records user-authored content in your warehouse, which is a
+separate decision. Everything else written to either log follows the artifact
+rules — resolved identity and aggregates only, no prompt text, no document
+text, no credential values or environment-variable names.
+
+Retention and pruning are yours: the tables are primitives, and anything
+reading them is a downstream concern.
+
 ## Artifacts
 
 `stel compile` writes the manifest; `run` and `build` write the manifest and

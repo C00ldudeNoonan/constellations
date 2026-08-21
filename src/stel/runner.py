@@ -7,9 +7,11 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,6 +20,7 @@ from .adapters import (
     WarehouseAdapter,
     create_adapter,
 )
+from .append_log import run_log_rows, write_rows
 from .budget import BudgetLedger
 from .checks import TestResult, run_model_tests, validate_test_requirements
 from .compiler import (
@@ -272,13 +275,31 @@ def run_project(
             subset_run=subset_run,
         )
 
+    started_at = datetime.now(UTC).isoformat()
     with adapter:
         if threads > 1 and len(selected) > 1:
             results_by_name = _run_in_batches(dag, selected, adapter, _run, threads)
         else:
             results_by_name = {name: _run(name, adapter) for name in selected}
 
-    return [results_by_name[name] for name in selected]
+        results = [results_by_name[name] for name in selected]
+        # Written inside the adapter context, after the models it describes:
+        # best-effort by contract, so a log failure never turns a successful
+        # run into a failed one (issue #306).
+        write_rows(
+            adapter,
+            resolved.run_log,
+            run_log_rows(
+                results,
+                invocation_id=uuid.uuid4().hex,
+                started_at=started_at,
+                completed_at=datetime.now(UTC).isoformat(),
+                profile_target=resolved.target_name,
+            ),
+            what="the run log",
+        )
+
+    return results
 
 
 def build_project(

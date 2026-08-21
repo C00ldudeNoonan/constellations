@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Append-only logs: run history and MCP query history (issues #306, #329)
+
+- **`run_log:`** on a profile target records one row per model per invocation —
+  resolved provider identity, rows processed/skipped/written, token and call
+  counts, `estimated_cost_usd`, status, duration. Cross-run questions ("what
+  has this project spent over 90 days", "did the prompt change move cost per
+  row") become queries instead of a directory of `run_results.json` files. A
+  `budget_exceeded` row makes a tripped budget visible after the fact.
+- **`mcp_query_log:`** records one row per served `search_context` call —
+  principal, model, mode, query fingerprint, result count, `zero_results`,
+  returned chunk ids, top score, elapsed. Written after authorization and
+  policy filtering, so a row reflects only what the caller could see and a
+  denied request logs nothing.
+- **`capture_query_text` is a second opt-in**, off even when the log is on.
+  The fingerprint answers "which questions repeat, and which return nothing"
+  without storing what anyone typed.
+- **Both are off by default, append-only, and create their relation on first
+  write** — turning one on is the whole setup. Both share one primitive, the
+  new `WarehouseAdapter.append_rows`.
+- **A log never fails the thing it logs.** Writes are best-effort; a failure is
+  one warning naming the exception class, and the run or MCP response is
+  unaffected.
+
+
 ### Warehouse-table sources: start a pipeline from a table (issue #322)
 
 - **`path: warehouse://<relation>`** on a source treats each row of a

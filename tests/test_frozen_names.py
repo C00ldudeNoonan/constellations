@@ -71,7 +71,7 @@ from stel.config.identifiers import (
     PROJECT_FILENAME,
     RESERVED_PREFIXES,
 )
-from stel.config.profile import WarehouseConfig
+from stel.config.profile import QueryLogConfig, RunLogConfig, WarehouseConfig
 from stel.dbt_export import (
     DBT_META_NAMESPACE,
     DEFAULT_SOURCE_NAME_PREFIX,
@@ -210,6 +210,20 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
         "dbt_ml.duckdb",
         "the file pre-#313 zero-config projects defaulted to; config load looks "
         "for it before opening an empty database under the new name",
+    ),
+    (
+        "config.profile.RunLogConfig.relation",
+        RunLogConfig(enabled=True).relation,
+        "stel_run_log",
+        "the run-log relation accumulates history a project queries by name; "
+        "a new default silently starts an empty second history beside it",
+    ),
+    (
+        "config.profile.QueryLogConfig.relation",
+        QueryLogConfig(enabled=True).relation,
+        "stel_mcp_query_log",
+        "same as the run log: renaming it strands the query history rather "
+        "than moving it",
     ),
     (
         "config.identifiers.PROJECT_FILENAME",
@@ -497,6 +511,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("dbt-ml.transform-incremental-reference", 1, "9f69628fa9a3e1f668ec869219282eb0"),
     ("dbt_ml/retrieval_eval/golden_set", 1, "9305ca078ff6376cce65b750ebaf21cf"),
     ("eval-metric-id", 1, "a857cb0a824c56aa011e6b9b88cbba6e"),
+    ("mcp-query", 1, "2d7492cf337d83575a18003a001c1453"),
     ("warehouse-source-row", 1, "362b1a57365cd242b114e1e95a647e79"),
     ("embedding-config", 1, "a1f45bc702e4875dad7d01e066f92374"),
     ("embedding-input-row", 1, "4c7f5bfe371485b0aa73c4b777011d4f"),

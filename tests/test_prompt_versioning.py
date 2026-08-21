@@ -106,7 +106,12 @@ def test_an_empty_version_file_is_a_typo_not_a_prompt(tmp_path: Path) -> None:
     not hasattr(Path, "symlink_to"), reason="platform without symlinks"
 )
 def test_a_symlinked_prompt_is_refused(tmp_path: Path) -> None:
-    """Same rule as project configuration: regular non-symlink files only."""
+    """Same rule as project configuration: regular non-symlink files only.
+
+    Caught by the path-component walk rather than the later stat check — the
+    walk covers every component, so it reaches a symlinked leaf first. The
+    stat check still guards non-regular files (a fifo, say).
+    """
     outside = tmp_path / "outside.md"
     outside.write_text("text from outside the project")
     directory = tmp_path / "project" / "prompts" / "sneaky"
@@ -116,7 +121,7 @@ def test_a_symlinked_prompt_is_refused(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("symlink creation not permitted")
 
-    with pytest.raises(PromptError, match="regular non-symlink file"):
+    with pytest.raises(PromptError, match="is a symlink"):
         resolve_prompt(
             _ref_config("sneaky", "v1"), tmp_path / "project", model_name="m"
         )

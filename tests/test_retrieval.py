@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +171,11 @@ def _write_typed_attribute_project(tmp_path: Path) -> None:
                     "          nullable: true",
                     "          filter_role: user",
                     "          returned: true",
+                    "        - name: observed_at",
+                    "          data_type: timestamp",
+                    "          nullable: true",
+                    "          filter_role: user",
+                    "          returned: true",
                     "        - name: page_count",
                     "          data_type: integer",
                     "          nullable: true",
@@ -197,6 +202,10 @@ def _typed_rows() -> pl.DataFrame:
             "category": ["prices", "labor"],
             "title": ["CPI", "Payrolls"],
             "filing_date_dt": [date(2019, 1, 1), date(2023, 2, 13)],
+            "observed_at": [
+                datetime(2019, 1, 1, 9, 30, tzinfo=UTC),
+                datetime(2023, 2, 13, 14, 0, tzinfo=UTC),
+            ],
             "page_count": [10, 20],
             "is_amended": [False, True],
         }
@@ -1002,9 +1011,9 @@ def test_every_declared_attribute_type_round_trips_a_filter(tmp_path: Path) -> N
     column. Config validation and index build both passed, so the only place
     it surfaced was the querying agent.
 
-    `timestamp` is covered by the compiler-level test below instead: DuckDB
-    returns timestamps in the session timezone, which trips an unrelated UTC
-    check at publish time and would make this test about that instead.
+    Covers `timestamp` too, which #337's version could not: DuckDB returned
+    timestamps in the session timezone, so a UTC value failed the publish-time
+    UTC check. Fixed in #339, which pins the session.
     """
     _write_typed_attribute_project(tmp_path)
     _materialize_upstream(tmp_path, _typed_rows())
@@ -1033,6 +1042,12 @@ def test_every_declared_attribute_type_round_trips_a_filter(tmp_path: Path) -> N
             "filing_date_dt",
             RetrievalPredicateOperator.EQUAL,
             date(2023, 2, 13),
+            ["c2"],
+        ),
+        (
+            "observed_at",
+            RetrievalPredicateOperator.GREATER_THAN_OR_EQUAL,
+            datetime(2020, 1, 1, tzinfo=UTC),
             ["c2"],
         ),
         ("page_count", RetrievalPredicateOperator.LESS_THAN, 15, ["c1"]),
@@ -1131,3 +1146,41 @@ def test_temporal_literals_are_typed_not_quoted_strings() -> None:
     assert _sql_literal(datetime(2020, 1, 1, tzinfo=UTC)).startswith("TIMESTAMP")
     # A value with a quote still escapes; the type prefix is not an opening.
     assert _sql_literal("o'brien") == "'o''brien'"
+
+
+def test_duckdb_reads_timestamps_as_stored_not_as_host_local(
+    tmp_path: Path,
+) -> None:
+    """Every DuckDB session stel opens is pinned to UTC (issue #339).
+
+    DuckDB defaults `TimeZone` to the host's local zone and converts
+    `TIMESTAMP WITH TIME ZONE` values into it on read, so a genuinely-UTC
+    value came back bearing the developer's offset and failed the publish-time
+    "search timestamp attributes must be UTC" check. Invisible in CI, whose
+    runners are UTC — so this asserts the setting rather than the symptom.
+    """
+    from stel.adapters import create_adapter, parse_warehouse_config
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "tz.duckdb"), "schema": "main"}
+    )
+    stored = datetime(2019, 1, 1, 9, 30, tzinfo=UTC)
+
+    with create_adapter(config) as adapter:
+        adapter.materialize_full("moments", pl.DataFrame({"at": [stored]}))
+
+        # The ordinary read path...
+        read_back = adapter.read_table("moments").to_dicts()[0]["at"]
+        assert read_back.utcoffset() == timedelta(0)
+        # ...and the Arrow snapshot path, which uses a cursor. A cursor starts
+        # a fresh session rather than inheriting the connection's, so pinning
+        # only at connect left this one host-local.
+        with adapter.table_snapshot("moments", batch_size=10) as snapshot:
+            rows = [row for batch in snapshot for row in batch.to_pylist()]
+
+    # `utcoffset()`, not equality: aware datetimes compare by *instant*, so
+    # `4:30-05:00 == 9:30+00:00` is True and an equality assertion cannot see
+    # the host-local rendering at all. The publish check tests the offset, so
+    # this does too.
+    assert [row["at"].utcoffset() for row in rows] == [timedelta(0)]
+    assert rows[0]["at"] == stored

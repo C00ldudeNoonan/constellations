@@ -231,6 +231,24 @@ def lock_path(project_dir: Path) -> Path:
     return project_dir / PROMPTS_DIRNAME / LOCK_FILENAME
 
 
+def _verified_lock_path(project_dir: Path) -> Path:
+    """The lock path, refused if any component is a symlink.
+
+    Raises `PromptLockError` rather than letting `verify_project_path`'s
+    `PromptError` escape: the CLI's prompt commands catch the lock error, so
+    the path error would have reached a user as an unhandled traceback rather
+    than a clean message. Linux CI caught that; the symlink tests skip on
+    Windows.
+    """
+    try:
+        path = verify_project_path(
+            lock_path(project_dir), project_dir, what="the prompt lock"
+        )
+    except PromptError as error:
+        raise PromptLockError(str(error)) from error
+    return path
+
+
 def discover_prompts(project_dir: Path) -> dict[str, str]:
     """Every `<name>/<version>` in the tree, mapped to its content hash."""
     root = project_dir / PROMPTS_DIRNAME
@@ -246,13 +264,7 @@ def discover_prompts(project_dir: Path) -> dict[str, str]:
 
 
 def read_lock(project_dir: Path) -> dict[str, str]:
-    path = verify_project_path(
-        lock_path(project_dir), project_dir, what="the prompt lock"
-    )
-    if path.is_symlink():
-        raise PromptLockError(
-            f"Refusing to read the prompt lock at {path}: it is a symlink."
-        )
+    path = _verified_lock_path(project_dir)
     if not path.exists():
         return {}
     try:
@@ -340,15 +352,8 @@ def write_lock(project_dir: Path, *, force: bool = False) -> tuple[int, int]:
             + " Pass --force only when the change is deliberate and reviewed."
         )
     added = len(found.keys() - locked.keys())
-    path = verify_project_path(
-        lock_path(project_dir), project_dir, what="the prompt lock"
-    )
+    path = _verified_lock_path(project_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        # write_text() follows a symlink and would truncate its target.
-        raise PromptLockError(
-            f"Refusing to write the prompt lock at {path}: it is a symlink."
-        )
     path.write_text(
         json.dumps(
             {"version": LOCK_VERSION, "prompts": dict(sorted(found.items()))},

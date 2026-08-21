@@ -638,3 +638,48 @@ def test_a_symlinked_lock_is_never_written_through(tmp_path: Path) -> None:
         write_lock(tmp_path)
 
     assert victim.read_text() == "do not truncate me"
+
+
+def test_a_lock_path_failure_surfaces_as_a_lock_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI catches `PromptLockError`, so a path failure must be one.
+
+    Otherwise a symlinked lock reaches the user as an unhandled traceback.
+    Written without a real symlink deliberately: the symlink tests skip on
+    Windows, so this conversion would otherwise be verified only in CI.
+    """
+    from stel import prompts as prompts_module
+    from stel.prompts import PromptError, PromptLockError, read_lock
+
+    def _refuse(*args: object, **kwargs: object) -> Path:
+        raise PromptError("Refusing to use the prompt lock: 'x' is a symlink.")
+
+    monkeypatch.setattr(prompts_module, "verify_project_path", _refuse)
+
+    with pytest.raises(PromptLockError, match="is a symlink"):
+        read_lock(tmp_path)
+
+
+def test_the_cli_reports_a_lock_path_failure_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from click.testing import CliRunner
+
+    from stel import prompts as prompts_module
+    from stel.cli import cli
+    from stel.prompts import PromptError
+
+    def _refuse(*args: object, **kwargs: object) -> Path:
+        raise PromptError("Refusing to use the prompt lock: 'x' is a symlink.")
+
+    monkeypatch.setattr(prompts_module, "verify_project_path", _refuse)
+
+    result = CliRunner().invoke(
+        cli, ["prompts", "check", "--project-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code != 0
+    assert "is a symlink" in result.output
+    # A clean error, not a traceback.
+    assert result.exception is None or isinstance(result.exception, SystemExit)

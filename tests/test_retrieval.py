@@ -785,6 +785,58 @@ def test_index_config_change_leaves_existing_collection_untouched(tmp_path: Path
         assert metadata.row_count == 2
 
 
+def test_tuning_batch_size_does_not_invalidate_the_published_index(
+    tmp_path: Path,
+) -> None:
+    """Issue #344's reported bug, end to end. `batch_size` changes how many
+    rows a publish sends per call and never what a row contains, but it used
+    to sit inside the collection fingerprint — so tuning publish pacing
+    demanded a blue/green rebuild and a full re-embed of the corpus."""
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    run_project(tmp_path, select="context_search")
+
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text().replace("batch_size: 2", "batch_size: 1")
+    )
+
+    # Must publish, not raise: the index still describes the same rows.
+    run_project(tmp_path, select="context_search")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.retrieval is not None
+    store = create_store(
+        resolved.retrieval.stores["primary"],
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias="primary",
+    )
+    with store:
+        metadata = store.inspect_collection("retrieval_demo__dev__context")
+        assert metadata is not None
+        assert metadata.row_count == 2
+
+
+def test_a_rebuild_forcing_change_names_the_field_that_forced_it(
+    tmp_path: Path,
+) -> None:
+    """The old failure said only that the configuration had changed, which left
+    the operator to diff the YAML themselves and gave no signal whether the
+    change was additive or genuinely invalidating."""
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    run_project(tmp_path, select="context_search")
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text().replace("metric: cosine", "metric: dot")
+    )
+
+    with pytest.raises(RunError, match="requires a rebuild: vector"):
+        run_project(tmp_path, select="context_search")
+
+
 def test_search_collection_collisions_fail_before_store_io(tmp_path: Path) -> None:
     _write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"

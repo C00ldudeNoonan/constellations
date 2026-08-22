@@ -27,11 +27,21 @@ from .coordination import (
     ServingNotReadyError,
     StaleServingLeaseError,
 )
+from .evolution import (
+    ChangeKind,
+    ConfigChange,
+    classify_changes,
+    descriptor_json,
+    rebuild_required,
+    semantic_search_config,
+)
 from .lancedb import LanceDBConfig, LanceDBStore
 from .registry import (
     absolutize_store_config,
     collection_config_fingerprint,
+    collection_descriptor,
     create_store,
+    legacy_collection_config_fingerprint,
     list_store_types,
     parse_store_config,
     store_class,
@@ -39,8 +49,10 @@ from .registry import (
 
 __all__ = [
     "PUBLISHER_FENCING_FEATURES",
+    "ChangeKind",
     "CollectionMetadata",
     "CollectionSpec",
+    "ConfigChange",
     "IndexedRow",
     "LanceDBConfig",
     "LanceDBStore",
@@ -66,9 +78,15 @@ __all__ = [
     "StaleServingLeaseError",
     "StateRetrievalTarget",
     "absolutize_store_config",
+    "classify_changes",
     "collection_config_fingerprint",
+    "collection_descriptor",
     "create_store",
+    "descriptor_json",
+    "legacy_collection_config_fingerprint",
     "list_store_types",
     "parse_store_config",
+    "rebuild_required",
+    "semantic_search_config",
     "store_class",
 ]

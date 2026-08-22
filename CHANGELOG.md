@@ -27,6 +27,37 @@
   change and 10 do now; the remaining 17 are recorded as debt, including
   `materialize_full_chunks`, `materialize_sql_full`/`_incremental`, and
   `replace_children`.
+### Search index configuration changes are classified, not just detected (issue #344)
+
+- **Tuning `batch_size` no longer forces a full re-embed.** A published
+  collection's fingerprint hashed the *whole* `search:` block, so fields that
+  only change execution cadence invalidated the index: changing `batch_size`
+  — how many rows a publish sends per call, never what a row contains —
+  demanded a blue/green rebuild of the collection at full embedding cost.
+  `index_options` did the same and is not read by any code at all.
+- **`on_index_change` was inside the fingerprint that decides how to react to
+  a fingerprint change.** Adopting a non-default policy therefore tripped the
+  very `fail` gate it was adopted to escape. Latent rather than reported,
+  because the compiler still rejects the other modes — it would have surfaced
+  the moment `rebuild` shipped.
+- **A change is now named.** Collections record a semantic descriptor rather
+  than only its digest, and a difference is classified per the change table in
+  `docs/architecture/semantic-retrieval.md`: an added attribute or a wider
+  projection is *compatible*; a changed vector dimension, metric, id mapping,
+  analyzer, or an existing attribute's type or filter role is
+  *rebuild-required*. The failure says which field forced it instead of
+  "configuration changed".
+- `on_index_change: fail` remains the default and the only supported policy —
+  `rebuild` and `online` are still rejected at compile time — so a classified
+  change still stops the run. What changed is that the operator is told what
+  moved, and whether the existing collection could have served it.
+- **Existing collections are re-stamped in place, never rebuilt.** A collection
+  published before descriptors existed carries only the older stamp; the first
+  publish after upgrading recomputes that stamp to prove the configuration is
+  unchanged and rewrites it. Rows are untouched and there is nothing to run by
+  hand. Had the descriptor simply been narrowed, every live index would have
+  failed its next publish and demanded exactly the rebuild this change exists
+  to remove.
 
 ## v0.10.0 - 2026-08-21
 

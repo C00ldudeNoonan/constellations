@@ -9,6 +9,7 @@ DAG scheduling, and result aggregation, and re-exports run_search_model.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import date, datetime, timedelta
@@ -32,14 +33,20 @@ from ..embedding import effective_search_config, resolve_search_embedding_option
 from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile
 from ..retrieval import (
+    ChangeKind,
+    CollectionMetadata,
     CollectionSpec,
     IndexedRow,
     PublishLease,
     RetrievalError,
     ServingCoordinationError,
     ServingCoordinator,
+    classify_changes,
     collection_config_fingerprint,
+    collection_descriptor,
     create_store,
+    descriptor_json,
+    legacy_collection_config_fingerprint,
 )
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..versioning import compute_model_code_version
@@ -136,11 +143,7 @@ def run_search_model(
                 force_publish = existing is None
                 collection_exists = existing is not None
                 if existing is not None:
-                    if existing.config_fingerprint != spec.config_fingerprint:
-                        raise RunError(
-                            "Search index configuration changed; choose a new collection "
-                            "or wait for atomic rebuild support"
-                        )
+                    _verify_collection_config(store, existing, spec)
                     if not existing.schema.equals(spec.arrow_schema, check_metadata=False):
                         raise RunError(
                             "Search index schema does not match the declared collection contract"
@@ -418,15 +421,21 @@ def _search_collection_spec(
         models_by_name,
         resolved,
     )
+    search_payload = effective_search_config(
+        model,
+        models_by_name,
+        profile_options=embedding_runtime.provider_options
+        if embedding_runtime is not None
+        else None,
+    )
     config_fingerprint = collection_config_fingerprint(
-        effective_search_config(
-            model,
-            models_by_name,
-            profile_options=embedding_runtime.provider_options
-            if embedding_runtime is not None
-            else None,
-        ),
-        store_type=store_type,
+        search_payload, store_type=store_type
+    )
+    descriptor = descriptor_json(
+        collection_descriptor(search_payload, store_type=store_type)
+    )
+    legacy_fingerprint = legacy_collection_config_fingerprint(
+        search_payload, store_type=store_type
     )
     return CollectionSpec(
         logical_name=search.collection or model.name,
@@ -446,7 +455,60 @@ def _search_collection_spec(
         distance_metric=search.vector.metric if search.vector else None,
         vector_search=search.vector.search if search.vector else None,
         config_fingerprint=config_fingerprint,
+        descriptor=descriptor,
+        legacy_config_fingerprint=legacy_fingerprint,
         arrow_schema=schema,
+    )
+
+
+def _verify_collection_config(
+    store: Any,
+    existing: CollectionMetadata,
+    spec: CollectionSpec,
+) -> None:
+    """Refuse a publish whose configuration no longer describes the collection.
+
+    `on_index_change: fail` is still the only supported policy, so this always
+    either proceeds or raises — but it now says *which* field moved, and it
+    distinguishes a change the existing collection could serve from one that
+    invalidates the rows already written (issue #344).
+    """
+    if existing.descriptor is None:
+        # Published before the descriptor existed: it carries only the legacy
+        # digest. Recomputing that digest is the one way to prove the
+        # configuration is unchanged, in which case the stamp is merely stale
+        # in format and is rewritten in place — no rebuild, no re-embed.
+        if existing.config_fingerprint == spec.legacy_config_fingerprint:
+            store.restamp_collection(spec)
+            return
+        raise RunError(
+            "Search index configuration changed. This collection predates "
+            "configuration classification, so the changed fields cannot be "
+            "named; publish under a new collection name, validate it, and cut "
+            "consumers over."
+        )
+
+    if existing.descriptor == spec.descriptor:
+        return
+
+    changes = classify_changes(
+        json.loads(existing.descriptor).get("search", {}),
+        json.loads(spec.descriptor).get("search", {}),
+    )
+    blocking = [c for c in changes if c.kind is ChangeKind.REBUILD_REQUIRED]
+    detail = "; ".join(change.describe() for change in changes) or "store contract"
+    if blocking:
+        raise RunError(
+            f"Search index configuration changed and requires a rebuild: {detail}. "
+            "Rows already written were indexed under the previous definition, so "
+            "publish under a new collection name, validate it, and cut consumers "
+            "over."
+        )
+    raise RunError(
+        f"Search index configuration changed: {detail}. The change is additive "
+        "and the existing collection could serve it, but in-place evolution "
+        "needs `on_index_change: online`, which is not implemented yet — "
+        "publish under a new collection name for now."
     )
 
 

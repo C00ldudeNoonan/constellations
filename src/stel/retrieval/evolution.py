@@ -178,3 +178,33 @@ def _classify_attributes(before: Any, after: Any) -> ConfigChange:
 
 def rebuild_required(changes: list[ConfigChange]) -> list[ConfigChange]:
     return [change for change in changes if change.kind is ChangeKind.REBUILD_REQUIRED]
+
+
+# Descriptor fields outside `search` that invalidate a collection on their own:
+# the store contract and semantic implementation version, per the design doc's
+# "whole-index invalidation" row.
+_CONTRACT_FIELDS = ("contract_version", "store_type", "store_implementation")
+
+
+def classify_descriptor_changes(
+    stored: dict[str, Any], current: dict[str, Any]
+) -> list[ConfigChange]:
+    """Classify a whole descriptor, not just its `search` mapping.
+
+    Comparing only `search` silently drops the contract fields, so a store
+    implementation bump — which invalidates every row written under it —
+    produced an empty change list and was reported as an additive change the
+    existing collection could serve (Codex review, #344).
+    """
+    changes = [
+        ConfigChange(
+            field=field,
+            kind=ChangeKind.REBUILD_REQUIRED,
+            detail=f"changed from {stored.get(field)!r} to {current.get(field)!r}",
+        )
+        for field in _CONTRACT_FIELDS
+        if stored.get(field) != current.get(field)
+    ]
+    return changes + classify_changes(
+        stored.get("search", {}), current.get("search", {})
+    )

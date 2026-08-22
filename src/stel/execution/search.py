@@ -41,7 +41,7 @@ from ..retrieval import (
     RetrievalError,
     ServingCoordinationError,
     ServingCoordinator,
-    classify_changes,
+    classify_descriptor_changes,
     collection_config_fingerprint,
     collection_descriptor,
     create_store,
@@ -491,9 +491,8 @@ def _verify_collection_config(
     if existing.descriptor == spec.descriptor:
         return
 
-    changes = classify_changes(
-        json.loads(existing.descriptor).get("search", {}),
-        json.loads(spec.descriptor).get("search", {}),
+    changes = classify_descriptor_changes(
+        json.loads(existing.descriptor), json.loads(spec.descriptor)
     )
     blocking = [c for c in changes if c.kind is ChangeKind.REBUILD_REQUIRED]
     detail = "; ".join(change.describe() for change in changes) or "store contract"

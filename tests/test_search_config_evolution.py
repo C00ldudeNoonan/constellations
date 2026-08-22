@@ -8,6 +8,9 @@ which field forced a rebuild instead of being told "something changed".
 """
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,6 +22,7 @@ from stel.retrieval import (
     CollectionMetadata,
     CollectionSpec,
     classify_changes,
+    classify_descriptor_changes,
     collection_config_fingerprint,
     descriptor_json,
     legacy_collection_config_fingerprint,
@@ -278,3 +282,131 @@ def test_an_additive_change_says_so_rather_than_demanding_a_rebuild() -> None:
     with pytest.raises(RunError, match="additive") as error:
         _verify_collection_config(_RecordingStore(), existing, spec)
     assert "rebuild" not in str(error.value).split("on_index_change")[0]
+
+
+# ─── Codex review regressions ────────────────────────────────────────────────
+
+
+def _real_spec(tmp_path: Path, **overrides: Any) -> tuple[Any, CollectionSpec]:
+    """A real LanceDB store plus a spec whose arrow schema it can create.
+
+    The re-stamp tests above use a recording fake, which is precisely how the
+    fingerprint bug below survived them: a fake that does not model the stored
+    stamp cannot show that re-stamping leaves it stale.
+    """
+    import pyarrow as pa
+
+    from stel.retrieval import parse_store_config
+    from stel.retrieval.lancedb import LanceDBStore
+
+    config = parse_store_config({"type": "lancedb", "path": str(tmp_path / "lance")})
+    store = LanceDBStore(config, project_name="demo", target_name="dev", alias="primary")
+    spec = _spec(**overrides)
+    schema = pa.schema(
+        [pa.field("chunk_id", pa.string()), pa.field("text", pa.string())]
+    )
+    return store, replace(spec, arrow_schema=schema)
+
+
+def test_a_restamped_collection_reports_its_new_fingerprint(tmp_path: Path) -> None:
+    """Re-stamping has to update the collection's *identity*, not just add a
+    descriptor beside a stale one.
+
+    Post-publication validation compares the stored fingerprint against the
+    spec's. If the re-stamp left the pre-#344 digest in place, every legacy
+    collection would publish its rows, advance state, then fail that check —
+    and fail it again on every retry, because the descriptor now short
+    circuits the re-stamp branch. A permanent block inflicted by the very
+    migration meant to avoid one (Codex review P1).
+
+    The collection is built the way v0.10.0 built one — schema-level stamp
+    only, no field metadata — so this exercises the real upgrade, not a
+    re-stamp of something already current.
+    """
+    import lancedb
+    import pyarrow as pa
+
+    from stel.retrieval.lancedb import (
+        _CONFIG_KEY,
+        _CONTRACT_KEY,
+        _OWNER_KEY,
+        _OWNER_VALUE,
+    )
+
+    store, spec = _real_spec(tmp_path)
+    legacy_schema = spec.arrow_schema.with_metadata(
+        {
+            _OWNER_KEY: _OWNER_VALUE,
+            _CONTRACT_KEY: b"1",
+            _CONFIG_KEY: spec.legacy_config_fingerprint.encode(),
+        }
+    )
+    db = lancedb.connect(str(tmp_path / "lance"))
+    db.create_table(spec.physical_name, schema=legacy_schema)
+    db.open_table(spec.physical_name).add(
+        [{"chunk_id": "a", "text": "x"}]
+    )
+    del pa
+
+    with store:
+        before = store.inspect_collection(spec.physical_name)
+        assert before is not None
+        assert before.descriptor is None, "fixture must look pre-#344"
+        assert before.config_fingerprint == spec.legacy_config_fingerprint
+
+        store.restamp_collection(spec)
+        written = store.inspect_collection(spec.physical_name)
+
+    assert written is not None
+    assert written.descriptor == spec.descriptor
+    # The assertion that was missing: identity, not just the descriptor. Without
+    # it the post-publication check compares a v1 stamp against a v2 spec.
+    assert written.config_fingerprint == spec.config_fingerprint
+    assert written.row_count == 1, "re-stamping must not touch rows"
+
+
+def test_a_created_collection_reports_the_current_fingerprint(tmp_path: Path) -> None:
+    """The same invariant on the create path, so the two cannot drift."""
+    store, spec = _real_spec(tmp_path)
+    with store:
+        store.create_collection(spec)
+        written = store.inspect_collection(spec.physical_name)
+
+    assert written is not None
+    assert written.config_fingerprint == spec.config_fingerprint
+
+
+def test_a_store_implementation_bump_requires_a_rebuild() -> None:
+    """The descriptor's contract fields invalidate a collection on their own.
+
+    Classifying only the `search` mapping dropped them, so a store
+    implementation bump produced an empty change list and was reported as an
+    additive change the existing collection could serve — the opposite of the
+    design doc's "whole-index invalidation" (Codex review P2).
+    """
+    stored = {
+        "contract_version": 2,
+        "store_type": "lancedb",
+        "store_implementation": "old",
+        "search": {"id_field": "chunk_id"},
+    }
+    current = {**stored, "store_implementation": "new"}
+
+    changes = classify_descriptor_changes(stored, current)
+
+    assert [c.field for c in changes] == ["store_implementation"]
+    assert all(c.kind is ChangeKind.REBUILD_REQUIRED for c in changes)
+
+
+def test_a_contract_change_reaches_the_publish_gate_as_a_rebuild() -> None:
+    """End of the same path: the operator must be told to rebuild, not told
+    the existing collection could serve it."""
+    spec = _spec()
+    stored = json.loads(spec.descriptor)
+    stored["store_implementation"] = "previous-implementation"
+    existing = _metadata(
+        descriptor=json.dumps(stored), config_fingerprint="stale-digest"
+    )
+
+    with pytest.raises(RunError, match="requires a rebuild: store_implementation"):
+        _verify_collection_config(_RecordingStore(), existing, spec)

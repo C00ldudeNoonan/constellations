@@ -1236,3 +1236,70 @@ def test_duckdb_reads_timestamps_as_stored_not_as_host_local(
     # this does too.
     assert [row["at"].utcoffset() for row in rows] == [timedelta(0)]
     assert rows[0]["at"] == stored
+
+
+def _set_index_change_policy(tmp_path: Path, policy: str) -> None:
+    path = tmp_path / "models" / "context_search.yml"
+    candidates = [path] if path.exists() else list((tmp_path / "models").glob("*.yml"))
+    for candidate in candidates:
+        text = candidate.read_text()
+        if "on_index_change: fail" in text:
+            candidate.write_text(
+                text.replace("on_index_change: fail", f"on_index_change: {policy}")
+            )
+            return
+    raise AssertionError("fixture no longer declares on_index_change")
+
+
+def test_rebuild_policy_is_refused_while_no_store_can_activate_atomically(
+    tmp_path: Path,
+) -> None:
+    """`rebuild` needs atomic generation activation, which no store advertises.
+    Accepting it would compile a policy that cannot be honored (issue #344)."""
+    _write_project(tmp_path)
+    _set_index_change_policy(tmp_path, "rebuild")
+    project, sources, models = load_project(tmp_path)
+
+    with pytest.raises(ConfigError, match="atomic generation activation"):
+        validate_project_contract(project, sources, models, tmp_path)
+
+
+def test_online_policy_compiles_against_a_store_that_advertises_evolution(
+    tmp_path: Path,
+) -> None:
+    """LanceDB can widen a live collection in place, so `online` is a policy it
+    can actually honor — unlike `rebuild`."""
+    _write_project(tmp_path)
+    _set_index_change_policy(tmp_path, "online")
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    validate_retrieval_capabilities(models, project, resolved)
+
+
+def test_online_policy_is_refused_when_the_store_cannot_evolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The capability is the gate, not the mode name. A store that cannot widen
+    in place must not be handed an `online` policy to honor."""
+    from stel.retrieval.base import RetrievalFeature
+    from stel.retrieval.lancedb import LanceDBStore
+
+    _write_project(tmp_path)
+    _set_index_change_policy(tmp_path, "online")
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    full = LanceDBStore.capabilities()
+    reduced = replace(
+        full,
+        features=frozenset(
+            f for f in full.features if f is not RetrievalFeature.ONLINE_SCHEMA_EVOLUTION
+        ),
+    )
+    monkeypatch.setattr(LanceDBStore, "capabilities", classmethod(lambda cls: reduced))
+
+    with pytest.raises(Exception, match="online_schema_evolution"):
+        validate_retrieval_capabilities(models, project, resolved)

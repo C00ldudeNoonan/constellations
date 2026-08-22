@@ -143,11 +143,14 @@ def run_search_model(
                 force_publish = existing is None
                 collection_exists = existing is not None
                 if existing is not None:
-                    _verify_collection_config(store, existing, spec)
-                    if not existing.schema.equals(spec.arrow_schema, check_metadata=False):
-                        raise RunError(
-                            "Search index schema does not match the declared collection contract"
-                        )
+                    evolved = _verify_collection_config(
+                        store, existing, spec, policy=search.on_index_change
+                    )
+                    if evolved:
+                        # The collection just changed shape; compare against
+                        # what it now is, not the snapshot taken before.
+                        existing = store.inspect_collection(physical) or existing
+                    _validate_collection_schema(existing.schema, spec)
 
                 for ordinal, batch in enumerate(snapshot):
                     indexed = _indexed_rows(
@@ -461,17 +464,55 @@ def _search_collection_spec(
     )
 
 
+def _schema_matches_by_name(existing: pa.Schema, declared: pa.Schema) -> bool:
+    """Compare two schemas by column name and type, ignoring order.
+
+    This is the contract stel actually relies on: every read, write, and
+    predicate addresses columns by name, so ordering carries no meaning, and a
+    store column's nullability is not a guarantee stel makes — rows are
+    validated on the way in. Types are still compared exactly.
+
+    An ordered comparison was over-strict, and once collections could be
+    widened it was wrong. `add_columns` can only append, while the declared
+    schema orders columns by projection, so a newly added attribute lands ahead
+    of the display fields in one and behind them in the other; added columns
+    are also nullable until the republish fills them. Comparing strictly
+    rejected a collection that had just been widened correctly, on every run
+    after the widening (Codex review, #344).
+    """
+    return {field.name: field.type for field in existing} == {
+        field.name: field.type for field in declared
+    }
+
+
+def _validate_collection_schema(existing: pa.Schema, spec: CollectionSpec) -> None:
+    """Refuse a collection whose physical shape is not the declared one.
+
+    One comparison for every path. A collection that was widened in place is
+    reached again on the next run, when nothing has changed and no evolution
+    happens, so a stricter check here than the one applied during the widening
+    would reject the collection it had just accepted.
+    """
+    if not _schema_matches_by_name(existing, spec.arrow_schema):
+        raise RunError(
+            "Search index schema does not match the declared collection contract"
+        )
+
+
 def _verify_collection_config(
     store: Any,
     existing: CollectionMetadata,
     spec: CollectionSpec,
-) -> None:
+    *,
+    policy: str = "fail",
+) -> bool:
     """Refuse a publish whose configuration no longer describes the collection.
 
-    `on_index_change: fail` is still the only supported policy, so this always
-    either proceeds or raises — but it now says *which* field moved, and it
-    distinguishes a change the existing collection could serve from one that
-    invalidates the rows already written (issue #344).
+    Returns whether the collection was widened in place. Under the default
+    `fail` policy this only ever returns False or raises, but it says *which*
+    field moved and distinguishes a change the existing collection could serve
+    from one that invalidates the rows already written. Under `online` a
+    compatible change is applied rather than refused (issue #344).
     """
     if existing.descriptor is None:
         # Published before the descriptor existed: it carries only the legacy
@@ -480,7 +521,7 @@ def _verify_collection_config(
         # in format and is rewritten in place — no rebuild, no re-embed.
         if existing.config_fingerprint == spec.legacy_config_fingerprint:
             store.restamp_collection(spec)
-            return
+            return False
         raise RunError(
             "Search index configuration changed. This collection predates "
             "configuration classification, so the changed fields cannot be "
@@ -489,7 +530,7 @@ def _verify_collection_config(
         )
 
     if existing.descriptor == spec.descriptor:
-        return
+        return False
 
     changes = classify_descriptor_changes(
         json.loads(existing.descriptor), json.loads(spec.descriptor)
@@ -503,11 +544,23 @@ def _verify_collection_config(
             "publish under a new collection name, validate it, and cut consumers "
             "over."
         )
+    if policy == "online":
+        # Compatible-only, and the store advertised that it can widen a live
+        # collection. Columns arrive null; every row's fingerprint includes the
+        # config digest, so the republish that follows refills the collection
+        # from the warehouse — an index rewrite, but no provider calls.
+        added = [
+            name
+            for name in spec.arrow_schema.names
+            if name not in set(existing.schema.names)
+        ]
+        store.evolve_collection(spec, added)
+        return True
+
     raise RunError(
         f"Search index configuration changed: {detail}. The change is additive "
-        "and the existing collection could serve it, but in-place evolution "
-        "needs `on_index_change: online`, which is not implemented yet — "
-        "publish under a new collection name for now."
+        "and the existing collection could serve it — set `on_index_change: "
+        "online` to widen it in place, or publish under a new collection name."
     )
 
 

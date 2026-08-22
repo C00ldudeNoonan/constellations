@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### `on_index_change: online` widens a live search index in place (issue #344)
+
+- **Adding a filterable attribute no longer costs a rebuild.** With
+  `on_index_change: online`, a change classification calls compatible — a new
+  attribute, or a wider `display_fields`/`return_text_fields` — is applied to
+  the published collection instead of refused. The columns are added in place
+  and the rows republished from the warehouse to fill them.
+- **No embeddings are recomputed.** Vectors come from the upstream table, so
+  the cost is an index rewrite rather than provider spend. On a 20k-document
+  corpus that is the difference between adding one filter column and paying to
+  embed the whole thing again.
+- **Only for compatible changes, and only where the store can do it.** A
+  changed vector dimension, metric, id mapping, analyzer, or an existing
+  attribute's type or filter role is still refused under `online` — the rows
+  already written are genuinely invalid, and a capability flag cannot change
+  that. Stores advertise `online_schema_evolution`; the policy is rejected at
+  compile time against one that cannot widen a live collection.
+- **`on_index_change: rebuild` is still rejected at compile time**, now with an
+  error that says why: atomic full replacement needs a store that can prove
+  atomic generation activation, and none does yet. The previous message
+  implied both remaining modes were merely unimplemented.
+
 ### The BigQuery pre-release gate now covers what it claims to (issue #347)
 
 - **`docs/release.md` names `tests/test_bigquery_adapter.py` as the gate for

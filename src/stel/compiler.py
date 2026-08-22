@@ -409,6 +409,10 @@ def validate_retrieval_capabilities(
             RetrievalFeature.ATOMIC_BATCH_MUTATION: "exact whole-batch receipts",
             RetrievalFeature.INDEX_READINESS: "post-publication index validation",
         }
+        if search.on_index_change == "online":
+            required[RetrievalFeature.ONLINE_SCHEMA_EVOLUTION] = (
+                "in-place widening for `on_index_change: online`"
+            )
         if search.vector is not None:
             required[
                 RetrievalFeature.APPROXIMATE_VECTOR_SEARCH
@@ -809,11 +813,13 @@ def _validate_materialization(model: ModelConfig) -> None:
                 "local proof-of-concept; atomic full replacement is deferred to #153",
                 ("materialization",),
             )
-        if model.search.on_index_change != "fail":
+        if model.search.on_index_change == "rebuild":
             raise _model_error(
                 model,
-                "Search resources support only `on_index_change: fail` until atomic "
-                "replacement and fenced online evolution are implemented",
+                "`on_index_change: rebuild` requires atomic generation activation, "
+                "which no retrieval store advertises yet. Use `fail` (the default) "
+                "and publish under a new collection name, or `online` for an "
+                "additive change",
                 ("search", "on_index_change"),
             )
         if model.warehouse_options:

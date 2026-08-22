@@ -16,11 +16,15 @@ from typing import Any
 import pytest
 
 from stel.execution.contracts import RunError
-from stel.execution.search import _verify_collection_config
+from stel.execution.search import (
+    _validate_collection_schema,
+    _verify_collection_config,
+)
 from stel.retrieval import (
     ChangeKind,
     CollectionMetadata,
     CollectionSpec,
+    IndexedRow,
     classify_changes,
     classify_descriptor_changes,
     collection_config_fingerprint,
@@ -410,3 +414,176 @@ def test_a_contract_change_reaches_the_publish_gate_as_a_rebuild() -> None:
 
     with pytest.raises(RunError, match="requires a rebuild: store_implementation"):
         _verify_collection_config(_RecordingStore(), existing, spec)
+
+
+# ─── on_index_change: online (issue #344, second pass) ───────────────────────
+
+
+class _EvolvingStore(_RecordingStore):
+    """Records widening as well as re-stamping."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.evolved: list[tuple[str, list[str]]] = []
+
+    def evolve_collection(self, spec: CollectionSpec, added: Any) -> None:
+        self.evolved.append((spec.descriptor, list(added)))
+
+
+def _schema_with(*names: str) -> Any:
+    import pyarrow as pa
+
+    return pa.schema([pa.field(name, pa.string()) for name in names])
+
+
+def test_online_widens_a_compatible_change_instead_of_refusing_it() -> None:
+    """The point of the mode: adding a filterable attribute to a live index
+    must not cost a rebuild, and the vectors are untouched, so it costs no
+    provider calls either."""
+    stored = _spec()
+    widened = replace(
+        _spec(
+            attributes=(
+                {"name": "category", "data_type": "string", "filter_role": "user"},
+                {"name": "section", "data_type": "string", "filter_role": "user"},
+            )
+        ),
+        arrow_schema=_schema_with("chunk_id", "text", "section"),
+    )
+    store = _EvolvingStore()
+    existing = _metadata(
+        descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
+    )
+    existing = replace(existing, schema=_schema_with("chunk_id", "text"))
+
+    assert _verify_collection_config(store, existing, widened, policy="online") is True
+    assert store.evolved == [(widened.descriptor, ["section"])]
+
+
+def test_online_still_refuses_a_rebuild_change() -> None:
+    """A capability flag cannot make an incompatible change safe — the design
+    doc says so outright, and the rows already written really are invalid."""
+    store = _EvolvingStore()
+    stored = _spec()
+    changed = _spec(
+        vector={"field": "embedding", "dimensions": 384, "metric": "cosine"}
+    )
+    existing = _metadata(
+        descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
+    )
+
+    with pytest.raises(RunError, match="requires a rebuild: vector"):
+        _verify_collection_config(store, existing, changed, policy="online")
+
+    assert store.evolved == []
+
+
+def test_fail_policy_points_at_online_for_an_additive_change() -> None:
+    """Under the default policy an additive change still stops the run, but the
+    error now names the mode that would have applied it."""
+    store = _EvolvingStore()
+    stored = _spec()
+    widened = _spec(display_fields=("title", "author"))
+    existing = _metadata(
+        descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
+    )
+
+    with pytest.raises(RunError, match=r"on_index_change: `?online"):
+        _verify_collection_config(store, existing, widened, policy="fail")
+
+    assert store.evolved == []
+
+
+def test_evolving_a_real_collection_adds_the_column_and_keeps_rows(
+    tmp_path: Path,
+) -> None:
+    """End to end against LanceDB: the column appears, the rows survive, and
+    the collection's descriptor advances so the next run sees no change."""
+    import pyarrow as pa
+
+    store, spec = _real_spec(tmp_path)
+    with store:
+        store.create_collection(spec)
+        # Two rows that must survive the widening untouched.
+        store.upsert(
+            spec.physical_name,
+            [
+                IndexedRow("a", {"chunk_id": "a", "text": "x"}, "fp-a"),
+                IndexedRow("b", {"chunk_id": "b", "text": "y"}, "fp-b"),
+            ],
+            id_field=spec.id_field,
+            mutation_digest="digest-1",
+        )
+
+        widened = replace(
+            spec,
+            arrow_schema=pa.schema(
+                [
+                    pa.field("chunk_id", pa.string()),
+                    pa.field("text", pa.string()),
+                    pa.field("section", pa.string()),
+                ]
+            ),
+            descriptor=spec.descriptor.replace('"text_fields"', '"text_fields2"'),
+        )
+        store.evolve_collection(widened, ["section"])
+        after = store.inspect_collection(spec.physical_name)
+
+    assert after is not None
+    assert set(after.schema.names) == {"chunk_id", "text", "section"}
+    assert after.row_count == 2, "widening must not rewrite or drop rows"
+    # Re-stamped as part of evolving, so the next run does not re-evolve.
+    assert after.descriptor == widened.descriptor
+
+
+def test_a_second_run_after_an_evolution_still_validates(tmp_path: Path) -> None:
+    """The run *after* a successful widening must not reject the collection.
+
+    Evolving re-stamps the descriptor, so the next run sees no config change
+    and falls through to the schema comparison. LanceDB appends added columns
+    and creates them nullable — exactly the differences the evolution run
+    tolerates — so an order- and nullability-sensitive comparison there fails
+    permanently on a collection that was widened correctly (Codex review P1).
+    """
+    import pyarrow as pa
+
+    store, spec = _real_spec(tmp_path)
+    # Declared order puts the new attribute ahead of the display field, while
+    # `add_columns` can only append it — the mismatch a strict compare rejects.
+    declared = pa.schema(
+        [
+            pa.field("chunk_id", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("section", pa.string()),
+            pa.field("title", pa.string()),
+        ]
+    )
+    with store:
+        store.create_collection(
+            replace(
+                spec,
+                arrow_schema=pa.schema(
+                    [
+                        pa.field("chunk_id", pa.string()),
+                        pa.field("text", pa.string()),
+                        pa.field("title", pa.string()),
+                    ]
+                ),
+            )
+        )
+        widened = replace(spec, arrow_schema=declared)
+        store.evolve_collection(widened, ["section"])
+        after = store.inspect_collection(spec.physical_name)
+
+    assert after is not None
+    # The next run finds a matching descriptor, so it evolves nothing and goes
+    # straight to schema validation — which must accept the collection it just
+    # widened. This is the assertion that fails if that check is stricter than
+    # the one used during the widening.
+    assert after.descriptor == widened.descriptor
+    assert _verify_collection_config(store, after, widened, policy="online") is False
+    _validate_collection_schema(after.schema, widened)
+
+    assert not after.schema.equals(declared, check_metadata=False), (
+        "fixture must reproduce the ordering difference the bug turns on"
+    )

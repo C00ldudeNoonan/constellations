@@ -1915,10 +1915,9 @@ Everything that defines a row's shape or meaning is:
 | an existing attribute's `data_type` or `filter_role` | rebuild required |
 | removing an attribute or a projected field | rebuild required |
 
-`on_index_change: fail` is the default and, today, the only supported policy —
-`rebuild` and `online` are rejected at compile time. So a classified change
-still stops the run, but the error names the field that forced it and says
-whether the existing collection could have served the change:
+`on_index_change: fail` is the default. A classified change stops the run, and
+the error names the field that forced it and says whether the existing
+collection could have served the change:
 
 ```
 Search index configuration changed and requires a rebuild: vector: changed
@@ -1926,6 +1925,40 @@ from {...} to {...}. Rows already written were indexed under the previous
 definition, so publish under a new collection name, validate it, and cut
 consumers over.
 ```
+
+### `on_index_change: online`
+
+Set `on_index_change: online` to apply a change the table above calls
+*compatible* — a new attribute, or a wider `display_fields` /
+`return_text_fields` — to the live collection instead of refusing it:
+
+```yaml
+search:
+  on_index_change: online
+```
+
+The new columns are added to the published collection in place, and the rows
+are then republished from the warehouse to fill them. **No embeddings are
+recomputed**: vectors come from the upstream table, so the cost is an index
+rewrite, not provider spend. That is the difference between adding a filter
+attribute to a 20k-document index for the price of a republish and paying to
+embed the corpus again.
+
+Two limits are deliberate:
+
+- **It applies only to compatible changes.** A changed vector dimension,
+  metric, id mapping, analyzer, or an existing attribute's type or filter role
+  is still refused under `online`, because the rows already written really are
+  invalid. A capability flag cannot make an incompatible change safe.
+- **The store must advertise `online_schema_evolution`.** The policy is
+  rejected at compile time against a store that cannot widen a live
+  collection, rather than failing mid-publish.
+
+`on_index_change: rebuild` remains rejected at compile time: an atomic full
+replacement requires a store that can prove atomic generation activation, and
+none does yet. Until then a rebuild-required change is handled the way the
+error says — publish under a new collection name, validate it, and cut
+consumers over.
 
 Changing `store` or `collection` is not an evolution at all — it selects a
 different physical collection, published independently under its own state.

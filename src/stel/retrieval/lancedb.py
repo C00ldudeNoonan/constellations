@@ -245,6 +245,9 @@ class LanceDBStore(RetrievalStore):
                     RetrievalFeature.INDEX_READINESS,
                     RetrievalFeature.DURABLE_WRITE_ACK,
                     RetrievalFeature.ATOMIC_BATCH_MUTATION,
+                    # `add_columns` widens a live table without rewriting
+                    # its rows (issue #344).
+                    RetrievalFeature.ONLINE_SCHEMA_EVOLUTION,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                 }
             ),
@@ -452,6 +455,33 @@ class LanceDBStore(RetrievalStore):
         if created is None:
             raise RetrievalError("LanceDB collection creation was not observable")
         return created
+
+    def evolve_collection(self, spec: CollectionSpec, added: Sequence[str]) -> None:
+        table = self._open_owned_table(spec.physical_name)
+        existing = set(table.schema.names)
+        missing = [name for name in added if name not in existing]
+        if missing:
+            # Added nullable and empty: the republish that follows fills them
+            # from the warehouse. Declaring them non-null here would reject the
+            # very rows that are about to be corrected.
+            fields = []
+            for name in missing:
+                index = spec.arrow_schema.get_field_index(name)
+                if index < 0:
+                    raise RetrievalError(
+                        "LanceDB cannot evolve a collection to add an undeclared column"
+                    )
+                field = spec.arrow_schema.field(index)
+                fields.append(pa.field(field.name, field.type, nullable=True))
+            try:
+                table.add_columns(fields)
+            except Exception:
+                raise RetrievalError(
+                    "LanceDB operation 'evolve' failed (code=lancedb_evolve_failed)"
+                ) from None
+        # Re-stamp last: a collection that was widened but still describes its
+        # previous shape would be re-evolved on the next run.
+        self.restamp_collection(spec)
 
     def restamp_collection(self, spec: CollectionSpec) -> None:
         table = self._open_owned_table(spec.physical_name)

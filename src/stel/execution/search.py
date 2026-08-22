@@ -150,19 +150,7 @@ def run_search_model(
                         # The collection just changed shape; compare against
                         # what it now is, not the snapshot taken before.
                         existing = store.inspect_collection(physical) or existing
-                        if not _schema_matches_by_name(
-                            existing.schema, spec.arrow_schema
-                        ):
-                            raise RunError(
-                                "Search index schema does not match the declared "
-                                "collection contract after online evolution"
-                            )
-                    elif not existing.schema.equals(
-                        spec.arrow_schema, check_metadata=False
-                    ):
-                        raise RunError(
-                            "Search index schema does not match the declared collection contract"
-                        )
+                    _validate_collection_schema(existing.schema, spec)
 
                 for ordinal, batch in enumerate(snapshot):
                     indexed = _indexed_rows(
@@ -479,17 +467,36 @@ def _search_collection_spec(
 def _schema_matches_by_name(existing: pa.Schema, declared: pa.Schema) -> bool:
     """Compare two schemas by column name and type, ignoring order.
 
-    Used only after an in-place widening. `add_columns` appends, while the
-    declared schema orders columns by projection, so a newly added attribute
-    lands ahead of the display fields in one and behind them in the other.
-    Order carries no meaning here — every read, write, and predicate addresses
-    columns by name — but types still must match exactly. Nullability is not
-    compared: a column added to a live collection is null until the republish
-    that follows fills it.
+    This is the contract stel actually relies on: every read, write, and
+    predicate addresses columns by name, so ordering carries no meaning, and a
+    store column's nullability is not a guarantee stel makes — rows are
+    validated on the way in. Types are still compared exactly.
+
+    An ordered comparison was over-strict, and once collections could be
+    widened it was wrong. `add_columns` can only append, while the declared
+    schema orders columns by projection, so a newly added attribute lands ahead
+    of the display fields in one and behind them in the other; added columns
+    are also nullable until the republish fills them. Comparing strictly
+    rejected a collection that had just been widened correctly, on every run
+    after the widening (Codex review, #344).
     """
     return {field.name: field.type for field in existing} == {
         field.name: field.type for field in declared
     }
+
+
+def _validate_collection_schema(existing: pa.Schema, spec: CollectionSpec) -> None:
+    """Refuse a collection whose physical shape is not the declared one.
+
+    One comparison for every path. A collection that was widened in place is
+    reached again on the next run, when nothing has changed and no evolution
+    happens, so a stricter check here than the one applied during the widening
+    would reject the collection it had just accepted.
+    """
+    if not _schema_matches_by_name(existing, spec.arrow_schema):
+        raise RunError(
+            "Search index schema does not match the declared collection contract"
+        )
 
 
 def _verify_collection_config(

@@ -16,7 +16,10 @@ from typing import Any
 import pytest
 
 from stel.execution.contracts import RunError
-from stel.execution.search import _verify_collection_config
+from stel.execution.search import (
+    _validate_collection_schema,
+    _verify_collection_config,
+)
 from stel.retrieval import (
     ChangeKind,
     CollectionMetadata,
@@ -531,3 +534,56 @@ def test_evolving_a_real_collection_adds_the_column_and_keeps_rows(
     assert after.row_count == 2, "widening must not rewrite or drop rows"
     # Re-stamped as part of evolving, so the next run does not re-evolve.
     assert after.descriptor == widened.descriptor
+
+
+def test_a_second_run_after_an_evolution_still_validates(tmp_path: Path) -> None:
+    """The run *after* a successful widening must not reject the collection.
+
+    Evolving re-stamps the descriptor, so the next run sees no config change
+    and falls through to the schema comparison. LanceDB appends added columns
+    and creates them nullable — exactly the differences the evolution run
+    tolerates — so an order- and nullability-sensitive comparison there fails
+    permanently on a collection that was widened correctly (Codex review P1).
+    """
+    import pyarrow as pa
+
+    store, spec = _real_spec(tmp_path)
+    # Declared order puts the new attribute ahead of the display field, while
+    # `add_columns` can only append it — the mismatch a strict compare rejects.
+    declared = pa.schema(
+        [
+            pa.field("chunk_id", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("section", pa.string()),
+            pa.field("title", pa.string()),
+        ]
+    )
+    with store:
+        store.create_collection(
+            replace(
+                spec,
+                arrow_schema=pa.schema(
+                    [
+                        pa.field("chunk_id", pa.string()),
+                        pa.field("text", pa.string()),
+                        pa.field("title", pa.string()),
+                    ]
+                ),
+            )
+        )
+        widened = replace(spec, arrow_schema=declared)
+        store.evolve_collection(widened, ["section"])
+        after = store.inspect_collection(spec.physical_name)
+
+    assert after is not None
+    # The next run finds a matching descriptor, so it evolves nothing and goes
+    # straight to schema validation — which must accept the collection it just
+    # widened. This is the assertion that fails if that check is stricter than
+    # the one used during the widening.
+    assert after.descriptor == widened.descriptor
+    assert _verify_collection_config(store, after, widened, policy="online") is False
+    _validate_collection_schema(after.schema, widened)
+
+    assert not after.schema.equals(declared, check_metadata=False), (
+        "fixture must reproduce the ordering difference the bug turns on"
+    )

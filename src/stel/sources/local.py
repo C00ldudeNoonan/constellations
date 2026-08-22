@@ -5,7 +5,7 @@ import hashlib
 import logging
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -424,7 +424,13 @@ def _open_ref_fd(ref: DocumentRef) -> int:
 class LocalDocumentSource(DocumentSource):
     """Files on disk under `<project_dir>/<source.path>`."""
 
-    def discover(self, source: SourceConfig, project_dir: Path) -> list[DocumentRef]:
+    def discover(
+        self,
+        source: SourceConfig,
+        project_dir: Path,
+        *,
+        source_filter: Sequence[str] = (),
+    ) -> list[DocumentRef]:
         source_dir = _source_dir(source, project_dir)
         if not source_dir.exists():
             log.info("Source '%s': path does not exist: %s", source.name, source_dir)

@@ -32,6 +32,7 @@ import datetime
 import decimal
 import json
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +88,11 @@ class WarehouseDocumentSource(DocumentSource):
         self._rows: dict[str, str] = {}
 
     def discover(
-        self, source: SourceConfig, project_dir: Path
+        self,
+        source: SourceConfig,
+        project_dir: Path,
+        *,
+        source_filter: Sequence[str] = (),
     ) -> list[DocumentRef]:
         relation = _relation(source)
         key = source.key_column

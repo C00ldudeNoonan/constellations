@@ -15,6 +15,7 @@ directory only when the runner has decided it actually needs processing.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,9 +52,21 @@ class SourceScan:
 class DocumentSource(ABC):
     @abstractmethod
     def discover(
-        self, source: SourceConfig, project_dir: Path
+        self,
+        source: SourceConfig,
+        project_dir: Path,
+        *,
+        source_filter: Sequence[str] = (),
     ) -> list[DocumentRef]:
-        """Deterministically list matching documents with stable identity."""
+        """Deterministically list matching documents with stable identity.
+
+        `source_filter` is the run's `--source-filter` globs, passed as a
+        **listing hint**: a backend may use it to narrow what it enumerates,
+        and may equally ignore it. The authoritative filter is applied by the
+        caller over the returned refs, so a backend that narrows incorrectly
+        cannot silently drop documents from a run — it can only fail to make
+        the listing cheaper (issue #348).
+        """
 
     @abstractmethod
     def fetch(self, ref: DocumentRef, work_dir: Path) -> Path:

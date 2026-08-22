@@ -83,6 +83,19 @@ it — which is precisely the person this redirect is for.
    The tests create and drop their own scratch datasets. If you cannot run them,
    note in the release PR that the BigQuery live path was not exercised.
 
+   **A new BigQuery operation needs a live test in that file before it ships.**
+   The gate is only worth running if it touches the code the release changed.
+   `append_rows` and `read_relation` shipped in v0.10.0 with no entry there, so
+   the gate passed while neither had ever run against BigQuery — reporting
+   success on code it never executed, which is worse than having no gate,
+   because this one is trusted. Neither is abstract on `WarehouseAdapter`, so
+   implementing the ABC never forced coverage.
+
+   `test_every_bigquery_operation_is_live_tested_or_listed_as_debt` now
+   enforces this in the ordinary suite: adding a BigQuery-specific method
+   without a live test fails, and the operations still lacking one are listed
+   explicitly rather than being invisible. That list may only shrink.
+
 6. Commit the release prep, then tag and push. The tag must match the package
    version in `pyproject.toml` with a leading `v`:
 

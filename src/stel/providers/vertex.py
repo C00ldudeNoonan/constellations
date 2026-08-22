@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import isfinite
 from threading import Lock
 from typing import Any, Literal
@@ -158,6 +159,29 @@ class VertexEmbeddingOptions(BaseModel):
         default="RETRIEVAL_QUERY",
     )
     auto_truncate: bool = provider_option("semantic", default=False)
+    # Batching and concurrency are execution, not semantics: they change how
+    # many calls carry the corpus, never the vectors that come back. Declaring
+    # them semantic would fold them into the embedding identity, so tuning
+    # throughput would invalidate every stored vector (issue #350).
+    max_texts_per_request: int = provider_option(
+        "execution",
+        default=250,
+        ge=1,
+        le=250,
+    )
+    # Under the ~20k-token per-request ceiling, with headroom for the estimate
+    # below being wrong in the unsafe direction.
+    max_tokens_per_request: int = provider_option(
+        "execution",
+        default=18_000,
+        ge=1,
+    )
+    max_concurrent_requests: int = provider_option(
+        "execution",
+        default=8,
+        ge=1,
+        le=32,
+    )
 
 
 @register_embedding_provider
@@ -226,24 +250,37 @@ class VertexEmbeddingProvider(EmbeddingProvider):
         client = _CLIENTS.get(genai, client_options)
         vectors: list[tuple[float, ...]] = []
         usage = ProviderUsage()
-        provider_requests = _split_requests(request)
+        provider_requests = _split_requests(request, options)
+
+        def _issue(provider_request: EmbeddingRequest) -> Any:
+            return client.models.embed_content(
+                model=provider_request.model,
+                contents=list(provider_request.texts),
+                config={
+                    "task_type": (
+                        options.query_task_type
+                        if provider_request.input_type == "query"
+                        else options.task_type
+                    ),
+                    "output_dimensionality": provider_request.dimensions,
+                    "auto_truncate": options.auto_truncate,
+                },
+            )
+
+        # The calls go out concurrently; the responses are parsed in request
+        # order below. Keeping parsing sequential preserves the usage
+        # accumulation and billed-request count exactly as the serial loop
+        # produced them, so only the waiting is parallel (issue #350).
+        responses = _issue_all(
+            provider_requests,
+            _issue,
+            max_workers=options.max_concurrent_requests,
+        )
         try:
             for request_number, provider_request in enumerate(
                 provider_requests, start=1
             ):
-                response = client.models.embed_content(
-                    model=provider_request.model,
-                    contents=list(provider_request.texts),
-                    config={
-                        "task_type": (
-                            options.query_task_type
-                            if provider_request.input_type == "query"
-                            else options.task_type
-                        ),
-                        "output_dimensionality": provider_request.dimensions,
-                        "auto_truncate": options.auto_truncate,
-                    },
-                )
+                response = responses[request_number - 1]
                 try:
                     parsed = _parse_response(
                         response,
@@ -643,23 +680,110 @@ def _import_google_genai(feature: str) -> Any:
     )
 
 
-def _split_requests(request: EmbeddingRequest) -> tuple[EmbeddingRequest, ...]:
+# Characters per token used to size a request. Deliberately below the ~3.9
+# English average so the estimate runs high and packs fewer texts than the
+# true limit allows: overshooting the per-request token ceiling fails the
+# whole call, while undershooting only costs a little throughput (issue #350).
+#
+# Measured against Vertex on representative filing prose, the real ratio was
+# ~5.7 chars/token, so this uses roughly half the declared token budget in
+# practice. That headroom is the point — an operator who has measured their
+# own corpus can raise `max_tokens_per_request` toward the true ~20k ceiling.
+_CHARS_PER_TOKEN = 3.0
+
+
+def _estimated_tokens(text: str) -> int:
+    return max(1, int(len(text) / _CHARS_PER_TOKEN) + 1)
+
+
+def _batch_bounds(
+    texts: Sequence[str], *, max_texts: int, max_tokens: int
+) -> tuple[tuple[int, int], ...]:
+    """Split `texts` into (start, end) spans within both budgets.
+
+    A single text over the token budget still gets its own request rather than
+    an empty one: the per-request ceiling is the provider's, and one oversized
+    text is `auto_truncate`'s problem, not a reason to make no progress.
+    """
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    tokens = 0
+    for index, text in enumerate(texts):
+        cost = _estimated_tokens(text)
+        full = index - start >= max_texts
+        over_budget = index > start and tokens + cost > max_tokens
+        if full or over_budget:
+            bounds.append((start, index))
+            start = index
+            tokens = 0
+        tokens += cost
+    if start < len(texts):
+        bounds.append((start, len(texts)))
+    return tuple(bounds)
+
+
+def _split_requests(
+    request: EmbeddingRequest, options: VertexEmbeddingOptions | None = None
+) -> tuple[EmbeddingRequest, ...]:
     model_name = request.model.rsplit("/", maxsplit=1)[-1]
-    request_limit = 1 if model_name.startswith("gemini-embedding") else 5
+    if model_name.startswith("gemini-embedding"):
+        # A model limit, not a tuning choice: this family accepts one text.
+        bounds = tuple((offset, offset + 1) for offset in range(len(request.texts)))
+    else:
+        options = options or VertexEmbeddingOptions()
+        bounds = _batch_bounds(
+            request.texts,
+            max_texts=options.max_texts_per_request,
+            max_tokens=options.max_tokens_per_request,
+        )
     return tuple(
         EmbeddingRequest(
             model=request.model,
-            texts=request.texts[offset : offset + request_limit],
+            texts=request.texts[start:end],
             dimensions=request.dimensions,
             input_ids=(
-                request.input_ids[offset : offset + request_limit]
+                request.input_ids[start:end]
                 if request.input_ids is not None
                 else None
             ),
             input_type=request.input_type,
         )
-        for offset in range(0, len(request.texts), request_limit)
+        for start, end in bounds
     )
+
+
+def _issue_all(
+    provider_requests: Sequence[EmbeddingRequest],
+    issue: Callable[[EmbeddingRequest], Any],
+    *,
+    max_workers: int,
+) -> list[Any]:
+    """Issue every split concurrently, returning responses in request order.
+
+    If any call raises, the lowest-indexed failure is re-raised once every
+    in-flight call has settled — the same exception the serial loop would have
+    surfaced first, and no request left running behind it.
+    """
+    if len(provider_requests) <= 1 or max_workers <= 1:
+        return [issue(provider_request) for provider_request in provider_requests]
+
+    responses: list[Any] = [None] * len(provider_requests)
+    failures: dict[int, BaseException] = {}
+    workers = min(max_workers, len(provider_requests))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(issue, provider_request): index
+            for index, provider_request in enumerate(provider_requests)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                responses[index] = future.result()
+            except BaseException as error:
+                failures[index] = error
+    if failures:
+        raise failures[min(failures)]
+    return responses
 
 
 def _parse_response(

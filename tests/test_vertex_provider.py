@@ -221,10 +221,14 @@ def test_vertex_gemini_model_splits_multi_input_batches(
         "publishers/google/models/text-multilingual-embedding-002",
     ],
 )
-def test_vertex_text_models_split_batches_at_five_inputs(
+def test_vertex_text_models_pack_a_request_up_to_its_budgets(
     model: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Six short texts used to cost two calls because the split was hardcoded
+    at five. Packing to the token budget is what turns a multi-day corpus
+    backfill into hours (issue #350) — the call count is the cost, not the
+    per-call latency."""
     fake = _FakeGenAI()
     monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
     texts = tuple(f"economic document {index}" for index in range(6))
@@ -241,20 +245,15 @@ def test_vertex_text_models_split_batches_at_five_inputs(
         runtime=ProviderRuntimeOptions(),
     )
 
-    assert [len(call["contents"]) for call in fake.calls] == [5, 1]
-    assert [
-        text
-        for call in fake.calls
-        for text in call["contents"]
-    ] == list(texts)
+    assert [len(call["contents"]) for call in fake.calls] == [6]
+    assert [text for call in fake.calls for text in call["contents"]] == list(texts)
     assert result.input_ids == input_ids
     assert len(result.vectors) == 6
     assert result.usage.input_tokens == 18
-    assert result.provider_requests == 2
+    assert result.provider_requests == 1
     # Not closed: the client is shared across requests now, and closing
     # it here would leave the cached entry unusable (issue #335).
     assert fake.close_count == 0
-
 
 def test_vertex_provider_uses_query_task_type(
     monkeypatch: pytest.MonkeyPatch,
@@ -1173,3 +1172,125 @@ def test_concurrent_first_requests_construct_one_client(
         thread.join()
 
     assert len(fake.client_options) == 1
+
+
+def test_the_token_budget_bounds_a_request_before_the_text_count_does() -> None:
+    """Long chunks must not be packed to 250 just because the count allows it:
+    overshooting the per-request token ceiling fails the call outright."""
+    from stel.providers.vertex import _batch_bounds
+
+    # ~3,000 chars ≈ 1,000 estimated tokens each, so three fit in a 3,500 budget.
+    texts = ["x" * 3_000] * 7
+    bounds = _batch_bounds(texts, max_texts=250, max_tokens=3_500)
+
+    assert [end - start for start, end in bounds] == [3, 3, 1]
+    assert bounds[0][0] == 0 and bounds[-1][1] == len(texts)
+
+
+def test_the_text_count_bounds_a_request_when_the_texts_are_short() -> None:
+    from stel.providers.vertex import _batch_bounds
+
+    bounds = _batch_bounds(["short"] * 10, max_texts=4, max_tokens=1_000_000)
+
+    assert [end - start for start, end in bounds] == [4, 4, 2]
+
+
+def test_a_single_oversized_text_still_gets_its_own_request() -> None:
+    """Never emit an empty request. One text over the ceiling is
+    `auto_truncate`'s problem, not a reason to make no progress."""
+    from stel.providers.vertex import _batch_bounds
+
+    bounds = _batch_bounds(["x" * 100_000, "small"], max_texts=250, max_tokens=10)
+
+    assert [end - start for start, end in bounds] == [1, 1]
+
+
+def test_the_estimate_runs_high_so_packing_stays_under_the_real_ceiling() -> None:
+    """The estimate is deliberately pessimistic: undershooting costs a little
+    throughput, overshooting fails the request."""
+    from stel.providers.vertex import _estimated_tokens
+
+    # English averages ~3.9 chars/token; the estimator must not exceed that.
+    text = "economic conditions deteriorated materially during the quarter " * 20
+    assert _estimated_tokens(text) > len(text) / 3.9
+
+
+def test_gemini_embedding_models_still_get_one_text_per_request() -> None:
+    """A model limit, not a tuning choice — the budget must not override it."""
+    from stel.providers.base import EmbeddingRequest as _Request
+    from stel.providers.vertex import _split_requests
+
+    splits = _split_requests(
+        _Request(model="gemini-embedding-001", texts=("a", "b", "c"), dimensions=3)
+    )
+
+    assert [len(split.texts) for split in splits] == [1, 1, 1]
+
+
+def test_concurrent_issuing_preserves_request_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vectors are matched to `input_ids` positionally, so a response arriving
+    out of order would silently attach every embedding to the wrong chunk."""
+    import time
+
+    from stel.providers.base import EmbeddingRequest as _Request
+    from stel.providers.vertex import _issue_all
+
+    requests = [
+        _Request(model="m", texts=(f"t{index}",), dimensions=3) for index in range(8)
+    ]
+
+    def _slow_first(request: _Request) -> str:
+        # The first call finishes last; a naive as-completed collection would
+        # return it in the wrong slot.
+        time.sleep(0.05 if request.texts[0] == "t0" else 0.0)
+        return request.texts[0]
+
+    assert _issue_all(requests, _slow_first, max_workers=8) == [
+        f"t{index}" for index in range(8)
+    ]
+
+
+def test_a_concurrent_failure_surfaces_the_lowest_indexed_error() -> None:
+    """The serial loop failed on the first bad request; concurrency must not
+    change which error the operator sees."""
+    from stel.providers.base import EmbeddingRequest as _Request
+    from stel.providers.vertex import _issue_all
+
+    requests = [
+        _Request(model="m", texts=(f"t{index}",), dimensions=3) for index in range(6)
+    ]
+
+    def _fail_two(request: _Request) -> str:
+        index = int(request.texts[0][1:])
+        if index in {2, 4}:
+            raise RuntimeError(f"boom-{index}")
+        return request.texts[0]
+
+    with pytest.raises(RuntimeError, match="boom-2"):
+        _issue_all(requests, _fail_two, max_workers=4)
+
+
+def test_batching_options_are_execution_not_semantic() -> None:
+    """Tuning throughput must not change the embedding identity — that would
+    invalidate every stored vector to make the pipeline faster."""
+    from stel.providers.base import profile_options_fingerprint
+    from stel.providers.vertex import VertexEmbeddingOptions
+
+    base = profile_options_fingerprint(VertexEmbeddingOptions())
+    tuned = profile_options_fingerprint(
+        VertexEmbeddingOptions(
+            max_texts_per_request=32,
+            max_tokens_per_request=4_000,
+            max_concurrent_requests=1,
+        )
+    )
+
+    assert base == tuned
+
+    # The guard is meaningful only if a genuinely semantic change *does* move
+    # the fingerprint.
+    assert profile_options_fingerprint(
+        VertexEmbeddingOptions(auto_truncate=True)
+    ) != base

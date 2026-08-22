@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Vertex embedding: pack requests to a token budget and issue them concurrently (issue #350)
+
+- **Every embed batch was chopped into 5-text requests issued one at a time.**
+  On a production-shaped run that was 3,796 calls for 18,688 chunks — 4.92
+  texts per call, and essentially the entire 56-minute wall time. At full
+  corpus scale it projects to ~800k sequential calls, roughly eight days of
+  waiting for about $69 of tokens. The per-call latency was never the problem;
+  the call *count* was.
+- **Requests now pack to a token budget** rather than a hardcoded count.
+  Measured on the same corpus shape, that is **8x fewer calls** (3,738 → 467,
+  averaging 40 texts per request).
+- **Splits are issued concurrently**, bounded by `max_concurrent_requests`
+  (default 8). Combined with the packing that turns 3,738 sequential round
+  trips into ~58 — the difference between a multi-day backfill and an
+  afternoon.
+- **Responses are still parsed in request order**, so usage accumulation, the
+  billed-request count on a failure, and the positional match between vectors
+  and `input_ids` are exactly what the serial loop produced. A concurrent
+  failure surfaces the lowest-indexed error, which is the one the serial loop
+  would have raised first.
+- **The new knobs are execution options, not semantic ones**
+  (`max_texts_per_request`, `max_tokens_per_request`,
+  `max_concurrent_requests`). Tuning throughput must not change the embedding
+  identity — that would invalidate every stored vector to make the pipeline
+  faster.
+- The token estimate is deliberately pessimistic (3.0 chars/token against a
+  ~3.9 English average; ~5.7 measured on real filing prose), because
+  overshooting the per-request ceiling fails the call while undershooting only
+  costs throughput. Raise `max_tokens_per_request` toward the ~20k ceiling if
+  you have measured your own corpus.
+- `gemini-embedding-*` models still take one text per request: that is a model
+  limit, not a tuning choice, and the budget does not override it.
+
 ### `on_index_change: online` widens a live search index in place (issue #344)
 
 - **Adding a filterable attribute no longer costs a rebuild.** With

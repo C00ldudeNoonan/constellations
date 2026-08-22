@@ -3,6 +3,7 @@ client interactions against a fake; real round-trips run only when
 STEL_BQ_TEST_PROJECT is set."""
 from __future__ import annotations
 
+import ast
 import io
 import logging
 import os
@@ -3526,3 +3527,212 @@ def test_a_defaulted_dataset_beside_a_populated_legacy_one_refuses() -> None:
     adapter._client = client
     with pytest.raises(LegacyWarehouseNamesError, match=f"schema: {LEGACY_SCHEMA_NAME}"):
         adapter._guard_legacy_names()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_append_rows_creates_accumulates_and_widens() -> None:
+    """Live cover for the append-only log primitive (issues #333, #347).
+
+    `append_rows` is a BigQuery-specific load job (`WRITE_APPEND` +
+    `CREATE_IF_NEEDED` + `ALLOW_FIELD_ADDITION`) and the fake client cannot
+    tell you whether a load job's `schema_update_options` behaves as claimed.
+    The widening case matters most: log writes are best-effort, so if a later
+    stel adding a column failed the write instead of widening the table, the
+    failure would degrade to a warning and could go unnoticed indefinitely.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            written = adapter.append_rows(
+                "run_log",
+                pl.DataFrame({"invocation_id": ["i1"], "rows": [3]}),
+            )
+            assert written == 1
+            # CREATE_IF_NEEDED: the log exists after its first write, with no
+            # separate existence probe for a concurrent writer to race.
+            assert adapter.relation_exists("run_log")
+
+            adapter.append_rows(
+                "run_log",
+                pl.DataFrame({"invocation_id": ["i2"], "rows": [5]}),
+            )
+            assert adapter.relation_row_count(f"{dataset}.run_log") == 2
+
+            # ALLOW_FIELD_ADDITION: a later column widens the table.
+            adapter.append_rows(
+                "run_log",
+                pl.DataFrame(
+                    {
+                        "invocation_id": ["i3"],
+                        "rows": [7],
+                        "prompt_version": ["v2"],
+                    }
+                ),
+            )
+            assert adapter.relation_row_count(f"{dataset}.run_log") == 3
+            # The rows written before the column existed survive it.
+            assert adapter.rows(
+                f"SELECT invocation_id FROM {adapter.table_ref('run_log')} "
+                "ORDER BY invocation_id"
+            ) == [("i1",), ("i2",), ("i3",)]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_read_relation_serves_the_warehouse_table_source() -> None:
+    """Live cover for the warehouse-table source read path (issues #322, #347).
+
+    `limit` must bound the query rather than the frame: an oversized relation
+    is refused after transferring cap+1 rows, not after materializing all of
+    them, which is only true if the LIMIT reaches BigQuery.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "comments",
+                pl.DataFrame(
+                    {"comment_id": ["c1", "c2", "c3"], "body": ["x", "y", "z"]}
+                ),
+            )
+            frame = adapter.read_relation(f"{dataset}.comments")
+            assert frame.height == 3
+            assert sorted(frame.columns) == ["body", "comment_id"]
+            assert adapter.read_relation(f"{dataset}.comments", limit=2).height == 2
+            assert adapter.relation_row_count(f"{dataset}.comments") == 3
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_rename_table_carries_a_table_and_its_rows() -> None:
+    """Live cover for the operation `stel migrate` is built on (#313, #347).
+
+    BigQuery has no `ALTER TABLE ... RENAME`, so the adapter copies under the
+    new name and drops the old one only once the copy exists. That is a
+    dialect-specific implementation moving real data — it carries every
+    pre-rename warehouse across an upgrade — and until now the fake client was
+    the only thing that had ever run it.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "old_docs", pl.DataFrame({"record_key": ["a", "b"], "x": [1, 2]})
+            )
+            adapter.rename_table("old_docs", "new_docs")
+
+            assert adapter.list_tables() == ["new_docs"]
+            assert not adapter.relation_exists("old_docs")
+            # Rows survive: a rename that silently emptied the table would
+            # strand incremental state and reprocess the corpus at cost.
+            assert adapter.rows(
+                f"SELECT record_key, x FROM {adapter.table_ref('new_docs')} "
+                "ORDER BY record_key"
+            ) == [("a", 1), ("b", 2)]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+# Operations whose BigQuery behavior no live test exercises yet (issue #347).
+# This is a ratchet, not a permission slip: adding a BigQuery-specific method
+# without a live test fails the test below, and covering one here means
+# deleting its entry. It must only ever shrink.
+#
+# The entries are debt, and some of it is sharp — `materialize_full_chunks`
+# backs full materialization, `materialize_sql_*` back SQL models, and
+# `replace_children` backs incremental child-row deletion. Each is dialect
+# specific and currently proven only against a fake client.
+_UNCOVERED_BY_LIVE_TESTS = frozenset(
+    {
+        "clear_state",
+        "delete_rows",
+        "delete_rows_and_state",
+        "delete_state",
+        "drop_table",
+        "dry_run_sql",
+        "execute",
+        "list_all_tables",
+        "materialize_full_chunks",
+        "materialize_sql_full",
+        "materialize_sql_incremental",
+        "query_df",
+        "quote_ident",
+        "replace_children",
+        "replace_state",
+        "scalar",
+        "warehouse_option_defaults",
+    }
+)
+
+# Base-class operations that issue BigQuery SQL through the adapter. They are
+# not overridden by BigQueryAdapter, so class introspection alone would miss
+# them — which is precisely how the #322/#333 additions escaped the gate.
+_EXTRA_LIVE_GATE_OPERATIONS = frozenset({"read_relation", "relation_row_count"})
+
+
+def _live_integration_source() -> str:
+    """The source of every `test_integration_*` function in this module."""
+    path = Path(__file__)
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    return "\n".join(
+        "\n".join(lines[node.lineno - 1 : node.end_lineno])
+        for node in ast.walk(ast.parse(text))
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_integration_")
+    )
+
+
+def test_every_bigquery_operation_is_live_tested_or_listed_as_debt() -> None:
+    """`docs/release.md` names this file as the pre-release BigQuery gate, so a
+    BigQuery-specific operation missing from it is a gate that reports success
+    without touching the code it is trusted to check.
+
+    That is not hypothetical: `append_rows` and `read_relation` shipped in
+    v0.10.0 with no entry here at all, and the documented gate passed while
+    neither had ever run against BigQuery. Neither is abstract on
+    `WarehouseAdapter`, so "implements the ABC" never forced coverage.
+    """
+    operations = {
+        name
+        for name, value in vars(BigQueryAdapter).items()
+        if callable(value) and not name.startswith("_")
+    } | _EXTRA_LIVE_GATE_OPERATIONS
+    source = _live_integration_source()
+    uncovered = {name for name in operations if f".{name}(" not in source}
+
+    newly_uncovered = uncovered - _UNCOVERED_BY_LIVE_TESTS
+    assert not newly_uncovered, (
+        "BigQuery operations added without a live integration test: "
+        f"{sorted(newly_uncovered)}. Add one to this file (see "
+        "test_integration_append_rows_creates_accumulates_and_widens), or add "
+        "the name to _UNCOVERED_BY_LIVE_TESTS with a reason."
+    )
+
+    now_covered = _UNCOVERED_BY_LIVE_TESTS - uncovered
+    assert not now_covered, (
+        f"{sorted(now_covered)} now has live coverage — remove it from "
+        "_UNCOVERED_BY_LIVE_TESTS so the ratchet keeps tightening."
+    )

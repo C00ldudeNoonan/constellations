@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### The BigQuery pre-release gate now covers what it claims to (issue #347)
+
+- **`docs/release.md` names `tests/test_bigquery_adapter.py` as the gate for
+  warehouse-adapter changes, and it did not test the adapter operations
+  v0.10.0 added.** `append_rows`, `read_relation`, and `relation_row_count`
+  appeared nowhere in that file — not live, not even against the fake client —
+  so the documented gate passed while none of them had ever run against
+  BigQuery. A gate that reports success on code it does not execute is worse
+  than no gate, because it is trusted. Neither method is abstract on
+  `WarehouseAdapter`, so implementing the ABC never forced coverage.
+- **Live tests for the three**, including the case with real blast radius: an
+  append carrying a new column must widen the table rather than fail, since
+  log writes are best-effort and a failure there degrades to a warning that
+  could go unnoticed indefinitely.
+- **A live test for `rename_table`**, the operation `stel migrate` is built
+  on. BigQuery has no `ALTER TABLE ... RENAME`, so the adapter copies under
+  the new name and drops the old one only once the copy exists — dialect
+  specific, moving real data, and previously proven only against a fake.
+- **A ratchet so this cannot recur.** A new BigQuery-specific operation
+  without a live test now fails the ordinary suite, and the operations that
+  still lack one are listed explicitly instead of being invisible. The list
+  may only shrink. Of 27 BigQuery operations, 5 had live coverage before this
+  change and 10 do now; the remaining 17 are recorded as debt, including
+  `materialize_full_chunks`, `materialize_sql_full`/`_incremental`, and
+  `replace_children`.
+
 ## v0.10.0 - 2026-08-21
 
 ### `chunk:` attributes each chunk to its heading (issue #332)

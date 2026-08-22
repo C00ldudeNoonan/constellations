@@ -179,6 +179,14 @@ class CollectionSpec:
     distance_metric: str | None
     vector_search: str | None
     config_fingerprint: str
+    # Canonical JSON of the semantic descriptor (issue #344). Persisted with
+    # the collection so a later publish can name which field changed rather
+    # than only observing that the digest moved.
+    descriptor: str
+    # The pre-#344 digest for this same config, used only to recognize a
+    # collection stamped before the descriptor existed and prove it unchanged.
+    # Removable with the rest of the legacy path (#321 category 1).
+    legacy_config_fingerprint: str
     arrow_schema: pa.Schema
 
 
@@ -219,6 +227,10 @@ class MutationReceipt:
 class CollectionMetadata:
     physical_name: str
     config_fingerprint: str | None
+    # None for a collection published before #344, which carries only the
+    # legacy digest. Such a collection is re-stamped in place once its
+    # configuration is proven unchanged; it is never rebuilt for this.
+    descriptor: str | None
     physical_generation: str
     row_count: int
     schema: pa.Schema
@@ -297,6 +309,17 @@ class RetrievalStore(ABC):
 
     @abstractmethod
     def create_collection(self, spec: CollectionSpec) -> CollectionMetadata: ...
+
+    @abstractmethod
+    def restamp_collection(self, spec: CollectionSpec) -> None:
+        """Rewrite a collection's stored descriptor, leaving its rows alone.
+
+        Called only after the caller has proven the configuration is unchanged
+        and the stamp is merely in an older format (issue #344). Stores that
+        cannot rewrite a stamp in place should raise rather than silently
+        succeed: a caller that believes a collection was re-stamped will not
+        try again.
+        """
 
     @abstractmethod
     def upsert(

@@ -1894,6 +1894,47 @@ that model's exact provider identity for query-time embedding and rejects stale
 or dimension-incompatible indexes. Externally generated vectors still declare
 a complete embedding identity and require a precomputed query vector.
 
+### Changing a published index's configuration
+
+A published collection records a **semantic descriptor** of the configuration
+it was built from. On the next publish stel compares the two and classifies the
+difference, so a change is named rather than merely detected.
+
+Fields that only affect execution cadence are not part of the descriptor and
+never invalidate an index: **`batch_size`**, **`index_options`**, and
+`on_index_change` itself. Tuning publish pacing is free.
+
+Everything that defines a row's shape or meaning is:
+
+| Change | Classification |
+| --- | --- |
+| new attribute, wider `display_fields`/`return_text_fields` | compatible |
+| `vector` field, dimensions, metric, or embedding identity | rebuild required |
+| `id_field`, `document_id_field`, `chunk_id_field` | rebuild required |
+| `text_fields`, `full_text`, `access`, `query` modes | rebuild required |
+| an existing attribute's `data_type` or `filter_role` | rebuild required |
+| removing an attribute or a projected field | rebuild required |
+
+`on_index_change: fail` is the default and, today, the only supported policy —
+`rebuild` and `online` are rejected at compile time. So a classified change
+still stops the run, but the error names the field that forced it and says
+whether the existing collection could have served the change:
+
+```
+Search index configuration changed and requires a rebuild: vector: changed
+from {...} to {...}. Rows already written were indexed under the previous
+definition, so publish under a new collection name, validate it, and cut
+consumers over.
+```
+
+Changing `store` or `collection` is not an evolution at all — it selects a
+different physical collection, published independently under its own state.
+
+Collections published before descriptors existed carry only the older stamp.
+The first publish after upgrading recomputes that older stamp to prove the
+configuration is unchanged and rewrites it in place. Rows are untouched: there
+is no rebuild, no re-embed, and nothing to run by hand.
+
 ### Serving readiness and coordination
 
 Publication is generation-fenced (issue #152). The active warehouse owns a

@@ -49,6 +49,17 @@ _OWNER_KEY = b"dbt_ml.owner"
 _OWNER_VALUE = b"dbt-ml"
 _CONTRACT_KEY = b"dbt_ml.record_contract"
 _CONFIG_KEY = b"dbt_ml.config_fingerprint"
+# The #344 semantic descriptor. Held as metadata on the collection's id
+# field rather than on the schema because LanceDB can rewrite field
+# metadata in place (`update_field_metadata`) and cannot rewrite
+# schema-level metadata at all — re-stamping a pre-#344 collection has to
+# be possible without rewriting its rows.
+_DESCRIPTOR_KEY = b"stel.collection_descriptor"
+# The descriptor's digest, written beside it. A re-stamped collection has
+# to report its *new* identity everywhere, and the schema-level
+# `_CONFIG_KEY` cannot be rewritten — leaving post-publication validation
+# comparing a v1 stamp against a v2 fingerprint forever (Codex review, #344).
+_FINGERPRINT_KEY = b"stel.config_fingerprint"
 # Recorded on published search indexes and compared on read to invalidate
 # state when the store implementation changes.
 _IMPLEMENTATION_IDENTITY_PREFIX = "dbt_ml.retrieval.lancedb:v1"
@@ -403,10 +414,10 @@ class LanceDBStore(RetrievalStore):
                 },
                 domain="dbt-ml-lancedb-generation",
             )
-            config = metadata.get(_CONFIG_KEY)
             return CollectionMetadata(
                 physical_name=name,
-                config_fingerprint=config.decode() if config else None,
+                config_fingerprint=_read_fingerprint(schema, metadata),
+                descriptor=_read_field_value(schema, _DESCRIPTOR_KEY),
                 physical_generation=generation,
                 row_count=int(table.count_rows()),
                 schema=schema,
@@ -428,7 +439,9 @@ class LanceDBStore(RetrievalStore):
                 _CONFIG_KEY: spec.config_fingerprint.encode(),
             }
         )
-        schema = spec.arrow_schema.with_metadata(metadata)
+        schema = _with_descriptor(
+            spec.arrow_schema.with_metadata(metadata), spec
+        )
         try:
             db.create_table(spec.physical_name, schema=schema)
         except Exception:
@@ -439,6 +452,30 @@ class LanceDBStore(RetrievalStore):
         if created is None:
             raise RetrievalError("LanceDB collection creation was not observable")
         return created
+
+    def restamp_collection(self, spec: CollectionSpec) -> None:
+        table = self._open_owned_table(spec.physical_name)
+        try:
+            table.update_field_metadata(
+                {
+                    "path": spec.id_field,
+                    "metadata": {
+                        _DESCRIPTOR_KEY.decode(): spec.descriptor,
+                        _FINGERPRINT_KEY.decode(): spec.config_fingerprint,
+                    },
+                }
+            )
+        except Exception:
+            raise RetrievalError(
+                "LanceDB operation 'restamp' failed (code=lancedb_restamp_failed)"
+            ) from None
+        written = self.inspect_collection(spec.physical_name)
+        if (
+            written is None
+            or written.descriptor != spec.descriptor
+            or written.config_fingerprint != spec.config_fingerprint
+        ):
+            raise RetrievalError("LanceDB collection re-stamp was not observable")
 
     def upsert(
         self,
@@ -645,6 +682,41 @@ class LanceDBStore(RetrievalStore):
             raise RetrievalError(
                 "LanceDB operation 'text search' failed (code=lancedb_text_search_failed)"
             ) from None
+
+
+def _with_descriptor(schema: pa.Schema, spec: CollectionSpec) -> pa.Schema:
+    """Attach the semantic descriptor to the collection's id field."""
+    index = schema.get_field_index(spec.id_field)
+    if index < 0:
+        raise RetrievalError("LanceDB collection schema is missing its id field")
+    field = schema.field(index)
+    metadata = dict(field.metadata or {})
+    metadata[_DESCRIPTOR_KEY] = spec.descriptor.encode()
+    metadata[_FINGERPRINT_KEY] = spec.config_fingerprint.encode()
+    return schema.set(index, field.with_metadata(metadata))
+
+
+def _read_field_value(schema: pa.Schema, key: bytes) -> str | None:
+    """A stel stamp held as field metadata, or None if absent."""
+    for field in schema:
+        value = (field.metadata or {}).get(key)
+        if value:
+            return value.decode()
+    return None
+
+
+def _read_fingerprint(schema: pa.Schema, metadata: dict[bytes, bytes]) -> str | None:
+    """The collection's configuration digest.
+
+    Field metadata wins: a re-stamped collection carries its current digest
+    there, while the schema-level key is frozen at whatever it held when the
+    table was created and cannot be rewritten.
+    """
+    field_value = _read_field_value(schema, _FINGERPRINT_KEY)
+    if field_value:
+        return field_value
+    legacy = metadata.get(_CONFIG_KEY)
+    return legacy.decode() if legacy else None
 
 
 def _identifier_piece(value: str) -> str:

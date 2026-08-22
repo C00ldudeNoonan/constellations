@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from ..hashing import canonical_fingerprint
 from .base import RetrievalConfigError, RetrievalStore, RetrievalStoreConfig
+from .evolution import semantic_search_config
 
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
 
@@ -78,7 +79,46 @@ def list_store_types() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def collection_descriptor(
+    search_config: dict[str, Any], *, store_type: str
+) -> dict[str, Any]:
+    """The stored description of a published collection's shape (issue #344).
+
+    Only the semantic projection of the search config takes part: cadence and
+    routing fields are excluded so tuning `batch_size` cannot invalidate an
+    index. The store contract travels with it because a change of store
+    implementation invalidates the collection just as a config change does.
+    """
+    return {
+        "contract_version": 2,
+        "store_type": store_type,
+        "store_implementation": store_class(store_type).implementation_identity(),
+        "search": semantic_search_config(search_config),
+    }
+
+
 def collection_config_fingerprint(search_config: dict[str, Any], *, store_type: str) -> str:
+    """Digest of the descriptor, for cheap equality in the serving ledger.
+
+    Change *detection* uses this; change *classification* needs the descriptor
+    itself, since a digest cannot say which field moved.
+    """
+    return canonical_fingerprint(
+        collection_descriptor(search_config, store_type=store_type),
+        domain="dbt-ml-search-collection-config",
+    )
+
+
+def legacy_collection_config_fingerprint(
+    search_config: dict[str, Any], *, store_type: str
+) -> str:
+    """The pre-#344 fingerprint: contract 1, over the whole search config.
+
+    Kept only to recognize a collection stamped before the descriptor existed
+    and prove its configuration is unchanged, so it can be re-stamped in place
+    instead of rebuilt. Removable once no collection carries a v1 stamp
+    (the #321 category-1 rule).
+    """
     return canonical_fingerprint(
         {
             "contract_version": 1,

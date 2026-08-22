@@ -1,0 +1,412 @@
+"""Search-config change classification and the pre-#344 re-stamp (issue #344).
+
+Two claims are under test. First, that fields which only change execution
+cadence no longer invalidate a published index — the bug this issue opened on,
+where tuning `batch_size` demanded a full re-embed. Second, that a change which
+*does* matter is named rather than merely detected, so the operator learns
+which field forced a rebuild instead of being told "something changed".
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from stel.execution.contracts import RunError
+from stel.execution.search import _verify_collection_config
+from stel.retrieval import (
+    ChangeKind,
+    CollectionMetadata,
+    CollectionSpec,
+    classify_changes,
+    classify_descriptor_changes,
+    collection_config_fingerprint,
+    descriptor_json,
+    legacy_collection_config_fingerprint,
+)
+from stel.retrieval.registry import collection_descriptor
+
+_BASE: dict[str, Any] = {
+    "access": "public",
+    "store": None,
+    "collection": None,
+    "id_field": "chunk_id",
+    "document_id_field": "document_id",
+    "chunk_id_field": "chunk_id",
+    "text_fields": ("text",),
+    "return_text_fields": ("text",),
+    "vector": {"field": "embedding", "dimensions": 2, "metric": "cosine"},
+    "full_text": {"fields": ("text",)},
+    "attributes": (
+        {"name": "category", "data_type": "string", "filter_role": "user"},
+    ),
+    "display_fields": ("title",),
+    "query": {"modes": {"vector", "text"}},
+    "on_index_change": "fail",
+    "batch_size": 1000,
+    "index_options": {},
+}
+
+
+def _config(**overrides: Any) -> dict[str, Any]:
+    return {**_BASE, **overrides}
+
+
+def _fingerprint(**overrides: Any) -> str:
+    return collection_config_fingerprint(_config(**overrides), store_type="lancedb")
+
+
+def _search(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = collection_descriptor(
+        _config(**overrides), store_type="lancedb"
+    )["search"]
+    return payload
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("batch_size", 500),
+        ("index_options", {"nprobes": 20}),
+        ("on_index_change", "rebuild"),
+    ],
+)
+def test_cadence_fields_do_not_invalidate_a_published_index(
+    field: str, value: Any
+) -> None:
+    """The reported bug. `batch_size` changes how many rows a publish sends per
+    call and `index_options` is not read by any code at all, yet both used to
+    change the fingerprint and force a blue/green rebuild plus a full re-embed.
+
+    `on_index_change` is the sharper one: it is the field that decides how to
+    react to a config change, so having it inside the fingerprint meant
+    adopting a non-default policy tripped the very gate it was adopting."""
+    assert _fingerprint(**{field: value}) == _fingerprint()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("id_field", "other_id"),
+        ("vector", {"field": "embedding", "dimensions": 3, "metric": "cosine"}),
+        ("vector", {"field": "embedding", "dimensions": 2, "metric": "dot"}),
+        ("text_fields", ("text", "title")),
+        ("access", "governed"),
+    ],
+)
+def test_semantic_fields_still_invalidate(field: str, value: Any) -> None:
+    """The complement: narrowing the descriptor must not have narrowed it so
+    far that a real change slips through."""
+    assert _fingerprint(**{field: value}) != _fingerprint()
+
+
+def test_an_added_attribute_is_compatible_and_named() -> None:
+    """Widening a collection with a new filterable attribute leaves every row
+    already written valid under its own definition."""
+    (change,) = classify_changes(
+        _search(),
+        _search(
+            attributes=(
+                {"name": "category", "data_type": "string", "filter_role": "user"},
+                {"name": "symbol", "data_type": "string", "filter_role": "user"},
+            )
+        ),
+    )
+    assert change.field == "attributes"
+    assert change.kind is ChangeKind.COMPATIBLE
+    assert "symbol" in change.detail
+
+
+def test_a_redefined_attribute_requires_a_rebuild() -> None:
+    """Prevents the dangerous confusion: changing an existing attribute's type
+    or filter role is not additive. Rows already indexed carry the old meaning,
+    and widening cannot reinterpret them."""
+    (change,) = classify_changes(
+        _search(),
+        _search(
+            attributes=(
+                {"name": "category", "data_type": "int", "filter_role": "user"},
+            )
+        ),
+    )
+    assert change.kind is ChangeKind.REBUILD_REQUIRED
+    assert "category" in change.detail
+
+
+def test_a_removed_attribute_requires_a_rebuild() -> None:
+    (change,) = classify_changes(_search(), _search(attributes=()))
+    assert change.kind is ChangeKind.REBUILD_REQUIRED
+    assert "category" in change.detail
+
+
+def test_a_changed_vector_dimension_names_the_field() -> None:
+    """The whole point of classification: the operator is told which field
+    forced the rebuild, not just that the digest moved."""
+    (change,) = classify_changes(
+        _search(),
+        _search(vector={"field": "embedding", "dimensions": 3, "metric": "cosine"}),
+    )
+    assert change.field == "vector"
+    assert change.kind is ChangeKind.REBUILD_REQUIRED
+
+
+def test_a_wider_projection_is_compatible_but_dropping_one_is_not() -> None:
+    (added,) = classify_changes(_search(), _search(display_fields=("title", "url")))
+    assert added.kind is ChangeKind.COMPATIBLE
+    (dropped,) = classify_changes(_search(), _search(display_fields=()))
+    assert dropped.kind is ChangeKind.REBUILD_REQUIRED
+
+
+def test_an_identical_config_classifies_as_no_change() -> None:
+    assert classify_changes(_search(), _search()) == []
+
+
+class _RecordingStore:
+    """Captures whether the collection was re-stamped rather than rebuilt."""
+
+    def __init__(self) -> None:
+        self.restamped: list[str] = []
+
+    def restamp_collection(self, spec: CollectionSpec) -> None:
+        self.restamped.append(spec.descriptor)
+
+
+def _spec(**overrides: Any) -> CollectionSpec:
+    config = _config(**overrides)
+    return CollectionSpec(
+        logical_name="context",
+        physical_name="proj__dev__context",
+        id_field="chunk_id",
+        text_fields=("text",),
+        full_text_fields=("text",),
+        attribute_fields=("category",),
+        scalar_index_fields=("category",),
+        display_fields=("title",),
+        vector_field="embedding",
+        vector_dimensions=2,
+        distance_metric="cosine",
+        vector_search="exact",
+        config_fingerprint=collection_config_fingerprint(config, store_type="lancedb"),
+        descriptor=descriptor_json(
+            collection_descriptor(config, store_type="lancedb")
+        ),
+        legacy_config_fingerprint=legacy_collection_config_fingerprint(
+            config, store_type="lancedb"
+        ),
+        arrow_schema=None,
+    )
+
+
+def _metadata(
+    *, descriptor: str | None, config_fingerprint: str | None
+) -> CollectionMetadata:
+    return CollectionMetadata(
+        physical_name="proj__dev__context",
+        config_fingerprint=config_fingerprint,
+        descriptor=descriptor,
+        physical_generation="gen",
+        row_count=2,
+        schema=None,
+    )
+
+
+def test_a_pre_344_collection_is_restamped_not_rebuilt() -> None:
+    """The migration. A collection published before the descriptor existed
+    carries only the legacy digest. Recomputing that digest proves the config
+    is unchanged, so the stamp is rewritten in place — no rebuild, no re-embed,
+    and no operator action. Getting this wrong would inflict exactly the cost
+    this issue exists to remove."""
+    spec = _spec()
+    store = _RecordingStore()
+    existing = _metadata(
+        descriptor=None, config_fingerprint=spec.legacy_config_fingerprint
+    )
+
+    _verify_collection_config(store, existing, spec)
+
+    assert store.restamped == [spec.descriptor]
+
+
+def test_a_pre_344_collection_whose_config_really_changed_still_fails() -> None:
+    """The complement: the re-stamp must fire only on positive proof that
+    nothing changed, never as a way to wave through a real change."""
+    store = _RecordingStore()
+    existing = _metadata(descriptor=None, config_fingerprint="some-other-digest")
+
+    with pytest.raises(RunError, match="cannot be named"):
+        _verify_collection_config(store, existing, _spec())
+
+    assert store.restamped == []
+
+
+def test_a_matching_descriptor_neither_fails_nor_restamps() -> None:
+    spec = _spec()
+    store = _RecordingStore()
+    existing = _metadata(
+        descriptor=spec.descriptor, config_fingerprint=spec.config_fingerprint
+    )
+
+    _verify_collection_config(store, existing, spec)
+
+    assert store.restamped == []
+
+
+def test_a_rebuild_change_names_the_field_in_the_error() -> None:
+    spec = _spec(vector={"field": "embedding", "dimensions": 3, "metric": "cosine"})
+    stored = _spec()
+    existing = _metadata(
+        descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
+    )
+
+    with pytest.raises(RunError, match="requires a rebuild: vector"):
+        _verify_collection_config(_RecordingStore(), existing, spec)
+
+
+def test_an_additive_change_says_so_rather_than_demanding_a_rebuild() -> None:
+    """`fail` is still the only policy, so this raises — but it must not tell
+    the operator to rebuild a collection that could serve the change."""
+    spec = _spec(
+        attributes=(
+            {"name": "category", "data_type": "string", "filter_role": "user"},
+            {"name": "symbol", "data_type": "string", "filter_role": "user"},
+        )
+    )
+    stored = _spec()
+    existing = _metadata(
+        descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
+    )
+
+    with pytest.raises(RunError, match="additive") as error:
+        _verify_collection_config(_RecordingStore(), existing, spec)
+    assert "rebuild" not in str(error.value).split("on_index_change")[0]
+
+
+# ─── Codex review regressions ────────────────────────────────────────────────
+
+
+def _real_spec(tmp_path: Path, **overrides: Any) -> tuple[Any, CollectionSpec]:
+    """A real LanceDB store plus a spec whose arrow schema it can create.
+
+    The re-stamp tests above use a recording fake, which is precisely how the
+    fingerprint bug below survived them: a fake that does not model the stored
+    stamp cannot show that re-stamping leaves it stale.
+    """
+    import pyarrow as pa
+
+    from stel.retrieval import parse_store_config
+    from stel.retrieval.lancedb import LanceDBStore
+
+    config = parse_store_config({"type": "lancedb", "path": str(tmp_path / "lance")})
+    store = LanceDBStore(config, project_name="demo", target_name="dev", alias="primary")
+    spec = _spec(**overrides)
+    schema = pa.schema(
+        [pa.field("chunk_id", pa.string()), pa.field("text", pa.string())]
+    )
+    return store, replace(spec, arrow_schema=schema)
+
+
+def test_a_restamped_collection_reports_its_new_fingerprint(tmp_path: Path) -> None:
+    """Re-stamping has to update the collection's *identity*, not just add a
+    descriptor beside a stale one.
+
+    Post-publication validation compares the stored fingerprint against the
+    spec's. If the re-stamp left the pre-#344 digest in place, every legacy
+    collection would publish its rows, advance state, then fail that check —
+    and fail it again on every retry, because the descriptor now short
+    circuits the re-stamp branch. A permanent block inflicted by the very
+    migration meant to avoid one (Codex review P1).
+
+    The collection is built the way v0.10.0 built one — schema-level stamp
+    only, no field metadata — so this exercises the real upgrade, not a
+    re-stamp of something already current.
+    """
+    import lancedb
+    import pyarrow as pa
+
+    from stel.retrieval.lancedb import (
+        _CONFIG_KEY,
+        _CONTRACT_KEY,
+        _OWNER_KEY,
+        _OWNER_VALUE,
+    )
+
+    store, spec = _real_spec(tmp_path)
+    legacy_schema = spec.arrow_schema.with_metadata(
+        {
+            _OWNER_KEY: _OWNER_VALUE,
+            _CONTRACT_KEY: b"1",
+            _CONFIG_KEY: spec.legacy_config_fingerprint.encode(),
+        }
+    )
+    db = lancedb.connect(str(tmp_path / "lance"))
+    db.create_table(spec.physical_name, schema=legacy_schema)
+    db.open_table(spec.physical_name).add(
+        [{"chunk_id": "a", "text": "x"}]
+    )
+    del pa
+
+    with store:
+        before = store.inspect_collection(spec.physical_name)
+        assert before is not None
+        assert before.descriptor is None, "fixture must look pre-#344"
+        assert before.config_fingerprint == spec.legacy_config_fingerprint
+
+        store.restamp_collection(spec)
+        written = store.inspect_collection(spec.physical_name)
+
+    assert written is not None
+    assert written.descriptor == spec.descriptor
+    # The assertion that was missing: identity, not just the descriptor. Without
+    # it the post-publication check compares a v1 stamp against a v2 spec.
+    assert written.config_fingerprint == spec.config_fingerprint
+    assert written.row_count == 1, "re-stamping must not touch rows"
+
+
+def test_a_created_collection_reports_the_current_fingerprint(tmp_path: Path) -> None:
+    """The same invariant on the create path, so the two cannot drift."""
+    store, spec = _real_spec(tmp_path)
+    with store:
+        store.create_collection(spec)
+        written = store.inspect_collection(spec.physical_name)
+
+    assert written is not None
+    assert written.config_fingerprint == spec.config_fingerprint
+
+
+def test_a_store_implementation_bump_requires_a_rebuild() -> None:
+    """The descriptor's contract fields invalidate a collection on their own.
+
+    Classifying only the `search` mapping dropped them, so a store
+    implementation bump produced an empty change list and was reported as an
+    additive change the existing collection could serve — the opposite of the
+    design doc's "whole-index invalidation" (Codex review P2).
+    """
+    stored = {
+        "contract_version": 2,
+        "store_type": "lancedb",
+        "store_implementation": "old",
+        "search": {"id_field": "chunk_id"},
+    }
+    current = {**stored, "store_implementation": "new"}
+
+    changes = classify_descriptor_changes(stored, current)
+
+    assert [c.field for c in changes] == ["store_implementation"]
+    assert all(c.kind is ChangeKind.REBUILD_REQUIRED for c in changes)
+
+
+def test_a_contract_change_reaches_the_publish_gate_as_a_rebuild() -> None:
+    """End of the same path: the operator must be told to rebuild, not told
+    the existing collection could serve it."""
+    spec = _spec()
+    stored = json.loads(spec.descriptor)
+    stored["store_implementation"] = "previous-implementation"
+    existing = _metadata(
+        descriptor=json.dumps(stored), config_fingerprint="stale-digest"
+    )
+
+    with pytest.raises(RunError, match="requires a rebuild: store_implementation"):
+        _verify_collection_config(_RecordingStore(), existing, spec)

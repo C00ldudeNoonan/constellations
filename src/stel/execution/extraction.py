@@ -67,10 +67,16 @@ log = logging.getLogger(__name__)
 # documents, and the startup sweep self-heals directories a *dead* run left
 # behind, which nothing else will ever clean up.
 #
-# The producer and the sweep filter must both use this constant. The sweep
-# only ever sees directories a *dead* process left behind, so a prefix that
-# drifts on one side disables the self-healing without failing anything.
-_FETCH_DIR_PREFIX = "dbt_ml_fetch_"
+# The producer and the sweep filter must agree. The sweep only ever sees
+# directories a *dead* process left behind, so a prefix that drifts on one
+# side disables the self-healing without failing anything — which is why the
+# rename below adds to the swept set rather than replacing it (issue #321).
+_FETCH_DIR_PREFIX = "stel_fetch_"
+# Scratch directories are the one residual `dbt_ml` spelling safe to rename:
+# nothing persists across runs, no hash consumes it, and no consumer reads it.
+# The pre-rename prefix stays swept so directories a dead process left behind
+# before the rename are still reclaimed instead of leaking forever.
+_SWEPT_FETCH_DIR_PREFIXES = (_FETCH_DIR_PREFIX, "dbt_ml_fetch_")
 
 # A directory's mtime is refreshed by every file *written* inside it, but a
 # single long native-batch submission (#149) can sit idle for hours without
@@ -137,17 +143,17 @@ def _fetch_dir_is_live(entry: Path) -> bool:
 
 
 def _sweep_stale_fetch_dirs(root: Path, *, max_age_seconds: float) -> None:
-    """Best-effort removal of `_FETCH_DIR_PREFIX`-prefixed directories under
-    `root` that are both older than `max_age_seconds` and not owned by a
-    still-running process. Never raises: a sweep failure must not fail the run
-    it happens to run alongside."""
+    """Best-effort removal of stel's scratch directories under `root` that are
+    both older than `max_age_seconds` and not owned by a still-running
+    process. Never raises: a sweep failure must not fail the run it happens to
+    run alongside. Both the current and pre-rename prefixes are swept."""
     try:
         entries = list(root.iterdir())
     except OSError:
         return
     now = time.time()
     for entry in entries:
-        if not entry.name.startswith(_FETCH_DIR_PREFIX):
+        if not entry.name.startswith(_SWEPT_FETCH_DIR_PREFIXES):
             continue
         try:
             if not entry.is_dir() or now - entry.stat().st_mtime < max_age_seconds:

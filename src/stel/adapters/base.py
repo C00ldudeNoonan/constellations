@@ -158,6 +158,13 @@ def validate_state_keys(record_keys: Sequence[str]) -> None:
 # connect-time guard in `WarehouseAdapter.__enter__`, so a warehouse that
 # still holds the old objects raises instead of starting over.
 
+# The `LEGACY_*` names below, the `LegacyWarehouseNamesError` guards, and
+# `adapters/migration.py` are one removable unit whose deletion criterion is
+# recorded in that module's docstring (issue #321). They are not dead code
+# while any warehouse still carries pre-rename names: the guard is what stops
+# stel treating such a warehouse as a fresh project and reprocessing its
+# corpus at provider cost.
+#
 # Incremental state. Hoisted from the DuckDB and BigQuery adapters, which
 # declared it separately with nothing asserting the two agreed.
 STATE_TABLE = "stel_state"

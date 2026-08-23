@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Rename follow-up: the residual `dbt_ml` spellings each have a recorded decision (issue #321)
+
+- **Scratch directories are renamed to `stel_fetch_*`** — the one residual
+  spelling that is safe to move, because nothing persists across runs, no hash
+  consumes it, and no consumer reads it. The startup sweep still recognizes
+  the pre-rename prefix: it only ever sees directories a dead process left
+  behind, so dropping the old name would not fail anything, it would silently
+  leak every such directory forever.
+- **The owner-PID marker is deliberately *not* renamed with it.** A missing
+  marker reads as "not live", so a newer stel would sweep a staging directory
+  an older one is still using. No benefit, real risk — now recorded next to
+  the name rather than left to be rediscovered.
+- **The migration machinery stays, with a written deletion criterion.**
+  `stel migrate`, the `LEGACY_*` name constants, and the
+  `LegacyWarehouseNamesError` guards are one removable unit, and the criterion
+  is verification rather than a date: no warehouse stel connects to still
+  carrying pre-rename names. Local DuckDB files under old `target/`
+  directories are warehouses too, and each one still holding `dbt_ml_state` is
+  a corpus that gets silently reprocessed at provider cost the moment the
+  guard stops looking for it.
+- The remaining spellings — the backend identity payload key, the run-results
+  version key, the emitted dbt source prefix and meta namespace, and the
+  classic-ML artifact runtime key — were already pinned in
+  `test_frozen_names.py`, each with the reason it cannot move. They are keys
+  inside hashes or inside files already on disk, so renaming them invalidates
+  incremental state, artifacts, or a consumer's committed dbt models. "Keep
+  permanently" is the decision, and it is now stated rather than implied.
+
 ### GCS discovery: the cap counts documents, and `--source-filter` narrows the listing (issue #348)
 
 - **`max_objects` counted the raw listing, before `file_pattern`.** A

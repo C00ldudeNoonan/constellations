@@ -11,6 +11,20 @@ until this has carried the existing objects over.
 Deliberately narrow. Only tables stel owns are touched, and only within the
 schema the target already points at — moving a whole schema is the operator's
 call, made by pinning `schema:`, not something a migration guesses at.
+
+**When this can be deleted (issue #321).** Not on a date, and not when the
+migration is believed done — when it is *verified* that no warehouse stel
+still connects to carries pre-rename names. The known consumer migrated its
+three warehouses (astrolabe#291, 2026-08), but local DuckDB files under old
+`target/` directories and scratch worktrees are warehouses too, and each one
+that still holds `dbt_ml_state` is a corpus that gets silently reprocessed at
+provider cost the moment the guard stops looking for it.
+
+Removal is all-or-nothing: `_guard_legacy_names` exists to point at
+`stel migrate`, so keeping the detection while dropping the command would
+leave an error naming something that no longer runs. Delete this module, the
+`LEGACY_*` name constants in `base.py`, the `LegacyWarehouseNamesError`
+guards, and the CLI command in one change, or keep them all.
 """
 from __future__ import annotations
 

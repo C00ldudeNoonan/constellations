@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.11.0 - 2026-08-23
 
 ### Rename follow-up: the residual `dbt_ml` spellings each have a recorded decision (issue #321)
 

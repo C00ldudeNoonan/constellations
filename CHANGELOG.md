@@ -28,6 +28,14 @@
   on concepts, `DimensionDef` declarations on the bundle, values validated
   against their declared sets at construction. v1 bundles are rejected by the
   version gate as before.
+- **It looks like a star map now.** Concepts render as glowing star sprites
+  (tinted live by the active dimension), a faint two-layer starfield drifts
+  slowly behind a nebula-tinted sky, depth fog fades distant stars, the
+  fourteen brightest concepts carry sky-chart labels, and concept edges read
+  as constellation lines — faint silver until a star is selected, when its own
+  constellation brightens and the rest recede. Rendering degrades to the
+  library's defaults when the THREE namespace is unavailable, and the page
+  stays fully self-contained.
 
 ## v0.11.0 - 2026-08-23
 

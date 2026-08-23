@@ -10,48 +10,66 @@
   <title>stel star map</title>
   <style>
     :root {
-      --bg: #0b0f17; --panel: #131a26; --fg: #e6edf3; --muted: #8b98a9;
-      --accent: #58a6ff; --edge: #33415580; --beam: #f0b429;
+      --bg: #05070f; --panel: rgba(13, 18, 32, 0.72); --fg: #dfe7f3;
+      --muted: #7d8aa0; --accent: #6fb7ff; --line: rgba(159, 183, 218, 0.14);
     }
     * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
-      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    html, body { margin: 0; height: 100%; color: var(--fg);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      /* Deep-space ground with faint nebula tints; the WebGL canvas renders
+         transparent on top so the scene floats in this sky. */
+      background:
+        radial-gradient(1100px 700px at 78% 18%, rgba(64, 90, 160, 0.16), transparent 60%),
+        radial-gradient(900px 600px at 15% 85%, rgba(96, 60, 140, 0.12), transparent 60%),
+        radial-gradient(700px 500px at 40% 40%, rgba(40, 120, 130, 0.07), transparent 65%),
+        var(--bg);
+    }
     #graph { position: fixed; inset: 0; }
     header { position: fixed; top: 0; left: 0; right: 0; z-index: 10;
-      display: flex; gap: 16px; align-items: center; padding: 10px 16px;
-      background: linear-gradient(var(--bg), transparent); }
-    header h1 { font-size: 15px; font-weight: 600; margin: 0; }
-    header h1 small { color: var(--muted); font-weight: 400; }
-    #search { background: var(--panel); border: 1px solid #263141; color: var(--fg);
-      border-radius: 6px; padding: 6px 10px; width: 240px; }
-    #panel { position: fixed; top: 52px; left: 16px; z-index: 10; max-width: 260px;
-      background: var(--panel); border: 1px solid #263141; border-radius: 8px;
-      padding: 10px 12px; }
-    #panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
-      color: var(--muted); margin: 0 0 6px; }
-    #colorby { width: 100%; background: var(--bg); border: 1px solid #263141;
-      color: var(--fg); border-radius: 6px; padding: 4px 6px; margin-bottom: 8px; }
-    .legend-item { display: flex; align-items: center; gap: 8px; margin: 3px 0;
-      cursor: pointer; user-select: none; }
-    .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
-    .legend-item.off { opacity: .35; }
-    #filters { margin-top: 14px; border-top: 1px solid #263141; padding-top: 10px; }
-    .ctl { display: block; margin: 8px 0; font-size: 13px; cursor: pointer; }
+      display: flex; gap: 16px; align-items: center; padding: 12px 18px;
+      background: linear-gradient(rgba(5,7,15,.85), transparent); }
+    header h1 { font-size: 14px; font-weight: 600; margin: 0;
+      letter-spacing: .14em; text-transform: uppercase; }
+    header h1 .glyph { color: var(--accent); margin-right: 6px; }
+    header h1 small { color: var(--muted); font-weight: 400;
+      letter-spacing: .04em; text-transform: none; }
+    #search { background: var(--panel); border: 1px solid var(--line);
+      color: var(--fg); border-radius: 8px; padding: 6px 12px; width: 240px;
+      backdrop-filter: blur(10px); outline: none; }
+    #search:focus { border-color: rgba(111, 183, 255, .45); }
+    #panel { position: fixed; top: 56px; left: 16px; z-index: 10; max-width: 264px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 12px 14px; backdrop-filter: blur(12px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .35); }
+    #panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+      color: var(--muted); margin: 0 0 8px; }
+    #colorby { width: 100%; background: rgba(5, 8, 16, .6);
+      border: 1px solid var(--line); color: var(--fg); border-radius: 7px;
+      padding: 5px 8px; margin-bottom: 10px; }
+    .legend-item { display: flex; align-items: center; gap: 9px; margin: 4px 0;
+      cursor: pointer; user-select: none; font-size: 13px; }
+    .swatch { width: 9px; height: 9px; border-radius: 50%; flex: none;
+      box-shadow: 0 0 6px 1px currentColor; }
+    .legend-item.off { opacity: .3; }
+    #filters { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .ctl { display: block; margin: 9px 0; font-size: 13px; cursor: pointer; }
     .ctl input[type="range"] { width: 100%; margin-top: 4px; accent-color: var(--accent); }
     .ctl input[type="checkbox"] { accent-color: var(--accent); margin-right: 6px; }
     .ctl .val { color: var(--muted); }
-    #detail { position: fixed; bottom: 16px; left: 16px; z-index: 10; max-width: 320px;
-      background: var(--panel); border: 1px solid #263141; border-radius: 8px;
-      padding: 10px 12px; display: none; }
+    #detail { position: fixed; bottom: 16px; left: 16px; z-index: 10; max-width: 330px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 12px 14px; display: none; backdrop-filter: blur(12px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .35); }
+    #detail strong { letter-spacing: .02em; }
     #detail .k { color: var(--muted); }
-    footer { position: fixed; bottom: 8px; right: 12px; z-index: 10;
-      color: var(--muted); font-size: 11px; }
+    footer { position: fixed; bottom: 10px; right: 14px; z-index: 10;
+      color: var(--muted); font-size: 11px; letter-spacing: .04em; }
     a { color: var(--accent); }
   </style>
 </head>
 <body>
   <header>
-    <h1>stel star map <small id="subtitle"></small></h1>
+    <h1><span class="glyph">✦</span>stel star map <small id="subtitle"></small></h1>
     <input id="search" type="search" placeholder="Search concepts…" autocomplete="off" />
   </header>
   <aside id="panel">
@@ -84,12 +102,13 @@
     document.getElementById("subtitle").textContent =
       "· " + DATA.project + " · " + DATA.concepts.length + " concepts";
 
-    // Categorical palette, stable per value within a dimension.
-    const PALETTE = ["#58a6ff","#f0b429","#7ee787","#ff7b72","#d2a8ff",
-                     "#ffa657","#79c0ff","#ff9bce","#56d4bc","#e3b341"];
+    // Star-tinted categorical palette: bright enough to glow on deep space.
+    const PALETTE = ["#7db8ff","#ffd76e","#8fe3a1","#ff8f85","#d8b4ff",
+                     "#ffb36e","#9fd8ff","#ff9fce","#7fe0cc","#ecd06f"];
     // Retrieval heat reads as temperature, not as arbitrary categories.
-    const HEAT_COLORS = { hot: "#ff7b72", warm: "#f0b429", cold: "#79c0ff",
-                          never: "#55606e" };
+    const HEAT_COLORS = { hot: "#ff8f85", warm: "#ffd76e", cold: "#9fd8ff",
+                          never: "#5a6478" };
+    const DIM = "#2b3644";  // deselected / receded
     // Known dbt resource kinds; anything else falls back to the neutral grey.
     const RESOURCE_COLOR = {
       source: "#8b98a9", model: "#3fb950", exposure: "#d2a8ff",
@@ -113,7 +132,7 @@
       const heat = dim.values.every(v => v in HEAT_COLORS);
       dim.values.forEach((v, i) =>
         dim.color[v] = heat ? HEAT_COLORS[v] : PALETTE[i % PALETTE.length]);
-      dim.color["—"] = dim.color["—"] || "#55606e";
+      dim.color["—"] = dim.color["—"] || "#5a6478";
     }
 
     let colorBy = DIMENSIONS[0];
@@ -184,11 +203,7 @@
         colorBy = DIMENSIONS[Number(select.value)];
         hidden.clear();           // the hidden set is per-dimension values
         buildLegend();
-        if (Graph) {
-          Graph.nodeColor(Graph.nodeColor())
-               .nodeVisibility(Graph.nodeVisibility())
-               .linkVisibility(Graph.linkVisibility());
-        }
+        if (Graph) fullRefresh();
       });
     }
 
@@ -199,14 +214,11 @@
         const row = document.createElement("div");
         row.className = "legend-item";
         row.innerHTML =
-          `<span class="swatch" style="background:${colorBy.color[v]}"></span>${v}`;
+          `<span class="swatch" style="background:${colorBy.color[v]};color:${colorBy.color[v]}"></span>${v}`;
         row.onclick = () => {
           if (hidden.has(v)) hidden.delete(v); else hidden.add(v);
           row.classList.toggle("off", hidden.has(v));
-          if (Graph) {
-            Graph.nodeVisibility(Graph.nodeVisibility())
-                 .linkVisibility(Graph.linkVisibility());
-          }
+          if (Graph) fullRefresh();
         };
         legend.appendChild(row);
       });
@@ -216,7 +228,7 @@
       const orphans = document.getElementById("orphans");
       orphans.addEventListener("change", () => {
         highlightOrphans = orphans.checked;
-        if (Graph) Graph.nodeColor(Graph.nodeColor());
+        if (Graph) fullRefresh();
       });
       const slider = document.getElementById("minfreq");
       const sliderVal = document.getElementById("minfreq-val");
@@ -224,19 +236,18 @@
       slider.addEventListener("input", () => {
         minFreq = Number(slider.value);
         sliderVal.textContent = slider.value;
-        refreshVisibility();
+        if (Graph) fullRefresh();
       });
       const lineage = document.getElementById("lineage");
       lineage.addEventListener("change", () => {
         lineageMode = lineage.checked;
-        refreshVisibility();
+        if (Graph) fullRefresh();
       });
     }
 
-    function refreshVisibility() {
-      if (!Graph) return;
-      Graph.nodeVisibility(Graph.nodeVisibility()).linkVisibility(Graph.linkVisibility());
-    }
+    // Set once buildGraph runs; refreshes both the library-driven accessors
+    // and the sprite tints the library does not know about.
+    let fullRefresh = () => {};
 
     function showDetail(node) {
       const el = document.getElementById("detail");
@@ -255,6 +266,102 @@
         el.innerHTML = `<strong>${node.name}</strong><br>` +
           `<span class="k">dbt ${node.resource_type}</span><br>${node.id}`;
       }
+    }
+
+    // ── star rendering ──────────────────────────────────────────────────────
+    // The standalone 3d-force-graph bundle exposes the THREE namespace; when it
+    // is present, concepts render as glowing star sprites with sky-chart
+    // labels, the scene gets depth fog, and a faint starfield drifts behind
+    // everything. Without it (an exotic build), the default spheres remain.
+    function three() { return window.THREE; }
+
+    function makeGlowTexture(THREE) {
+      // A white radial glow: bright core, soft halo. SpriteMaterial's color
+      // tints it per node, so one texture serves every star.
+      const size = 128;
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+      g.addColorStop(0.0, "rgba(255,255,255,1)");
+      g.addColorStop(0.12, "rgba(255,255,255,.95)");
+      g.addColorStop(0.3, "rgba(255,255,255,.32)");
+      g.addColorStop(0.65, "rgba(255,255,255,.07)");
+      g.addColorStop(1.0, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, size, size);
+      const texture = new THREE.Texture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    function makeLabelSprite(THREE, text) {
+      // Sky-chart style: small caps, letter-spaced, faint blue-white.
+      const scaleUp = 3;                     // supersample for crisp text
+      const font = `${11 * scaleUp}px -apple-system, "Segoe UI", sans-serif`;
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      ctx.font = font;
+      const label = text.toUpperCase();
+      const spacing = 2 * scaleUp;
+      const width = ctx.measureText(label).width + spacing * label.length + 8;
+      canvas.width = Math.ceil(width);
+      canvas.height = 16 * scaleUp;
+      ctx.font = font;
+      ctx.fillStyle = "rgba(205, 220, 240, 0.85)";
+      ctx.textBaseline = "middle";
+      let x = 4;
+      for (const ch of label) {
+        ctx.fillText(ch, x, canvas.height / 2);
+        x += ctx.measureText(ch).width + spacing;
+      }
+      const texture = new THREE.Texture(canvas);
+      texture.needsUpdate = true;
+      const material = new THREE.SpriteMaterial({
+        map: texture, transparent: true, depthWrite: false,
+      });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(canvas.width / (6 * scaleUp), canvas.height / (6 * scaleUp), 1);
+      return sprite;
+    }
+
+    function addStarfield(THREE, scene) {
+      // Two faint shells of distant stars, drifting at slightly different
+      // speeds — the "slightly moving faded star background". Far enough out
+      // that the graph never intersects them; additive blending keeps them
+      // luminous but unobtrusive.
+      const shells = [];
+      for (const [count, radius, size, opacity] of
+           [[1400, 2600, 3.2, 0.28], [700, 1700, 2.2, 0.18]]) {
+        const positions = new Float32Array(count * 3);
+        for (let i = 0; i < count; i++) {
+          // Uniform on a sphere shell with a little radial jitter.
+          const u = Math.random() * 2 - 1;
+          const theta = Math.random() * Math.PI * 2;
+          const r = radius * (0.85 + Math.random() * 0.3);
+          const s = Math.sqrt(1 - u * u);
+          positions[i * 3] = r * s * Math.cos(theta);
+          positions[i * 3 + 1] = r * u;
+          positions[i * 3 + 2] = r * s * Math.sin(theta);
+        }
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.PointsMaterial({
+          color: 0xcfe0f5, size, transparent: true, opacity,
+          sizeAttenuation: false, depthWrite: false,
+        });
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+        shells.push(points);
+      }
+      let last = performance.now();
+      (function drift(now) {
+        const dt = Math.min(100, now - last); last = now;
+        shells[0].rotation.y += dt * 0.0000045;
+        shells[1].rotation.y -= dt * 0.0000030;
+        shells[1].rotation.x += dt * 0.0000012;
+        requestAnimationFrame(drift);
+      })(last);
     }
 
     function buildGraph() {
@@ -278,11 +385,16 @@
       }));
       DATA.dag_plane.edges.forEach(e =>
         links.push({ source: e.from, target: e.to, kind: "dag" }));
+      // Sky-chart labels go on the brightest stars; a chart that names every
+      // faint one is unreadable.
+      const labelled = new Set(
+        [...DATA.concepts].sort((a, b) => b.frequency - a.frequency)
+          .slice(0, 14).map(c => c.canonical_id));
       DATA.concepts.forEach(c => {
         const node = {
           id: c.canonical_id, name: c.display, kind: "concept", label: c.label || "—",
           val: c.frequency, link_status: c.link_status, frequency: c.frequency,
-          dimensions: c.dimensions || {},
+          dimensions: c.dimensions || {}, labelled: labelled.has(c.canonical_id),
         };
         if (c.position) {
           node.fx = c.position.x;
@@ -316,9 +428,14 @@
           if (s === selected || t === selected) touching.add(linkKey(l));
         });
       }
-      function refresh() {
-        Graph.nodeColor(Graph.nodeColor()).linkVisibility(Graph.linkVisibility())
-             .linkColor(Graph.linkColor()).linkDirectionalParticles(Graph.linkDirectionalParticles());
+
+      function conceptColor(n) {
+        if (highlightOrphans) return isOrphan(n.id) ? "#ff5c5c" : DIM;
+        const base = colorBy.color[colorBy.valueOf(n)] || "#5a6478";
+        if (!selected) return base;
+        if (n.id === selected || (neighbors.get(selected) || new Set()).has(n.id))
+          return base;
+        return DIM;
       }
 
       function nodeVisible(n) {
@@ -327,9 +444,37 @@
         return n.frequency >= minFreq;
       }
 
+      const THREE = three();
+      const glowTexture = THREE ? makeGlowTexture(THREE) : null;
+
+      function starObject(n) {
+        // Concepts render as glowing star sprites; the DAG plane keeps the
+        // library's default geometry so ground and sky read differently.
+        if (!THREE || n.kind !== "concept") return undefined;
+        const group = new THREE.Group();
+        const material = new THREE.SpriteMaterial({
+          map: glowTexture, transparent: true, depthWrite: false,
+          color: conceptColor(n),
+        });
+        const star = new THREE.Sprite(material);
+        const scale = 7 + Math.sqrt(n.frequency) * 2.2;
+        star.scale.set(scale, scale, 1);
+        group.add(star);
+        n.__starMaterial = material;
+        if (n.labelled) {
+          const label = makeLabelSprite(THREE, n.name);
+          label.position.set(0, -(scale * 0.55 + 3), 0);
+          group.add(label);
+          n.__labelMaterial = label.material;
+        }
+        return group;
+      }
+
       Graph = ForceGraph3D()(document.getElementById("graph"))
-        .backgroundColor("#0b0f17")
+        // Transparent scene: the page's nebula gradient is the sky.
+        .backgroundColor("rgba(0,0,0,0)")
         .graphData({ nodes, links })
+        .nodeThreeObject(starObject)
         .nodeLabel(n => n.kind === "concept"
           ? `${n.name} · ${n.label} · freq ${n.frequency}`
           + (isOrphan(n.id) ? " · orphan" : "")
@@ -337,18 +482,8 @@
           + (isOrphan(n.id) ? " · orphan" : ""))
         .nodeVal(n => n.kind === "dag" ? 6 : Math.max(2, n.val))
         .nodeVisibility(nodeVisible)
-        .nodeColor(n => {
-          // Orphan highlight overrides everything: unconnected nodes glow red,
-          // the rest recede.
-          if (highlightOrphans) return isOrphan(n.id) ? "#ff5c5c" : "#2b3644";
-          const base = n.kind === "dag"
-            ? (RESOURCE_COLOR[n.resource_type] || "#8b98a9")
-            : (colorBy.color[colorBy.valueOf(n)] || "#55606e");
-          if (!selected) return base;
-          if (n.id === selected || (neighbors.get(selected) || new Set()).has(n.id))
-            return base;
-          return "#2b3644";
-        })
+        .nodeColor(n => n.kind === "dag"
+          ? (RESOURCE_COLOR[n.resource_type] || "#8b98a9") : conceptColor(n))
         .linkVisibility(l => {
           const s = l.source, t = l.target;
           if (l.kind !== "concept" && !lineageMode) return false;
@@ -356,25 +491,51 @@
           return l.kind === "cross"
             ? (selected ? touching.has(linkKey(l)) : false) : true;
         })
-        // 3d-force-graph defaults linkOpacity to 0.2, which washes lines out on
-        // the dark background; raise it and use solid colors for contrast.
-        .linkOpacity(0.85)
+        // Constellation lines: faint silver until a star is chosen, then its
+        // own constellation brightens and the rest recede.
+        .linkOpacity(0.55)
         .linkColor(l => {
           if (l.kind === "cross") return "#ffcb47";      // amber beam
-          if (l.kind === "dag") return "#8291a6";        // plane lineage (subdued)
-          return selected && !touching.has(linkKey(l)) ? "#3a4657" : "#8ce99a";
+          if (l.kind === "dag") return "#5d6a7d";        // plane lineage (subdued)
+          return selected
+            ? (touching.has(linkKey(l)) ? "#cfe3ff" : "#232c3a")
+            : "#8fa5c4";
         })
-        .linkWidth(l => l.kind === "cross" ? 2.2 : (l.kind === "concept" ? 1.1 : 0.8))
+        .linkWidth(l => l.kind === "cross" ? 2.2
+          : (l.kind === "concept" ? (selected && touching.has(linkKey(l)) ? 1.6 : 0.7) : 0.8))
         .linkDirectionalArrowLength(l => l.kind === "concept" && l.directed ? 3 : 0)
         .linkDirectionalParticles(l =>
           l.kind === "cross" && touching.has(linkKey(l)) ? 3 : 0)
         .onNodeClick(node => {
           selected = (selected === node.id) ? null : node.id;
-          recomputeTouching(); showDetail(selected ? node : null); refresh();
+          recomputeTouching(); showDetail(selected ? node : null); fullRefresh();
         })
         .onBackgroundClick(() => {
-          selected = null; recomputeTouching(); showDetail(null); refresh();
+          selected = null; recomputeTouching(); showDetail(null); fullRefresh();
         });
+
+      if (THREE) {
+        // Depth cue: far stars fade toward the sky color.
+        Graph.scene().fog = new THREE.FogExp2(0x05070f, 0.00075);
+        addStarfield(THREE, Graph.scene());
+      }
+
+      fullRefresh = () => {
+        // Library-driven accessors...
+        Graph.nodeColor(Graph.nodeColor()).nodeVisibility(Graph.nodeVisibility())
+             .linkVisibility(Graph.linkVisibility()).linkColor(Graph.linkColor())
+             .linkWidth(Graph.linkWidth())
+             .linkDirectionalParticles(Graph.linkDirectionalParticles());
+        // ...plus the sprite tints the library does not manage.
+        for (const n of nodes) {
+          if (n.__starMaterial) n.__starMaterial.color.set(conceptColor(n));
+          if (n.__labelMaterial) {
+            const receded = selected && n.id !== selected &&
+              !(neighbors.get(selected) || new Set()).has(n.id);
+            n.__labelMaterial.opacity = receded ? 0.15 : 1;
+          }
+        }
+      };
 
       // 3d-force-graph sizes its canvas from the container once at init; if the
       // container hasn't laid out yet the canvas is 0×0 and nothing draws. Pin it
@@ -401,7 +562,7 @@
         Graph.zoomToFit(400, 60);
         const entry = entryNode();
         if (entry && entry.fx !== undefined) {
-          selected = entry.id; recomputeTouching(); showDetail(entry); refresh();
+          selected = entry.id; recomputeTouching(); showDetail(entry); fullRefresh();
           setTimeout(() => Graph.cameraPosition(
             { x: entry.fx, y: entry.fy + 40, z: entry.fz + 140 }, entry, 900), 500);
         }
@@ -409,7 +570,7 @@
 
       document.getElementById("search").addEventListener("input", e => {
         const q = e.target.value.trim().toLowerCase();
-        if (!q) { selected = null; recomputeTouching(); showDetail(null); refresh(); return; }
+        if (!q) { selected = null; recomputeTouching(); showDetail(null); fullRefresh(); return; }
         const hit = nodes.find(n => n.kind === "concept" &&
           (n.name.toLowerCase().includes(q) || n.id.toLowerCase().includes(q)));
         if (hit) {
@@ -417,7 +578,7 @@
           const x = hit.fx ?? hit.x, y = hit.fy ?? hit.y, z = hit.fz ?? hit.z;
           if (x !== undefined)
             Graph.cameraPosition({ x, y: y + 30, z: z + 80 }, hit, 600);
-          refresh();
+          fullRefresh();
         }
       });
     }

@@ -187,3 +187,19 @@ def test_baked_positions_pin_concept_nodes() -> None:
     html = render_concept_cloud(demo_export())
     assert "node.fx = c.position.x" in html
     assert "node.fy = c.position.y + Y_OFFSET" in html
+
+
+def test_render_carries_the_star_motif() -> None:
+    """The constellation look (#345 follow-up): glowing star sprites tinted by
+    the active dimension, a drifting faded starfield, depth fog, and sky-chart
+    labels on the brightest concepts. All of it degrades to the library's
+    default rendering when THREE is unavailable."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert "makeGlowTexture" in html and "SpriteMaterial" in html
+    assert "addStarfield" in html and "drift" in html    # slightly moving stars
+    assert "FogExp2" in html                              # depth cue
+    assert "makeLabelSprite" in html                      # sky-chart labels
+    assert 'backgroundColor("rgba(0,0,0,0)")' in html     # nebula CSS shows through
+    assert "window.THREE" in html and "return undefined" in html  # graceful fallback

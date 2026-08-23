@@ -34,6 +34,8 @@ from .schema import (
     DagEdge,
     DagNode,
     DagPlane,
+    DimensionDef,
+    Position,
     Provenance,
 )
 
@@ -65,6 +67,10 @@ def build_concept_cloud(
     top_n: int = 200,
     generated_at: str | None = None,
     statuses: tuple[str, ...] = ("matched", "ambiguous"),
+    embeddings: pl.DataFrame | None = None,
+    vector_field: str = "embedding",
+    query_log: pl.DataFrame | None = None,
+    dimension_columns: dict[str, tuple[pl.DataFrame, str]] | None = None,
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -83,6 +89,37 @@ def build_concept_cloud(
     )
     kept = {c.canonical_id for c in concepts}
     concept_edges = _aggregate_edges(relations, canonical_of, kept)
+
+    if embeddings is not None:
+        positions = concept_positions(
+            links, embeddings, vector_field=vector_field, kept=kept
+        )
+        concepts = [
+            c.model_copy(update={"position": positions.get(c.canonical_id)})
+            for c in concepts
+        ]
+
+    dimension_defs: list[DimensionDef] = []
+    values_by_concept: dict[str, dict[str, str]] = defaultdict(dict)
+    if query_log is not None:
+        heat_def, heat_values = retrieval_dimension(links, query_log, kept=kept)
+        if heat_def is not None:
+            dimension_defs.append(heat_def)
+            for cid, value in heat_values.items():
+                values_by_concept[cid][heat_def.name] = value
+    for name, (frame, value_column) in sorted((dimension_columns or {}).items()):
+        column_def, column_values = column_dimension(
+            name, frame, value_column, kept=kept
+        )
+        if column_def is not None:
+            dimension_defs.append(column_def)
+            for cid, value in column_values.items():
+                values_by_concept[cid][name] = value
+    if values_by_concept:
+        concepts = [
+            c.model_copy(update={"dimensions": values_by_concept.get(c.canonical_id, {})})
+            for c in concepts
+        ]
     cross_layer_edges = (
         tuple(
             CrossLayerEdge(concept=c.canonical_id, dag_node=linking_node_id)
@@ -98,6 +135,7 @@ def build_concept_cloud(
         concepts=tuple(concepts),
         concept_edges=concept_edges,
         cross_layer_edges=cross_layer_edges,
+        dimensions=tuple(dimension_defs),
     )
 
 
@@ -231,6 +269,203 @@ def _aggregate_edges(
     )
 
 
+
+# Coordinate radius the projection is scaled to. Matches the artifact's scene
+# scale (the DAG plane grid spreads ~60 units per node), so semantic layout
+# and lineage mode share one coordinate system.
+_POSITION_RADIUS = 120.0
+_RETRIEVAL_DIMENSION = "retrieval"
+
+
+def concept_positions(
+    links: pl.DataFrame,
+    embeddings: pl.DataFrame,
+    *,
+    vector_field: str = "embedding",
+    kept: set[str],
+) -> dict[str, Position]:
+    """Semantic coordinates: mention-vector centroids projected to 3D (#345).
+
+    The embed relation already carries every mention's vector (the upstream
+    record's columns survive embedding), so this is a join and a mean — no
+    provider calls. PCA rather than UMAP: deterministic, dependency-light, and
+    at <=2,000 concepts the difference does not earn a heavyweight import.
+    Only coordinates leave this function; vectors never enter the bundle.
+    """
+    try:
+        import numpy as np
+    except ImportError as error:  # pragma: no cover - numpy rides other extras
+        raise ConceptCloudExportError(
+            "Baked positions require numpy (installed by most stel extras); "
+            "install it or export without --embed-model"
+        ) from error
+
+    if "mention_id" not in embeddings.columns or vector_field not in embeddings.columns:
+        raise ConceptCloudExportError(
+            f"embed model output must have `mention_id` and `{vector_field}` columns"
+        )
+    joined = (
+        links.filter(pl.col("canonical_id").is_in(sorted(kept)))
+        .select("mention_id", "canonical_id")
+        .join(
+            embeddings.select("mention_id", vector_field),
+            on="mention_id",
+            how="inner",
+        )
+    )
+    if joined.height == 0:
+        return {}
+    # Element-wise centroid per concept. Deliberately not `.list.mean()`,
+    # which averages *within* one row's vector; the centroid is the mean
+    # across a concept's mention vectors, per dimension.
+    by_concept: dict[str, list[Any]] = defaultdict(list)
+    for row in joined.iter_rows(named=True):
+        vector = row[vector_field]
+        if vector is not None:
+            by_concept[str(row["canonical_id"])].append(vector)
+    if len(by_concept) < 2:
+        return {}
+    ids = sorted(by_concept)
+    try:
+        matrix = np.array(
+            [np.mean(np.array(by_concept[cid], dtype=np.float64), axis=0) for cid in ids]
+        )
+    except ValueError as error:
+        raise ConceptCloudExportError(
+            "mention vectors must share one dimensionality to be projected"
+        ) from error
+    if matrix.ndim != 2:
+        return {}
+    centered = matrix - matrix.mean(axis=0)
+    # Deterministic PCA via SVD; sign fixed so the largest-magnitude loading on
+    # each axis is positive, since SVD signs are otherwise arbitrary.
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    components = vt[:3]
+    for i in range(components.shape[0]):
+        if components[i][np.argmax(np.abs(components[i]))] < 0:
+            components[i] = -components[i]
+    projected = centered @ components.T
+    if projected.shape[1] < 3:
+        projected = np.pad(projected, ((0, 0), (0, 3 - projected.shape[1])))
+    peak = float(np.abs(projected).max()) or 1.0
+    projected = projected * (_POSITION_RADIUS / peak)
+    return {
+        cid: Position(x=float(x), y=float(y), z=float(z))
+        for cid, (x, y, z) in zip(ids, projected, strict=True)
+    }
+
+
+def retrieval_dimension(
+    links: pl.DataFrame,
+    query_log: pl.DataFrame,
+    *,
+    kept: set[str],
+) -> tuple[DimensionDef | None, dict[str, str]]:
+    """The usage-feedback dimension: retrieval heat from the MCP query log.
+
+    Joins `returned_chunk_ids` through the linking rows to concepts and
+    buckets hit counts into hot/warm/cold/never. Aggregate-only by
+    construction — counts are the only thing read; query text and principal
+    ids never leave the warehouse frame (issue #345, #329 rule 1).
+    `never` is deliberate and arguably the most actionable value on the map:
+    a concept agents cannot reach.
+    """
+    if "returned_chunk_ids" not in query_log.columns:
+        return None, {}
+    join_column = next(
+        (c for c in ("chunk_id", "document_id") if c in links.columns), None
+    )
+    if join_column is None:
+        return None, {}
+    hits = (
+        query_log.select(pl.col("returned_chunk_ids").alias("returned"))
+        .explode("returned")
+        .drop_nulls()
+        .group_by("returned")
+        .len()
+        .rename({"returned": join_column, "len": "hits"})
+    )
+    per_concept = (
+        links.filter(pl.col("canonical_id").is_in(sorted(kept)))
+        .select("canonical_id", join_column)
+        .join(hits, on=join_column, how="left")
+        .group_by("canonical_id")
+        .agg(pl.col("hits").fill_null(0).sum().alias("hits"))
+    )
+    counts = {
+        str(row["canonical_id"]): int(row["hits"])
+        for row in per_concept.iter_rows(named=True)
+    }
+    # Every kept concept gets a value; ones with no joinable rows are `never`.
+    counts = {cid: counts.get(cid, 0) for cid in kept}
+    positive = sorted(count for count in counts.values() if count > 0)
+    definition = DimensionDef(
+        name=_RETRIEVAL_DIMENSION,
+        values=("hot", "warm", "cold", "never"),
+        source="query_log",
+        description="How often agents' queries returned this concept's chunks",
+    )
+    if not positive:
+        return definition, {cid: "never" for cid in counts}
+    # Tertiles over concepts that were retrieved at all; deterministic bounds.
+    low = positive[len(positive) // 3]
+    high = positive[(2 * len(positive)) // 3]
+
+    def bucket(count: int) -> str:
+        if count == 0:
+            return "never"
+        if count <= low:
+            return "cold"
+        if count <= high:
+            return "warm"
+        return "hot"
+
+    return definition, {cid: bucket(count) for cid, count in counts.items()}
+
+
+def column_dimension(
+    name: str,
+    frame: pl.DataFrame,
+    value_column: str,
+    *,
+    kept: set[str],
+) -> tuple[DimensionDef | None, dict[str, str]]:
+    """A declared pipeline dimension: any concept-keyed categorical column.
+
+    This is where `llm:` enum fields (#304) flow in for free — the label set
+    is already declared and validated upstream; here it just becomes a color.
+    A concept with multiple rows takes the most frequent value, ties broken
+    lexically for determinism.
+    """
+    if "canonical_id" not in frame.columns or value_column not in frame.columns:
+        raise ConceptCloudExportError(
+            f"dimension '{name}' needs `canonical_id` and `{value_column}` columns"
+        )
+    rows = (
+        frame.filter(
+            pl.col("canonical_id").is_in(sorted(kept))
+            & pl.col(value_column).is_not_null()
+        )
+        .group_by("canonical_id", value_column)
+        .len()
+        .sort(["canonical_id", "len", value_column], descending=[False, True, False])
+        .group_by("canonical_id", maintain_order=True)
+        .first()
+    )
+    values = {
+        str(row["canonical_id"]): str(row[value_column])
+        for row in rows.iter_rows(named=True)
+    }
+    if not values:
+        return None, {}
+    definition = DimensionDef(
+        name=name,
+        values=tuple(sorted(set(values.values()))),
+        source="column",
+    )
+    return definition, values
+
+
 def _first(values: list[object]) -> object | None:
     for v in values:
         if v is not None and str(v).strip():
@@ -297,6 +532,10 @@ def export_concept_cloud(
     target: str | None = None,
     profiles_dir: str | Path | None = None,
     top_n: int = 200,
+    embed_model: str | None = None,
+    vector_field: str = "embedding",
+    with_query_log: bool = False,
+    dimension_specs: dict[str, str] | None = None,
 ) -> ConceptCloudExport:
     """Read the project's tables through the active adapter and build a bundle.
 
@@ -346,10 +585,32 @@ def export_concept_cloud(
         dag_plane, id_by_name = dag_plane_from_stel_manifest(manifest)
         linking_node_id = id_by_name.get(linking_model)
 
+    dimension_columns: dict[str, tuple[pl.DataFrame, str]] = {}
     with create_adapter(resolved.warehouse, project_dir=project_path) as adapter:
         links = adapter.read_table(linking_model)
         relations = adapter.read_table(relation_model) if relation_model else None
         entities = adapter.read_table(entity_model) if entity_model else None
+        embeddings = adapter.read_table(embed_model) if embed_model else None
+        query_log = None
+        if with_query_log:
+            # The log is opt-in and may not exist yet; an absent relation is
+            # "no usage data", not an export failure.
+            log_config = resolved.mcp_query_log
+            relation = log_config.relation if log_config else "stel_mcp_query_log"
+            try:
+                query_log = adapter.read_table(relation)
+            except Exception:
+                query_log = None
+        for name, spec in sorted((dimension_specs or {}).items()):
+            model_name, _, value_column = spec.partition(".")
+            if not model_name or not value_column:
+                raise ConceptCloudExportError(
+                    f"dimension '{name}' must be `model.column`, got {spec!r}"
+                )
+            dimension_columns[name] = (
+                adapter.read_table(model_name),
+                value_column,
+            )
 
     return build_concept_cloud(
         project=project.name,
@@ -360,4 +621,8 @@ def export_concept_cloud(
         linking_node_id=linking_node_id,
         linking_model=linking_model,
         top_n=top_n,
+        embeddings=embeddings,
+        vector_field=vector_field,
+        query_log=query_log,
+        dimension_columns=dimension_columns or None,
     )

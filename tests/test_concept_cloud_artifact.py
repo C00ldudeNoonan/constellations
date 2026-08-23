@@ -157,4 +157,33 @@ def test_render_includes_orphan_and_filter_controls() -> None:
     assert 'id="orphans"' in html and "highlightOrphans" in html
     assert "isOrphan" in html          # orphan = no meaningful edges
     assert 'id="minfreq"' in html and "minFreq" in html
-    assert 'id="show-plane"' in html and "showPlane" in html
+    # The plane checkbox became the lineage-mode toggle in v2 (#345), and it
+    # defaults OFF: the star map is the primary view.
+    assert 'id="lineage"' in html and "lineageMode" in html
+    assert 'id="lineage"> Lineage' in html and "checked" not in html.split(
+        'id="lineage"'
+    )[0].rsplit("<label", 1)[-1]
+
+
+def test_render_includes_the_dimension_picker_and_entry_point() -> None:
+    """v2 (#345): the color-by picker, dimension-aware legend, and the entry
+    point that opens on the hottest concept instead of the whole hairball."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert 'id="colorby"' in html and "buildColorBy" in html
+    assert "HEAT_COLORS" in html          # retrieval reads as temperature
+    assert "entryNode" in html            # opens on something specific
+    assert '"retrieval"' in html          # demo dimension serialized
+    assert "stel star map" in html
+
+
+def test_baked_positions_pin_concept_nodes() -> None:
+    """Concepts with positions are pinned (fx/fy/fz): position IS the meaning,
+    and the force simulation would erase the projection in seconds. This is a
+    recorded deviation from 'seed then relax'."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert "node.fx = c.position.x" in html
+    assert "node.fy = c.position.y + Y_OFFSET" in html

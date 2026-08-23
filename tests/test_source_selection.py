@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -117,10 +118,14 @@ def test_downstream_selection_discovers_exact_source_ancestors(
     original_discover = LocalDocumentSource.discover
 
     def _tracked_discover(
-        self: LocalDocumentSource, source: SourceConfig, project_dir: Path
+        self: LocalDocumentSource,
+        source: SourceConfig,
+        project_dir: Path,
+        *,
+        source_filter: Sequence[str] = (),
     ) -> list[DocumentRef]:
         discovered.append(source.name)
-        return original_discover(self, source, project_dir)
+        return original_discover(self, source, project_dir, source_filter=source_filter)
 
     monkeypatch.setattr(LocalDocumentSource, "discover", _tracked_discover)
     run_project(mixed_source_project, select="local_raw")

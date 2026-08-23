@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### GCS discovery: the cap counts documents, and `--source-filter` narrows the listing (issue #348)
+
+- **`max_objects` counted the raw listing, before `file_pattern`.** A
+  production backfill of 511 per-ticker partitions died at run 25 and every
+  run after it: a sibling pipeline had written 9,690 `.json`/`.md` sidecars
+  under the same prefix, pushing the raw count past 30,000 while the `.htm`
+  count the source actually reads stayed at 19,854. The runs failed at
+  discovery, over objects the pattern would have discarded. The cap now counts
+  matching documents.
+- **A too-broad prefix still fails loudly.** Counting matches would otherwise
+  remove the protection the raw count was really providing, so a listing that
+  keeps scanning far past the cap without finishing is refused — a typo'd
+  prefix crawls loudly rather than quietly.
+- **`--source-filter` is pushed into the listing prefix.** A run with
+  `--source-filter 'AMAT/*'` listed 30,000 objects and kept about 40. When
+  every glob shares a static leading segment, that segment narrows the listing
+  itself, which is what makes per-partition runs cheap rather than merely
+  possible.
+- **Only whole segments qualify.** `AMAT*` does not narrow, because it would
+  exclude `AMATX/…` which the glob matches; a glob starting with a wildcard
+  narrows nothing; and globs with no shared static segment fall back to the
+  old listing. Document identity is unchanged — the source-relative path still
+  carries the segment the listing prefix absorbed, so no `document_id` moves.
+- The filter reaches backends as a **listing hint**. The authoritative filter
+  is still applied by the runner over the returned refs, so a backend that
+  narrows incorrectly cannot silently drop documents from a run — it can only
+  fail to make the listing cheaper.
+
 ### Vertex embedding: pack requests to a token budget and issue them concurrently (issue #350)
 
 - **Every embed batch was chopped into 5-text requests issued one at a time.**

@@ -1114,6 +1114,20 @@ sources:
       warn_after: { count: 45, period: day }
 ```
 
+**`max_objects` counts matching documents.** The cap is about the documents
+the source reads, so objects the `file_pattern` discards do not consume it — a
+sibling pipeline writing `.json` sidecars under the same prefix cannot fail a
+`*.htm` source. A prefix broad enough to keep scanning far past the cap without
+finishing still fails, so a typo'd prefix crawls loudly rather than quietly.
+
+**`--source-filter` narrows the listing.** When every glob shares a static
+leading path segment, that segment is pushed into the listing prefix, so
+`--source-filter 'AMAT/*'` lists one ticker's objects instead of the whole
+prefix and then discarding the rest. Only whole segments qualify: `AMAT*` does
+not narrow (it would exclude `AMATX/…`, which the glob matches), and a glob
+beginning with a wildcard narrows nothing. Document identity is unaffected —
+the source-relative path still carries the segment the listing prefix absorbed.
+
 Incremental identity comes from the object listing (md5 → crc32c →
 generation), so unchanged objects are skipped **without downloading
 anything**; changed objects are fetched generation-pinned into a per-run

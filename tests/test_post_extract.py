@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import traceback
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -259,9 +260,13 @@ class _BatchSource(DocumentSource):
         self.fetched: Path | None = None
 
     def discover(
-        self, source: SourceConfig, project_dir: Path
+        self,
+        source: SourceConfig,
+        project_dir: Path,
+        *,
+        source_filter: Sequence[str] = (),
     ) -> list[DocumentRef]:
-        del source, project_dir
+        del source, project_dir, source_filter
         return []
 
     def fetch(self, ref: DocumentRef, work_dir: Path) -> Path:

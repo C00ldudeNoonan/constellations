@@ -221,9 +221,11 @@ def test_bounded_listing_raises(tmp_path: Path) -> None:
     src = _gcs_source(_FakeStorageClient(blobs))
     with pytest.raises(SourceError, match="max_objects"):
         src.discover(_cfg(max_objects=3), tmp_path)
-    # and the listing itself was capped, not just post-filtered
+    # The listing is still capped rather than post-filtered, but at the scan
+    # ceiling: the cap now counts matched documents, so the listing has to be
+    # allowed past `max_objects` to know how many actually match (issue #348).
     client = src._client
-    assert client.list_calls[-1] == ("bkt", "raw/docs/", 4)
+    assert client.list_calls[-1] == ("bkt", "raw/docs/", 3 * 10 + 1)
 
 
 def test_sibling_prefix_is_not_ingested(tmp_path: Path) -> None:
@@ -508,3 +510,76 @@ def test_close_releases_client_and_is_idempotent() -> None:
     source.close()  # idempotent — no client to close the second time
     assert closed["n"] == 1
     assert source._client is None
+
+
+# ─── discovery cost and cap semantics (issue #348) ──────────────────────────
+
+
+def test_the_cap_counts_matching_documents_not_the_raw_listing(
+    tmp_path: Path,
+) -> None:
+    """A sibling pipeline wrote 9,690 `.json`/`.md` sidecars under the same
+    prefix and every later partition run died at discovery — for objects the
+    `*.html` pattern would have discarded. The cap is about the documents this
+    source reads, not about what else happens to live under the prefix."""
+    blobs = [_FakeBlob(f"raw/docs/{i}.html") for i in range(3)]
+    blobs += [_FakeBlob(f"raw/docs/sidecar-{i}.json") for i in range(50)]
+    src = _gcs_source(_FakeStorageClient(blobs))
+
+    refs = src.discover(_cfg(max_objects=10), tmp_path)
+
+    assert [ref.relative_path for ref in refs] == [f"{i}.html" for i in range(3)]
+
+
+def test_a_too_broad_prefix_still_fails_loudly(tmp_path: Path) -> None:
+    """Counting matches must not remove the protection the raw count gave: a
+    typo'd prefix should crawl loudly, not quietly."""
+    blobs = [_FakeBlob(f"raw/docs/sidecar-{i}.json") for i in range(40)]
+    src = _gcs_source(_FakeStorageClient(blobs))
+
+    with pytest.raises(SourceError, match="too broad"):
+        src.discover(_cfg(max_objects=3), tmp_path)
+
+
+def test_a_source_filter_narrows_the_listing_prefix(tmp_path: Path) -> None:
+    """`--source-filter 'AMAT/*'` listed 30k objects and kept ~40. The glob's
+    static leading segment can narrow the listing itself."""
+    blobs = [_FakeBlob(f"raw/docs/AMAT/{i}.html") for i in range(2)]
+    blobs += [_FakeBlob(f"raw/docs/AAPL/{i}.html") for i in range(500)]
+    client = _FakeStorageClient(blobs)
+    src = _gcs_source(client)
+
+    refs = src.discover(_cfg(), tmp_path, source_filter=("AMAT/*",))
+
+    assert client.list_calls[-1][1] == "raw/docs/AMAT/"
+    # Identity is the source-relative path, so it must still carry the segment
+    # the listing prefix absorbed — otherwise every document_id changes.
+    assert [ref.relative_path for ref in refs] == ["AMAT/0.html", "AMAT/1.html"]
+
+
+def test_filters_without_a_shared_static_segment_do_not_narrow(
+    tmp_path: Path,
+) -> None:
+    """Two tickers share no static prefix, and a leading wildcard has none at
+    all. Narrowing on either would drop documents the run asked for."""
+    blobs = [_FakeBlob(f"raw/docs/{sym}/0.html") for sym in ("AMAT", "AAPL")]
+    client = _FakeStorageClient(blobs)
+    src = _gcs_source(client)
+
+    src.discover(_cfg(), tmp_path, source_filter=("AMAT/*", "AAPL/*"))
+    assert client.list_calls[-1][1] == "raw/docs/"
+
+    src.discover(_cfg(), tmp_path, source_filter=("*/2024*",))
+    assert client.list_calls[-1][1] == "raw/docs/"
+
+
+def test_a_partial_segment_glob_does_not_narrow_past_a_boundary() -> None:
+    """`AMAT*` must not become the prefix `AMAT`: that would also list
+    `AMATX/…`, which the glob does match — but `AMAT/2024*` may narrow to the
+    whole segment `AMAT/`."""
+    from stel.sources.gcs import _static_filter_prefix
+
+    assert _static_filter_prefix(("AMAT*",)) == ""
+    assert _static_filter_prefix(("AMAT/2024*",)) == "AMAT/"
+    assert _static_filter_prefix(("AMAT/*",)) == "AMAT/"
+    assert _static_filter_prefix(()) == ""

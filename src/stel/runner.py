@@ -504,7 +504,9 @@ def _discover_sources(
             source.path, warehouse=warehouse, project_dir=project_dir
         )
         try:
-            refs = backend.discover(source, project_dir)
+            # Passed as a listing hint only — the filter below is what
+            # actually decides the run's documents (issue #348).
+            refs = backend.discover(source, project_dir, source_filter=source_filter)
         except SourceError as e:
             raise RunError(str(e)) from e
         if source_filter:

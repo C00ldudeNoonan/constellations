@@ -199,3 +199,39 @@ def test_incremental_extraction_bounds_peak_fetch_staging(
     run_project(project)
 
     assert max_entries_seen == 0
+
+
+# ── the #321 rename: producer moved, the swept set only grew ───────────────
+
+
+def test_the_producer_writes_the_current_prefix() -> None:
+    """Scratch directories are the one residual `dbt_ml` spelling safe to
+    rename: nothing persists across runs, no hash consumes it, and no consumer
+    reads it (issue #321)."""
+    from stel.execution import extraction as extraction_module
+
+    assert extraction_module._FETCH_DIR_PREFIX == "stel_fetch_"
+
+
+def test_the_sweep_still_reclaims_pre_rename_directories(tmp_path: Path) -> None:
+    """A directory a dead process abandoned before the rename must still be
+    reclaimed. The sweep only ever sees what a dead process left behind, so
+    dropping the old prefix would not fail anything — it would silently leak
+    every such directory forever."""
+    from stel.execution.extraction import _sweep_stale_fetch_dirs
+
+    old = time.time() - 999_999
+    legacy = tmp_path / "dbt_ml_fetch_abandoned"
+    legacy.mkdir()
+    (legacy / "leftover.bin").write_bytes(b"x" * 100)
+    os.utime(legacy, (old, old))
+
+    current = tmp_path / "stel_fetch_abandoned"
+    current.mkdir()
+    (current / "leftover.bin").write_bytes(b"x" * 100)
+    os.utime(current, (old, old))
+
+    _sweep_stale_fetch_dirs(tmp_path, max_age_seconds=3600)
+
+    assert not legacy.exists(), "pre-rename directories would leak forever"
+    assert not current.exists()

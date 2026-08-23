@@ -338,15 +338,26 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
     (
         "execution.extraction._FETCH_DIR_PREFIX",
         extraction_module._FETCH_DIR_PREFIX,
-        "dbt_ml_fetch_",
+        "stel_fetch_",
+        "renamed in #321 — safe only because the sweep below still recognizes "
+        "the pre-rename prefix; the producer may move, the swept set may not",
+    ),
+    (
+        "execution.extraction._SWEPT_FETCH_DIR_PREFIXES",
+        extraction_module._SWEPT_FETCH_DIR_PREFIXES,
+        ("stel_fetch_", "dbt_ml_fetch_"),
         "the #273 startup sweep only ever sees directories a dead process left "
-        "behind, so a producer/filter mismatch disables the self-healing silently",
+        "behind, so dropping a prefix here disables the self-healing silently "
+        "and leaks whatever that process abandoned — additive only",
     ),
     (
         "execution.extraction._OWNER_MARKER_NAME",
         extraction_module._OWNER_MARKER_NAME,
         ".dbt_ml_owner_pid",
-        "distinguishes a live run's staging directory from an abandoned one",
+        "distinguishes a live run's staging directory from an abandoned one. "
+        "Deliberately NOT renamed with the directory prefix (#321): a missing "
+        "marker reads as not-live, so a newer stel would sweep a directory an "
+        "older one is still using. No benefit, real risk",
     ),
     ("env.PROFILES_DIR_ENV", env_module.PROFILES_DIR_ENV, "STEL_PROFILES_DIR", "operator-set"),
     ("env.VERBOSE_ENV", env_module.VERBOSE_ENV, "STEL_VERBOSE", "operator-set"),

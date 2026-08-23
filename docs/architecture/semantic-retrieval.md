@@ -1292,6 +1292,26 @@ temporarily empty a collection, or expose a half-built generation. Initial
 incremental publication may create a missing collection because no prior
 serving generation exists.
 
+#### What proves atomic activation (issue #355)
+
+The proof is not store-side. The active generation is resolved through the
+warehouse-owned serving ledger, so activation is a fenced warehouse row update
+on the same machinery as `replace_state_scope` — the store is never asked to
+swap anything and needs no alias primitive or conditional write.
+
+What the store must prove is narrower, and is advertised as
+`private_generation_build`: it can create a collection under a caller-chosen
+physical name that receives no production queries, and drop one later. LanceDB
+satisfies this. A store with a fixed collection namespace does not, which is
+what the capability exists to catch.
+
+This depends on the serving scope being keyed on the *logical* collection.
+Keying it on the physical collection — as it was before #355 — makes
+resolution circular: a reader would need the active generation in order to
+compute the scope that names the active generation. `physical_collection()`
+therefore returns the unsuffixed, pre-#355 name when no generation is
+requested, because that is where every already-published index still lives.
+
 ### Failure, recovery, and idempotency
 
 Every mutation is stable-ID idempotent and publication is at-least-once:

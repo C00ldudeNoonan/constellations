@@ -1303,3 +1303,138 @@ def test_online_policy_is_refused_when_the_store_cannot_evolve(
 
     with pytest.raises(Exception, match="online_schema_evolution"):
         validate_retrieval_capabilities(models, project, resolved)
+
+
+# ─── private generation build (issue #355) ──────────────────────────────────
+
+
+def _gen_store(tmp_path: Path) -> Any:
+    from stel.retrieval import LanceDBConfig, LanceDBStore
+
+    return LanceDBStore(
+        LanceDBConfig(type="lancedb", path=str(tmp_path / "lance")),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+
+
+def test_unsuffixed_physical_name_is_unchanged_by_generations(
+    tmp_path: Path,
+) -> None:
+    """The pre-#355 name must keep addressing already-published collections.
+
+    Every index published before generations existed lives under this exact
+    name; changing it would strand the data rather than migrate it.
+    """
+    store = _gen_store(tmp_path)
+    assert store.physical_collection("ctx") == "proj__dev__ctx"
+    assert store.physical_collection("ctx", generation=None) == "proj__dev__ctx"
+
+
+def test_generation_yields_a_distinct_private_collection_name(
+    tmp_path: Path,
+) -> None:
+    store = _gen_store(tmp_path)
+    base = store.physical_collection("ctx")
+    gen_a = store.physical_collection("ctx", generation="a1b2")
+    gen_b = store.physical_collection("ctx", generation="c3d4")
+
+    assert gen_a != base and gen_b != base and gen_a != gen_b
+    assert gen_a.startswith(base)
+
+
+def test_generation_token_charset_is_enforced(tmp_path: Path) -> None:
+    from stel.retrieval import RetrievalError
+
+    store = _gen_store(tmp_path)
+    # The token crosses into a physical collection name, so it is restricted
+    # rather than escaped.
+    for bad in ("has-dash", "UPPER", "with_underscore", "", "x" * 17, "a b"):
+        with pytest.raises(RetrievalError, match="generation token"):
+            store.physical_collection("ctx", generation=bad)
+
+
+def test_generation_suffix_cannot_overflow_the_name_limit(
+    tmp_path: Path,
+) -> None:
+    from stel.retrieval import RetrievalError
+
+    store = _gen_store(tmp_path)
+    long_logical = "c" * 120
+    # Unsuffixed it already fills the budget; the suffix must be rejected
+    # rather than produce a truncated or invalid collection name.
+    with pytest.raises(RetrievalError, match="invalid"):
+        store.physical_collection(long_logical, generation="abcd1234")
+
+
+def test_lancedb_advertises_private_generation_build() -> None:
+    from stel.retrieval import LanceDBStore, RetrievalFeature
+
+    assert (
+        RetrievalFeature.PRIVATE_GENERATION_BUILD
+        in LanceDBStore.capabilities().features
+    )
+
+
+def test_drop_collection_removes_only_an_owned_existing_collection(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("lancedb")
+    import pyarrow as pa
+
+    from stel.retrieval import CollectionSpec
+
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx", generation="a1b2")
+        # Nothing to drop yet: reported, not raised, so a retirement sweep is
+        # safe to run against an already-reclaimed generation.
+        assert store.drop_collection(name) is False
+
+        store.create_collection(
+            CollectionSpec(
+                logical_name="ctx",
+                physical_name=name,
+                id_field="id",
+                text_fields=("body",),
+                full_text_fields=(),
+                attribute_fields=(),
+                scalar_index_fields=(),
+                display_fields=("body",),
+                vector_field=None,
+                vector_dimensions=None,
+                distance_metric=None,
+                vector_search="exact",
+                config_fingerprint="cfg1",
+                descriptor="{}",
+                legacy_config_fingerprint="legacy1",
+                arrow_schema=pa.schema(
+                    [pa.field("id", pa.string()), pa.field("body", pa.string())]
+                ),
+            )
+        )
+        assert store.inspect_collection(name) is not None
+        assert store.drop_collection(name) is True
+        assert store.inspect_collection(name) is None
+
+
+def test_drop_collection_refuses_a_collection_stel_does_not_own(
+    tmp_path: Path,
+) -> None:
+    """A mistyped or externally managed name must not be destroyed here."""
+    lancedb = pytest.importorskip("lancedb")
+    import pyarrow as pa
+
+    from stel.retrieval import RetrievalError
+
+    store = _gen_store(tmp_path)
+    with store:
+        foreign = lancedb.connect(str(tmp_path / "lance"))
+        foreign.create_table(
+            "proj__dev__foreign",
+            schema=pa.schema([pa.field("id", pa.string())]),
+        )
+        with pytest.raises(RetrievalError, match="not owned by stel"):
+            store.drop_collection("proj__dev__foreign")
+        assert "proj__dev__foreign" in foreign.list_tables().tables

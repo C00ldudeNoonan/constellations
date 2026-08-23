@@ -35,6 +35,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    validate_generation_token,
 )
 from .registry import register
 
@@ -249,6 +250,10 @@ class LanceDBStore(RetrievalStore):
                     # its rows (issue #344).
                     RetrievalFeature.ONLINE_SCHEMA_EVOLUTION,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
+                    # Build under a private name, drop later; the swap itself
+                    # is a warehouse row update, not a LanceDB operation
+                    # (issue #355).
+                    RetrievalFeature.PRIVATE_GENERATION_BUILD,
                 }
             ),
             distance_metrics=frozenset({"cosine", "euclidean", "dot"}),
@@ -391,16 +396,42 @@ class LanceDBStore(RetrievalStore):
             collection,
         )
 
-    def physical_collection(self, logical_name: str) -> str:
+    def physical_collection(
+        self, logical_name: str, *, generation: str | None = None
+    ) -> str:
         values = {
             "project": _identifier_piece(self.project_name),
             "target": _identifier_piece(self.target_name),
             "collection": _identifier_piece(logical_name),
         }
         physical = self._config.collection_template.format(**values)
+        if generation is not None:
+            # Suffixed only when a generation is asked for, so the unsuffixed
+            # name keeps addressing collections published before #355.
+            physical = f"{physical}__g{validate_generation_token(generation)}"
         if not _COLLECTION_RE.fullmatch(physical):
             raise RetrievalError("Resolved LanceDB collection name is invalid")
         return physical
+
+    def drop_collection(self, name: str) -> bool:
+        if not _COLLECTION_RE.fullmatch(name):
+            raise RetrievalError("LanceDB collection name is invalid")
+        db = self._connection()
+        try:
+            if name not in db.list_tables().tables:
+                return False
+            # Opening through the owned-table path first refuses to drop a
+            # collection stel did not create, so a mistyped or externally
+            # managed name cannot be destroyed here.
+            self._open_owned_table(name)
+            db.drop_table(name)
+            return True
+        except RetrievalError:
+            raise
+        except Exception:
+            raise RetrievalError(
+                "LanceDB operation 'drop' failed (code=lancedb_drop_failed)"
+            ) from None
 
     def inspect_collection(self, name: str) -> CollectionMetadata | None:
         db = self._connection()

@@ -815,3 +815,165 @@ def test_public_indexes_reject_policy_filters(tmp_path: Path) -> None:
                 SearchFilter("category", SearchFilterOperator.EQUAL, "prices"),
             ),
         )
+
+
+# ─── serving scope re-keying (issue #355) ───────────────────────────────────
+
+
+def _legacy_scope(model_name: str = "context_search") -> StateScope:
+    """A scope standing in for a pre-#355 physical-collection-keyed identity."""
+    return StateScope.for_target_descriptor(
+        model_name,
+        stage="retrieval_publish",
+        descriptor={"store_type": "lancedb", "physical_collection": "proj_dev_context"},
+    )
+
+
+def test_state_retrieval_target_keys_on_logical_not_physical() -> None:
+    """The whole point of #355: two physical names, one stable serving identity.
+
+    If the descriptor kept the physical collection, a generation swap would
+    change target_identity, and a reader would need the active generation in
+    order to compute the scope that names the active generation.
+    """
+    from stel.retrieval.base import StateRetrievalTarget
+
+    gen_a = StateRetrievalTarget("lancedb", "routing1", "proj_dev_ctx_g1", "ctx")
+    gen_b = StateRetrievalTarget("lancedb", "routing1", "proj_dev_ctx_g2", "ctx")
+
+    assert gen_a.descriptor() == gen_b.descriptor()
+    assert "physical_collection" not in gen_a.descriptor()
+    assert gen_a.descriptor()["logical_collection"] == "ctx"
+    # The physical name is still reported for artifacts, just not keyed on.
+    assert gen_a.physical_collection != gen_b.physical_collection
+    assert gen_a.legacy_descriptor() != gen_b.legacy_descriptor()
+
+
+def test_rekey_scope_moves_ledger_row(coordinator: Any) -> None:
+    legacy, current = _legacy_scope(), _scope()
+    lease = coordinator.acquire_publish(
+        legacy, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+    assert coordinator.status(legacy).status == STATUS_READY
+    assert coordinator.status(current).status == STATUS_UNPUBLISHED
+
+    assert coordinator.rekey_scope(legacy, current) == 1
+
+    moved = coordinator.status(current)
+    assert moved.status == STATUS_READY
+    assert moved.active_generation == "gen1"
+    assert moved.fencing_token == lease.fencing_token
+
+
+def test_rekey_scope_is_idempotent_and_ignores_absent_source(
+    coordinator: Any,
+) -> None:
+    legacy, current = _legacy_scope(), _scope()
+    lease = coordinator.acquire_publish(
+        legacy, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+
+    assert coordinator.rekey_scope(legacy, current) == 1
+    # Second run finds nothing under the old identity and reports zero rather
+    # than failing, so the migration command is safe to re-run.
+    assert coordinator.rekey_scope(legacy, current) == 0
+    assert coordinator.status(current).status == STATUS_READY
+
+
+def test_rekey_scope_refuses_when_destination_is_occupied(
+    coordinator: Any,
+) -> None:
+    legacy, current = _legacy_scope(), _scope()
+    for scope in (legacy, current):
+        lease = coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg1"
+        )
+        coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+
+    with pytest.raises(ServingCoordinationError, match="already has"):
+        coordinator.rekey_scope(legacy, current)
+    # Neither side is disturbed by the refusal.
+    assert coordinator.status(legacy).status == STATUS_READY
+    assert coordinator.status(current).status == STATUS_READY
+
+
+def test_rekey_scope_refuses_while_a_query_lease_is_outstanding(
+    coordinator: Any,
+) -> None:
+    legacy, current = _legacy_scope(), _scope()
+    publish = coordinator.acquire_publish(
+        legacy, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        publish,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+    query = coordinator.acquire_query(legacy)
+
+    with pytest.raises(ServingBusyError, match="outstanding query leases"):
+        coordinator.rekey_scope(legacy, current)
+
+    # The reader is undisturbed and still validates against its own scope.
+    coordinator.validate_query(query)
+    coordinator.release_query(query)
+    assert coordinator.rekey_scope(legacy, current) == 1
+
+
+def test_rekey_scope_refuses_to_change_model_or_stage(coordinator: Any) -> None:
+    legacy = _legacy_scope()
+    other_model = _scope("other_search")
+    with pytest.raises(ServingCoordinationError, match="only change target_identity"):
+        coordinator.rekey_scope(legacy, other_model)
+
+
+def test_rekey_state_scope_moves_rows_and_refuses_collisions(
+    tmp_path: Path,
+) -> None:
+    from stel.adapters.base import AdapterError, StateRecord
+
+    legacy, current = _legacy_scope(), _scope()
+    with create_adapter(_wh(tmp_path / "state.duckdb")) as adapter:
+        adapter.upsert_state(
+            legacy,
+            [
+                StateRecord("doc-1", "fp1", "v1"),
+                StateRecord("doc-2", "fp2", "v1"),
+            ],
+        )
+        assert len(adapter.fetch_state(legacy)) == 2
+        assert adapter.fetch_state(current) == {}
+
+        assert adapter.rekey_state_scope(legacy, current) == 2
+
+        moved = adapter.fetch_state(current)
+        assert set(moved) == {"doc-1", "doc-2"}
+        assert moved["doc-1"].input_fingerprint == "fp1"
+        assert adapter.fetch_state(legacy) == {}
+        # Idempotent: nothing left under the old identity.
+        assert adapter.rekey_state_scope(legacy, current) == 0
+
+        # A collision must not silently merge or discard either publication.
+        adapter.upsert_state(legacy, [StateRecord("doc-3", "fp3", "v1")])
+        with pytest.raises(AdapterError, match="already holds"):
+            adapter.rekey_state_scope(legacy, current)
+        assert len(adapter.fetch_state(legacy)) == 1
+        assert len(adapter.fetch_state(current)) == 2

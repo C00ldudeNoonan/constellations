@@ -380,6 +380,7 @@ stel show <model> [--limit N]                            # peek at a materialize
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
 stel serving recover <search-index> --owner-terminated   # explicit authority reassignment after a crash
+stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
 stel providers list [--output {table,json}]              # built-in + entry-point providers, incompatible plugins flagged
 stel source freshness                                    # mtime vs warn_after/error_after
 stel docs generate [--output DIR]                        # static HTML site from manifest.json
@@ -2007,6 +2008,27 @@ Recovery advances the fencing token (so a surviving zombie fails its next
 check), clears leases, and leaves the scope failed until the next `stel run`
 republishes it. After upgrading to this contract, run `stel run` once per
 search index to establish its ledger before querying.
+
+#### Migrating the serving scope
+
+The serving scope is keyed on the *logical* collection. Earlier versions keyed
+it on the physical collection, which cannot survive a logical collection having
+more than one physical generation behind it: resolving the ledger row would
+require already knowing the active generation that row names.
+
+An index published before this change keeps its ledger row and publication
+state under the old key, where nothing looks for it. stel treats an index with
+unreachable publication state as unpublished, so the next run re-embeds it in
+full. Move it instead — once per affected index:
+
+```bash
+stel serving migrate-scope chunk_search
+```
+
+The command is idempotent; a second run reports nothing to migrate. It is
+refused while query leases are outstanding (let readers finish, or run
+`stel serving recover`), and refused if the destination scope already holds a
+published ledger row rather than picking a winner between two publications.
 
 Governed indexes (`access: governed`) are supported on stores that declare
 strong read-after-write consistency and metadata filtering. Changed governed

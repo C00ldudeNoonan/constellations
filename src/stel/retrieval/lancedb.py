@@ -388,6 +388,7 @@ class LanceDBStore(RetrievalStore):
             self.store_type(),
             self.safe_descriptor().safe_target_identity,
             self.physical_collection(collection),
+            collection,
         )
 
     def physical_collection(self, logical_name: str) -> str:

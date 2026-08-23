@@ -226,6 +226,77 @@ class ServingCoordinator:
             ],
         )
 
+    # ─── scope re-keying (issue #355) ─────────────────────────────────────
+
+    def rekey_scope(self, old: StateScope, new: StateScope) -> int:
+        """Move the ledger row for `old` onto `new`, returning rows moved.
+
+        Companion to `WarehouseAdapter.rekey_state_scope` for the two tables
+        this class owns. Refused while any query lease is outstanding on
+        either scope: a lease pins a generation under an identity that is
+        about to stop existing, and rewriting it would leave the holder
+        validating against a row it can no longer find. Release the leases
+        (or `serving recover`) first.
+        """
+        if old.model_name != new.model_name or old.stage != new.stage:
+            raise ServingCoordinationError(
+                "Serving scope re-keying may only change target_identity"
+            )
+        if old.target_identity == new.target_identity:
+            return 0
+        if self._lease_count(old) or self._lease_count(new):
+            raise ServingBusyError(
+                "Refusing to re-key a serving scope with outstanding query "
+                "leases; retry once readers have finished or run "
+                "`stel serving recover`"
+            )
+        ledger = self._ref(LEDGER_TABLE)
+
+        def _claimed_count(scope: StateScope) -> int:
+            # `_ensure_row` plants an unclaimed `unpublished` placeholder the
+            # first time any read touches a scope — merely having called
+            # `status()` on the destination is not a collision. Only a row
+            # that has actually been claimed counts as one.
+            found = self._adapter.rows(
+                f"""
+                SELECT COUNT(*) FROM {ledger}
+                WHERE model_name = ? AND stage = ? AND target_identity = ?
+                  AND NOT (status = ? AND publication_id IS NULL)
+                """,
+                [*self._scope_params(scope), STATUS_UNPUBLISHED],
+            )
+            return int(found[0][0]) if found else 0
+
+        # Source first: once the row has moved, the destination is occupied
+        # *because* the migration succeeded, so checking it first would make
+        # the second run of an idempotent command fail.
+        count = _claimed_count(old)
+        if count == 0:
+            return 0
+        if _claimed_count(new) > 0:
+            raise ServingCoordinationError(
+                "Refusing to re-key: the destination serving scope already has "
+                "a published ledger row"
+            )
+        # Clear any placeholder at the destination so the moved row does not
+        # land beside a duplicate for the same scope triple.
+        self._adapter.execute(
+            f"""
+            DELETE FROM {ledger}
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND status = ? AND publication_id IS NULL
+            """,
+            [*self._scope_params(new), STATUS_UNPUBLISHED],
+        )
+        self._adapter.execute(
+            f"""
+            UPDATE {ledger} SET target_identity = ?
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+            """,
+            [new.target_identity, *self._scope_params(old)],
+        )
+        return count
+
     # ─── reads ────────────────────────────────────────────────────────────
 
     def _scope_params(self, scope: StateScope) -> list[Any]:

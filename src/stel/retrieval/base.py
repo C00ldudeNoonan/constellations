@@ -158,11 +158,38 @@ class SafeRetrievalTarget:
 
 @dataclass(frozen=True)
 class StateRetrievalTarget:
+    """Identity of the serving scope for one logical collection (issue #355).
+
+    `descriptor()` keys on the *logical* collection, not the physical one.
+    That is what lets the serving ledger row stay reachable while the physical
+    collection behind it is replaced: a reader resolves the scope from the
+    logical name alone, then follows `active_generation` to the physical
+    collection. Keying on the physical name instead would make the ledger
+    unreadable the moment generations exist — you would have to know the
+    active generation to compute the scope that names it.
+
+    `physical_collection` is retained for artifact reporting only; it is
+    deliberately excluded from the descriptor.
+    """
+
     store_type: str
     routing_identity_fingerprint: str
     physical_collection: str
+    logical_collection: str
 
     def descriptor(self) -> dict[str, str]:
+        return {
+            "store_type": self.store_type,
+            "routing_identity_fingerprint": self.routing_identity_fingerprint,
+            "logical_collection": self.logical_collection,
+        }
+
+    def legacy_descriptor(self) -> dict[str, str]:
+        """The pre-#355 physical-keyed descriptor.
+
+        Only `serving migrate-scope` uses this, to locate rows written under
+        the old identity so they can be rewritten under the new one.
+        """
         return {
             "store_type": self.store_type,
             "routing_identity_fingerprint": self.routing_identity_fingerprint,

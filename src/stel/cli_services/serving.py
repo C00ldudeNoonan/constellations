@@ -23,14 +23,14 @@ if TYPE_CHECKING:
     from ..retrieval import ServingLedgerEntry
 
 
-def resolve_serving_scope(
+def _resolve_serving_scopes(
     project_dir: Path,
     *,
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> tuple[Any, ResolvedProfile]:
-    """Resolve the retrieval-publish state scope for one search index.
+) -> tuple[Any, Any, ResolvedProfile]:
+    """Resolve the current and pre-#355 retrieval-publish scopes for an index.
 
     Domain failures (unknown index, no retrieval config, unavailable store)
     raise ConfigClickError (exit 2); configuration/profile errors propagate for
@@ -61,10 +61,33 @@ def resolve_serving_scope(
         alias=alias,
     )
     logical = model.search.collection or model.name
+    state_target = store.state_descriptor(logical)
     scope = StateScope.for_target_descriptor(
         model.name,
         stage="retrieval_publish",
-        descriptor=store.state_descriptor(logical).descriptor(),
+        descriptor=state_target.descriptor(),
+    )
+    legacy_scope = StateScope.for_target_descriptor(
+        model.name,
+        stage="retrieval_publish",
+        descriptor=state_target.legacy_descriptor(),
+    )
+    return scope, legacy_scope, resolved
+
+
+def resolve_serving_scope(
+    project_dir: Path,
+    *,
+    profiles_dir: Path | None,
+    target: str | None,
+    model_name: str,
+) -> tuple[Any, ResolvedProfile]:
+    """The current (logical-keyed) serving scope for one search index."""
+    scope, _legacy, resolved = _resolve_serving_scopes(
+        project_dir,
+        profiles_dir=profiles_dir,
+        target=target,
+        model_name=model_name,
     )
     return scope, resolved
 
@@ -105,3 +128,42 @@ def serving_recover(
         return ServingCoordinator(adapter).recover(
             scope, owner_terminated=owner_terminated
         )
+
+
+def serving_migrate_scope(
+    project_dir: Path,
+    *,
+    profiles_dir: Path | None,
+    target: str | None,
+    model_name: str,
+) -> dict[str, int | str]:
+    """Move an index's serving scope from the pre-#355 physical-collection key
+    onto the logical-collection key.
+
+    Issue #355 re-keys the retrieval serving scope so the ledger stays
+    readable once a logical collection can have more than one physical
+    generation behind it. Indexes published before that change keep their
+    state and ledger row under the old identity, where nothing looks for it —
+    and an unreachable publication state means the next run re-embeds an index
+    that is already published. This moves both, or reports that there is
+    nothing to move.
+    """
+    from ..retrieval import ServingCoordinator
+
+    scope, legacy_scope, resolved = _resolve_serving_scopes(
+        project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
+    )
+    if scope.target_identity == legacy_scope.target_identity:
+        return {"model": model_name, "state_rows": 0, "ledger_rows": 0}
+    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+        coordinator = ServingCoordinator(adapter)
+        # Ledger first: it is the row that decides whether an index is
+        # considered published at all. If the state move fails after it, a
+        # re-run finds the ledger already moved and finishes the state.
+        ledger_rows = coordinator.rekey_scope(legacy_scope, scope)
+        state_rows = adapter.rekey_state_scope(legacy_scope, scope)
+    return {
+        "model": model_name,
+        "state_rows": state_rows,
+        "ledger_rows": ledger_rows,
+    }

@@ -35,6 +35,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    reject_generation_shaped_collection_name,
     validate_generation_token,
 )
 from .registry import register
@@ -404,7 +405,9 @@ class LanceDBStore(RetrievalStore):
             "target": _identifier_piece(self.target_name),
             "collection": _identifier_piece(logical_name),
         }
-        physical = self._config.collection_template.format(**values)
+        physical = reject_generation_shaped_collection_name(
+            self._config.collection_template.format(**values)
+        )
         if generation is not None:
             # Suffixed only when a generation is asked for, so the unsuffixed
             # name keeps addressing collections published before #355.

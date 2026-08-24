@@ -8,35 +8,44 @@ would ever reclaim them.
 **Why there is no grace period.** The issue asks how long a superseded
 generation should linger and what reclaims it if a publisher dies mid-flight.
 Both answers fall out of the coordination protocol rather than needing a timer
-or a generations table:
+or a generations table: `acquire_publish` refuses while any query lease
+exists, and `acquire_query` refuses while a publisher holds the claim. So
+while the publish lease is held there are *zero* query leases and *no* other
+publisher, by construction — a sweep running under that lease can race
+neither a reader (whichever generation the reader pinned) nor a concurrent
+build creating the next private generation.
 
-- `acquire_publish` refuses while any query lease exists, and `acquire_query`
-  refuses while a publisher holds the claim. So while the publish lease is
-  held there are *zero* query leases, by construction — a sweep running under
-  that claim cannot race a reader, whichever generation the reader pinned.
-- `serving recover` clears every lease before returning, giving the same
-  guarantee from the other direction.
+Holding the lease is therefore the contract, verified rather than trusted:
+`retire_superseded_generations` takes the coordinator and the caller's
+`PublishLease` and aborts if the fence has moved. Running "just after
+recovery" is *not* a safe state on its own — recovery only guarantees zero
+leases at the instant it clears them, and another process may acquire the
+publish lease and start building a new generation while the sweep is listing
+and dropping. A post-recovery sweeper must acquire the lease like any other
+publisher.
 
-A sweep is therefore only ever correct in those two states, and in both of
-them "is anything reading this?" is already answered. The caller is
-responsible for being in one of them; that is the contract of this module.
-
-The active generation is identified by the ledger, so anything else matching
-the generation-suffixed pattern is unreachable and safe to drop.
+**Why prefix matching is safe.** A generation collection is named exactly
+`<base>__g<token>` (1-16 lowercase alphanumerics). That shape is reserved:
+`reject_generation_shaped_collection_name` refuses to resolve any *base*
+collection name ending the same way, so no sibling logical collection can be
+mistaken for a generation of this one. The sweep still matches the complete
+shape — marker plus exact token — never a bare prefix. The active generation
+is identified by the ledger; anything else matching the shape is unreachable
+and safe to drop.
 """
 from __future__ import annotations
 
+import re
+
 from .base import (
+    GENERATION_MARKER,
     RetrievalCapabilityError,
     RetrievalFeature,
     RetrievalStore,
 )
+from .coordination import PublishLease, ServingCoordinator
 
-# Collections built for a generation are named `<base>__g<token>` by
-# `physical_collection(..., generation=...)`. The marker is what keeps the
-# unsuffixed `<base>` — the collection an in-place incremental publish writes,
-# and where every pre-#355 index still lives — out of every candidate set.
-GENERATION_MARKER = "__g"
+_GENERATION_TOKEN_RE = re.compile(r"^[a-z0-9]{1,16}$")
 
 
 def generation_prefix(store: RetrievalStore, logical_collection: str) -> str:
@@ -53,13 +62,18 @@ def superseded_generations(
     """Generation collections for `logical_collection` that nothing can reach.
 
     Excludes the active generation, and never includes the unsuffixed base
-    collection: dropping that would destroy an in-place published index.
+    collection: dropping that would destroy an in-place published index. Only
+    complete generation names — the shared prefix followed by exactly one
+    valid token — are candidates, so a collection that merely shares the
+    prefix without the generation shape is never classified as one.
     """
     prefix = generation_prefix(store, logical_collection)
     return sorted(
         name
         for name in store.list_collections()
-        if name.startswith(prefix) and name != active_collection
+        if name.startswith(prefix)
+        and _GENERATION_TOKEN_RE.fullmatch(name[len(prefix) :])
+        and name != active_collection
     )
 
 
@@ -68,12 +82,16 @@ def retire_superseded_generations(
     *,
     logical_collection: str,
     active_collection: str | None,
+    coordinator: ServingCoordinator,
+    lease: PublishLease,
 ) -> list[str]:
     """Drop every unreachable generation, returning the names retired.
 
-    The caller must hold the publish lease for this scope, or have just
-    recovered it — see the module docstring for why that is what makes the
-    sweep safe. Idempotent: a second run finds nothing.
+    The caller must hold the publish lease for this scope — see the module
+    docstring for why that is what makes the sweep safe — and the lease is
+    verified against the ledger before listing and before every drop, so a
+    reassigned fence aborts the sweep before it can delete a newer
+    publisher's build. Idempotent: a second run finds nothing.
 
     A collection stel does not own is refused by `drop_collection` rather than
     skipped. A foreign table sitting on this prefix means the namespace is not
@@ -85,12 +103,14 @@ def retire_superseded_generations(
             f"Retrieval store '{store.store_type()}' does not build private "
             "generations, so it has none to retire"
         )
+    coordinator.verify_publish(lease)
     retired = []
     for name in superseded_generations(
         store,
         logical_collection=logical_collection,
         active_collection=active_collection,
     ):
+        coordinator.verify_publish(lease)
         if store.drop_collection(name):
             retired.append(name)
     return retired

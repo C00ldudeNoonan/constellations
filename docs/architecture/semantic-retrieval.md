@@ -1325,17 +1325,29 @@ of resolution.
 There is no grace period and no generations table. Both fall out of the
 coordination protocol: `acquire_publish` refuses while any query lease exists,
 and `acquire_query` refuses while a publisher holds the claim, so while the
-publish lease is held there are zero query leases by construction. A sweep
-running under that claim cannot race a reader whichever generation the reader
-pinned. `serving recover` gives the same guarantee from the other direction by
-clearing every lease.
+publish lease is held there are zero query leases and no other publisher, by
+construction. A sweep running under that lease can race neither a reader
+(whichever generation the reader pinned) nor a concurrent build creating the
+next private generation.
 
-A sweep is therefore only correct in those two states, and the caller is
-responsible for being in one. The ledger names the active generation, so
-anything else matching the `<base>__g<token>` pattern is unreachable and safe
-to drop — including a half-built generation left by a publisher that died
-before activating. The unsuffixed base collection carries no marker and is
-never a candidate, because that is where an in-place published index lives.
+Holding the publish lease is therefore the sweep's contract, and it is
+verified rather than trusted: the sweeper passes its lease and the fence is
+checked against the ledger before listing and before every drop. Running
+"just after `serving recover`" is not a safe state on its own — recovery only
+guarantees zero leases at the instant it clears them, and another process may
+acquire the publish lease and start building while a lease-less sweep is
+listing and dropping. A post-recovery sweeper acquires the lease like any
+other publisher.
+
+The ledger names the active generation, so any other collection named exactly
+`<base>__g<token>` (one 1-16 lowercase-alphanumeric token) is unreachable and
+safe to drop — including a half-built generation left by a publisher that
+died before activating. That suffix shape is reserved: name resolution
+refuses any *base* collection name ending in `__g<token>`, so a sibling
+logical collection (say `ctx__garchive` next to `ctx`) can never be mistaken
+for a retired generation and swept. The unsuffixed base collection carries no
+marker and is never a candidate, because that is where an in-place published
+index lives.
 
 Recovery preserves the activation pointer rather than clearing it with the
 generation. It rebuilds the ledger row, and losing the pointer would strand a

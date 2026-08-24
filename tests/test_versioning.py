@@ -488,7 +488,7 @@ def test_llm_execution_only_options_do_not_change_model_code_version(
     ) == compute_model_code_version(model, project, tmp_path, resolved=second)
 
 
-def test_backend_version_changes_model_code_version(
+def test_backend_parser_identity_changes_model_code_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model = ModelConfig(
@@ -500,7 +500,7 @@ def test_backend_version_changes_model_code_version(
     monkeypatch.setattr(
         "stel.versioning.get_backend",
         lambda name: SimpleNamespace(
-            version=lambda: "backend/one",
+            parser_identity=lambda: "parser/one",
             implementation_identity=lambda: "implementation/stable",
         ),
     )
@@ -508,7 +508,7 @@ def test_backend_version_changes_model_code_version(
     monkeypatch.setattr(
         "stel.versioning.get_backend",
         lambda name: SimpleNamespace(
-            version=lambda: "backend/two",
+            parser_identity=lambda: "parser/two",
             implementation_identity=lambda: "implementation/stable",
         ),
     )
@@ -528,7 +528,7 @@ def test_backend_implementation_changes_model_code_version(
     monkeypatch.setattr(
         "stel.versioning.get_backend",
         lambda name: SimpleNamespace(
-            version=lambda: "parser/stable",
+            parser_identity=lambda: None,
             implementation_identity=lambda: "implementation/one",
         ),
     )
@@ -536,12 +536,35 @@ def test_backend_implementation_changes_model_code_version(
     monkeypatch.setattr(
         "stel.versioning.get_backend",
         lambda name: SimpleNamespace(
-            version=lambda: "parser/stable",
+            parser_identity=lambda: None,
             implementation_identity=lambda: "implementation/two",
         ),
     )
 
     assert first != compute_model_code_version(model, project, tmp_path)
+
+
+def test_release_version_does_not_change_model_code_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property issue #363 exists for: a release that touches no
+    backend-reachable source leaves extraction code_version — and with it
+    every document's incremental state — intact. The real json backend is
+    used so the whole identity chain (implementation_identity, parser
+    identity, version) is exercised, with only the reported release moved.
+    """
+    model = ModelConfig(
+        name="raw",
+        source="ref('docs')",
+        extraction=ExtractionConfig(backend="json"),
+    )
+    project = ProjectConfig(name="p")
+    first = compute_model_code_version(model, project, tmp_path)
+    monkeypatch.setattr(
+        "stel.backends.base.distribution_version", lambda: "999.0.0"
+    )
+
+    assert compute_model_code_version(model, project, tmp_path) == first
 
 
 def test_custom_backend_options_are_json_safe_and_runtime_values_are_unchanged(

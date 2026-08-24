@@ -80,6 +80,9 @@ class HtmlBackend(BaseBackend):
     def version(self) -> str:
         return f"beautifulsoup4/{optional_dependency_version('beautifulsoup4')}"
 
+    def parser_identity(self) -> str | None:
+        return self.version()
+
     def supported_formats(self) -> list[str]:
         return [".html", ".htm"]
 

@@ -36,6 +36,10 @@ repository-level `.github/workflows/` directory.
 1. New file in `src/stel/backends/` inheriting from `BaseBackend`.
 2. Decorate the class with `@register`.
 3. Implement `name()`, `supported_formats()`, `extract(path, options)`.
+   If extraction is built on a third-party parsing library, override
+   `version()` to report that library's version and `parser_identity()` to
+   return it as well — a library upgrade must re-key incremental extraction
+   state, and stel's own source digests cannot see it (issue #363).
 4. Register the import in `src/stel/backends/__init__.py` (the side-effect
    import is what triggers `@register`).
 5. Add a synth generator under `src/stel/synth/` if you want to support

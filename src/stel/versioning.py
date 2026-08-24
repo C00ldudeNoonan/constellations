@@ -225,9 +225,14 @@ def compute_model_code_version(
             else canonical_options
         )
         backend = get_backend(backend_name)
+        # version() is row provenance and release-tagged for backends without
+        # a parsing library; hashing it here re-keyed every corpus on every
+        # release (issue #363). Code identity comes from the source digests in
+        # implementation_identity(); third-party parser upgrades invalidate
+        # via parser_identity().
         effective_extraction = {
             "backend": backend_name,
-            "backend_version": backend.version(),
+            "backend_parser": backend.parser_identity(),
             "backend_implementation": backend.implementation_identity(),
             "options": semantic_options,
         }

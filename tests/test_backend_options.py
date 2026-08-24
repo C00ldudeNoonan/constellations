@@ -39,6 +39,48 @@ def test_shipped_backends_expose_distinct_implementation_identities() -> None:
     assert all(identity.startswith("stel/") for identity in identities)
 
 
+def test_implementation_identity_excludes_the_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release that ships no backend-reachable source change must leave
+    every backend identity — and with it `extraction:` state — intact
+    (issue #363)."""
+    before = {
+        name: get_backend(name).implementation_identity()
+        for name in list_backends()
+    }
+    monkeypatch.setattr(
+        "stel.backends.base.distribution_version", lambda: "999.0.0"
+    )
+
+    after = {
+        name: get_backend(name).implementation_identity()
+        for name in list_backends()
+    }
+    assert after == before
+
+
+def test_implementation_identity_covers_transitive_stel_imports() -> None:
+    from stel.backends.base import _dependency_source_digests
+
+    digests = dict(_dependency_source_digests("stel.backends.html_backend"))
+
+    # Direct import of the backend module.
+    assert "stel.backends.base" in digests
+    # Reached only transitively (base imports hashing; html_backend does not).
+    assert "stel.hashing" in digests
+    # The origin module's own digest is a separate payload field, not a dep.
+    assert "stel.backends.html_backend" not in digests
+    assert all(digest is not None for digest in digests.values())
+
+
+def test_parser_identity_reports_libraries_and_only_libraries() -> None:
+    assert get_backend("html").parser_identity() == get_backend("html").version()
+    assert get_backend("pdf").parser_identity() == get_backend("pdf").version()
+    for name in ("json", "markdown", "llm", "email"):
+        assert get_backend(name).parser_identity() is None
+
+
 @pytest.mark.parametrize(
     ("backend", "options"),
     [

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Extraction state now survives releases (issue #363)
+
+- **Backend identity no longer embeds the stel release.**
+  `implementation_identity()` hashes source digests only — the backend class,
+  its module, `BaseBackend`, and every stel module the backend module
+  transitively imports — so upgrading stel re-keys `extraction:` state only
+  when a release actually changes backend-reachable code. Third-party parser
+  upgrades still invalidate, via the new `parser_identity()` (beautifulsoup4
+  for `html`, pypdf for `pdf`); the release-tagged `version()` string remains
+  on extracted rows as provenance but no longer enters `code_version`.
+- **One-time migration cost:** adopting this release changes the identity
+  payload itself, so the first run re-extracts every corpus once (cached
+  provider responses survive — they key on the provider contract identity).
+  After that, extraction state is stable across releases that leave backend
+  code untouched.
+
 ### The concept cloud becomes the star map (issue #345)
 
 - **Concepts are positioned by meaning.** `--embed-model` places each concept

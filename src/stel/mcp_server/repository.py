@@ -44,6 +44,14 @@ class ContextRepository(Protocol):
         """Whether this target opted into storing raw query text (issue #329)."""
         return False
 
+    def warm_up(self) -> None:
+        """Eagerly validate warehouse access at server startup (issue #365).
+
+        A default no-op, so an in-memory or test repository needs no warm-up
+        implementation to satisfy the protocol.
+        """
+        return None
+
 
 class WarehouseContextRepository:
     def __init__(
@@ -65,6 +73,20 @@ class WarehouseContextRepository:
     def query_log_captures_text(self) -> bool:
         config = self._resolved.mcp_query_log
         return config is not None and config.enabled and config.capture_query_text
+
+    def warm_up(self) -> None:
+        """Open and close the warehouse once, exactly as a request would.
+
+        Credentials resolve lazily inside each request's adapter open; under
+        stdio serving a hang or failure there surfaces only as a per-call
+        "timeout" with no diagnostics (issue #365). Warming up at startup
+        makes a broken auth setup fail loudly at boot instead.
+        """
+        with create_adapter(
+            self._resolved.warehouse,
+            project_dir=self._project_dir,
+        ):
+            pass
 
     def log_query(self, row: Mapping[str, Any]) -> None:
         """Append a served query to the log, if this target enabled one.

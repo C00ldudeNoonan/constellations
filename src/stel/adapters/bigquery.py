@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime
@@ -94,6 +95,32 @@ _INSTALL_HINT = (
     "BigQuery support requires google-cloud-bigquery. "
     "Install it with: pip install 'stel[bigquery]'"
 )
+
+
+def _adc_file_path() -> Path | None:
+    """The credentials file google.auth's ADC lookup would load, or None.
+
+    ``GOOGLE_APPLICATION_CREDENTIALS`` wins, then gcloud's documented
+    well-known file (``CLOUDSDK_CONFIG``, else ``%APPDATA%\\gcloud`` on
+    Windows, else ``~/.config/gcloud``). Resolved here — never by asking
+    gcloud — so loading ADC needs no subprocess (issue #365).
+    """
+    explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if explicit:
+        path = Path(explicit)
+        return path if path.is_file() else None
+    config_dir = os.environ.get("CLOUDSDK_CONFIG")
+    if config_dir:
+        gcloud_dir = Path(config_dir)
+    elif os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        gcloud_dir = (
+            Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        ) / "gcloud"
+    else:
+        gcloud_dir = Path.home() / ".config" / "gcloud"
+    path = gcloud_dir / "application_default_credentials.json"
+    return path if path.is_file() else None
 
 
 def _log_publication(
@@ -1033,7 +1060,21 @@ class BigQueryAdapter(WarehouseAdapter):
         else:  # oauth: gcloud Application Default Credentials
             import google.auth
 
-            creds, _ = google.auth.default(scopes=scopes)
+            # google.auth.default() resolves gcloud-SDK user ADC by shelling
+            # out to `gcloud config config-helper` for a project id. Under
+            # `stel mcp serve` that child inherits the MCP stdio pipes and,
+            # on Windows, never exits — hanging the first warehouse call
+            # (issue #365). The discovered project is never used (`project:`
+            # is a required profile field), so load the ADC file directly and
+            # fall back to full discovery only for non-file credential
+            # sources such as the GCE metadata server.
+            adc_file = _adc_file_path()
+            if adc_file is not None:
+                creds, _ = google.auth.load_credentials_from_file(
+                    str(adc_file), scopes=scopes
+                )
+            else:
+                creds, _ = google.auth.default(scopes=scopes)
 
         if cfg.impersonate_service_account:
             from google.auth import impersonated_credentials

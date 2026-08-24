@@ -2517,6 +2517,82 @@ def test_credentials_oauth_reveals_each_value_once(
     assert reveal_count == 3
 
 
+def test_adc_file_path_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from stel.adapters.bigquery import _adc_file_path
+
+    explicit = tmp_path / "explicit-adc.json"
+    explicit.write_text("{}")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(explicit))
+    assert _adc_file_path() == explicit
+
+    # An explicit path that does not exist yields None, so credential
+    # construction falls through to google.auth.default() and raises its
+    # normal, clear error instead of silently using another source.
+    monkeypatch.setenv(
+        "GOOGLE_APPLICATION_CREDENTIALS", str(tmp_path / "missing.json")
+    )
+    assert _adc_file_path() is None
+
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    gcloud_dir = tmp_path / "gcloud-config"
+    gcloud_dir.mkdir()
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(gcloud_dir))
+    assert _adc_file_path() is None
+    well_known = gcloud_dir / "application_default_credentials.json"
+    well_known.write_text("{}")
+    assert _adc_file_path() == well_known
+
+
+def test_credentials_oauth_adc_file_loads_without_gcloud_shellout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """gcloud-SDK user ADC must load with no subprocess: google.auth.default()
+    shells out to `gcloud config config-helper`, and under `stel mcp serve`
+    that child inherits the MCP stdio pipes and hangs on Windows (#365)."""
+    import google.auth
+
+    captured: dict[str, Any] = {}
+    sentinel = object()
+
+    adc = tmp_path / "application_default_credentials.json"
+    adc.write_text("{}")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc))
+
+    def fake_load(path: str, scopes: Any = None) -> tuple[Any, None]:
+        captured["path"] = path
+        captured["scopes"] = scopes
+        return sentinel, None
+
+    def fail_default(scopes: Any = None) -> tuple[Any, None]:
+        raise AssertionError("google.auth.default() must not be reached")
+
+    monkeypatch.setattr(google.auth, "load_credentials_from_file", fake_load)
+    monkeypatch.setattr(google.auth, "default", fail_default)
+
+    assert _adapter()._credentials() is sentinel
+    assert captured["path"] == str(adc)
+    assert list(captured["scopes"]) == _bq_cfg().scopes
+
+
+def test_credentials_oauth_falls_back_to_default_without_adc_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import google.auth
+
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(tmp_path / "no-such-dir"))
+
+    sentinel = object()
+
+    def fake_default(scopes: Any = None) -> tuple[Any, None]:
+        return sentinel, None
+
+    monkeypatch.setattr(google.auth, "default", fake_default)
+    assert _adapter()._credentials() is sentinel
+
+
 def test_missing_oauth_reference_fails_before_sdk_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

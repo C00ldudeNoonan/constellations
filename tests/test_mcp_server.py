@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -67,12 +68,16 @@ class FakeRepository:
         # assert what a served query records without a warehouse.
         self.logged: list[Mapping[str, Any]] = []
         self._capture_query_text = capture_query_text
+        self.warm_ups = 0
 
     def log_query(self, row: Mapping[str, Any]) -> None:
         self.logged.append(row)
 
     def query_log_captures_text(self) -> bool:
         return self._capture_query_text
+
+    def warm_up(self) -> None:
+        self.warm_ups += 1
 
     def read_rows(
         self,
@@ -921,3 +926,48 @@ def test_a_slow_log_write_cannot_time_out_a_served_answer() -> None:
     assert response.error is None
     assert len(response.results) == 1
     assert len(repository.logged) == 1
+
+
+def test_warm_up_delegates_to_repository() -> None:
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        service.warm_up()
+    finally:
+        service.close()
+
+    assert repository.warm_ups == 1
+
+
+def test_serve_stdio_warms_up_before_the_transport_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential problems must fail loudly at boot, not as per-call
+    "timeout" errors once the stdio transport owns the pipes (issue #365)."""
+    from stel.mcp_server import server as server_module
+
+    events: list[str] = []
+
+    class StubService:
+        def warm_up(self) -> None:
+            events.append("warm_up")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class StubApp:
+        def run(self, transport: str) -> None:
+            events.append(f"run:{transport}")
+
+    monkeypatch.setattr(
+        server_module.ContextService,
+        "from_project",
+        classmethod(lambda cls, project_dir, **kwargs: StubService()),
+    )
+    monkeypatch.setattr(
+        server_module, "create_mcp_server", lambda service: StubApp()
+    )
+
+    server_module.serve_stdio(Path("unused-project-dir"))
+
+    assert events == ["warm_up", "run:stdio", "close"]

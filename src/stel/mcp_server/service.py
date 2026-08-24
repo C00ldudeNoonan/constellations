@@ -261,6 +261,15 @@ class ContextService:
     def close(self) -> None:
         self._limiter.close()
 
+    def warm_up(self) -> None:
+        """Resolve warehouse credentials and connectivity before serving.
+
+        Called by `serve_stdio` ahead of the stdio transport so a broken auth
+        setup fails loudly at boot instead of as a per-call "timeout"
+        (issue #365).
+        """
+        self._repository.warm_up()
+
     def list_context_models(
         self,
         request: ListContextModelsRequest,

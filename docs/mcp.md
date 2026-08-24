@@ -120,6 +120,26 @@ assuming ownership of the other's domain.
 For a source checkout, replace the `--with stel[...]` portion with
 `--project C:/path/to/<checkout>/stel`.
 
+### BigQuery with gcloud user credentials
+
+With `method: oauth` (gcloud Application Default Credentials), stel loads the
+ADC file directly and never shells out to `gcloud`, because a `gcloud` child
+process would inherit the MCP stdio pipes and can hang the server on Windows.
+Run `gcloud auth application-default login` once so the ADC file exists. If
+your environment resolves credentials another way, setting
+`GOOGLE_APPLICATION_CREDENTIALS` to the ADC file path in the server's `env`
+block forces the no-subprocess path explicitly:
+
+```json
+"env": {
+  "GOOGLE_APPLICATION_CREDENTIALS": "C:/Users/<user>/AppData/Roaming/gcloud/application_default_credentials.json"
+}
+```
+
+The server also opens the warehouse once at startup, so a broken credential
+setup fails at boot with a real error instead of surfacing as per-call
+`timeout` errors mid-session.
+
 ## Limits and errors
 
 `stel mcp serve --help` lists controls for operation timeout, requests per

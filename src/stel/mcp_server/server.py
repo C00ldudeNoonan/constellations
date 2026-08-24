@@ -126,6 +126,10 @@ def serve_stdio(
         settings=settings,
     )
     try:
+        # Resolve credentials and open the warehouse once before the stdio
+        # transport starts, so auth problems fail loudly at boot rather than
+        # as per-call "timeout" errors mid-session (issue #365).
+        service.warm_up()
         create_mcp_server(service).run(transport="stdio")
     finally:
         service.close()

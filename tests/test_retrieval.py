@@ -27,8 +27,11 @@ from stel.dbt_export import build_dbt_sources
 from stel.manifest import build_manifest
 from stel.profile import resolve_profile
 from stel.retrieval import (
+    CollectionSpec,
+    LanceDBConfig,
     LanceDBStore,
     RetrievalError,
+    RetrievalFeature,
     RetrievalPredicate,
     RetrievalPredicateOperator,
     ServingCoordinator,
@@ -1309,8 +1312,6 @@ def test_online_policy_is_refused_when_the_store_cannot_evolve(
 
 
 def _gen_store(tmp_path: Path) -> Any:
-    from stel.retrieval import LanceDBConfig, LanceDBStore
-
     return LanceDBStore(
         LanceDBConfig(type="lancedb", path=str(tmp_path / "lance")),
         project_name="proj",
@@ -1345,8 +1346,6 @@ def test_generation_yields_a_distinct_private_collection_name(
 
 
 def test_generation_token_charset_is_enforced(tmp_path: Path) -> None:
-    from stel.retrieval import RetrievalError
-
     store = _gen_store(tmp_path)
     # The token crosses into a physical collection name, so it is restricted
     # rather than escaped.
@@ -1358,8 +1357,6 @@ def test_generation_token_charset_is_enforced(tmp_path: Path) -> None:
 def test_generation_suffix_cannot_overflow_the_name_limit(
     tmp_path: Path,
 ) -> None:
-    from stel.retrieval import RetrievalError
-
     store = _gen_store(tmp_path)
     long_logical = "c" * 120
     # Unsuffixed it already fills the budget; the suffix must be rejected
@@ -1369,8 +1366,6 @@ def test_generation_suffix_cannot_overflow_the_name_limit(
 
 
 def test_lancedb_advertises_private_generation_build() -> None:
-    from stel.retrieval import LanceDBStore, RetrievalFeature
-
     assert (
         RetrievalFeature.PRIVATE_GENERATION_BUILD
         in LanceDBStore.capabilities().features
@@ -1380,11 +1375,6 @@ def test_lancedb_advertises_private_generation_build() -> None:
 def test_drop_collection_removes_only_an_owned_existing_collection(
     tmp_path: Path,
 ) -> None:
-    pytest.importorskip("lancedb")
-    import pyarrow as pa
-
-    from stel.retrieval import CollectionSpec
-
     store = _gen_store(tmp_path)
     with store:
         name = store.physical_collection("ctx", generation="a1b2")
@@ -1425,8 +1415,6 @@ def test_drop_collection_refuses_a_collection_stel_does_not_own(
     """A mistyped or externally managed name must not be destroyed here."""
     lancedb = pytest.importorskip("lancedb")
     import pyarrow as pa
-
-    from stel.retrieval import RetrievalError
 
     store = _gen_store(tmp_path)
     with store:

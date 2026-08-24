@@ -233,7 +233,9 @@ def _write_classifier_artifact(
 ) -> None:
     path.mkdir(parents=True, exist_ok=True)
     payload = _classifier_payload(classifier)
-    (path / "model.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+    (path / "model.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
     payload_files = ["model.json"]
     metadata["files"] = ["metadata.json", *payload_files]
     metadata["artifact_files_hash"] = _artifact_files_hash(path, payload_files, classifier)

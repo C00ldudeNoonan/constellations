@@ -216,12 +216,16 @@ def _write_artifact_payload(path: Path, vectorizer: dict[str, Any]) -> list[str]
         "idf": vectorizer["idf"],
         "options": vectorizer["options"],
     }
-    (path / "vocabulary.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+    (path / "vocabulary.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
     return ["vocabulary.json"]
 
 
 def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
-    (path / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    (path / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _read_metadata(path: Path) -> dict[str, Any]:
@@ -250,7 +254,7 @@ def _read_artifact_json(
             "non-symlink file"
         )
     try:
-        payload = json.loads(file_path.read_text())
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as e:
         raise IncompatibleClassicMLArtifactError(
             f"malformed {label} JSON at {artifact_path}: {e}"

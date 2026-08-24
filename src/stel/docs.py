@@ -44,7 +44,7 @@ def generate_docs(
         # Generate the manifest on the fly if missing.
         write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
 
-    manifest = json.loads((target_dir / MANIFEST_FILENAME).read_text())
+    manifest = json.loads((target_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     run_results = _read_run_results(target_dir)
     last_run_by_model = {r["model_name"]: r for r in run_results}
 
@@ -109,7 +109,7 @@ def _jinja_env() -> Environment:
 
 
 def _write(path: Path, template: Any, context: dict[str, Any]) -> int:
-    path.write_text(template.render(**context))
+    path.write_text(template.render(**context), encoding="utf-8")
     return 1
 
 
@@ -117,4 +117,4 @@ def _read_run_results(target_dir: Path) -> list[dict[str, Any]]:
     p = target_dir / RUN_RESULTS_FILENAME
     if not p.exists():
         return []
-    return cast(list[dict[str, Any]], json.loads(p.read_text()).get("results", []))
+    return cast(list[dict[str, Any]], json.loads(p.read_text(encoding="utf-8")).get("results", []))

@@ -554,7 +554,7 @@ def export_concept_cloud(
     )
 
     if dbt_manifest is not None:
-        manifest = json.loads(Path(dbt_manifest).read_text())
+        manifest = json.loads(Path(dbt_manifest).read_text(encoding="utf-8"))
         dag_plane = dag_plane_from_dbt_manifest(manifest)
         source = source_name or default_dbt_source_name(project.name)
         linking_node_id = f"source.{source}.{linking_model}"
@@ -581,7 +581,7 @@ def export_concept_cloud(
         if not manifest_path.exists():
             write_manifest(project_path, target=target,
                            profiles_dir=Path(profiles_dir) if profiles_dir else None)
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         dag_plane, id_by_name = dag_plane_from_stel_manifest(manifest)
         linking_node_id = id_by_name.get(linking_model)
 

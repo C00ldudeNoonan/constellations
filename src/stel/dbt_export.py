@@ -131,7 +131,10 @@ def write_dbt_sources(
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
 
-    output.write_text(yaml.safe_dump(payload, sort_keys=False, default_flow_style=False))
+    output.write_text(
+        yaml.safe_dump(payload, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
     return output
 
 

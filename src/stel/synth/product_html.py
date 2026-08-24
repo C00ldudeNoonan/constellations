@@ -35,7 +35,7 @@ def generate_product_pages(count: int, output_dir: Path, seed: int = 42) -> list
             description=description,
         )
         path = output_dir / f"product_{i:05d}.html"
-        path.write_text(html)
+        path.write_text(html, encoding="utf-8")
         paths.append(path)
     return paths
 

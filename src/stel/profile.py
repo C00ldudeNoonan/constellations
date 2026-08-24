@@ -524,7 +524,7 @@ def _load_profiles_file(
     document: YamlDocument | None = None
     load_error: ProfileError | None = None
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             document = parse_yaml_document(f.read())
     except yaml.YAMLError as e:
         load_error = ProfileError(format_yaml_parse_error(path, e))

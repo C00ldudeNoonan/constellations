@@ -94,7 +94,7 @@ def _write_owner_marker(work_dir: Path) -> None:
     different stel process — can tell a directory still owned by a live run
     apart from one a dead run left behind (#273)."""
     try:
-        (work_dir / _OWNER_MARKER_NAME).write_text(str(os.getpid()))
+        (work_dir / _OWNER_MARKER_NAME).write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         log.debug(
             "failed to write fetch-staging owner marker in %s", work_dir, exc_info=True
@@ -136,7 +136,7 @@ def _fetch_dir_is_live(entry: Path) -> bool:
     failed — both fall back to the age check the caller already made."""
     marker = entry / _OWNER_MARKER_NAME
     try:
-        pid = int(marker.read_text().strip())
+        pid = int(marker.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return False
     return _pid_is_alive(pid)

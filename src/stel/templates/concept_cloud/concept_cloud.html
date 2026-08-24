@@ -276,17 +276,18 @@
     function three() { return window.THREE; }
 
     function makeGlowTexture(THREE) {
-      // A white radial glow: bright core, soft halo. SpriteMaterial's color
-      // tints it per node, so one texture serves every star.
-      const size = 128;
+      // A white halo only — the crisp core is a real sphere, so the sprite
+      // carries just the soft falloff. SpriteMaterial's color tints it per
+      // node; 256px keeps it smooth at the scales bright stars reach.
+      const size = 256;
       const canvas = document.createElement("canvas");
       canvas.width = canvas.height = size;
       const ctx = canvas.getContext("2d");
       const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-      g.addColorStop(0.0, "rgba(255,255,255,1)");
-      g.addColorStop(0.12, "rgba(255,255,255,.95)");
-      g.addColorStop(0.3, "rgba(255,255,255,.32)");
-      g.addColorStop(0.65, "rgba(255,255,255,.07)");
+      g.addColorStop(0.0, "rgba(255,255,255,.85)");
+      g.addColorStop(0.2, "rgba(255,255,255,.35)");
+      g.addColorStop(0.45, "rgba(255,255,255,.12)");
+      g.addColorStop(0.75, "rgba(255,255,255,.03)");
       g.addColorStop(1.0, "rgba(255,255,255,0)");
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, size, size);
@@ -448,22 +449,32 @@
       const glowTexture = THREE ? makeGlowTexture(THREE) : null;
 
       function starObject(n) {
-        // Concepts render as glowing star sprites; the DAG plane keeps the
-        // library's default geometry so ground and sky read differently.
+        // A star is a crisp, self-luminous sphere with a soft halo sprite
+        // behind it. The sphere gives a sharp edge at any zoom (a lone sprite
+        // pixelates as its texture scales) and real depth against the fog;
+        // MeshBasicMaterial is unlit, which is what "self-luminous" means.
+        // The DAG plane keeps the library's default geometry so ground and
+        // sky read differently.
         if (!THREE || n.kind !== "concept") return undefined;
         const group = new THREE.Group();
-        const material = new THREE.SpriteMaterial({
-          map: glowTexture, transparent: true, depthWrite: false,
-          color: conceptColor(n),
+        const color = conceptColor(n);
+        const radius = 1.6 + Math.sqrt(n.frequency) * 0.55;
+        const coreMaterial = new THREE.MeshBasicMaterial({ color });
+        const core = new THREE.Mesh(
+          new THREE.SphereGeometry(radius, 24, 16), coreMaterial);
+        group.add(core);
+        const haloMaterial = new THREE.SpriteMaterial({
+          map: glowTexture, transparent: true, depthWrite: false, color,
         });
-        const star = new THREE.Sprite(material);
-        const scale = 7 + Math.sqrt(n.frequency) * 2.2;
-        star.scale.set(scale, scale, 1);
-        group.add(star);
-        n.__starMaterial = material;
+        const halo = new THREE.Sprite(haloMaterial);
+        const haloScale = radius * 7;
+        halo.scale.set(haloScale, haloScale, 1);
+        group.add(halo);
+        n.__coreMaterial = coreMaterial;
+        n.__starMaterial = haloMaterial;
         if (n.labelled) {
           const label = makeLabelSprite(THREE, n.name);
-          label.position.set(0, -(scale * 0.55 + 3), 0);
+          label.position.set(0, -(radius * 2 + 4), 0);
           group.add(label);
           n.__labelMaterial = label.material;
         }
@@ -488,20 +499,28 @@
           const s = l.source, t = l.target;
           if (l.kind !== "concept" && !lineageMode) return false;
           if (typeof s === "object" && (!nodeVisible(s) || !nodeVisible(t))) return false;
+          // Lineage mode shows every beam faintly — the point of the mode is
+          // seeing the two maps connected, not clicking blind — and the
+          // selected star's beams brighten below. With a selection, only its
+          // beams stay, so the trace is legible.
           return l.kind === "cross"
-            ? (selected ? touching.has(linkKey(l)) : false) : true;
+            ? (selected ? touching.has(linkKey(l)) : true) : true;
         })
         // Constellation lines: faint silver until a star is chosen, then its
         // own constellation brightens and the rest recede.
         .linkOpacity(0.55)
         .linkColor(l => {
-          if (l.kind === "cross") return "#ffcb47";      // amber beam
+          if (l.kind === "cross")
+            // Amber beams: bright when traced from a selected star, embers
+            // otherwise so the ground connection reads without shouting.
+            return selected && touching.has(linkKey(l)) ? "#ffcb47" : "#7a6329";
           if (l.kind === "dag") return "#5d6a7d";        // plane lineage (subdued)
           return selected
             ? (touching.has(linkKey(l)) ? "#cfe3ff" : "#232c3a")
             : "#8fa5c4";
         })
-        .linkWidth(l => l.kind === "cross" ? 2.2
+        .linkWidth(l => l.kind === "cross"
+          ? (selected && touching.has(linkKey(l)) ? 2.2 : 0.5)
           : (l.kind === "concept" ? (selected && touching.has(linkKey(l)) ? 1.6 : 0.7) : 0.8))
         .linkDirectionalArrowLength(l => l.kind === "concept" && l.directed ? 3 : 0)
         .linkDirectionalParticles(l =>
@@ -528,6 +547,7 @@
              .linkDirectionalParticles(Graph.linkDirectionalParticles());
         // ...plus the sprite tints the library does not manage.
         for (const n of nodes) {
+          if (n.__coreMaterial) n.__coreMaterial.color.set(conceptColor(n));
           if (n.__starMaterial) n.__starMaterial.color.set(conceptColor(n));
           if (n.__labelMaterial) {
             const receded = selected && n.id !== selected &&

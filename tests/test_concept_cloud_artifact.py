@@ -203,3 +203,20 @@ def test_render_carries_the_star_motif() -> None:
     assert "makeLabelSprite" in html                      # sky-chart labels
     assert 'backgroundColor("rgba(0,0,0,0)")' in html     # nebula CSS shows through
     assert "window.THREE" in html and "return undefined" in html  # graceful fallback
+    # A star is a crisp sphere core with the halo behind it: a lone sprite
+    # pixelates as its texture scales and reads flat.
+    assert "SphereGeometry" in html and "MeshBasicMaterial" in html
+    assert "__coreMaterial" in html
+
+
+def test_lineage_mode_shows_beams_without_requiring_a_selection() -> None:
+    """The point of lineage mode is seeing the two maps connected. Beams used
+    to draw only for a selected star, so toggling the mode showed nothing
+    until a blind click; now every beam shows faintly and the selected star's
+    brighten."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert "? touching.has(linkKey(l)) : true" in html
+    # Two-state beam color: bright when traced, ember otherwise.
+    assert "#ffcb47" in html and "#7a6329" in html

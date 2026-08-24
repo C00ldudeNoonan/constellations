@@ -443,6 +443,52 @@ def test_project_document_chunk_row_carries_parent_policy_fields_verbatim() -> N
     assert policy_fingerprint(document) == policy_fingerprint(chunk)
 
 
+def test_all_null_optional_columns_need_the_contract_schema_not_inference() -> None:
+    """A projected batch whose rows are all-null in an optional column (every
+    document section-less, so citation_section_path is None throughout) infers
+    a Null-typed column — which either fails with a ComputeError once a later
+    row carries a real value, or quietly materializes and drifts the schema
+    per batch. Constructing with the contract schema from
+    empty_agent_context_frame is the prescribed fix (issue #366); the example
+    transforms demonstrate it.
+    """
+    document = project_document_registry_row(
+        **_registry_kwargs(is_public=True, authorization_resolved=True)
+    )
+
+    def chunk(index: int, sections: list[str] | None) -> dict[str, Any]:
+        return project_document_chunk_row(
+            document,
+            chunk_index=index,
+            text=f"chunk {index}",
+            upstream_unique_id="model.economic_data.document_chunks",
+            invocation_id="invocation-001",
+            chunker_identity="recursive:1000:100",
+            citation_section_path=sections,
+        )
+
+    sectionless = [chunk(0, None), chunk(1, None)]
+
+    # The trap: inference on an all-null slice types the column Null.
+    assert pl.DataFrame(sectionless).schema["citation_section_path"] == pl.Null
+
+    # The fix: the contract schema keeps the declared dtype, and a later batch
+    # with real section paths concatenates cleanly.
+    schema = dict(empty_agent_context_frame(AgentContextGrain.DOCUMENT_CHUNKS).schema)
+    combined = pl.concat(
+        [
+            pl.DataFrame(sectionless, schema=schema),
+            pl.DataFrame([chunk(2, ["Part II", "Item 6"])], schema=schema),
+        ]
+    )
+    assert combined.schema["citation_section_path"] == pl.List(pl.String)
+    assert combined["citation_section_path"].to_list() == [
+        None,
+        None,
+        ["Part II", "Item 6"],
+    ]
+
+
 def test_project_document_chunk_row_citation_defaults_still_satisfy_locator_rule() -> None:
     document = project_document_registry_row(
         **_registry_kwargs(is_public=True, authorization_resolved=True)

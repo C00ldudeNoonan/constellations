@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Example wrappers construct frames from the contract schema (issue #366)
+
+- The `agent_context_from_builtin_pipeline` transforms build their output with
+  an explicit schema from `empty_agent_context_frame(grain).schema` instead of
+  polars inference, and `docs/mcp.md` documents the pattern: a batch that is
+  all-null in an optional column (e.g. `citation_section_path`) otherwise
+  infers a Null-typed column that fails — or quietly drifts the schema — on
+  the first mixed batch.
+
 ### Keyed reference deps: incremental transforms stop reprojecting the corpus (issue #364)
 
 - **`ReferenceDep(name, join_key=...)`** in `IncrementalContract.reference_deps`

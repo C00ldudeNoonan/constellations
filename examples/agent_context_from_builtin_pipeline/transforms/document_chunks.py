@@ -4,8 +4,26 @@ from typing import Any
 
 import polars as pl
 
-from stel.agent_context import project_document_chunk_row
+from stel.agent_context import empty_agent_context_frame, project_document_chunk_row
 from stel.transforms import IncrementalContract, ReferenceDep
+
+# Extra columns this wrapper adds on top of the agent_context/v1 contract.
+_EXTRA_FIELDS: dict[str, pl.DataType] = {
+    "title": pl.String(),
+    "source_key": pl.String(),
+}
+
+
+def _schema() -> dict[str, pl.DataType]:
+    # Always construct with the contract schema, never inference: a batch
+    # whose rows are all-null in an optional column (e.g. every document
+    # section-less, so citation_section_path is None throughout) would
+    # otherwise infer Null for that column — failing with a ComputeError on
+    # the first mixed batch, or quietly drifting the schema (issue #366).
+    return {
+        **dict(empty_agent_context_frame("document_chunks").schema),
+        **_EXTRA_FIELDS,
+    }
 
 
 def declared_incremental_contract(options: dict[str, Any]) -> IncrementalContract:
@@ -61,4 +79,4 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
         # replaced per source document.
         row["source_key"] = str(chunk["source_key"])
         rows.append(row)
-    return pl.DataFrame(rows)
+    return pl.DataFrame(rows, schema=_schema())

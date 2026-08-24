@@ -709,7 +709,9 @@ def _keyed_ref_setup(
     tmp_path: Path, registry: pl.DataFrame
 ) -> tuple[Any, Any]:
     (tmp_path / "transforms").mkdir()
-    (tmp_path / "transforms" / "labeled.py").write_text(_KEYED_REF_TRANSFORM_SOURCE)
+    (tmp_path / "transforms" / "labeled.py").write_text(
+        _KEYED_REF_TRANSFORM_SOURCE, encoding="utf-8"
+    )
     model = _incremental_model(
         "labeled", "transforms.labeled", ["ref('docs')", "ref('registry')"]
     )
@@ -849,7 +851,7 @@ def test_keyless_reference_dep_fingerprints_match_string_form(tmp_path: Path) ->
     for label, source in (("str", _REF_TRANSFORM_SOURCE), ("dep", keyless_source)):
         subdir = tmp_path / label
         (subdir / "transforms").mkdir(parents=True)
-        (subdir / "transforms" / "filtered.py").write_text(source)
+        (subdir / "transforms" / "filtered.py").write_text(source, encoding="utf-8")
         model = _incremental_model(
             "filtered", "transforms.filtered", ["ref('docs')", "ref('vocab')"]
         )

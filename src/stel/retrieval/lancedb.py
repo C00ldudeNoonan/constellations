@@ -413,6 +413,15 @@ class LanceDBStore(RetrievalStore):
             raise RetrievalError("Resolved LanceDB collection name is invalid")
         return physical
 
+    def list_collections(self) -> tuple[str, ...]:
+        db = self._connection()
+        try:
+            return tuple(sorted(db.list_tables().tables))
+        except Exception:
+            raise RetrievalError(
+                "LanceDB operation 'list' failed (code=lancedb_list_failed)"
+            ) from None
+
     def drop_collection(self, name: str) -> bool:
         if not _COLLECTION_RE.fullmatch(name):
             raise RetrievalError("LanceDB collection name is invalid")

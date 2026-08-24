@@ -38,6 +38,10 @@ from stel.retrieval import (
     collection_config_fingerprint,
     create_store,
 )
+from stel.retrieval.retention import (
+    retire_superseded_generations,
+    superseded_generations,
+)
 from stel.runner import RunError, run_project
 
 
@@ -1426,3 +1430,106 @@ def test_drop_collection_refuses_a_collection_stel_does_not_own(
         with pytest.raises(RetrievalError, match="not owned by stel"):
             store.drop_collection("proj__dev__foreign")
         assert "proj__dev__foreign" in foreign.list_tables().tables
+
+
+# ─── generation retirement (issue #355) ─────────────────────────────────────
+
+
+def _make_collection(store: Any, name: str) -> None:
+    store.create_collection(
+        CollectionSpec(
+            logical_name="ctx",
+            physical_name=name,
+            id_field="id",
+            text_fields=("body",),
+            full_text_fields=(),
+            attribute_fields=(),
+            scalar_index_fields=(),
+            display_fields=("body",),
+            vector_field=None,
+            vector_dimensions=None,
+            distance_metric=None,
+            vector_search="exact",
+            config_fingerprint="cfg1",
+            descriptor="{}",
+            legacy_config_fingerprint="legacy1",
+            arrow_schema=pa.schema(
+                [pa.field("id", pa.string()), pa.field("body", pa.string())]
+            ),
+        )
+    )
+
+
+def test_retirement_never_considers_the_unsuffixed_base_collection(
+    tmp_path: Path,
+) -> None:
+    """The base collection is where an in-place published index lives.
+
+    It has no generation marker, so it must never appear as a candidate —
+    dropping it would destroy a working index rather than reclaim garbage.
+    """
+    store = _gen_store(tmp_path)
+    with store:
+        base = store.physical_collection("ctx")
+        _make_collection(store, base)
+        _make_collection(store, store.physical_collection("ctx", generation="a1b2"))
+
+        candidates = superseded_generations(
+            store, logical_collection="ctx", active_collection=None
+        )
+        assert base not in candidates
+        assert candidates == [store.physical_collection("ctx", generation="a1b2")]
+
+
+def test_retirement_spares_the_active_generation(tmp_path: Path) -> None:
+    store = _gen_store(tmp_path)
+    with store:
+        active = store.physical_collection("ctx", generation="a1b2")
+        superseded = store.physical_collection("ctx", generation="c3d4")
+        base = store.physical_collection("ctx")
+        for name in (base, active, superseded):
+            _make_collection(store, name)
+
+        retired = retire_superseded_generations(
+            store, logical_collection="ctx", active_collection=active
+        )
+
+        assert retired == [superseded]
+        remaining = store.list_collections()
+        assert active in remaining and base in remaining
+        assert superseded not in remaining
+
+
+def test_retirement_is_idempotent(tmp_path: Path) -> None:
+    store = _gen_store(tmp_path)
+    with store:
+        active = store.physical_collection("ctx", generation="a1b2")
+        _make_collection(store, active)
+        _make_collection(store, store.physical_collection("ctx", generation="c3d4"))
+
+        first = retire_superseded_generations(
+            store, logical_collection="ctx", active_collection=active
+        )
+        second = retire_superseded_generations(
+            store, logical_collection="ctx", active_collection=active
+        )
+        assert len(first) == 1
+        assert second == []
+
+
+def test_retirement_does_not_reach_another_logical_collection(
+    tmp_path: Path,
+) -> None:
+    """The prefix is per logical collection, so a sweep stays in its lane."""
+    store = _gen_store(tmp_path)
+    with store:
+        mine = store.physical_collection("ctx", generation="a1b2")
+        theirs = store.physical_collection("other", generation="a1b2")
+        _make_collection(store, mine)
+        _make_collection(store, theirs)
+
+        retired = retire_superseded_generations(
+            store, logical_collection="ctx", active_collection=None
+        )
+        assert retired == [mine]
+        assert theirs in store.list_collections()

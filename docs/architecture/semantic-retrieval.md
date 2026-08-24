@@ -1320,6 +1320,29 @@ serving collection, so when that path lands it must preserve the pointer
 instead; otherwise a failed rebuild would drop a still-healthy generation out
 of resolution.
 
+#### Retiring a superseded generation (issue #355)
+
+There is no grace period and no generations table. Both fall out of the
+coordination protocol: `acquire_publish` refuses while any query lease exists,
+and `acquire_query` refuses while a publisher holds the claim, so while the
+publish lease is held there are zero query leases by construction. A sweep
+running under that claim cannot race a reader whichever generation the reader
+pinned. `serving recover` gives the same guarantee from the other direction by
+clearing every lease.
+
+A sweep is therefore only correct in those two states, and the caller is
+responsible for being in one. The ledger names the active generation, so
+anything else matching the `<base>__g<token>` pattern is unreachable and safe
+to drop — including a half-built generation left by a publisher that died
+before activating. The unsuffixed base collection carries no marker and is
+never a candidate, because that is where an in-place published index lives.
+
+Recovery preserves the activation pointer rather than clearing it with the
+generation. It rebuilds the ledger row, and losing the pointer would strand a
+generation-served index: the logical name would fall back to the unsuffixed
+default, which for a generation build holds no data. The scope stays failed
+either way, so this is inert for readers.
+
 This depends on the serving scope being keyed on the *logical* collection.
 Keying it on the physical collection — as it was before #355 — makes
 resolution circular: a reader would need the active generation in order to

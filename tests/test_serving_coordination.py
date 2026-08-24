@@ -1124,3 +1124,32 @@ def test_failure_clears_the_activation_pointer_with_the_generation(
     # rebuild will have to preserve the pointer instead.
     with pytest.raises(ServingNotReadyError):
         coordinator.acquire_query(scope)
+
+
+def test_recover_preserves_the_activation_pointer(coordinator: Any) -> None:
+    """Recovery must not strand a generation-served index.
+
+    It rebuilds the ledger row, so the pointer has to be carried across. The
+    scope stays failed either way — this only keeps the record of which
+    physical collection holds the data, which a republish or a retirement
+    sweep needs to avoid dropping the live generation.
+    """
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+
+    entry = coordinator.recover(scope, owner_terminated=True)
+
+    assert entry.status == STATUS_FAILED
+    assert entry.active_collection == "proj__dev__ctx__ga1b2"
+    # Still unreadable, so preserving the pointer changes nothing for readers.
+    with pytest.raises(ServingNotReadyError):
+        coordinator.acquire_query(scope)

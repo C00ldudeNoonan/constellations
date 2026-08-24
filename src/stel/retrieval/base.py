@@ -375,6 +375,24 @@ class RetrievalStore(ABC):
         activation may later point the logical name at.
         """
 
+    def list_collections(self) -> tuple[str, ...]:
+        """Every physical collection name visible in this store's namespace.
+
+        Used to find generations the serving ledger no longer points at. The
+        names are unfiltered by ownership: `drop_collection` is what refuses a
+        collection stel does not own, and it should stay the single place that
+        decides that.
+        """
+        capabilities = self.capabilities()
+        if RetrievalFeature.PRIVATE_GENERATION_BUILD in capabilities.features:
+            raise RetrievalError(
+                "Retrieval store advertises private_generation_build but does "
+                "not implement list_collections()"
+            )
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot list collections"
+        )
+
     def drop_collection(self, name: str) -> bool:
         """Remove a physical collection, returning whether one was removed.
 

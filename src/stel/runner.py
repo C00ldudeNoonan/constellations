@@ -221,14 +221,6 @@ def run_project(
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )
-    if full_refresh and any(
-        model.search is not None and model.name in set(selected) for model in models
-    ):
-        raise RunError(
-            "--full-refresh is unavailable for search resources until atomic store "
-            "activation and state replacement are implemented by #153"
-        )
-
     dbt_ref_models = sorted(
         model.name
         for model in models
@@ -367,14 +359,6 @@ def build_project(
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )
-    if full_refresh and any(
-        model.search is not None and model.name in set(selected) for model in models
-    ):
-        raise RunError(
-            "--full-refresh is unavailable for search resources until atomic store "
-            "activation and state replacement are implemented by #153"
-        )
-
     dbt_ref_models = sorted(
         model.name
         for model in models
@@ -676,6 +660,7 @@ def _run_model(
             project_dir=project_dir,
             adapter=adapter,
             resolved=resolved,
+            full_refresh=full_refresh,
         )
     elif model.eval is not None:
         result = _run_eval_model(

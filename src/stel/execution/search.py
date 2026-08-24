@@ -10,12 +10,13 @@ DAG scheduling, and result aggregation, and re-exports run_search_model.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import pyarrow as pa
 
@@ -23,6 +24,7 @@ from ..adapters import (
     AdapterError,
     StateRecord,
     StateScope,
+    StateScopeFence,
     WarehouseAdapter,
     WarehouseCapability,
 )
@@ -39,6 +41,7 @@ from ..retrieval import (
     IndexedRow,
     PublishLease,
     RetrievalError,
+    RetrievalFeature,
     ServingCoordinationError,
     ServingCoordinator,
     classify_descriptor_changes,
@@ -47,7 +50,9 @@ from ..retrieval import (
     create_store,
     descriptor_json,
     legacy_collection_config_fingerprint,
+    rebuild_required,
 )
+from ..retrieval.retention import retire_superseded_generations
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
@@ -61,6 +66,7 @@ def run_search_model(
     project_dir: Path,
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
+    full_refresh: bool = False,
 ) -> ModelRunResult:
     search = model.search
     assert search is not None
@@ -111,7 +117,36 @@ def run_search_model(
             batch_size=search.batch_size,
             key_column=search.id_field,
         ) as snapshot:
-            physical = store.physical_collection(logical_collection)
+            # The serving scope is keyed on the logical collection, so it
+            # resolves without knowing which generation is live (issue #355).
+            state_scope = StateScope.for_target_descriptor(
+                model.name,
+                stage="retrieval_publish",
+                descriptor=store.state_descriptor(logical_collection).descriptor(),
+            )
+            # A null activation pointer means the unsuffixed default, which is
+            # what every index published before generations existed uses.
+            active_collection = coordinator.status(state_scope).active_collection
+            default_collection = store.physical_collection(logical_collection)
+            rebuild = _rebuild_requested(
+                model, full_refresh=full_refresh
+            ) or _config_change_forces_rebuild(
+                store,
+                model=model,
+                models_by_name=models_by_name,
+                collection=active_collection or default_collection,
+                upstream_schema=snapshot.schema,
+                store_type=store_config.type,
+                resolved=resolved,
+            )
+            if rebuild:
+                _require_private_generation_build(store, model)
+                generation_token = uuid4().hex[:12]
+                physical = store.physical_collection(
+                    logical_collection, generation=generation_token
+                )
+            else:
+                physical = active_collection or default_collection
             spec = _search_collection_spec(
                 model=model,
                 models_by_name=models_by_name,
@@ -120,15 +155,19 @@ def run_search_model(
                 store_type=store_config.type,
                 resolved=resolved,
             )
-            state_target = store.state_descriptor(logical_collection)
-            state_scope = StateScope.for_target_descriptor(
-                model.name,
-                stage="retrieval_publish",
-                descriptor=state_target.descriptor(),
+            # A rebuild accumulates publication state in its own scope, keyed
+            # on the generation it is building. Writing into the serving scope
+            # would corrupt the state of the generation still serving reads,
+            # and the whole point is that the old one keeps serving until
+            # activation. Activation then moves the scope atomically.
+            publish_scope = (
+                _generation_state_scope(model.name, physical)
+                if rebuild
+                else state_scope
             )
             reconciler = BoundedReconciler(
                 adapter,
-                state_scope,
+                publish_scope,
                 code_version=code_version,
                 page_size=search.batch_size,
             )
@@ -247,7 +286,7 @@ def run_search_model(
                     # gated by the serving ledger.
                     coordinator.verify_publish(publish_lease)
                     adapter.upsert_state(
-                        state_scope,
+                        publish_scope,
                         [
                             StateRecord(
                                 row.record_id, row.input_fingerprint, code_version
@@ -262,9 +301,13 @@ def run_search_model(
                 # Stale discovery streams state pages whose keys no longer
                 # exist upstream, in ascending key order — complete even for
                 # an empty upstream, with residency bounded by one page.
-                stale_pages = reconciler.iter_stale_pages(
-                    upstream_table=upstream,
-                    key_column=search.id_field,
+                stale_pages = (
+                    reconciler.iter_stale_pages(
+                        upstream_table=upstream,
+                        key_column=search.id_field,
+                    )
+                    if not rebuild
+                    else _no_stale_pages()
                 )
                 try:
                     for ordinal, stale_page in enumerate(stale_pages):
@@ -295,7 +338,7 @@ def run_search_model(
                                 "Retrieval store did not return an exact durable "
                                 "delete receipt"
                             )
-                        adapter.delete_state(state_scope, record_ids)
+                        adapter.delete_state(publish_scope, record_ids)
                         deleted += len(record_ids)
                 finally:
                     stale_pages.close()
@@ -318,12 +361,35 @@ def run_search_model(
         coordinator.verify_publish(publish_lease)
         assert active_generation is not None
         assert spec is not None
+        if rebuild:
+            # Activation, in the order the design requires: the state snapshot
+            # is replaced atomically first, fenced on this publication's claim,
+            # and only then does the ledger pointer move. A crash between them
+            # leaves the old generation still named and still serving.
+            _activate_generation(
+                adapter,
+                serving_scope=state_scope,
+                publish_scope=publish_scope,
+                lease=publish_lease,
+                page_size=search.batch_size,
+            )
         coordinator.mark_ready(
             publish_lease,
             active_generation=active_generation,
             config_fingerprint=spec.config_fingerprint,
             counts=(inserted, updated, skipped, deleted),
+            active_collection=physical if rebuild else active_collection,
         )
+        if rebuild:
+            # Only now is the previous generation unreachable. Under the
+            # publish claim there are no query leases, so nothing can be
+            # reading it — see retrieval/retention.py.
+            with store:
+                retire_superseded_generations(
+                    store,
+                    logical_collection=logical_collection,
+                    active_collection=physical,
+                )
     except (AdapterError, RetrievalError, RunError) as error:
         if publish_lease is not None:
             _mark_search_publication_failed(
@@ -331,6 +397,10 @@ def run_search_model(
                 publish_lease,
                 error,
                 counts=(inserted, updated, skipped, deleted),
+                # A rebuild builds where nothing is reading, so a failure
+                # leaves the previous generation intact and still correct.
+                # An in-place publish may have corrupted what it wrote into.
+                active_collection=active_collection if rebuild else None,
             )
         if isinstance(error, RunError):
             raise
@@ -363,12 +433,145 @@ def run_search_model(
     )
 
 
+def _no_stale_pages() -> Generator[Sequence[Any], None, None]:
+    """A rebuild has no stale rows: nothing was ever published into it.
+
+    A generator rather than an empty iterator so it carries the `.close()` the
+    caller's `finally` block calls on the real page stream.
+    """
+    return
+    yield  # pragma: no cover - unreachable, makes this a generator
+
+
+def _activate_generation(
+    adapter: WarehouseAdapter,
+    *,
+    serving_scope: StateScope,
+    publish_scope: StateScope,
+    lease: PublishLease,
+    page_size: int,
+) -> None:
+    """Move a generation's publication state into the serving scope.
+
+    Fenced on this publication's claim, so a publisher that lost authority
+    mid-build cannot overwrite the state of whatever replaced it. Streams the
+    generation's state in pages rather than materializing it: a full index can
+    be millions of rows, and bounded residency is the rule the whole
+    publication path is written to.
+    """
+    fence = StateScopeFence(
+        publication_id=lease.publication_id, fencing_token=lease.fencing_token
+    )
+    with adapter.state_page_reader(publish_scope, page_size=page_size) as reader:
+        adapter.replace_state_scope(
+            serving_scope, _state_batches(reader), fence=fence
+        )
+    # The generation scope has served its purpose; leaving it would accumulate
+    # one dead scope per rebuild.
+    adapter.clear_state(publish_scope)
+
+
+def _state_batches(reader: Any) -> Iterator[Sequence[StateRecord]]:
+    cursor = None
+    while True:
+        page = reader.fetch_page(cursor)
+        if not page.records:
+            return
+        yield [
+            StateRecord(record.record_key, record.input_fingerprint, record.code_version)
+            for record in page.records
+        ]
+        if page.next_cursor is None:
+            return
+        cursor = page.next_cursor
+
+
+def _rebuild_requested(model: ModelConfig, *, full_refresh: bool) -> bool:
+    """Whether the operator asked for a full replacement.
+
+    `materialization: full` states it in the project; `--full-refresh` states
+    it for one run. Neither is inferred — an unannounced full re-embed is the
+    behavior issue #344 rejected.
+    """
+    return full_refresh or model.materialization == "full"
+
+
+def _require_private_generation_build(store: Any, model: ModelConfig) -> None:
+    if (
+        RetrievalFeature.PRIVATE_GENERATION_BUILD
+        not in store.capabilities().features
+    ):
+        raise RunError(
+            f"Search index '{model.name}' needs a full replacement, but "
+            f"retrieval store '{store.store_type()}' cannot build a private "
+            "generation, so the running index cannot be replaced atomically"
+        )
+
+
+def _generation_state_scope(model_name: str, physical_collection: str) -> StateScope:
+    """The publication scope a rebuild accumulates state in.
+
+    Keyed on the physical generation, which is what makes it an independent
+    publication: it is invisible to readers and to the serving ledger until
+    activation moves it into the serving scope.
+    """
+    return StateScope.for_target_descriptor(
+        model_name,
+        stage="retrieval_generation_publish",
+        descriptor={"physical_collection": physical_collection},
+    )
+
+
+def _config_change_forces_rebuild(
+    store: Any,
+    *,
+    model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
+    collection: str,
+    upstream_schema: pa.Schema,
+    store_type: str,
+    resolved: ResolvedProfile,
+) -> bool:
+    """Whether `on_index_change: rebuild` should replace the live collection.
+
+    Only asked under that policy, and answered before a target collection is
+    chosen — the alternative is discovering it after opening a fence on the
+    collection being replaced.
+    """
+    search = model.search
+    assert search is not None
+    if search.on_index_change != "rebuild":
+        return False
+    with store:
+        existing = store.inspect_collection(collection)
+    if existing is None:
+        return False
+    spec = _search_collection_spec(
+        model=model,
+        models_by_name=models_by_name,
+        physical_collection=collection,
+        upstream_schema=upstream_schema,
+        store_type=store_type,
+        resolved=resolved,
+    )
+    if existing.descriptor is None or existing.descriptor == spec.descriptor:
+        return False
+    return bool(
+        rebuild_required(
+            classify_descriptor_changes(
+                json.loads(existing.descriptor), json.loads(spec.descriptor)
+            )
+        )
+    )
+
+
 def _mark_search_publication_failed(
     coordinator: ServingCoordinator,
     lease: PublishLease,
     error: Exception,
     *,
     counts: tuple[int, int, int, int],
+    active_collection: str | None = None,
 ) -> None:
     """Record the failure under a safe code; a stale fence has nothing to record."""
     if isinstance(error, ServingCoordinationError):
@@ -380,7 +583,12 @@ def _mark_search_publication_failed(
     else:
         code = "publication_failed"
     with suppress(ServingCoordinationError):
-        coordinator.mark_failed(lease, safe_error_code=code, counts=counts)
+        coordinator.mark_failed(
+            lease,
+            safe_error_code=code,
+            counts=counts,
+            active_collection=active_collection,
+        )
 
 
 def _search_collection_spec(

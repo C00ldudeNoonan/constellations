@@ -26,6 +26,7 @@ from stel.adapters import (
 )
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.cli import cli
+from stel.cli_services.serving import resolve_serving_scope
 from stel.compiler import (
     validate_project_contract,
     validate_retrieval_capabilities,
@@ -767,13 +768,58 @@ def test_empty_input_creates_typed_empty_collection(tmp_path: Path) -> None:
         assert metadata.schema.field("embedding").type.list_size == 2
 
 
-def test_search_full_refresh_fails_closed(tmp_path: Path) -> None:
+def _store_for(project_dir: Path) -> Any:
+    project, _, _ = load_project(project_dir)
+    resolved = resolve_profile(project, project_dir)
+    assert resolved.retrieval is not None
+    return create_store(
+        resolved.retrieval.stores["primary"],
+        project_name=project.name,
+        target_name=resolved.target_name,
+        alias="primary",
+    )
+
+
+def test_full_refresh_rebuilds_into_a_private_generation_and_activates(
+    tmp_path: Path,
+) -> None:
+    """The whole point of #355: replace a live index without emptying it.
+
+    After a full refresh the logical name must resolve to a *different*
+    physical collection than before, the ledger must point at it, and the
+    superseded one must be gone.
+    """
     _write_project(tmp_path)
     _materialize_upstream(tmp_path, _rows())
+    run_project(tmp_path, select="context_search")
 
-    with pytest.raises(RunError, match="atomic store activation"):
-        run_project(tmp_path, select="context_search", full_refresh=True)
-    assert not (tmp_path / "target" / "lancedb").exists()
+    scope, resolved = resolve_serving_scope(
+        tmp_path, profiles_dir=None, target=None, model_name="context_search"
+    )
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        before = ServingCoordinator(adapter).status(scope)
+    # An in-place publish leaves the pointer null: the unsuffixed default.
+    assert before.active_collection is None
+
+    run_project(tmp_path, select="context_search", full_refresh=True)
+
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        after = ServingCoordinator(adapter).status(scope)
+    assert after.status == "ready"
+    assert after.active_collection is not None
+    assert "__g" in after.active_collection
+
+    store = _store_for(tmp_path)
+    with store:
+        collections = store.list_collections()
+        # Exactly one generation survives; the sweep took the rest.
+        assert sum("__g" in name for name in collections) == 1
+        assert after.active_collection in collections
+        # The new generation actually holds the data — an activation that
+        # pointed at an empty collection would satisfy every check above.
+        rebuilt = store.inspect_collection(after.active_collection)
+    assert rebuilt is not None
+    assert rebuilt.row_count == len(_rows())
 
 
 def test_index_config_change_leaves_existing_collection_untouched(tmp_path: Path) -> None:
@@ -1267,17 +1313,40 @@ def _set_index_change_policy(tmp_path: Path, policy: str) -> None:
     raise AssertionError("fixture no longer declares on_index_change")
 
 
-def test_rebuild_policy_is_refused_while_no_store_can_activate_atomically(
-    tmp_path: Path,
-) -> None:
-    """`rebuild` needs atomic generation activation, which no store advertises.
-    Accepting it would compile a policy that cannot be honored (issue #344)."""
+def test_rebuild_policy_now_compiles(tmp_path: Path) -> None:
+    """LanceDB advertises private_generation_build, so `rebuild` is a policy it
+    can honor — it builds a new generation and activates it (issue #355)."""
     _write_project(tmp_path)
     _set_index_change_policy(tmp_path, "rebuild")
     project, sources, models = load_project(tmp_path)
 
-    with pytest.raises(ConfigError, match="atomic generation activation"):
-        validate_project_contract(project, sources, models, tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+
+
+def test_rebuild_policy_replaces_the_index_on_an_incompatible_change(
+    tmp_path: Path,
+) -> None:
+    """The change that `fail` refuses, `rebuild` absorbs — without a window in
+    which the collection is empty or half-built."""
+    _write_project(tmp_path)
+    _set_index_change_policy(tmp_path, "rebuild")
+    _materialize_upstream(tmp_path, _rows())
+    run_project(tmp_path, select="context_search")
+
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace("metric: cosine", "metric: dot"),
+        encoding="utf-8",
+    )
+    run_project(tmp_path, select="context_search")
+
+    scope, resolved = resolve_serving_scope(
+        tmp_path, profiles_dir=None, target=None, model_name="context_search"
+    )
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        entry = ServingCoordinator(adapter).status(scope)
+    assert entry.status == "ready"
+    assert entry.active_collection is not None and "__g" in entry.active_collection
 
 
 def test_online_policy_compiles_against_a_store_that_advertises_evolution(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -61,6 +62,16 @@ class RetrievalFeature(StrEnum):
     SINGLE_HOST_PUBLISHER_LOCK = "single_host_publisher_lock"
     PROVIDER_ENFORCED_FENCING = "provider_enforced_fencing"
     IMMUTABLE_GENERATION_ACTIVATION = "immutable_generation_activation"
+    # Private generation build (issue #355). The store can create a collection
+    # under a caller-chosen physical name that receives no production queries,
+    # and drop one later. Deliberately weaker than
+    # IMMUTABLE_GENERATION_ACTIVATION: with the active generation resolved
+    # through the warehouse-owned serving ledger, the store is never asked to
+    # swap anything, so it needs no alias primitive and no conditional write.
+    # The swap is a fenced warehouse row update; the store only builds and
+    # drops. A store with a fixed collection namespace cannot do even this,
+    # which is what the flag exists to catch.
+    PRIVATE_GENERATION_BUILD = "private_generation_build"
 
 
 PUBLISHER_FENCING_FEATURES = frozenset(
@@ -150,6 +161,23 @@ class RetrievalCapabilities:
         )
 
 
+_GENERATION_RE = re.compile(r"^[a-z0-9]{1,16}$")
+
+
+def validate_generation_token(value: str) -> str:
+    """Validate a generation token before it is rendered into a collection name.
+
+    Deliberately narrow: the token crosses into a physical collection name, so
+    it is restricted to lowercase alphanumerics rather than merely escaped.
+    """
+    if not _GENERATION_RE.fullmatch(value):
+        raise RetrievalError(
+            "Retrieval generation token must be 1-16 lowercase alphanumeric "
+            "characters"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class SafeRetrievalTarget:
     store_type: str
@@ -158,11 +186,38 @@ class SafeRetrievalTarget:
 
 @dataclass(frozen=True)
 class StateRetrievalTarget:
+    """Identity of the serving scope for one logical collection (issue #355).
+
+    `descriptor()` keys on the *logical* collection, not the physical one.
+    That is what lets the serving ledger row stay reachable while the physical
+    collection behind it is replaced: a reader resolves the scope from the
+    logical name alone, then follows `active_generation` to the physical
+    collection. Keying on the physical name instead would make the ledger
+    unreadable the moment generations exist — you would have to know the
+    active generation to compute the scope that names it.
+
+    `physical_collection` is retained for artifact reporting only; it is
+    deliberately excluded from the descriptor.
+    """
+
     store_type: str
     routing_identity_fingerprint: str
     physical_collection: str
+    logical_collection: str
 
     def descriptor(self) -> dict[str, str]:
+        return {
+            "store_type": self.store_type,
+            "routing_identity_fingerprint": self.routing_identity_fingerprint,
+            "logical_collection": self.logical_collection,
+        }
+
+    def legacy_descriptor(self) -> dict[str, str]:
+        """The pre-#355 physical-keyed descriptor.
+
+        Only `serving migrate-scope` uses this, to locate rows written under
+        the old identity so they can be rewritten under the new one.
+        """
         return {
             "store_type": self.store_type,
             "routing_identity_fingerprint": self.routing_identity_fingerprint,
@@ -308,7 +363,35 @@ class RetrievalStore(ABC):
     def state_descriptor(self, collection: str) -> StateRetrievalTarget: ...
 
     @abstractmethod
-    def physical_collection(self, logical_name: str) -> str: ...
+    def physical_collection(
+        self, logical_name: str, *, generation: str | None = None
+    ) -> str:
+        """The physical collection backing `logical_name`.
+
+        With `generation=None` this must return the name used before issue
+        #355 existed, unchanged — that is the collection every already
+        published index still lives in, and renaming it would strand the data.
+        A generation token names a distinct, privately built collection that
+        activation may later point the logical name at.
+        """
+
+    def drop_collection(self, name: str) -> bool:
+        """Remove a physical collection, returning whether one was removed.
+
+        Used to retire a superseded generation and to clean up a private build
+        that failed before activation. Never called on the active generation;
+        the caller resolves that through the serving ledger first.
+        """
+        del name
+        capabilities = self.capabilities()
+        if RetrievalFeature.PRIVATE_GENERATION_BUILD in capabilities.features:
+            raise RetrievalError(
+                "Retrieval store advertises private_generation_build but does "
+                "not implement drop_collection()"
+            )
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot drop collections"
+        )
 
     @abstractmethod
     def inspect_collection(self, name: str) -> CollectionMetadata | None: ...

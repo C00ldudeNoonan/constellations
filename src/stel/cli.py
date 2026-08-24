@@ -1776,6 +1776,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"status:            {entry.status}")
     click.echo(f"fencing_token:     {entry.fencing_token}")
     click.echo(f"active_generation: {entry.active_generation or '-'}")
+    click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
     click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
     click.echo(f"query_leases:      {entry.query_leases}")
     click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")
@@ -1825,6 +1826,46 @@ def serving_recover(
     click.echo(
         f"Recovered serving scope for '{model_name}': status={entry.status}, "
         f"fencing_token={entry.fencing_token}. Re-run `stel run` to publish."
+    )
+
+
+@serving.command("migrate-scope")
+@click.argument("model_name")
+@_project_context_options
+@click.pass_context
+def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
+    """Move a search index's serving scope onto its logical-collection key.
+
+    Issue #355 re-keys the retrieval serving scope from the physical
+    collection to the logical one, so the ledger stays readable once a
+    logical collection can have several physical generations behind it. An
+    index published before that change keeps its ledger row and publication
+    state under the old key, where nothing looks for it — and stel treats an
+    index with unreachable state as unpublished, which means re-embedding it.
+
+    Run this once per affected index. It is idempotent: a second run reports
+    zero rows moved.
+    """
+    from .cli_services.serving import serving_migrate_scope as _migrate
+    from .retrieval import ServingCoordinationError
+
+    try:
+        result = _migrate(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, ServingCoordinationError) as e:
+        raise click.ClickException(str(e)) from e
+    if not result["state_rows"] and not result["ledger_rows"]:
+        click.echo(f"Nothing to migrate for '{model_name}'; scope is already current.")
+        return
+    click.echo(
+        f"Migrated serving scope for '{model_name}': "
+        f"ledger_rows={result['ledger_rows']} state_rows={result['state_rows']}"
     )
 
 

@@ -1497,6 +1497,87 @@ to see the plan first."""
     def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
         """Remove state rows for `record_keys` within exactly `scope`."""
 
+    def table_column_names(self, table: str) -> frozenset[str] | None:
+        """Lowercased column names of a stel-owned table, None if it is absent.
+
+        Used to add a column to a persisted table that predates it: the
+        serving tables are created with CREATE TABLE IF NOT EXISTS, which is
+        silently a no-op against an existing table with an older schema.
+        """
+        columns = self._state_columns(table)
+        if columns is None:
+            return None
+        return frozenset(str(name).lower() for name, _type, _nullable in columns)
+
+    def _state_columns(
+        self, table: str
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' cannot introspect "
+            "table columns"
+        )
+
+    # ─── serving scope re-keying (issue #355) ─────────────────────────────
+
+    def rekey_state_scope(self, old: StateScope, new: StateScope) -> int:
+        """Move every state row from `old` to `new`, returning rows moved.
+
+        Issue #355 re-keys the retrieval serving scope from the physical
+        collection to the logical one, which changes `target_identity` for
+        indexes published before that change. Their state is otherwise
+        unreachable — and unreachable publication state means the next run
+        treats a published index as new and re-embeds it.
+
+        Refuses rather than merges when `new` already holds rows: a collision
+        means two distinct publications resolved to one identity, and picking
+        a winner here would silently discard one of them. Idempotent — a
+        second call finds nothing under `old` and reports zero.
+        """
+        if old.model_name != new.model_name or old.stage != new.stage:
+            raise AdapterError(
+                "State scope re-keying may only change target_identity"
+            )
+        if old.target_identity == new.target_identity:
+            return 0
+        table = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+
+        def _count(scope: StateScope) -> int:
+            # The state table spells StateScope.stage as `state_scope`.
+            found = self.rows(
+                f"""
+                SELECT COUNT(*) FROM {table}
+                WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+                """,
+                [scope.model_name, scope.stage, scope.target_identity],
+            )
+            return int(found[0][0]) if found else 0
+
+        # Source first. After a completed migration the destination holds the
+        # moved rows and the source is empty, which is success, not a
+        # collision — checking the destination first would make the second run
+        # of an idempotent command fail.
+        count = _count(old)
+        if count == 0:
+            return 0
+        if _count(new) > 0:
+            raise AdapterError(
+                "Refusing to re-key state: the destination scope already holds "
+                "rows. Resolve the collision before migrating."
+            )
+        self.execute(
+            f"""
+            UPDATE {table} SET target_identity = ?
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+            """,
+            [
+                new.target_identity,
+                old.model_name,
+                old.stage,
+                old.target_identity,
+            ],
+        )
+        return count
+
     # ─── paged state reconciliation (issue #153) ──────────────────────────
 
     def fetch_state_subset(

@@ -16,6 +16,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    validate_generation_token,
 )
 from .coordination import (
     PublishLease,
@@ -91,4 +92,5 @@ __all__ = [
     "rebuild_required",
     "semantic_search_config",
     "store_class",
+    "validate_generation_token",
 ]

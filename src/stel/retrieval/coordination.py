@@ -79,6 +79,10 @@ class ServingLedgerEntry:
     expected_code_version: str | None
     config_fingerprint: str | None
     active_generation: str | None
+    # The physical collection the logical name currently resolves to (issue
+    # #355). None means the unsuffixed default, which is what every row
+    # written before generations existed means.
+    active_collection: str | None
     safe_error_code: str | None
     rows_inserted: int
     rows_updated: int
@@ -104,6 +108,9 @@ class QueryLease:
     lease_id: str
     fencing_token: int
     pinned_generation: str
+    # Resolved at acquire time so a reader keeps querying the collection its
+    # lease pinned even if activation moves the pointer underneath it.
+    pinned_collection: str | None
     config_fingerprint: str
 
 
@@ -126,6 +133,7 @@ class ServingCoordinator:
     def __init__(self, adapter: WarehouseAdapter) -> None:
         self._adapter = adapter
         self._ensure_tables()
+        self._ensure_ledger_columns()
 
     # ─── table management ─────────────────────────────────────────────────
 
@@ -150,6 +158,7 @@ class ServingCoordinator:
                 expected_code_version STRING,
                 config_fingerprint STRING,
                 active_generation STRING,
+                active_collection STRING,
                 safe_error_code STRING,
                 rows_inserted BIGINT NOT NULL,
                 rows_updated BIGINT NOT NULL,
@@ -173,6 +182,20 @@ class ServingCoordinator:
                 acquired_at TIMESTAMP NOT NULL
             )
             """
+        )
+
+    def _ensure_ledger_columns(self) -> None:
+        """Add `active_collection` to a ledger created before issue #355.
+
+        `_ensure_tables` uses CREATE TABLE IF NOT EXISTS, which does nothing
+        to an existing table, so a ledger written by an earlier version would
+        otherwise fail every statement naming the new column.
+        """
+        columns = self._adapter.table_column_names(LEDGER_TABLE)
+        if columns is None or "active_collection" in columns:
+            return
+        self._adapter.execute(
+            f"ALTER TABLE {self._ref(LEDGER_TABLE)} ADD COLUMN active_collection STRING"
         )
 
     def _ensure_row(self, scope: StateScope) -> None:
@@ -226,6 +249,77 @@ class ServingCoordinator:
             ],
         )
 
+    # ─── scope re-keying (issue #355) ─────────────────────────────────────
+
+    def rekey_scope(self, old: StateScope, new: StateScope) -> int:
+        """Move the ledger row for `old` onto `new`, returning rows moved.
+
+        Companion to `WarehouseAdapter.rekey_state_scope` for the two tables
+        this class owns. Refused while any query lease is outstanding on
+        either scope: a lease pins a generation under an identity that is
+        about to stop existing, and rewriting it would leave the holder
+        validating against a row it can no longer find. Release the leases
+        (or `serving recover`) first.
+        """
+        if old.model_name != new.model_name or old.stage != new.stage:
+            raise ServingCoordinationError(
+                "Serving scope re-keying may only change target_identity"
+            )
+        if old.target_identity == new.target_identity:
+            return 0
+        if self._lease_count(old) or self._lease_count(new):
+            raise ServingBusyError(
+                "Refusing to re-key a serving scope with outstanding query "
+                "leases; retry once readers have finished or run "
+                "`stel serving recover`"
+            )
+        ledger = self._ref(LEDGER_TABLE)
+
+        def _claimed_count(scope: StateScope) -> int:
+            # `_ensure_row` plants an unclaimed `unpublished` placeholder the
+            # first time any read touches a scope — merely having called
+            # `status()` on the destination is not a collision. Only a row
+            # that has actually been claimed counts as one.
+            found = self._adapter.rows(
+                f"""
+                SELECT COUNT(*) FROM {ledger}
+                WHERE model_name = ? AND stage = ? AND target_identity = ?
+                  AND NOT (status = ? AND publication_id IS NULL)
+                """,
+                [*self._scope_params(scope), STATUS_UNPUBLISHED],
+            )
+            return int(found[0][0]) if found else 0
+
+        # Source first: once the row has moved, the destination is occupied
+        # *because* the migration succeeded, so checking it first would make
+        # the second run of an idempotent command fail.
+        count = _claimed_count(old)
+        if count == 0:
+            return 0
+        if _claimed_count(new) > 0:
+            raise ServingCoordinationError(
+                "Refusing to re-key: the destination serving scope already has "
+                "a published ledger row"
+            )
+        # Clear any placeholder at the destination so the moved row does not
+        # land beside a duplicate for the same scope triple.
+        self._adapter.execute(
+            f"""
+            DELETE FROM {ledger}
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND status = ? AND publication_id IS NULL
+            """,
+            [*self._scope_params(new), STATUS_UNPUBLISHED],
+        )
+        self._adapter.execute(
+            f"""
+            UPDATE {ledger} SET target_identity = ?
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+            """,
+            [new.target_identity, *self._scope_params(old)],
+        )
+        return count
+
     # ─── reads ────────────────────────────────────────────────────────────
 
     def _scope_params(self, scope: StateScope) -> list[Any]:
@@ -236,7 +330,8 @@ class ServingCoordinator:
             f"""
             SELECT fencing_token, status, publication_id, expected_code_version,
                    config_fingerprint, active_generation, safe_error_code,
-                   rows_inserted, rows_updated, rows_skipped, rows_deleted
+                   rows_inserted, rows_updated, rows_skipped, rows_deleted,
+                   active_collection
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -271,6 +366,7 @@ class ServingCoordinator:
                 expected_code_version=None,
                 config_fingerprint=None,
                 active_generation=None,
+                active_collection=None,
                 safe_error_code=None,
                 rows_inserted=0,
                 rows_updated=0,
@@ -285,6 +381,7 @@ class ServingCoordinator:
             expected_code_version=None if row[3] is None else str(row[3]),
             config_fingerprint=None if row[4] is None else str(row[4]),
             active_generation=None if row[5] is None else str(row[5]),
+            active_collection=None if row[11] is None else str(row[11]),
             safe_error_code=None if row[6] is None else str(row[6]),
             rows_inserted=int(row[7]),
             rows_updated=int(row[8]),
@@ -379,12 +476,14 @@ class ServingCoordinator:
         active_generation: str | None,
         safe_error_code: str | None,
         counts: tuple[int, int, int, int],
+        active_collection: str | None = None,
     ) -> None:
         inserted, updated, skipped, deleted = counts
         self._adapter.execute(
             f"""
             UPDATE {self._ref(LEDGER_TABLE)}
-            SET status = ?, active_generation = ?, safe_error_code = ?,
+            SET status = ?, active_generation = ?, active_collection = ?,
+                safe_error_code = ?,
                 rows_inserted = ?, rows_updated = ?, rows_skipped = ?,
                 rows_deleted = ?, publication_id = NULL,
                 completed_at = CURRENT_TIMESTAMP
@@ -394,6 +493,7 @@ class ServingCoordinator:
             [
                 status,
                 active_generation,
+                active_collection,
                 safe_error_code,
                 inserted,
                 updated,
@@ -422,8 +522,15 @@ class ServingCoordinator:
         active_generation: str,
         config_fingerprint: str,
         counts: tuple[int, int, int, int],
+        active_collection: str | None = None,
     ) -> None:
-        """Activate a generation, conditional on the fence and expected config."""
+        """Activate a generation, conditional on the fence and expected config.
+
+        `active_collection` is the physical collection the logical name should
+        resolve to from now on (issue #355) — this is the atomic activation
+        itself, a fenced warehouse row update. None keeps the pre-generation
+        meaning: resolve to the unsuffixed default.
+        """
         if not active_generation:
             raise ServingCoordinationError("Ready activation requires a physical generation")
         row = self._read_row(lease.scope)
@@ -439,6 +546,7 @@ class ServingCoordinator:
             lease,
             status=STATUS_READY,
             active_generation=active_generation,
+            active_collection=active_collection,
             safe_error_code=None,
             counts=counts,
         )
@@ -454,7 +562,14 @@ class ServingCoordinator:
 
         An in-place incremental publish that failed midway may have mutated
         the previously ready generation, so failure always clears the active
-        generation rather than reverting to it.
+        generation rather than reverting to it. The activation pointer is
+        cleared with it, which is safe only because a failed row is refused by
+        `acquire_query` — nothing can follow a stale pointer.
+
+        A private-generation rebuild (issue #355) does not mutate the serving
+        collection, so when that path lands its failure handling must preserve
+        the pointer instead of clearing it; otherwise a failed rebuild would
+        drop the still-healthy previous generation out of resolution.
         """
         self._finish(
             lease,
@@ -490,6 +605,7 @@ class ServingCoordinator:
             )
         fencing_token = int(row[0])
         pinned_generation = str(row[5])
+        pinned_collection = None if row[11] is None else str(row[11])
         config_fingerprint = "" if row[4] is None else str(row[4])
         lease_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
@@ -525,6 +641,7 @@ class ServingCoordinator:
             lease_id=lease_id,
             fencing_token=fencing_token,
             pinned_generation=pinned_generation,
+            pinned_collection=pinned_collection,
             config_fingerprint=config_fingerprint,
         )
         held = self._adapter.rows(

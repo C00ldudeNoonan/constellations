@@ -329,7 +329,6 @@ def search(
         store_type=store_config.type,
     )
     logical_collection = search_config.collection or model.name
-    physical_collection = store.physical_collection(logical_collection)
     state_scope = StateScope.for_target_descriptor(
         model.name,
         stage="retrieval_publish",
@@ -354,6 +353,15 @@ def search(
                     models_by_name,
                     request,
                     resolved=resolved,
+                )
+                # Follow the ledger's activation pointer (issue #355) rather
+                # than recomputing the name: the logical collection resolves
+                # to whichever generation the lease pinned. A null pointer is
+                # every index published before generations existed, and means
+                # the unsuffixed default.
+                physical_collection = (
+                    lease.pinned_collection
+                    or store.physical_collection(logical_collection)
                 )
                 with store:
                     metadata = store.inspect_collection(physical_collection)

@@ -50,6 +50,6 @@ def generate_posts(count: int, output_dir: Path, seed: int = 42) -> list[Path]:
             f"\n{body}\n"
         )
         path = output_dir / f"post_{i:05d}.md"
-        path.write_text(md)
+        path.write_text(md, encoding="utf-8")
         paths.append(path)
     return paths

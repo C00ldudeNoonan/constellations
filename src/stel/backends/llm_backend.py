@@ -204,7 +204,7 @@ class LLMBackend(BaseBackend):
             call_options["timeout_seconds"] = options["timeout_seconds"]
 
         fields, usage = extract_fields_with_usage(
-            path.read_text(),
+            path.read_text(encoding="utf-8"),
             fields_spec=fields_spec,
             provider=provider_name,
             model=model,
@@ -399,7 +399,7 @@ class LLMBackend(BaseBackend):
             try:
                 if budget is not None:
                     budget.check_file_bytes(path.stat().st_size)
-                text = path.read_text()
+                text = path.read_text(encoding="utf-8")
             except BudgetExceededError:
                 raise
             except Exception as e:

@@ -938,7 +938,9 @@ def _write_matrix_artifact(
     model_payload: dict[str, Any],
 ) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    (path / "model.json").write_text(json.dumps(model_payload, indent=2, sort_keys=True))
+    (path / "model.json").write_text(
+        json.dumps(model_payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
     payload_files = ["model.json"]
     metadata["files"] = ["metadata.json", *payload_files]
     metadata["artifact_files_hash"] = _artifact_files_hash(path, payload_files, model_payload)

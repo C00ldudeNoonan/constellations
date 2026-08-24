@@ -119,3 +119,44 @@ and exclude unrelated resolution churn.
   mechanics.
 - Keep `dbt` and `stel` lowercase, including at the start of a sentence.
   Write `dbt Labs` for the company.
+
+### Python standards
+
+These are enforced by review, not by ruff, so they need stating. Where a rule
+has a standing exception in this repository, the exception is named — treat an
+unnamed deviation as a defect.
+
+- **Look before you leap.** Check conditions rather than catching exceptions
+  for control flow: membership tests over `except KeyError`, `.exists()`
+  before `.resolve()`. Exceptions belong at three places only — an error
+  boundary (CLI, MCP, runner), wrapping a third-party call that offers no
+  alternative, and adding context before re-raising. The provider and store
+  layers wrap broad `except Exception` deliberately: the security invariants
+  above require that native exception text never reach logs or artifacts, so
+  those handlers re-raise a sanitized error rather than swallowing one.
+- **Always pass `encoding="utf-8"` to text I/O.** `read_text()`,
+  `write_text()`, and text-mode `open()` otherwise use the platform locale,
+  which is not UTF-8 on Windows — the same file then reads differently on two
+  developers' machines, and a non-ASCII character in project YAML, a source
+  document, or a manifest becomes a decode failure that reproduces nowhere
+  else. Binary handles take no encoding.
+- **Use `pathlib`, not `os.path`** — with one deliberate exception:
+  `os.path.abspath` is used where normalization must stay *lexical*, because
+  `Path.resolve()` follows symlinks and the source-discovery invariants above
+  require not following them. Keep that reasoning at the call site.
+- **Imports at module level.** Inline imports are legitimate only for lazily
+  loading an optional dependency (see the extras rule above), breaking a
+  circular import, or `TYPE_CHECKING`. Modules that import lazily by design —
+  `cli_services/*`, the CLI command bodies — say so in their docstring; follow
+  the local convention rather than hoisting those.
+- **Prefer required parameters to defaults.** A default silently encodes an
+  assumption, and adding one to an existing signature does not fail any
+  existing call site. Give a parameter a default only when the default is
+  right for essentially every caller; when a caller passing the wrong value
+  would be a silent bug, make it required so the decision is visible at the
+  call site.
+- **One canonical import path.** Do not re-export a symbol from a package
+  `__init__` unless something actually imports it from there.
+- **Four levels of indentation maximum**; extract a helper instead. Properties
+  and magic methods stay O(1) — anything doing I/O or iteration gets an
+  explicit method name.

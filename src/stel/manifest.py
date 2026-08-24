@@ -119,7 +119,7 @@ def write_manifest(
             build_manifest(project_dir, target=target, profiles_dir=profiles_dir),
             indent=2,
         )
-    )
+    , encoding="utf-8")
     return out
 
 
@@ -241,7 +241,7 @@ def write_run_results(
         test_failures=test_failures,
     )
     out = target_dir / RUN_RESULTS_FILENAME
-    out.write_text(json.dumps(payload, indent=2))
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return out
 
 
@@ -639,7 +639,7 @@ def read_state_code_versions(state_path: Path) -> dict[str, str]:
             "(or its directory) written by a previous `compile` or `run`."
         )
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         raise StateError(f"{path} is not valid JSON: {e}") from e
     models = data.get("models")

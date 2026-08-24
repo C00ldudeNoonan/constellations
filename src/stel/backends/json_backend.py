@@ -19,7 +19,7 @@ class JsonBackend(BaseBackend):
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             data = json.load(f)
 
         if not isinstance(data, dict):

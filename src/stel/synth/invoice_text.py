@@ -60,6 +60,6 @@ def generate_invoice_texts(count: int, output_dir: Path, seed: int = 42) -> list
         )
 
         path = output_dir / f"invoice_{i:05d}.txt"
-        path.write_text(body)
+        path.write_text(body, encoding="utf-8")
         paths.append(path)
     return paths

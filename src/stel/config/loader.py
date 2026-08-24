@@ -562,7 +562,7 @@ def _parse_yaml_with_document[T: BaseModel](
     document: YamlDocument | None = None
     load_error: ConfigError | None = None
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             document = parse_yaml_document(f.read())
     except yaml.YAMLError as e:
         load_error = ConfigError(format_yaml_parse_error(path, e))

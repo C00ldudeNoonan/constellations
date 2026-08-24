@@ -36,7 +36,7 @@ def generate_support_tickets(count: int, output_dir: Path, seed: int = 42) -> li
     for i in range(count):
         ticket = _make_ticket(fake, rng, i, now)
         path = output_dir / f"ticket_{i:05d}.json"
-        path.write_text(json.dumps(ticket, indent=2, default=str))
+        path.write_text(json.dumps(ticket, indent=2, default=str), encoding="utf-8")
         paths.append(path)
     return paths
 

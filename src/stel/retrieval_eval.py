@@ -429,5 +429,5 @@ def write_retrieval_eval_artifact(
     target_dir.mkdir(parents=True, exist_ok=True)
     out = target_dir / RETRIEVAL_EVAL_FILENAME
     payload = build_retrieval_eval_artifact(project, results)
-    out.write_text(json.dumps(payload, indent=2))
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return out

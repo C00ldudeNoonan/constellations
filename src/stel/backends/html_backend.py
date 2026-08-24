@@ -86,7 +86,7 @@ class HtmlBackend(BaseBackend):
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
         parser = options.get("parser", "html.parser")
-        soup = _bs4().BeautifulSoup(path.read_text(), parser)
+        soup = _bs4().BeautifulSoup(path.read_text(encoding="utf-8"), parser)
 
         warnings: list[str] = []
         fields: dict[str, Any] = {}

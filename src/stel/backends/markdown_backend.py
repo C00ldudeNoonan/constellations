@@ -31,7 +31,7 @@ class MarkdownBackend(BaseBackend):
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         warnings: list[str] = []
         frontmatter, body = self._split_frontmatter(content, warnings)
 

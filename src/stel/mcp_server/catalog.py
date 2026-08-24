@@ -239,7 +239,7 @@ def _read_json(path: Path, *, required: bool) -> Mapping[str, Any] | None:
             )
         return None
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raise ArtifactCatalogError(f"The {path.name} artifact is not readable JSON") from None
     if not isinstance(value, dict):

@@ -383,7 +383,10 @@ def init(name: str, template: str) -> None:
     for filename in (PROJECT_FILENAME, PROFILES_FILENAME):
         path = target / filename
         if path.exists():
-            path.write_text(path.read_text().replace("__PROJECT_NAME__", name))
+            path.write_text(
+                path.read_text(encoding="utf-8").replace("__PROJECT_NAME__", name),
+                encoding="utf-8",
+            )
 
     click.echo(f"Created stel project at {target} (template: {template})")
     click.echo("")
@@ -938,7 +941,7 @@ def run(
     )
 
     if json_output:
-        click.echo(results_path.read_text())
+        click.echo(results_path.read_text(encoding="utf-8"))
         if any(r.errors for r in results):
             ctx.exit(1)
         return
@@ -1141,7 +1144,7 @@ def build(
     errored_models = sum(1 for r in result.run_results if r.errors)
 
     if json_output:
-        click.echo(results_path.read_text())
+        click.echo(results_path.read_text(encoding="utf-8"))
     else:
         _echo_build(result)
 
@@ -1301,7 +1304,7 @@ def eval_(
         return
 
     if as_json:
-        click.echo(artifact_path.read_text())
+        click.echo(artifact_path.read_text(encoding="utf-8"))
         if failed:
             ctx.exit(1)
         return

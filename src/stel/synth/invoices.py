@@ -24,7 +24,7 @@ def generate_invoices(count: int, output_dir: Path, seed: int = 42) -> list[Path
     for i in range(count):
         invoice = _make_invoice(fake, rng, i)
         path = output_dir / f"invoice_{i:05d}.json"
-        path.write_text(json.dumps(invoice, indent=2, default=str))
+        path.write_text(json.dumps(invoice, indent=2, default=str), encoding="utf-8")
         paths.append(path)
     return paths
 

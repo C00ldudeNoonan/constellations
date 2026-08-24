@@ -36,7 +36,7 @@ def generate_arxiv_papers(count: int, output_dir: Path, seed: int = 42) -> list[
     for i in range(count):
         record = _make_paper(fake, rng, i, now)
         path = output_dir / f"paper_{i:05d}.json"
-        path.write_text(json.dumps(record, indent=2, default=str))
+        path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
         paths.append(path)
     return paths
 

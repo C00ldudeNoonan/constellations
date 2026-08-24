@@ -157,4 +157,66 @@ def test_render_includes_orphan_and_filter_controls() -> None:
     assert 'id="orphans"' in html and "highlightOrphans" in html
     assert "isOrphan" in html          # orphan = no meaningful edges
     assert 'id="minfreq"' in html and "minFreq" in html
-    assert 'id="show-plane"' in html and "showPlane" in html
+    # The plane checkbox became the lineage-mode toggle in v2 (#345), and it
+    # defaults OFF: the star map is the primary view.
+    assert 'id="lineage"' in html and "lineageMode" in html
+    assert 'id="lineage"> Lineage' in html and "checked" not in html.split(
+        'id="lineage"'
+    )[0].rsplit("<label", 1)[-1]
+
+
+def test_render_includes_the_dimension_picker_and_entry_point() -> None:
+    """v2 (#345): the color-by picker, dimension-aware legend, and the entry
+    point that opens on the hottest concept instead of the whole hairball."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert 'id="colorby"' in html and "buildColorBy" in html
+    assert "HEAT_COLORS" in html          # retrieval reads as temperature
+    assert "entryNode" in html            # opens on something specific
+    assert '"retrieval"' in html          # demo dimension serialized
+    assert "stel star map" in html
+
+
+def test_baked_positions_pin_concept_nodes() -> None:
+    """Concepts with positions are pinned (fx/fy/fz): position IS the meaning,
+    and the force simulation would erase the projection in seconds. This is a
+    recorded deviation from 'seed then relax'."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert "node.fx = c.position.x" in html
+    assert "node.fy = c.position.y + Y_OFFSET" in html
+
+
+def test_render_carries_the_star_motif() -> None:
+    """The constellation look (#345 follow-up): glowing star sprites tinted by
+    the active dimension, a drifting faded starfield, depth fog, and sky-chart
+    labels on the brightest concepts. All of it degrades to the library's
+    default rendering when THREE is unavailable."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert "makeGlowTexture" in html and "SpriteMaterial" in html
+    assert "addStarfield" in html and "drift" in html    # slightly moving stars
+    assert "FogExp2" in html                              # depth cue
+    assert "makeLabelSprite" in html                      # sky-chart labels
+    assert 'backgroundColor("rgba(0,0,0,0)")' in html     # nebula CSS shows through
+    assert "window.THREE" in html and "return undefined" in html  # graceful fallback
+    # A star is a crisp sphere core with the halo behind it: a lone sprite
+    # pixelates as its texture scales and reads flat.
+    assert "SphereGeometry" in html and "MeshBasicMaterial" in html
+    assert "__coreMaterial" in html
+
+
+def test_lineage_mode_shows_beams_without_requiring_a_selection() -> None:
+    """The point of lineage mode is seeing the two maps connected. Beams used
+    to draw only for a selected star, so toggling the mode showed nothing
+    until a blind click; now every beam shows faintly and the selected star's
+    brighten."""
+    from stel.concept_cloud import demo_export
+
+    html = render_concept_cloud(demo_export())
+    assert "? touching.has(linkKey(l)) : true" in html
+    # Two-state beam color: bright when traced, ember otherwise.
+    assert "#ffcb47" in html and "#7a6329" in html

@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### The concept cloud becomes the star map (issue #345)
+
+- **Concepts are positioned by meaning.** `--embed-model` places each concept
+  at the centroid of its mention vectors — which the pipeline already
+  computed — projected to 3D at export time. No provider calls, and only
+  coordinates enter the bundle: never vectors, never text. In the viewer,
+  positioned concepts are pinned; a force simulation would erase the
+  projection's semantics in seconds, which is a recorded deviation from the
+  design comment's "seed then relax".
+- **Categorical dimensions are a feedback loop, not a hardcode.**
+  `--with-query-log` joins the MCP query log's `returned_chunk_ids` through
+  the linking rows to concepts and buckets the counts into a `retrieval`
+  dimension — hot, warm, cold, and `never`, the most actionable value on the
+  map. Aggregate-only by construction. `--dimension name=model.column` turns
+  any concept-keyed categorical column into a dimension; enum fields (#304)
+  fit directly.
+- **The artifact grew a color-by picker** over entity type plus every declared
+  dimension, with per-value legend toggles; retrieval heat renders as
+  temperature rather than arbitrary category colors. The dbt DAG plane became
+  **lineage mode**, off by default — the star map is the primary view, and the
+  toggle drops the plane in beneath with the beams. The page opens focused on
+  the hottest retrieved concept instead of the whole graph.
+- **Bundle contract v2** (`schema_version: "2"`): `position` and `dimensions`
+  on concepts, `DimensionDef` declarations on the bundle, values validated
+  against their declared sets at construction. v1 bundles are rejected by the
+  version gate as before.
+- **It looks like a star map now.** Concepts render as glowing star sprites
+  (tinted live by the active dimension), a faint two-layer starfield drifts
+  slowly behind a nebula-tinted sky, depth fog fades distant stars, the
+  fourteen brightest concepts carry sky-chart labels, and concept edges read
+  as constellation lines — faint silver until a star is selected, when its own
+  constellation brightens and the rest recede. Rendering degrades to the
+  library's defaults when the THREE namespace is unavailable, and the page
+  stays fully self-contained.
+
 ## v0.11.0 - 2026-08-23
 
 ### Rename follow-up: the residual `dbt_ml` spellings each have a recorded decision (issue #321)

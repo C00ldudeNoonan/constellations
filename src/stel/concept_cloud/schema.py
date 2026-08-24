@@ -15,7 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 # Bumped when the bundle shape changes so the artifact and the export job can
 # evolve independently; the artifact refuses a bundle it does not understand.
-CONCEPT_CLOUD_SCHEMA_VERSION = "1"
+# v2 (issue #345): baked 3D positions and categorical dimensions.
+CONCEPT_CLOUD_SCHEMA_VERSION = "2"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -104,6 +105,58 @@ class Provenance(_Frozen):
         return _require_non_empty(value)
 
 
+class Position(_Frozen):
+    """Baked 3D coordinates from the export-time projection (issue #345).
+
+    Computed as the centroid of the concept's mention embeddings projected to
+    3D, so proximity means how the corpus uses a concept — the projection runs
+    in Python at export time and only coordinates enter the bundle, never
+    text or raw vectors. Null on a concept means no embedding data was
+    available; the artifact falls back to force layout for those nodes."""
+
+    x: float
+    y: float
+    z: float
+
+    @field_validator("x", "y", "z")
+    @classmethod
+    def _finite(cls, value: float) -> float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("position coordinates must be finite")
+        return value
+
+
+class DimensionDef(_Frozen):
+    """One categorical dimension concepts can be colored and filtered by
+    (issue #345). The value set is closed and declared here, so the artifact
+    can build a stable legend without scanning every concept.
+
+    `source` records where the values came from: `query_log` dimensions are
+    aggregates derived from the MCP query log (retrieval heat — never query
+    text or principals); `column` dimensions are concept-keyed categorical
+    columns from the pipeline, e.g. an `llm:` enum field."""
+
+    name: str
+    values: tuple[str, ...]
+    source: Literal["query_log", "column"]
+    description: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+    @field_validator("values")
+    @classmethod
+    def _values_non_empty_and_unique(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if not values:
+            raise ValueError("dimension must declare at least one value")
+        cleaned = tuple(_require_non_empty(value) for value in values)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("dimension values must be unique")
+        return cleaned
+
+
 class Concept(_Frozen):
     """One canonical entity in the cloud. Keyed on `canonical_id` from the
     entity-linking output; `display` is human-readable only when the operator
@@ -119,6 +172,12 @@ class Concept(_Frozen):
     # Entity-linking match score; null for exact-alias matches.
     match_score: float | None = None
     provenance: Provenance
+    # Baked semantic coordinates; null falls back to force layout (#345).
+    position: Position | None = None
+    # Dimension name -> value. Every key must name a DimensionDef on the
+    # bundle and every value must be in that def's declared set; a concept
+    # absent from a dimension simply omits the key.
+    dimensions: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("canonical_id", "display")
     @classmethod
@@ -182,13 +241,15 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["1"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["2"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane
     concepts: tuple[Concept, ...] = ()
     concept_edges: tuple[ConceptEdge, ...] = ()
     cross_layer_edges: tuple[CrossLayerEdge, ...] = ()
+    # Declared categorical dimensions (issue #345); order is picker order.
+    dimensions: tuple[DimensionDef, ...] = ()
 
     @field_validator("generated_at", "project")
     @classmethod
@@ -200,6 +261,22 @@ class ConceptCloudExport(_Frozen):
         concept_ids = {concept.canonical_id for concept in self.concepts}
         if len(concept_ids) != len(self.concepts):
             raise ValueError("concept canonical_ids must be unique")
+        dimension_defs = {dim.name: set(dim.values) for dim in self.dimensions}
+        if len(dimension_defs) != len(self.dimensions):
+            raise ValueError("dimension names must be unique")
+        for concept in self.concepts:
+            for name, value in concept.dimensions.items():
+                allowed = dimension_defs.get(name)
+                if allowed is None:
+                    raise ValueError(
+                        f"concept '{concept.canonical_id}' uses undeclared "
+                        f"dimension '{name}'"
+                    )
+                if value not in allowed:
+                    raise ValueError(
+                        f"concept '{concept.canonical_id}' has value {value!r} "
+                        f"outside dimension '{name}' declared set"
+                    )
         node_ids = {node.id for node in self.dag_plane.nodes}
         for edge in self.concept_edges:
             for endpoint in (edge.source, edge.target):

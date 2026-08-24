@@ -20,7 +20,9 @@ from .schema import (
     DagEdge,
     DagNode,
     DagPlane,
+    DimensionDef,
     LinkStatus,
+    Position,
     Provenance,
 )
 
@@ -175,6 +177,39 @@ def _canonical_id(display: str, label: str) -> str:
     return f"{label.lower()}:{_slug(display)}"
 
 
+def _demo_position(canonical_id: str, label: str) -> Position:
+    """Deterministic pseudo-semantic layout: one cluster center per entity
+    type on a sphere, concepts jittered around it by an id hash — the shape a
+    real mention-centroid projection produces, without shipping vectors."""
+    import hashlib
+    import math
+
+    labels = sorted({lbl for _, lbl, _, _ in _CONCEPTS})
+    index = labels.index(label)
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    y = 1.0 - (index + 0.5) * (2.0 / len(labels))
+    radius = math.sqrt(1.0 - y * y)
+    theta = golden * index
+    center = (math.cos(theta) * radius * 90, y * 70, math.sin(theta) * radius * 90)
+    digest = hashlib.blake2b(canonical_id.encode(), digest_size=6).digest()
+    jitter = tuple((b / 255.0 - 0.5) * 40 for b in digest[:3])
+    return Position(
+        x=center[0] + jitter[0], y=center[1] + jitter[1], z=center[2] + jitter[2]
+    )
+
+
+def _demo_retrieval(display: str, frequency: int) -> str:
+    """Frequency-correlated but not identical — a couple of well-covered
+    concepts agents never ask about, which is the story the dimension tells."""
+    if display in ("World Bank", "Senate", "Berkshire Hathaway"):
+        return "never"
+    if frequency >= 70:
+        return "hot"
+    if frequency >= 30:
+        return "warm"
+    return "cold"
+
+
 def demo_export() -> ConceptCloudExport:
     """A sizable, realistic economic-news concept cloud over a layered dbt DAG."""
     id_by_display = {d: _canonical_id(d, lbl) for d, lbl, _, _ in _CONCEPTS}
@@ -193,6 +228,8 @@ def demo_export() -> ConceptCloudExport:
                 source_node="source.dbt_ml_economic_data.link_entities",
                 documents=documents_of[display],
             ),
+            position=_demo_position(id_by_display[display], label),
+            dimensions={"retrieval": _demo_retrieval(display, freq)},
         )
         for display, label, freq, status in _CONCEPTS
     )
@@ -234,4 +271,12 @@ def demo_export() -> ConceptCloudExport:
         concepts=concepts,
         concept_edges=tuple(edges),
         cross_layer_edges=cross_layer_edges,
+        dimensions=(
+            DimensionDef(
+                name="retrieval",
+                values=("hot", "warm", "cold", "never"),
+                source="query_log",
+                description="How often agents' queries returned this concept's chunks",
+            ),
+        ),
     )

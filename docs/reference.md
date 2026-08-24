@@ -2855,12 +2855,13 @@ transform — closing the loop in one `dbt build`. See
 [`examples/dbt_ref_roundtrip_dbt`](../examples/dbt_ref_roundtrip_dbt) for a
 runnable stel → dbt → stel → dbt round trip.
 
-## Concept cloud (visualization, proof of concept)
+## Star map (visualization)
 
-`stel concept-cloud` renders extracted entities as an explorable 3D **concept
-cloud** floating over a 2D plane of the dbt DAG, with lines tying each concept
-down to the model that produced it — a way to *see* how the fuzzy unstructured
-layer maps onto the deterministic structured one (issue #255).
+`stel concept-cloud` renders extracted entities as an explorable 3D **star
+map**: concepts positioned by meaning, colored by declared or usage-derived
+dimensions, with a toggleable *lineage mode* that drops the dbt DAG plane in
+beneath and ties each concept down to the model that produced it (issues
+#255, #345).
 
 The command writes a single **self-contained HTML file** (the rendering library
 is inlined, so it opens offline in any browser — the inline preview panels in
@@ -2884,9 +2885,31 @@ entity-linking output supplies canonical concepts (sized by mention frequency,
 colored by entity type) and the mention→canonical map; the relation grain
 supplies typed concept-to-concept edges; and the DAG plane comes from the
 downstream dbt `manifest.json` (or stel's own if `--dbt-manifest` is omitted).
-The viewer has orbit controls, click-to-trace cross-layer beams, a text search,
-entity-type toggles, an orphan highlight (nodes with no edges), and a
-min-frequency filter.
+The viewer has orbit controls, a color-by picker over every dimension, a
+text search, per-value legend toggles, an orphan highlight, a min-frequency
+filter, and lineage mode (off by default) with click-to-trace beams. It opens
+focused on the hottest retrieved concept — or the most frequent one — rather
+than the whole graph.
+
+**Semantic positions** (`--embed-model <model>`). Point the export at an embed
+model over the linking mentions and each concept is placed at the centroid of
+its mention vectors, projected to 3D at export time (PCA; deterministic).
+Proximity then means how the corpus uses a concept. Only coordinates enter the
+bundle — never vectors or text — and concepts stay pinned to their positions
+in the viewer, because position *is* the meaning. Without the flag, layout
+falls back to the force simulation.
+
+**Categorical dimensions** (issue #345). Beyond the built-in entity-type
+coloring:
+
+- `--with-query-log` derives a **retrieval heat** dimension
+  (hot/warm/cold/never) from the MCP query log: how often agents' queries
+  actually returned each concept's chunks. Aggregate-only — query text and
+  principal ids never leave the warehouse. `never` is the value worth
+  looking at first: well-covered concepts agents cannot reach.
+- `--dimension name=model.column` (repeatable) turns any concept-keyed
+  categorical column into a dimension. `llm:` enum fields fit directly: the
+  label set is already declared and validated upstream.
 
 **Prerequisites.** The cloud is keyed on `canonical_id`, so an entity-linking
 (`link_entities`) model must have run; and human-readable node labels require the

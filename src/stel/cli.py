@@ -1552,6 +1552,32 @@ def mcp_serve(
     show_default=True,
     help="Cap the cloud to the N most frequent canonical concepts.",
 )
+@click.option(
+    "--embed-model",
+    default=None,
+    help=(
+        "Embed model over the linking mentions; bakes semantic 3D positions "
+        "from mention-vector centroids (#345). Coordinates only — no vectors "
+        "or text enter the bundle."
+    ),
+)
+@click.option(
+    "--with-query-log",
+    is_flag=True,
+    help=(
+        "Derive a `retrieval` heat dimension (hot/warm/cold/never) from the "
+        "MCP query log. Aggregate-only; absent log means no dimension."
+    ),
+)
+@click.option(
+    "--dimension",
+    "dimensions",
+    multiple=True,
+    help=(
+        "Categorical dimension from a concept-keyed column, as "
+        "name=model.column (repeatable). Enum-field outputs fit directly."
+    ),
+)
 @_project_context_options
 @click.pass_context
 def concept_cloud(
@@ -1565,6 +1591,9 @@ def concept_cloud(
     dbt_manifest: Path | None,
     source_name: str | None,
     top_n: int,
+    embed_model: str | None,
+    with_query_log: bool,
+    dimensions: tuple[str, ...],
 ) -> None:
     """Render the self-contained 3D concept-cloud artifact (#255).
 
@@ -1586,6 +1615,14 @@ def concept_cloud(
             "Pass --linking-model <model> to export a project's concepts, "
             "or --demo / --placeholder for a built-in bundle."
         )
+    dimension_specs: dict[str, str] = {}
+    for raw in dimensions:
+        name, _, spec = raw.partition("=")
+        if not name or not spec:
+            raise click.ClickException(
+                f"--dimension must be name=model.column, got {raw!r}"
+            )
+        dimension_specs[name] = spec
     try:
         export = export_concept_cloud(
             ctx.obj["project_dir"],
@@ -1597,6 +1634,9 @@ def concept_cloud(
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
             top_n=top_n,
+            embed_model=embed_model,
+            with_query_log=with_query_log,
+            dimension_specs=dimension_specs or None,
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e

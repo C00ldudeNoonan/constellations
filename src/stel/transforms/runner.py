@@ -38,6 +38,30 @@ class TransformContext:
 
 
 @dataclass(frozen=True)
+class ReferenceDep:
+    """One reference dependency of an incremental transform (issue #364).
+
+    ``join_key`` — when set, the column in this reference table whose values
+    are parent identities (the same value space as
+    ``IncrementalContract.parent_source_key``). Invalidation is then scoped
+    per parent: a parent's fingerprint covers only the reference rows joined
+    to it, so a changed reference row reprojects the parents it belongs to
+    instead of the whole corpus. Declaring a join key asserts the transform
+    derives a parent's children from this reference *only* through that
+    parent's joined rows; reference rows keyed to no current parent therefore
+    do not participate in invalidation, and rows with a null or empty join
+    key are rejected at run time.
+
+    ``join_key=None`` keeps table-scoped semantics — any change to the
+    reference invalidates every parent — and is equivalent to naming the
+    dependency as a plain string in ``reference_deps``.
+    """
+
+    name: str
+    join_key: str | None = None
+
+
+@dataclass(frozen=True)
 class IncrementalContract:
     """How an incremental one-to-many transform maps input parents to output
     child rows (issue #218). Returned by a transform module's optional
@@ -58,9 +82,12 @@ class IncrementalContract:
                        upstream by position and cannot name it).
     parent_source_key  the string column in ``parent_source`` identifying the
                        parent.
-    reference_deps     dependencies passed whole to the transform; a change to
-                       any of them invalidates every parent (folded into each
-                       parent's input fingerprint).
+    reference_deps     dependencies passed whole to the transform. A plain
+                       string (or a :class:`ReferenceDep` without a
+                       ``join_key``) is table-scoped: any change to it
+                       invalidates every parent. A :class:`ReferenceDep` with
+                       a ``join_key`` scopes invalidation to each parent's
+                       joined rows (issue #364).
 
     ``parent_source`` and ``reference_deps`` together must account for every
     entry in ``depends_on`` so no input escapes invalidation.
@@ -70,7 +97,14 @@ class IncrementalContract:
     child_key: str
     parent_source_key: str
     parent_source: str | None = None
-    reference_deps: tuple[str, ...] = ()
+    reference_deps: tuple[str | ReferenceDep, ...] = ()
+
+    def reference_specs(self) -> tuple[ReferenceDep, ...]:
+        """Every reference dep in normalized :class:`ReferenceDep` form."""
+        return tuple(
+            ref if isinstance(ref, ReferenceDep) else ReferenceDep(ref)
+            for ref in self.reference_deps
+        )
 
     def resolve_parent_source(self, dependencies: Sequence[str]) -> str:
         """The effective parent-source model name for ``dependencies``. When
@@ -90,11 +124,26 @@ class IncrementalContract:
                 raise ValueError(f"IncrementalContract.{name} must be a non-empty string")
         if self.parent_key == self.child_key:
             raise ValueError("IncrementalContract parent_key and child_key must differ")
-        refs = tuple(self.reference_deps)
-        if any(not isinstance(ref, str) or not ref.strip() for ref in refs):
-            raise ValueError(
-                "IncrementalContract.reference_deps must be non-empty model-name strings"
-            )
+        for ref in self.reference_deps:
+            if isinstance(ref, ReferenceDep):
+                if not isinstance(ref.name, str) or not ref.name.strip():
+                    raise ValueError(
+                        "IncrementalContract.reference_deps ReferenceDep.name must be "
+                        "a non-empty model-name string"
+                    )
+                if ref.join_key is not None and (
+                    not isinstance(ref.join_key, str) or not ref.join_key.strip()
+                ):
+                    raise ValueError(
+                        "IncrementalContract.reference_deps ReferenceDep.join_key must "
+                        "be a non-empty column name or None"
+                    )
+            elif not isinstance(ref, str) or not ref.strip():
+                raise ValueError(
+                    "IncrementalContract.reference_deps entries must be non-empty "
+                    "model-name strings or ReferenceDep instances"
+                )
+        refs = tuple(spec.name for spec in self.reference_specs())
         ref_set = set(refs)
         if len(ref_set) != len(refs):
             raise ValueError("IncrementalContract.reference_deps contains duplicates")

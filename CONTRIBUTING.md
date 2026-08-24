@@ -99,10 +99,15 @@ in stel's installed backend registry.
    `declared_incremental_contract(options) -> IncrementalContract`. The contract
    names the output `parent_key` (delete scope) and `child_key` (upsert scope),
    the `parent_source` dependency (and its key column) whose rows define the
-   parents, and any whole-table `reference_deps`. The runner then skips
-   unchanged parents, invokes the transform only on changed and new parents, and
-   replaces a changed parent's children by deleting on the parent key and
-   upserting on the child key. Emit the same deterministic `child_key` for the
+   parents, and any `reference_deps`. A reference named as a plain string is
+   table-scoped: any change to it invalidates every parent. When the transform
+   derives a parent's children from a reference only through rows joined to
+   that parent, declare it as `ReferenceDep(name, join_key=...)` — the join-key
+   column holds parent identities, and invalidation then scopes to each
+   parent's joined rows instead of the whole corpus (issue #364). The runner
+   skips unchanged parents, invokes the transform only on changed and new
+   parents, and replaces a changed parent's children by deleting on the parent
+   key and upserting on the child key. Emit the same deterministic `child_key` for the
    same input, carry the `parent_key` on every output row, and process parents
    independently (a transform needing cross-parent state cannot be incremental).
    Without the hook a transform stays `full`; declaring it for

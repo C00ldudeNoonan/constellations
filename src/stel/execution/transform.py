@@ -31,6 +31,7 @@ from ..providers import get_inference_provider, resolve_provider_model
 from ..sql_models import compile_sql, discover_refs, read_sql_source
 from ..transforms import (
     IncrementalContract,
+    ReferenceDep,
     TransformContext,
     load_incremental_contract,
     load_transform,
@@ -339,8 +340,16 @@ def _run_incremental_transform(
     if is_incremental and not prior_state and adapter.relation_exists(model.name):
         is_incremental = False
 
-    reference_fingerprints = {
-        ref: _frame_fingerprint(deps[ref]) for ref in contract.reference_deps
+    reference_specs = contract.reference_specs()
+    table_reference_fingerprints = {
+        spec.name: _frame_fingerprint(deps[spec.name])
+        for spec in reference_specs
+        if spec.join_key is None
+    }
+    keyed_reference_fingerprints = {
+        spec.name: _keyed_reference_fingerprints(deps[spec.name], spec, model.name)
+        for spec in reference_specs
+        if spec.join_key is not None
     }
     groups = _parent_groups(parent_frame, contract.parent_source_key, model.name)
     current_keys = {key for key, _ in groups}
@@ -350,6 +359,11 @@ def _run_incremental_transform(
     changed: list[str] = []
     skipped = 0
     for parent_key, rows in groups:
+        reference_fingerprints = dict(table_reference_fingerprints)
+        for name, by_parent in keyed_reference_fingerprints.items():
+            reference_fingerprints[name] = by_parent.get(
+                parent_key, _EMPTY_REFERENCE_ROWS_FINGERPRINT
+            )
         fingerprint = _parent_fingerprint(parent_key, rows, reference_fingerprints)
         if is_incremental:
             prior = prior_state.get(parent_key)
@@ -492,6 +506,54 @@ def _frame_fingerprint(frame: pl.DataFrame) -> str:
         {"rows": sorted(frame.iter_rows(named=True), key=canonical_json)},
         domain="dbt-ml.transform-incremental-reference",
     )
+
+
+# What a keyed reference dep contributes to a parent with no joined rows: the
+# fingerprint of an empty row group, so gaining a first reference row (or
+# losing the last one) still moves that parent's fingerprint.
+_EMPTY_REFERENCE_ROWS_FINGERPRINT = canonical_fingerprint(
+    {"rows": []}, domain="dbt-ml.transform-incremental-reference"
+)
+
+
+def _keyed_reference_fingerprints(
+    frame: pl.DataFrame, spec: ReferenceDep, model_name: str
+) -> dict[str, str]:
+    """Per-parent fingerprints over a keyed reference dep's joined rows
+    (issue #364), keyed by parent identity. Mirrors `_parent_groups`'
+    strictness: the declared join-key column must exist, be string-typed, and
+    hold no null or empty values — a reference row that belongs to no parent
+    would otherwise escape invalidation silently."""
+    key_col = spec.join_key
+    assert key_col is not None
+    if key_col not in frame.columns:
+        raise RunError(
+            f"Incremental transform '{model_name}': reference dep '{spec.name}' is "
+            f"missing its declared join_key column '{key_col}'. "
+            f"Available: {sorted(frame.columns)}"
+        )
+    if frame.schema[key_col] != pl.String:
+        raise RunError(
+            f"Incremental transform '{model_name}': reference dep '{spec.name}' "
+            f"join_key column '{key_col}' must be string-typed, "
+            f"got {frame.schema[key_col]}"
+        )
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in frame.iter_rows(named=True):
+        raw = row[key_col]
+        if raw is None or not str(raw).strip():
+            raise RunError(
+                f"Incremental transform '{model_name}': reference dep '{spec.name}' "
+                f"join_key column '{key_col}' contains null or empty values"
+            )
+        groups.setdefault(str(raw), []).append(row)
+    return {
+        key: canonical_fingerprint(
+            {"rows": sorted(rows, key=canonical_json)},
+            domain="dbt-ml.transform-incremental-reference",
+        )
+        for key, rows in groups.items()
+    }
 
 
 def _parent_fingerprint(

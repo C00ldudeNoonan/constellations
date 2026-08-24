@@ -1,5 +1,6 @@
 from .runner import (
     IncrementalContract,
+    ReferenceDep,
     TransformContext,
     TransformFn,
     load_incremental_contract,
@@ -11,6 +12,7 @@ from .runner import (
 
 __all__ = [
     "IncrementalContract",
+    "ReferenceDep",
     "TransformContext",
     "TransformFn",
     "load_incremental_contract",

@@ -977,3 +977,150 @@ def test_rekey_state_scope_moves_rows_and_refuses_collisions(
             adapter.rekey_state_scope(legacy, current)
         assert len(adapter.fetch_state(legacy)) == 1
         assert len(adapter.fetch_state(current)) == 2
+
+
+# ─── ledger-resolved activation (issue #355) ────────────────────────────────
+
+
+def test_a_ledger_predating_generations_gains_the_activation_column(
+    tmp_path: Path,
+) -> None:
+    """`_ensure_tables` is CREATE IF NOT EXISTS, so an older ledger needs ALTER.
+
+    Without the ALTER, every statement naming `active_collection` fails
+    against a ledger written by an earlier version.
+    """
+    from stel.adapters.base import SERVING_LEDGER_TABLE
+
+    warehouse = _wh(tmp_path / "old.duckdb")
+    with create_adapter(warehouse) as adapter:
+        adapter.execute(f"CREATE SCHEMA IF NOT EXISTS {adapter.schema_ref}")
+        adapter.execute(
+            f"""
+            CREATE TABLE {adapter.schema_ref}.{adapter.quote_ident(SERVING_LEDGER_TABLE)} (
+                model_name STRING NOT NULL,
+                stage STRING NOT NULL,
+                target_identity STRING NOT NULL,
+                row_id STRING NOT NULL,
+                fencing_token BIGINT NOT NULL,
+                status STRING NOT NULL,
+                publication_id STRING,
+                expected_code_version STRING,
+                config_fingerprint STRING,
+                active_generation STRING,
+                safe_error_code STRING,
+                rows_inserted BIGINT NOT NULL,
+                rows_updated BIGINT NOT NULL,
+                rows_skipped BIGINT NOT NULL,
+                rows_deleted BIGINT NOT NULL,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+            """
+        )
+        assert "active_collection" not in (
+            adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
+        )
+
+        coordinator = ServingCoordinator(adapter)
+
+        assert "active_collection" in (
+            adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
+        )
+        # And the upgraded ledger is usable end to end.
+        scope = _scope()
+        lease = coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg1"
+        )
+        coordinator.mark_ready(
+            lease,
+            active_generation="gen1",
+            config_fingerprint="cfg1",
+            counts=(1, 0, 0, 0),
+        )
+        assert coordinator.status(scope).active_collection is None
+
+
+def test_mark_ready_records_the_activation_pointer(coordinator: Any) -> None:
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    assert coordinator.status(scope).active_collection == "proj__dev__ctx__ga1b2"
+
+
+def test_activation_defaults_to_the_unsuffixed_collection(
+    coordinator: Any,
+) -> None:
+    """An in-place incremental publish leaves the pointer null.
+
+    Null is what every row written before generations existed means, and it
+    resolves to the unsuffixed default — so this is the path that keeps
+    already-published indexes working untouched.
+    """
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+    assert coordinator.status(scope).active_collection is None
+    assert coordinator.acquire_query(scope).pinned_collection is None
+
+
+def test_a_query_lease_pins_the_collection_it_resolved(coordinator: Any) -> None:
+    """The pin is what keeps a reader coherent across a later activation."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    query = coordinator.acquire_query(scope)
+    assert query.pinned_collection == "proj__dev__ctx__ga1b2"
+    assert query.pinned_generation == "gen1"
+    coordinator.release_query(query)
+
+
+def test_failure_clears_the_activation_pointer_with_the_generation(
+    coordinator: Any,
+) -> None:
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    retry = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_failed(retry, safe_error_code="publish_failed")
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_FAILED
+    assert entry.active_collection is None
+    # Safe only because a failed row is refused to readers; a private-generation
+    # rebuild will have to preserve the pointer instead.
+    with pytest.raises(ServingNotReadyError):
+        coordinator.acquire_query(scope)

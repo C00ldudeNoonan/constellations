@@ -1736,6 +1736,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"status:            {entry.status}")
     click.echo(f"fencing_token:     {entry.fencing_token}")
     click.echo(f"active_generation: {entry.active_generation or '-'}")
+    click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
     click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
     click.echo(f"query_leases:      {entry.query_leases}")
     click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")

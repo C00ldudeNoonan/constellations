@@ -386,3 +386,52 @@ def test_same_request_runs_against_mocked_remote_store(
         result.record_id for result in local
     ]
     assert remote[0].contributing_ranks == {"text": 1, "vector": 1}
+
+
+# ─── ledger-resolved activation (issue #355) ────────────────────────────────
+
+
+def test_search_follows_the_ledger_activation_pointer(
+    published_project: Path,
+) -> None:
+    """The reader must resolve through the ledger, not recompute the name.
+
+    Pointing the activation at a collection that does not exist has to break
+    the query: if search still computed the physical name deterministically,
+    it would keep succeeding and the indirection would be decorative.
+    """
+    from stel.adapters import create_adapter
+    from stel.adapters.base import SERVING_LEDGER_TABLE
+    from stel.cli_services.serving import resolve_serving_scope
+
+    request = SearchRequest(
+        model="release_search",
+        query="inflation consumer prices",
+        mode=SearchMode.VECTOR,
+        limit=2,
+    )
+    assert search(published_project, request)  # resolves via the null default
+
+    scope, resolved = resolve_serving_scope(
+        published_project,
+        profiles_dir=None,
+        target=None,
+        model_name="release_search",
+    )
+    with create_adapter(resolved.warehouse, project_dir=published_project) as adapter:
+        ledger = f"{adapter.schema_ref}.{adapter.quote_ident(SERVING_LEDGER_TABLE)}"
+        adapter.execute(
+            f"""
+            UPDATE {ledger} SET active_collection = ?
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+            """,
+            [
+                "proj__dev__absent_generation",
+                scope.model_name,
+                scope.stage,
+                scope.target_identity,
+            ],
+        )
+
+    with pytest.raises(SearchError, match="has not been published"):
+        search(published_project, request)

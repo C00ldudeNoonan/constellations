@@ -1305,6 +1305,21 @@ physical name that receives no production queries, and drop one later. LanceDB
 satisfies this. A store with a fixed collection namespace does not, which is
 what the capability exists to catch.
 
+The pointer itself is the ledger's `active_collection` column: the physical
+collection the logical name currently resolves to. A query lease reads it at
+acquire time and pins it, so activation cannot move a reader mid-query. A null
+pointer means the unsuffixed default — which is exactly what every row written
+before generations existed means, so no migration of ledger rows is required
+for this half.
+
+Note the asymmetry in failure handling: `mark_failed` clears the pointer along
+with the generation, which is correct for an in-place incremental publish
+(that path may have mutated the serving collection) and safe because a failed
+row is refused to readers. A private-generation rebuild does not touch the
+serving collection, so when that path lands it must preserve the pointer
+instead; otherwise a failed rebuild would drop a still-healthy generation out
+of resolution.
+
 This depends on the serving scope being keyed on the *logical* collection.
 Keying it on the physical collection — as it was before #355 — makes
 resolution circular: a reader would need the active generation in order to

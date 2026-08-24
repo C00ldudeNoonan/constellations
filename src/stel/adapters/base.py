@@ -1497,6 +1497,26 @@ to see the plan first."""
     def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
         """Remove state rows for `record_keys` within exactly `scope`."""
 
+    def table_column_names(self, table: str) -> frozenset[str] | None:
+        """Lowercased column names of a stel-owned table, None if it is absent.
+
+        Used to add a column to a persisted table that predates it: the
+        serving tables are created with CREATE TABLE IF NOT EXISTS, which is
+        silently a no-op against an existing table with an older schema.
+        """
+        columns = self._state_columns(table)
+        if columns is None:
+            return None
+        return frozenset(str(name).lower() for name, _type, _nullable in columns)
+
+    def _state_columns(
+        self, table: str
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' cannot introspect "
+            "table columns"
+        )
+
     # ─── serving scope re-keying (issue #355) ─────────────────────────────
 
     def rekey_state_scope(self, old: StateScope, new: StateScope) -> int:

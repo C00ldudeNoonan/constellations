@@ -781,7 +781,7 @@ _BACKEND_IDENTITY_PAYLOAD_KEYS = (
     "backend_class_source",
     "backend_module_source",
     "base_source",
-    "dbt_ml_version",
+    "dependency_sources",
 )
 
 
@@ -829,7 +829,8 @@ def test_backend_identity_payload_keys_are_frozen() -> None:
         "every document as new and re-extracts every corpus, green the whole "
         "way. Cached provider responses survive (they key on the provider "
         "contract identity, not the backend), so the bill is wall-clock on a "
-        "warm cache and real provider spend on a cold one. `dbt_ml_version` "
-        "in particular keeps its pre-#313 spelling on purpose, for the same "
-        "reason `providers.base._IDENTITY_PACKAGE` does."
+        "warm cache and real provider spend on a cold one. The release "
+        "version was dropped from this payload on purpose (issue #363) — "
+        "reintroducing it, under any spelling, re-keys every corpus on every "
+        "release again."
     )

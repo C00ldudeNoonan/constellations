@@ -33,6 +33,9 @@ class PdfBackend(BaseBackend):
     def version(self) -> str:
         return f"pypdf/{optional_dependency_version('pypdf')}"
 
+    def parser_identity(self) -> str | None:
+        return self.version()
+
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
         options = self.parse_options(options)
         text_field = options.get("text_field", "text")

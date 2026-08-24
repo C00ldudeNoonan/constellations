@@ -1720,3 +1720,43 @@ def test_retirement_aborts_when_the_publish_lease_is_stale(
                 lease=lease,
             )
         assert superseded in store.list_collections()
+
+
+def test_a_rebuild_that_fails_after_the_state_swap_clears_the_stale_state(
+    tmp_path: Path,
+) -> None:
+    """Activation swaps state before marking ready — the fence forces that
+    order. If the swap lands and activation does not, the serving scope
+    describes a collection the pointer does not name, and a later incremental
+    publish would skip rows the old collection never received.
+
+    The failure path clears that state, so the next run republishes in full.
+    """
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    run_project(tmp_path, select="context_search")
+
+    scope, resolved = resolve_serving_scope(
+        tmp_path, profiles_dir=None, target=None, model_name="context_search"
+    )
+    real_mark_ready = ServingCoordinator.mark_ready
+
+    def _fail_activation(self: Any, *args: Any, **kwargs: Any) -> None:
+        raise RunError("activation interrupted")
+
+    ServingCoordinator.mark_ready = _fail_activation  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RunError, match="activation interrupted"):
+            run_project(tmp_path, select="context_search", full_refresh=True)
+    finally:
+        ServingCoordinator.mark_ready = real_mark_ready  # type: ignore[method-assign]
+
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        # State that no longer describes the served collection is gone, so the
+        # next publish cannot skip rows on the strength of it.
+        assert adapter.fetch_state(scope) == {}
+
+    results = run_project(tmp_path, select="context_search")
+    published = next(r for r in results if r.model_name == "context_search")
+    # Every row republished rather than skipped as already-published.
+    assert published.rows_written == len(_rows())

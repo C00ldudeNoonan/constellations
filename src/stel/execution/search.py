@@ -52,6 +52,7 @@ from ..retrieval import (
     legacy_collection_config_fingerprint,
     rebuild_required,
 )
+from ..retrieval.base import GENERATION_MARKER
 from ..retrieval.retention import retire_superseded_generations
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..versioning import compute_model_code_version
@@ -102,6 +103,8 @@ def run_search_model(
     coordinator = ServingCoordinator(adapter)
     publish_lease: PublishLease | None = None
     active_generation: str | None = None
+    state_swapped = False
+    superseded_collection: str | None = None
 
     try:
         # Publication-state residency is bounded (issue #153): reconciliation
@@ -178,6 +181,19 @@ def run_search_model(
                 config_fingerprint=spec.config_fingerprint,
             )
             with store.publisher_fence(physical), store:
+                if rebuild:
+                    # Reclaim generations left by publishers that died before
+                    # activating. Under the publish claim, and before this
+                    # build's collection exists, so the sweep cannot list it
+                    # as a candidate. Sparing the live generation is what
+                    # `active_collection` does here.
+                    retire_superseded_generations(
+                        store,
+                        logical_collection=logical_collection,
+                        active_collection=active_collection or default_collection,
+                        coordinator=coordinator,
+                        lease=publish_lease,
+                    )
                 existing = store.inspect_collection(physical)
                 force_publish = existing is None
                 collection_exists = existing is not None
@@ -362,10 +378,17 @@ def run_search_model(
         assert active_generation is not None
         assert spec is not None
         if rebuild:
-            # Activation, in the order the design requires: the state snapshot
-            # is replaced atomically first, fenced on this publication's claim,
-            # and only then does the ledger pointer move. A crash between them
-            # leaves the old generation still named and still serving.
+            # The state snapshot is replaced first, fenced on this claim, and
+            # only then does the ledger pointer move. The order is forced:
+            # `mark_ready` releases the publication claim, so a fenced
+            # replacement after it would be refused.
+            #
+            # That leaves one window. If the swap lands and activation does
+            # not, the serving scope describes the new generation while the
+            # pointer still names the old collection, and a later incremental
+            # publish would skip rows the old collection never received.
+            # `state_swapped` lets the failure path clear that state, so the
+            # next run reconciles against nothing and republishes in full.
             _activate_generation(
                 adapter,
                 serving_scope=state_scope,
@@ -373,6 +396,7 @@ def run_search_model(
                 lease=publish_lease,
                 page_size=search.batch_size,
             )
+            state_swapped = True
         coordinator.mark_ready(
             publish_lease,
             active_generation=active_generation,
@@ -380,17 +404,29 @@ def run_search_model(
             counts=(inserted, updated, skipped, deleted),
             active_collection=physical if rebuild else active_collection,
         )
-        if rebuild:
-            # Only now is the previous generation unreachable. Under the
-            # publish claim there are no query leases, so nothing can be
-            # reading it — see retrieval/retention.py.
+        # Activation succeeded: the swapped state now describes the live
+        # generation. Clearing it from here on would leave the ledger ready
+        # with empty state and re-embed the whole index on the next run.
+        state_swapped = False
+        superseded_collection = (
+            active_collection
+            if rebuild and active_collection and GENERATION_MARKER in active_collection
+            else None
+        )
+        if rebuild and superseded_collection is not None:
+            # The collection this activation replaced. Dropped by name rather
+            # than by sweeping: `mark_ready` has released the publish claim,
+            # and a listing sweep without it can delete a generation another
+            # publisher is building. A superseded name is safe — every build
+            # takes a fresh token, so nothing else is ever writing to it.
             with store:
-                retire_superseded_generations(
-                    store,
-                    logical_collection=logical_collection,
-                    active_collection=physical,
-                )
+                store.drop_collection(superseded_collection)
     except (AdapterError, RetrievalError, RunError) as error:
+        if state_swapped and state_scope is not None:
+            # See the activation note above: this state no longer describes
+            # the collection the pointer names.
+            with suppress(AdapterError):
+                adapter.clear_state(state_scope)
         if publish_lease is not None:
             _mark_search_publication_failed(
                 coordinator,

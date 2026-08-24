@@ -476,7 +476,7 @@ class ServingCoordinator:
         active_generation: str | None,
         safe_error_code: str | None,
         counts: tuple[int, int, int, int],
-        active_collection: str | None = None,
+        active_collection: str | None,
     ) -> None:
         inserted, updated, skipped, deleted = counts
         self._adapter.execute(
@@ -575,6 +575,8 @@ class ServingCoordinator:
             lease,
             status=STATUS_FAILED,
             active_generation=None,
+            # Cleared deliberately, not by omission — see the note above.
+            active_collection=None,
             safe_error_code=validate_safe_error_code(safe_error_code),
             counts=counts,
         )

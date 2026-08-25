@@ -28,10 +28,9 @@ class TranscriptContextCall(BaseModel):
     """One stel `search_context` call the exchange made (issue #380).
 
     The retrieval judgment in reduced form: which ids came back, and which of
-    them the answer went on to name, or the MCP error code if the call
-    failed. `query_fingerprint` uses the
-    same function and domain as the MCP query log, so a transcript row joins
-    to a served-side log row. `query_text` is null unless the converter was
+    them the answer went on to name, or the MCP error code if the call failed.
+    `query_fingerprint` uses the same function and domain as the MCP query
+    log, so a transcript row joins to a served-side log row. `query_text` is null unless the converter was
     run with query capture opted in.
     """
 

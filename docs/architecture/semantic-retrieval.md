@@ -1320,6 +1320,41 @@ serving collection, so when that path lands it must preserve the pointer
 instead; otherwise a failed rebuild would drop a still-healthy generation out
 of resolution.
 
+#### Retiring a superseded generation (issue #355)
+
+There is no grace period and no generations table. Both fall out of the
+coordination protocol: `acquire_publish` refuses while any query lease exists,
+and `acquire_query` refuses while a publisher holds the claim, so while the
+publish lease is held there are zero query leases and no other publisher, by
+construction. A sweep running under that lease can race neither a reader
+(whichever generation the reader pinned) nor a concurrent build creating the
+next private generation.
+
+Holding the publish lease is therefore the sweep's contract, and it is
+verified rather than trusted: the sweeper passes its lease and the fence is
+checked against the ledger before listing and before every drop. Running
+"just after `serving recover`" is not a safe state on its own — recovery only
+guarantees zero leases at the instant it clears them, and another process may
+acquire the publish lease and start building while a lease-less sweep is
+listing and dropping. A post-recovery sweeper acquires the lease like any
+other publisher.
+
+The ledger names the active generation, so any other collection named exactly
+`<base>__g<token>` (one 1-16 lowercase-alphanumeric token) is unreachable and
+safe to drop — including a half-built generation left by a publisher that
+died before activating. That suffix shape is reserved: name resolution
+refuses any *base* collection name ending in `__g<token>`, so a sibling
+logical collection (say `ctx__garchive` next to `ctx`) can never be mistaken
+for a retired generation and swept. The unsuffixed base collection carries no
+marker and is never a candidate, because that is where an in-place published
+index lives.
+
+Recovery preserves the activation pointer rather than clearing it with the
+generation. It rebuilds the ledger row, and losing the pointer would strand a
+generation-served index: the logical name would fall back to the unsuffixed
+default, which for a generation build holds no data. The scope stays failed
+either way, so this is inert for readers.
+
 This depends on the serving scope being keyed on the *logical* collection.
 Keying it on the physical collection — as it was before #355 — makes
 resolution circular: a reader would need the active generation in order to

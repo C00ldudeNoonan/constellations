@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -15,7 +17,13 @@ import pyarrow as pa
 import pytest
 from click.testing import CliRunner
 
-from stel.adapters import AdapterError, StateScope, TableReadSnapshot, create_adapter
+from stel.adapters import (
+    AdapterError,
+    StateScope,
+    TableReadSnapshot,
+    create_adapter,
+    parse_warehouse_config,
+)
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.cli import cli
 from stel.compiler import (
@@ -35,8 +43,13 @@ from stel.retrieval import (
     RetrievalPredicate,
     RetrievalPredicateOperator,
     ServingCoordinator,
+    StaleServingLeaseError,
     collection_config_fingerprint,
     create_store,
+)
+from stel.retrieval.retention import (
+    retire_superseded_generations,
+    superseded_generations,
 )
 from stel.runner import RunError, run_project
 
@@ -1426,3 +1439,215 @@ def test_drop_collection_refuses_a_collection_stel_does_not_own(
         with pytest.raises(RetrievalError, match="not owned by stel"):
             store.drop_collection("proj__dev__foreign")
         assert "proj__dev__foreign" in foreign.list_tables().tables
+
+
+# ─── generation retirement (issue #355) ─────────────────────────────────────
+
+
+def _make_collection(store: Any, name: str) -> None:
+    store.create_collection(
+        CollectionSpec(
+            logical_name="ctx",
+            physical_name=name,
+            id_field="id",
+            text_fields=("body",),
+            full_text_fields=(),
+            attribute_fields=(),
+            scalar_index_fields=(),
+            display_fields=("body",),
+            vector_field=None,
+            vector_dimensions=None,
+            distance_metric=None,
+            vector_search="exact",
+            config_fingerprint="cfg1",
+            descriptor="{}",
+            legacy_config_fingerprint="legacy1",
+            arrow_schema=pa.schema(
+                [pa.field("id", pa.string()), pa.field("body", pa.string())]
+            ),
+        )
+    )
+
+
+@contextmanager
+def _held_publish_lease(tmp_path: Path) -> Iterator[tuple[Any, Any, Any]]:
+    """A coordinator with the publish lease held — the state a sweep requires."""
+    config = parse_warehouse_config(
+        {
+            "type": "duckdb",
+            "path": str(tmp_path / "serving.duckdb"),
+            "schema": "serving",
+        }
+    )
+    with create_adapter(config) as adapter:
+        coordinator = ServingCoordinator(adapter)
+        scope = StateScope.for_target_descriptor(
+            "ctx_search",
+            stage="retrieval_publish",
+            descriptor={"store_type": "lancedb", "collection": "ctx"},
+        )
+        lease = coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg1"
+        )
+        yield coordinator, lease, scope
+
+
+def test_retirement_never_considers_the_unsuffixed_base_collection(
+    tmp_path: Path,
+) -> None:
+    """The base collection is where an in-place published index lives.
+
+    It has no generation marker, so it must never appear as a candidate —
+    dropping it would destroy a working index rather than reclaim garbage.
+    """
+    store = _gen_store(tmp_path)
+    with store:
+        base = store.physical_collection("ctx")
+        _make_collection(store, base)
+        _make_collection(store, store.physical_collection("ctx", generation="a1b2"))
+
+        candidates = superseded_generations(
+            store, logical_collection="ctx", active_collection=None
+        )
+        assert base not in candidates
+        assert candidates == [store.physical_collection("ctx", generation="a1b2")]
+
+
+def test_retirement_spares_the_active_generation(tmp_path: Path) -> None:
+    store = _gen_store(tmp_path)
+    with store, _held_publish_lease(tmp_path) as (coordinator, lease, _scope):
+        active = store.physical_collection("ctx", generation="a1b2")
+        superseded = store.physical_collection("ctx", generation="c3d4")
+        base = store.physical_collection("ctx")
+        for name in (base, active, superseded):
+            _make_collection(store, name)
+
+        retired = retire_superseded_generations(
+            store,
+            logical_collection="ctx",
+            active_collection=active,
+            coordinator=coordinator,
+            lease=lease,
+        )
+
+        assert retired == [superseded]
+        remaining = store.list_collections()
+        assert active in remaining and base in remaining
+        assert superseded not in remaining
+
+
+def test_retirement_is_idempotent(tmp_path: Path) -> None:
+    store = _gen_store(tmp_path)
+    with store, _held_publish_lease(tmp_path) as (coordinator, lease, _scope):
+        active = store.physical_collection("ctx", generation="a1b2")
+        _make_collection(store, active)
+        _make_collection(store, store.physical_collection("ctx", generation="c3d4"))
+
+        first = retire_superseded_generations(
+            store,
+            logical_collection="ctx",
+            active_collection=active,
+            coordinator=coordinator,
+            lease=lease,
+        )
+        second = retire_superseded_generations(
+            store,
+            logical_collection="ctx",
+            active_collection=active,
+            coordinator=coordinator,
+            lease=lease,
+        )
+        assert len(first) == 1
+        assert second == []
+
+
+def test_retirement_does_not_reach_another_logical_collection(
+    tmp_path: Path,
+) -> None:
+    """The prefix is per logical collection, so a sweep stays in its lane."""
+    store = _gen_store(tmp_path)
+    with store, _held_publish_lease(tmp_path) as (coordinator, lease, _scope):
+        mine = store.physical_collection("ctx", generation="a1b2")
+        theirs = store.physical_collection("other", generation="a1b2")
+        _make_collection(store, mine)
+        _make_collection(store, theirs)
+
+        retired = retire_superseded_generations(
+            store,
+            logical_collection="ctx",
+            active_collection=None,
+            coordinator=coordinator,
+            lease=lease,
+        )
+        assert retired == [mine]
+        assert theirs in store.list_collections()
+
+
+def test_generation_shaped_logical_names_are_rejected(tmp_path: Path) -> None:
+    """The `__g<token>` suffix shape is reserved for generation collections.
+
+    A logical collection resolving to `proj__dev__ctx__garchive` would be
+    indistinguishable from a retired generation of its sibling `ctx` and
+    swept with it, so name resolution refuses the shape outright.
+    """
+    store = _gen_store(tmp_path)
+    with pytest.raises(RetrievalError, match="reserved generation suffix"):
+        store.physical_collection("ctx__garchive")
+    with pytest.raises(RetrievalError, match="reserved generation suffix"):
+        store.physical_collection("ctx__garchive", generation="a1b2")
+    # The marker alone, or a marker not in suffix position, stays allowed.
+    assert store.physical_collection("ctx__g") == "proj__dev__ctx__g"
+    assert store.physical_collection("ctx__gv2__x") == "proj__dev__ctx__gv2__x"
+
+
+def test_retirement_matches_complete_generation_names_only(
+    tmp_path: Path,
+) -> None:
+    """A collection sharing the prefix without the exact token shape survives.
+
+    Only `<base>__g<token>` with one valid 1-16 lowercase-alphanumeric token
+    is a generation; a longer or malformed remainder is somebody else's
+    collection, never a sweep candidate.
+    """
+    store = _gen_store(tmp_path)
+    with store:
+        generation = store.physical_collection("ctx", generation="a1b2")
+        _make_collection(store, generation)
+        # Pre-existing or externally created names that merely share the
+        # prefix: an invalid token (underscore) and an over-long token.
+        for bystander in (
+            "proj__dev__ctx__gv2__extra",
+            "proj__dev__ctx__g" + "x" * 17,
+        ):
+            _make_collection(store, bystander)
+
+        candidates = superseded_generations(
+            store, logical_collection="ctx", active_collection=None
+        )
+        assert candidates == [generation]
+
+
+def test_retirement_aborts_when_the_publish_lease_is_stale(
+    tmp_path: Path,
+) -> None:
+    """A sweep whose lease was reassigned must not delete anything.
+
+    After `recover` clears the claim, another publisher may already be
+    building a new private generation; the fence check makes the stale
+    sweeper abort before any drop instead of deleting that build.
+    """
+    store = _gen_store(tmp_path)
+    with store, _held_publish_lease(tmp_path) as (coordinator, lease, scope):
+        superseded = store.physical_collection("ctx", generation="c3d4")
+        _make_collection(store, superseded)
+        coordinator.recover(scope, owner_terminated=True)
+
+        with pytest.raises(StaleServingLeaseError):
+            retire_superseded_generations(
+                store,
+                logical_collection="ctx",
+                active_collection=None,
+                coordinator=coordinator,
+                lease=lease,
+            )
+        assert superseded in store.list_collections()

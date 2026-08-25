@@ -35,6 +35,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    reject_generation_shaped_collection_name,
     validate_generation_token,
 )
 from .registry import register
@@ -404,7 +405,9 @@ class LanceDBStore(RetrievalStore):
             "target": _identifier_piece(self.target_name),
             "collection": _identifier_piece(logical_name),
         }
-        physical = self._config.collection_template.format(**values)
+        physical = reject_generation_shaped_collection_name(
+            self._config.collection_template.format(**values)
+        )
         if generation is not None:
             # Suffixed only when a generation is asked for, so the unsuffixed
             # name keeps addressing collections published before #355.
@@ -412,6 +415,15 @@ class LanceDBStore(RetrievalStore):
         if not _COLLECTION_RE.fullmatch(physical):
             raise RetrievalError("Resolved LanceDB collection name is invalid")
         return physical
+
+    def list_collections(self) -> tuple[str, ...]:
+        db = self._connection()
+        try:
+            return tuple(sorted(db.list_tables().tables))
+        except Exception:
+            raise RetrievalError(
+                "LanceDB operation 'list' failed (code=lancedb_list_failed)"
+            ) from None
 
     def drop_collection(self, name: str) -> bool:
         if not _COLLECTION_RE.fullmatch(name):

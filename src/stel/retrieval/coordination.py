@@ -697,6 +697,28 @@ class ServingCoordinator:
                 "re-run with the owner-terminated confirmation"
             )
         ledger = self._ref(LEDGER_TABLE)
+        # Recovery rebuilds the row, so the activation pointer has to be read
+        # before it is deleted and carried across (issue #355). Losing it
+        # would strand a generation-served index: the pointer is the only
+        # record of which physical collection is live, and without it the
+        # logical name falls back to the unsuffixed default, which for a
+        # generation build does not hold the data. The scope is left failed
+        # either way, so carrying it forward is inert for readers — it just
+        # keeps the information a republish or a retirement sweep needs.
+        # Read tolerantly: recovery also repairs a ledger corrupted by
+        # duplicate creation races, and `_read_row` refuses exactly that case.
+        # Among duplicates the highest fence is the one that got furthest.
+        pointer = self._adapter.rows(
+            f"""
+            SELECT active_collection FROM {ledger}
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND active_collection IS NOT NULL
+            ORDER BY fencing_token DESC
+            LIMIT 1
+            """,
+            self._scope_params(scope),
+        )
+        active_collection = str(pointer[0][0]) if pointer else None
         self._adapter.execute(
             f"""
             DELETE FROM {self._ref(LEASE_TABLE)}
@@ -725,10 +747,10 @@ class ServingCoordinator:
             f"""
             INSERT INTO {ledger} (
                 model_name, stage, target_identity, row_id, fencing_token,
-                status, safe_error_code, rows_inserted, rows_updated,
-                rows_skipped, rows_deleted, completed_at
+                status, safe_error_code, active_collection, rows_inserted,
+                rows_updated, rows_skipped, rows_deleted, completed_at
             )
-            SELECT ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP
             FROM (SELECT 1) AS seed
             """,
             [
@@ -737,6 +759,7 @@ class ServingCoordinator:
                 next_fence,
                 STATUS_FAILED,
                 RECOVERY_ERROR_CODE,
+                active_collection,
             ],
         )
         return self.status(scope)

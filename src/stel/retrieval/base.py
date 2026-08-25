@@ -163,6 +163,14 @@ class RetrievalCapabilities:
 
 _GENERATION_RE = re.compile(r"^[a-z0-9]{1,16}$")
 
+# Collections built for a generation are named `<base>__g<token>` by
+# `physical_collection(..., generation=...)`. The marker plus the exact token
+# shape is what a retirement sweep matches against, so the shape is reserved:
+# no *base* collection name may end this way (see
+# `reject_generation_shaped_collection_name`).
+GENERATION_MARKER = "__g"
+_GENERATION_SUFFIX_RE = re.compile(rf"{GENERATION_MARKER}[a-z0-9]{{1,16}}$")
+
 
 def validate_generation_token(value: str) -> str:
     """Validate a generation token before it is rendered into a collection name.
@@ -176,6 +184,28 @@ def validate_generation_token(value: str) -> str:
             "characters"
         )
     return value
+
+
+def reject_generation_shaped_collection_name(physical: str) -> str:
+    """Refuse a base collection name that looks like a generation collection.
+
+    The generation retirement sweep (issue #355) classifies any collection
+    named `<base>__g<token>` as a retired generation of `<base>` and deletes
+    it. A *logical* collection whose resolved base name ends the same way —
+    say logical `ctx__garchive` next to logical `ctx` — would be
+    indistinguishable from a generation of its sibling and swept with it, so
+    the shape is reserved at name-resolution time. Every store must route its
+    unsuffixed base names through this check before appending a generation
+    suffix.
+    """
+    if _GENERATION_SUFFIX_RE.search(physical):
+        raise RetrievalError(
+            f"Retrieval collection name '{physical}' ends with the reserved "
+            f"generation suffix `{GENERATION_MARKER}<token>`; rename the "
+            "logical collection so it cannot be mistaken for a retired "
+            "generation of a sibling collection"
+        )
+    return physical
 
 
 @dataclass(frozen=True)
@@ -374,6 +404,24 @@ class RetrievalStore(ABC):
         A generation token names a distinct, privately built collection that
         activation may later point the logical name at.
         """
+
+    def list_collections(self) -> tuple[str, ...]:
+        """Every physical collection name visible in this store's namespace.
+
+        Used to find generations the serving ledger no longer points at. The
+        names are unfiltered by ownership: `drop_collection` is what refuses a
+        collection stel does not own, and it should stay the single place that
+        decides that.
+        """
+        capabilities = self.capabilities()
+        if RetrievalFeature.PRIVATE_GENERATION_BUILD in capabilities.features:
+            raise RetrievalError(
+                "Retrieval store advertises private_generation_build but does "
+                "not implement list_collections()"
+            )
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot list collections"
+        )
 
     def drop_collection(self, name: str) -> bool:
         """Remove a physical collection, returning whether one was removed.

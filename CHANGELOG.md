@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Agent transcript pipeline: stel can read its own exhaust (issue #360)
+
+- **`stel transcripts convert` / `sync`** turn Claude Code and Codex session
+  transcripts into `transcript/v1` landing documents — one reduced JSON per
+  session, consumed downstream as an ordinary local `json` source. The
+  exchange is the unit: each `## [<ordinal>] <prompt>` heading lets the
+  existing chunker attribute every chunk to the request that produced it.
+  Reduction is the contract: prompts (truncated beyond 4,000 chars) and
+  assistant prose land; thinking blocks, tool result bodies, tool argument
+  values, sidechain and meta records never do — each tool call reduces to
+  name, argument fingerprint, outcome, and dropped-output byte count, and
+  file-bearing arguments become per-exchange `files_touched`. `sync` skips
+  live sessions (`--min-idle-seconds`, default 300) and writes atomically per
+  session id, so a grown session re-lands exactly one document.
+- **`examples/agent_transcripts/`** composes the full pipeline with shipped
+  primitives only: landing files → json extraction → heading-attributed
+  chunks → `agent_context/v1` wrappers (incremental, registry as a keyed
+  reference dep) → deterministic embeddings → a governed search index with
+  `harness`, `exchange_heading`, `tools_used`, and `files_touched` attributes.
+
 ### Example wrappers construct frames from the contract schema (issue #366)
 
 - The `agent_context_from_builtin_pipeline` transforms build their output with

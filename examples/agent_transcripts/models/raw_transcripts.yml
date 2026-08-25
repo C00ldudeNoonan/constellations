@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: raw_transcripts
+    description: "transcript/v1 sessions extracted from the landing directory"
+    source: ref('transcript_landing')
+    extraction:
+      backend: json
+      options:
+        fields:
+          - session_id
+          - harness
+          - project_path
+          - git_branch
+          - started_at
+          - ended_at
+          - text
+          - exchanges
+          - tools_used
+          - files_touched
+    materialization: incremental
+    tests:
+      - not_null: [session_id, harness, text]
+      - unique: session_id

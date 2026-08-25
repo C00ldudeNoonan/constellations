@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: transcript_search
+    description: "What did past agent sessions try? Exchange-grain session search"
+    depends_on: [ref('chunk_embeddings')]
+    materialization: incremental
+    tags: [retrieval, agent-context]
+    search:
+      access: governed
+      store: local
+      collection: agent_transcripts
+      id_field: context_id
+      document_id_field: document_id
+      chunk_id_field: chunk_id
+      text_fields: [text]
+      return_text_fields: [text]
+      vector:
+        field: embedding
+        dimensions: 8
+        metric: cosine
+        search: exact
+        embedding: inherit
+      full_text:
+        fields: [text]
+      attributes:
+        - name: tenant_id
+          data_type: string
+          filter_role: policy
+        - name: title
+          data_type: string
+          returned: true
+        - name: harness
+          data_type: string
+          returned: true
+        # Nullable: the session-header chunk precedes the first exchange
+        # heading, so it carries no attribution.
+        - name: exchange_heading
+          data_type: string
+          returned: true
+          nullable: true
+        - name: tools_used
+          data_type: string
+          returned: true
+        - name: files_touched
+          data_type: string
+          returned: true
+      display_fields: [title]
+      query:
+        modes: [vector, text, hybrid]
+        consistency: strong
+      on_index_change: fail
+      batch_size: 100

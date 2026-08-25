@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: transcript_landing
+    description: >
+      transcript/v1 landing documents written by `stel transcripts convert`
+      or `stel transcripts sync` (issue #360). In a real deployment this
+      directory sits outside the project (set `external: true`) and a
+      SessionEnd hook or scheduled sync appends to it.
+    path: "./fixtures/landing/"
+    file_pattern: "*.json"

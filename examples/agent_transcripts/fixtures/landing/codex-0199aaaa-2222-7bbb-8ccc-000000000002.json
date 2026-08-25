@@ -1,0 +1,33 @@
+{
+  "schema_version": "transcript/v1",
+  "harness": "codex",
+  "session_id": "0199aaaa-2222-7bbb-8ccc-000000000002",
+  "source_path": "C:\\Users\\alexn\\AppData\\Local\\Temp\\claude\\C--Users-alexn-Documents-github-dbt-ml\\053026d8-04cf-4fb4-9872-b438cd5903ce\\scratchpad\\fixture_src\\rollout-sample.jsonl",
+  "project_path": "/work/sample-app",
+  "git_branch": "feature/etl",
+  "started_at": "2026-08-21T09:00:02Z",
+  "ended_at": "2026-08-21T09:01:10Z",
+  "exchange_count": 1,
+  "tools_used": [
+    "shell"
+  ],
+  "files_touched": [],
+  "text": "## [0] Profile the ETL job and tell me where the time goes\n\n- tool shell (ok, 6000B) args:5981e97992a6\n\nNinety percent of the wall time is the row-by-row insert loop; batching inserts with executemany cuts the run from 41s to 6s.\n",
+  "exchanges": [
+    {
+      "ordinal": 0,
+      "heading": "[0] Profile the ETL job and tell me where the time goes",
+      "started_at": "2026-08-21T09:00:02Z",
+      "ended_at": "2026-08-21T09:01:10Z",
+      "prompt_chars": 51,
+      "prompt_truncated": false,
+      "assistant_chars": 125,
+      "tool_calls": 1,
+      "tool_errors": 0,
+      "tools_used": [
+        "shell"
+      ],
+      "files_touched": []
+    }
+  ]
+}

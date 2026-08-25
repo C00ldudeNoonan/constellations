@@ -2841,6 +2841,7 @@ stops before it pollutes everything downstream.
 | `examples/rag_chunks_pipeline/`     | document registry → deterministic RAG chunks                           |
 | `examples/sql_governed_chunks/`     | warehouse-native SQL model applying document permissions               |
 | [`examples/metric_evidence_agent/`](../examples/metric_evidence_agent/) | dbt metric + governed, cited stel evidence over two MCP servers |
+| `examples/agent_transcripts/`       | Claude Code / Codex sessions → exchange-attributed governed search (#360) |
 
 The stel-native examples run with
 `uv run stel --project-dir examples/<name> ...`. The two dbt composition
@@ -3052,6 +3053,45 @@ text, no credential values or environment-variable names.
 
 Retention and pruning are yours: the tables are primitives, and anything
 reading them is a downstream concern.
+
+## Agent transcripts
+
+`stel transcripts` converts Claude Code and Codex session transcripts into
+`transcript/v1` landing documents — one reduced JSON file per session — that
+an ordinary local `json` source then consumes (issue #360). The session is
+the document and the *exchange* (one user prompt plus every assistant and
+tool turn it caused) is the unit chunks attribute to: each exchange renders
+under a `## [<ordinal>] <prompt>` markdown heading, so a `chunk:` model with
+`headings.pattern: '^## (\[\d+\] .+)$'` names every chunk's exchange in its
+`section` column.
+
+```bash
+stel transcripts convert <transcript.jsonl> --out <landing-dir>   # e.g. from a SessionEnd hook
+stel transcripts sync --out <landing-dir>                          # scan ~/.claude/projects and ~/.codex/sessions
+```
+
+Reduction is the contract, not a tuning knob: user prompts (truncated beyond
+4,000 characters — pasted bulk content does not land whole) and assistant
+prose are kept; thinking blocks, tool result bodies, and tool argument values
+are dropped. Each tool call contributes one line — name, argument
+fingerprint, ok/error, and the byte count of the output that was dropped —
+and the file paths named by file-bearing arguments become per-exchange
+`files_touched`, the corpus's best search filter. Sidechain (subagent) and
+meta records, and Codex instruction/environment messages, never land.
+
+`sync` skips any transcript modified within `--min-idle-seconds`
+(default 300): that file is a live session, and its sealed exchanges land on
+a later pass. Landing writes are atomic and named `{harness}-{session_id}.json`,
+so a grown session rewrites exactly one document and content-hash-based
+extraction reprocesses only it. Both parsers are tolerant by contract —
+unknown record types and torn tail lines skip rather than fail, since neither
+harness versions its transcript format.
+
+`examples/agent_transcripts/` composes the full pipeline: landing files →
+`json` extraction → heading-attributed chunks → `agent_context/v1` wrapper
+transforms (incremental, with the registry as a keyed reference dep) →
+deterministic embeddings → a governed search index with `harness`,
+`exchange_heading`, `tools_used`, and `files_touched` attributes.
 
 ## Artifacts
 

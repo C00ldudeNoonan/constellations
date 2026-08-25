@@ -1,0 +1,10 @@
+name: agent_transcripts
+version: "0.1.0"
+profile: agent_transcripts
+
+extraction:
+  default_backend: json
+
+source-paths: ["sources"]
+model-paths: ["models"]
+target-path: "target"

@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: document_registry
+    description: "agent_context/v1 document_registry: one row per agent session"
+    depends_on: [ref('raw_transcripts')]
+    transform:
+      type: python
+      module: transforms.document_registry
+    agent_context:
+      contract: agent_context/v1
+      grain: document_registry
+    fields:
+      - name: title
+        data_type: string
+      - name: harness
+        data_type: string
+      - name: session_id
+        data_type: string
+      - name: upstream_document_id
+        data_type: string
+      - name: exchanges
+        data_type: string
+    materialization: full
+    tests:
+      - not_null: [document_id, document_version_id, source_key, title]
+      - unique: document_version_id

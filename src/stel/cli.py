@@ -1979,6 +1979,99 @@ def providers_list(output: str) -> None:
         )
 
 
+@cli.group()
+def transcripts() -> None:
+    """Convert agent-session transcripts into transcript/v1 landing files.
+
+    Claude Code and Codex sessions become one reduced, exchange-structured
+    JSON document each, ready to consume as an ordinary local json source
+    (issue #360). Prose is kept; tool exhaust is reduced to name, argument
+    fingerprint, outcome, and byte count.
+    """
+
+
+@transcripts.command("convert")
+@click.argument(
+    "paths",
+    nargs=-1,
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--out",
+    "out_dir",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Landing directory for transcript/v1 documents.",
+)
+def transcripts_convert(paths: tuple[Path, ...], out_dir: Path) -> None:
+    """Convert specific transcript files (assumed final, e.g. from a
+    SessionEnd hook). The harness is detected per file."""
+    from .transcripts import convert_file
+
+    for path in paths:
+        landed = convert_file(path, out_dir)
+        if landed is None:
+            raise click.ClickException(
+                f"Not a recognized agent transcript with conversation: {path}"
+            )
+        click.echo(f"wrote {landed}")
+
+
+@transcripts.command("sync")
+@click.option(
+    "--out",
+    "out_dir",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Landing directory for transcript/v1 documents.",
+)
+@click.option(
+    "--claude-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Claude Code projects directory [default: ~/.claude/projects].",
+)
+@click.option(
+    "--codex-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Codex sessions directory [default: ~/.codex/sessions].",
+)
+@click.option(
+    "--min-idle-seconds",
+    type=click.FloatRange(min=0),
+    default=None,
+    help="Skip transcripts modified more recently than this — the live "
+    "session rule [default: 300].",
+)
+def transcripts_sync(
+    out_dir: Path,
+    claude_dir: Path | None,
+    codex_dir: Path | None,
+    min_idle_seconds: float | None,
+) -> None:
+    """Scan the harness directories and convert every settled transcript."""
+    from .transcripts import (
+        DEFAULT_MIN_IDLE_SECONDS,
+        default_claude_dir,
+        default_codex_dir,
+        sync_transcripts,
+    )
+
+    written = sync_transcripts(
+        out_dir=out_dir,
+        claude_dir=claude_dir if claude_dir is not None else default_claude_dir(),
+        codex_dir=codex_dir if codex_dir is not None else default_codex_dir(),
+        min_idle_seconds=(
+            min_idle_seconds
+            if min_idle_seconds is not None
+            else DEFAULT_MIN_IDLE_SECONDS
+        ),
+    )
+    click.echo(f"wrote {len(written)} transcript document(s) to {out_dir}")
+
+
 @cli.command()
 @_project_context_options
 @click.pass_context

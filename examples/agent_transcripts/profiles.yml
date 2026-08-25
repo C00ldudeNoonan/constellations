@@ -1,0 +1,14 @@
+agent_transcripts:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/transcripts.duckdb
+        schema: transcripts
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb

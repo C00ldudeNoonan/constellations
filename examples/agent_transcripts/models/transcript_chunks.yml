@@ -1,0 +1,23 @@
+version: 2
+
+# The built-in chunk: primitive with heading attribution (issue #332): every
+# exchange in the rendered transcript opens with a `## [<ordinal>] <prompt>`
+# heading, so each chunk's `section` names the exchange that produced it.
+models:
+  - name: transcript_chunks
+    description: "Recursive character chunks of each session, attributed to exchanges"
+    depends_on: [ref('raw_transcripts')]
+    chunk:
+      strategy: recursive
+      text_field: text
+      chunk_size: 700
+      chunk_overlap: 80
+      headings:
+        pattern: '^## (\[\d+\] .+)$'
+    # Incremental matters twice here: unchanged sessions are not re-chunked,
+    # and their rows keep a stable `chunked_at`, so the downstream keyed
+    # incremental transform sees stable parent fingerprints (issue #364).
+    materialization: incremental
+    tests:
+      - not_null: [chunk_id, document_id, text]
+      - unique: chunk_id

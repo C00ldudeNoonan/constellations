@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: document_chunks
+    description: "agent_context/v1 document_chunks: exchange-attributed session chunks"
+    depends_on: [ref('document_registry'), ref('transcript_chunks')]
+    transform:
+      type: python
+      module: transforms.document_chunks
+    agent_context:
+      contract: agent_context/v1
+      grain: document_chunks
+    fields:
+      - name: title
+        data_type: string
+      - name: harness
+        data_type: string
+      - name: upstream_document_id
+        data_type: string
+      - name: exchange_ordinal
+        data_type: integer
+      - name: exchange_heading
+        data_type: string
+      - name: tools_used
+        data_type: string
+      - name: files_touched
+        data_type: string
+      - name: tool_errors
+        data_type: integer
+    materialization: incremental
+    tests:
+      - not_null: [context_id, chunk_id, document_version_id, text]
+      - unique: context_id

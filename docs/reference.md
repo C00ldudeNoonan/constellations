@@ -1308,8 +1308,8 @@ which sets how many changed parents are invoked and published per batch:
   materialization: incremental
 ```
 
-Each batch publishes its children and advances those parents' state before the
-next begins, so a run that fails partway keeps what committed and a relaunch
+Each batch reconciles `on_schema_change`, publishes its children, and advances
+those parents' state before the next begins, so a run that fails partway keeps what committed and a relaunch
 reprocesses only the parents whose state never advanced. Without it, a failure
 at the last parent — or at the publish — re-pays the whole corpus, which on a
 multi-million-row wrapper is tens of minutes and a multi-gigabyte republish.

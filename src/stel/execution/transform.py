@@ -441,7 +441,6 @@ def _run_incremental_transform(
     changed_set = set(changed)
     records_by_parent = {record.record_key: record for record in state_records}
     rows_written = 0
-    batches = 0
     for batch in _batched(processed_parents, model.transform_commit_every()):
         call_deps = dict(deps)
         call_deps[parent_source] = parent_frame.filter(
@@ -462,15 +461,19 @@ def _run_incremental_transform(
                 new_rows=output,
                 state_scope=state_scope,
                 state_records=[records_by_parent[key] for key in batch],
-                # Reconciled by the first batch; later batches carry the same
-                # output schema, so re-running the policy would either repeat
-                # the ALTER or compare against a table it just changed.
-                on_schema_change=model.on_schema_change if batches == 0 else "ignore",
+                # Every batch, not just the first (Codex review). A transform's
+                # output schema can be data-dependent, so a later batch may
+                # introduce a column the first never emitted. Forcing `ignore`
+                # after the first batch would drop that column silently while
+                # still advancing the parents' state, making the loss
+                # unrecoverable on later runs. Reconciling every batch costs
+                # nothing when the schema is stable: `plan_schema_change`
+                # early-returns once the column sets match.
+                on_schema_change=model.on_schema_change,
                 options=options,
             )
         except AdapterError as error:
             raise RunError(str(error)) from error
-        batches += 1
 
     result.rows_written = rows_written
     result.documents_processed = len(processed_parents)

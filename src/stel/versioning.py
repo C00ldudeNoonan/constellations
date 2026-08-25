@@ -241,7 +241,12 @@ def compute_model_code_version(
                 canonical_options
             )
     if model.transform is not None and model.transform.uses_llm:
-        effective_transform = model.transform.model_dump()
+        # Same exclusion as the non-LLM path below (Codex review). This branch
+        # builds the transform payload itself, so without it `commit_every`
+        # stayed in the hash for exactly the transforms where a needless
+        # reprocess is most expensive — tuning the batch size would re-run
+        # every parent through inference.
+        effective_transform = model.transform.model_dump(exclude={"commit_every"})
         effective_transform["inference"] = _profile_inference_descriptor(resolved)
         effective_transform["llm_helper_implementation"] = get_backend(
             "llm"

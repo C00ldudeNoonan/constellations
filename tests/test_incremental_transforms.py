@@ -1083,6 +1083,80 @@ def test_a_run_smaller_than_the_batch_size_commits_once(
     assert calls["n"] == 1
 
 
+@pytest.mark.parametrize("uses_llm", [False, True])
+def test_commit_every_stays_out_of_code_version(tmp_path: Path, uses_llm: bool) -> None:
+    """Both branches of the code-version payload, and that is the point.
+
+    `uses_llm` transforms build their own `effective_transform`, so an
+    exclusion applied only to the fallback branch left the dial inside the
+    hash for exactly the models where a needless reprocess costs the most —
+    every parent back through inference (Codex review). The non-LLM case alone
+    passed while the bug was live.
+    """
+    from stel.config import load_project
+    from stel.versioning import compute_model_code_version
+
+    project = _project(tmp_path)
+    _write_doc(project, "d0.json", "word0")
+    project_config, _sources, models = load_project(project)
+    model = next(item for item in models if item.name == "word_tokens")
+    assert model.transform is not None
+    if uses_llm:
+        model = model.model_copy(
+            update={"transform": model.transform.model_copy(update={"uses_llm": True})}
+        )
+        assert model.transform is not None
+
+    baseline = compute_model_code_version(model, project_config, project)
+    tuned = model.model_copy(
+        update={"transform": model.transform.model_copy(update={"commit_every": 7})}
+    )
+    changed = model.model_copy(
+        update={"transform": model.transform.model_copy(update={"module": "other"})}
+    )
+
+    assert compute_model_code_version(tuned, project_config, project) == baseline
+    assert compute_model_code_version(changed, project_config, project) != baseline
+
+
+def test_a_later_batch_that_adds_a_column_still_reconciles_schema(
+    tmp_path: Path,
+) -> None:
+    """A transform's output schema can be data-dependent, so a later batch may
+    emit a column the first never did. Forcing `ignore` after the first batch
+    dropped it silently while still advancing state, making the loss
+    unrecoverable (Codex review). Under `fail` the drift must surface."""
+    project = _project(tmp_path)
+    _set_commit_every(project, 1)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+    # A first run is a full materialization, so it never batches. The state it
+    # leaves is what makes the next run incremental.
+    run_project(project)
+
+    transform = project / "transforms" / "word_tokens.py"
+    widened = chr(10).join(
+        [
+            "    frame = pl.DataFrame(rows, schema=_SCHEMA)",
+            "    # Every parent but the first emits a column the first never did.",
+            "    if rows and rows[0]['word'] != 'word0':",
+            "        frame = frame.with_columns(extra=pl.lit('x'))",
+            "    return frame",
+        ]
+    )
+    transform.write_text(
+        transform.read_text(encoding="utf-8").replace(
+            "    return pl.DataFrame(rows, schema=_SCHEMA)", widened
+        ),
+        encoding="utf-8",
+    )
+
+    # The edited module changes code_version, so every parent reprocesses —
+    # batch 1 (d0) emits the original schema, batch 2 (d1) adds a column.
+    with pytest.raises(Exception, match="Schema change"):
+        run_project(project)
+
+
 def test_commit_every_does_not_invalidate_existing_state(tmp_path: Path) -> None:
     """It changes execution cadence, never output content — so it must stay out
     of code_version, exactly like extraction's flush_every. Including it would

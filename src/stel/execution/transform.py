@@ -521,16 +521,52 @@ def _parent_groups(
     data it came from, which is how a 5GB parent table reached a 10GiB ceiling.
 
     Streaming per parent puts the ceiling at the largest single parent instead
-    of the whole corpus. `partition_by(maintain_order=True)` preserves
-    first-appearance group order, so processed-parent ordering is unchanged,
-    and each parent's rows are serialized exactly as before — the fingerprint
-    is byte-identical, which it has to be: a changed digest would invalidate
-    every parent in every existing project and re-run the whole corpus.
+    of the whole corpus. Group order is first-appearance and each parent's rows
+    are serialized exactly as before — the fingerprint is byte-identical, which
+    it has to be: a changed digest would invalidate every parent in every
+    existing project and re-run the whole corpus.
     """
     _validate_group_key(frame, key_col, model_name=model_name, surface="parent_source")
-    for partition in frame.partition_by(key_col, maintain_order=True):
+    for key, group in _row_groups(frame, key_col, model_name=model_name):
         # Materialized per parent, then dropped when the next one is yielded.
-        yield str(partition[key_col][0]), list(partition.iter_rows(named=True))
+        yield key, list(group.iter_rows(named=True))
+
+
+# Scratch column for the row indices `_row_groups` gathers by. Suffixed to
+# stay clear of user columns; a collision is refused rather than shadowed.
+_ROW_INDEX_COLUMN = "__stel_row_index__"
+
+
+def _row_groups(
+    frame: pl.DataFrame, key_col: str, *, model_name: str
+) -> Iterator[tuple[str, pl.DataFrame]]:
+    """Yield (key, rows) one group at a time, in first-appearance key order.
+
+    Lazily, which is the whole point of issue #383 and the part
+    `partition_by` cannot do: it returns a *list* of every partition, so the
+    entire corpus is materialized as sub-frames before a generator over it can
+    yield anything — the peak this was meant to remove, plus per-DataFrame
+    overhead that is worst for the high-cardinality tables that motivated the
+    change (Codex review).
+
+    Instead one pass records each group's row indices — a few bytes per row,
+    not a copy of it — and each group is gathered only when it is asked for.
+    Peak memory is then the source frame plus the largest single group.
+    """
+    if _ROW_INDEX_COLUMN in frame.columns:
+        raise RunError(
+            f"Incremental transform '{model_name}': input column "
+            f"'{_ROW_INDEX_COLUMN}' is reserved by stel; rename it"
+        )
+    grouped = (
+        frame.with_row_index(_ROW_INDEX_COLUMN)
+        .group_by(key_col, maintain_order=True)
+        .agg(pl.col(_ROW_INDEX_COLUMN))
+    )
+    for key, indices in zip(
+        grouped[key_col], grouped[_ROW_INDEX_COLUMN], strict=True
+    ):
+        yield str(key), frame[indices]
 
 
 def _frame_fingerprint(frame: pl.DataFrame) -> str:
@@ -586,11 +622,11 @@ def _keyed_reference_fingerprints(
     # (issue #383): only the digest is kept, so holding every group's rows as
     # Python objects bought nothing and cost a whole-table copy.
     return {
-        str(partition[key_col][0]): canonical_fingerprint(
-            {"rows": sorted(partition.iter_rows(named=True), key=canonical_json)},
+        key: canonical_fingerprint(
+            {"rows": sorted(group.iter_rows(named=True), key=canonical_json)},
             domain="dbt-ml.transform-incremental-reference",
         )
-        for partition in frame.partition_by(key_col, maintain_order=True)
+        for key, group in _row_groups(frame, key_col, model_name=model_name)
     }
 
 

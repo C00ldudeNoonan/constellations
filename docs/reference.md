@@ -3085,7 +3085,10 @@ the feedback loop is built on, so each one lands in the exchange's
 `context_calls` as structured fields — the context model queried, the
 `query_fingerprint`, the returned `context_id`s and `chunk_id`s, whether the
 call returned nothing, and which of the returned ids the assistant went on to
-name in the prose that followed. The result body itself is still dropped, and
+name in the prose that followed. A call that *failed* records its MCP
+`error_code` and is never marked `zero_results`: a denied or timed-out search
+returned nothing because it failed, and counting it as an empty retrieval
+would corrupt the zero-result rate this corpus exists to measure. The result body itself is still dropped, and
 the fingerprint uses the same function and domain as the MCP query log, so a
 transcript row joins directly to a served-side log row.
 

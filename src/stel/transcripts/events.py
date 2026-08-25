@@ -48,6 +48,10 @@ class ContextCall:
     returned_chunk_ids: tuple[str, ...]
     cited_context_ids: tuple[str, ...]
     zero_results: bool
+    # The MCP error code when the call failed, else None. A failed search is
+    # not an empty one: conflating them would poison the zero-result rate,
+    # which is the cheapest retrieval-quality signal there is (Codex review).
+    error_code: str | None
 
 
 @dataclass(frozen=True)

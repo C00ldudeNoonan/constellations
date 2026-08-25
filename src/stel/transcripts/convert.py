@@ -284,6 +284,7 @@ def _context_calls(
                 returned_chunk_ids=call.returned_chunk_ids,
                 cited_context_ids=cited_ids(following, call.returned_context_ids),
                 zero_results=call.zero_results,
+                error_code=call.error_code,
             )
         )
     return tuple(records)

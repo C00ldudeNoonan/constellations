@@ -3,7 +3,6 @@
 pipeline entry points."""
 from .contract import (
     TRANSCRIPT_SCHEMA_VERSION,
-    TranscriptContextCall,
     TranscriptDocument,
     TranscriptExchange,
 )
@@ -22,7 +21,6 @@ from .convert import (
 __all__ = [
     "DEFAULT_MIN_IDLE_SECONDS",
     "TRANSCRIPT_SCHEMA_VERSION",
-    "TranscriptContextCall",
     "TranscriptDocument",
     "TranscriptExchange",
     "build_document",

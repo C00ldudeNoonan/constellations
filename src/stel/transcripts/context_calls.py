@@ -61,6 +61,7 @@ def parse_context_call(
     query = args.get("query")
     query_text = query if isinstance(query, str) else None
     model = args.get("model")
+    error_code = _error_code(payload)
     return ContextCall(
         model=model if isinstance(model, str) else None,
         # Fingerprinted with the same function and domain the MCP query log
@@ -72,7 +73,11 @@ def parse_context_call(
         returned_context_ids=tuple(context_ids),
         returned_chunk_ids=tuple(chunk_ids),
         cited_context_ids=(),
-        zero_results=not context_ids and not chunk_ids,
+        # A failed call returned nothing because it failed, not because the
+        # corpus had no match; only a successful empty result is a zero
+        # result (Codex review).
+        zero_results=error_code is None and not context_ids and not chunk_ids,
+        error_code=error_code,
     )
 
 
@@ -88,6 +93,23 @@ def cited_ids(prose: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(
         candidate for candidate in candidates if candidate and candidate in prose
     )
+
+
+def _error_code(payload: dict[str, Any]) -> str | None:
+    """The MCP error code of a failed context response, else None.
+
+    An error response still declares `mcp_context/v1` and carries empty
+    `results`, so without this a denied or timed-out call would be recorded as
+    a genuine zero-result retrieval.
+    """
+    error = payload.get("error")
+    if error is None:
+        return None
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, str) and code:
+            return code
+    return "unknown"
 
 
 def _is_search_tool(tool_name: str) -> bool:

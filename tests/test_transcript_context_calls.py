@@ -141,6 +141,7 @@ def test_search_context_call_is_captured_without_its_body(tmp_path: Path) -> Non
     assert call.returned_context_ids == (_CTX_A, _CTX_B)
     assert call.returned_chunk_ids == (_CHUNK_A, _CHUNK_A)
     assert call.zero_results is False
+    assert call.error_code is None
     # The snippet bodies that carried those ids are still dropped entirely.
     assert "must never land" not in document.model_dump_json()
 
@@ -194,8 +195,38 @@ def test_citation_requires_prose_after_the_call(tmp_path: Path) -> None:
 def test_zero_result_call_is_recorded(tmp_path: Path) -> None:
     call, _ = _only_call(tmp_path, _session(result=_context_response()))
     assert call.zero_results is True
+    assert call.error_code is None
     assert call.returned_context_ids == ()
     assert call.cited_context_ids == ()
+
+
+def test_failed_call_is_not_a_zero_result(tmp_path: Path) -> None:
+    """A denied or timed-out search returns no rows because it failed, not
+    because the corpus had no match. Recording it as a zero result would
+    poison the retrieval-quality signal this feature exists to produce
+    (Codex review).
+    """
+    for code in ("not_found_or_denied", "timeout", "busy"):
+        error_response = json.dumps(
+            {
+                "schema_version": "mcp_context/v1",
+                "results": [],
+                "error": {"code": code, "message": "m", "retryable": True},
+            }
+        )
+        call, _ = _only_call(tmp_path, _session(result=error_response))
+        assert call.error_code == code
+        assert call.zero_results is False
+        assert call.returned_context_ids == ()
+
+
+def test_malformed_error_still_marks_the_call_failed(tmp_path: Path) -> None:
+    malformed = json.dumps(
+        {"schema_version": "mcp_context/v1", "results": [], "error": "boom"}
+    )
+    call, _ = _only_call(tmp_path, _session(result=malformed))
+    assert call.error_code == "unknown"
+    assert call.zero_results is False
 
 
 def test_mcp_text_block_result_shape_is_recognized(tmp_path: Path) -> None:

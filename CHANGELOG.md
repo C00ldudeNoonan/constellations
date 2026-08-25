@@ -8,7 +8,8 @@
   `search_context` call against stel's own MCP server, the converter now keeps
   the context model, `query_fingerprint`, returned `context_id`s/`chunk_id`s,
   the zero-result flag, and which returned ids the assistant named in the
-  prose that followed. This is a deliberate, narrow exception to the #360
+  prose that followed. A failed call records its MCP `error_code` instead and
+  is never counted as a zero result. This is a deliberate, narrow exception to the #360
   reduction — the result body is still dropped — because that reduction
   otherwise discards exactly the retrieval judgment #329 phase 3 consumes.
 - The fingerprint uses the same function and domain as the MCP query log, so a

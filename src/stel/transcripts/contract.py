@@ -28,7 +28,8 @@ class TranscriptContextCall(BaseModel):
     """One stel `search_context` call the exchange made (issue #380).
 
     The retrieval judgment in reduced form: which ids came back, and which of
-    them the assistant's answer went on to name. `query_fingerprint` uses the
+    them the answer went on to name, or the MCP error code if the call
+    failed. `query_fingerprint` uses the
     same function and domain as the MCP query log, so a transcript row joins
     to a served-side log row. `query_text` is null unless the converter was
     run with query capture opted in.
@@ -42,7 +43,11 @@ class TranscriptContextCall(BaseModel):
     returned_context_ids: tuple[str, ...]
     returned_chunk_ids: tuple[str, ...]
     cited_context_ids: tuple[str, ...]
+    # True only for a call that succeeded and matched nothing. A call that
+    # failed carries `error_code` instead and is neither a relevant judgment
+    # nor a hard negative.
     zero_results: bool
+    error_code: str | None = None
 
 
 class TranscriptExchange(BaseModel):

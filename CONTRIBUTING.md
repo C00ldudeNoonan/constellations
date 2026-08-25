@@ -116,6 +116,15 @@ in stel's installed backend registry.
    key and upserting on the child key. Emit the same deterministic `child_key` for the
    same input, carry the `parent_key` on every output row, and process parents
    independently (a transform needing cross-parent state cannot be incremental).
+   Optionally declare `identity_columns` — the columns that constitute a
+   parent's identity (issue #385). Without them, every column counts: the
+   runner reads the whole parent table to classify, and editing a column the
+   transform never reads still reprocesses the parent. Declaring them narrows
+   the classify read to those columns and scopes the full-row read to the
+   parents that actually changed, so cost tracks the change set rather than the
+   corpus. Declare the columns the transform's output actually depends on;
+   a column outside the set stops invalidating, and opting in changes the
+   fingerprint, so that transform reprocesses once.
    Without the hook a transform stays `full`; declaring it for
    `materialization: incremental` is required and validated against `depends_on`
    at compile time.

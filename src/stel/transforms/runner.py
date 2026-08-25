@@ -98,6 +98,18 @@ class IncrementalContract:
     parent_source_key: str
     parent_source: str | None = None
     reference_deps: tuple[str | ReferenceDep, ...] = ()
+    # Columns that constitute a parent's identity (issue #385). Empty — the
+    # default — means every column, which is the original behavior and keeps
+    # existing fingerprints byte-identical, so a transform that does not
+    # declare these reprocesses nothing on upgrade.
+    #
+    # Declaring them does two things: the runner reads only these columns to
+    # decide which parents changed, so classification stops scanning the whole
+    # table; and a column outside the set stops invalidating the parent, which
+    # is usually a fix rather than a loss — today editing a column the
+    # transform never reads still forces a reprocess. Opting in changes the
+    # digest, so that transform reprocesses once.
+    identity_columns: tuple[str, ...] = ()
 
     def reference_specs(self) -> tuple[ReferenceDep, ...]:
         """Every reference dep in normalized :class:`ReferenceDep` form."""
@@ -105,6 +117,18 @@ class IncrementalContract:
             ref if isinstance(ref, ReferenceDep) else ReferenceDep(ref)
             for ref in self.reference_deps
         )
+
+    def classify_columns(self) -> tuple[str, ...] | None:
+        """Columns the runner must read to classify parents, or None for all.
+
+        The parent key is always included: it is what groups the rows, so a
+        contract that lists identity columns without it would still need it.
+        """
+        if not self.identity_columns:
+            return None
+        if self.parent_source_key in self.identity_columns:
+            return self.identity_columns
+        return (self.parent_source_key, *self.identity_columns)
 
     def resolve_parent_source(self, dependencies: Sequence[str]) -> str:
         """The effective parent-source model name for ``dependencies``. When
@@ -124,6 +148,16 @@ class IncrementalContract:
                 raise ValueError(f"IncrementalContract.{name} must be a non-empty string")
         if self.parent_key == self.child_key:
             raise ValueError("IncrementalContract parent_key and child_key must differ")
+        for column in self.identity_columns:
+            if not isinstance(column, str) or not column.strip():
+                raise ValueError(
+                    "IncrementalContract.identity_columns entries must be "
+                    "non-empty column names"
+                )
+        if len(set(self.identity_columns)) != len(self.identity_columns):
+            raise ValueError(
+                "IncrementalContract.identity_columns must not repeat a column"
+            )
         for ref in self.reference_deps:
             if isinstance(ref, ReferenceDep):
                 if not isinstance(ref.name, str) or not ref.name.strip():

@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 
 from ..adapters import (
     AdapterError,
+    ReadPredicate,
+    ReadPredicateOperator,
     StateRecord,
     StateScope,
     StateValue,
@@ -172,6 +174,24 @@ def run_transform_model(
     )
 
     transform_fn = load_transform(model.transform.module, project_dir)
+
+    # Resolved before the dependencies are read, not after: the contract names
+    # the parent source and the columns that identify a parent, and both are
+    # needed to avoid reading the whole parent table (issue #385).
+    contract = (
+        load_incremental_contract(
+            model.transform.module, project_dir, model.transform.options
+        )
+        if model.materialization == "incremental"
+        else None
+    )
+    classify_columns = contract.classify_columns() if contract is not None else None
+    parent_source_name = (
+        contract.resolve_parent_source([parse_ref(ref) for ref in model.depends_on])
+        if contract is not None and model.depends_on
+        else None
+    )
+
     deps: dict[str, pl.DataFrame] = {}
     if dbt_ref_source is not None:
         # The single input is a dbt-built table (#177). In embedded mode the dbt
@@ -181,7 +201,15 @@ def run_transform_model(
         deps[dbt_ref_name] = adapter.read_table(dbt_ref_name)
     for dep_ref in model.depends_on or []:
         dep_name = parse_ref(dep_ref)
-        deps[dep_name] = adapter.read_table(dep_name)
+        if dep_name == parent_source_name and classify_columns is not None:
+            # Only the identity columns, and only to classify. The rows the
+            # transform receives are read per batch, scoped to the parents that
+            # actually changed.
+            deps[dep_name] = _read_projected(
+                adapter, dep_name, classify_columns, model
+            )
+        else:
+            deps[dep_name] = adapter.read_table(dep_name)
 
     ctx = TransformContext(
         project_dir=project_dir,
@@ -203,9 +231,6 @@ def run_transform_model(
     )
 
     if model.materialization == "incremental":
-        contract = load_incremental_contract(
-            model.transform.module, project_dir, model.transform.options
-        )
         # The compiler requires the contract for incremental materialization.
         assert contract is not None, "incremental transform is missing its contract"
         _require_incremental_capabilities(model, adapter)
@@ -441,11 +466,21 @@ def _run_incremental_transform(
     changed_set = set(changed)
     records_by_parent = {record.record_key: record for record in state_records}
     rows_written = 0
+    classify_only = contract.classify_columns() is not None
     for batch in _batched(processed_parents, model.transform_commit_every()):
         call_deps = dict(deps)
-        call_deps[parent_source] = parent_frame.filter(
-            pl.col(contract.parent_source_key).is_in(batch)
-        )
+        if classify_only:
+            # `parent_frame` holds only the identity columns, so the rows the
+            # transform needs are fetched here, scoped to this batch's parents
+            # (issue #385). This is the read that makes bytes scanned
+            # proportional to what changed.
+            call_deps[parent_source] = _read_parents(
+                adapter, parent_source, contract.parent_source_key, batch
+            )
+        else:
+            call_deps[parent_source] = parent_frame.filter(
+                pl.col(contract.parent_source_key).is_in(batch)
+            )
         output = _validate_agent_context_output(
             _invoke_transform(transform_fn, call_deps, ctx, model), model
         )
@@ -499,6 +534,59 @@ def _reject_unsupported_incremental_strategy(
             "new parents, which would drop unchanged parents sharing a partition. "
             "Use the default merge strategy."
         )
+
+
+def _read_projected(
+    adapter: WarehouseAdapter,
+    table: str,
+    columns: tuple[str, ...],
+    model: ModelConfig,
+) -> pl.DataFrame:
+    """Read only `columns` from `table`, streamed rather than loaded whole.
+
+    The classify pass never needs the other columns (issue #385), and on a
+    wide parent table they are most of the bytes.
+    """
+    frames: list[pl.DataFrame] = []
+    try:
+        with adapter.table_snapshot(table, columns=list(columns)) as snapshot:
+            for batch in snapshot:
+                frames.append(cast(pl.DataFrame, pl.from_arrow(batch)))
+    except AdapterError as error:
+        raise RunError(
+            f"Incremental transform '{model.name}': could not read identity "
+            f"columns {sorted(columns)} from '{table}': {error}"
+        ) from None
+    if not frames:
+        return pl.DataFrame(schema={column: pl.String() for column in columns})
+    return pl.concat(frames, how="vertical")
+
+
+def _read_parents(
+    adapter: WarehouseAdapter,
+    table: str,
+    key_column: str,
+    keys: list[str],
+) -> pl.DataFrame:
+    """Full rows for exactly `keys`, pushed down as an IN predicate.
+
+    This is the read that makes cost proportional to the change set: on a
+    steady-state incremental run it returns a handful of parents rather than
+    the corpus.
+    """
+    frames: list[pl.DataFrame] = []
+    with adapter.table_snapshot(
+        table,
+        predicate=ReadPredicate(key_column, ReadPredicateOperator.IN, tuple(keys)),
+    ) as snapshot:
+        for batch in snapshot:
+            frames.append(cast(pl.DataFrame, pl.from_arrow(batch)))
+    if not frames:
+        raise RunError(
+            f"Parent source '{table}' returned no rows for parents that "
+            "classification said had changed; it changed underneath the run"
+        )
+    return pl.concat(frames, how="vertical")
 
 
 def _batched(keys: list[str], size: int) -> Iterator[list[str]]:

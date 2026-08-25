@@ -1171,3 +1171,111 @@ def test_commit_every_does_not_invalidate_existing_state(tmp_path: Path) -> None
 
     assert _result(results, "word_tokens").documents_processed == 0
     assert _result(results, "word_tokens").documents_skipped == 3
+
+
+# ─── declared identity columns (issue #385) ─────────────────────────────────
+
+
+def _declare_identity(project: Path, columns: str) -> None:
+    """Make the fixture transform declare identity columns in its contract."""
+    path = project / "transforms" / "word_tokens.py"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            '        parent_source_key="document_id",',
+            '        parent_source_key="document_id",'
+            + chr(10)
+            + f"        identity_columns={columns},",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_contract_without_identity_columns_is_unchanged(tmp_path: Path) -> None:
+    """The default must reprocess nothing on upgrade.
+
+    Empty identity_columns means every column, which is the original digest, so
+    existing projects see no re-run — the migration cost is opt-in per
+    transform rather than imposed on everyone.
+    """
+    project = _project(tmp_path)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+    run_project(project)
+
+    results = run_project(project)
+    assert _result(results, "word_tokens").documents_skipped == 3
+    assert _result(results, "word_tokens").documents_processed == 0
+
+
+def test_a_change_outside_the_identity_columns_no_longer_reprocesses(
+    tmp_path: Path,
+) -> None:
+    """The semantic half of #385, and a fix rather than a loss.
+
+    With identity declared as the key alone, editing the body does not
+    invalidate the parent. Today every column counts, so editing a column the
+    transform never reads still forces a reprocess.
+    """
+    project = _project(tmp_path)
+    _declare_identity(project, '("document_id",)')
+    _write_doc(project, "d0.json", "alpha")
+    run_project(project)
+
+    # Same document id, different body.
+    _write_doc(project, "d0.json", "alpha beta gamma")
+    results = run_project(project)
+
+    tokens = _result(results, "word_tokens")
+    assert tokens.documents_processed == 0
+    assert tokens.documents_skipped == 1
+
+
+def test_a_new_parent_is_still_processed_with_identity_columns(
+    tmp_path: Path,
+) -> None:
+    """Narrowing identity must not narrow discovery: a parent with no prior
+    state is new whatever its columns say."""
+    project = _project(tmp_path)
+    _declare_identity(project, '("document_id",)')
+    _write_doc(project, "d0.json", "alpha")
+    run_project(project)
+
+    _write_doc(project, "d1.json", "beta")
+    results = run_project(project)
+
+    assert _result(results, "word_tokens").documents_processed == 1
+    assert len(_state_keys(project)) == 2
+
+
+def test_classification_reads_only_the_identity_columns(tmp_path: Path) -> None:
+    """The memory half of #385: the wide columns never enter the classify pass.
+
+    Asserting on the projection is the only way to see this — the run succeeds
+    either way, which is exactly why an unasserted version would rot.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path)
+    _declare_identity(project, '("document_id",)')
+    _write_doc(project, "d0.json", "alpha")
+    run_project(project)
+    _write_doc(project, "d1.json", "beta")
+
+    projections: list[Any] = []
+    real = DuckDBAdapter.table_snapshot
+
+    def _record(self: Any, table: str, **kwargs: Any) -> Any:
+        if table == "documents":
+            projections.append(kwargs.get("columns"))
+        return real(self, table, **kwargs)
+
+    original = DuckDBAdapter.table_snapshot
+    DuckDBAdapter.table_snapshot = _record  # type: ignore[method-assign]
+    try:
+        run_project(project)
+    finally:
+        DuckDBAdapter.table_snapshot = original  # type: ignore[method-assign]
+
+    # The classify pass asked for the identity columns only; `body` is absent.
+    assert ["document_id"] in projections
+    assert not any(cols and "body" in cols for cols in projections if cols)

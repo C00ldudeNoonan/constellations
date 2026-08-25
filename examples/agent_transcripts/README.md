@@ -51,7 +51,32 @@ transform:, agent_context:           |            — each chunk's `section` nam
               transcript_search     search: governed, filter/display attributes
                                     harness, exchange_heading, tools_used,
                                     files_touched
+
+raw_transcripts
+        v
+retrieval_judgment_candidates       transform: built-in, #329 phase 3 —
+                                    candidates a human promotes, never goldens
 ```
+
+## Candidate retrieval judgments
+
+When a session queries stel's own governed context, the transcript records
+which ids came back and which the answer then named. `stel transcripts`
+captures that (never the result bodies), and
+`retrieval_judgment_candidates` reshapes it into one row per returned id:
+
+| judgment | what it is | what it is not |
+|---|---|---|
+| `cited` | the answer named this id after the call returned it | |
+| `returned_not_cited` | returned beside it, not named | **not** evidence of irrelevance — an agent may use a chunk without quoting its id |
+| `zero_result` | the query matched nothing | |
+
+Failed searches produce no rows at all: a denied or timed-out call returned
+nothing because it failed, not because the corpus lacked a match.
+
+Nothing here is read by `retrieval_tests:` or `eval:`, and nothing promotes
+itself at any confidence — that is #329 rule 2. Promotion is a separate,
+human step (issue #380).
 
 ## The grain
 

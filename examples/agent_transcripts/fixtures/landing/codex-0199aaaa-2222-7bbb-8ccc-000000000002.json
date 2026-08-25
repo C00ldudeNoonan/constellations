@@ -1,18 +1,19 @@
 {
-  "schema_version": "transcript/v1",
+  "schema_version": "transcript/v1.1",
   "harness": "codex",
   "session_id": "0199aaaa-2222-7bbb-8ccc-000000000002",
-  "source_path": "C:\\Users\\alexn\\AppData\\Local\\Temp\\claude\\C--Users-alexn-Documents-github-dbt-ml\\053026d8-04cf-4fb4-9872-b438cd5903ce\\scratchpad\\fixture_src\\rollout-sample.jsonl",
+  "source_path": "C:\\Users\\alexn\\AppData\\Local\\Temp\\claude\\C--Users-alexn-Documents-github-dbt-ml\\053026d8-04cf-4fb4-9872-b438cd5903ce\\scratchpad\\fixture_src2\\rollout-sample.jsonl",
   "project_path": "/work/sample-app",
   "git_branch": "feature/etl",
   "started_at": "2026-08-21T09:00:02Z",
-  "ended_at": "2026-08-21T09:01:10Z",
-  "exchange_count": 1,
+  "ended_at": "2026-08-21T09:02:30Z",
+  "exchange_count": 2,
   "tools_used": [
+    "search_context",
     "shell"
   ],
   "files_touched": [],
-  "text": "## [0] Profile the ETL job and tell me where the time goes\n\n- tool shell (ok, 6000B) args:5981e97992a6\n\nNinety percent of the wall time is the row-by-row insert loop; batching inserts with executemany cuts the run from 41s to 6s.\n",
+  "text": "## [0] Profile the ETL job and tell me where the time goes\n\n- tool shell (ok, 6000B) args:5981e97992a6\n\nNinety percent of the wall time is the row-by-row insert loop; batching inserts with executemany cuts the run from 41s to 6s.\n\n## [1] Is there a documented SLA for the nightly load?\n\n- tool search_context (ok, 51B) args:d2213b971813\n\nNothing in the governed corpus documents a nightly-load SLA.\n",
   "exchanges": [
     {
       "ordinal": 0,
@@ -27,7 +28,35 @@
       "tools_used": [
         "shell"
       ],
-      "files_touched": []
+      "files_touched": [],
+      "context_calls": []
+    },
+    {
+      "ordinal": 1,
+      "heading": "[1] Is there a documented SLA for the nightly load?",
+      "started_at": "2026-08-21T09:02:00Z",
+      "ended_at": "2026-08-21T09:02:30Z",
+      "prompt_chars": 47,
+      "prompt_truncated": false,
+      "assistant_chars": 60,
+      "tool_calls": 1,
+      "tool_errors": 0,
+      "tools_used": [
+        "search_context"
+      ],
+      "files_touched": [],
+      "context_calls": [
+        {
+          "model": "context_search",
+          "query_fingerprint": "a145f513f747e78864fcc0fa6ede6bac",
+          "query_text": null,
+          "returned_context_ids": [],
+          "returned_chunk_ids": [],
+          "cited_context_ids": [],
+          "zero_results": true,
+          "error_code": null
+        }
+      ]
     }
   ]
 }

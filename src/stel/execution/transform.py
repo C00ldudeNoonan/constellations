@@ -405,22 +405,17 @@ def _run_incremental_transform(
         result.metrics = _incremental_metrics(contract, is_incremental=True)
         return result
 
-    call_deps = dict(deps)
-    if is_incremental:
-        call_deps[parent_source] = parent_frame.filter(
-            pl.col(contract.parent_source_key).is_in(processed_parents)
-        )
-
-    output = _validate_agent_context_output(
-        _invoke_transform(transform_fn, call_deps, ctx, model), model
-    )
-    _validate_incremental_output(
-        output, contract, model, set(processed_parents), is_incremental=is_incremental
-    )
-
     if not is_incremental:
+        output = _validate_agent_context_output(
+            _invoke_transform(transform_fn, dict(deps), ctx, model), model
+        )
+        _validate_incremental_output(
+            output, contract, model, set(processed_parents), is_incremental=False
+        )
         # Full refresh: atomic full replace, then reset the per-parent state
-        # baseline so the next incremental run classifies correctly.
+        # baseline so the next incremental run classifies correctly. Never
+        # batched — `materialize_full` replaces the table in one operation, and
+        # committing it in pieces would expose a partially built table.
         result.rows_written = adapter.materialize_full(
             model.name, output, options=options
         )
@@ -436,20 +431,46 @@ def _run_incremental_transform(
             keys=removed,
             state_scope=state_scope,
         )
-    try:
-        rows_written = adapter.replace_children(
-            model.name,
-            parent_key=contract.parent_key,
-            parent_ids=changed,
-            child_key=contract.child_key,
-            new_rows=output,
-            state_scope=state_scope,
-            state_records=state_records,
-            on_schema_change=model.on_schema_change,
-            options=options,
+
+    # Invoke and publish in batches of changed parents, committing each the way
+    # extraction commits each flush (issue #379). Each parent's children are
+    # independent by the incremental contract's own definition, so a
+    # partially-published run is coherent: the parents whose state advanced are
+    # done, and a relaunch reclassifies only the rest. Before this, a failure
+    # at the last parent — or at the publish — re-paid the whole corpus.
+    changed_set = set(changed)
+    records_by_parent = {record.record_key: record for record in state_records}
+    rows_written = 0
+    batches = 0
+    for batch in _batched(processed_parents, model.transform_commit_every()):
+        call_deps = dict(deps)
+        call_deps[parent_source] = parent_frame.filter(
+            pl.col(contract.parent_source_key).is_in(batch)
         )
-    except AdapterError as error:
-        raise RunError(str(error)) from error
+        output = _validate_agent_context_output(
+            _invoke_transform(transform_fn, call_deps, ctx, model), model
+        )
+        _validate_incremental_output(
+            output, contract, model, set(batch), is_incremental=True
+        )
+        try:
+            rows_written += adapter.replace_children(
+                model.name,
+                parent_key=contract.parent_key,
+                parent_ids=[key for key in batch if key in changed_set],
+                child_key=contract.child_key,
+                new_rows=output,
+                state_scope=state_scope,
+                state_records=[records_by_parent[key] for key in batch],
+                # Reconciled by the first batch; later batches carry the same
+                # output schema, so re-running the policy would either repeat
+                # the ALTER or compare against a table it just changed.
+                on_schema_change=model.on_schema_change if batches == 0 else "ignore",
+                options=options,
+            )
+        except AdapterError as error:
+            raise RunError(str(error)) from error
+        batches += 1
 
     result.rows_written = rows_written
     result.documents_processed = len(processed_parents)
@@ -475,6 +496,17 @@ def _reject_unsupported_incremental_strategy(
             "new parents, which would drop unchanged parents sharing a partition. "
             "Use the default merge strategy."
         )
+
+
+def _batched(keys: list[str], size: int) -> Iterator[list[str]]:
+    """Split parents into commit batches, preserving order.
+
+    A run with fewer changed parents than `size` yields exactly one batch, so
+    the common case keeps its single warehouse MERGE and behaves as it did
+    before issue #379.
+    """
+    for start in range(0, len(keys), size):
+        yield keys[start : start + size]
 
 
 def _validate_group_key(

@@ -111,7 +111,7 @@ def compute_code_version(
         "transform": (
             dict(effective_transform)
             if effective_transform is not None
-            else transform.model_dump()
+            else transform.model_dump(exclude={"commit_every"})
             if transform
             else None
         ),

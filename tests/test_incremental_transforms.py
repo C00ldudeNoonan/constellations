@@ -986,3 +986,114 @@ def test_a_missing_or_mistyped_parent_key_is_refused() -> None:
         list(_parent_groups(pl.DataFrame({"other": ["a"]}), "parent_id", "m"))
     with pytest.raises(RunError, match="must be string-typed"):
         list(_parent_groups(pl.DataFrame({"parent_id": [1]}), "parent_id", "m"))
+
+
+# ─── batched commits (issue #379) ───────────────────────────────────────────
+
+
+def _set_commit_every(project: Path, value: int) -> None:
+    path = project / "models" / "word_tokens.yml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "      module: transforms.word_tokens\n",
+            f"      module: transforms.word_tokens\n      commit_every: {value}\n",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_batching_does_not_change_what_gets_published(tmp_path: Path) -> None:
+    """Same rows, same state, whether committed in one batch or four."""
+    (tmp_path / "one").mkdir()
+    (tmp_path / "many").mkdir()
+    single = _project(tmp_path / "one")
+    batched = _project(tmp_path / "many")
+    _set_commit_every(batched, 1)
+    for project in (single, batched):
+        for index in range(4):
+            _write_doc(project, f"d{index}.json", f"word{index} shared")
+        run_project(project)
+
+    assert _tokens(single) == _tokens(batched)
+    assert _state_keys(single) == _state_keys(batched)
+
+
+def test_a_failure_mid_run_keeps_the_batches_that_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of #379. Before this, a failure at the last parent re-paid the
+    whole corpus; now the parents whose state advanced stay done."""
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path)
+    _set_commit_every(project, 1)
+    for index in range(4):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+
+    real = DuckDBAdapter.replace_children
+    calls = {"n": 0}
+
+    def _fail_on_third(self: Any, *args: Any, **kwargs: Any) -> int:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("warehouse blew up mid-run")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "replace_children", _fail_on_third)
+    with pytest.raises(Exception, match="warehouse blew up"):
+        run_project(project)
+
+    # Two batches committed before the failure, and their state advanced.
+    survived = _state_keys(project)
+    assert len(survived) == 2
+
+    monkeypatch.undo()
+    results = run_project(project)
+
+    # The relaunch reclassifies only the parents that never committed.
+    assert _result(results, "word_tokens").documents_processed == 2
+    assert len(_state_keys(project)) == 4
+    assert len(_tokens(project)) == 4
+
+
+def test_a_run_smaller_than_the_batch_size_commits_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default is high enough that ordinary projects keep one MERGE.
+
+    Batching that split every small run into many warehouse round trips would
+    trade a rare failure cost for a constant one.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+
+    real = DuckDBAdapter.replace_children
+    calls = {"n": 0}
+
+    def _counting(self: Any, *args: Any, **kwargs: Any) -> int:
+        calls["n"] += 1
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "replace_children", _counting)
+    run_project(project)
+
+    assert calls["n"] == 1
+
+
+def test_commit_every_does_not_invalidate_existing_state(tmp_path: Path) -> None:
+    """It changes execution cadence, never output content — so it must stay out
+    of code_version, exactly like extraction's flush_every. Including it would
+    re-run every corpus on the run after an operator tunes it."""
+    project = _project(tmp_path)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+    run_project(project)
+
+    _set_commit_every(project, 1)
+    results = run_project(project)
+
+    assert _result(results, "word_tokens").documents_processed == 0
+    assert _result(results, "word_tokens").documents_skipped == 3

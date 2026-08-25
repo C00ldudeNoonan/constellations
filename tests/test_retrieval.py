@@ -1760,3 +1760,37 @@ def test_a_rebuild_that_fails_after_the_state_swap_clears_the_stale_state(
     published = next(r for r in results if r.model_name == "context_search")
     # Every row republished rather than skipped as already-published.
     assert published.rows_written == len(_rows())
+
+
+def test_a_failure_after_activation_keeps_the_activated_state(
+    tmp_path: Path,
+) -> None:
+    """Once activation succeeds the swapped state describes the live
+    generation. Clearing it because a later step failed would leave the ledger
+    ready with empty state, and re-embed the whole index on the next run.
+    """
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    run_project(tmp_path, select="context_search")
+    # A first rebuild has no predecessor to retire, so take two: the second
+    # supersedes the first and does reach the post-activation drop.
+    run_project(tmp_path, select="context_search", full_refresh=True)
+
+    scope, resolved = resolve_serving_scope(
+        tmp_path, profiles_dir=None, target=None, model_name="context_search"
+    )
+    real_drop = LanceDBStore.drop_collection
+
+    def _fail_after_activation(self: Any, name: str) -> bool:
+        raise RetrievalError("retirement failed")
+
+    LanceDBStore.drop_collection = _fail_after_activation  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RunError, match="retirement failed"):
+            run_project(tmp_path, select="context_search", full_refresh=True)
+    finally:
+        LanceDBStore.drop_collection = real_drop  # type: ignore[method-assign]
+
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        # The activated generation's state survives the failed cleanup.
+        assert adapter.fetch_state(scope) != {}

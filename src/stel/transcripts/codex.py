@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from ..hashing import canonical_fingerprint
+from .context_calls import parse_context_call
 from .contract import Harness
 from .events import (
     AssistantProse,
@@ -39,7 +40,9 @@ _TOOL_OUTPUT_TYPES = ("custom_tool_call_output", "function_call_output")
 _INJECTED_USER_PREFIXES = ("<environment_context>", "<user_instructions>")
 
 
-def parse_codex(path: Path) -> ParsedSession | None:
+def parse_codex(
+    path: Path, *, capture_query: bool = False
+) -> ParsedSession | None:
     """Parse one rollout file, or None when it holds no conversation."""
     lines = _payload_lines(path)
     session_id: str | None = None
@@ -68,7 +71,9 @@ def parse_codex(path: Path) -> ParsedSession | None:
             if event is not None:
                 events.append(event)
         elif payload_type in _TOOL_CALL_TYPES:
-            call = _tool_call_event(payload, timestamp, outputs)
+            call = _tool_call_event(
+                payload, timestamp, outputs, capture_query=capture_query
+            )
             if call is not None:
                 events.append(call)
     if session_id is None or not any(isinstance(e, UserTurn) for e in events):
@@ -106,10 +111,13 @@ def _payload_lines(path: Path) -> list[tuple[str, Any, dict[str, Any]]]:
 
 def _tool_outputs(
     lines: list[tuple[str, Any, dict[str, Any]]],
-) -> dict[str, int]:
-    """call_id -> output byte count. Codex outputs carry no error verdict, so
-    outcome stays unknown; the byte count still records the exhaust dropped."""
-    outputs: dict[str, int] = {}
+) -> dict[str, tuple[int, Any]]:
+    """call_id -> (output byte count, raw output). Codex outputs carry no
+    error verdict, so outcome stays unknown; the byte count still records the
+    exhaust dropped. The raw output is held only long enough for
+    `parse_context_call` to recognize a stel context response (issue #380).
+    """
+    outputs: dict[str, tuple[int, Any]] = {}
     for kind, _timestamp, payload in lines:
         if kind != "response_item" or payload.get("type") not in _TOOL_OUTPUT_TYPES:
             continue
@@ -118,11 +126,10 @@ def _tool_outputs(
             continue
         output = payload.get("output")
         if isinstance(output, str):
-            outputs[call_id] = len(output.encode("utf-8"))
+            outputs[call_id] = (len(output.encode("utf-8")), output)
         elif output is not None:
-            outputs[call_id] = len(
-                json.dumps(output, ensure_ascii=False, default=str).encode("utf-8")
-            )
+            encoded = json.dumps(output, ensure_ascii=False, default=str)
+            outputs[call_id] = (len(encoded.encode("utf-8")), output)
     return outputs
 
 
@@ -161,7 +168,9 @@ def _message_event(
 def _tool_call_event(
     payload: dict[str, Any],
     timestamp: Any,
-    outputs: dict[str, int],
+    outputs: dict[str, tuple[int, Any]],
+    *,
+    capture_query: bool,
 ) -> ToolCall | None:
     name = payload.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -187,9 +196,10 @@ def _tool_call_event(
     elif status == "failed":
         ok = False
     call_id = payload.get("call_id")
-    result_bytes = (
-        outputs.get(call_id) if isinstance(call_id, str) else None
-    )
+    result_bytes: int | None = None
+    output: Any = None
+    if isinstance(call_id, str) and call_id in outputs:
+        result_bytes, output = outputs[call_id]
     return ToolCall(
         name=name,
         args_fingerprint=canonical_fingerprint(
@@ -200,4 +210,7 @@ def _tool_call_event(
         ok=ok,
         result_bytes=result_bytes,
         timestamp=timestamp,
+        context=parse_context_call(
+            name, args_dict, output, capture_query=capture_query
+        ),
     )

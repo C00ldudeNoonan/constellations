@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..hashing import canonical_fingerprint
+from .context_calls import parse_context_call
 from .contract import Harness
 from .events import (
     AssistantProse,
@@ -33,7 +34,9 @@ from .events import (
 HARNESS: Harness = "claude-code"
 
 
-def parse_claude_code(path: Path) -> ParsedSession | None:
+def parse_claude_code(
+    path: Path, *, capture_query: bool = False
+) -> ParsedSession | None:
     """Parse one session file, or None when it holds no conversation."""
     entries = _entries(path)
     session_id: str | None = None
@@ -63,7 +66,11 @@ def parse_claude_code(path: Path) -> ParsedSession | None:
             if text:
                 events.append(UserTurn(text=text, timestamp=timestamp))
             continue
-        events.extend(_assistant_events(content, timestamp, results))
+        events.extend(
+            _assistant_events(
+                content, timestamp, results, capture_query=capture_query
+            )
+        )
     if session_id is None or not any(isinstance(e, UserTurn) for e in events):
         return None
     return ParsedSession(
@@ -96,11 +103,15 @@ def _entries(path: Path) -> list[dict[str, Any]]:
 
 def _tool_results(
     entries: list[dict[str, Any]],
-) -> dict[str, tuple[bool | None, int]]:
-    """tool_use id -> (ok, result byte count). Results arrive as user-role
-    `tool_result` blocks, possibly after intervening records, so they are
-    collected up front and joined onto their calls by id."""
-    results: dict[str, tuple[bool | None, int]] = {}
+) -> dict[str, tuple[bool | None, int, Any]]:
+    """tool_use id -> (ok, result byte count, raw payload). Results arrive as
+    user-role `tool_result` blocks, possibly after intervening records, so
+    they are collected up front and joined onto their calls by id.
+
+    The raw payload is held only long enough for `parse_context_call` to
+    recognize a stel context response; it never reaches a landing document.
+    """
+    results: dict[str, tuple[bool | None, int, Any]] = {}
     for entry in entries:
         if entry.get("type") != "user":
             continue
@@ -118,7 +129,8 @@ def _tool_results(
                 continue
             is_error = block.get("is_error")
             ok = None if not isinstance(is_error, bool) else not is_error
-            results[use_id] = (ok, _content_bytes(block.get("content")))
+            payload = block.get("content")
+            results[use_id] = (ok, _content_bytes(payload), payload)
     return results
 
 
@@ -156,7 +168,9 @@ def _user_text(content: Any) -> str | None:
 def _assistant_events(
     content: Any,
     timestamp: Any,
-    results: dict[str, tuple[bool | None, int]],
+    results: dict[str, tuple[bool | None, int, Any]],
+    *,
+    capture_query: bool,
 ) -> list[SessionEvent]:
     if not isinstance(content, list):
         return []
@@ -178,8 +192,9 @@ def _assistant_events(
             use_id = block.get("id")
             ok: bool | None = None
             result_bytes: int | None = None
+            payload: Any = None
             if isinstance(use_id, str) and use_id in results:
-                ok, result_bytes = results[use_id]
+                ok, result_bytes, payload = results[use_id]
             events.append(
                 ToolCall(
                     name=name,
@@ -191,6 +206,9 @@ def _assistant_events(
                     ok=ok,
                     result_bytes=result_bytes,
                     timestamp=timestamp,
+                    context=parse_context_call(
+                        name, args_dict, payload, capture_query=capture_query
+                    ),
                 )
             )
     return events

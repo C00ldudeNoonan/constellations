@@ -20,8 +20,20 @@ from pathlib import Path
 
 from .claude_code import parse_claude_code
 from .codex import parse_codex
-from .contract import TranscriptDocument, TranscriptExchange
-from .events import AssistantProse, ParsedSession, SessionEvent, ToolCall, UserTurn
+from .context_calls import cited_ids
+from .contract import (
+    TranscriptContextCall,
+    TranscriptDocument,
+    TranscriptExchange,
+)
+from .events import (
+    AssistantProse,
+    ContextCall,
+    ParsedSession,
+    SessionEvent,
+    ToolCall,
+    UserTurn,
+)
 
 # Reduction caps. Prompt bodies carry pasted content — the main way secrets
 # and bulk data would otherwise enter the corpus — so they are truncated with
@@ -55,12 +67,14 @@ def detect_harness(path: Path) -> str | None:
     return None
 
 
-def parse_transcript(path: Path) -> ParsedSession | None:
+def parse_transcript(
+    path: Path, *, capture_query: bool = False
+) -> ParsedSession | None:
     harness = detect_harness(path)
     if harness == "claude-code":
-        return parse_claude_code(path)
+        return parse_claude_code(path, capture_query=capture_query)
     if harness == "codex":
-        return parse_codex(path)
+        return parse_codex(path, capture_query=capture_query)
     return None
 
 
@@ -104,10 +118,12 @@ def build_document(session: ParsedSession) -> TranscriptDocument | None:
     )
 
 
-def convert_file(path: Path, out_dir: Path) -> Path | None:
+def convert_file(
+    path: Path, out_dir: Path, *, capture_query: bool = False
+) -> Path | None:
     """Convert one transcript into the landing directory; None when the file
     is not a recognized transcript or holds no conversation."""
-    session = parse_transcript(path)
+    session = parse_transcript(path, capture_query=capture_query)
     if session is None:
         return None
     document = build_document(session)
@@ -134,6 +150,7 @@ def sync_transcripts(
     claude_dir: Path | None,
     codex_dir: Path | None,
     min_idle_seconds: float,
+    capture_query: bool = False,
 ) -> list[Path]:
     """Convert every settled transcript under the harness directories.
 
@@ -150,7 +167,7 @@ def sync_transcripts(
     for path in candidates:
         if path.stat().st_mtime > cutoff:
             continue
-        landed = convert_file(path, out_dir)
+        landed = convert_file(path, out_dir, capture_query=capture_query)
         if landed is not None:
             written.append(landed)
     return written
@@ -197,9 +214,14 @@ def _build_exchange(
     tool_calls = 0
     tool_errors = 0
     timestamps: list[datetime] = []
+    # Context calls and prose carry their position in the exchange: a
+    # citation is evidence only when the prose naming an id came *after* the
+    # call that returned it (issue #380).
+    context_calls: list[tuple[int, ContextCall]] = []
+    prose_positions: list[tuple[int, str]] = []
     if prompt.timestamp is not None:
         timestamps.append(prompt.timestamp)
-    for event in group[1:]:
+    for position, event in enumerate(group[1:]):
         if event.timestamp is not None:
             timestamps.append(event.timestamp)
         if isinstance(event, AssistantProse):
@@ -208,6 +230,7 @@ def _build_exchange(
                 tool_lines = []
             lines.extend(["", event.text])
             prose_chars += len(event.text)
+            prose_positions.append((position, event.text))
         elif isinstance(event, ToolCall):
             tool_calls += 1
             tools_used.add(event.name)
@@ -215,6 +238,8 @@ def _build_exchange(
             if event.ok is False:
                 tool_errors += 1
             tool_lines.append(_tool_line(event))
+            if event.context is not None:
+                context_calls.append((position, event.context))
     if tool_lines:
         lines.extend(["", *tool_lines])
     if files_touched:
@@ -232,8 +257,36 @@ def _build_exchange(
         tool_errors=tool_errors,
         tools_used=tuple(sorted(tools_used)),
         files_touched=tuple(sorted(files_touched)),
+        context_calls=_context_calls(context_calls, prose_positions),
     )
     return exchange, "\n".join(lines)
+
+
+def _context_calls(
+    calls: list[tuple[int, ContextCall]],
+    prose_positions: list[tuple[int, str]],
+) -> tuple[TranscriptContextCall, ...]:
+    """Landing records for an exchange's stel context calls, each resolving
+    which of the returned ids the assistant went on to name."""
+    records: list[TranscriptContextCall] = []
+    for position, call in calls:
+        following = "\n".join(
+            text
+            for prose_position, text in prose_positions
+            if prose_position > position
+        )
+        records.append(
+            TranscriptContextCall(
+                model=call.model,
+                query_fingerprint=call.query_fingerprint,
+                query_text=call.query_text,
+                returned_context_ids=call.returned_context_ids,
+                returned_chunk_ids=call.returned_chunk_ids,
+                cited_context_ids=cited_ids(following, call.returned_context_ids),
+                zero_results=call.zero_results,
+            )
+        )
+    return tuple(records)
 
 
 def _heading_text(prompt: str) -> str:

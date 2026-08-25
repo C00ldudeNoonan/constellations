@@ -2004,13 +2004,25 @@ def transcripts() -> None:
     type=click.Path(file_okay=False, path_type=Path),
     help="Landing directory for transcript/v1 documents.",
 )
-def transcripts_convert(paths: tuple[Path, ...], out_dir: Path) -> None:
+@click.option(
+    "--capture-context-queries",
+    is_flag=True,
+    default=False,
+    help="Record the query text of stel search_context calls, not just its "
+    "fingerprint. Off by default, mirroring the query log's separate "
+    "capture_query_text opt-in.",
+)
+def transcripts_convert(
+    paths: tuple[Path, ...], out_dir: Path, capture_context_queries: bool
+) -> None:
     """Convert specific transcript files (assumed final, e.g. from a
     SessionEnd hook). The harness is detected per file."""
     from .transcripts import convert_file
 
     for path in paths:
-        landed = convert_file(path, out_dir)
+        landed = convert_file(
+            path, out_dir, capture_query=capture_context_queries
+        )
         if landed is None:
             raise click.ClickException(
                 f"Not a recognized agent transcript with conversation: {path}"
@@ -2045,11 +2057,20 @@ def transcripts_convert(paths: tuple[Path, ...], out_dir: Path) -> None:
     help="Skip transcripts modified more recently than this — the live "
     "session rule [default: 300].",
 )
+@click.option(
+    "--capture-context-queries",
+    is_flag=True,
+    default=False,
+    help="Record the query text of stel search_context calls, not just its "
+    "fingerprint. Off by default, mirroring the query log's separate "
+    "capture_query_text opt-in.",
+)
 def transcripts_sync(
     out_dir: Path,
     claude_dir: Path | None,
     codex_dir: Path | None,
     min_idle_seconds: float | None,
+    capture_context_queries: bool,
 ) -> None:
     """Scan the harness directories and convert every settled transcript."""
     from .transcripts import (
@@ -2068,6 +2089,7 @@ def transcripts_sync(
             if min_idle_seconds is not None
             else DEFAULT_MIN_IDLE_SECONDS
         ),
+        capture_query=capture_context_queries,
     )
     click.echo(f"wrote {len(written)} transcript document(s) to {out_dir}")
 

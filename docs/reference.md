@@ -2422,6 +2422,14 @@ Relations materialize incrementally on the same one-to-many path as the other
 child tables: a changed document re-derives exactly its relation rows. See
 `examples/economic_nlp/` for runnable co-occurrence and rule pipelines.
 
+That path classifies parents from a **streamed** read of the parent table,
+keeping one digest per row rather than the row, and then reads back only the
+parents that changed (issue #385). Peak memory therefore follows the change
+set rather than the corpus, and an incremental transform requires its adapter
+to advertise `STREAMING_TABULAR_READS`. What invalidates a parent is
+unchanged — every column still participates, order still does not matter, and
+repeated rows still count.
+
 ### Document-level aggregate features
 
 `nlp_document_features` rolls the token, entity, and entity-link child tables

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Incremental transform memory follows the change set (issue #385)
+
+- **The parent table is no longer read whole.** Classification streams it and
+  keeps one digest per row (~32 bytes) instead of the row, then rows come back
+  only for the parents that actually changed, pushed down as an `IN`
+  predicate. Peak residency stops scaling with the corpus and starts scaling
+  with what changed — the remaining term after #384.
+- **The parent fingerprint now hashes per-row digests** rather than the rows
+  themselves (`version=2`). Coverage is deliberately unchanged: every column
+  still participates, order still does not matter, and repeated rows still
+  count — sorting digests preserves multiplicity where an XOR or sum
+  accumulator would have silently absorbed it.
+- **One-time cost:** the encoding change re-keys every parent, so the first
+  run after adoption reprocesses each incremental transform once, then runs
+  incrementally as before. Same shape as #363, and pinned in
+  `test_frozen_names.py` so it can never happen unremarked.
+- Incremental transforms now require the adapter to advertise
+  `STREAMING_TABULAR_READS`; both shipped adapters do, and the alternative is
+  the whole-corpus read this change exists to remove.
+
 ### Promoting candidates into golden sets (issue #380)
 
 - **`golden_sets/<name>.yml`** is the promotion artifact: a reviewed file in

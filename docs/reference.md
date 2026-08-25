@@ -1295,6 +1295,34 @@ Extraction streams rows to the warehouse every `flush_every` documents
   materialization: incremental
 ```
 
+Incremental **transforms** get the same treatment through `commit_every`,
+which sets how many changed parents are invoked and published per batch:
+
+```yaml
+- name: chunk_entities
+  depends_on: [ref('document_chunks')]
+  transform:
+    type: python
+    module: transforms.chunk_entities
+    commit_every: 250   # smaller = finer crash recovery, more MERGEs
+  materialization: incremental
+```
+
+Each batch reconciles `on_schema_change`, publishes its children, and advances
+those parents' state before the next begins, so a run that fails partway keeps what committed and a relaunch
+reprocesses only the parents whose state never advanced. Without it, a failure
+at the last parent — or at the publish — re-pays the whole corpus, which on a
+multi-million-row wrapper is tens of minutes and a multi-gigabyte republish.
+
+The default (1000) is high enough that a run with fewer changed parents than
+that is a single batch: identical behavior, one MERGE. Lower it when a run is
+long enough that losing it hurts; raise it to cut MERGE count, and BigQuery
+bytes billed, on runs that rarely fail.
+
+Like `flush_every`, `commit_every` is excluded from `code_version` — it changes
+execution cadence, never output content, so tuning it does not invalidate
+existing state.
+
 Incremental writes are atomic per publication: DuckDB uses a transaction and
 BigQuery loads a unique staging table then executes one `MERGE`. Missing,
 NULL, or duplicate incremental keys are rejected before mutation. A killed

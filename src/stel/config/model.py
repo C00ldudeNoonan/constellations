@@ -229,6 +229,16 @@ class TransformConfig(BaseModel):
     path: str | None = None
     uses_llm: bool = False
     options: dict[str, Any] = Field(default_factory=dict)
+    # Incremental transforms invoke and publish in batches of this many changed
+    # parents (issue #379), committing each batch the way extraction commits
+    # each flush. A failed run then re-pays one batch instead of the corpus.
+    #
+    # The default is high enough that a run with fewer changed parents than
+    # this is a single batch — identical behavior and one warehouse MERGE, so
+    # ordinary projects see no change. Large runs get checkpointing, at one
+    # MERGE per batch. Excluded from code_version like extraction's
+    # flush_every: it changes execution cadence, never output content.
+    commit_every: int = Field(default=1000, gt=0)
 
     @model_validator(mode="after")
     def _validate_implementation(self) -> TransformConfig:
@@ -994,6 +1004,10 @@ class ModelConfig(BaseModel):
         if isinstance(extraction, Mapping):
             prepared["extraction"] = _protect_extraction_mapping(extraction)
         return prepared
+
+    def transform_commit_every(self) -> int:
+        """Changed parents per commit batch for an incremental transform."""
+        return self.transform.commit_every if self.transform is not None else 1000
 
     @field_validator("name")
     @classmethod

@@ -986,3 +986,188 @@ def test_a_missing_or_mistyped_parent_key_is_refused() -> None:
         list(_parent_groups(pl.DataFrame({"other": ["a"]}), "parent_id", "m"))
     with pytest.raises(RunError, match="must be string-typed"):
         list(_parent_groups(pl.DataFrame({"parent_id": [1]}), "parent_id", "m"))
+
+
+# ─── batched commits (issue #379) ───────────────────────────────────────────
+
+
+def _set_commit_every(project: Path, value: int) -> None:
+    path = project / "models" / "word_tokens.yml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "      module: transforms.word_tokens\n",
+            f"      module: transforms.word_tokens\n      commit_every: {value}\n",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_batching_does_not_change_what_gets_published(tmp_path: Path) -> None:
+    """Same rows, same state, whether committed in one batch or four."""
+    (tmp_path / "one").mkdir()
+    (tmp_path / "many").mkdir()
+    single = _project(tmp_path / "one")
+    batched = _project(tmp_path / "many")
+    _set_commit_every(batched, 1)
+    for project in (single, batched):
+        for index in range(4):
+            _write_doc(project, f"d{index}.json", f"word{index} shared")
+        run_project(project)
+
+    assert _tokens(single) == _tokens(batched)
+    assert _state_keys(single) == _state_keys(batched)
+
+
+def test_a_failure_mid_run_keeps_the_batches_that_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of #379. Before this, a failure at the last parent re-paid the
+    whole corpus; now the parents whose state advanced stay done."""
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path)
+    _set_commit_every(project, 1)
+    for index in range(4):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+
+    real = DuckDBAdapter.replace_children
+    calls = {"n": 0}
+
+    def _fail_on_third(self: Any, *args: Any, **kwargs: Any) -> int:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("warehouse blew up mid-run")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "replace_children", _fail_on_third)
+    with pytest.raises(Exception, match="warehouse blew up"):
+        run_project(project)
+
+    # Two batches committed before the failure, and their state advanced.
+    survived = _state_keys(project)
+    assert len(survived) == 2
+
+    monkeypatch.undo()
+    results = run_project(project)
+
+    # The relaunch reclassifies only the parents that never committed.
+    assert _result(results, "word_tokens").documents_processed == 2
+    assert len(_state_keys(project)) == 4
+    assert len(_tokens(project)) == 4
+
+
+def test_a_run_smaller_than_the_batch_size_commits_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default is high enough that ordinary projects keep one MERGE.
+
+    Batching that split every small run into many warehouse round trips would
+    trade a rare failure cost for a constant one.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+
+    real = DuckDBAdapter.replace_children
+    calls = {"n": 0}
+
+    def _counting(self: Any, *args: Any, **kwargs: Any) -> int:
+        calls["n"] += 1
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "replace_children", _counting)
+    run_project(project)
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.parametrize("uses_llm", [False, True])
+def test_commit_every_stays_out_of_code_version(tmp_path: Path, uses_llm: bool) -> None:
+    """Both branches of the code-version payload, and that is the point.
+
+    `uses_llm` transforms build their own `effective_transform`, so an
+    exclusion applied only to the fallback branch left the dial inside the
+    hash for exactly the models where a needless reprocess costs the most —
+    every parent back through inference (Codex review). The non-LLM case alone
+    passed while the bug was live.
+    """
+    from stel.config import load_project
+    from stel.versioning import compute_model_code_version
+
+    project = _project(tmp_path)
+    _write_doc(project, "d0.json", "word0")
+    project_config, _sources, models = load_project(project)
+    model = next(item for item in models if item.name == "word_tokens")
+    assert model.transform is not None
+    if uses_llm:
+        model = model.model_copy(
+            update={"transform": model.transform.model_copy(update={"uses_llm": True})}
+        )
+        assert model.transform is not None
+
+    baseline = compute_model_code_version(model, project_config, project)
+    tuned = model.model_copy(
+        update={"transform": model.transform.model_copy(update={"commit_every": 7})}
+    )
+    changed = model.model_copy(
+        update={"transform": model.transform.model_copy(update={"module": "other"})}
+    )
+
+    assert compute_model_code_version(tuned, project_config, project) == baseline
+    assert compute_model_code_version(changed, project_config, project) != baseline
+
+
+def test_a_later_batch_that_adds_a_column_still_reconciles_schema(
+    tmp_path: Path,
+) -> None:
+    """A transform's output schema can be data-dependent, so a later batch may
+    emit a column the first never did. Forcing `ignore` after the first batch
+    dropped it silently while still advancing state, making the loss
+    unrecoverable (Codex review). Under `fail` the drift must surface."""
+    project = _project(tmp_path)
+    _set_commit_every(project, 1)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+    # A first run is a full materialization, so it never batches. The state it
+    # leaves is what makes the next run incremental.
+    run_project(project)
+
+    transform = project / "transforms" / "word_tokens.py"
+    widened = chr(10).join(
+        [
+            "    frame = pl.DataFrame(rows, schema=_SCHEMA)",
+            "    # Every parent but the first emits a column the first never did.",
+            "    if rows and rows[0]['word'] != 'word0':",
+            "        frame = frame.with_columns(extra=pl.lit('x'))",
+            "    return frame",
+        ]
+    )
+    transform.write_text(
+        transform.read_text(encoding="utf-8").replace(
+            "    return pl.DataFrame(rows, schema=_SCHEMA)", widened
+        ),
+        encoding="utf-8",
+    )
+
+    # The edited module changes code_version, so every parent reprocesses —
+    # batch 1 (d0) emits the original schema, batch 2 (d1) adds a column.
+    with pytest.raises(Exception, match="Schema change"):
+        run_project(project)
+
+
+def test_commit_every_does_not_invalidate_existing_state(tmp_path: Path) -> None:
+    """It changes execution cadence, never output content — so it must stay out
+    of code_version, exactly like extraction's flush_every. Including it would
+    re-run every corpus on the run after an operator tunes it."""
+    project = _project(tmp_path)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+    run_project(project)
+
+    _set_commit_every(project, 1)
+    results = run_project(project)
+
+    assert _result(results, "word_tokens").documents_processed == 0
+    assert _result(results, "word_tokens").documents_skipped == 3

@@ -194,6 +194,12 @@ class TransformOptionsValidator(Protocol):
     def __call__(self, options: Mapping[str, Any]) -> None: ...
 
 
+class TransformOptionsProjectValidator(Protocol):
+    """The two-argument form, for options naming a file in the project."""
+
+    def __call__(self, options: Mapping[str, Any], project_dir: Path) -> None: ...
+
+
 class TransformDependencyDeclaration(Protocol):
     def __call__(self, options: Mapping[str, Any]) -> Iterable[str]: ...
 
@@ -259,7 +265,7 @@ def validate_transform_contract(
     """
     module = _load_transform_module(module_path, project_dir)
     transform_call_arity(_transform_fn(module, module_path))
-    _validate_options_hook(module, module_path, options)
+    _validate_options_hook(module, module_path, options, project_dir)
     _validate_declared_dependencies(module, module_path, options, dependencies)
     _validate_incremental_contract(
         module, module_path, options, dependencies, materialization
@@ -351,7 +357,18 @@ def _validate_options_hook(
     module: ModuleType,
     module_path: str,
     options: Mapping[str, Any],
+    project_dir: Path,
 ) -> None:
+    """Run a transform's `validate_options` hook.
+
+    Accepts either `validate_options(options)` or
+    `validate_options(options, project_dir)`, chosen by arity the same way
+    `run(deps)` / `run(deps, ctx)` is. The two-argument form exists because
+    options can name a file in the project, and validating that file *here*
+    is what keeps a bad one from being discovered mid-run — after upstream
+    models have already spent provider calls and mutated the warehouse
+    (Codex review; AGENTS.md preflight rule).
+    """
     validator = getattr(module, "validate_options", None)
     if validator is None:
         return
@@ -363,7 +380,20 @@ def _validate_options_hook(
         type(validator).__call__
     ):
         raise TypeError("async transform option validators are not supported")
+    if _accepts_project_dir(validator):
+        cast(TransformOptionsProjectValidator, validator)(dict(options), project_dir)
+        return
     cast(TransformOptionsValidator, validator)(dict(options))
+
+
+def _accepts_project_dir(validator: Any) -> bool:
+    signature = inspect.signature(validator)
+    marker = object()
+    try:
+        signature.bind(marker, marker)
+    except TypeError:
+        return False
+    return True
 
 
 def _validate_declared_dependencies(

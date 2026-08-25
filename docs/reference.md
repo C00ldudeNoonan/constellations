@@ -258,6 +258,7 @@ preserved automatically. A shorthand without options is also valid:
 `post_extract: post_extract.sec_text`.
 
 stel imports the module and calls its optional `validate_options(options)`
+(or `validate_options(options, project_dir)`, when the options name a file)
 during compilation, before source discovery, credentials, or warehouse access.
 The hook runs once per successful backend result, including native-batch
 results, while the verified source snapshot still exists. Its module source and

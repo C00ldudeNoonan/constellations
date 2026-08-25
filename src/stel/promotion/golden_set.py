@@ -19,6 +19,13 @@ against that index's `id_field`, so a set promoted in the wrong id space fails
 loudly instead of matching nothing and reporting a perfect zero (issue #380,
 constraint 3).
 
+**All of that is checked at compile time**, through the two-argument
+`validate_options(options, project_dir)` hook, not when the transform runs.
+By execution the upstream models have already spent provider calls and written
+to the warehouse, and a malformed promotion discovered there costs all of it
+(AGENTS.md: preflight rejects bad configuration before remote calls or
+warehouse mutation).
+
 `depends_on` names the candidates the set was promoted from. The rows are not
 read — the file is the source of truth, and a promoted golden must survive the
 corpus it came from being rotated away — but the edge keeps promotion ordered
@@ -28,15 +35,16 @@ one.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 from ..config import load_project
-from ..paths import resolve_within_project
 from ..transforms import TransformContext
-from .contract import PromotionError, load_golden_set
+from .contract import GoldenSetFile, PromotionError, load_golden_set
 
 _SCHEMA: dict[str, pl.DataType] = {
     "query_id": pl.String(),
@@ -54,29 +62,14 @@ _SCHEMA: dict[str, pl.DataType] = {
 }
 
 
-def validate_options(options: Mapping[str, Any]) -> None:
-    unknown = sorted(set(options) - {"path", "search_model"})
-    if unknown:
-        raise ValueError(
-            f"golden_set: unknown options {unknown}; expected 'path' and "
-            "'search_model'"
-        )
-    for name in ("path", "search_model"):
-        value = options.get(name)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"golden_set requires a non-empty `{name}:`")
+def validate_options(options: Mapping[str, Any], project_dir: Path) -> None:
+    """Reject a bad promotion before anything upstream of it runs."""
+    _resolve(options, project_dir)
 
 
 def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
     del deps  # the file is the source of truth; see the module docstring
-    validate_options(ctx.options)
-    path = resolve_within_project(
-        str(ctx.options["path"]),
-        ctx.project_dir,
-        surface="golden_set transform option `path`",
-    )
-    golden = load_golden_set(path)
-    _check_id_space(golden.id_space, ctx, path=str(path))
+    golden = _resolve(ctx.options, ctx.project_dir)
     rows = [
         {
             "query_id": query.query_id,
@@ -97,15 +90,75 @@ def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=_SCHEMA)
 
 
-def _check_id_space(id_space: str, ctx: TransformContext, *, path: str) -> None:
+def _resolve(options: Mapping[str, Any], project_dir: Path) -> GoldenSetFile:
+    """Everything that can be wrong with a promotion, checked in one place so
+    compile time and run time cannot disagree about what is valid."""
+    _validate_option_shapes(options)
+    path = _golden_set_path(str(options["path"]), project_dir)
+    golden = load_golden_set(path)
+    _check_id_space(golden.id_space, options, project_dir, path=path)
+    return golden
+
+
+def _validate_option_shapes(options: Mapping[str, Any]) -> None:
+    unknown = sorted(set(options) - {"path", "search_model"})
+    if unknown:
+        raise ValueError(
+            f"golden_set: unknown options {unknown}; expected 'path' and "
+            "'search_model'"
+        )
+    for name in ("path", "search_model"):
+        value = options.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"golden_set requires a non-empty `{name}:`")
+
+
+def _golden_set_path(raw: str, project_dir: Path) -> Path:
+    """The promoted file, confined to the project and reached without
+    following a symlink at any level.
+
+    `paths.resolve_within_project` cannot be used alone here: it calls
+    `.resolve()`, so a symlink pointing at a file still inside the project is
+    dereferenced before `load_golden_set` ever sees it, and its no-symlink
+    guard can never fire (Codex review). Containment is therefore established
+    lexically — `os.path.abspath` normalizes `..` without following links,
+    the same exception AGENTS.md names for source discovery — and every
+    component from the project down is then checked for links.
+    """
+    candidate = Path(os.path.abspath(project_dir / raw))
+    root = Path(os.path.abspath(project_dir))
+    if not candidate.is_relative_to(root):
+        raise PromotionError(
+            f"golden_set `path: {raw}` resolves outside the project directory: "
+            f"{candidate}"
+        )
+    walked = root
+    for part in candidate.relative_to(root).parts:
+        walked = walked / part
+        if walked.is_symlink():
+            raise PromotionError(
+                f"golden_set `path: {raw}` is reached through a symlink "
+                f"({walked}); the reviewed promotion artifact must be a real "
+                "file in the project"
+            )
+    return candidate
+
+
+def _check_id_space(
+    id_space: str,
+    options: Mapping[str, Any],
+    project_dir: Path,
+    *,
+    path: Path,
+) -> None:
     """Refuse a set promoted in an id space the target index does not key on.
 
     Without this the mismatch is invisible: every `relevant_id` simply fails
     to match a returned `record_id`, and the eval reports zero recall as if
     retrieval were broken rather than as if the golden set were mislabelled.
     """
-    model_name = str(ctx.options["search_model"])
-    _project, _sources, models = load_project(ctx.project_dir)
+    model_name = str(options["search_model"])
+    _project, _sources, models = load_project(project_dir)
     target = next((model for model in models if model.name == model_name), None)
     if target is None:
         raise PromotionError(

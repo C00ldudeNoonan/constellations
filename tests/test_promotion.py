@@ -328,6 +328,84 @@ def test_promoting_in_the_wrong_id_space_fails_loudly(tmp_path: Path) -> None:
         run_project(project, select="promoted_goldens")
 
 
+def test_an_invalid_promotion_fails_before_anything_executes(tmp_path: Path) -> None:
+    """The promotion is validated at compile time, not when the transform
+    runs. By execution the upstream models have already spent provider calls
+    and written to the warehouse, so a malformed file discovered there costs
+    all of it (Codex review; AGENTS.md preflight rule)."""
+    project = _project(tmp_path)
+    # Wrong id space: the index keys on chunk_id.
+    _write_promotion(
+        project,
+        id_space="context_id",
+        queries=[
+            {
+                "query_id": "q",
+                "query_text": "t",
+                "relevant_ids": ["abc"],
+                "promoted_by": "alex",
+                "promoted_at": "2026-08-25",
+                "evidence": {"sessions": ["s"]},
+            }
+        ],
+    )
+
+    with pytest.raises(Exception, match="context_id"):
+        run_project(project)
+
+    # Nothing ran: no warehouse file, so no extraction, embedding, or publish.
+    assert not (project / "target" / "data.duckdb").exists()
+
+
+def test_blank_and_repeated_ids_are_rejected(tmp_path: Path) -> None:
+    """`excluded_ids: [""]` is a non-empty tuple, so it satisfies a naive
+    "asserts something" check while no search result can ever match it — the
+    query would then drop out of the ranking aggregates rather than fail
+    (Codex review)."""
+    blank = _document(queries=[_query(relevant_ids=[], excluded_ids=[""])])
+    with pytest.raises(PromotionError, match="blank entry"):
+        load_golden_set(_write(tmp_path, blank))
+
+    repeated = _document(queries=[_query(relevant_ids=["abc", "abc"])])
+    with pytest.raises(PromotionError, match="repeats an id"):
+        load_golden_set(_write(tmp_path, repeated))
+
+
+def test_a_symlinked_promotion_artifact_is_refused(tmp_path: Path) -> None:
+    """A symlink whose target is still inside the project survives
+    `resolve_within_project`, which dereferences it — so containment alone
+    does not keep the reviewed artifact a real, reviewable file."""
+    project = _project(tmp_path)
+    real = project / "elsewhere.yml"
+    real.write_text(
+        yaml.safe_dump({"version": 1, "id_space": "chunk_id", "queries": []}),
+        encoding="utf-8",
+    )
+    (project / "golden_sets").mkdir(exist_ok=True)
+    link = project / "golden_sets" / "release_search.yml"
+    try:
+        link.symlink_to(real)
+    except OSError:  # pragma: no cover - platform-dependent privilege
+        pytest.skip("creating symlinks requires privileges on this platform")
+
+    with pytest.raises(Exception, match="symlink"):
+        run_project(project)
+
+
+def test_a_path_outside_the_project_is_refused(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "models" / "goldens.yml").write_text(
+        _golden_model().replace(
+            "path: golden_sets/release_search.yml",
+            "path: ../escape.yml",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="outside the project"):
+        run_project(project)
+
+
 def test_an_unknown_search_model_is_refused(tmp_path: Path) -> None:
     project = _project(tmp_path, search_model="no_such_model")
     _write_promotion(project, id_space="chunk_id", queries=[])

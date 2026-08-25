@@ -80,6 +80,22 @@ class PromotedQuery(BaseModel):
 
     @model_validator(mode="after")
     def _must_assert_something(self) -> PromotedQuery:
+        # Blank ids are checked first: a search result can never carry one, so
+        # `excluded_ids: [""]` would satisfy the tuple-level check below while
+        # asserting nothing at all — and the query, having no usable labels,
+        # would then drop out of the ranking aggregates instead of failing
+        # (Codex review).
+        for name in ("relevant_ids", "required_ids", "excluded_ids"):
+            ids: tuple[str, ...] = getattr(self, name)
+            if any(not identifier.strip() for identifier in ids):
+                raise ValueError(
+                    f"promoted query '{self.query_id}' has a blank entry in "
+                    f"{name}; no search result can match it"
+                )
+            if len(set(ids)) != len(ids):
+                raise ValueError(
+                    f"promoted query '{self.query_id}' repeats an id in {name}"
+                )
         if not (self.relevant_ids or self.required_ids or self.excluded_ids):
             raise ValueError(
                 f"promoted query '{self.query_id}' asserts nothing: give it "

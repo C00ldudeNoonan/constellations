@@ -11,3 +11,18 @@ __PROJECT_NAME__:
         model: claude-haiku-4-5
         api_key_env: ANTHROPIC_API_KEY
         cache_path: ./target/llm_cache.duckdb
+
+    # MotherDuck is the same DuckDB engine, managed. Uncomment and run
+    # `stel run --target motherduck` with MOTHERDUCK_TOKEN set in your
+    # environment; never put the token value in this file.
+    # motherduck:
+    #   warehouse:
+    #     type: duckdb
+    #     path: md:__PROJECT_NAME__
+    #     token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+    #     schema: __PROJECT_NAME__
+    #   llm:
+    #     provider: anthropic
+    #     model: claude-haiku-4-5
+    #     api_key_env: ANTHROPIC_API_KEY
+    #     cache_path: ./target/llm_cache.duckdb

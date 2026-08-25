@@ -2866,7 +2866,15 @@ STEL_PROJECT_DIR=path/to/stel_project dbt build
 
 Each generated Python model imports `stel.dbt_embed.materialize` lazily at run
 time; dbt-duckdb executes it in-process, so extraction, LLM calls, and the LLM
-response cache all run locally. See
+response cache all run locally.
+
+Embedded mode works against MotherDuck with no stel-side configuration: dbt
+owns the target in this mode, so pointing the **dbt-duckdb profile** at
+`md:<database>` (with dbt-duckdb's own `motherduck_token` handling) materializes
+the generated models there. stel's internal capture database is a throwaway
+local temp file either way and never touches the dbt target.
+
+See
 [`examples/dbt_embed_duckdb`](../examples/dbt_embed_duckdb) for a runnable
 three-level DAG (extraction → transforms → SQL mart).
 

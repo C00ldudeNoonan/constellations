@@ -20,8 +20,9 @@ build a DAG, materialize incrementally, test the results, and emit artifacts.
 
 The active platform roadmap is intentionally narrow:
 
-- **Warehouses:** DuckDB and BigQuery are shipped; MotherDuck compatibility
-  and Snowflake are planned.
+- **Warehouses:** DuckDB is the default and reference adapter, and MotherDuck
+  (`path: md:<database>`) is shipped as its managed deployment — the same
+  adapter and capability contract. BigQuery is shipped; Snowflake is planned.
 - **Retrieval:** LanceDB is the supported reference store. Additional hosted
   retrieval-store integrations are not currently planned.
 - **Embedded dbt execution:** dbt-duckdb only. BigQuery and future Snowflake

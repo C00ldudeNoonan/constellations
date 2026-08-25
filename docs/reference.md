@@ -381,6 +381,7 @@ stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FI
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
 stel serving recover <search-index> --owner-terminated   # explicit authority reassignment after a crash
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
+stel suggest dbt --from RELATION --dbt-project DIR       # propose `description:` for under-documented dbt models
 stel providers list [--output {table,json}]              # built-in + entry-point providers, incompatible plugins flagged
 stel source freshness                                    # mtime vs warn_after/error_after
 stel docs generate [--output DIR]                        # static HTML site from manifest.json
@@ -2016,7 +2017,67 @@ The first publish after upgrading recomputes that older stamp to prove the
 configuration is unchanged and rewrites it in place. Rows are untouched: there
 is no rebuild, no re-embed, and nothing to run by hand.
 
-### Serving readiness and coordination
+#
+## Suggesting context improvements
+
+`stel suggest dbt` turns the agent-transcript corpus into a **reviewable
+patch** against a dbt project. dbt keeps its context as files in git, so the
+acceptance mechanism is a diff a human reads and merges — not a table of
+recommendations nobody opens.
+
+```bash
+stel suggest dbt --from analytics.doc_suggestions --dbt-project ../analytics
+```
+
+It prints a unified diff and changes nothing. Re-run with `--write` to apply;
+stel never commits.
+
+### Where the analysis lives
+
+Not in the command. Deciding *which* models are under-documented, and what
+their descriptions should say, is an ordinary stel project over the transcript
+corpus — the same provider, prompt-provenance, and incremental machinery every
+other model uses. `stel suggest dbt` reads the relation those models produce.
+
+That relation is the contract:
+
+| column | meaning |
+|---|---|
+| `dbt_model` | the dbt model to document |
+| `dbt_column` | column to document; null for a model-level description |
+| `suggested_description` | the proposed prose |
+| `evidence_count` | distinct sessions supporting the suggestion |
+| `evidence_sessions` | which sessions — the provenance a reviewer asks for first |
+
+`--min-evidence` (default 3) is the bar. One session is an anecdote: an agent
+opens a model's SQL for all sorts of reasons. Repetition across sessions is
+what separates "someone looked at this once" from "this keeps costing people
+time".
+
+### What it will not do
+
+Each of these is a way a well-meaning suggestion could destroy work:
+
+- **Never overwrites an existing description.** Only absent ones are filled —
+  and a `description:` key that is present but empty or null counts as
+  existing, because inserting a second one beside it produces a duplicate
+  mapping key that loaders resolve back to the empty value.
+- **Never touches any key but `description:`.** Tests, columns, and config are
+  out of reach.
+- **Never documents the wrong object.** The entry is located inside the
+  `models:` block and at that sequence's own depth, so a source table or a
+  column sharing the model's name cannot be edited in its place.
+- **Never leaves `models/**/*.yml`.** `dbt_project.yml`, seeds, and snapshots
+  are not searched, so they cannot be edited. Symlinks are refused rather than
+  followed — including a symlinked `models/` or any symlinked directory
+  beneath it, which would otherwise put files outside the project in reach.
+- **Never applies without `--write`,** and never commits.
+
+Descriptions are ordinary prose and may contain colons, quotes, or newlines.
+They are emitted as quoted YAML scalars, so a description cannot introduce
+keys into the file it lands in.
+
+## Serving readiness and coordination
 
 Publication is generation-fenced (issue #152). The active warehouse owns a
 per-index serving ledger plus publish/query leases: a publisher acquires an

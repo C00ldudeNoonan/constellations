@@ -87,6 +87,7 @@ from .search import (
     search as run_search,
 )
 from .sources import SourceError
+from .suggest import DEFAULT_MIN_EVIDENCE
 from .synth import (
     generate_arxiv_papers,
     generate_invoice_pdfs,
@@ -1870,6 +1871,84 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
         f"Migrated serving scope for '{model_name}': "
         f"ledger_rows={result['ledger_rows']} state_rows={result['state_rows']}"
     )
+
+
+@cli.group()
+def suggest() -> None:
+    """Propose context improvements from the agent-transcript corpus (#361)."""
+
+
+@suggest.command("dbt")
+@click.option(
+    "--from",
+    "relation",
+    required=True,
+    help="Relation holding candidate suggestions, produced by the analysis project.",
+)
+@click.option(
+    "--dbt-project",
+    "dbt_project",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="dbt project directory to patch. Only models/**/*.yml is ever touched.",
+)
+@click.option(
+    "--min-evidence",
+    default=DEFAULT_MIN_EVIDENCE,
+    show_default=True,
+    help="Distinct sessions required before a gap is worth proposing a change for.",
+)
+@click.option(
+    "--write",
+    is_flag=True,
+    help="Apply the patch. Without this the diff is printed and nothing changes.",
+)
+@_project_context_options
+@click.pass_context
+def suggest_dbt(
+    ctx: click.Context,
+    relation: str,
+    dbt_project: Path,
+    min_evidence: int,
+    write: bool,
+) -> None:
+    """Propose `description:` for dbt models agents keep having to read.
+
+    Only absent descriptions are filled and only `description:` is touched, so
+    a suggestion can add context but never overwrite it. Review the diff and
+    merge it like any other change; stel does not commit.
+    """
+    from .cli_services.suggest import suggest_dbt as _suggest_dbt
+
+    try:
+        diff, outcomes = _suggest_dbt(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            relation=relation,
+            dbt_project_dir=dbt_project,
+            min_evidence=min_evidence,
+            write=write,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except AdapterError as e:
+        raise click.ClickException(str(e)) from e
+
+    applied = [outcome for outcome in outcomes if outcome.applied]
+    if not applied:
+        click.echo("No suggestions to apply.")
+    else:
+        click.echo(diff, nl=False)
+        click.echo(
+            f"{len(applied)} suggestion(s) "
+            f"{'applied' if write else 'proposed'}."
+        )
+        if not write:
+            click.echo("Re-run with --write to apply.")
+    skipped = [outcome for outcome in outcomes if not outcome.applied]
+    for outcome in skipped:
+        click.echo(f"skipped {outcome.target}: {outcome.reason}", err=True)
 
 
 @cli.group()

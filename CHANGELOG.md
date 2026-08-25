@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Promoting candidates into golden sets (issue #380)
+
+- **`golden_sets/<name>.yml`** is the promotion artifact: a reviewed file in
+  the project, not a warehouse write, because a promotion is a human
+  judgement that wants git review, blame, and revert.
+  `stel.promotion.golden_set` materializes it into the relation
+  `retrieval_tests.golden_set` already refs — **the evals need no changes at
+  all**, closing #329 phase 3's loop.
+- **Every promoted query names its sessions**, and `query_text` is required
+  and human-owned: the corpus records only a fingerprint unless text capture
+  was opted into, and `retrieval_tests` replays each query through `search()`,
+  so the reviewer supplying the text is what makes a row re-runnable.
+- **The file's `id_space` is checked against the target index's `id_field`.**
+  A set promoted in the wrong id space matches nothing and reports zero
+  recall — indistinguishable from broken retrieval — so the mismatch is a hard
+  error naming both spaces.
+
 ### Candidate retrieval judgments from the transcript corpus (issue #380)
 
 - **`stel.transcripts.transforms.retrieval_judgments`** derives #329 phase 3's

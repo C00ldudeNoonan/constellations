@@ -86,7 +86,13 @@ in stel's installed backend registry.
    positional arguments.
 2. For transforms with options, expose `validate_options(options) -> None`.
    The compiler calls this hook before source discovery, credentials, optional
-   SDK initialization, model loading, or warehouse mutation.
+   SDK initialization, model loading, or warehouse mutation. When the options
+   name a file in the project, take the two-argument form
+   `validate_options(options, project_dir) -> None` instead and validate that
+   file here: by execution the upstream models have already spent provider
+   calls and written to the warehouse, so a bad file found then costs all of
+   it. The form is chosen by arity, the same way `run(deps)` and
+   `run(deps, ctx)` are.
 3. When options name the transform's upstream models, also expose
    `declared_dependencies(options) -> Iterable[str]` returning the complete set
    of model names those options require. Implementing it asserts that the

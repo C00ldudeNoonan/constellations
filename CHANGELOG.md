@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Transcripts capture stel's own MCP calls (issue #380)
+
+- **`transcript/v1.1`** adds `context_calls` to each exchange: for a
+  `search_context` call against stel's own MCP server, the converter now keeps
+  the context model, `query_fingerprint`, returned `context_id`s/`chunk_id`s,
+  the zero-result flag, and which returned ids the assistant named in the
+  prose that followed. A failed call records its MCP `error_code` instead and
+  is never counted as a zero result. This is a deliberate, narrow exception to the #360
+  reduction — the result body is still dropped — because that reduction
+  otherwise discards exactly the retrieval judgment #329 phase 3 consumes.
+- The fingerprint uses the same function and domain as the MCP query log, so a
+  transcript row joins to a served-side log row without a second convention.
+  Recognition keys on the response's own `mcp_context/v1` marker, not on the
+  MCP server name (which the operator chooses), so a similarly named tool from
+  another server is not mistaken for stel's.
+- Query **text** stays out unless `stel transcripts convert|sync
+  --capture-context-queries` is passed, mirroring the query log's separate
+  `capture_query_text` opt-in. The field is additive: `transcript/v1`
+  documents remain valid and read back with no context calls.
+
 ### Agent transcript pipeline: stel can read its own exhaust (issue #360)
 
 - **`stel transcripts convert` / `sync`** turn Claude Code and Codex session

@@ -311,7 +311,7 @@ def test_landing_write_is_stable_and_atomic(tmp_path: Path) -> None:
     assert first.name == f"claude-code-{_SID_CLAUDE}.json"
     assert not list(out.glob("*.tmp"))
     payload = json.loads(first.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "transcript/v1"
+    assert payload["schema_version"] == "transcript/v1.1"
 
 
 def test_sync_skips_the_live_session(tmp_path: Path) -> None:

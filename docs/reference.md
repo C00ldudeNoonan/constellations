@@ -3079,6 +3079,27 @@ and the file paths named by file-bearing arguments become per-exchange
 `files_touched`, the corpus's best search filter. Sidechain (subagent) and
 meta records, and Codex instruction/environment messages, never land.
 
+**stel's own MCP calls are the one exception** (issue #380). A
+`search_context` call against stel's server carries the retrieval judgment
+the feedback loop is built on, so each one lands in the exchange's
+`context_calls` as structured fields — the context model queried, the
+`query_fingerprint`, the returned `context_id`s and `chunk_id`s, whether the
+call returned nothing, and which of the returned ids the assistant went on to
+name in the prose that followed. A call that *failed* records its MCP
+`error_code` and is never marked `zero_results`: a denied or timed-out search
+returned nothing because it failed, and counting it as an empty retrieval
+would corrupt the zero-result rate this corpus exists to measure. The result body itself is still dropped, and
+the fingerprint uses the same function and domain as the MCP query log, so a
+transcript row joins directly to a served-side log row.
+
+Recognition keys on the response's own `mcp_context/v1` marker rather than on
+the MCP server's name, which is operator-chosen in client configuration: a
+tool named like stel's that answers something else is not treated as one.
+Query *text* stays out unless `--capture-context-queries` is passed, the same
+separate opt-in `capture_query_text` is for the query log. Documents carrying
+`context_calls` declare `transcript/v1.1`; the field is additive and `v1`
+documents remain valid.
+
 `sync` skips any transcript modified within `--min-idle-seconds`
 (default 300): that file is a live session, and its sealed exchanges land on
 a later pass. Landing writes are atomic and named `{harness}-{session_id}.json`,

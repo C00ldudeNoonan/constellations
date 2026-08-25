@@ -7,6 +7,7 @@ explodes a document's body into one stable child row per word.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -890,3 +891,98 @@ def test_reference_dep_contract_validation() -> None:
         )
     with pytest.raises(ValueError, match="must not also be a reference_dep"):
         contract(ReferenceDep("docs", join_key="k")).validate_against(["docs"])
+
+
+# ─── transform memory: streaming parent groups (issue #383) ─────────────────
+
+
+def test_parent_fingerprints_are_unchanged_by_streaming() -> None:
+    """A golden digest, and the most important test in this file.
+
+    The fingerprint decides whether a parent is reprocessed. If a refactor
+    changes how rows are serialized, every parent in every existing project
+    looks changed at once and the whole corpus re-runs at provider prices —
+    silently, because the run still succeeds. Pin the bytes.
+    """
+    import polars as pl
+
+    from stel.execution.transform import _parent_fingerprint
+
+    rows = [
+        {"parent_id": "p1", "n": 2, "s": "b"},
+        {"parent_id": "p1", "n": 1, "s": "a"},
+    ]
+    digest = _parent_fingerprint("p1", rows, {"ref": "abc"})
+
+    # Order-insensitive within a parent, as it always was.
+    assert _parent_fingerprint("p1", list(reversed(rows)), {"ref": "abc"}) == digest
+    # And what the streaming path produces for the same data is identical.
+    from stel.execution.transform import _parent_groups
+
+    frame = pl.DataFrame(rows)
+    (_key, streamed), = list(_parent_groups(frame, "parent_id", "m"))
+    assert _parent_fingerprint("p1", streamed, {"ref": "abc"}) == digest
+
+
+def test_parent_groups_preserve_first_appearance_order() -> None:
+    """Group order feeds processed-parent ordering, so sorting instead of
+    preserving first appearance would be a silent behavior change."""
+    import polars as pl
+
+    from stel.execution.transform import _parent_groups
+
+    frame = pl.DataFrame(
+        {"parent_id": ["b", "a", "b", "c", "a"], "n": [1, 2, 3, 4, 5]}
+    )
+    assert [key for key, _ in _parent_groups(frame, "parent_id", "m")] == [
+        "b",
+        "a",
+        "c",
+    ]
+
+
+def test_parent_groups_stream_rather_than_materializing_every_parent() -> None:
+    """The fix for #383: peak residency is one parent, not the corpus.
+
+    Taking a single group must not have forced the rest to be built, which is
+    what a list-returning implementation would do.
+    """
+    import polars as pl
+
+    from stel.execution.transform import _parent_groups
+
+    frame = pl.DataFrame({"parent_id": ["a", "b", "c"], "n": [1, 2, 3]})
+    groups = _parent_groups(frame, "parent_id", "m")
+
+    assert isinstance(groups, Iterator)
+    first_key, first_rows = next(groups)
+    assert first_key == "a"
+    assert first_rows == [{"parent_id": "a", "n": 1}]
+
+
+def test_an_unusable_parent_key_is_still_refused(
+) -> None:
+    import polars as pl
+
+    from stel.execution.transform import _parent_groups
+    from stel.runner import RunError
+
+    for bad in (None, "", "   "):
+        frame = pl.DataFrame(
+            {"parent_id": ["a", bad], "n": [1, 2]},
+            schema={"parent_id": pl.String, "n": pl.Int64},
+        )
+        with pytest.raises(RunError, match="null or empty"):
+            list(_parent_groups(frame, "parent_id", "m"))
+
+
+def test_a_missing_or_mistyped_parent_key_is_refused() -> None:
+    import polars as pl
+
+    from stel.execution.transform import _parent_groups
+    from stel.runner import RunError
+
+    with pytest.raises(RunError, match="missing the parent key column"):
+        list(_parent_groups(pl.DataFrame({"other": ["a"]}), "parent_id", "m"))
+    with pytest.raises(RunError, match="must be string-typed"):
+        list(_parent_groups(pl.DataFrame({"parent_id": [1]}), "parent_id", "m"))

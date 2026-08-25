@@ -671,6 +671,21 @@ wheels = [
 ]
 
 [[package]]
+name = "google-cloud-bigquery-storage"
+version = "2.41.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/c9/1dc5941062fd196959ab343174d91f132cb2308cc3c80deb7dd194543977/google_cloud_bigquery_storage-2.41.0-py3-none-any.whl", hash = "sha256:a7511f05aedb533e01f029e30b26ff073ca66d672f701bb736024553697b589c", size = 308013, upload-time = "2026-08-24T21:55:17.697Z" },
+]
+
+[[package]]
 name = "google-cloud-core"
 version = "2.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2576,6 +2591,7 @@ all = [
     { name = "fpdf2" },
     { name = "ftfy" },
     { name = "google-cloud-bigquery" },
+    { name = "google-cloud-bigquery-storage" },
     { name = "google-cloud-storage" },
     { name = "google-genai" },
     { name = "lancedb" },
@@ -2591,6 +2607,7 @@ all = [
 ]
 bigquery = [
     { name = "google-cloud-bigquery" },
+    { name = "google-cloud-bigquery-storage" },
 ]
 gcs = [
     { name = "google-cloud-storage" },
@@ -2657,6 +2674,8 @@ requires-dist = [
     { name = "ftfy", marker = "extra == 'text'", specifier = ">=6.2" },
     { name = "google-cloud-bigquery", marker = "extra == 'all'", specifier = ">=3.25" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3.25" },
+    { name = "google-cloud-bigquery-storage", marker = "extra == 'all'", specifier = ">=2.25" },
+    { name = "google-cloud-bigquery-storage", marker = "extra == 'bigquery'", specifier = ">=2.25" },
     { name = "google-cloud-storage", marker = "extra == 'all'", specifier = ">=2.16" },
     { name = "google-cloud-storage", marker = "extra == 'gcs'", specifier = ">=2.16" },
     { name = "google-genai", marker = "extra == 'all'", specifier = ">=1.28" },

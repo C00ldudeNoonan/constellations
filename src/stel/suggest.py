@@ -112,12 +112,42 @@ def schema_files(dbt_project_dir: Path) -> list[Path]:
             f"No models/ directory under {dbt_project_dir}; this does not look "
             "like a dbt project"
         )
+    if models_dir.is_symlink():
+        raise SuggestionError(
+            f"{models_dir} is a symlink; refusing to edit through it"
+        )
     return sorted(
         path
         for pattern in ("*.yml", "*.yaml")
         for path in models_dir.rglob(pattern)
-        if path.is_file() and not path.is_symlink()
+        if path.is_file() and _contained_without_symlinks(path, models_dir)
     )
+
+
+def _contained_without_symlinks(path: Path, root: Path) -> bool:
+    """Whether `path` sits under `root` with no symlink anywhere between.
+
+    `rglob` follows symlinked directories, and `is_symlink()` on the file it
+    yields sees only the regular destination — so a symlinked `models/sub`
+    would put files outside the dbt project in reach of `--write`, breaking
+    the containment this module promises (Codex review). Every component from
+    `root` down is checked instead.
+
+    Deliberately lexical: `resolve()` would follow the very links being
+    guarded against, so ancestry is compared on the unresolved path.
+    """
+    if path.is_symlink():
+        return False
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
 
 
 def _model_entry(document: Any, model_name: str) -> dict[str, Any] | None:
@@ -157,14 +187,77 @@ def _entry_block(lines: list[str], start: int) -> int:
     return index
 
 
-def _find_entry_line(lines: list[str], name: str, *, within: range | None) -> int | None:
-    """Line index of the `- name: <name>` entry, optionally inside a block."""
+def _sequence_item_indent(lines: list[str], span: range) -> int | None:
+    """Indent of the first `- ` item in `span` — the depth every direct entry
+    of that sequence sits at."""
+    for index in span:
+        stripped = lines[index].lstrip()
+        if stripped.startswith("- "):
+            return len(lines[index]) - len(stripped)
+    return None
+
+
+def _find_entry_line(
+    lines: list[str], name: str, *, within: range | None, depth: int | None = None
+) -> int | None:
+    """Line index of the `- name: <name>` entry, optionally inside a block.
+
+    `depth` restricts the match to entries of one sequence. Without it a
+    *column* named like the model it belongs beside would match first and be
+    documented instead of the model (Codex review, extended): scoping to the
+    `models:` block is not enough, because columns are nested inside it.
+    """
     span = within if within is not None else range(len(lines))
     for index in span:
-        stripped = lines[index].strip()
-        if stripped in (f"- name: {name}", f"- name: '{name}'", f'- name: "{name}"'):
-            return index
+        line = lines[index]
+        stripped = line.strip()
+        if stripped not in (f"- name: {name}", f"- name: '{name}'", f'- name: "{name}"'):
+            continue
+        if depth is not None and len(line) - len(line.lstrip()) != depth:
+            continue
+        return index
     return None
+
+
+def _top_level_block(lines: list[str], key: str) -> range | None:
+    """Line range covered by a top-level `key:` block, or None.
+
+    A schema file may declare `sources:` beside `models:`, and a source table
+    can share a name with a model. Searching the whole file for `- name: <x>`
+    would then find the source entry first and document the wrong object
+    (Codex review), so the search is scoped to the block that owns models.
+    """
+    for index, line in enumerate(lines):
+        if line.strip() != f"{key}:" or line[:1].isspace():
+            continue
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end]
+            if (
+                candidate.strip()
+                and not candidate.lstrip().startswith("#")
+                and not candidate[:1].isspace()
+            ):
+                break
+            end += 1
+        return range(index + 1, end)
+    return None
+
+
+def _documented_reason(entry: dict[str, Any]) -> str | None:
+    """Why this entry must not receive an inserted description, or None.
+
+    Presence of the key decides, not truthiness: inserting a second
+    `description:` beside an empty or null one produces a duplicate mapping
+    key, which loaders resolve to the *existing* empty value — the suggestion
+    would be silently discarded while the command reported it applied, and
+    stricter loaders reject the file outright (Codex review).
+    """
+    if "description" not in entry:
+        return None
+    if entry.get("description"):
+        return "already documented"
+    return "description key already present but empty; edit it by hand"
 
 
 def _columns_block(lines: list[str], model_start: int, model_end: int) -> range | None:
@@ -190,7 +283,15 @@ def render_suggestion(
         return None, "model not declared in this file"
 
     lines = text.splitlines(keepends=True)
-    model_line = _find_entry_line(lines, row.dbt_model, within=None)
+    models_block = _top_level_block(lines, "models")
+    if models_block is None:
+        return None, "models block is not a plain block sequence; edit it by hand"
+    model_line = _find_entry_line(
+        lines,
+        row.dbt_model,
+        within=models_block,
+        depth=_sequence_item_indent(lines, models_block),
+    )
     if model_line is None:
         # Parsed but not locatable as a plain `- name:` line — a flow mapping
         # or an anchor. Refusing beats guessing at an insertion point.
@@ -198,19 +299,26 @@ def render_suggestion(
     model_end = _entry_block(lines, model_line)
 
     if row.dbt_column is None:
-        if entry.get("description"):
-            return None, "already documented"
+        documented = _documented_reason(entry)
+        if documented is not None:
+            return None, documented
         insert_at, indent_from = model_line + 1, lines[model_line]
     else:
         column = _column_entry(entry, row.dbt_column)
         if column is None:
             return None, f"column '{row.dbt_column}' not declared in this file"
-        if column.get("description"):
-            return None, "already documented"
+        documented = _documented_reason(column)
+        if documented is not None:
+            return None, documented
         columns = _columns_block(lines, model_line, model_end)
         if columns is None:
             return None, "columns block is not a plain block sequence"
-        column_line = _find_entry_line(lines, row.dbt_column, within=columns)
+        column_line = _find_entry_line(
+            lines,
+            row.dbt_column,
+            within=columns,
+            depth=_sequence_item_indent(lines, columns),
+        )
         if column_line is None:
             return None, "column entry is not a plain block mapping"
         insert_at, indent_from = column_line + 1, lines[column_line]
@@ -219,6 +327,11 @@ def render_suggestion(
     # `name` two columns right of the dash, and `description` is its sibling.
     dash = len(indent_from) - len(indent_from.lstrip())
     indent = " " * (dash + 2)
+    # `splitlines(keepends=True)` leaves a final line without a trailing
+    # newline unterminated; inserting after it would splice both onto one line
+    # and emit malformed YAML (Codex review).
+    if insert_at > 0 and not lines[insert_at - 1].endswith(chr(10)):
+        lines[insert_at - 1] += chr(10)
     lines.insert(insert_at, f"{indent}description: {_yaml_scalar(row.suggested_description)}\n")
     return "".join(lines), "applied"
 

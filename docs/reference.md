@@ -2058,11 +2058,19 @@ time".
 
 Each of these is a way a well-meaning suggestion could destroy work:
 
-- **Never overwrites an existing description.** Only absent ones are filled.
+- **Never overwrites an existing description.** Only absent ones are filled —
+  and a `description:` key that is present but empty or null counts as
+  existing, because inserting a second one beside it produces a duplicate
+  mapping key that loaders resolve back to the empty value.
 - **Never touches any key but `description:`.** Tests, columns, and config are
   out of reach.
+- **Never documents the wrong object.** The entry is located inside the
+  `models:` block and at that sequence's own depth, so a source table or a
+  column sharing the model's name cannot be edited in its place.
 - **Never leaves `models/**/*.yml`.** `dbt_project.yml`, seeds, and snapshots
-  are not searched, so they cannot be edited.
+  are not searched, so they cannot be edited. Symlinks are refused rather than
+  followed — including a symlinked `models/` or any symlinked directory
+  beneath it, which would otherwise put files outside the project in reach.
 - **Never applies without `--write`,** and never commits.
 
 Descriptions are ordinary prose and may contain colons, quotes, or newlines.

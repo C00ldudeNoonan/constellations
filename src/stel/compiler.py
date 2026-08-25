@@ -806,21 +806,12 @@ def _validate_retrieval_tests(model: ModelConfig, model_names: set[str]) -> None
 
 def _validate_materialization(model: ModelConfig) -> None:
     if model.search is not None:
-        if model.materialization != "incremental":
+        if model.materialization not in ("incremental", "full"):
             raise _model_error(
                 model,
-                "Search resources support only `materialization: incremental` in the "
-                "local proof-of-concept; atomic full replacement is deferred to #153",
+                "Search resources support `materialization: incremental` or "
+                "`materialization: full`",
                 ("materialization",),
-            )
-        if model.search.on_index_change == "rebuild":
-            raise _model_error(
-                model,
-                "`on_index_change: rebuild` requires atomic generation activation, "
-                "which no retrieval store advertises yet. Use `fail` (the default) "
-                "and publish under a new collection name, or `online` for an "
-                "additive change",
-                ("search", "on_index_change"),
             )
         if model.warehouse_options:
             raise _model_error(

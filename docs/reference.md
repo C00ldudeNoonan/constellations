@@ -1969,11 +1969,44 @@ Two limits are deliberate:
   rejected at compile time against a store that cannot widen a live
   collection, rather than failing mid-publish.
 
-`on_index_change: rebuild` remains rejected at compile time: an atomic full
-replacement requires a store that can prove atomic generation activation, and
-none does yet. Until then a rebuild-required change is handled the way the
-error says — publish under a new collection name, validate it, and cut
-consumers over.
+### `on_index_change: rebuild`
+
+Set `on_index_change: rebuild` to absorb a change the table above calls
+rebuild-required, instead of stopping the run. stel builds a **new generation**
+— a physical collection nothing is querying — validates it, and only then
+points the logical collection at it. The previous generation keeps serving
+every read until that switch, so there is no window in which the index is
+empty, half-built, or serving rows from two configurations.
+
+```yaml
+search:
+  on_index_change: rebuild
+```
+
+The same machinery backs a full replacement asked for directly:
+
+```bash
+stel run --select chunk_search --full-refresh
+```
+
+or, permanently, `materialization: full` on the search resource.
+
+Three things follow from how activation works, and are worth knowing before
+turning any of them on:
+
+- **It re-embeds everything.** A rebuild is a full republication at provider
+  prices. It is never inferred from a change — you ask for it, by policy or by
+  flag. An unannounced full re-embed is the behavior this design rejects.
+- **The store must advertise `private_generation_build`.** A store that cannot
+  build a collection under a private name cannot replace a live one
+  atomically, and the run fails before touching anything.
+- **The superseded generation is retired after activation**, once nothing can
+  be reading it. A generation left behind by a publisher that died mid-build
+  is reclaimed by the next successful publish.
+
+Recovery is safe across all of this: `stel serving recover` preserves the
+record of which generation is live, so recovering authority does not force a
+re-embed.
 
 Changing `store` or `collection` is not an evolution at all — it selects a
 different physical collection, published independently under its own state.

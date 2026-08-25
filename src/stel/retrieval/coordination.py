@@ -557,26 +557,28 @@ class ServingCoordinator:
         *,
         safe_error_code: str,
         counts: tuple[int, int, int, int] = (0, 0, 0, 0),
+        active_collection: str | None = None,
     ) -> None:
         """Record a failed publication; the scope becomes unavailable to queries.
 
-        An in-place incremental publish that failed midway may have mutated
-        the previously ready generation, so failure always clears the active
-        generation rather than reverting to it. The activation pointer is
-        cleared with it, which is safe only because a failed row is refused by
-        `acquire_query` — nothing can follow a stale pointer.
+        The active generation is always cleared: an in-place publish that
+        failed midway may have mutated it, and there is no way to tell from
+        here whether it did.
 
-        A private-generation rebuild (issue #355) does not mutate the serving
-        collection, so when that path lands its failure handling must preserve
-        the pointer instead of clearing it; otherwise a failed rebuild would
-        drop the still-healthy previous generation out of resolution.
+        `active_collection` is the asymmetry (issue #355). An in-place publish
+        writes into the collection the pointer names, so a failure there may
+        have corrupted it and the pointer must go — the default. A private
+        generation build writes somewhere nothing is reading; a failure leaves
+        the previous generation untouched and still correct, so that path
+        passes the existing pointer to keep it. Clearing it there would drop a
+        healthy generation out of resolution and force a full re-embed, which
+        is the cost issue #355 exists to avoid.
         """
         self._finish(
             lease,
             status=STATUS_FAILED,
             active_generation=None,
-            # Cleared deliberately, not by omission — see the note above.
-            active_collection=None,
+            active_collection=active_collection,
             safe_error_code=validate_safe_error_code(safe_error_code),
             counts=counts,
         )

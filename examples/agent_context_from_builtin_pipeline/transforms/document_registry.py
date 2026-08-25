@@ -5,9 +5,23 @@ from typing import Any
 
 import polars as pl
 
-from stel.agent_context import project_document_registry_row
+from stel.agent_context import empty_agent_context_frame, project_document_registry_row
 
 _RECORDED_AT = datetime(2026, 7, 20, tzinfo=UTC)
+
+# Extra columns this wrapper adds on top of the agent_context/v1 contract.
+_EXTRA_FIELDS: dict[str, pl.DataType] = {"title": pl.String()}
+
+
+def _schema() -> dict[str, pl.DataType]:
+    # Always construct with the contract schema, never inference: a batch
+    # whose rows are all-null in an optional column would otherwise infer
+    # Null for it — failing with a ComputeError on the first mixed batch, or
+    # quietly drifting the schema (issue #366).
+    return {
+        **dict(empty_agent_context_frame("document_registry").schema),
+        **_EXTRA_FIELDS,
+    }
 
 
 def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
@@ -45,4 +59,4 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
         )
         row["title"] = str(source["title"])
         rows.append(row)
-    return pl.DataFrame(rows)
+    return pl.DataFrame(rows, schema=_schema())

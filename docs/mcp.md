@@ -46,7 +46,12 @@ built-in `extraction:`/`chunk:` primitives cannot claim the contract, so a
 search index built directly on them will not surface here even once fully
 populated. `stel.agent_context.project_document_registry_row`/
 `project_document_chunk_row` turn an existing `extraction:`/`chunk:` pipeline
-into a contract-emitting transform in roughly 15-20 lines each; see
+into a contract-emitting transform in roughly 15-20 lines each. Construct the
+output frame with an explicit schema from
+`empty_agent_context_frame(grain).schema` (plus any extra columns) rather than
+letting polars infer one — a batch that is all-null in an optional column such
+as `citation_section_path` otherwise infers a Null-typed column and fails, or
+drifts the schema, on a later mixed batch. See
 `examples/agent_context_from_builtin_pipeline/` for a complete project
 (`extraction:` → `chunk:` → two thin `transform:` wrappers → `embed:` →
 `search:`) that compiles, runs, and is discoverable through

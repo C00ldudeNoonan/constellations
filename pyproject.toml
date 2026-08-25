@@ -20,7 +20,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-bigquery = ["google-cloud-bigquery>=3.25"]
+# The storage client is not optional in practice: without it `to_arrow()`
+# silently degrades to REST paging, which parses the whole result through
+# Python objects before Arrow assembly — the load-phase multiplier behind
+# the OOM in issue #383 — and warns only with a UserWarning from deep
+# inside google-cloud.
+bigquery = ["google-cloud-bigquery>=3.25", "google-cloud-bigquery-storage>=2.25"]
 gcs = ["google-cloud-storage>=2.16"]
 vertex = ["google-genai>=1.28"]
 lancedb = ["lancedb>=0.34,<0.35"]
@@ -35,6 +40,7 @@ nlp = ["spacy>=3.8,<4"]
 ml = ["scikit-learn>=1.3", "numpy>=1.26"]
 all = [
     "google-cloud-bigquery>=3.25",
+    "google-cloud-bigquery-storage>=2.25",
     "google-cloud-storage>=2.16",
     "google-genai>=1.28",
     "lancedb>=0.34,<0.35",

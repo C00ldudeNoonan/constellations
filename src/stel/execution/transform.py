@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -351,8 +352,17 @@ def _run_incremental_transform(
         for spec in reference_specs
         if spec.join_key is not None
     }
+    # Vectorized rather than derived from the groups: `_parent_groups` now
+    # streams (issue #383), and the distinct keys are a column-wise question
+    # that never needed the rows.
+    _validate_group_key(
+        parent_frame,
+        contract.parent_source_key,
+        model_name=model.name,
+        surface="parent_source",
+    )
+    current_keys = set(parent_frame[contract.parent_source_key].unique().to_list())
     groups = _parent_groups(parent_frame, contract.parent_source_key, model.name)
-    current_keys = {key for key, _ in groups}
 
     processed_parents: list[str] = []
     state_records: list[StateRecord] = []
@@ -467,12 +477,18 @@ def _reject_unsupported_incremental_strategy(
         )
 
 
-def _parent_groups(
-    frame: pl.DataFrame, key_col: str, model_name: str
-) -> list[tuple[str, list[dict[str, Any]]]]:
+def _validate_group_key(
+    frame: pl.DataFrame, key_col: str, *, model_name: str, surface: str
+) -> None:
+    """Reject a grouping key that cannot identify rows, before any grouping.
+
+    Vectorized rather than per-row: the null/empty check is the reason the old
+    path had to visit every row as a Python object, and a column-wise test
+    answers it over Arrow without materializing anything (issue #383).
+    """
     if key_col not in frame.columns:
         raise RunError(
-            f"Incremental transform '{model_name}': parent_source is missing the "
+            f"Incremental transform '{model_name}': {surface} is missing the "
             f"parent key column '{key_col}'. Available: {sorted(frame.columns)}"
         )
     if frame.schema[key_col] != pl.String:
@@ -480,23 +496,41 @@ def _parent_groups(
             f"Incremental transform '{model_name}': parent key column '{key_col}' "
             f"must be string-typed, got {frame.schema[key_col]}"
         )
-    groups: dict[str, list[dict[str, Any]]] = {}
-    order: list[str] = []
-    for row in frame.iter_rows(named=True):
-        raw = row[key_col]
-        if raw is None or not str(raw).strip():
-            raise RunError(
-                f"Incremental transform '{model_name}': parent key column "
-                f"'{key_col}' contains null or empty values"
-            )
-        key = str(raw)
-        bucket = groups.get(key)
-        if bucket is None:
-            bucket = []
-            groups[key] = bucket
-            order.append(key)
-        bucket.append(row)
-    return [(key, groups[key]) for key in order]
+    unusable = frame.select(
+        (pl.col(key_col).is_null() | (pl.col(key_col).str.strip_chars() == ""))
+        .any()
+        .alias("bad")
+    ).item()
+    if unusable:
+        raise RunError(
+            f"Incremental transform '{model_name}': parent key column "
+            f"'{key_col}' contains null or empty values"
+        )
+
+
+def _parent_groups(
+    frame: pl.DataFrame, key_col: str, model_name: str
+) -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    """Yield (parent key, rows) one parent at a time, in first-appearance order.
+
+    A generator, and that is the point (issue #383). These row dicts exist only
+    to be fingerprinted — the rows the transform actually receives come from
+    `parent_frame.filter(...)` further down — so holding every parent's rows at
+    once cost a second whole-table copy in Python objects, on top of the frame
+    itself. Python dict and str overhead makes that copy larger than the Arrow
+    data it came from, which is how a 5GB parent table reached a 10GiB ceiling.
+
+    Streaming per parent puts the ceiling at the largest single parent instead
+    of the whole corpus. `partition_by(maintain_order=True)` preserves
+    first-appearance group order, so processed-parent ordering is unchanged,
+    and each parent's rows are serialized exactly as before — the fingerprint
+    is byte-identical, which it has to be: a changed digest would invalidate
+    every parent in every existing project and re-run the whole corpus.
+    """
+    _validate_group_key(frame, key_col, model_name=model_name, surface="parent_source")
+    for partition in frame.partition_by(key_col, maintain_order=True):
+        # Materialized per parent, then dropped when the next one is yielded.
+        yield str(partition[key_col][0]), list(partition.iter_rows(named=True))
 
 
 def _frame_fingerprint(frame: pl.DataFrame) -> str:
@@ -538,21 +572,25 @@ def _keyed_reference_fingerprints(
             f"join_key column '{key_col}' must be string-typed, "
             f"got {frame.schema[key_col]}"
         )
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for row in frame.iter_rows(named=True):
-        raw = row[key_col]
-        if raw is None or not str(raw).strip():
-            raise RunError(
-                f"Incremental transform '{model_name}': reference dep '{spec.name}' "
-                f"join_key column '{key_col}' contains null or empty values"
-            )
-        groups.setdefault(str(raw), []).append(row)
+    unusable = frame.select(
+        (pl.col(key_col).is_null() | (pl.col(key_col).str.strip_chars() == ""))
+        .any()
+        .alias("bad")
+    ).item()
+    if unusable:
+        raise RunError(
+            f"Incremental transform '{model_name}': reference dep '{spec.name}' "
+            f"join_key column '{key_col}' contains null or empty values"
+        )
+    # One group's rows at a time, for the same reason as `_parent_groups`
+    # (issue #383): only the digest is kept, so holding every group's rows as
+    # Python objects bought nothing and cost a whole-table copy.
     return {
-        key: canonical_fingerprint(
-            {"rows": sorted(rows, key=canonical_json)},
+        str(partition[key_col][0]): canonical_fingerprint(
+            {"rows": sorted(partition.iter_rows(named=True), key=canonical_json)},
             domain="dbt-ml.transform-incremental-reference",
         )
-        for key, rows in groups.items()
+        for partition in frame.partition_by(key_col, maintain_order=True)
     }
 
 

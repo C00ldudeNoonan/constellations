@@ -5,6 +5,24 @@ from typing import Any
 import polars as pl
 
 from stel.agent_context import project_document_chunk_row
+from stel.transforms import IncrementalContract, ReferenceDep
+
+
+def declared_incremental_contract(options: dict[str, Any]) -> IncrementalContract:
+    """Chunks are the parents; the registry is a keyed reference (issue #364).
+
+    `join_key="source_key"` scopes invalidation per parent: ingesting a new
+    note projects only that note's chunks, and a changed registry row
+    reprojects only the documents it belongs to — instead of every registry
+    change reprojecting the whole corpus.
+    """
+    return IncrementalContract(
+        parent_key="source_key",
+        child_key="chunk_id",
+        parent_source="research_note_chunks",
+        parent_source_key="source_key",
+        reference_deps=(ReferenceDep("document_registry", join_key="source_key"),),
+    )
 
 
 def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
@@ -39,5 +57,8 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
             schema_fingerprint="agent-context-builtin-pipeline-chunks-v1",
         )
         row["title"] = str(parent["title"])
+        # The incremental contract's parent key: chunk rows are deleted and
+        # replaced per source document.
+        row["source_key"] = str(chunk["source_key"])
         rows.append(row)
     return pl.DataFrame(rows)

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Keyed reference deps: incremental transforms stop reprojecting the corpus (issue #364)
+
+- **`ReferenceDep(name, join_key=...)`** in `IncrementalContract.reference_deps`
+  scopes a reference dependency's invalidation to each parent's joined rows:
+  the join-key column holds parent identities, and a changed reference row now
+  reprojects only the parents it belongs to instead of flipping every parent
+  stale. Plain-string entries keep the table-scoped semantics byte-for-byte,
+  so existing contracts see no state re-key. Declaring a join key asserts the
+  transform derives a parent's children from that reference only through its
+  joined rows; null or empty join-key values are rejected at run time.
+- The `agent_context_from_builtin_pipeline` example's chunks wrapper is now
+  `materialization: incremental` with the registry as a keyed reference — the
+  prescribed wrapper pattern no longer pays a corpus-wide reprojection on
+  every registry change. Switching an existing transform to a keyed reference
+  changes its module source, so the first run after the switch reprocesses
+  every parent once and runs incrementally from then on.
+
 ### Extraction state now survives releases (issue #363)
 
 - **Backend identity no longer embeds the stel release.**

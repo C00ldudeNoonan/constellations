@@ -13,7 +13,9 @@ models:
     fields:
       - name: title
         data_type: string
-    materialization: full
+      - name: source_key
+        data_type: string
+    materialization: incremental
     tests:
       - not_null: [context_id, chunk_id, document_version_id, text]
       - unique: context_id

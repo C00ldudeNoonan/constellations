@@ -14,6 +14,7 @@ import duckdb
 import polars as pl
 import pytest
 
+from stel.adapters import StateValue
 from stel.runner import RunError, run_project
 
 _TRANSFORM_SOURCE = '''
@@ -650,3 +651,242 @@ def test_insert_overwrite_strategy_is_rejected(tmp_path: Path) -> None:
         _run_incremental(tmp_path, adapter, model)
     # Rejected before any warehouse mutation.
     assert not adapter.calls
+
+
+# ─── keyed reference deps (issue #364) ───────────────────────────────────────
+
+_KEYED_REF_TRANSFORM_SOURCE = '''
+from __future__ import annotations
+
+import polars as pl
+
+from stel.hashing import canonical_fingerprint
+from stel.transforms import IncrementalContract, ReferenceDep
+
+_SCHEMA = {
+    "row_id": pl.String(),
+    "document_id": pl.String(),
+    "word": pl.String(),
+    "label": pl.String(),
+}
+
+
+def declared_incremental_contract(options):
+    return IncrementalContract(
+        parent_key="document_id",
+        child_key="row_id",
+        parent_source="docs",
+        parent_source_key="document_id",
+        reference_deps=(ReferenceDep("registry", join_key="document_id"),),
+    )
+
+
+def run(deps, ctx=None):
+    labels = {
+        str(row["document_id"]): str(row["label"])
+        for row in deps["registry"].iter_rows(named=True)
+    }
+    rows = []
+    for record in deps["docs"].iter_rows(named=True):
+        document_id = str(record["document_id"])
+        for position, word in enumerate(str(record["body"]).split()):
+            rows.append(
+                {
+                    "row_id": canonical_fingerprint(
+                        {"document_id": document_id, "position": position},
+                        domain="test.keyedref",
+                    ),
+                    "document_id": document_id,
+                    "word": word,
+                    "label": labels.get(document_id, "unlabeled"),
+                }
+            )
+    return pl.DataFrame(rows, schema=_SCHEMA)
+'''
+
+
+def _keyed_ref_setup(
+    tmp_path: Path, registry: pl.DataFrame
+) -> tuple[Any, Any]:
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "labeled.py").write_text(
+        _KEYED_REF_TRANSFORM_SOURCE, encoding="utf-8"
+    )
+    model = _incremental_model(
+        "labeled", "transforms.labeled", ["ref('docs')", "ref('registry')"]
+    )
+    adapter = _RecordingAdapter(
+        {
+            "docs": pl.DataFrame(
+                {"document_id": ["docA", "docB"], "body": ["alpha beta", "gamma"]}
+            ),
+            "registry": registry,
+        }
+    )
+    return model, adapter
+
+
+def test_keyed_reference_change_reprocesses_only_its_parents(tmp_path: Path) -> None:
+    model, adapter = _keyed_ref_setup(
+        tmp_path,
+        pl.DataFrame({"document_id": ["docA", "docB"], "label": ["x", "y"]}),
+    )
+
+    first = _run_incremental(tmp_path, adapter, model)
+    assert first.documents_processed == 2
+
+    # Only docB's registry row changes: docA must be skipped, and docB's
+    # children replaced with the new label — the corpus-wide reprojection
+    # this contract shape previously forced (issue #364).
+    adapter.calls.clear()
+    adapter._upstream["registry"] = pl.DataFrame(
+        {"document_id": ["docA", "docB"], "label": ["x", "y2"]}
+    )
+    second = _run_incremental(tmp_path, adapter, model)
+    assert second.documents_processed == 1
+    assert second.documents_skipped == 1
+    rc_calls = [c for c in adapter.calls if c[0] == "replace_children"]
+    assert len(rc_calls) == 1
+    assert rc_calls[0][2] == ["docB"]
+    table = adapter._tables["labeled"]
+    assert set(table.filter(pl.col("document_id") == "docB")["label"]) == {"y2"}
+    assert set(table.filter(pl.col("document_id") == "docA")["label"]) == {"x"}
+
+
+def test_keyed_reference_gaining_and_losing_rows_moves_only_that_parent(
+    tmp_path: Path,
+) -> None:
+    # docB starts with no registry row: the empty-group fingerprint.
+    model, adapter = _keyed_ref_setup(
+        tmp_path, pl.DataFrame({"document_id": ["docA"], "label": ["x"]})
+    )
+
+    first = _run_incremental(tmp_path, adapter, model)
+    assert first.documents_processed == 2
+    assert set(adapter._tables["labeled"].filter(pl.col("document_id") == "docB")["label"]) == {
+        "unlabeled"
+    }
+
+    # docB gains its first registry row: only docB reprocesses.
+    adapter.calls.clear()
+    adapter._upstream["registry"] = pl.DataFrame(
+        {"document_id": ["docA", "docB"], "label": ["x", "y"]}
+    )
+    second = _run_incremental(tmp_path, adapter, model)
+    assert second.documents_processed == 1
+    assert second.documents_skipped == 1
+    assert next(c for c in adapter.calls if c[0] == "replace_children")[2] == ["docB"]
+
+    # And loses it again: only docB reprocesses back to the empty group.
+    adapter.calls.clear()
+    adapter._upstream["registry"] = pl.DataFrame(
+        {"document_id": ["docA"], "label": ["x"]}
+    )
+    third = _run_incremental(tmp_path, adapter, model)
+    assert third.documents_processed == 1
+    assert third.documents_skipped == 1
+    assert set(adapter._tables["labeled"].filter(pl.col("document_id") == "docB")["label"]) == {
+        "unlabeled"
+    }
+
+
+def test_keyed_reference_row_for_absent_parent_is_inert(tmp_path: Path) -> None:
+    model, adapter = _keyed_ref_setup(
+        tmp_path,
+        pl.DataFrame({"document_id": ["docA", "docB"], "label": ["x", "y"]}),
+    )
+    first = _run_incremental(tmp_path, adapter, model)
+    assert first.documents_processed == 2
+
+    # A registry row keyed to a parent that does not exist cannot contribute
+    # to any current parent's children under the declared join semantics.
+    adapter.calls.clear()
+    adapter._upstream["registry"] = pl.DataFrame(
+        {"document_id": ["docA", "docB", "docZ"], "label": ["x", "y", "z"]}
+    )
+    second = _run_incremental(tmp_path, adapter, model)
+    assert second.documents_processed == 0
+    assert second.documents_skipped == 2
+    assert not [
+        c for c in adapter.calls if c[0] in {"replace_children", "delete_rows_and_state"}
+    ]
+
+
+def test_keyed_reference_null_join_key_is_rejected(tmp_path: Path) -> None:
+    model, adapter = _keyed_ref_setup(
+        tmp_path,
+        pl.DataFrame({"document_id": ["docA", None], "label": ["x", "y"]}),
+    )
+    with pytest.raises(RunError, match="null or empty"):
+        _run_incremental(tmp_path, adapter, model)
+    mutating = {"delete_rows_and_state", "replace_children", "materialize_full"}
+    assert not [c for c in adapter.calls if c[0] in mutating]
+
+
+def test_keyed_reference_missing_join_key_column_is_rejected(tmp_path: Path) -> None:
+    model, adapter = _keyed_ref_setup(
+        tmp_path, pl.DataFrame({"doc": ["docA"], "label": ["x"]})
+    )
+    with pytest.raises(RunError, match="join_key column 'document_id'"):
+        _run_incremental(tmp_path, adapter, model)
+
+
+def test_keyless_reference_dep_fingerprints_match_string_form(tmp_path: Path) -> None:
+    """`ReferenceDep(name)` without a join_key must be byte-identical to the
+    plain-string form, so normalizing an existing contract re-keys nothing."""
+    keyless_source = _REF_TRANSFORM_SOURCE.replace(
+        'reference_deps=("vocab",),',
+        'reference_deps=(ReferenceDep("vocab"),),',
+    ).replace(
+        "from stel.transforms import IncrementalContract",
+        "from stel.transforms import IncrementalContract, ReferenceDep",
+    )
+    assert 'ReferenceDep("vocab")' in keyless_source
+
+    upstream = {
+        "docs": pl.DataFrame({"document_id": ["docA"], "body": ["alpha beta"]}),
+        "vocab": pl.DataFrame({"term": ["alpha"]}),
+    }
+    fingerprints: list[str] = []
+    for label, source in (("str", _REF_TRANSFORM_SOURCE), ("dep", keyless_source)):
+        subdir = tmp_path / label
+        (subdir / "transforms").mkdir(parents=True)
+        (subdir / "transforms" / "filtered.py").write_text(source, encoding="utf-8")
+        model = _incremental_model(
+            "filtered", "transforms.filtered", ["ref('docs')", "ref('vocab')"]
+        )
+        adapter = _RecordingAdapter({k: v.clone() for k, v in upstream.items()})
+        _run_incremental(subdir, adapter, model)
+        state_value = adapter._state["filtered"]["docA"]
+        assert isinstance(state_value, StateValue)
+        fingerprints.append(state_value.input_fingerprint)
+
+    assert fingerprints[0] == fingerprints[1]
+
+
+def test_reference_dep_contract_validation() -> None:
+    from stel.transforms import IncrementalContract, ReferenceDep
+
+    def contract(*refs: Any) -> IncrementalContract:
+        return IncrementalContract(
+            parent_key="document_id",
+            child_key="row_id",
+            parent_source="docs",
+            parent_source_key="document_id",
+            reference_deps=tuple(refs),
+        )
+
+    contract("vocab", ReferenceDep("registry", join_key="document_id")).validate_against(
+        ["docs", "vocab", "registry"]
+    )
+
+    with pytest.raises(ValueError, match=r"ReferenceDep\.name"):
+        contract(ReferenceDep("")).validate_against(["docs"])
+    with pytest.raises(ValueError, match=r"ReferenceDep\.join_key"):
+        contract(ReferenceDep("vocab", join_key=" ")).validate_against(["docs", "vocab"])
+    with pytest.raises(ValueError, match="duplicates"):
+        contract("vocab", ReferenceDep("vocab", join_key="k")).validate_against(
+            ["docs", "vocab"]
+        )
+    with pytest.raises(ValueError, match="must not also be a reference_dep"):
+        contract(ReferenceDep("docs", join_key="k")).validate_against(["docs"])

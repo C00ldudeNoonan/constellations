@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
 
 from ..adapters import (
     AdapterError,
+    ReadPredicate,
+    ReadPredicateOperator,
     StateRecord,
     StateScope,
     StateValue,
@@ -172,16 +175,33 @@ def run_transform_model(
     )
 
     transform_fn = load_transform(model.transform.module, project_dir)
-    deps: dict[str, pl.DataFrame] = {}
+    dep_names: list[str] = []
     if dbt_ref_source is not None:
         # The single input is a dbt-built table (#177). In embedded mode the dbt
         # Python shim reads `dbt.ref('name')` and injects it as an upstream, which
         # the CaptureAdapter serves through the same `read_table` path.
-        dbt_ref_name = parse_dbt_ref(dbt_ref_source)
-        deps[dbt_ref_name] = adapter.read_table(dbt_ref_name)
-    for dep_ref in model.depends_on or []:
-        dep_name = parse_ref(dep_ref)
-        deps[dep_name] = adapter.read_table(dep_name)
+        dep_names.append(parse_dbt_ref(dbt_ref_source))
+    dep_names.extend(parse_ref(dep_ref) for dep_ref in model.depends_on or [])
+
+    contract: IncrementalContract | None = None
+    if model.materialization == "incremental":
+        contract = load_incremental_contract(
+            model.transform.module, project_dir, model.transform.options
+        )
+        # The compiler requires the contract for incremental materialization.
+        assert contract is not None, "incremental transform is missing its contract"
+        _require_incremental_capabilities(model, adapter)
+
+    # The parent source is deliberately *not* read here when the model is
+    # incremental: it is classified from a streamed scan and then re-read
+    # scoped to the parents that actually changed, so peak memory follows the
+    # change set rather than the corpus (issue #385).
+    parent_source = (
+        contract.resolve_parent_source(dep_names) if contract is not None else None
+    )
+    deps: dict[str, pl.DataFrame] = {
+        name: adapter.read_table(name) for name in dep_names if name != parent_source
+    }
 
     ctx = TransformContext(
         project_dir=project_dir,
@@ -202,13 +222,8 @@ def run_transform_model(
         provider_implementation=provider_implementation,
     )
 
-    if model.materialization == "incremental":
-        contract = load_incremental_contract(
-            model.transform.module, project_dir, model.transform.options
-        )
-        # The compiler requires the contract for incremental materialization.
-        assert contract is not None, "incremental transform is missing its contract"
-        _require_incremental_capabilities(model, adapter)
+    if contract is not None:
+        assert parent_source is not None
         return _run_incremental_transform(
             model=model,
             project=project,
@@ -219,6 +234,7 @@ def run_transform_model(
             ctx=ctx,
             deps=deps,
             contract=contract,
+            parent_source=parent_source,
             full_refresh=full_refresh,
             result=result,
         )
@@ -292,6 +308,14 @@ def _require_incremental_capabilities(
         for capability in (
             WarehouseCapability.ATOMIC_PARENT_CHILD_REPLACE,
             WarehouseCapability.ATOMIC_STATE_SCOPE_REPLACE,
+            # Classification streams the parent table rather than loading it
+            # (issue #385); without this the only alternative is the
+            # whole-corpus read the change exists to remove.
+            WarehouseCapability.STREAMING_TABULAR_READS,
+            # The scoped re-read pushes an IN predicate. Without this an
+            # adapter would pass preflight, complete the whole classification
+            # scan, and only then fail (Codex review).
+            WarehouseCapability.TABULAR_PREDICATE_PUSHDOWN,
         )
         if capability not in capabilities
     ]
@@ -313,6 +337,7 @@ def _run_incremental_transform(
     ctx: TransformContext,
     deps: dict[str, pl.DataFrame],
     contract: IncrementalContract,
+    parent_source: str,
     full_refresh: bool,
     result: ModelRunResult,
 ) -> ModelRunResult:
@@ -322,8 +347,6 @@ def _run_incremental_transform(
     key and upserting on the child key, and advance state only after a
     successful publication (issue #218)."""
     assert model.transform is not None
-    parent_source = contract.resolve_parent_source(list(deps))
-    parent_frame = deps[parent_source]
     code_version = compute_model_code_version(
         model, project, project_dir, resolved=resolved
     )
@@ -352,29 +375,30 @@ def _run_incremental_transform(
         for spec in reference_specs
         if spec.join_key is not None
     }
-    # Vectorized rather than derived from the groups: `_parent_groups` now
-    # streams (issue #383), and the distinct keys are a column-wise question
-    # that never needed the rows.
-    _validate_group_key(
-        parent_frame,
+    # Classification streams the parent table and keeps only a digest per row,
+    # so the corpus is never resident (issue #385). Rows come back afterwards
+    # for the changed parents alone.
+    digests_by_parent = _stream_parent_digests(
+        adapter,
+        parent_source,
         contract.parent_source_key,
         model_name=model.name,
-        surface="parent_source",
     )
-    current_keys = set(parent_frame[contract.parent_source_key].unique().to_list())
-    groups = _parent_groups(parent_frame, contract.parent_source_key, model.name)
+    current_keys = set(digests_by_parent)
 
     processed_parents: list[str] = []
     state_records: list[StateRecord] = []
     changed: list[str] = []
     skipped = 0
-    for parent_key, rows in groups:
+    for parent_key, row_digests in digests_by_parent.items():
         reference_fingerprints = dict(table_reference_fingerprints)
         for name, by_parent in keyed_reference_fingerprints.items():
             reference_fingerprints[name] = by_parent.get(
                 parent_key, _EMPTY_REFERENCE_ROWS_FINGERPRINT
             )
-        fingerprint = _parent_fingerprint(parent_key, rows, reference_fingerprints)
+        fingerprint = _parent_fingerprint(
+            parent_key, row_digests, reference_fingerprints
+        )
         if is_incremental:
             prior = prior_state.get(parent_key)
             if prior == StateValue(fingerprint, code_version):
@@ -406,8 +430,12 @@ def _run_incremental_transform(
         return result
 
     if not is_incremental:
+        full_deps = dict(deps)
+        full_deps[parent_source] = _read_parent_rows(
+            adapter, parent_source, contract.parent_source_key, keys=None
+        )
         output = _validate_agent_context_output(
-            _invoke_transform(transform_fn, dict(deps), ctx, model), model
+            _invoke_transform(transform_fn, full_deps, ctx, model), model
         )
         _validate_incremental_output(
             output, contract, model, set(processed_parents), is_incremental=False
@@ -443,9 +471,20 @@ def _run_incremental_transform(
     rows_written = 0
     for batch in _batched(processed_parents, model.transform_commit_every()):
         call_deps = dict(deps)
-        call_deps[parent_source] = parent_frame.filter(
-            pl.col(contract.parent_source_key).is_in(batch)
+        # Rows arrive per batch, scoped to that batch's parents (issue #385
+        # composed with #379's batching): peak follows the commit batch, which
+        # is tighter than either change gives on its own.
+        batch_rows = _read_parent_rows(
+            adapter, parent_source, contract.parent_source_key, keys=batch
         )
+        _verify_classified_rows(
+            batch_rows,
+            contract.parent_source_key,
+            batch,
+            digests_by_parent,
+            model_name=model.name,
+        )
+        call_deps[parent_source] = batch_rows
         output = _validate_agent_context_output(
             _invoke_transform(transform_fn, call_deps, ctx, model), model
         )
@@ -481,6 +520,43 @@ def _run_incremental_transform(
     result.documents_deleted = len(removed)
     result.metrics = _incremental_metrics(contract, is_incremental=True)
     return result
+
+
+def _verify_classified_rows(
+    frame: pl.DataFrame,
+    key_col: str,
+    batch: list[str],
+    classified: dict[str, list[str]],
+    *,
+    model_name: str,
+) -> None:
+    """Refuse to publish rows that are not the rows that were classified.
+
+    Classification and the scoped read are separate snapshots (issue #385), so
+    an upstream relation replaced between them would have a parent publish one
+    generation's rows under another generation's fingerprint — a success that
+    stores state describing content the table no longer holds (Codex review).
+    The per-row digests are already in hand, so re-deriving them for the rows
+    actually read costs one hash per changed row and turns that into a loud
+    failure.
+
+    This covers every parent whose rows are published. A parent classified as
+    *unchanged* is never re-read, and a `--full-refresh` reads the whole table
+    in one pass, so both remain exposed to a concurrent replacement for the
+    rest of the run — self-correcting, because the next run reclassifies from
+    current content, but not detected here.
+    """
+    observed: dict[str, list[str]] = {}
+    for row in frame.iter_rows(named=True):
+        observed.setdefault(str(row[key_col]), []).append(_row_digest(row))
+    for parent_key in batch:
+        if sorted(observed.get(parent_key, [])) != sorted(classified[parent_key]):
+            raise RunError(
+                f"Incremental transform '{model_name}': parent '{parent_key}' "
+                "changed between classification and its scoped read, so its "
+                "children would publish under a fingerprint describing "
+                "different rows. Re-run once the upstream relation is stable."
+            )
 
 
 def _reject_unsupported_incremental_strategy(
@@ -541,30 +617,6 @@ def _validate_group_key(
             f"Incremental transform '{model_name}': parent key column "
             f"'{key_col}' contains null or empty values"
         )
-
-
-def _parent_groups(
-    frame: pl.DataFrame, key_col: str, model_name: str
-) -> Iterator[tuple[str, list[dict[str, Any]]]]:
-    """Yield (parent key, rows) one parent at a time, in first-appearance order.
-
-    A generator, and that is the point (issue #383). These row dicts exist only
-    to be fingerprinted — the rows the transform actually receives come from
-    `parent_frame.filter(...)` further down — so holding every parent's rows at
-    once cost a second whole-table copy in Python objects, on top of the frame
-    itself. Python dict and str overhead makes that copy larger than the Arrow
-    data it came from, which is how a 5GB parent table reached a 10GiB ceiling.
-
-    Streaming per parent puts the ceiling at the largest single parent instead
-    of the whole corpus. Group order is first-appearance and each parent's rows
-    are serialized exactly as before — the fingerprint is byte-identical, which
-    it has to be: a changed digest would invalidate every parent in every
-    existing project and re-run the whole corpus.
-    """
-    _validate_group_key(frame, key_col, model_name=model_name, surface="parent_source")
-    for key, group in _row_groups(frame, key_col, model_name=model_name):
-        # Materialized per parent, then dropped when the next one is yielded.
-        yield key, list(group.iter_rows(named=True))
 
 
 # Scratch column for the row indices `_row_groups` gathers by. Suffixed to
@@ -665,18 +717,147 @@ def _keyed_reference_fingerprints(
     }
 
 
+# Rows per streamed batch. Large enough that per-batch overhead is noise,
+# small enough that one batch is never the memory story.
+_CLASSIFY_BATCH_ROWS = 10_000
+
+# Parent keys per scoped re-read. BigQuery rejects very large IN lists, and a
+# huge one is a planning cost even where it is accepted, so the changed set is
+# fetched in chunks and concatenated.
+_READ_KEY_CHUNK = 1_000
+
+
+def _stream_parent_digests(
+    adapter: WarehouseAdapter,
+    table: str,
+    key_col: str,
+    *,
+    model_name: str,
+) -> dict[str, list[str]]:
+    """Per-parent row digests, in first-appearance parent order.
+
+    The classification pass of issue #385. Rows are read in batches and
+    reduced to one digest each, so what stays resident is ~32 bytes per row
+    rather than the row itself — for a corpus like #383's SEC chunks, a few
+    hundred MB in place of several GB. Nothing here needs the rows again:
+    only the digests feed the fingerprint.
+
+    Key validation happens per batch rather than over a materialized column,
+    for the same reason.
+    """
+    digests: dict[str, list[str]] = {}
+    with adapter.table_snapshot(
+        table, batch_size=_CLASSIFY_BATCH_ROWS
+    ) as snapshot:
+        if key_col not in snapshot.schema.names:
+            raise RunError(
+                f"Incremental transform '{model_name}': parent_source is missing "
+                f"the parent key column '{key_col}'. "
+                f"Available: {sorted(snapshot.schema.names)}"
+            )
+        key_type = snapshot.schema.field(key_col).type
+        if not pa.types.is_string(key_type) and not pa.types.is_large_string(key_type):
+            # Coercing instead would be worse than a type error: the scoped
+            # re-read pushes string parameters at a typed column, which an
+            # adapter may answer with no rows — and an empty transform result
+            # makes `replace_children` delete that parent's children and
+            # advance its state (Codex review).
+            raise RunError(
+                f"Incremental transform '{model_name}': parent key column "
+                f"'{key_col}' must be string-typed, got {key_type}"
+            )
+        for batch in snapshot:
+            for row in batch.to_pylist():
+                raw = row[key_col]
+                if raw is None or not str(raw).strip():
+                    raise RunError(
+                        f"Incremental transform '{model_name}': parent key column "
+                        f"'{key_col}' contains null or empty values"
+                    )
+                digests.setdefault(str(raw), []).append(_row_digest(row))
+    return digests
+
+
+def _read_parent_rows(
+    adapter: WarehouseAdapter,
+    table: str,
+    key_col: str,
+    *,
+    keys: Sequence[str] | None,
+) -> pl.DataFrame:
+    """The parent rows the transform will actually see.
+
+    `keys is None` means every row (a full refresh, which needs them all).
+    Otherwise the read is pushed down to just those parents, so an incremental
+    run moves data proportional to what changed (issue #385).
+    """
+    if keys is None:
+        return adapter.read_table(table)
+    if not keys:
+        return adapter.read_table(table).clear()
+    frames = [
+        _read_keyed_chunk(adapter, table, key_col, tuple(keys[start : start + _READ_KEY_CHUNK]))
+        for start in range(0, len(keys), _READ_KEY_CHUNK)
+    ]
+    return frames[0] if len(frames) == 1 else pl.concat(frames, how="vertical")
+
+
+def _read_keyed_chunk(
+    adapter: WarehouseAdapter, table: str, key_col: str, keys: tuple[str, ...]
+) -> pl.DataFrame:
+    predicate = ReadPredicate(
+        column=key_col, operator=ReadPredicateOperator.IN, value=keys
+    )
+    batches: list[pl.DataFrame] = []
+    with adapter.table_snapshot(
+        table, batch_size=_CLASSIFY_BATCH_ROWS, predicate=predicate
+    ) as snapshot:
+        empty = pl.from_arrow(snapshot.schema.empty_table())
+        assert isinstance(empty, pl.DataFrame)
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            batches.append(frame)
+    return pl.concat(batches, how="vertical") if batches else empty
+
+
+def _row_digest(row: Mapping[str, Any]) -> str:
+    """One row's whole contribution to its parent's fingerprint.
+
+    Every column still participates — the coverage question (what invalidates
+    a parent) is deliberately unchanged by issue #385, which is a memory
+    question.
+    """
+    return canonical_fingerprint(row, domain="dbt-ml.transform-incremental-row")
+
+
 def _parent_fingerprint(
     parent_key: str,
-    rows: list[dict[str, Any]],
+    row_digests: Sequence[str],
     reference_fingerprints: dict[str, str],
 ) -> str:
+    """A parent's input fingerprint, over its rows' digests rather than its
+    rows (issue #385).
+
+    Sorting digests keeps the two properties the previous encoding had — the
+    result is order-insensitive, and repeated rows still count, because
+    duplicates survive a sort where they would cancel in an XOR or sum
+    accumulator. What changes is that a parent's contribution can be
+    accumulated from a streamed scan at 32 bytes per row instead of holding
+    every row, which is the whole point: peak stops scaling with the corpus.
+
+    `version=2` marks the encoding change. It re-keys every parent once — the
+    same one-time cost #363 paid, and the reason `_INPUT_FINGERPRINT_VERSION`
+    is pinned in `test_frozen_names.py` rather than left implicit.
+    """
     return canonical_fingerprint(
         {
             "parent": parent_key,
-            "rows": sorted(rows, key=canonical_json),
+            "rows": sorted(row_digests),
             "references": reference_fingerprints,
         },
         domain="dbt-ml.transform-incremental-input",
+        version=2,
     )
 
 

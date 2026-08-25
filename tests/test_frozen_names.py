@@ -526,7 +526,11 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("dbt-ml.nlp-entity", 1, "1210a385cadbdd8b52560f4e909afab9"),
     ("dbt-ml.nlp-token", 1, "3353cd8ad6c7715d403d7a94f7a386be"),
     ("dbt-ml.tone-lexicon", 1, "e1ba3829a480e432af1393119eb0ff81"),
-    ("dbt-ml.transform-incremental-input", 1, "c83fb706e8ba9060850314bcb687c9c6"),
+    # v1 is retired: #385 moved the encoding from rows to per-row digests
+    # so classification can stream. The bump is the loud part of a change
+    # that re-keys every parent once.
+    ("dbt-ml.transform-incremental-input", 2, "d250f3a87cfb6171ab989f913d5404a8"),
+    ("dbt-ml.transform-incremental-row", 1, "df5c9829894036571168d4e63e78bd25"),
     ("dbt-ml.transform-incremental-reference", 1, "9f69628fa9a3e1f668ec869219282eb0"),
     ("dbt_ml/retrieval_eval/golden_set", 1, "9305ca078ff6376cce65b750ebaf21cf"),
     ("eval-metric-id", 1, "a857cb0a824c56aa011e6b9b88cbba6e"),

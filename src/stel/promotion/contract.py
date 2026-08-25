@@ -52,6 +52,13 @@ class PromotionEvidence(BaseModel):
                 "evidence.sessions must name at least one session; a promoted "
                 "row that cannot say where it came from is not a promotion"
             )
+        # A blank entry is a non-empty tuple that names nothing, which defeats
+        # the contract while satisfying it (Codex review).
+        if any(not session.strip() for session in self.sessions):
+            raise ValueError(
+                "evidence.sessions contains a blank entry; every promoted row "
+                "must name the session it came from"
+            )
         return self
 
 

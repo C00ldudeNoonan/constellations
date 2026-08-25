@@ -66,6 +66,16 @@ def test_a_promotion_must_name_its_sessions(tmp_path: Path) -> None:
         load_golden_set(_write(tmp_path, document))
 
 
+def test_a_blank_session_identifier_is_rejected(tmp_path: Path) -> None:
+    """`sessions: ["   "]` is a non-empty tuple that names nothing — it
+    satisfies the "must have provenance" check while defeating it
+    (Codex review)."""
+    document = _document(queries=[_query(evidence={"sessions": ["   "]})])
+
+    with pytest.raises(PromotionError, match="blank entry"):
+        load_golden_set(_write(tmp_path, document))
+
+
 def test_a_query_that_asserts_nothing_is_rejected(tmp_path: Path) -> None:
     document = _document(queries=[_query(relevant_ids=[])])
 

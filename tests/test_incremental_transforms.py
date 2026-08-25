@@ -6,10 +6,10 @@ explodes a document's body into one stable child row per word.
 """
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import polars as pl
@@ -378,6 +378,16 @@ def run(deps: dict[str, pl.DataFrame], ctx=None) -> pl.DataFrame:
 '''
 
 
+class _FakeSnapshot:
+    def __init__(self, table, batch_size: int) -> None:
+        self._table = table
+        self._batch_size = batch_size
+        self.schema = table.schema
+
+    def __iter__(self):
+        yield from self._table.to_batches(max_chunksize=self._batch_size)
+
+
 class _RecordingAdapter:
     """Duck-typed WarehouseAdapter subset the incremental executor calls,
     advertising BigQuery's capabilities and recording the operations issued."""
@@ -410,7 +420,41 @@ class _RecordingAdapter:
         return name in self._tables
 
     def read_table(self, name: str):
+        self.calls.append(("read_table", name))
         return self._upstream[name]
+
+    @contextlib.contextmanager
+    def table_snapshot(
+        self,
+        table: str,
+        *,
+        columns=None,
+        batch_size: int = 10_000,
+        predicate=None,
+        key_column=None,
+    ):
+        """The streamed, predicate-pushed read the incremental classifier uses
+        (issue #385). Filtering here mirrors what a real adapter pushes into
+        SQL, so a test that scopes a read exercises the same path."""
+        from stel.adapters.base import ReadPredicate, ReadPredicateOperator
+
+        frame = self._upstream[table]
+        predicates = (
+            []
+            if predicate is None
+            else [predicate]
+            if isinstance(predicate, ReadPredicate)
+            else list(predicate)
+        )
+        for entry in predicates:
+            if entry.operator is not ReadPredicateOperator.IN:
+                raise AssertionError(f"unsupported predicate {entry.operator}")
+            frame = frame.filter(pl.col(entry.column).is_in(list(entry.value)))
+        if columns is not None:
+            frame = frame.select(list(columns))
+        self.calls.append(("table_snapshot", table, len(predicates)))
+        yield _FakeSnapshot(frame.to_arrow(), batch_size)
+
 
     def fetch_state(self, scope):
         return dict(self._state.get(scope.model_name, {}))
@@ -896,75 +940,145 @@ def test_reference_dep_contract_validation() -> None:
 # ─── transform memory: streaming parent groups (issue #383) ─────────────────
 
 
-def test_parent_fingerprints_are_unchanged_by_streaming() -> None:
-    """A golden digest, and the most important test in this file.
-
-    The fingerprint decides whether a parent is reprocessed. If a refactor
-    changes how rows are serialized, every parent in every existing project
-    looks changed at once and the whole corpus re-runs at provider prices —
-    silently, because the run still succeeds. Pin the bytes.
+def test_parent_fingerprint_properties_survive_the_digest_encoding() -> None:
+    """The fingerprint decides whether a parent is reprocessed, so a change to
+    how rows are combined re-keys every parent in every project at once.
+    #385 made that change deliberately (rows -> per-row digests, so the corpus
+    need not be resident), and `version=2` plus the goldens in
+    `test_frozen_names.py` are what make it loud. What must *not* drift are
+    the three properties the encoding has always had.
     """
-    import polars as pl
-
-    from stel.execution.transform import _parent_fingerprint
+    from stel.execution.transform import _parent_fingerprint, _row_digest
 
     rows = [
         {"parent_id": "p1", "n": 2, "s": "b"},
         {"parent_id": "p1", "n": 1, "s": "a"},
     ]
-    digest = _parent_fingerprint("p1", rows, {"ref": "abc"})
+    digests = [_row_digest(row) for row in rows]
+    fingerprint = _parent_fingerprint("p1", digests, {"ref": "abc"})
 
-    # Order-insensitive within a parent, as it always was.
-    assert _parent_fingerprint("p1", list(reversed(rows)), {"ref": "abc"}) == digest
-    # And what the streaming path produces for the same data is identical.
-    from stel.execution.transform import _parent_groups
+    # 1. Order-insensitive within a parent.
+    assert _parent_fingerprint("p1", list(reversed(digests)), {"ref": "abc"}) == fingerprint
+    # 2. Multiplicity counts — a repeated row is not absorbed, which an XOR or
+    #    sum accumulator would have done silently.
+    assert _parent_fingerprint("p1", digests + digests[:1], {"ref": "abc"}) != fingerprint
+    # 3. Every column participates: no narrowing of what invalidates a parent.
+    for column in ("parent_id", "n", "s"):
+        changed = dict(rows[0]) | {column: "different"}
+        assert _row_digest(changed) != digests[0]
+    # And the parent key and reference fingerprints still bind.
+    assert _parent_fingerprint("p2", digests, {"ref": "abc"}) != fingerprint
+    assert _parent_fingerprint("p1", digests, {"ref": "xyz"}) != fingerprint
 
-    frame = pl.DataFrame(rows)
-    (_key, streamed), = list(_parent_groups(frame, "parent_id", "m"))
-    assert _parent_fingerprint("p1", streamed, {"ref": "abc"}) == digest
+
+def test_the_parent_read_is_scoped_to_the_changed_parents(tmp_path: Path) -> None:
+    """The point of #385. Classification streams, and rows come back only for
+    the parents that changed — so an incremental run moves data proportional
+    to the change set, not the corpus. Without this pinned, a refactor could
+    reinstate the whole-table read and every behavioural test would still
+    pass."""
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "word_tokens.py").write_text(_TRANSFORM_SOURCE)
+    model = _incremental_model("word_tokens", "transforms.word_tokens", ["ref('documents')"])
+    adapter = _RecordingAdapter(
+        {
+            "documents": pl.DataFrame(
+                {"document_id": ["docA", "docB"], "body": ["alpha beta", "gamma"]}
+            )
+        }
+    )
+
+    _run_incremental(tmp_path, adapter, model)
+
+    # Only docA changes.
+    adapter.calls.clear()
+    adapter._upstream["documents"] = pl.DataFrame(
+        {"document_id": ["docA", "docB"], "body": ["alpha beta delta", "gamma"]}
+    )
+    result = _run_incremental(tmp_path, adapter, model)
+    assert result.documents_processed == 1
+    assert result.documents_skipped == 1
+
+    snapshots = [call for call in adapter.calls if call[0] == "table_snapshot"]
+    # One unfiltered scan to classify, then one predicate-scoped read for the
+    # single changed parent.
+    assert [call[2] for call in snapshots] == [0, 1]
+    # And the parent table was never read whole.
+    assert ("read_table", "documents") not in adapter.calls
 
 
-def test_parent_groups_preserve_first_appearance_order() -> None:
-    """Group order feeds processed-parent ordering, so sorting instead of
-    preserving first appearance would be a silent behavior change."""
+def test_rows_that_changed_since_classification_are_refused(tmp_path: Path) -> None:
+    """Classification and the scoped read are separate snapshots (issue #385).
+    If the upstream is replaced between them, a parent would publish one
+    generation's rows under another generation's fingerprint — state
+    describing content the table no longer holds (Codex review)."""
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "word_tokens.py").write_text(_TRANSFORM_SOURCE)
+    model = _incremental_model("word_tokens", "transforms.word_tokens", ["ref('documents')"])
+
+    class _ShiftingAdapter(_RecordingAdapter):
+        """Swaps the parent table's contents after classification has read it."""
+
+        def __init__(self, upstream, replacement):
+            super().__init__(upstream)
+            self._replacement = replacement
+            self._scans = 0
+
+        @contextlib.contextmanager
+        def table_snapshot(self, table, **kwargs):
+            with super().table_snapshot(table, **kwargs) as snapshot:
+                yield snapshot
+            self._scans += 1
+            if self._scans == 1:
+                self._upstream[table] = self._replacement
+
+    adapter = _ShiftingAdapter(
+        {"documents": pl.DataFrame({"document_id": ["docA"], "body": ["alpha"]})},
+        pl.DataFrame({"document_id": ["docA"], "body": ["totally different"]}),
+    )
+
+    with pytest.raises(RunError, match="changed between classification"):
+        _run_incremental(tmp_path, adapter, model)
+
+
+def _digests(frame, key_col: str = "parent_id", model: str = "m"):
+    """Classification against a fake adapter serving `frame` (issue #385)."""
+    from stel.execution.transform import _stream_parent_digests
+
+    adapter = cast(Any, _RecordingAdapter({"parents": frame}))
+    return _stream_parent_digests(adapter, "parents", key_col, model_name=model)
+
+
+def test_classification_preserves_first_appearance_parent_order() -> None:
+    """Processed-parent order is observable — it drives `replace_children`
+    batching and the reported counts — so it must not drift with the read."""
     import polars as pl
-
-    from stel.execution.transform import _parent_groups
 
     frame = pl.DataFrame(
-        {"parent_id": ["b", "a", "b", "c", "a"], "n": [1, 2, 3, 4, 5]}
+        {"parent_id": ["b", "a", "b", "c"], "n": [1, 2, 3, 4]}
     )
-    assert [key for key, _ in _parent_groups(frame, "parent_id", "m")] == [
-        "b",
-        "a",
-        "c",
-    ]
+
+    assert list(_digests(frame)) == ["b", "a", "c"]
 
 
-def test_parent_groups_stream_rather_than_materializing_every_parent() -> None:
-    """The fix for #383: peak residency is one parent, not the corpus.
-
-    Taking a single group must not have forced the rest to be built, which is
-    what a list-returning implementation would do.
-    """
+def test_classification_keeps_digests_not_rows() -> None:
+    """The fix for #385: what survives the scan is a digest per row, not the
+    row. A refactor that accumulated rows again would put the corpus back in
+    memory while every behavioural test still passed."""
     import polars as pl
 
-    from stel.execution.transform import _parent_groups
+    frame = pl.DataFrame({"parent_id": ["a", "a", "b"], "n": [1, 2, 3]})
 
-    frame = pl.DataFrame({"parent_id": ["a", "b", "c"], "n": [1, 2, 3]})
-    groups = _parent_groups(frame, "parent_id", "m")
+    digests = _digests(frame)
 
-    assert isinstance(groups, Iterator)
-    first_key, first_rows = next(groups)
-    assert first_key == "a"
-    assert first_rows == [{"parent_id": "a", "n": 1}]
+    assert [len(group) for group in digests.values()] == [2, 1]
+    for group in digests.values():
+        assert all(isinstance(entry, str) for entry in group)
 
 
-def test_an_unusable_parent_key_is_still_refused(
-) -> None:
+def test_an_unusable_parent_key_is_still_refused() -> None:
     import polars as pl
 
-    from stel.execution.transform import _parent_groups
     from stel.runner import RunError
 
     for bad in (None, "", "   "):
@@ -973,19 +1087,18 @@ def test_an_unusable_parent_key_is_still_refused(
             schema={"parent_id": pl.String, "n": pl.Int64},
         )
         with pytest.raises(RunError, match="null or empty"):
-            list(_parent_groups(frame, "parent_id", "m"))
+            _digests(frame)
 
 
-def test_a_missing_or_mistyped_parent_key_is_refused() -> None:
+def test_a_missing_parent_key_column_is_refused() -> None:
     import polars as pl
 
-    from stel.execution.transform import _parent_groups
     from stel.runner import RunError
 
     with pytest.raises(RunError, match="missing the parent key column"):
-        list(_parent_groups(pl.DataFrame({"other": ["a"]}), "parent_id", "m"))
+        _digests(pl.DataFrame({"other": ["a"]}))
     with pytest.raises(RunError, match="must be string-typed"):
-        list(_parent_groups(pl.DataFrame({"parent_id": [1]}), "parent_id", "m"))
+        _digests(pl.DataFrame({"parent_id": [1]}))
 
 
 # ─── batched commits (issue #379) ───────────────────────────────────────────

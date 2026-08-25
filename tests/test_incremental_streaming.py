@@ -17,8 +17,6 @@ import pytest
 from stel.execution.contracts import RunError
 from stel.execution.transform import (
     _keyed_reference_fingerprints,
-    _parent_fingerprint,
-    _parent_groups,
     _row_groups,
 )
 from stel.hashing import canonical_fingerprint, canonical_json
@@ -54,20 +52,6 @@ def _groups_the_old_way(
     return [(key, groups[key]) for key in order]
 
 
-def test_parent_fingerprints_are_byte_identical_to_the_old_grouping() -> None:
-    frame = _frame()
-    streamed = list(_parent_groups(frame, _KEY, "m"))
-    original = _groups_the_old_way(frame, _KEY)
-
-    assert [key for key, _ in streamed] == [key for key, _ in original]
-    for (new_key, new_rows), (old_key, old_rows) in zip(
-        streamed, original, strict=True
-    ):
-        assert _parent_fingerprint(new_key, new_rows, {}) == _parent_fingerprint(
-            old_key, old_rows, {}
-        )
-
-
 def test_keyed_reference_fingerprints_are_byte_identical_to_the_old_grouping() -> None:
     frame = _frame()
     expected = {
@@ -97,7 +81,6 @@ def test_grouping_never_materializes_every_partition(
     monkeypatch.setattr(pl.DataFrame, "partition_by", forbidden)
 
     frame = _frame()
-    assert [key for key, _ in _parent_groups(frame, _KEY, "m")] == ["b", "a", "c"]
     assert set(
         _keyed_reference_fingerprints(frame, ReferenceDep("r", join_key=_KEY), "m")
     ) == {"a", "b", "c"}

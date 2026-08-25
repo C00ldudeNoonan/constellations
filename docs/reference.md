@@ -3204,6 +3204,64 @@ These are candidates, never goldens: nothing here is read by
 `retrieval_tests:` or `eval:`, and nothing promotes itself at any confidence
 (#329 rule 2). Promotion is a separate human step.
 
+### Promoting candidates into a golden set
+
+A promotion is a human judgement, so the artifact is **a reviewed file in the
+project**, not a warehouse write — it wants git review, blame, and revert, and
+a table nobody opens gives you none of those. `golden_sets/<name>.yml`:
+
+```yaml
+version: 1
+# Must match the target index's `id_field`.
+id_space: context_id
+queries:
+  - query_id: refund_rounding
+    query_text: "rounding policy for refunds"
+    relevant_ids: ["11111111111111111111111111111111"]
+    promoted_by: alex
+    promoted_at: 2026-08-25
+    evidence:
+      sessions: ["0f5a2c1e-1111-4aaa-8bbb-000000000001"]
+      harness: claude-code
+      query_fingerprint: ed3b7566a129f02e9b61b2a32da0b58d
+```
+
+`stel.promotion.golden_set` materializes it into the relation
+`retrieval_tests.golden_set` already refs, so **the evals need no changes**:
+
+```yaml
+  - name: promoted_goldens
+    depends_on: [ref('retrieval_judgment_candidates')]
+    transform:
+      type: python
+      module: stel.promotion.golden_set
+      options:
+        path: golden_sets/context_search.yml
+        search_model: context_search
+    materialization: full
+```
+
+Two rules the file enforces, each guarding a way a promotion could produce a
+worthless test:
+
+- **Every promoted query names its sessions.** The first question a reviewer
+  asks is where a row came from; one that cannot answer is indistinguishable
+  from an invented golden. A set written from scratch is a fine model — it is
+  just not a promotion, and does not belong in this file.
+- **`id_space` is checked against `search_model`'s `id_field`.** A set
+  promoted in the wrong space matches nothing and reports zero recall, which
+  reads as broken retrieval rather than a mislabelled golden set. The mismatch
+  is a hard error naming both spaces.
+
+`query_text` is required and human-owned. The corpus records only a query
+fingerprint unless text capture was opted into, and `retrieval_tests` replays
+each query through `search()` — so the reviewer supplying or confirming the
+text is the step that turns an observation into a re-runnable test.
+
+`depends_on` names the candidates the set was promoted from. Those rows are
+not read: the file is the source of truth, and a promoted golden must survive
+the sessions it came from being rotated away.
+
 ## Artifacts
 
 `stel compile` writes the manifest; `run` and `build` write the manifest and

@@ -3175,6 +3175,35 @@ transforms (incremental, with the registry as a keyed reference dep) →
 deterministic embeddings → a governed search index with `harness`,
 `exchange_heading`, `tools_used`, and `files_touched` attributes.
 
+### Candidate retrieval judgments
+
+`stel.transcripts.transforms.retrieval_judgments` turns the captured context
+calls into one candidate row per returned id (#329 phase 3, issue #380). Point
+it at the model holding `transcript/v1.1` rows:
+
+```yaml
+transform:
+  type: python
+  module: stel.transcripts.transforms.retrieval_judgments
+  options:
+    transcripts: raw_transcripts
+```
+
+Each row carries its `judgment` — `cited`, `returned_not_cited`, or
+`zero_result` — plus the `query_fingerprint` that joins it to the MCP query
+log, the session and exchange it came from, and `id_space`, which names the id
+space the candidate is expressed in (`search_context` results carry both a
+`context_id` and a `chunk_id`, and an index keys on one or the other, so
+promotion reconciles it against the target's `id_field` rather than assuming).
+
+`returned_not_cited` is **not** a negative: an agent may use a chunk without
+naming its id. `zero_result` is the one honest negative. Failed calls
+contribute nothing at all.
+
+These are candidates, never goldens: nothing here is read by
+`retrieval_tests:` or `eval:`, and nothing promotes itself at any confidence
+(#329 rule 2). Promotion is a separate human step.
+
 ## Artifacts
 
 `stel compile` writes the manifest; `run` and `build` write the manifest and

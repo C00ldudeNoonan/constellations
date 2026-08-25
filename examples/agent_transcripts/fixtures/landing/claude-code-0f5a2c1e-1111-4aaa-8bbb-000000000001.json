@@ -1,23 +1,23 @@
 {
-  "schema_version": "transcript/v1",
+  "schema_version": "transcript/v1.1",
   "harness": "claude-code",
   "session_id": "0f5a2c1e-1111-4aaa-8bbb-000000000001",
-  "source_path": "C:\\Users\\alexn\\AppData\\Local\\Temp\\claude\\C--Users-alexn-Documents-github-dbt-ml\\053026d8-04cf-4fb4-9872-b438cd5903ce\\scratchpad\\fixture_src\\claude-session.jsonl",
+  "source_path": "C:\\Users\\alexn\\AppData\\Local\\Temp\\claude\\C--Users-alexn-Documents-github-dbt-ml\\053026d8-04cf-4fb4-9872-b438cd5903ce\\scratchpad\\fixture_src2\\claude-session.jsonl",
   "project_path": "/work/sample-app",
   "git_branch": "main",
   "started_at": "2026-08-20T14:00:00Z",
-  "ended_at": "2026-08-20T14:05:30Z",
+  "ended_at": "2026-08-20T14:05:40Z",
   "exchange_count": 2,
   "tools_used": [
     "Bash",
     "Edit",
-    "Read"
+    "Read",
+    "mcp__stel-context__search_context"
   ],
   "files_touched": [
-    "src/app/formatting.py",
-    "tests/test_invoices.py"
+    "src/app/formatting.py"
   ],
-  "text": "## [0] Fix the failing currency rounding test in tests/test_invoices.py\n\nThe test asserts banker's rounding but the formatter truncates. I'll read the formatter, fix the rounding mode, and re-run the test.\n\n- tool Read (ok, 81B) args:47fb7f3156cd\n- tool Edit (ok, 2B) args:a4fdd2359a34\n- tool Bash (error, 85B) args:cc8df4f73a8b\n\nThe first run failed on decimal normalization; comparing normalized decimals fixes it. Re-ran and the suite passes.\n\n- tool Bash (ok, 8B) args:0cb7aa165bce\n\nFiles: src/app/formatting.py\n\n## [1] Now add a regression test covering negative amounts\n\nAdded a parametrized case for negative amounts mirroring the positive fixtures; rounding away from zero matches the ledger's behavior.\n\n- tool Edit (ok, 2B) args:3bd140eda135\n\nFiles: tests/test_invoices.py\n",
+  "text": "## [0] Fix the failing currency rounding test in tests/test_invoices.py\n\nThe test asserts banker's rounding but the formatter truncates. I'll read the formatter, fix the rounding mode, and re-run the test.\n\n- tool Read (ok, 81B) args:47fb7f3156cd\n- tool Edit (ok, 2B) args:a4fdd2359a34\n- tool Bash (error, 85B) args:cc8df4f73a8b\n\nThe first run failed on decimal normalization; comparing normalized decimals fixes it. Re-ran and the suite passes.\n\n- tool Bash (ok, 8B) args:0cb7aa165bce\n\nFiles: src/app/formatting.py\n\n## [1] What is our documented rounding policy for refunds?\n\n- tool mcp__stel-context__search_context (ok, 643B) args:061999de61b9\n\nThe policy rounds half to even at the line level (context 11111111111111111111111111111111), which matches the change above.\n",
   "exchanges": [
     {
       "ordinal": 0,
@@ -36,23 +36,42 @@
       ],
       "files_touched": [
         "src/app/formatting.py"
-      ]
+      ],
+      "context_calls": []
     },
     {
       "ordinal": 1,
-      "heading": "[1] Now add a regression test covering negative amounts",
+      "heading": "[1] What is our documented rounding policy for refunds?",
       "started_at": "2026-08-20T14:05:00Z",
-      "ended_at": "2026-08-20T14:05:30Z",
+      "ended_at": "2026-08-20T14:05:40Z",
       "prompt_chars": 51,
       "prompt_truncated": false,
-      "assistant_chars": 134,
+      "assistant_chars": 124,
       "tool_calls": 1,
       "tool_errors": 0,
       "tools_used": [
-        "Edit"
+        "mcp__stel-context__search_context"
       ],
-      "files_touched": [
-        "tests/test_invoices.py"
+      "files_touched": [],
+      "context_calls": [
+        {
+          "model": "context_search",
+          "query_fingerprint": "ed3b7566a129f02e9b61b2a32da0b58d",
+          "query_text": null,
+          "returned_context_ids": [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222"
+          ],
+          "returned_chunk_ids": [
+            "33333333333333333333333333333333",
+            "44444444444444444444444444444444"
+          ],
+          "cited_context_ids": [
+            "11111111111111111111111111111111"
+          ],
+          "zero_results": false,
+          "error_code": null
+        }
       ]
     }
   ]

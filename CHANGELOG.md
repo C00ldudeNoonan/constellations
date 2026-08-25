@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Candidate retrieval judgments from the transcript corpus (issue #380)
+
+- **`stel.transcripts.transforms.retrieval_judgments`** derives #329 phase 3's
+  raw material: one candidate row per id a `search_context` call returned,
+  judged `cited`, `returned_not_cited`, or `zero_result`. Failed calls
+  contribute nothing — a denied or timed-out search returned nothing because
+  it failed, not because the corpus lacked a match.
+- **Candidates, never goldens.** Nothing in the relation is read by
+  `retrieval_tests:` or `eval:`, and nothing promotes itself at any
+  confidence (#329 rule 2). `returned_not_cited` is recorded so a reviewer can
+  see what else came back, and is explicitly not evidence of irrelevance.
+- Every row carries the provenance a reviewer asks for first — session,
+  harness, exchange and call ordinal, timestamp — plus `id_space`, so
+  promotion reconciles the candidate against the target index's `id_field`
+  instead of assuming which id space it is in.
+- `examples/agent_transcripts/` gains the model, and its fixtures now include
+  a cited retrieval and a zero-result query.
+
 ### Transcripts capture stel's own MCP calls (issue #380)
 
 - **`transcript/v1.1`** adds `context_calls` to each exchange: for a

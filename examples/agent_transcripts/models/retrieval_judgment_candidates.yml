@@ -1,0 +1,18 @@
+version: 2
+
+# #329 phase 3 (issue #380). Candidates a human promotes — never goldens, and
+# never read by `retrieval_tests:` or `eval:`. See the transform's docstring
+# for what each `judgment` value is, and is not, evidence of.
+models:
+  - name: retrieval_judgment_candidates
+    description: "Candidate retrieval judgments derived from stel's own MCP calls"
+    depends_on: [ref('raw_transcripts')]
+    transform:
+      type: python
+      module: stel.transcripts.transforms.retrieval_judgments
+      options:
+        transcripts: raw_transcripts
+    materialization: incremental
+    tests:
+      - not_null: [candidate_id, session_id, query_fingerprint, judgment, id_space]
+      - unique: candidate_id

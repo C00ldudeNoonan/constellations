@@ -70,3 +70,26 @@ def test_transcripts_example_reruns_incrementally(tmp_path: Path) -> None:
     # (issue #364) skips every session on the second run.
     assert chunks.documents_processed == 0
     assert chunks.documents_skipped == 2
+
+
+def test_transcripts_example_derives_candidate_judgments(tmp_path: Path) -> None:
+    """The corpus's own MCP calls become #329 phase 3 candidates (issue #380):
+    a cited id, the id that came back beside it, and a query that matched
+    nothing — the three things a reviewer needs to tell apart."""
+    project = _project(tmp_path)
+    run_project(project)
+
+    rows = _rows(
+        project,
+        "SELECT harness, judgment, context_id, id_space, query_fingerprint "
+        'FROM "transcripts".transcripts.retrieval_judgment_candidates',
+    )
+    judgments = sorted(judgment for _h, judgment, *_rest in rows)
+    assert judgments == ["cited", "returned_not_cited", "zero_result"]
+
+    for _harness, judgment, context_id, id_space, fingerprint in rows:
+        assert fingerprint, "a candidate with no fingerprint cannot be promoted"
+        # Constraint 3 of #380: promotion must reconcile this against the
+        # target index's id_field rather than assume, so it is recorded.
+        assert id_space == "context_id"
+        assert (context_id is None) == (judgment == "zero_result")

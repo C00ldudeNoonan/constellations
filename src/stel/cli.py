@@ -1470,34 +1470,100 @@ def mcp() -> None:
     default=10_000,
     show_default=True,
 )
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "streamable-http", "sse"]),
+    default="stdio",
+    show_default=True,
+    help="stdio for a local client; the others serve many callers over HTTP.",
+)
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", type=click.IntRange(1, 65535), default=8000, show_default=True)
+@click.option(
+    "--trust-proxy-principal-headers",
+    is_flag=True,
+    help=(
+        "Take each caller's identity from X-Stel-Principal-Id and friends. "
+        "ONLY safe when a proxy in front authenticates the caller and "
+        "OVERWRITES those headers — reachable directly, any caller can claim "
+        "any tenant. Required for a network transport until token "
+        "verification lands."
+    ),
+)
 @_project_context_options
 @click.pass_context
 def mcp_serve(
     ctx: click.Context,
+    transport: str,
+    host: str,
+    port: int,
+    trust_proxy_principal_headers: bool,
     timeout_seconds: float,
     max_concurrency: int,
     max_requests_per_minute: int,
     max_response_bytes: int,
     max_scan_rows: int,
 ) -> None:
-    """Run the read-only stel MCP server over stdio."""
-    from .mcp_server.authorization import AuthorizationError
+    """Run the read-only stel MCP server.
+
+    Defaults to stdio, where the operator running the process is the
+    principal. A network transport serves many callers, so it needs an
+    identity per request and refuses to start without one.
+    """
+    from .mcp_server.authorization import (
+        AuthorizationError,
+        TrustedHeaderPrincipalResolver,
+    )
     from .mcp_server.catalog import ArtifactCatalogError
-    from .mcp_server.server import serve_stdio
+    from .mcp_server.server import serve_network, serve_stdio
     from .mcp_server.service import ContextServerSettings
 
+    settings = ContextServerSettings(
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
+        max_requests_per_minute=max_requests_per_minute,
+        max_response_bytes=max_response_bytes,
+        max_scan_rows=max_scan_rows,
+    )
     try:
-        serve_stdio(
+        if transport == "stdio":
+            if trust_proxy_principal_headers:
+                raise ConfigClickError(
+                    "--trust-proxy-principal-headers applies to a network "
+                    "transport; stdio resolves its principal from the "
+                    "operator's environment."
+                )
+            serve_stdio(
+                ctx.obj["project_dir"],
+                target=ctx.obj["target"],
+                profiles_dir=ctx.obj["profiles_dir"],
+                settings=settings,
+            )
+            return
+        if not trust_proxy_principal_headers:
+            raise ConfigClickError(
+                f"--transport {transport} serves many callers, so each request "
+                "needs its own identity. No per-request principal source is "
+                "configured, and the stdio default would serve every caller as "
+                "one principal — with that principal's tenant filters. Pass "
+                "--trust-proxy-principal-headers if an authenticating proxy "
+                "sets them."
+            )
+        click.echo(
+            f"Serving on {host}:{port} over {transport}. Caller identity comes "
+            "from proxy-set headers — verify the proxy authenticates and "
+            "overwrites them.",
+            err=True,
+        )
+        serve_network(
             ctx.obj["project_dir"],
+            transport=transport,
+            host=host,
+            port=port,
+            principal_resolver=TrustedHeaderPrincipalResolver(),
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
-            settings=ContextServerSettings(
-                timeout_seconds=timeout_seconds,
-                max_concurrency=max_concurrency,
-                max_requests_per_minute=max_requests_per_minute,
-                max_response_bytes=max_response_bytes,
-                max_scan_rows=max_scan_rows,
-            ),
+            settings=settings,
         )
     except (ArtifactCatalogError, AuthorizationError, *_CONFIG_ERRORS) as error:
         raise ConfigClickError(str(error)) from error

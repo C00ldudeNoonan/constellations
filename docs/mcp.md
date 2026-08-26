@@ -78,9 +78,48 @@ arguments. Governed search predicates are compiled from the principal, and
 warehouse rows are independently rechecked after search and on every document
 or lineage lookup.
 
-This environment resolver is for deterministic local stdio use. The service
-accepts injectable principal and authorization interfaces so a later network
-transport can supply authenticated identities without changing tool contracts.
+This environment resolver is for deterministic local stdio use, where the
+operator running the process *is* the principal. It is refused on a network
+transport — see below.
+
+## Serving over a network
+
+```bash
+stel mcp serve --transport streamable-http --host 0.0.0.0 --port 8000   --trust-proxy-principal-headers
+```
+
+A network transport serves many callers, so identity has to come per request
+rather than from the process. The stdio environment resolver is **rejected at
+startup** for these transports: it would serve every caller as whichever
+identity the server started with, applying that identity's tenant filters to
+everyone's queries. Nothing about the responses would look wrong, which is why
+this is a refusal rather than a warning.
+
+`--trust-proxy-principal-headers` reads each caller's identity from:
+
+| header | meaning |
+|---|---|
+| `X-Stel-Principal-Id` | subject id; absent means no principal, and the call is refused |
+| `X-Stel-Tenant-Id` | tenant, when the deployment is multi-tenant |
+| `X-Stel-Access-Groups` | comma-separated groups |
+| `X-Stel-Policy-Claims` | JSON object of trusted claims |
+
+**This trusts its input completely.** It is sound only when something in front
+of the server authenticates the caller and *overwrites* every one of these
+headers on each request — an authenticating reverse proxy, an identity-aware
+proxy, a service mesh. Exposed directly, it is not authentication: any caller
+can claim any tenant by setting a header. Terminate auth in front of it, and
+confirm the proxy overwrites rather than appends.
+
+Two limits worth knowing before a shared deployment:
+
+- **Warehouse credentials are per process, not per caller.** A hosted server
+  holds one set for everyone, so row-level governance is the only boundary
+  between tenants.
+- **Rate limits are per process.** `--max-requests-per-minute` was sized for
+  one local client; shared, it is a global cap one caller can exhaust.
+
+Token verification without a proxy in front is tracked in issue #392.
 
 ## Generic client configuration
 

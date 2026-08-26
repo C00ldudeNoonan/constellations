@@ -17,10 +17,11 @@ from stel.mcp_server.authorization import (
 from stel.mcp_server.grants import (
     Grant,
     GrantAuthorizationProvider,
+    GrantConfigurationError,
     StaticGrantStore,
     WarehouseGrantStore,
 )
-from stel.mcp_server.service import ContextService
+from stel.mcp_server.service import ContextService, _authorizing_tenant
 from stel.search import SearchFilterOperator
 
 TENANT = PolicyAttribute("tenant_id", "string")
@@ -215,7 +216,7 @@ def test_a_blank_grant_value_is_refused_rather_than_guessed() -> None:
     )
     store = WarehouseGrantStore(repository, relation="ops.grants")
 
-    with pytest.raises(AuthorizationError, match="no usable"):
+    with pytest.raises(GrantConfigurationError, match="no usable"):
         store.grants_for("alice")
 
 
@@ -227,7 +228,7 @@ def test_a_grant_relation_missing_a_column_fails_loudly() -> None:
     )
     store = WarehouseGrantStore(repository, relation="ops.grants")
 
-    with pytest.raises(AuthorizationError, match="no usable 'value'"):
+    with pytest.raises(GrantConfigurationError, match="no usable 'value'"):
         store.grants_for("alice")
 
 
@@ -245,3 +246,62 @@ def test_from_project_refuses_both_authorization_and_grants_relation(
             authorization=ClaimAuthorizationProvider(),
             grants_relation="ops.grants",
         )
+
+
+# ─── review follow-ups (PR #396) ────────────────────────────────────────────
+
+
+def test_malformed_grant_row_is_a_configuration_error_not_a_denial() -> None:
+    """Schema drift must not masquerade as "this subject has no grants".
+
+    `AuthorizationError` is caught by the service as an ordinary denial, so
+    raising it here would show the operator an empty catalog with no reason.
+    """
+
+    class _BlankValueRepository:
+        def read_rows(
+            self,
+            relation: str,
+            *,
+            predicates: Sequence[ReadPredicate],
+            max_rows: int,
+            columns: Sequence[str] | None = None,
+        ) -> tuple[Mapping[str, Any], ...]:
+            return ({"subject_id": "alice", "attribute": "tenant_id", "value": "  "},)
+
+    store = WarehouseGrantStore(_BlankValueRepository(), relation="ops.grants")
+
+    with pytest.raises(GrantConfigurationError):
+        store.grants_for("alice")
+
+    # The distinction is the whole point: a denial handler must not swallow it.
+    assert not issubclass(GrantConfigurationError, AuthorizationError)
+
+
+def test_audit_log_tenant_comes_from_grants_not_the_forged_claim() -> None:
+    """A caller who asserts another tenant must not have their served query
+    filed under it — audit trails are read exactly when that is suspected."""
+    provider = GrantAuthorizationProvider(
+        StaticGrantStore([Grant("alice", "tenant_id", "acme")])
+    )
+
+    filters = provider.search_policy_filters(
+        _principal(tenant_id="globex"), access="governed", attributes=[TENANT]
+    )
+
+    assert _authorizing_tenant(filters) == "acme"
+
+
+def test_authorizing_tenant_is_none_when_no_single_honest_value() -> None:
+    provider = GrantAuthorizationProvider(
+        StaticGrantStore(
+            [Grant("alice", "tenant_id", "acme"), Grant("alice", "tenant_id", "globex")]
+        )
+    )
+
+    filters = provider.search_policy_filters(
+        _principal(), access="governed", attributes=[TENANT]
+    )
+
+    assert _authorizing_tenant(filters) is None
+    assert _authorizing_tenant(()) is None

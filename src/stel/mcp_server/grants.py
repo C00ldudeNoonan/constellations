@@ -49,6 +49,17 @@ DEFAULT_GRANT_TTL_SECONDS = 60.0
 MAX_GRANT_ROWS = 1000
 
 
+class GrantConfigurationError(Exception):
+    """The grants relation itself is malformed.
+
+    Deliberately not an `AuthorizationError`. The service treats that as an
+    ordinary denial — `not_found_or_denied` for one resource, a silent skip in
+    `list_context_models` — which would render schema drift in the grants
+    relation indistinguishable from a subject legitimately having no grants.
+    The operator would see an empty catalog and no reason for it.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Grant:
     """One value a subject is permitted for one policy attribute."""
@@ -149,7 +160,7 @@ def _grant_from_row(row: Mapping[str, Any], relation: str) -> Grant:
     for column in GRANT_COLUMNS:
         value = row.get(column)
         if not isinstance(value, str) or not value.strip():
-            raise AuthorizationError(
+            raise GrantConfigurationError(
                 f"Grant relation '{relation}' has a row with no usable "
                 f"'{column}'. Grants must be non-empty strings; a blank one is "
                 "ambiguous between 'no grant' and 'grant everything'."

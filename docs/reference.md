@@ -428,6 +428,11 @@ declaration. Configuration failures exit 2.
   filtered run is **additive/upsert-only**: it never deletes, requires
   incremental extraction models, and is rejected with `--full-refresh`. Deletion
   of removed documents is reconciled by a periodic unfiltered full run.
+  On object-store sources each glob's leading static segment narrows the
+  listing itself, and **several filters list one narrowed prefix each rather
+  than falling back to the whole bucket prefix** — so K filters cost K cheap
+  listings and batch size stays an orchestration knob. A glob with no static
+  segment (`'*/2024*'`) has nothing to narrow on and lists everything.
 
 ### Upgrading a warehouse built before the rename
 

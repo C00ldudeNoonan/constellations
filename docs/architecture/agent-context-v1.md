@@ -169,6 +169,13 @@ least one policy attribute (`tenant_id`, `access_groups`, `classification`, or
 `policy_ref`). Unresolved rows remain auditable in the warehouse but must not be
 indexed. This is publication eligibility, not caller authorization.
 
+`access_groups` is array-valued, so it is filtered by set overlap — the row's
+groups must share at least one element with the caller's — rather than by
+equality or `IN`, which ask scalar questions. The retrieval store must
+advertise the `array_containment_filters` capability; one that cannot express
+overlap refuses the query rather than dropping the filter, since a dropped
+policy prefilter is an unfiltered read.
+
 At query time the retrieval server derives mandatory filters from trusted
 caller claims. User or model relevance filters are composed separately and
 cannot remove or weaken mandatory policy filters. stel does not authenticate

@@ -59,6 +59,12 @@ class RetrievalFeature(StrEnum):
     # stale writers are excluded: an OS-enforced single-host lock, provider
     # conditional writes, or immutable generations with conditional
     # activation. The latter two are reserved for distributed adapters.
+    # Filtering an array-valued column by overlap with a set (issue #397).
+    # Declared separately from METADATA_FILTERING because a store can filter
+    # scalars perfectly well and have no way to express array overlap. A store
+    # that cannot must fail closed: silently dropping a policy filter turns an
+    # unusable governed model into an unfiltered one, which is far worse.
+    ARRAY_CONTAINMENT_FILTERS = "array_containment_filters"
     SINGLE_HOST_PUBLISHER_LOCK = "single_host_publisher_lock"
     PROVIDER_ENFORCED_FENCING = "provider_enforced_fencing"
     IMMUTABLE_GENERATION_ACTIVATION = "immutable_generation_activation"
@@ -91,6 +97,11 @@ class RetrievalPredicateOperator(StrEnum):
     GREATER_THAN = "gt"
     GREATER_THAN_OR_EQUAL = "ge"
     IN = "in"
+    # "this array column shares at least one element with these values"
+    # (issue #397). Distinct from IN, which asks whether a *scalar* column is
+    # one of several values -- the inverse relation, and not expressible for
+    # an array-valued attribute.
+    ARRAY_CONTAINS_ANY = "array_contains_any"
 
 
 RetrievalScalar = str | int | float | bool | date | datetime
@@ -107,12 +118,21 @@ class RetrievalPredicate:
             raise RetrievalError("Retrieval predicate field must not be empty")
         if not isinstance(self.operator, RetrievalPredicateOperator):
             raise RetrievalError("Retrieval predicate operator is invalid")
-        if self.operator == RetrievalPredicateOperator.IN:
+        if self.operator in _TUPLE_VALUED_OPERATORS:
             if not isinstance(self.value, tuple) or not self.value:
-                raise RetrievalError("Retrieval IN predicates require a non-empty tuple")
+                # An empty set would mean "matches nothing", but an operator
+                # that silently matches nothing is indistinguishable from a
+                # dropped filter to everything downstream. Callers must decide
+                # explicitly rather than encode it as an empty tuple.
+                raise RetrievalError(
+                    f"Retrieval {self.operator.value} predicates require a "
+                    "non-empty tuple"
+                )
             first = type(self.value[0])
             if any(type(item) is not first for item in self.value):
-                raise RetrievalError("Retrieval IN values must share one type")
+                raise RetrievalError(
+                    f"Retrieval {self.operator.value} values must share one type"
+                )
             values = self.value
         else:
             if isinstance(self.value, tuple):
@@ -126,6 +146,11 @@ class RetrievalPredicate:
             f"RetrievalPredicate(field={self.field!r}, "
             f"operator={self.operator.value!r}, value=<redacted>)"
         )
+
+
+_TUPLE_VALUED_OPERATORS = frozenset(
+    {RetrievalPredicateOperator.IN, RetrievalPredicateOperator.ARRAY_CONTAINS_ANY}
+)
 
 
 def _is_retrieval_scalar(value: Any) -> bool:

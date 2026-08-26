@@ -559,16 +559,24 @@ def _parse_search_vector(value: str | None) -> tuple[float, ...] | None:
         raise ValueError("--vector must be a non-empty JSON array of numbers") from None
 
 
+_JSON_ARRAY_FILTER_OPERATORS = frozenset(
+    {SearchFilterOperator.IN, SearchFilterOperator.ARRAY_CONTAINS_ANY}
+)
+
+
 def _parse_search_filter(field: str, operator: str, value: str) -> SearchFilter:
     resolved_operator = SearchFilterOperator(operator)
-    if resolved_operator != SearchFilterOperator.IN:
+    if resolved_operator not in _JSON_ARRAY_FILTER_OPERATORS:
         return SearchFilter(field, resolved_operator, value)
+    name = resolved_operator.value
     try:
         decoded = json.loads(value)
     except json.JSONDecodeError:
-        raise ValueError("Search filter 'in' values must be a JSON array") from None
+        raise ValueError(f"Search filter '{name}' values must be a JSON array") from None
     if not isinstance(decoded, list) or not decoded:
-        raise ValueError("Search filter 'in' values must be a non-empty JSON array")
+        raise ValueError(
+            f"Search filter '{name}' values must be a non-empty JSON array"
+        )
     return SearchFilter(field, resolved_operator, tuple(decoded))
 
 

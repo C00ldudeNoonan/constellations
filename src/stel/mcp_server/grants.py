@@ -194,16 +194,23 @@ class GrantAuthorizationProvider:
         granted = _granted_values(self._store, principal.subject_id)
         filters: list[SearchFilter] = []
         for attribute in attributes:
-            if attribute.data_type == "array[string]":
-                raise AuthorizationError(
-                    "The active retrieval store cannot compile array-valued "
-                    "policy claims"
-                )
             values = granted.get(attribute.name, ())
             if not values:
                 raise AuthorizationError(
                     "The caller has no grant for every required policy attribute"
                 )
+            if attribute.data_type == "array[string]":
+                # Several grant rows for one attribute already collect into a
+                # set, which is exactly the shape an overlap test wants
+                # (issue #397).
+                filters.append(
+                    SearchFilter(
+                        attribute.name,
+                        SearchFilterOperator.ARRAY_CONTAINS_ANY,
+                        values,
+                    )
+                )
+                continue
             filters.append(
                 SearchFilter(
                     attribute.name,
@@ -243,9 +250,26 @@ class GrantAuthorizationProvider:
         for attribute in attributes:
             allowed = granted.get(attribute.name, ())
             value = row.get(attribute.name)
+            if attribute.data_type == "array[string]":
+                if not _overlaps(value, allowed):
+                    return False
+                continue
             if not isinstance(value, str) or value not in allowed:
                 return False
         return True
+
+
+def _overlaps(value: Any, allowed: tuple[str, ...]) -> bool:
+    """Whether an array-valued row attribute shares an element with the grants.
+
+    An empty or absent list is refused, matching the scalar rule: a row that
+    carries no value for a required attribute is not thereby public. Non-string
+    elements are ignored rather than coerced, so a malformed row cannot match
+    by stringification.
+    """
+    if not isinstance(value, list | tuple):
+        return False
+    return any(item in allowed for item in value if isinstance(item, str))
 
 
 def _granted_values(store: GrantStore, subject_id: str) -> dict[str, tuple[str, ...]]:

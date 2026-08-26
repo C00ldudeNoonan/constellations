@@ -167,10 +167,10 @@ A grants relation that is malformed — a null, blank, or missing column — fai
 as a configuration error rather than as a denial, so schema drift does not
 present as "this subject has no grants".
 
-Policy attributes declared as `array[string]`, including the `access_groups`
-shape in the agent-context contract, cannot be compiled into a search filter
-by any provider today and fail closed. Use scalar attributes such as
-`access_group` until issue #397 lands.
+Policy attributes declared as `array[string]` — including the `access_groups`
+shape in the agent-context contract — are filtered by set overlap: the row's
+groups must share at least one element with the caller's grants. One grant row
+per group, exactly as for scalar attributes.
 
 Grants are cached per subject for `--grant-ttl-seconds` (default 60). That TTL
 is the ceiling on how long a revoked grant keeps working — restart the server

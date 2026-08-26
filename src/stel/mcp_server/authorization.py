@@ -183,15 +183,23 @@ class ClaimAuthorizationProvider:
             return ()
         filters: list[SearchFilter] = []
         for attribute in attributes:
-            if attribute.data_type == "array[string]":
-                raise AuthorizationError(
-                    "The active retrieval store cannot compile array-valued policy claims"
-                )
             value = self._claim_value(principal, attribute.name)
             if value is None or value == ():
                 raise AuthorizationError(
                     "The caller has no trusted value for every required policy attribute"
                 )
+            if attribute.data_type == "array[string]":
+                # The row holds a list and the claim is the set to overlap it
+                # with, so a single claim still compiles to a one-element set
+                # rather than an equality test against a list (issue #397).
+                filters.append(
+                    SearchFilter(
+                        attribute.name,
+                        SearchFilterOperator.ARRAY_CONTAINS_ANY,
+                        value if isinstance(value, tuple) else (value,),
+                    )
+                )
+                continue
             operator = (
                 SearchFilterOperator.IN
                 if isinstance(value, tuple)
@@ -263,7 +271,9 @@ class ClaimAuthorizationProvider:
             return principal.policy_claims[field]
         if field in {"tenant", "tenant_id"}:
             return principal.tenant_id
-        if field in {"access_group", "group"}:
+        # `access_groups` is the name the agent-context contract documents for
+        # the array-valued form; the singular aliases predate it (issue #397).
+        if field in {"access_groups", "access_group", "group"}:
             return principal.access_groups
         return None
 

@@ -59,6 +59,11 @@ from .contracts import (
     SearchContextResult,
     ToolError,
 )
+from .grants import (
+    DEFAULT_GRANT_TTL_SECONDS,
+    GrantAuthorizationProvider,
+    WarehouseGrantStore,
+)
 from .repository import (
     ContextRepository,
     ContextRepositoryError,
@@ -249,15 +254,40 @@ class ContextService:
         profiles_dir: Path | None = None,
         principal_resolver: PrincipalResolver | None = None,
         authorization: AuthorizationProvider | None = None,
+        grants_relation: str | None = None,
+        grant_ttl_seconds: float = DEFAULT_GRANT_TTL_SECONDS,
         settings: ContextServerSettings | None = None,
     ) -> ContextService:
+        """Build a service against a project directory.
+
+        `grants_relation` names an operator-owned warehouse relation of
+        (subject_id, attribute, value) rows. Supplying it swaps the default
+        claim-derived authorization for grants looked up by subject, so a
+        forged access-group or tenant header buys the caller nothing
+        (issue #392).
+        """
+        if grants_relation is not None and authorization is not None:
+            raise ValueError(
+                "Pass either 'authorization' or 'grants_relation', not both: "
+                "a grants relation builds an authorization provider, so "
+                "supplying both leaves it ambiguous which policy is in force."
+            )
+        repository = WarehouseContextRepository(
+            project_dir,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+        if grants_relation is not None:
+            authorization = GrantAuthorizationProvider(
+                WarehouseGrantStore(
+                    repository,
+                    relation=grants_relation,
+                    ttl_seconds=grant_ttl_seconds,
+                )
+            )
         return cls(
             catalog=ArtifactCatalog.load(project_dir, expected_target=target),
-            repository=WarehouseContextRepository(
-                project_dir,
-                target=target,
-                profiles_dir=profiles_dir,
-            ),
+            repository=repository,
             context_search=PortableContextSearch(
                 project_dir,
                 target=target,

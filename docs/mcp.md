@@ -121,6 +121,51 @@ Two limits worth knowing before a shared deployment:
 
 Token verification without a proxy in front is tracked in issue #392.
 
+## Operator-owned grants
+
+By default a principal's policy values *are* its claims: the tenant and access
+groups the caller arrives with decide what the caller may read. Over stdio that
+is correct, because the operator sets the environment and is the principal.
+Over any transport where the claims come from the caller, it means a forged
+`STEL_MCP_ACCESS_GROUPS` — or the header a proxy maps it from — is a policy
+change, and a correctly configured proxy is the only thing separating one
+tenant from another.
+
+`--grants-relation` moves that decision to a relation you own:
+
+```bash
+stel mcp serve --grants-relation ops.context_grants
+```
+
+The relation supplies three string columns:
+
+| Column | Meaning |
+| --- | --- |
+| `subject_id` | The authenticated subject the grant belongs to. |
+| `attribute` | A policy attribute name, such as `tenant_id` or `access_group`. |
+| `value` | One value the subject is permitted for that attribute. |
+
+One row per permitted value; several rows for the same attribute compile to an
+`IN` filter. With this set, `STEL_MCP_TENANT_ID`, `STEL_MCP_ACCESS_GROUPS`, and
+`STEL_MCP_POLICY_CLAIMS` are **not consulted** — only `STEL_MCP_PRINCIPAL_ID`
+is, as the subject to look up. That is the point: the caller proves who they
+are, and you decide what that subject may read.
+
+A subject with no grant for a required attribute is refused rather than given
+an unfiltered read, and rows returned by search are rechecked against the same
+grants, so a retrieval store that ignored a filter still cannot leak a row.
+
+Grants are cached per subject for `--grant-ttl-seconds` (default 60). That TTL
+is the ceiling on how long a revoked grant keeps working — restart the server
+if a revocation must take effect immediately.
+
+Two limits worth stating plainly. stel is still the enforcement point: grants
+make policy central and auditable, but they do not make the warehouse refuse a
+query stel should not have issued — per-tenant warehouse credentials are the
+layer that does that, and they compose with this. And the grants relation is
+as trustworthy as its write path; treat it as production access control, not
+as a model that anything downstream may edit.
+
 ## Generic client configuration
 
 Most stdio MCP clients accept a configuration shaped like this. Replace the

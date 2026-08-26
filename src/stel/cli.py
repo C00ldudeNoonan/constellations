@@ -1490,6 +1490,26 @@ def mcp() -> None:
         "verification lands."
     ),
 )
+@click.option(
+    "--grants-relation",
+    type=str,
+    default=None,
+    help=(
+        "Warehouse relation of (subject_id, attribute, value) grants. When "
+        "set, authorization is looked up by authenticated subject instead of "
+        "being read from caller-supplied claim headers."
+    ),
+)
+@click.option(
+    "--grant-ttl-seconds",
+    type=click.FloatRange(min=1.0),
+    default=None,
+    show_default="60",
+    help=(
+        "How long a subject's grants are cached. This is the ceiling on how "
+        "long a revoked grant keeps applying."
+    ),
+)
 @_project_context_options
 @click.pass_context
 def mcp_serve(
@@ -1503,6 +1523,8 @@ def mcp_serve(
     max_requests_per_minute: int,
     max_response_bytes: int,
     max_scan_rows: int,
+    grants_relation: str | None,
+    grant_ttl_seconds: float | None,
 ) -> None:
     """Run the read-only stel MCP server.
 
@@ -1537,6 +1559,8 @@ def mcp_serve(
                 ctx.obj["project_dir"],
                 target=ctx.obj["target"],
                 profiles_dir=ctx.obj["profiles_dir"],
+                grants_relation=grants_relation,
+                grant_ttl_seconds=grant_ttl_seconds,
                 settings=settings,
             )
             return
@@ -1563,6 +1587,8 @@ def mcp_serve(
             principal_resolver=TrustedHeaderPrincipalResolver(),
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
+            grants_relation=grants_relation,
+            grant_ttl_seconds=grant_ttl_seconds,
             settings=settings,
         )
     except (ArtifactCatalogError, AuthorizationError, *_CONFIG_ERRORS) as error:

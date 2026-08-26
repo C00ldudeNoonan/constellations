@@ -107,6 +107,11 @@ def _grants_provider() -> GrantAuthorizationProvider:
     )
 
 
+# Both providers, because the recheck and the prefilter have to agree and
+# nothing else forces them to. A provider that compiles a correct overlap
+# prefilter and then rejects the rows it selected returns nothing at all --
+# which is what the claim provider did until this was caught in review.
+@pytest.mark.parametrize("provider_name", ["claims", "grants"])
 @pytest.mark.parametrize(
     ("row_groups", "expected"),
     [
@@ -118,17 +123,54 @@ def _grants_provider() -> GrantAuthorizationProvider:
         ("analysts", False),
     ],
 )
-def test_can_read_intersects_array_groups(row_groups: Any, expected: bool) -> None:
+def test_can_read_intersects_array_groups(
+    provider_name: str,
+    row_groups: Any,
+    expected: bool,
+) -> None:
     """An absent or empty list is refused, matching the scalar rule: a row
     carrying no value for a required attribute is not thereby public. A bare
     string is refused too rather than being treated as a one-element list."""
+    provider: Any = (
+        ClaimAuthorizationProvider() if provider_name == "claims" else _grants_provider()
+    )
+    # The claim provider reads the caller's own groups; the grant provider
+    # reads the operator's. Both are ("analysts",)-equivalent here so one
+    # expectation covers both.
+    principal = _principal(access_groups=("analysts",))
     row = {
         "authorization_resolved": True,
         "is_public": False,
         "access_groups": row_groups,
     }
 
-    assert _grants_provider().can_read(_principal(), row, attributes=[GROUPS]) is expected
+    assert provider.can_read(principal, row, attributes=[GROUPS]) is expected
+
+
+def test_a_row_the_prefilter_selects_is_not_rejected_by_the_recheck() -> None:
+    """The two halves must agree. A correct prefilter paired with a recheck
+    that rejects everything yields an empty result set, which looks like
+    "no matching documents" rather than like a bug."""
+    provider = ClaimAuthorizationProvider()
+    principal = _principal(access_groups=("analysts", "ops"))
+    row_groups = ["analysts", "admins"]
+
+    (filter_,) = provider.search_policy_filters(
+        principal, access="governed", attributes=[GROUPS]
+    )
+    assert isinstance(filter_.value, tuple)
+    selected_by_prefilter = bool(set(row_groups) & set(filter_.value))
+
+    assert selected_by_prefilter
+    assert provider.can_read(
+        principal,
+        {
+            "authorization_resolved": True,
+            "is_public": False,
+            "access_groups": row_groups,
+        },
+        attributes=[GROUPS],
+    )
 
 
 # ─── the store contract ─────────────────────────────────────────────────────

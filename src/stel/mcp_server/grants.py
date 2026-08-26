@@ -27,7 +27,12 @@ from typing import Any, Protocol
 
 from ..adapters.base import ReadPredicate, ReadPredicateOperator
 from ..search import SearchFilter, SearchFilterOperator
-from .authorization import AuthorizationError, PolicyAttribute, Principal
+from .authorization import (
+    AuthorizationError,
+    PolicyAttribute,
+    Principal,
+    policy_values_overlap,
+)
 
 # Columns the grants relation must provide. Named rather than inferred so a
 # relation that drifted fails with the missing column instead of silently
@@ -251,25 +256,12 @@ class GrantAuthorizationProvider:
             allowed = granted.get(attribute.name, ())
             value = row.get(attribute.name)
             if attribute.data_type == "array[string]":
-                if not _overlaps(value, allowed):
+                if not policy_values_overlap(value, allowed):
                     return False
                 continue
             if not isinstance(value, str) or value not in allowed:
                 return False
         return True
-
-
-def _overlaps(value: Any, allowed: tuple[str, ...]) -> bool:
-    """Whether an array-valued row attribute shares an element with the grants.
-
-    An empty or absent list is refused, matching the scalar rule: a row that
-    carries no value for a required attribute is not thereby public. Non-string
-    elements are ignored rather than coerced, so a malformed row cannot match
-    by stringification.
-    """
-    if not isinstance(value, list | tuple):
-        return False
-    return any(item in allowed for item in value if isinstance(item, str))
 
 
 def _granted_values(store: GrantStore, subject_id: str) -> dict[str, tuple[str, ...]]:

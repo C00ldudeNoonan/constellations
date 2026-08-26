@@ -471,7 +471,12 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
         str,
     ),
     multiple=True,
-    help="Repeatable FIELD OP VALUE filter. Use a JSON array with the 'in' operator.",
+    help=(
+        "Repeatable FIELD OP VALUE filter. The 'in' and 'array_contains_any' "
+        "operators take a JSON array. An array[string] field must use "
+        "'array_contains_any', which matches when the row's list shares any "
+        "value with the array given."
+    ),
 )
 @click.option(
     "--field",

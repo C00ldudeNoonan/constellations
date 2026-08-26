@@ -146,6 +146,23 @@ def _current_http_request() -> Any:
     return getattr(context, "request", None) if context is not None else None
 
 
+def policy_values_overlap(
+    row_value: Any,
+    allowed: SearchScalar | tuple[SearchScalar, ...],
+) -> bool:
+    """Whether an array-valued row attribute shares an element with the policy.
+
+    An absent or empty list is refused, matching the scalar rule: a row that
+    carries no value for a required attribute is not thereby public. Non-string
+    elements are ignored rather than coerced, so a malformed row cannot match
+    by stringification, and a bare string is not treated as a one-element list.
+    """
+    if not isinstance(row_value, list | tuple):
+        return False
+    permitted = allowed if isinstance(allowed, tuple) else (allowed,)
+    return any(item in permitted for item in row_value if isinstance(item, str))
+
+
 class AuthorizationProvider(Protocol):
     def search_policy_filters(
         self,
@@ -244,6 +261,15 @@ class ClaimAuthorizationProvider:
             row_value = row.get(attribute.name)
             if claim is None or row_value is None:
                 return False
+            if attribute.data_type == "array[string]":
+                # The row holds a list, so the question is overlap, not
+                # membership. Comparing the list against the claim tuple
+                # rejects every row, including the ones the prefilter just
+                # selected (issue #397).
+                if not policy_values_overlap(row_value, claim):
+                    return False
+                matched = True
+                continue
             if isinstance(claim, tuple):
                 if row_value not in claim:
                     return False

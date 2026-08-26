@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+## v0.12.0 - 2026-08-26
+
+### Upgrading: one reprocess, paid once (issues #363, #385)
+
+Two changes in this release re-key incremental state, and they are shipped
+together deliberately so the cost is paid once rather than twice:
+
+- **`extraction:` models re-extract once.** Backend identity dropped the stel
+  release (#363), which changes the identity payload itself. After this run,
+  a release that leaves backend-reachable code alone no longer re-extracts
+  anything — which is the whole point.
+- **`transform: materialization: incremental` models reproject once.** The
+  parent fingerprint moved to per-row digests so classification can stream
+  (#385).
+
+Cached provider responses survive both: they key on the provider contract
+identity, not on backend or transform identity. Plan the first run after
+upgrading accordingly, and prefer to take it at a quiet time.
+
+### Atomic generation activation for search indexes (issue #355)
+
+- **A rebuild builds into a private generation and activates by pointer.**
+  `materialization: full`, `--full-refresh`, and an incompatible change under
+  `on_index_change: rebuild` no longer refuse: the new index is built into a
+  collection nothing is querying, validated, and only then does the ledger
+  pointer move. The previous generation serves every read until that switch,
+  so there is no window where the index is empty, half-built, or mixing two
+  configurations.
+- **The serving scope keys on the logical collection**, so the ledger stays
+  readable while the physical collection behind a name is replaced;
+  `active_generation` became a pointer to follow rather than a value to
+  compare.
+- **Superseded generations are retired.** The collection a rebuild replaced,
+  and a half-built one left by a publisher that died before activating, are
+  both reclaimed — under the publish lease, where "is anything reading this?"
+  is already answered by the existing lease protocol, so no timer or
+  generations table was needed.
+
+### `stel suggest dbt` (issue #361)
+
+The feedback loop ended at measurement; this is the half that changes a file.
+`stel suggest dbt --from <relation> --dbt-project <dir>` reads candidate
+suggestions and renders them as a unified diff against the dbt project.
+Nothing is written without `--write`, and nothing is ever committed —
+promotion of a suggestion stays a human act, reviewed as a diff where the
+context actually lives.
+
 ### Incremental transform memory follows the change set (issue #385)
 
 - **The parent table is no longer read whole.** Classification streams it and
@@ -173,6 +220,56 @@
   constellation brightens and the rest recede. Rendering degrades to the
   library's defaults when the THREE namespace is unavailable, and the page
   stays fully self-contained.
+
+### GCS listing pushdown composes across filters (issue #378)
+
+`_static_filter_prefix` narrowed the listing only when every `--source-filter`
+glob shared one static leading segment, and returned "list everything" the
+moment they disagreed — so one filter got the #348 win and two gave it back
+entirely, which is exactly what a batched backfill passes. It now lists the
+narrowest covering set of prefixes separately and unions the results, with the
+scan ceiling applied to the total.
+
+### Incremental transforms commit in batches (issue #379)
+
+Extraction checkpoints as it goes; incremental transforms did not — they
+invoked the module over every changed parent, then published and advanced
+state in a single call at the end, so a failure at parent 90-of-100 re-paid
+all 100. Changed parents are now processed and committed in batches, each
+advancing its own parents' state, so a relaunch reclassifies only what did not
+finish.
+
+### Parent groups stream rather than materializing the corpus (issue #383)
+
+`_parent_groups` held every row of the parent table as Python dicts, grouped
+by parent, purely to fingerprint them — an overhead larger than the Arrow data
+it came from. Groups are now produced one at a time, gathered by recorded row
+indices rather than by materializing every partition up front.
+
+### Fixed
+
+- **`stel mcp serve` no longer hangs on Windows with gcloud user credentials**
+  (issue #365). `google.auth.default()` resolves gcloud-SDK credentials by
+  shelling out to `gcloud config config-helper`; under stdio serving that
+  child inherits the MCP protocol pipes and never exits, so every warehouse
+  call reported a retryable "timeout" that no retry could clear. The ADC file
+  is now loaded directly, with no subprocess. The server also opens the
+  warehouse once at startup, so a broken credential setup fails loudly at boot
+  instead of mid-session.
+- **All text I/O specifies `utf-8`** (issue #369). `read_text()`,
+  `write_text()`, and text-mode `open()` otherwise fall back to the platform
+  locale, which is not UTF-8 on Windows — so a non-ASCII character in project
+  YAML, a source document, or a manifest became a decode failure that
+  reproduced on one machine and nowhere else. Three of the affected call sites
+  were config and source-document reads. The Python standards this follows are
+  now recorded in `AGENTS.md`.
+
+### Documentation
+
+- MotherDuck is documented as the shipped managed deployment of the DuckDB
+  adapter rather than a planned one (issue #186), and every `stel init`
+  template now carries a commented-out MotherDuck target so the local-dev
+  graduation path is visible at init.
 
 ## v0.11.0 - 2026-08-23
 

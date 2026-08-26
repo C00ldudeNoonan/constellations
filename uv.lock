@@ -681,6 +681,7 @@ dependencies = [
     { name = "proto-plus" },
     { name = "protobuf" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/45/de/d499a74cad60fe548986504da00e20177cb1d3c8bfbb1fc2347e518f8cbd/google_cloud_bigquery_storage-2.41.0.tar.gz", hash = "sha256:b999295f08ce7e2d6a260d245b5b9843ba1603f6164515c9f0cb5d81ee71a5d2", size = 315252, upload-time = "2026-08-25T19:18:34.837Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b2/c9/1dc5941062fd196959ab343174d91f132cb2308cc3c80deb7dd194543977/google_cloud_bigquery_storage-2.41.0-py3-none-any.whl", hash = "sha256:a7511f05aedb533e01f029e30b26ff073ca66d672f701bb736024553697b589c", size = 308013, upload-time = "2026-08-24T21:55:17.697Z" },
 ]
@@ -2568,7 +2569,7 @@ wheels = [
 
 [[package]]
 name = "stel"
-version = "0.11.0"
+version = "0.12.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

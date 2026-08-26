@@ -21,7 +21,7 @@ from __future__ import annotations
 import fnmatch
 import importlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -116,10 +116,22 @@ def _static_filter_prefixes(source_filter: Sequence[str]) -> tuple[str, ...]:
 
 
 def _matches(relative: str, pattern: str, recursive: bool) -> bool:
+    """Whether a source-relative object path matches a glob, case-sensitively.
+
+    `fnmatch.fnmatch` folds case through `os.path.normcase`, which lowercases
+    on Windows — so the same filter against the same bucket selected different
+    documents depending on the developer's platform, and `AMAT/*` matched
+    `amat/x.html` on Windows only. GCS object names are case-sensitive
+    everywhere, so `fnmatchcase` is the honest comparison.
+
+    It is also what keeps the listing pushdown sound (Codex review on #378):
+    prefix listing is case-sensitive, so a case-insensitive matcher would
+    authoritatively match objects a narrowed prefix can never return.
+    """
     if not recursive and "/" in relative:
         return False
     target = relative if "/" in pattern else PurePosixPath(relative).name
-    return fnmatch.fnmatch(target, pattern)
+    return fnmatch.fnmatchcase(target, pattern)
 
 
 def content_hash_for_blob(blob: Any) -> str:
@@ -180,6 +192,42 @@ class GCSDocumentSource(DocumentSource):
                 "Application Default Credentials may not include a default project."
             ) from e
 
+    def _list_prefixes(
+        self,
+        source: SourceConfig,
+        *,
+        bucket_name: str,
+        listing_prefixes: Sequence[str],
+        scan_ceiling: int,
+        listing_label: str,
+    ) -> Iterator[Any]:
+        """Yield every object under each prefix, under one shared scan ceiling.
+
+        Extracted so `discover`'s per-blob branches keep their original depth:
+        inlining the prefix loop put them five levels deep, past the four this
+        repository allows (Codex review). The ceiling counts across prefixes,
+        not per prefix — a filter set that fans out into many listings is
+        exactly how an unbounded scan would otherwise slip through.
+        """
+        scanned = 0
+        client = self._get_client(source.project)
+        for listing_prefix in listing_prefixes:
+            for blob in client.list_blobs(
+                bucket_name,
+                prefix=listing_prefix or None,
+                max_results=scan_ceiling + 1,
+            ):
+                scanned += 1
+                if scanned > scan_ceiling:
+                    raise SourceError(
+                        f"Source '{source.name}': scanned more than "
+                        f"{scan_ceiling} objects under "
+                        f"gs://{bucket_name}/{listing_label} without reaching "
+                        f"the end of the listing. The prefix is too broad — "
+                        "narrow it, or raise `max_objects` on the source."
+                    )
+                yield blob
+
     def discover(
         self,
         source: SourceConfig,
@@ -215,42 +263,35 @@ class GCSDocumentSource(DocumentSource):
         # list, and the prefixes already carry `list_prefix`.
         listing_label = ", ".join(listing_prefixes)
         try:
-            for listing_prefix in listing_prefixes:
-                for blob in self._get_client(source.project).list_blobs(
-                    bucket_name,
-                    prefix=listing_prefix or None,
-                    max_results=scan_ceiling + 1,
+            for blob in self._list_prefixes(
+                source,
+                bucket_name=bucket_name,
+                listing_prefixes=listing_prefixes,
+                scan_ceiling=scan_ceiling,
+                listing_label=listing_label,
+            ):
+                scanned += 1
+                if blob.name.endswith("/"):  # directory placeholder objects
+                    continue
+                if list_prefix and not blob.name.startswith(list_prefix):
+                    continue
+                relative = blob.name.removeprefix(list_prefix)
+                if not relative or not _matches(
+                    relative, source.file_pattern, source.recursive
                 ):
-                    scanned += 1
-                    if scanned > scan_ceiling:
-                        raise SourceError(
-                            f"Source '{source.name}': scanned more than "
-                            f"{scan_ceiling} objects under "
-                            f"gs://{bucket_name}/{listing_label} without reaching "
-                            f"the end of the listing. The prefix is too broad — "
-                            "narrow it, or raise `max_objects` on the source."
-                        )
-                    if blob.name.endswith("/"):  # directory placeholder objects
-                        continue
-                    if list_prefix and not blob.name.startswith(list_prefix):
-                        continue
-                    relative = blob.name.removeprefix(list_prefix)
-                    if not relative or not _matches(
-                        relative, source.file_pattern, source.recursive
-                    ):
-                        continue
-                    matched.append(blob)
-                    # The cap is about the documents this source reads. Counting
-                    # the raw listing instead let unrelated objects under the same
-                    # prefix — a sibling pipeline's sidecars — fail a run over
-                    # files the pattern would have discarded (issue #348).
-                    if len(matched) > source.max_objects:
-                        raise SourceError(
-                            f"Source '{source.name}': more than {source.max_objects} "
-                            f"documents match under gs://{bucket_name}/"
-                            f"{listing_label}. Narrow the prefix or raise "
-                            "`max_objects` on the source."
-                        )
+                    continue
+                matched.append(blob)
+                # The cap is about the documents this source reads. Counting
+                # the raw listing instead let unrelated objects under the same
+                # prefix — a sibling pipeline's sidecars — fail a run over
+                # files the pattern would have discarded (issue #348).
+                if len(matched) > source.max_objects:
+                    raise SourceError(
+                        f"Source '{source.name}': more than {source.max_objects} "
+                        f"documents match under gs://{bucket_name}/"
+                        f"{listing_label}. Narrow the prefix or raise "
+                        "`max_objects` on the source."
+                    )
         except (SourceError, ConfigError):
             raise
         except Exception as e:

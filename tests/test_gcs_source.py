@@ -650,3 +650,26 @@ def test_the_scan_ceiling_spans_the_union_not_each_prefix(tmp_path: Path) -> Non
             tmp_path,
             source_filter=("AMAT/*", "AAPL/*", "NVDA/*"),
         )
+
+
+def test_object_matching_is_case_sensitive_on_every_platform(
+    tmp_path: Path,
+) -> None:
+    """GCS object names are case-sensitive, so the matcher must be too.
+
+    `fnmatch.fnmatch` folds case through `os.path.normcase`, which lowercases
+    on Windows — so before this the same filter against the same bucket
+    selected different documents depending on the developer's platform.
+
+    It is also what makes the listing pushdown sound (Codex review on #378):
+    prefix listing is case-sensitive, so a case-insensitive matcher would
+    authoritatively match objects a narrowed prefix can never return, and the
+    run would silently omit them.
+    """
+    blobs = [_FakeBlob("raw/docs/amat/0.html"), _FakeBlob("raw/docs/AMAT/1.html")]
+    client = _FakeStorageClient(blobs)
+    src = _gcs_source(client)
+
+    refs = src.discover(_cfg(), tmp_path, source_filter=("AMAT/*",))
+
+    assert [ref.relative_path for ref in refs] == ["AMAT/1.html"]

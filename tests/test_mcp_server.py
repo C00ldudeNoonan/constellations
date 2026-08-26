@@ -7,7 +7,7 @@ import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -1129,3 +1129,45 @@ def test_the_cli_refuses_proxy_headers_on_stdio(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "applies to a network transport" in result.output
+
+
+def test_a_request_scoped_resolver_sees_the_calling_thread_context() -> None:
+    """The network transport resolves identity from a contextvar the SDK sets
+    per request (issue #392). Every operation is submitted to a
+    ThreadPoolExecutor, and contextvars do not cross that boundary on their
+    own — so without propagation the resolver finds nothing and every network
+    call is refused as MISSING_PRINCIPAL, no matter who the caller is
+    (Codex review).
+    """
+    import contextvars
+
+    current: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
+        "test_request_principal", default=None
+    )
+
+    class RequestScopedResolver:
+        def resolve(self) -> Principal | None:
+            return current.get()
+
+    service = ContextService(
+        catalog=_artifact_catalog(),
+        repository=FakeRepository(_fixture_rows()),
+        context_search=FakeSearch(),
+        principal_resolver=cast(Any, RequestScopedResolver()),
+        authorization=ClaimAuthorizationProvider(),
+    )
+    token = current.set(
+        Principal(
+            "network-caller",
+            tenant_id="research",
+            policy_claims={"classification": "internal"},
+        )
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        current.reset(token)
+        service.close()
+
+    assert response.error is None, response.error
+    assert [model.name for model in response.models] == ["context_search"]

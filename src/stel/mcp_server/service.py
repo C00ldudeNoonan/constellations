@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -162,9 +163,18 @@ class _OperationLimiter:
                 retryable=True,
             )
 
+        # The operation runs in a worker thread, and contextvars do not cross
+        # that boundary on their own. A network transport resolves the caller's
+        # identity from the SDK's per-request contextvar, so without this the
+        # resolver finds nothing and every call is refused as
+        # MISSING_PRINCIPAL regardless of who asked (Codex review, #392).
+        # Copied here, in the calling thread, while the request context is
+        # still current.
+        context = contextvars.copy_context()
+
         def guarded() -> T:
             try:
-                return operation()
+                return context.run(operation)
             finally:
                 self._semaphore.release()
 

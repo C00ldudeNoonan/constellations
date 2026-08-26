@@ -80,6 +80,72 @@ class EnvironmentPrincipalResolver:
         )
 
 
+# Header names the trusted-proxy resolver reads. Chosen to be unmistakable in
+# a proxy config: anything a caller could set directly must be overwritten
+# there, so the names should never look incidental.
+PRINCIPAL_HEADER = "x-stel-principal-id"
+TENANT_HEADER = "x-stel-tenant-id"
+ACCESS_GROUPS_HEADER = "x-stel-access-groups"
+POLICY_CLAIMS_HEADER = "x-stel-policy-claims"
+
+
+class TrustedHeaderPrincipalResolver:
+    """Resolve one principal per request from headers set by a trusted proxy.
+
+    **This resolver trusts its input completely.** It is sound only when
+    something in front of the server authenticates the caller and *overwrites*
+    these headers on every request — an authenticating reverse proxy, an
+    identity-aware proxy, a service mesh. Reachable directly by callers, it is
+    not authentication at all: anyone can claim any tenant by setting a header.
+
+    That is why it is never a default and why the CLI requires naming the
+    trust boundary to enable it. The failure is silent — a forged header
+    produces correct-looking answers scoped to someone else's corpus — so it
+    has to be impossible to switch on by accident rather than merely
+    discouraged.
+
+    Reads the live request through the SDK's request contextvar, so identity
+    is per call rather than per process. Outside a request, or on a transport
+    with no HTTP request behind it, it resolves to None and the service
+    refuses the call as unauthenticated.
+    """
+
+    def resolve(self) -> Principal | None:
+        request = _current_http_request()
+        if request is None:
+            return None
+        headers = request.headers
+        subject_id = (headers.get(PRINCIPAL_HEADER) or "").strip()
+        if not subject_id:
+            return None
+        tenant_id = (headers.get(TENANT_HEADER) or "").strip()
+        groups = tuple(
+            value.strip()
+            for value in (headers.get(ACCESS_GROUPS_HEADER) or "").split(",")
+            if value.strip()
+        )
+        return Principal(
+            subject_id=subject_id,
+            tenant_id=tenant_id or None,
+            access_groups=groups,
+            policy_claims=_parse_policy_claims(headers.get(POLICY_CLAIMS_HEADER)),
+        )
+
+
+def _current_http_request() -> Any:
+    """The Starlette request for the call in flight, or None.
+
+    The resolver is invoked deep in the service, which has no request
+    parameter, so identity comes from the SDK's contextvar rather than from a
+    changed `PrincipalResolver` signature — the whole point of the Protocol is
+    that transports differ and the service does not care.
+    """
+    from mcp.server.lowlevel.server import request_ctx
+
+    context = request_ctx.get(None)
+    return getattr(context, "request", None) if context is not None else None
+
+
 class AuthorizationProvider(Protocol):
     def search_policy_filters(
         self,

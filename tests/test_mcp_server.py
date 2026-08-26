@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -971,3 +972,202 @@ def test_serve_stdio_warms_up_before_the_transport_starts(
     server_module.serve_stdio(Path("unused-project-dir"))
 
     assert events == ["warm_up", "run:stdio", "close"]
+
+
+# ─── deployable transports (issue #392) ─────────────────────────────────────
+
+
+def test_a_network_transport_refuses_a_process_wide_principal(
+    tmp_path: Path,
+) -> None:
+    """The footgun has to be impossible, not discouraged.
+
+    The environment resolver is right for stdio — the operator running the
+    process is the principal — and inverted over a network, where every caller
+    would be served as whichever identity the process started with, filtered by
+    that identity's tenant. Nothing about the responses would look wrong.
+    """
+    from stel.mcp_server.authorization import (
+        EnvironmentPrincipalResolver,
+        Principal,
+        StaticPrincipalResolver,
+    )
+    from stel.mcp_server.server import serve_network
+
+    for resolver in (
+        EnvironmentPrincipalResolver(),
+        StaticPrincipalResolver(Principal(subject_id="a", access_groups=("g",))),
+    ):
+        with pytest.raises(ValueError, match="one identity for the whole process"):
+            serve_network(
+                tmp_path,
+                transport="streamable-http",
+                host="127.0.0.1",
+                port=8000,
+                principal_resolver=resolver,
+            )
+
+
+def test_an_unknown_network_transport_is_refused(tmp_path: Path) -> None:
+    from stel.mcp_server.authorization import TrustedHeaderPrincipalResolver
+    from stel.mcp_server.server import serve_network
+
+    with pytest.raises(ValueError, match="Unknown network transport"):
+        serve_network(
+            tmp_path,
+            transport="websocket",
+            host="127.0.0.1",
+            port=8000,
+            principal_resolver=TrustedHeaderPrincipalResolver(),
+        )
+
+
+def test_the_header_resolver_reads_the_request_in_flight() -> None:
+    """Identity is per call, not per process — that is the whole point."""
+    from stel.mcp_server.authorization import TrustedHeaderPrincipalResolver
+
+    resolver = TrustedHeaderPrincipalResolver()
+
+    class _Request:
+        def __init__(self, headers: dict[str, str]) -> None:
+            self.headers = headers
+
+    alice = _Request(
+        {
+            "x-stel-principal-id": "alice",
+            "x-stel-tenant-id": "acme",
+            "x-stel-access-groups": "analysts, admins",
+        }
+    )
+    with _request_in_flight(alice):
+        principal = resolver.resolve()
+    assert principal is not None
+    assert principal.subject_id == "alice"
+    assert principal.tenant_id == "acme"
+    # Principal normalizes groups to a sorted, de-duplicated tuple.
+    assert principal.access_groups == ("admins", "analysts")
+
+    bob = _Request({"x-stel-principal-id": "bob", "x-stel-tenant-id": "globex"})
+    with _request_in_flight(bob):
+        other = resolver.resolve()
+    assert other is not None
+    assert other.tenant_id == "globex"
+
+
+def test_the_header_resolver_yields_nothing_without_a_request() -> None:
+    """Off a request — stdio, or a bad wiring — there is no identity to infer,
+    and inventing one is how a server ends up unauthenticated by default."""
+    from stel.mcp_server.authorization import TrustedHeaderPrincipalResolver
+
+    assert TrustedHeaderPrincipalResolver().resolve() is None
+
+
+def test_an_unidentified_request_yields_no_principal() -> None:
+    """A request that reaches the server without the proxy's header is not
+    anonymous-but-allowed; it has no principal at all."""
+    from stel.mcp_server.authorization import TrustedHeaderPrincipalResolver
+
+    class _Request:
+        def __init__(self) -> None:
+            self.headers = {"x-stel-tenant-id": "acme"}
+
+    with _request_in_flight(_Request()):
+        assert TrustedHeaderPrincipalResolver().resolve() is None
+
+
+@contextlib.contextmanager
+def _request_in_flight(request: Any) -> Any:
+    """Stand in for the SDK's per-request contextvar."""
+    from types import SimpleNamespace
+    from typing import cast
+
+    from mcp.server.lowlevel.server import request_ctx
+
+    token = request_ctx.set(cast(Any, SimpleNamespace(request=request)))
+    try:
+        yield
+    finally:
+        request_ctx.reset(token)
+
+
+def test_the_cli_refuses_a_network_transport_without_a_per_request_identity(
+    tmp_path: Path,
+) -> None:
+    """Refusing by default is the guardrail: forgetting the flag must not
+    quietly fall back to the stdio identity model."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["--project-dir", str(tmp_path), "mcp", "serve", "--transport", "streamable-http"],
+    )
+
+    assert result.exit_code != 0
+    assert "needs its own identity" in result.output
+
+
+def test_the_cli_refuses_proxy_headers_on_stdio(tmp_path: Path) -> None:
+    """Accepting the flag on stdio would imply the headers were doing something
+    there; they are not, and a silently ignored security flag is worse than a
+    rejected one."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir",
+            str(tmp_path),
+            "mcp",
+            "serve",
+            "--trust-proxy-principal-headers",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "applies to a network transport" in result.output
+
+
+def test_a_request_scoped_resolver_sees_the_calling_thread_context() -> None:
+    """The network transport resolves identity from a contextvar the SDK sets
+    per request (issue #392). Every operation is submitted to a
+    ThreadPoolExecutor, and contextvars do not cross that boundary on their
+    own — so without propagation the resolver finds nothing and every network
+    call is refused as MISSING_PRINCIPAL, no matter who the caller is
+    (Codex review).
+    """
+    import contextvars
+
+    current: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
+        "test_request_principal", default=None
+    )
+
+    class RequestScopedResolver:
+        def resolve(self) -> Principal | None:
+            return current.get()
+
+    service = ContextService(
+        catalog=_artifact_catalog(),
+        repository=FakeRepository(_fixture_rows()),
+        context_search=FakeSearch(),
+        principal_resolver=cast(Any, RequestScopedResolver()),
+        authorization=ClaimAuthorizationProvider(),
+    )
+    token = current.set(
+        Principal(
+            "network-caller",
+            tenant_id="research",
+            policy_claims={"classification": "internal"},
+        )
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        current.reset(token)
+        service.close()
+
+    assert response.error is None, response.error
+    assert [model.name for model in response.models] == ["context_search"]

@@ -112,6 +112,9 @@ def create_mcp_server(service: ContextService) -> Any:
     return app
 
 
+NETWORK_TRANSPORTS = ("streamable-http", "sse")
+
+
 def serve_stdio(
     project_dir: Path,
     *,
@@ -125,11 +128,76 @@ def serve_stdio(
         profiles_dir=profiles_dir,
         settings=settings,
     )
+    _run(service, transport="stdio")
+
+
+def serve_network(
+    project_dir: Path,
+    *,
+    transport: str,
+    host: str,
+    port: int,
+    principal_resolver: Any,
+    target: str | None = None,
+    profiles_dir: Path | None = None,
+    settings: ContextServerSettings | None = None,
+) -> None:
+    """Serve over a network transport with a per-request principal resolver.
+
+    `principal_resolver` is required and has no default, deliberately. The
+    environment resolver is correct for stdio — the operator running the
+    process *is* the principal — and inverted over a network, where it would
+    collapse every caller into whichever identity the process started with.
+    The failure is silent: policy filters still apply, just the wrong ones, so
+    the server answers confidently out of someone else's tenant. Making the
+    parameter required means that mistake cannot be made by omission
+    (issue #392).
+    """
+    if transport not in NETWORK_TRANSPORTS:
+        raise ValueError(
+            f"Unknown network transport {transport!r}; expected one of "
+            f"{', '.join(NETWORK_TRANSPORTS)}"
+        )
+    _reject_process_wide_identity(principal_resolver, transport)
+    service = ContextService.from_project(
+        project_dir,
+        target=target,
+        profiles_dir=profiles_dir,
+        settings=settings,
+        principal_resolver=principal_resolver,
+    )
+    _run(service, transport=transport, host=host, port=port)
+
+
+def _reject_process_wide_identity(principal_resolver: Any, transport: str) -> None:
+    """Refuse a network transport whose identity is process-wide.
+
+    A refusal rather than a warning: the symptom of getting this wrong is
+    correct-looking answers scoped to the wrong tenant, which no operator
+    would notice from the outside.
+    """
+    from .authorization import EnvironmentPrincipalResolver, StaticPrincipalResolver
+
+    if isinstance(
+        principal_resolver, EnvironmentPrincipalResolver | StaticPrincipalResolver
+    ):
+        raise ValueError(
+            f"Transport {transport!r} serves many callers, but "
+            f"{type(principal_resolver).__name__} resolves one identity for the "
+            "whole process — every caller would be served as that principal, "
+            "with that principal's tenant filters. Use a per-request resolver."
+        )
+
+
+def _run(service: ContextService, *, transport: str, **settings: Any) -> None:
     try:
-        # Resolve credentials and open the warehouse once before the stdio
-        # transport starts, so auth problems fail loudly at boot rather than
-        # as per-call "timeout" errors mid-session (issue #365).
+        # Resolve credentials and open the warehouse once before the transport
+        # starts, so auth problems fail loudly at boot rather than as per-call
+        # "timeout" errors mid-session (issue #365).
         service.warm_up()
-        create_mcp_server(service).run(transport="stdio")
+        app = create_mcp_server(service)
+        for name, value in settings.items():
+            setattr(app.settings, name, value)
+        app.run(transport=transport)
     finally:
         service.close()

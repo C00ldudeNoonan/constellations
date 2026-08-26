@@ -557,29 +557,96 @@ def test_a_source_filter_narrows_the_listing_prefix(tmp_path: Path) -> None:
     assert [ref.relative_path for ref in refs] == ["AMAT/0.html", "AMAT/1.html"]
 
 
-def test_filters_without_a_shared_static_segment_do_not_narrow(
+def test_several_filters_list_one_narrowed_prefix_each(tmp_path: Path) -> None:
+    """Two tickers share no static prefix, so before #378 the pushdown gave up
+    and listed everything. Each glob has a perfectly good segment of its own;
+    they are listed separately and unioned."""
+    blobs = [_FakeBlob(f"raw/docs/{sym}/0.html") for sym in ("AMAT", "AAPL", "NVDA")]
+    client = _FakeStorageClient(blobs)
+    src = _gcs_source(client)
+
+    refs = src.discover(_cfg(), tmp_path, source_filter=("AMAT/*", "AAPL/*"))
+
+    assert [call[1] for call in client.list_calls] == [
+        "raw/docs/AAPL/",
+        "raw/docs/AMAT/",
+    ]
+    # The union is exactly the asked-for documents, and NVDA was never listed.
+    assert sorted(ref.relative_path for ref in refs) == ["AAPL/0.html", "AMAT/0.html"]
+
+
+def test_a_glob_with_no_static_segment_still_lists_everything(
     tmp_path: Path,
 ) -> None:
-    """Two tickers share no static prefix, and a leading wildcard has none at
-    all. Narrowing on either would drop documents the run asked for."""
+    """Nothing narrower can cover a leading wildcard, and the full listing
+    covers every other glob passed alongside it."""
     blobs = [_FakeBlob(f"raw/docs/{sym}/0.html") for sym in ("AMAT", "AAPL")]
     client = _FakeStorageClient(blobs)
     src = _gcs_source(client)
 
-    src.discover(_cfg(), tmp_path, source_filter=("AMAT/*", "AAPL/*"))
-    assert client.list_calls[-1][1] == "raw/docs/"
-
     src.discover(_cfg(), tmp_path, source_filter=("*/2024*",))
-    assert client.list_calls[-1][1] == "raw/docs/"
+    assert [call[1] for call in client.list_calls] == ["raw/docs/"]
+
+    client.list_calls.clear()
+    src.discover(_cfg(), tmp_path, source_filter=("AMAT/*", "*/2024*"))
+    assert [call[1] for call in client.list_calls] == ["raw/docs/"]
+
+
+def test_nested_prefixes_collapse_so_listings_cannot_overlap(
+    tmp_path: Path,
+) -> None:
+    """`AMAT/` covers `AMAT/2024/`, so listing both would return the same
+    object twice. The shorter prefix wins and the listings stay disjoint."""
+    from stel.sources.gcs import _static_filter_prefixes
+
+    assert _static_filter_prefixes(("AMAT/*", "AMAT/2024/*")) == ("AMAT/",)
+    assert _static_filter_prefixes(("AMAT/2024/*", "AAPL/*")) == (
+        "AAPL/",
+        "AMAT/2024/",
+    )
+    # Sibling segments are not nested: `AMAT/` is not a string prefix of
+    # `AMATX/`, so both survive.
+    assert _static_filter_prefixes(("AMAT/*", "AMATX/*")) == ("AMAT/", "AMATX/")
 
 
 def test_a_partial_segment_glob_does_not_narrow_past_a_boundary() -> None:
     """`AMAT*` must not become the prefix `AMAT`: that would also list
     `AMATX/…`, which the glob does match — but `AMAT/2024*` may narrow to the
     whole segment `AMAT/`."""
-    from stel.sources.gcs import _static_filter_prefix
+    from stel.sources.gcs import _static_filter_prefixes
 
-    assert _static_filter_prefix(("AMAT*",)) == ""
-    assert _static_filter_prefix(("AMAT/2024*",)) == "AMAT/"
-    assert _static_filter_prefix(("AMAT/*",)) == "AMAT/"
-    assert _static_filter_prefix(()) == ""
+    assert _static_filter_prefixes(("AMAT*",)) == ("",)
+    assert _static_filter_prefixes(("AMAT/2024*",)) == ("AMAT/",)
+    assert _static_filter_prefixes(("AMAT/*",)) == ("AMAT/",)
+    assert _static_filter_prefixes(()) == ("",)
+
+
+def test_the_scan_ceiling_spans_the_union_not_each_prefix(tmp_path: Path) -> None:
+    """A filter set that fans out into many listings must still fail loudly.
+
+    One ceiling per prefix would let K filters scan K times the cap while every
+    individual listing looked fine — the cap exists to stop a run scanning an
+    unbounded corpus, and fanning out is exactly how that would happen
+    (issue #378).
+    """
+    # max_objects=2 gives a scan ceiling of 20. Three prefixes of 9 objects
+    # each stay under it individually and exceed it together. Exactly one
+    # object matches `*.html`, so the matched-document cap stays clear and the
+    # scan ceiling is what is under test.
+    blobs = [
+        _FakeBlob(
+            f"raw/docs/{sym}/{index}."
+            + ("html" if sym == "AMAT" and index == 0 else "json")
+        )
+        for sym in ("AMAT", "AAPL", "NVDA")
+        for index in range(9)
+    ]
+    client = _FakeStorageClient(blobs)
+    src = _gcs_source(client)
+
+    with pytest.raises(SourceError, match="scanned more than"):
+        src.discover(
+            _cfg(max_objects=2),
+            tmp_path,
+            source_filter=("AMAT/*", "AAPL/*", "NVDA/*"),
+        )

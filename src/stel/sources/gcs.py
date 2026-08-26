@@ -66,20 +66,30 @@ _SCAN_CEILING_MULTIPLIER = 10
 _GLOB_METACHARACTERS = ("*", "?", "[")
 
 
-def _static_filter_prefix(source_filter: Sequence[str]) -> str:
-    """The path prefix every `--source-filter` glob shares before its wildcard.
+def _static_filter_prefixes(source_filter: Sequence[str]) -> tuple[str, ...]:
+    """The narrowest set of listing prefixes covering every `--source-filter`.
 
     `--source-filter 'AMAT/*'` against a 30k-object prefix listed all 30k and
     kept ~40. The globs address the source-relative path, so a leading segment
     with no wildcard in it can narrow the listing itself.
 
-    Only whole segments count: the result is truncated at the last `/`, so
-    `AMAT*` contributes nothing rather than excluding `AMATX/…`, and a glob
-    that starts with a wildcard disables the optimization entirely. Returning
-    `""` always means "list what you would have listed before".
+    Several filters yield several prefixes, listed separately and unioned
+    (issue #378). Collapsing to one shared prefix — or, worse, to `""` when
+    they disagree — gave back the whole win the moment a run passed more than
+    one filter, which is exactly what a batched backfill does.
+
+    Only whole segments count: each prefix is truncated at the last `/`, so
+    `AMAT*` contributes nothing rather than excluding `AMATX/…`. A glob with
+    no static segment forces `("",)` — list everything — because nothing
+    narrower can cover it.
+
+    Nested prefixes collapse to the shorter one, which also makes the returned
+    prefixes mutually disjoint: after the reduction no prefix is a string
+    prefix of another, so separate listings cannot return the same object
+    twice.
     """
     if not source_filter:
-        return ""
+        return ("",)
     statics: set[str] = set()
     for pattern in source_filter:
         cut = min(
@@ -87,8 +97,22 @@ def _static_filter_prefix(source_filter: Sequence[str]) -> str:
             default=len(pattern),
         )
         head = pattern[:cut]
-        statics.add(head[: head.rfind("/") + 1] if "/" in head else "")
-    return statics.pop() if len(statics) == 1 else ""
+        static = head[: head.rfind("/") + 1] if "/" in head else ""
+        if not static:
+            # This glob can only be served by the full listing, and the full
+            # listing covers every other glob too.
+            return ("",)
+        statics.add(static)
+    return tuple(
+        sorted(
+            candidate
+            for candidate in statics
+            if not any(
+                other != candidate and candidate.startswith(other)
+                for other in statics
+            )
+        )
+    )
 
 
 def _matches(relative: str, pattern: str, recursive: bool) -> bool:
@@ -171,57 +195,67 @@ class GCSDocumentSource(DocumentSource):
         # The filter can narrow what is *listed*, but never what `relative` is
         # measured against: document identity is the source-relative path, so
         # stripping a filter-derived prefix would change every document_id.
-        listing_prefix = list_prefix + _static_filter_prefix(source_filter)
-        log.info(
-            "Source '%s': listing gs://%s/%s",
-            source.name,
-            bucket_name,
-            listing_prefix,
+        listing_prefixes = tuple(
+            list_prefix + static for static in _static_filter_prefixes(source_filter)
         )
+        log.info(
+            "Source '%s': listing %d prefix(es) under gs://%s/%s",
+            source.name,
+            len(listing_prefixes),
+            bucket_name,
+            list_prefix,
+        )
+        # One ceiling across every prefix, not one each: the cap exists to stop
+        # a run scanning an unbounded corpus, and a filter set that fans out
+        # into many listings should still hit it (issue #378).
         scan_ceiling = source.max_objects * _SCAN_CEILING_MULTIPLIER
         matched: list[Any] = []
         scanned = 0
+        # Reads exactly as it did for a single prefix; only a fan-out shows a
+        # list, and the prefixes already carry `list_prefix`.
+        listing_label = ", ".join(listing_prefixes)
         try:
-            for blob in self._get_client(source.project).list_blobs(
-                bucket_name,
-                prefix=listing_prefix or None,
-                max_results=scan_ceiling + 1,
-            ):
-                scanned += 1
-                if scanned > scan_ceiling:
-                    raise SourceError(
-                        f"Source '{source.name}': scanned more than "
-                        f"{scan_ceiling} objects under "
-                        f"gs://{bucket_name}/{listing_prefix} without reaching "
-                        f"the end of the listing. The prefix is too broad — "
-                        "narrow it, or raise `max_objects` on the source."
-                    )
-                if blob.name.endswith("/"):  # directory placeholder objects
-                    continue
-                if list_prefix and not blob.name.startswith(list_prefix):
-                    continue
-                relative = blob.name.removeprefix(list_prefix)
-                if not relative or not _matches(
-                    relative, source.file_pattern, source.recursive
+            for listing_prefix in listing_prefixes:
+                for blob in self._get_client(source.project).list_blobs(
+                    bucket_name,
+                    prefix=listing_prefix or None,
+                    max_results=scan_ceiling + 1,
                 ):
-                    continue
-                matched.append(blob)
-                # The cap is about the documents this source reads. Counting
-                # the raw listing instead let unrelated objects under the same
-                # prefix — a sibling pipeline's sidecars — fail a run over
-                # files the pattern would have discarded (issue #348).
-                if len(matched) > source.max_objects:
-                    raise SourceError(
-                        f"Source '{source.name}': more than {source.max_objects} "
-                        f"documents match under gs://{bucket_name}/"
-                        f"{listing_prefix}. Narrow the prefix or raise "
-                        "`max_objects` on the source."
-                    )
+                    scanned += 1
+                    if scanned > scan_ceiling:
+                        raise SourceError(
+                            f"Source '{source.name}': scanned more than "
+                            f"{scan_ceiling} objects under "
+                            f"gs://{bucket_name}/{listing_label} without reaching "
+                            f"the end of the listing. The prefix is too broad — "
+                            "narrow it, or raise `max_objects` on the source."
+                        )
+                    if blob.name.endswith("/"):  # directory placeholder objects
+                        continue
+                    if list_prefix and not blob.name.startswith(list_prefix):
+                        continue
+                    relative = blob.name.removeprefix(list_prefix)
+                    if not relative or not _matches(
+                        relative, source.file_pattern, source.recursive
+                    ):
+                        continue
+                    matched.append(blob)
+                    # The cap is about the documents this source reads. Counting
+                    # the raw listing instead let unrelated objects under the same
+                    # prefix — a sibling pipeline's sidecars — fail a run over
+                    # files the pattern would have discarded (issue #348).
+                    if len(matched) > source.max_objects:
+                        raise SourceError(
+                            f"Source '{source.name}': more than {source.max_objects} "
+                            f"documents match under gs://{bucket_name}/"
+                            f"{listing_label}. Narrow the prefix or raise "
+                            "`max_objects` on the source."
+                        )
         except (SourceError, ConfigError):
             raise
         except Exception as e:
             raise self._api_error(
-                f"listing gs://{bucket_name}/{listing_prefix}", e
+                f"listing gs://{bucket_name}/{listing_label}", e
             ) from e
         log.info(
             "Source '%s': scanned %d object(s), %d matched under gs://%s/%s",
@@ -229,7 +263,7 @@ class GCSDocumentSource(DocumentSource):
             scanned,
             len(matched),
             bucket_name,
-            listing_prefix,
+            listing_label,
         )
 
         refs: list[DocumentRef] = []

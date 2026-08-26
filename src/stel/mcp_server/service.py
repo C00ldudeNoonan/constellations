@@ -59,6 +59,12 @@ from .contracts import (
     SearchContextResult,
     ToolError,
 )
+from .grants import (
+    DEFAULT_GRANT_TTL_SECONDS,
+    GrantAuthorizationProvider,
+    GrantConfigurationError,
+    WarehouseGrantStore,
+)
 from .repository import (
     ContextRepository,
     ContextRepositoryError,
@@ -249,15 +255,40 @@ class ContextService:
         profiles_dir: Path | None = None,
         principal_resolver: PrincipalResolver | None = None,
         authorization: AuthorizationProvider | None = None,
+        grants_relation: str | None = None,
+        grant_ttl_seconds: float = DEFAULT_GRANT_TTL_SECONDS,
         settings: ContextServerSettings | None = None,
     ) -> ContextService:
+        """Build a service against a project directory.
+
+        `grants_relation` names an operator-owned warehouse relation of
+        (subject_id, attribute, value) rows. Supplying it swaps the default
+        claim-derived authorization for grants looked up by subject, so a
+        forged access-group or tenant header buys the caller nothing
+        (issue #392).
+        """
+        if grants_relation is not None and authorization is not None:
+            raise ValueError(
+                "Pass either 'authorization' or 'grants_relation', not both: "
+                "a grants relation builds an authorization provider, so "
+                "supplying both leaves it ambiguous which policy is in force."
+            )
+        repository = WarehouseContextRepository(
+            project_dir,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+        if grants_relation is not None:
+            authorization = GrantAuthorizationProvider(
+                WarehouseGrantStore(
+                    repository,
+                    relation=grants_relation,
+                    ttl_seconds=grant_ttl_seconds,
+                )
+            )
         return cls(
             catalog=ArtifactCatalog.load(project_dir, expected_target=target),
-            repository=WarehouseContextRepository(
-                project_dir,
-                target=target,
-                profiles_dir=profiles_dir,
-            ),
+            repository=repository,
             context_search=PortableContextSearch(
                 project_dir,
                 target=target,
@@ -395,6 +426,10 @@ class ContextService:
                 access=resource.access,
                 attributes=resource.policy_attributes,
             )
+        except GrantConfigurationError as exc:
+            # Not a denial: the relation is broken, and reporting it as
+            # "denied" would leave the operator with no signal to act on.
+            raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
         except AuthorizationError:
             raise _not_found_or_denied() from None
         return _AuthorizedResource(principal, resource, policy_filters)
@@ -412,6 +447,8 @@ class ContextService:
                     access=resource.access,
                     attributes=resource.policy_attributes,
                 )
+            except GrantConfigurationError as exc:
+                raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
             except AuthorizationError:
                 continue
             available.append(resource)
@@ -502,6 +539,7 @@ class ContextService:
                 self._query_log_row(
                     request,
                     authorized.principal,
+                    policy_filters=authorized.policy_filters,
                     resource_name=resource.name,
                     results=results,
                     elapsed_ms=round((monotonic() - started) * 1000, 3),
@@ -514,6 +552,7 @@ class ContextService:
         request: SearchContextRequest,
         principal: Principal,
         *,
+        policy_filters: tuple[SearchFilter, ...],
         resource_name: str,
         results: tuple[SearchContextResult, ...],
         elapsed_ms: float,
@@ -527,11 +566,16 @@ class ContextService:
         The query fingerprint is always recorded and the text never is unless
         the target separately opted in: "which questions repeat, and which
         return nothing" is answerable without keeping what anyone typed.
+
+        The tenant comes from the compiled policy filters rather than the
+        principal's claim. Under grant-based authorization the claim is
+        caller-supplied and ignored for policy, so logging it would file a
+        served query under a tenant the caller merely asserted.
         """
         return {
             "logged_at": datetime.now(UTC).isoformat(),
             "principal_id": principal.subject_id,
-            "tenant_id": principal.tenant_id,
+            "tenant_id": _authorizing_tenant(policy_filters),
             "model_name": resource_name,
             "mode": request.mode,
             "query_fingerprint": query_fingerprint(request.query),
@@ -921,6 +965,20 @@ def _required_string(row: Mapping[str, Any], field: str) -> str:
             "A governed context relation contains an invalid contract row",
         )
     return value
+
+
+def _authorizing_tenant(policy_filters: tuple[SearchFilter, ...]) -> str | None:
+    """The tenant the query was actually filtered to, if exactly one.
+
+    Ground truth for the audit log: this is what was sent to the warehouse,
+    not what the caller claimed. `None` for a public model or a multi-tenant
+    grant, where no single value is the honest answer.
+    """
+    for policy_filter in policy_filters:
+        if policy_filter.field == "tenant_id":
+            value = policy_filter.value
+            return value if isinstance(value, str) else None
+    return None
 
 
 def _source(row: Mapping[str, Any]) -> DocumentSource:

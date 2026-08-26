@@ -111,15 +111,81 @@ proxy, a service mesh. Exposed directly, it is not authentication: any caller
 can claim any tenant by setting a header. Terminate auth in front of it, and
 confirm the proxy overwrites rather than appends.
 
+Note what the proxy is actually being trusted *for*. By default it
+authenticates the caller **and** supplies their policy — the tenant and groups
+in those headers decide what gets read. [Operator-owned
+grants](#operator-owned-grants) narrow that to authentication alone: with
+`--grants-relation` set, only `X-Stel-Principal-Id` is consulted and the rest
+are ignored, so a mistake in the proxy's header handling stops being a
+tenant-isolation failure. If you are exposing this over a network, use both.
+
 Two limits worth knowing before a shared deployment:
 
 - **Warehouse credentials are per process, not per caller.** A hosted server
   holds one set for everyone, so row-level governance is the only boundary
-  between tenants.
+  between tenants. Per-tenant credentials are tracked in issue #395.
 - **Rate limits are per process.** `--max-requests-per-minute` was sized for
   one local client; shared, it is a global cap one caller can exhaust.
 
 Token verification without a proxy in front is tracked in issue #392.
+
+## Operator-owned grants
+
+By default a principal's policy values *are* its claims: the tenant and access
+groups the caller arrives with decide what the caller may read. Over stdio that
+is correct, because the operator sets the environment and is the principal.
+Over any transport where the claims come from the caller, it means a forged
+`STEL_MCP_ACCESS_GROUPS` — or the header a proxy maps it from — is a policy
+change, and a correctly configured proxy is the only thing separating one
+tenant from another.
+
+`--grants-relation` moves that decision to a relation you own:
+
+```bash
+stel mcp serve --grants-relation ops.context_grants
+```
+
+The relation supplies three string columns:
+
+| Column | Meaning |
+| --- | --- |
+| `subject_id` | The authenticated subject the grant belongs to. |
+| `attribute` | A policy attribute name, such as `tenant_id` or `access_group`. |
+| `value` | One value the subject is permitted for that attribute. |
+
+One row per permitted value; several rows for the same attribute compile to an
+`IN` filter. With this set, `STEL_MCP_TENANT_ID`, `STEL_MCP_ACCESS_GROUPS`, and
+`STEL_MCP_POLICY_CLAIMS` are **not consulted** — only `STEL_MCP_PRINCIPAL_ID`
+is, as the subject to look up. That is the point: the caller proves who they
+are, and you decide what that subject may read.
+
+A subject with no grant for a required attribute is refused rather than given
+an unfiltered read, and rows returned by search are rechecked against the same
+grants, so a retrieval store that ignored a filter still cannot leak a row.
+
+A grants relation that is malformed — a null, blank, or missing column — fails
+as a configuration error rather than as a denial, so schema drift does not
+present as "this subject has no grants".
+
+Policy attributes declared as `array[string]`, including the `access_groups`
+shape in the agent-context contract, cannot be compiled into a search filter
+by any provider today and fail closed. Use scalar attributes such as
+`access_group` until issue #397 lands.
+
+Grants are cached per subject for `--grant-ttl-seconds` (default 60). That TTL
+is the ceiling on how long a revoked grant keeps working — restart the server
+if a revocation must take effect immediately.
+
+Two limits worth stating plainly. stel is still the enforcement point: grants
+make policy central and auditable, but they do not make the warehouse refuse a
+query stel should not have issued — per-tenant warehouse credentials are the
+layer that does that, and they compose with this. And the grants relation is
+as trustworthy as its write path; treat it as production access control, not
+as a model that anything downstream may edit.
+
+Queries are logged with the tenant the policy actually filtered to, not the
+tenant the caller claimed, so the audit trail stays meaningful when those
+differ.
 
 ## Generic client configuration
 

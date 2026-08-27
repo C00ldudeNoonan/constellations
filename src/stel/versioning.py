@@ -128,7 +128,7 @@ def compute_code_version(
             dict(effective_embedding)
             if effective_embedding is not None
             else {
-                **embed.model_dump(exclude={"batch_size", "max_retries"}),
+                **embed.model_dump(exclude={"batch_size", "max_retries", "flush_every"}),
                 "identity": EmbeddingIdentity.from_config(embed).to_dict(),
             }
             if embed
@@ -141,7 +141,7 @@ def compute_code_version(
         "llm": (
             dict(effective_llm)
             if effective_llm is not None
-            else llm.model_dump(exclude={"max_concurrent", "max_retries"})
+            else llm.model_dump(exclude={"max_concurrent", "max_retries", "flush_every"})
             if llm
             else None
         ),
@@ -276,7 +276,7 @@ def compute_model_code_version(
             resolved,
         )
         effective_embedding = {
-            **model.embed.model_dump(exclude={"batch_size", "max_retries"}),
+            **model.embed.model_dump(exclude={"batch_size", "max_retries", "flush_every"}),
             "identity": EmbeddingIdentity.from_config(
                 model.embed,
                 profile_options=embedding_options.provider_options,

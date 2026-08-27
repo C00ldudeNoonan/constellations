@@ -9,7 +9,7 @@ compatibility.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
@@ -32,6 +32,7 @@ from ..embedding import EmbeddingIdentity, embed_texts
 from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
 from ..versioning import compute_model_code_version
+from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
 from .errors import artifact_error_text
 from .usage import add_provider_usage
@@ -125,14 +126,27 @@ def run_embed_model(
         for record_id in removed
         if record_id in existing_rows
     ]
-    work: list[_EmbedWork] = []
+    flush_every = config.flush_every
     skipped = 0
     cache_hits = 0
-    for record_id, record in zip(
-        record_ids,
-        source.iter_rows(named=True),
-        strict=True,
-    ):
+    embedded_count = 0
+    processed = 0
+    usage_totals: dict[str, int | float] = {}
+    provider_batches = 0
+    provider_calls = 0
+    use_full = model.materialization == "full" or full_refresh or rebuild_target
+    now = datetime.now(UTC).isoformat()
+    output_schema = _embedding_output_schema(source, vector_field=config.vector_field)
+    publisher = FlushPublisher(
+        adapter,
+        model_name=model.name,
+        state_scope=state_scope,
+        use_full=use_full,
+    )
+
+    def _window(record_id: str, record: dict[str, Any]) -> _EmbedWork | None:
+        """Decide this record's fate without holding anything corpus-sized."""
+        nonlocal skipped, cache_hits
         text_value = record[config.text_field]
         text = "" if text_value is None else str(text_value)
         input_fingerprint = canonical_fingerprint(
@@ -145,7 +159,7 @@ def run_embed_model(
             code_version,
         ):
             skipped += 1
-            continue
+            return None
         text_hash = canonical_fingerprint(
             {"text": text},
             domain="embedding-input-text",
@@ -175,13 +189,39 @@ def run_embed_model(
                     str(embedded_at) if embedded_at is not None else None
                 )
                 cache_hits += 1
-        work.append(item)
+        return item
 
-    pending = [item for item in work if item.vector is None]
-    usage_totals: dict[str, int | float] = {}
-    provider_batches = 0
-    provider_calls = 0
-    try:
+    def _iter_windows() -> Iterator[list[_EmbedWork]]:
+        """Yield at most `flush_every` items at a time.
+
+        The whole point of the rewrite (issue #401): the previous shape built
+        one list of every row, embedded every vector into it, built a second
+        list of output rows, then a DataFrame over that -- three corpus-sized
+        structures alive at once, with 768 floats per row held as Python
+        objects. A 3.6M-chunk corpus could not finish inside 115GB of virtual
+        memory, and because nothing published until the end, 28 hours of paid
+        provider calls were lost with it.
+        """
+        window: list[_EmbedWork] = []
+        for record_id, record in zip(
+            record_ids,
+            source.iter_rows(named=True),
+            strict=True,
+        ):
+            item = _window(record_id, record)
+            if item is None:
+                continue
+            window.append(item)
+            if len(window) >= flush_every:
+                yield window
+                window = []
+        if window:
+            yield window
+
+    def _embed_window(window: list[_EmbedWork]) -> None:
+        nonlocal provider_batches, provider_calls, embedded_count
+        pending = [item for item in window if item.vector is None]
+        embedded_count += len(pending)
         for offset in range(0, len(pending), config.batch_size):
             batch = pending[offset : offset + config.batch_size]
             embedded = embed_texts(
@@ -198,65 +238,88 @@ def run_embed_model(
             add_provider_usage(usage_totals, embedded.usage.to_metrics())
             for item, vector in zip(batch, embedded.vectors, strict=True):
                 item.vector = vector
-    except Exception as e:
-        raise RunError(
-            f"Embed model '{model.name}' provider execution failed: "
-            f"{artifact_error_text(e)}"
-        ) from e
 
-    now = datetime.now(UTC).isoformat()
-    rows = [
-        _embedding_row(
-            item,
-            identity=identity,
-            vector_field=config.vector_field,
-            embedded_at=item.embedded_at or now,
-        )
-        for item in work
-    ]
-    state_records = [
-        StateRecord(item.record_id, item.input_fingerprint, code_version)
-        for item in work
-    ]
-    output = (
-        pl.DataFrame(rows)
-        if rows
-        else _empty_embedding_frame(
-            source,
-            vector_field=config.vector_field,
-        )
-    )
+    def _publish(window: list[_EmbedWork]) -> None:
+        """Publish one flush, then advance state for exactly its rows.
 
-    rows_written = 0
-    use_full = model.materialization == "full" or full_refresh or rebuild_target
-    try:
-        if use_full:
-            rows_written = adapter.materialize_full(
+        Ordering is `FlushPublisher`'s, not this module's: a full rebuild
+        clears state before its first write, state advances only after a write
+        lands, and a warehouse failure is reported without the warehouse's own
+        text. Those rules are identical for every flushing stage, and the one
+        time each stage implemented them separately they diverged.
+        """
+        frame = pl.DataFrame(
+            [
+                _embedding_row(
+                    item,
+                    identity=identity,
+                    vector_field=config.vector_field,
+                    embedded_at=item.embedded_at or now,
+                )
+                for item in window
+            ],
+            schema=output_schema,
+        )
+        publisher.publish(
+            write_full=lambda: adapter.materialize_full(
                 model.name,
-                output,
+                frame,
+                options=warehouse_opts,
+            ),
+            write_incremental=lambda: adapter.materialize_incremental(
+                model.name,
+                frame,
+                key_col=config.id_field,
+                on_schema_change=(
+                    model.on_schema_change
+                    if publisher.first_publication
+                    else "append_new_columns"
+                ),
+                options=warehouse_opts,
+                update_when_changed=model.update_when_changed,
+            ),
+            state_records=[
+                StateRecord(item.record_id, item.input_fingerprint, code_version)
+                for item in window
+            ],
+        )
+
+    for window in _iter_windows():
+        # Provider failures and publication failures are kept apart on
+        # purpose. `artifact_error_text` exists to sanitize *provider* text;
+        # routing a warehouse error through it hands the raw message to its
+        # fallback, and that message can quote the offending row and the
+        # statement that touched it (issue #401 review).
+        try:
+            _embed_window(window)
+        except Exception as e:
+            raise RunError(
+                f"Embed model '{model.name}' provider execution failed: "
+                f"{artifact_error_text(e)}"
+            ) from e
+        processed += len(window)
+        _publish(window)
+        # Drop the window's vectors before the next one is built. Without
+        # this the generator's reference keeps one extra flush alive.
+        window.clear()
+
+    try:
+        if not publisher.published_any and use_full:
+            # Nothing to write, but a rebuild still owes the target its table.
+            adapter.replace_state(state_scope, [])
+            publisher.rows_written += adapter.materialize_full(
+                model.name,
+                _empty_embedding_frame(source, vector_field=config.vector_field),
                 options=warehouse_opts,
             )
-            adapter.replace_state(state_scope, state_records)
-        else:
-            if rows:
-                rows_written = adapter.materialize_incremental(
-                    model.name,
-                    output,
-                    key_col=config.id_field,
-                    on_schema_change=model.on_schema_change,
-                    options=warehouse_opts,
-                    update_when_changed=model.update_when_changed,
-                )
-            if removed:
-                adapter.delete_rows_and_state(
-                    model.name,
-                    key_col=config.id_field,
-                    keys=removed_target_keys,
-                    state_scope=state_scope,
-                    state_record_keys=removed,
-                )
-            if state_records:
-                adapter.upsert_state(state_scope, state_records)
+        if removed and not use_full:
+            adapter.delete_rows_and_state(
+                model.name,
+                key_col=config.id_field,
+                keys=removed_target_keys,
+                state_scope=state_scope,
+                state_record_keys=removed,
+            )
     except AdapterError as e:
         raise RunError(str(e)) from e
 
@@ -264,8 +327,8 @@ def run_embed_model(
         "provider_calls": provider_calls,
         "batches": provider_batches,
         "cache_hits": cache_hits,
-        "cache_misses": len(pending),
-        "rows_embedded": len(pending),
+        "cache_misses": embedded_count,
+        "rows_embedded": embedded_count,
         "metadata_updates": cache_hits,
         **usage_totals,
     }
@@ -276,10 +339,10 @@ def run_embed_model(
         provider=identity.provider,
         provider_model=identity.model,
         provider_implementation=identity.implementation,
-        documents_processed=len(work),
+        documents_processed=processed,
         documents_skipped=skipped,
         documents_deleted=len(removed),
-        rows_written=rows_written,
+        rows_written=publisher.rows_written,
         metrics=metrics,
         artifact_metadata={"embedding": identity.to_dict()},
     )
@@ -372,11 +435,19 @@ def _embedding_row(
     return row
 
 
-def _empty_embedding_frame(
+def _embedding_output_schema(
     source: pl.DataFrame,
     *,
     vector_field: str,
-) -> pl.DataFrame:
+) -> dict[str, Any]:
+    """The output schema, fixed for the whole run.
+
+    Every flush frame is built with this rather than inferred from its own
+    rows (issue #401 review). A passthrough column that happens to be all-NULL
+    in the first flush would otherwise infer as Null, the target column would
+    be created from that, and a later flush carrying real values would fail on
+    conversion -- after its provider calls had been paid for.
+    """
     schema: dict[str, Any] = dict(source.schema)
     schema.update(
         {
@@ -390,4 +461,14 @@ def _empty_embedding_frame(
             "embedded_at": pl.String,
         }
     )
-    return pl.DataFrame(schema=schema)
+    return schema
+
+
+def _empty_embedding_frame(
+    source: pl.DataFrame,
+    *,
+    vector_field: str,
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        schema=_embedding_output_schema(source, vector_field=vector_field)
+    )

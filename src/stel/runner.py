@@ -715,6 +715,7 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            run_budget=run_budget,
         )
     elif model.llm is not None:
         result = _run_llm_model(

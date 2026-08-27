@@ -20,11 +20,14 @@ import polars as pl
 
 from ..adapters import (
     AdapterError,
+    ReadPredicate,
+    ReadPredicateOperator,
     StateRecord,
     StateScope,
     StateValue,
     WarehouseAdapter,
 )
+from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
 from ..config.model import EMBED_METADATA_FIELDS, ModelConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -60,6 +63,7 @@ def run_embed_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    run_budget: BudgetLedger | None = None,
 ) -> ModelRunResult:
     assert model.embed is not None
     config = model.embed
@@ -110,23 +114,37 @@ def run_embed_model(
         if is_incremental and not rebuild_target
         else {}
     )
-    existing_rows = (
-        _existing_embedding_rows(
-            adapter,
-            model.name,
-            id_field=config.id_field,
-        )
+    # The target is never loaded whole. The previous shape read every row --
+    # vectors included -- into Python dicts before any embedding began, which
+    # is ~25KB per 768-dim row: at 3.6M chunks that is ~90GB spent before the
+    # first provider call, and only on the *resume* path, where the run being
+    # resumed has already proven the corpus is large (issue #401 follow-up).
+    reuse_reader = (
+        _EmbeddingReuseReader(adapter, model.name, config=config)
         if is_incremental and not rebuild_target
-        else {}
+        else None
     )
+    # Embeds were the only provider-spending stage the run budget could not
+    # see: --max-cost and friends gated extraction and llm calls while a
+    # Vertex embed run spent freely. No cost estimator yet -- embedding
+    # pricing is not modeled -- so max_api_calls, max_input_tokens, and
+    # max_documents are the enforceable dimensions, and with per-flush
+    # publication a budget stop is graceful: published windows stay, state is
+    # advanced for exactly them, and the run reports budget_exceeded instead
+    # of pretending to fail.
+    budget_guard = BudgetGuard(None, run_budget) if run_budget is not None else None
 
     current_ids = set(record_ids)
     removed = sorted(set(processed_state) - current_ids)
-    removed_target_keys = [
-        existing_rows[record_id][config.id_field]
-        for record_id in removed
-        if record_id in existing_rows
-    ]
+    removed_target_keys: list[Any] = (
+        [
+            key
+            for record_id in removed
+            if (key := reuse_reader.target_key(record_id)) is not None
+        ]
+        if reuse_reader is not None
+        else []
+    )
     flush_every = config.flush_every
     skipped = 0
     cache_hits = 0
@@ -173,24 +191,40 @@ def run_embed_model(
             text_hash=text_hash,
             text=text,
         )
-        existing = existing_rows.get(record_id)
-        if (
-            existing is not None
-            and existing.get("embedding_input_hash") == text_hash
-            and existing.get("embedding_config_hash") == identity.config_hash
-        ):
-            vector = _coerce_embedding_vector(
-                existing.get(config.vector_field),
-                dimensions=config.dimensions,
-            )
-            if vector is not None:
-                item.vector = vector
-                embedded_at = existing.get("embedded_at")
-                item.embedded_at = (
-                    str(embedded_at) if embedded_at is not None else None
-                )
-                cache_hits += 1
         return item
+
+    def _apply_reuse(window: list[_EmbedWork]) -> None:
+        """Reclaim vectors the target already holds, one window at a time.
+
+        One keyed, projected read per window rather than one whole-target
+        load per run: residency is bounded by `flush_every` rows of reuse
+        columns, and a corpus that never changes text pays warehouse reads,
+        not provider calls.
+        """
+        nonlocal cache_hits
+        if reuse_reader is None:
+            return
+        window_reuse = reuse_reader.rows_for(
+            [item.record_id for item in window]
+        )
+        for item in window:
+            existing = window_reuse.get(item.record_id)
+            if (
+                existing is not None
+                and existing.get("embedding_input_hash") == item.text_hash
+                and existing.get("embedding_config_hash") == identity.config_hash
+            ):
+                vector = _coerce_embedding_vector(
+                    existing.get(config.vector_field),
+                    dimensions=config.dimensions,
+                )
+                if vector is not None:
+                    item.vector = vector
+                    embedded_at = existing.get("embedded_at")
+                    item.embedded_at = (
+                        str(embedded_at) if embedded_at is not None else None
+                    )
+                    cache_hits += 1
 
     def _iter_windows() -> Iterator[list[_EmbedWork]]:
         """Yield at most `flush_every` items at a time.
@@ -223,8 +257,12 @@ def run_embed_model(
         nonlocal provider_batches, provider_calls, embedded_count
         pending = [item for item in window if item.vector is None]
         embedded_count += len(pending)
+        if pending and budget_guard is not None:
+            budget_guard.charge_documents(len(pending))
         for offset in range(0, len(pending), config.batch_size):
             batch = pending[offset : offset + config.batch_size]
+            if budget_guard is not None:
+                budget_guard.ensure_headroom()
             embedded = embed_texts(
                 [item.text for item in batch],
                 identity,
@@ -237,6 +275,16 @@ def run_embed_model(
             provider_batches += 1
             provider_calls += embedded.provider_requests
             add_provider_usage(usage_totals, embedded.usage.to_metrics())
+            if budget_guard is not None:
+                # Embedding usage carries no api_calls key -- the request
+                # count is provider_requests -- so fold it in explicitly or
+                # max_api_calls silently never trips for embeds.
+                budget_guard.charge_metrics(
+                    {
+                        **embedded.usage.to_metrics(),
+                        "api_calls": embedded.provider_requests,
+                    }
+                )
             for item, vector in zip(batch, embedded.vectors, strict=True):
                 item.vector = vector
 
@@ -285,6 +333,8 @@ def run_embed_model(
             ],
         )
 
+    run_status: str | None = None
+    errors: list[str] = []
     # Counted in source rows and advanced per flushed window: the operator
     # cares how much of the corpus is through, not how many provider requests
     # it took. `record_ids` is the whole column, so the total is known even
@@ -297,8 +347,18 @@ def run_embed_model(
             # routing a warehouse error through it hands the raw message to its
             # fallback, and that message can quote the offending row and the
             # statement that touched it (issue #401 review).
+            _apply_reuse(window)
             try:
                 _embed_window(window)
+            except BudgetExceededError as e:
+                # Exhaustion fires before the next provider call. Windows
+                # already published stay with their state advanced; this
+                # window's partial vectors are discarded and re-embedded next
+                # run, exactly like a crash at the same point -- which is the
+                # entire design.
+                run_status = "budget_exceeded"
+                errors.append(f"BudgetExceededError: {e}")
+                break
             except Exception as e:
                 raise RunError(
                     f"Embed model '{model.name}' provider execution failed: "
@@ -316,12 +376,17 @@ def run_embed_model(
             # Drop the window's vectors before the next one is built. Without
             # this the generator's reference keeps one extra flush alive.
             window.clear()
-        # Rows skipped after the final window are consumed but never advanced
-        # above, so close the bar out on the total it was opened with.
-        task.advance(len(record_ids) - advanced)
+        if run_status is None:
+            # Rows skipped after the final window are consumed but never
+            # advanced above, so close the bar out on the total it was opened
+            # with. A budget stop leaves the bar where it stopped: filling it
+            # would report a corpus as done that the cap just cut short.
+            task.advance(len(record_ids) - advanced)
 
     try:
-        if not publisher.published_any and use_full:
+        if run_status is not None:
+            pass  # a budget stop mutates nothing further
+        elif not publisher.published_any and use_full:
             # Nothing to write, but a rebuild still owes the target its table.
             adapter.replace_state(state_scope, [])
             publisher.rows_written += adapter.materialize_full(
@@ -329,7 +394,7 @@ def run_embed_model(
                 _empty_embedding_frame(source, vector_field=config.vector_field),
                 options=warehouse_opts,
             )
-        if removed and not use_full:
+        if removed and not use_full and run_status is None:
             adapter.delete_rows_and_state(
                 model.name,
                 key_col=config.id_field,
@@ -353,6 +418,8 @@ def run_embed_model(
         model_name=model.name,
         materialization=model.materialization,
         kind="embed",
+        status=run_status,
+        errors=errors,
         provider=identity.provider,
         provider_model=identity.model,
         provider_implementation=identity.implementation,
@@ -393,20 +460,104 @@ def _embed_record_ids(
     return record_ids
 
 
-def _existing_embedding_rows(
-    adapter: WarehouseAdapter,
-    table: str,
-    *,
-    id_field: str,
-) -> dict[str, dict[str, Any]]:
-    existing = adapter.read_table(table)
-    if id_field not in existing.columns:
-        return {}
-    return {
-        str(row[id_field]): row
-        for row in existing.iter_rows(named=True)
-        if row[id_field] is not None
-    }
+class _EmbeddingReuseReader:
+    """Bounded reads of the existing embed target on resume (issue #401).
+
+    The resume path used to read the whole target into Python dicts, vectors
+    included, before any embedding began -- ~25KB per 768-dim row, ~90GB at
+    3.6M chunks -- and it is reachable only on resume, when the corpus has
+    already proven itself too large for exactly that. What the run actually
+    needs is far smaller:
+
+    - **The id column, once.** State keys are stringified ids, but the target
+      column may be typed (a numeric id is a tested contract), so deleting
+      removed rows and pushing keyed predicates both need the *typed* value.
+      One streamed, projected pass builds that map: no vectors, no metadata,
+      residency proportional to key count rather than row width.
+    - **Reuse columns, one window at a time.** A keyed IN predicate over the
+      window's typed ids, projected to the hash/vector columns, so residency
+      is bounded by `flush_every` whatever the corpus size.
+    """
+
+    def __init__(
+        self,
+        adapter: WarehouseAdapter,
+        table: str,
+        *,
+        config: Any,
+    ) -> None:
+        self._adapter = adapter
+        self._table = table
+        self._id_field = config.id_field
+        self._columns = (
+            config.id_field,
+            "embedding_input_hash",
+            "embedding_config_hash",
+            config.vector_field,
+            "embedded_at",
+        )
+        self._usable = False
+        self._target_keys: dict[str, Any] = {}
+        self._load_keys()
+
+    def _load_keys(self) -> None:
+        # Schema probe via a zero-row read, not a snapshot: the DuckDB
+        # snapshot's close() rolls back its transaction but does not close an
+        # unexhausted Arrow reader, and that reader pins the database file.
+        # Every other snapshot consumer iterates to exhaustion, which is why
+        # the leak stayed invisible until a probe that never iterates.
+        names = set(self._adapter.read_table(self._table, limit=0).columns)
+        if not set(self._columns).issubset(names):
+            # A pre-embed table (or an older contract) has nothing to reuse;
+            # the old whole-table loader answered {} here too.
+            return
+        with self._adapter.table_snapshot(
+            self._table,
+            columns=[self._id_field],
+            batch_size=100_000,
+        ) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for value in frame[self._id_field].to_list():
+                    if value is not None:
+                        self._target_keys[str(value)] = value
+        self._usable = True
+
+    def target_key(self, record_id: str) -> Any | None:
+        """The typed id column value for a stringified record id, if present."""
+        return self._target_keys.get(record_id)
+
+    def rows_for(self, record_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        if not self._usable:
+            return {}
+        typed = [
+            self._target_keys[record_id]
+            for record_id in record_ids
+            if record_id in self._target_keys
+        ]
+        if not typed:
+            return {}
+        predicate = ReadPredicate(
+            self._id_field,
+            ReadPredicateOperator.IN,
+            tuple(typed),
+        )
+        found: dict[str, dict[str, Any]] = {}
+        with self._adapter.table_snapshot(
+            self._table,
+            columns=list(self._columns),
+            predicate=predicate,
+            batch_size=len(typed),
+        ) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for row in frame.iter_rows(named=True):
+                    key = row.get(self._id_field)
+                    if key is not None:
+                        found[str(key)] = row
+        return found
 
 
 def _coerce_embedding_vector(

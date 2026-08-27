@@ -319,3 +319,130 @@ def test_a_warehouse_failure_is_not_reported_as_a_provider_failure(
 
     assert secret not in str(caught.value)
     assert "provider execution failed" not in str(caught.value)
+
+
+# ─── the resume path is bounded (issue #401 follow-up) ──────────────────────
+
+
+def test_resume_never_reads_the_whole_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix for the accumulate-everything run made a second wall reachable:
+    on resume, the old code read the entire existing target -- vectors
+    included -- into Python dicts before the first provider call. ~25KB per
+    768-dim row is ~90GB at 3.6M chunks, on a path only reachable once the
+    corpus has already proven itself that large.
+
+    Asserted where it is observable: a resume may read the target only
+    through zero-row schema probes and projected snapshot reads, never as a
+    full read_table materialization.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)  # first run publishes the target
+
+    full_reads: list[str] = []
+    original = DuckDBAdapter.read_table
+
+    def spy(self: Any, table: str, *, limit: int | None = None) -> Any:
+        if table == "document_embeddings" and limit != 0:
+            full_reads.append(table)
+        return original(self, table, limit=limit)
+
+    monkeypatch.setattr(DuckDBAdapter, "read_table", spy)
+    # Touch one chunk's text so the resume has real work to do.
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        connection.execute(
+            "UPDATE \"db\".docs.document_chunks SET text = 'revised' "
+            "WHERE chunk_id = (SELECT min(chunk_id) FROM \"db\".docs.document_chunks)"
+        )
+    finally:
+        connection.close()
+
+    run_project(project, select="document_embeddings")
+
+    assert full_reads == []
+
+
+def test_resume_still_reuses_vectors_for_metadata_only_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole-target load existed to serve vector reuse. The bounded
+    per-window lookup must keep serving it, or every metadata-only change
+    becomes a paid re-embedding -- correct output, silent cost."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+
+    # A run over an unchanged corpus: everything skips via state, no provider
+    # calls, no reuse needed. Then force fingerprints to move without moving
+    # text, which is exactly the reuse case: state misses, text hash matches.
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # Mutate an existing passthrough column so every fingerprint moves
+        # while every text hash stays put -- the exact reuse case.
+        connection.execute(
+            "UPDATE \"db\".docs.document_chunks SET title = title || ' (reclassified)'"
+        )
+    finally:
+        connection.close()
+
+    [result] = run_project(project, select="document_embeddings")
+
+    # Every row was re-fingerprinted, none re-embedded.
+    assert result.documents_processed == DOCUMENTS
+    assert calls["n"] == 0
+    assert result.metrics["cache_hits"] == DOCUMENTS
+
+
+# ─── the run budget can finally see embed spend ─────────────────────────────
+
+
+def test_a_budget_stop_is_graceful_and_resumable(tmp_path: Path) -> None:
+    """Embeds were the only provider-spending stage the run budget could not
+    gate: --max-cost stopped extraction and llm calls while a Vertex embed
+    run spent freely. And a cap is only worth having if hitting it behaves
+    like a crash at the same point -- published windows stay, state covers
+    exactly them, and raising the cap resumes for the remainder.
+    """
+    project = _project(tmp_path, flush_every=2)
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      llm:\n"
+        "        provider: deterministic\n"
+        "        model: deterministic-v1\n"
+        "        budget:\n"
+        "          max_api_calls: 4\n",
+        encoding="utf-8",
+    )
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+
+    [capped] = run_project(project, select="document_embeddings")
+
+    assert capped.status == "budget_exceeded"
+    assert any("BudgetExceededError" in error for error in capped.errors)
+    # Two windows of two landed before the cap; nothing after it mutated.
+    assert _embedded_count(project) == 4
+
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8").replace(
+            "max_api_calls: 4", "max_api_calls: 100"
+        ),
+        encoding="utf-8",
+    )
+    [resumed] = run_project(project, select="document_embeddings")
+
+    assert resumed.status is None
+    assert resumed.metrics["provider_calls"] == DOCUMENTS - 4
+    assert _embedded_count(project) == DOCUMENTS

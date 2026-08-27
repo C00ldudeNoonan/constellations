@@ -90,7 +90,28 @@ credential-gated and have deterministic unit coverage. Update `uv.lock` only
 when required by an intentional `pyproject.toml` metadata or dependency change,
 and exclude unrelated resolution churn.
 
-## Change and GitHub hygiene
+## Change, GitHub, and Linear hygiene
+
+Linear tracks **themes**; GitHub tracks **work**. One Linear issue (team prefix
+`ALE`, project `Constellations` for this repo, `Astrolabe` for the downstream
+data project) spans many GitHub issues and many PRs. Never mirror the two
+one-to-one — a Linear issue per GitHub issue makes both lists worthless.
+
+- **Every GitHub issue names its theme.** Put `Theme: ALE-nn — <title>` and the
+  Linear URL in the body. Find the theme by listing open Linear issues in the
+  project rather than from a list kept here, which would go stale; if none
+  fits, say so in the issue and ask instead of inventing one.
+- **Every PR names the theme too**, as a bare identifier (`ALE-nn`) in the
+  body. **Never use a Linear closing keyword** — `Fixes ALE-nn`, `Closes
+  ALE-nn`, `Resolves ALE-nn` — because a theme outlives any single PR, and
+  auto-completing it hides every remaining GitHub issue underneath.
+- **Post the back-link.** When a GitHub issue is filed under a theme, or a PR
+  merges under one, add a one-line comment on the Linear theme naming the
+  issue or PR and what it did. Branch names here are `feat/<issue>-<slug>` and
+  carry no `ALE-` identifier, so Linear's automatic branch linking does not
+  fire; the comment is the link that is actually guaranteed to exist.
+- Keep the traffic proportionate: a theme wants a line per GitHub issue and per
+  merged PR, not a running log of every commit.
 
 - Inspect the worktree first. Preserve unrelated user changes, use an isolated
   worktree when branches conflict, and stage explicit files only.

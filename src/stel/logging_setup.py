@@ -24,16 +24,26 @@ import logging
 import sys
 
 from .env import VERBOSE_ENV, read_env
-from .progress import ProgressReporter
+from .progress import ProgressReporter, reporter_is_active
 
-# Marks a record whose event the progress reporter also renders as a callback
-# (source discovery, model completion, BigQuery publication telemetry). Both
-# channels are live on a TTY since issue #403, so without this the operator
-# would see every such event twice — once from the emitting log call, once from
-# the reporter. The record still reaches a plain stderr handler, which is the
-# only channel on a captured run.
+# Marks a record whose event the progress reporter also renders itself (source
+# discovery, model completion, BigQuery publication telemetry). Since #403 both
+# channels can be live at once, and since #404 the reporter is installed even
+# without `-v`, so without this the operator would see such events twice — once
+# from the emitting log call, once from the reporter. Dropped only while a
+# reporter is actually rendering: on a `--json` run the log record is the event's
+# only copy and must survive.
 REPORTER_ECHO = "stel_reporter_echo"
 REPORTER_ECHO_EXTRA = {REPORTER_ECHO: True}
+
+
+def _drop_reporter_echoes(record: logging.LogRecord) -> bool:
+    """``logging.Filter`` callable: False drops the record.
+
+    Asked per record rather than decided at install time — the reporter can be
+    swapped (nested commands, tests) after the handler is attached.
+    """
+    return not (getattr(record, REPORTER_ECHO, False) and reporter_is_active())
 
 _HANDLER_ATTR = "_stel_verbose_handler"
 # Must stay equal to the top-level package name: a handler attached to a
@@ -66,8 +76,9 @@ class _ReporterHandler(logging.Handler):
     The reporter owns the terminal while a ``click.progressbar`` is live, so it
     is the only thing that can decide whether a line prints now or waits for the
     bar to finish. Records whose event the reporter already renders as a
-    callback are dropped here rather than at the call site: the emitting module
-    should not have to know which channel is installed.
+    callback are dropped by ``_drop_reporter_echoes`` rather than at the call
+    site: the emitting module should not have to know which channel is
+    installed.
     """
 
     def __init__(self, reporter: ProgressReporter) -> None:
@@ -75,8 +86,6 @@ class _ReporterHandler(logging.Handler):
         self._reporter = reporter
 
     def emit(self, record: logging.LogRecord) -> None:
-        if getattr(record, REPORTER_ECHO, False):
-            return
         # stdlib handler contract: a logging failure must never propagate into
         # the code being logged. handleError honors logging.raiseExceptions.
         try:
@@ -117,6 +126,7 @@ def configure_verbose_logging(
         else _ReporterHandler(reporter)
     )
     handler.setLevel(logging.INFO)
+    handler.addFilter(_drop_reporter_echoes)
     handler.setFormatter(
         logging.Formatter(
             fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",

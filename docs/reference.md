@@ -522,29 +522,50 @@ manifest written by a previous `compile` or `run`. The CI recipe: store
 
 ## Progress output
 
-`stel run` and `stel build` are silent by default beyond their final
-summary table. Pass `-v` for per-source discovery lines, per-model
-start/finish lines, and a live per-model progress bar on a TTY; on
-non-TTY stderr (e.g. a Dagster capture) the bar is dropped and the INFO
-log lines are the whole channel, since a carriage-return bar redrawn every
-flush is noise in a captured stream.
+`stel run` and `stel build` narrate as they go. By default they stream a
+**ledger** to stderr — a header, one line per model as it completes, and a
+footer — before the summary table lands on stdout:
 
-On a TTY both run together: log records are routed through the progress
-reporter, which holds them while a bar is live and prints them once it
-finishes, so the bar is never written over. Events the reporter renders
-itself — source discovery, model completion, BigQuery publication telemetry —
-are emitted once, not once per channel. `run --threads N` runs independent
-models concurrently, so it falls back to the plain log-line channel even on a
-TTY (parallel bars on one terminal would interleave).
+```
+Running 3 models (target: dev, duckdb)
+[1/3] raw_invoices            extraction         40 rows     1.0s  OK
+[2/3] invoice_summary         transform          38 rows     0.0s  OK
+[3/3] monthly_totals          transform          13 rows     0.0s  OK
+Completed in 1.1s: 3 ok
+```
 
-A bar that stays live for a long time caps how many lines it holds; if any are
-dropped, the count is printed before the rest rather than silently swallowed.
+The counter tracks completions, not launch order, so `--threads N` finishing
+out of order still counts up. `stel build` also prints a `SKIPPED (upstream
+failed)` line for each model it blocks. The ledger is not TTY-gated: a CI log
+wants it as much as a terminal does.
+
+Pass `-v` for detail on top of that — per-source discovery lines, the phases
+(profile resolution, warehouse connect, the incremental to-process/unchanged
+split, publication telemetry, test execution), and a live per-model progress
+bar on a TTY. Bars cover the model kinds with a countable unit of work:
+extraction, `llm:`, `embed:` and `chunk:`. `search:` reports indexed batches as
+lines instead, because its read is a one-shot bounded stream with no row count
+to render a bar against.
+
+On a TTY the log channel and the bar run together: records are routed through
+the progress reporter, which holds them while a bar is live and prints them
+once it finishes, so the bar is never written over. Events the reporter renders
+itself — source discovery, model completion, publication telemetry — are
+emitted once, not once per channel. A bar that stays live for a long time caps
+how many lines it holds; if any are dropped, the count is printed before the
+rest rather than silently swallowed. `run --threads N` runs independent models
+concurrently, so it falls back to the plain log-line channel even on a TTY
+(parallel bars on one terminal would interleave).
+
+`--json` is the machine path and goes quiet: the payload on stdout is the whole
+output, with no ledger on stderr. Add `-v` alongside it to get the log channel
+back while keeping stdout a single parseable payload.
 
 With `--source-filter`, the reported per-source count is the post-filter
 selected count, so it always reflects what is actually processed. For runs
 launched by an orchestrator, `STEL_VERBOSE=1` enables verbose output without
-changing the CLI invocation. All progress output goes to stderr, so `--json`
-on stdout stays a single parseable payload.
+changing the CLI invocation. `-v` is also available on `stel eval` and
+`stel concept-cloud`.
 
 The verbose flag is deliberately capped at INFO. DEBUG-level log sites
 (transform failures, provider errors) carry unsanitized exception text
@@ -552,9 +573,10 @@ and traceback frames that the user-facing error path scrubs but a raw
 log stream would not — attach your own DEBUG handler if you need it for
 troubleshooting.
 
-Under verbose, each BigQuery incremental publication also emits safe
-telemetry (issue #292) — the progress reporter renders it on a TTY, the INFO
-log carries it on a captured/orchestrator run: the output relation, the
+Under verbose, each incremental publication also emits safe telemetry
+(issue #292) — the progress reporter renders it on a TTY, the INFO log carries
+it on a captured/orchestrator run. DuckDB reports the relation, row count and
+key; BigQuery adds the job-level statistics below: the output relation, the
 BigQuery **job id**, bytes processed, and DML-affected row count. The job id
 lets you match stel's own jobs against BigQuery job history /
 `INFORMATION_SCHEMA.JOBS`, so many tiny stel flushes can be told apart from an

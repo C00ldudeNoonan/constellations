@@ -1,17 +1,30 @@
-"""Long-running-command progress feedback (issue #268).
+"""Long-running-command progress feedback (issues #268, #403, #404).
 
-Verbose mode (``-v``, ``STEL_VERBOSE=1``) attaches a live per-model progress
-bar to stderr for the extraction loop and prints one line per source-discovery
-completion. Non-TTY callers (Dagster captures, redirected stderr) get the plain
-``log.info`` lines emitted by discovery/extraction/runner instead, since a
-carriage-return bar redrawn every flush is noise in a captured stream.
+Every non-JSON invocation gets a reporter, at one of three levels:
+
+``QUIET``
+    ``--json``. Nothing on stderr; the payload on stdout is the whole output.
+
+``NORMAL``
+    The default. A running ledger — a header naming the run, one line per model
+    as it completes, and a footer — so a build that takes forty minutes says
+    what it is doing without the operator having had to predict that in advance
+    (issue #404). No progress bars, TTY or not.
+
+``VERBOSE``
+    ``-v`` / ``STEL_VERBOSE=1``. The ledger, plus per-source discovery lines,
+    per-model progress bars on a TTY, and the forwarded ``stel`` INFO log.
+
+Bars are TTY-only: a carriage-return bar redrawn every flush is noise in a
+captured stream. The ledger is not — a CI log wants it as much as a terminal
+does, and it goes to stderr so ``--json`` on stdout stays parseable.
 
 On a TTY the log channel runs *alongside* the bar rather than in place of it
 (issue #403): records reach :meth:`ProgressReporter.detail`, which buffers them
 while a bar is live and flushes them once it finishes. Before that, a terminal
-run saw only the four events this module renders itself, so provider batch
-polls and source-scan lines were visible only when stderr was redirected —
-watching a run live showed strictly less than piping it to a file.
+run saw only the events this module renders itself, so provider batch polls and
+source-scan lines were visible only when stderr was redirected — watching a run
+live showed strictly less than piping it to a file.
 
 The active reporter is module-global to mirror the existing ``logging`` pattern:
 extraction and the runner query :func:`get_reporter` instead of threading a
@@ -20,6 +33,7 @@ reporter argument through every executor.
 
 from __future__ import annotations
 
+import enum
 import sys
 import threading
 import time
@@ -28,6 +42,15 @@ from types import TracebackType
 from typing import Any, Protocol, Self, TextIO
 
 import click
+
+
+class OutputLevel(enum.IntEnum):
+    """How much the CLI says while a command runs. Ordered, so callers can ask
+    ``level >= OutputLevel.VERBOSE`` rather than enumerating members."""
+
+    QUIET = 0
+    NORMAL = 1
+    VERBOSE = 2
 
 
 class ProgressTask(Protocol):
@@ -42,11 +65,23 @@ class ProgressTask(Protocol):
 
 
 class ProgressReporter(Protocol):
+    def run_started(
+        self, total: int, *, target: str, warehouse: str, project_total: int
+    ) -> None: ...
     def source_discovered(self, source_name: str, count: int) -> None: ...
     def model_task(self, model_name: str, kind: str, total: int) -> ProgressTask: ...
     def model_finished(
-        self, model_name: str, rows: int, duration: float, status: str | None
+        self,
+        model_name: str,
+        kind: str,
+        rows: int,
+        duration: float,
+        status: str | None,
+        *,
+        failed: bool,
     ) -> None: ...
+    def model_skipped(self, model_name: str, reason: str) -> None: ...
+    def run_finished(self, *, ok: int, errored: int, skipped: int) -> None: ...
     def publication(self, message: str) -> None: ...
     def detail(self, message: str) -> None: ...
 
@@ -68,6 +103,11 @@ class _NullTask:
 
 
 class _NullReporter:
+    def run_started(
+        self, total: int, *, target: str, warehouse: str, project_total: int
+    ) -> None:
+        return
+
     def source_discovered(self, source_name: str, count: int) -> None:
         return
 
@@ -75,8 +115,21 @@ class _NullReporter:
         return _NullTask()
 
     def model_finished(
-        self, model_name: str, rows: int, duration: float, status: str | None
+        self,
+        model_name: str,
+        kind: str,
+        rows: int,
+        duration: float,
+        status: str | None,
+        *,
+        failed: bool,
     ) -> None:
+        return
+
+    def model_skipped(self, model_name: str, reason: str) -> None:
+        return
+
+    def run_finished(self, *, ok: int, errored: int, skipped: int) -> None:
         return
 
     def publication(self, message: str) -> None:
@@ -146,12 +199,21 @@ _MAX_DEFERRED_LINES = 500
 
 
 class _TerminalReporter:
-    """Terminal-friendly reporter. Per-model progress bars go on stderr; source
-    discovery, model-finished status, publication telemetry and forwarded log
-    records get one-line summaries around the bar."""
+    """Renders the run ledger on stderr, plus — at ``VERBOSE`` — source
+    discovery lines, per-model progress bars, publication telemetry and
+    forwarded log records around it."""
 
-    def __init__(self, stream: TextIO) -> None:
+    def __init__(
+        self, stream: TextIO, *, level: OutputLevel, bars: bool
+    ) -> None:
         self._stream = stream
+        self._level = level
+        # Bars need a TTY; the ledger does not. Kept as a flag rather than
+        # re-checked per task so one run cannot change its mind halfway.
+        self._bars = bars
+        self._total = 0
+        self._completed = 0
+        self._started_at: float | None = None
         # A live per-model bar defers detail lines; >0 while one is active. Only
         # one bar is ever active on this channel — verbose over multiple
         # concurrent models (run --threads N) uses the log channel, not the
@@ -199,34 +261,101 @@ class _TerminalReporter:
         for message in pending:
             self._echo(message)
 
+    def run_started(
+        self, total: int, *, target: str, warehouse: str, project_total: int
+    ) -> None:
+        self._total = total
+        self._completed = 0
+        self._started_at = now_monotonic()
+        noun = "model" if total == 1 else "models"
+        # "3 of 12" only when a selector actually narrowed the run; otherwise
+        # the second number says nothing and reads as though something was
+        # dropped.
+        scope = f"{total} of {project_total}" if total != project_total else f"{total}"
+        # ASCII only: this lands on a Windows console whose code page is not
+        # guaranteed to carry U+00B7, and a mojibake header is worse than a
+        # plain one.
+        self._echo(f"Running {scope} {noun} (target: {target}, {warehouse})")
+
     def source_discovered(self, source_name: str, count: int) -> None:
-        self._echo(f"[source] {source_name}: discovered {count:,} object(s)")
+        # Discovery detail belongs to -v: at NORMAL the per-model ledger line
+        # already reports what was processed, and a project with many sources
+        # would otherwise push the ledger off the screen before it starts.
+        if self._level < OutputLevel.VERBOSE:
+            return
+        # "selected", not "discovered": the runner passes the post-filter count
+        # (issue #348), and the two differ under --source-filter. Matching the
+        # log line's wording also keeps the captured and terminal channels
+        # saying the same thing about the same number.
+        self._echo(f"[source] {source_name}: {count:,} document(s) selected")
 
     def model_task(self, model_name: str, kind: str, total: int) -> ProgressTask:
+        if not self._bars:
+            return _NullTask()
         label = f"[{kind}] {model_name}"
         if total == 0:
             self._echo(f"{label}: 0 documents (nothing to process)")
         return _TerminalTask(label, total, self._stream, reporter=self)
 
     def model_finished(
-        self, model_name: str, rows: int, duration: float, status: str | None
+        self,
+        model_name: str,
+        kind: str,
+        rows: int,
+        duration: float,
+        status: str | None,
+        *,
+        failed: bool,
     ) -> None:
-        status_suffix = f" [{status}]" if status else ""
+        self._completed += 1
+        outcome = status.upper() if status else ("ERROR" if failed else "OK")
         self._echo(
-            f"[done]   {model_name}: {rows:,} row(s) in "
-            f"{_format_duration(duration)}{status_suffix}"
+            f"{self._counter()} {model_name:<24}{kind:<12}"
+            f"{rows:>9,} rows{_format_duration(duration):>9}  {outcome}"
         )
 
+    def model_skipped(self, model_name: str, reason: str) -> None:
+        self._completed += 1
+        self._echo(
+            f"{self._counter()} {model_name:<24}{'-':<12}"
+            f"{'-':>9}     {'-':>8}  SKIPPED ({reason})"
+        )
+
+    def run_finished(self, *, ok: int, errored: int, skipped: int) -> None:
+        parts = [f"{ok} ok"]
+        if errored:
+            parts.append(f"{errored} error" + ("s" if errored != 1 else ""))
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        elapsed = (
+            ""
+            if self._started_at is None
+            else f" in {_format_duration(now_monotonic() - self._started_at)}"
+        )
+        self._echo(f"Completed{elapsed}: {', '.join(parts)}")
+
+    def _counter(self) -> str:
+        """``[3/7]`` — completions, not launch order, so `--threads N` finishing
+        out of order still counts up rather than jumping around."""
+        width = len(str(self._total))
+        return f"[{self._completed:>{width}}/{self._total}]"
+
     def publication(self, message: str) -> None:
-        # Publication telemetry (issue #292) fires per flush, inside the model's
-        # live progress bar, so it takes the deferral path.
+        # Per-flush telemetry (issue #292) is `-v` detail: at NORMAL it would
+        # put one line per flush between consecutive ledger lines, which is
+        # exactly the wall of text the ledger exists to replace.
+        if self._level < OutputLevel.VERBOSE:
+            return
+        # Fires inside the model's live progress bar, so it takes the deferral
+        # path rather than writing over the redraw.
         self._defer_or_echo(f"[publish] {message}")
 
     def detail(self, message: str) -> None:
         """Render one already-formatted line from the forwarded log channel.
 
         No prefix: the record arrives pre-formatted by the logging handler,
-        which supplies its own timestamp/level/logger shape."""
+        which supplies its own timestamp/level/logger shape. Reached only at
+        VERBOSE, since that is the only level with a log handler installed."""
         self._defer_or_echo(message)
 
 
@@ -252,24 +381,41 @@ def set_reporter(reporter: ProgressReporter | None) -> None:
     _reporter = reporter if reporter is not None else _NullReporter()
 
 
-def configure_progress(verbosity: int, *, stream: TextIO | None = None) -> bool:
-    """Install a terminal reporter when verbose is requested and stderr is a
-    TTY. Non-TTY callers keep the null reporter so the plain ``log.info`` lines
-    stay the sole channel — a captured log stream doesn't want a carriage-return
-    progress bar re-written every flush.
+def reporter_is_active() -> bool:
+    """True when something is rendering run events to the operator.
 
-    Returns True when a terminal reporter was installed. Callers use this to
-    avoid enabling the INFO log handler at the same time; a redrawing
-    ``click.progressbar`` and a plain ``log.info`` line share stderr, so
-    running both would corrupt the bar and double-print discovery / model
-    boundary events (once from the log call, once from the reporter callback).
+    The log channel asks this to decide whether an event that the reporter also
+    renders should print from a log record too — see ``REPORTER_ECHO`` in
+    ``logging_setup``.
+    """
+    return not isinstance(_reporter, _NullReporter)
+
+
+def configure_progress(
+    level: OutputLevel,
+    *,
+    bars_safe: bool = True,
+    stream: TextIO | None = None,
+) -> bool:
+    """Install the reporter for ``level`` and report whether bars are live.
+
+    Bars need ``VERBOSE``, a TTY, and ``bars_safe`` — concurrent models
+    (``run --threads N``) each open their own ``click.progressbar`` on the one
+    stderr and their redraws interleave, so that case takes the ledger and the
+    plain log channel instead. The ledger itself is installed at ``NORMAL`` and
+    above regardless of TTY: a CI log wants it too.
+
+    Returns True when bars are live, which tells the caller to route the INFO
+    log handler through the reporter so records defer past a bar instead of
+    writing over it (issue #403).
     """
     target = stream if stream is not None else sys.stderr
-    if verbosity <= 0 or not _is_tty(target):
+    if level <= OutputLevel.QUIET:
         set_reporter(None)
         return False
-    set_reporter(_TerminalReporter(target))
-    return True
+    bars = bars_safe and level >= OutputLevel.VERBOSE and _is_tty(target)
+    set_reporter(_TerminalReporter(target, level=level, bars=bars))
+    return bars
 
 
 def _is_tty(stream: TextIO) -> bool:

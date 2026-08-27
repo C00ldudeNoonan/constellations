@@ -455,6 +455,12 @@ def run_extraction_model(
 
     skipped = len(docs) - len(docs_to_process)
     total_docs = len(docs_to_process)
+    log.info(
+        "%s: %d document(s) to process, %d unchanged since last run",
+        model.name,
+        total_docs,
+        skipped,
+    )
     flush_every = model.extraction.flush_every
     use_full = model.materialization == "full" or full_refresh
 

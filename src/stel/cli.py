@@ -51,7 +51,7 @@ from .profile import (
     resolve_llm_options,
     resolve_profile,
 )
-from .progress import configure_progress, get_reporter
+from .progress import OutputLevel, configure_progress, get_reporter
 from .prompts import (
     PromptLockError,
     check_lock,
@@ -137,30 +137,34 @@ def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
     )(command)
 
 
-def _enable_verbose_output(verbose_count: int, *, bars_safe: bool = True) -> None:
-    """Install the verbose channels — on a TTY, the progress bar/reporter *and*
-    the INFO log handler routed through it; otherwise the log handler writing to
-    stderr directly.
+def _configure_output(
+    verbose_count: int, *, bars_safe: bool = True, json_output: bool = False
+) -> None:
+    """Pick the output level for this invocation and install its channels.
 
-    The two used to be mutually exclusive to keep plain ``log.info`` writes from
-    smearing the ``click.progressbar`` redraws, which meant a terminal saw only
-    the four events the reporter renders itself — provider batch polls and
-    source-scan lines were visible only when stderr was redirected (issue #403).
-    Routing records through the reporter keeps the bar intact (they are deferred
-    while one is live) without losing the text. Events the reporter also emits
-    as a callback carry ``REPORTER_ECHO_EXTRA`` so they print once, not twice.
+    ``--json`` is the machine path, so it goes quiet: the payload on stdout is
+    the whole output, and a caller who wants narration alongside it can add
+    ``-v`` for the log channel on stderr. Otherwise the default is the running
+    ledger (issue #404) and ``-v`` layers detail on top of it — discovery lines,
+    progress bars on a TTY, and the forwarded INFO log.
 
-    ``bars_safe=False`` forces the plain log channel even on a TTY: when models
-    run concurrently (``run --threads N`` over multiple models) each opens its
-    own ``click.progressbar`` on the one stderr and their redraws interleave.
-    INFO log records are emitted atomically under the logging lock, so lines
-    from parallel models stay individually intact."""
+    On a TTY with bars live the log handler is routed through the reporter so
+    records defer past a bar instead of writing over it (issue #403).
+    ``bars_safe=False`` (``run --threads N`` over multiple models) drops the
+    bars: each model would open its own ``click.progressbar`` on the one stderr
+    and their redraws would interleave. INFO records are emitted atomically
+    under the logging lock, so parallel models stay individually intact."""
     verbosity = resolve_verbosity(verbose_count)
-    if bars_safe and configure_progress(verbosity):
-        configure_verbose_logging(verbosity, reporter=get_reporter())
+    if json_output:
+        level = OutputLevel.QUIET
+    elif verbosity > 0:
+        level = OutputLevel.VERBOSE
     else:
-        configure_progress(0)
-        configure_verbose_logging(verbosity)
+        level = OutputLevel.NORMAL
+    bars = configure_progress(level, bars_safe=bars_safe)
+    configure_verbose_logging(
+        verbosity, reporter=get_reporter() if bars else None
+    )
 
 
 def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
@@ -916,7 +920,7 @@ def run(
     target = ctx.obj["target"]
     # `run --threads N` executes independent models concurrently, each with its
     # own progress bar on one stderr — fall back to interleave-safe log lines.
-    _enable_verbose_output(verbose, bars_safe=threads <= 1)
+    _configure_output(verbose, bars_safe=threads <= 1, json_output=json_output)
 
     if watch:
         _run_watch(
@@ -1120,7 +1124,7 @@ def build(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    _enable_verbose_output(verbose)
+    _configure_output(verbose, json_output=json_output)
     start = time.monotonic()
     try:
         result = build_project(
@@ -1287,6 +1291,7 @@ def test(
 )
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
 @click.option("--json", "as_json", is_flag=True, help="Print the eval artifact to stdout.")
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def eval_(
@@ -1294,6 +1299,7 @@ def eval_(
     select: str | None,
     exclude: str | None,
     as_json: bool,
+    verbose: int,
 ) -> None:
     """Run golden-set retrieval evaluations declared as `retrieval_tests:` on
     search models (issue #137): recall/precision/hit-rate/MRR/NDCG@k against
@@ -1302,6 +1308,7 @@ def eval_(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    _configure_output(verbose, json_output=as_json)
     try:
         results = run_retrieval_evaluation(
             project_dir,
@@ -1693,6 +1700,7 @@ def mcp_serve(
         "name=model.column (repeatable). Enum-field outputs fit directly."
     ),
 )
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def concept_cloud(
@@ -1709,6 +1717,7 @@ def concept_cloud(
     embed_model: str | None,
     with_query_log: bool,
     dimensions: tuple[str, ...],
+    verbose: int,
 ) -> None:
     """Render the self-contained 3D concept-cloud artifact (#255).
 
@@ -1717,6 +1726,7 @@ def concept_cloud(
     ``--demo`` for the sizable built-in example, or ``--placeholder`` for the
     minimal one.
     """
+    _configure_output(verbose)
     if placeholder or demo:
         bundle = demo_export() if demo else placeholder_export()
         written = write_concept_cloud(bundle, output)

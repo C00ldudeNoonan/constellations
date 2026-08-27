@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from hashlib import blake2b
@@ -15,6 +16,8 @@ from pydantic import BaseModel, Field, model_validator
 from ..config.profile import WarehouseConfig
 from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
+from ..logging_setup import REPORTER_ECHO_EXTRA
+from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
 from .base import (
     SERVING_LEDGER_TABLE,
@@ -52,6 +55,28 @@ from .base import (
 )
 from .base import STATE_TABLE as _STATE_TABLE
 from .registry import register
+
+log = logging.getLogger(__name__)
+
+
+def _log_publication(
+    operation: str, table_ref: str, rows: int, *, key: str | None = None
+) -> None:
+    """Safe per-publication telemetry, the DuckDB counterpart to the BigQuery
+    one (issue #292). BigQuery has a job id to correlate against; DuckDB is
+    in-process, so the useful facts are just which relation was written, how,
+    and how many rows — enough to see a long incremental model making progress
+    flush by flush. Never SQL text or row values.
+
+    Marked as a reporter echo: the reporter renders its own `[publish]` line
+    from the same call, so the log record is the copy for a run where nothing
+    else is rendering."""
+    message = (
+        f"published {operation}: table={table_ref} rows={rows}"
+        + (f" key={key}" if key else "")
+    )
+    log.info("%s", message, extra=REPORTER_ECHO_EXTRA)
+    get_reporter().publication(message)
 
 _STATE_V1_COLUMNS = (
     ("model_name", "VARCHAR", "NO"),
@@ -775,6 +800,12 @@ class DuckDBAdapter(WarehouseAdapter):
                 self.connection.execute("COMMIT")
         finally:
             self.connection.unregister("stel_staging")
+        _log_publication(
+            "incremental",
+            f"{self.schema_ref}.{self.quote_ident(table)}",
+            df.height,
+            key=key_col,
+        )
         return df.height
 
     def materialize_full_chunks(

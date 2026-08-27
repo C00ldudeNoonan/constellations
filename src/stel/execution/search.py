@@ -10,6 +10,7 @@ DAG scheduling, and result aggregation, and re-exports run_search_model.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from contextlib import suppress
 from datetime import date, datetime, timedelta
@@ -57,6 +58,8 @@ from ..retrieval.retention import retire_superseded_generations
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
+
+log = logging.getLogger(__name__)
 
 
 def run_search_model(
@@ -215,6 +218,15 @@ def run_search_model(
                         max_id_bytes=store.capabilities().max_id_bytes,
                     )
                     rows_seen += len(indexed)
+                    # A line rather than a bar: the snapshot is a one-shot
+                    # bounded stream with no row count, so there is no total to
+                    # render a determinate bar against.
+                    log.info(
+                        "%s: indexing batch %d (%d row(s) so far)",
+                        model.name,
+                        ordinal + 1,
+                        rows_seen,
+                    )
                     upstream_records = [
                         UpstreamRecord(row.record_id, row.input_fingerprint)
                         for row in indexed

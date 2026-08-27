@@ -51,6 +51,7 @@ from ..credentials import (
     CredentialResolutionError,
 )
 from ..hashing import canonical_fingerprint
+from ..logging_setup import REPORTER_ECHO_EXTRA
 from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
 from .base import (
@@ -137,11 +138,11 @@ def _log_publication(
     overlapping external orchestrator run. Only job-level statistics and the
     output relation are surfaced — never SQL text or row values.
 
-    Sent to both verbose channels: the `stel` INFO log (the active channel on
-    non-TTY / captured orchestrator runs) and the progress reporter (the active
-    channel on an interactive TTY, where the log handler is removed to protect
-    the progress bar). `_enable_verbose_output` only ever enables one of them,
-    so a verbose run sees the line exactly once regardless of which."""
+    Sent to both verbose channels: the `stel` INFO log (which a captured
+    orchestrator run reads) and the progress reporter (which owns an interactive
+    TTY). Both are live at once on a TTY since issue #403, so the log record is
+    marked as a reporter echo and dropped there — the reporter's own
+    `[publish]` line is the one that prints, deferred past any live bar."""
     message = (
         f"published {operation}: table={table_ref} "
         f"job_id={getattr(job, 'job_id', None)} "
@@ -149,7 +150,7 @@ def _log_publication(
         f"bytes_processed={getattr(job, 'total_bytes_processed', None)}"
         + (f" key={key}" if key else "")
     )
-    log.info("%s", message)
+    log.info("%s", message, extra=REPORTER_ECHO_EXTRA)
     get_reporter().publication(message)
 
 

@@ -3,10 +3,12 @@
 By default the CLI writes only its summary tables; when a build spans thousands
 of documents over many minutes, that leaves callers with no way to tell whether
 progress is being made. Callers opt in with ``-v`` on the CLI or the
-``STEL_VERBOSE`` env var, which configures a stderr handler on the ``stel``
+``STEL_VERBOSE`` env var, which configures an INFO handler on the ``stel``
 logger namespace so the ``log.info(...)`` calls already sprinkled through
 discovery, extraction, and the runner become visible without changing default
-output.
+output. The handler writes to stderr directly on a captured run, or hands
+records to the progress reporter on a TTY so they coexist with a live progress
+bar (issue #403) instead of the two channels excluding each other.
 
 Deliberately capped at INFO. Enabling DEBUG through this flag would surface
 the ``log.debug(..., exc_info=True)`` sites in ``execution/transform.py`` and
@@ -22,6 +24,16 @@ import logging
 import sys
 
 from .env import VERBOSE_ENV, read_env
+from .progress import ProgressReporter
+
+# Marks a record whose event the progress reporter also renders as a callback
+# (source discovery, model completion, BigQuery publication telemetry). Both
+# channels are live on a TTY since issue #403, so without this the operator
+# would see every such event twice — once from the emitting log call, once from
+# the reporter. The record still reaches a plain stderr handler, which is the
+# only channel on a captured run.
+REPORTER_ECHO = "stel_reporter_echo"
+REPORTER_ECHO_EXTRA = {REPORTER_ECHO: True}
 
 _HANDLER_ATTR = "_stel_verbose_handler"
 # Must stay equal to the top-level package name: a handler attached to a
@@ -48,12 +60,43 @@ def resolve_verbosity(cli_count: int) -> int:
         return 1
 
 
-def configure_verbose_logging(verbosity: int) -> None:
-    """Attach a single INFO-level stderr handler to the ``stel`` logger.
+class _ReporterHandler(logging.Handler):
+    """Hands formatted records to a progress reporter instead of a stream.
+
+    The reporter owns the terminal while a ``click.progressbar`` is live, so it
+    is the only thing that can decide whether a line prints now or waits for the
+    bar to finish. Records whose event the reporter already renders as a
+    callback are dropped here rather than at the call site: the emitting module
+    should not have to know which channel is installed.
+    """
+
+    def __init__(self, reporter: ProgressReporter) -> None:
+        super().__init__()
+        self._reporter = reporter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, REPORTER_ECHO, False):
+            return
+        # stdlib handler contract: a logging failure must never propagate into
+        # the code being logged. handleError honors logging.raiseExceptions.
+        try:
+            self._reporter.detail(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+def configure_verbose_logging(
+    verbosity: int, *, reporter: ProgressReporter | None = None
+) -> None:
+    """Attach a single INFO-level handler to the ``stel`` logger.
 
     Idempotent: repeated calls replace the previous handler rather than stacking
     duplicates, so re-invocation across nested commands or tests stays clean.
     Level is fixed at INFO — see the module docstring for why.
+
+    With ``reporter``, records are routed through it so they interleave safely
+    with a live progress bar (issue #403); without one they go straight to
+    stderr, which is what a captured/orchestrated run wants.
     """
     logger = logging.getLogger(_ROOT_LOGGER)
     existing = getattr(logger, _HANDLER_ATTR, None)
@@ -68,7 +111,11 @@ def configure_verbose_logging(verbosity: int) -> None:
         logger.propagate = True
         return
 
-    handler = logging.StreamHandler(sys.stderr)
+    handler: logging.Handler = (
+        logging.StreamHandler(sys.stderr)
+        if reporter is None
+        else _ReporterHandler(reporter)
+    )
     handler.setLevel(logging.INFO)
     handler.setFormatter(
         logging.Formatter(

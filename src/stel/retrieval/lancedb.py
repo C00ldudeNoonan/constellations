@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import re
-import sys
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
@@ -38,6 +36,7 @@ from .base import (
     reject_generation_shaped_collection_name,
     validate_generation_token,
 )
+from .locks import PublisherLock, default_host_lock_base
 from .registry import register
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -345,7 +344,10 @@ class LanceDBStore(RetrievalStore):
             raise RetrievalError("LanceDB collection name is invalid")
         lock_dir = self._lock_dir()
         lock_dir.mkdir(parents=True, exist_ok=True)
-        return _PublisherLock(lock_dir / f"{collection}.stel-publisher.lock")
+        return PublisherLock(
+            lock_dir / f"{collection}.stel-publisher.lock",
+            store_type=self.store_type(),
+        )
 
     def _lock_dir(self) -> Path:
         """Directory holding this store's publisher lock files.
@@ -371,7 +373,11 @@ class LanceDBStore(RetrievalStore):
         override = self._config.publisher_lock_dir
         if override is None and not self._config.is_cloud_uri:
             return self._config.local_data_path()
-        base = Path(override) if override is not None else _default_host_lock_base()
+        base = (
+            Path(override)
+            if override is not None
+            else default_host_lock_base(self.store_type())
+        )
         digest = self.safe_descriptor().safe_target_identity[:32]
         return base / digest
 
@@ -816,19 +822,6 @@ def _canonical_cloud_uri(uri: str) -> str:
     return f"{canonical_scheme}://{rest.rstrip('/')}"
 
 
-def _default_host_lock_base() -> Path:
-    """Fixed per-machine base for cloud-store publisher locks, independent of
-    TMPDIR/TEMP so every publisher on the host resolves to the same directory
-    (a `tempfile.gettempdir()` base would vary per process/container and let
-    two publishers' locks silently miss each other). Publishers in isolated
-    mount namespaces still need an explicit `publisher_lock_dir` on a shared
-    volume."""
-    if sys.platform == "win32":
-        base = os.environ.get("PROGRAMDATA") or "C:\\ProgramData"
-        return Path(base) / "stel" / "lancedb-locks"
-    return Path("/var/tmp/stel-lancedb-locks")
-
-
 def _sql_string(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise RetrievalError("LanceDB record IDs must be non-empty strings")
@@ -910,56 +903,3 @@ def _sql_literal(value: Any) -> str:
     if isinstance(value, int | float):
         return str(value)
     raise RetrievalError("Retrieval predicate contains an unsupported value")
-
-
-class _PublisherLock(AbstractContextManager[None]):
-    """Non-blocking OS file lock excluding concurrent publisher processes."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._handle: Any | None = None
-
-    def __enter__(self) -> None:
-        handle = self._path.open("a+b")
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            raise RetrievalError(
-                "Another publisher holds the LanceDB collection lock "
-                "(code=lancedb_publisher_lock_held); terminate it before "
-                "recovering the serving scope"
-            ) from None
-        self._handle = handle
-        return None
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        handle = self._handle
-        self._handle = None
-        if handle is None:
-            return
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()

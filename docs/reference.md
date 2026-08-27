@@ -83,7 +83,7 @@ The core install stays lean. Add only the feature groups a project uses:
 | `bigquery` | BigQuery warehouse adapter |
 | `gcs` | Google Cloud Storage document sources |
 | `vertex` | Google Vertex AI text embeddings (`google-genai`) |
-| `lancedb` | Local LanceDB search-index publication and queries |
+| `lancedb` | Local LanceDB search-index publication and queries (the `duckdb` search store needs no extra) |
 | [`mcp`](mcp.md) | Read-only governed context server over MCP stdio |
 | `all` | Every optional feature above |
 
@@ -1833,8 +1833,10 @@ uv run stel prompts check
 
 A `search:` resource publishes exactly one upstream warehouse model to an
 independently configured retrieval store. It is a leaf serving resource, not a
-warehouse relation. Install `stel[lancedb]`, configure the operator-owned
-store in `profiles.yml`, and explicitly opt in to public indexes:
+warehouse relation. Two stores ship: `duckdb`, which needs no extra and can
+live in the warehouse file itself, and `lancedb`, which needs
+`stel[lancedb]`. Configure the operator-owned store in `profiles.yml` and
+explicitly opt in to public indexes:
 
 ```yaml
 my_project:
@@ -1853,6 +1855,62 @@ my_project:
             type: lancedb
             path: ./target/lancedb
 ```
+
+### DuckDB-native search
+
+When the warehouse is already DuckDB, a separate retrieval system is an extra
+moving part for no reason. The `duckdb` store serves vector and full-text
+search from a DuckDB file — optionally the same file as the warehouse — using
+the `vss` and `fts` extensions:
+
+```yaml
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: duckdb
+            path: ./target/stel.duckdb
+```
+
+`duckdb` is a core dependency, so this needs no extra; the `vss` and `fts`
+extensions are installed on first connect, which requires network access once
+(an air-gapped host must have them pre-installed). The store opens its own
+connection and closes only that connection, so pointing it at the warehouse
+file does not close the database out from under the warehouse adapter.
+
+Three behaviors are worth knowing before choosing it:
+
+**Approximate vector search is opt-in.** DuckDB will not build a persistent
+HNSW index unless `hnsw_experimental_persistence` is set, because that index
+is not covered by the write-ahead log and a crash can leave it inconsistent
+with the table. stel will not set that flag for you: declaring
+`vector: {search: approximate}` without it fails at publish with an
+explanation rather than silently accepting the risk. Exact search needs no
+index and returns the same rows — the cost of declining is latency, not
+correctness:
+
+```yaml
+          local:
+            type: duckdb
+            path: ./target/stel.duckdb
+            hnsw_experimental_persistence: true
+            hnsw_ef_construction: 128
+            hnsw_m: 16
+```
+
+**Indexes are rebuilt at publish, not maintained.** DuckDB's HNSW index does
+not compact on delete, so an incrementally churned index would grow without
+bound; the BM25 index is a snapshot of the table at build time rather than a
+live view. Both are rebuilt when a publish completes, which keeps publish cost
+predictable and query cost flat.
+
+**Hybrid search is composed, not native.** DuckDB has no operator that blends
+`vss` and `fts` ranking, so hybrid runs both legs and stel fuses them with
+RRF. This is a supported shape, not a limitation of the store's honesty about
+itself.
+
+Ownership is stamped in the table comment and read back through DuckDB's
+catalog, so a table stel did not create is refused rather than published into.
 
 The project model declares the portable serving contract:
 

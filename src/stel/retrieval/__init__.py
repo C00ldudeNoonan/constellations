@@ -27,6 +27,7 @@ from .coordination import (
     ServingNotReadyError,
     StaleServingLeaseError,
 )
+from .duckdb import DuckDBConfig, DuckDBStore
 from .evolution import (
     ChangeKind,
     ConfigChange,
@@ -54,6 +55,8 @@ __all__ = [
     "CollectionMetadata",
     "CollectionSpec",
     "ConfigChange",
+    "DuckDBConfig",
+    "DuckDBStore",
     "IndexedRow",
     "LanceDBConfig",
     "LanceDBStore",

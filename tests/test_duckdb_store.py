@@ -370,3 +370,91 @@ def test_closing_the_store_leaves_a_shared_warehouse_file_usable(
     warehouse.execute("INSERT INTO canonical VALUES (2)")
     assert warehouse.execute("SELECT count(*) FROM canonical").fetchone() == (2,)
     warehouse.close()
+
+
+# ─── concurrency ────────────────────────────────────────────────────────────
+
+
+def test_a_database_held_by_another_process_is_a_distinct_error(
+    tmp_path: Path,
+) -> None:
+    """DuckDB is single-writer per file across processes, and a concurrent
+    publisher is an ordinary operational condition rather than a
+    misconfiguration. It must not surface as a generic connect failure that
+    sends the operator to check their profile.
+
+    Uses a real second process: two connections inside one process share
+    DuckDB's cached instance and do not contend at all, so an in-process test
+    would assert nothing.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    database = tmp_path / "held.duckdb"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""
+                import duckdb, sys, time
+                conn = duckdb.connect(r"{database}")
+                conn.execute("CREATE TABLE t(x INT)")
+                sys.stdout.write("ready")
+                sys.stdout.flush()
+                time.sleep(30)
+                """
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.read(5) == "ready"
+        store = DuckDBStore(
+            DuckDBConfig(path=str(database)),
+            project_name="proj",
+            target_name="dev",
+            alias="default",
+        )
+
+        with pytest.raises(RetrievalError, match="duckdb_database_locked"):
+            with store:
+                pass
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_error_text_never_carries_the_database_path(tmp_path: Path) -> None:
+    """DuckDB's native message embeds the file path. Errors reach logs and
+    artifacts, so the path must not ride along."""
+    store = DuckDBStore(
+        DuckDBConfig(path=str(tmp_path / "store.duckdb")),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+    with store:
+        name = _populate(store)
+        # A predicate on a column that does not exist fails inside DuckDB, so
+        # this exercises the wrapped-native-error path rather than one of the
+        # store's own precondition checks.
+        with pytest.raises(RetrievalError) as caught:
+            store.vector_search(
+                name,
+                [1.0, 0.0, 0.0],
+                vector_field="embedding",
+                limit=1,
+                predicates=[
+                    RetrievalPredicate(
+                        "no_such_column", RetrievalPredicateOperator.EQUAL, "x"
+                    )
+                ],
+            )
+
+    assert "duckdb_vector_search_failed" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    assert "no_such_column" not in str(caught.value)

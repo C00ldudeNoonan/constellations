@@ -12,3 +12,22 @@ agent_transcripts:
           local:
             type: lancedb
             path: ./target/lancedb
+
+    # The same project, served from DuckDB instead of LanceDB. Nothing in
+    # models/ changes -- the search model names a store alias, not a store
+    # type, so switching is a target change (issue #371).
+    #
+    # The retrieval path here is the warehouse file itself: vector and
+    # full-text search run in the same database as the canonical rows, so this
+    # target stands up no second system at all.
+    dev_duckdb:
+      warehouse:
+        type: duckdb
+        path: ./target/transcripts.duckdb
+        schema: transcripts
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: duckdb
+            path: ./target/transcripts.duckdb

@@ -236,6 +236,20 @@ class DuckDBStore(RetrievalStore):
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             conn = duckdb.connect(str(path))
+        except duckdb.IOException:
+            # DuckDB is single-writer per file across processes, which matters
+            # far more here than for a remote store: a concurrent publisher is
+            # an ordinary operational condition, not a configuration mistake.
+            # Classified separately so an operator is not sent to check their
+            # profile when the answer is "something else has the file open".
+            # Only the exception *type* is inspected -- DuckDB's message
+            # carries the database path, which must not reach logs.
+            raise RetrievalError(
+                "DuckDB database is already open by another process "
+                "(code=duckdb_database_locked). DuckDB allows one writer per "
+                "file; wait for the other publisher to finish, or give the "
+                "retrieval store its own path."
+            ) from None
         except Exception:
             raise RetrievalError(
                 "DuckDB operation 'connect' failed (code=duckdb_connect_failed)"

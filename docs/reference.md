@@ -1912,6 +1912,34 @@ itself.
 Ownership is stamped in the table comment and read back through DuckDB's
 catalog, so a table stel did not create is refused rather than published into.
 
+#### What is and is not atomic
+
+Stating this explicitly because the guarantees differ from a remote store's,
+and the difference is invisible until it matters:
+
+- **One upsert batch is atomic.** It runs as a single statement inside a real
+  transaction, so a partial batch is not a state any reader can observe.
+- **A delete batch is atomic**, for the same reason.
+- **A publish as a whole is not.** Creating the collection, writing rows, and
+  rebuilding indexes are separate transactions. A crash between them leaves a
+  collection that exists and is stamped but whose indexes lag its rows;
+  re-running the publish converges it.
+- **Index rebuilds are not atomic with the writes they follow.** Between the
+  bulk mutation and the rebuild, full-text queries reflect the previous BM25
+  snapshot. Vector queries are unaffected, since exact search reads the table
+  directly.
+- **Concurrent readers during a publish see the collection mid-update.** stel
+  fences concurrent *publishers* on one host, but it does not snapshot the
+  collection for readers, and DuckDB offers no rename-based swap that would
+  give one without a second copy of the data.
+
+The single-host publisher lock is the boundary from issue #152 and is unchanged
+here: it excludes another publisher on the same machine and cannot fence one on
+another machine sharing the file. DuckDB's own single-writer rule does catch
+that case, but as a lock error rather than as coordination — stel reports it
+as `duckdb_database_locked` so it reads as a concurrent publisher rather than
+a misconfiguration.
+
 The project model declares the portable serving contract:
 
 ```yaml

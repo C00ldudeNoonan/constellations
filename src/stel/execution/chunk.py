@@ -23,6 +23,7 @@ from ..chunking import (
 from ..config.model import CHUNK_GENERATED_FIELDS, ModelConfig
 from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
+from ..progress import get_reporter
 from ..versioning import compute_code_version
 from .contracts import ModelRunResult, RunError
 from .values import scalarize
@@ -108,53 +109,55 @@ def run_chunk_model(
     current_ids: set[str] = set()
     changed_ids: list[str] = []
 
-    for document_id, record in zip(
-        document_ids, frame.iter_rows(named=True), strict=True
-    ):
-        current_ids.add(document_id)
-        raw_text = record[chunk_config.text_field]
-        text = "" if raw_text is None else str(raw_text)
-        document_hash = chunk_input_hash(record, text_field=chunk_config.text_field)
-        if is_incremental:
-            prior = processed_state.get(document_id)
-            if prior == StateValue(document_hash, code_version):
-                skipped += 1
-                continue
-            if prior is not None:
-                changed_ids.append(document_id)
-        processed += 1
-        # Rendered per document, because the values are the document's. The
-        # block is charged against chunk_size before splitting and prepended
-        # after, so every emitted chunk — block included — stays within the
-        # size the embedder was configured for (issue #308).
-        block = render_metadata_block(record, chunk_config.in_text_metadata)
-        try:
-            pieces = split_text(
-                text, chunk_config, reserved=measure(block, chunk_config) if block else 0
-            )
-        except ChunkingError as error:
-            raise RunError(f"Chunk model '{model.name}': {error}") from error
-        carried = {column: record[column] for column in carry_columns}
-        for piece in pieces:
-            rows.append(
-                chunk_row(
-                    carried=carried,
-                    document_id=document_id,
-                    piece_index=piece.index,
-                    chunk_count=len(pieces),
-                    text=block + piece.text,
-                    section_column=(
-                        chunk_config.headings.column
-                        if chunk_config.headings is not None
-                        else None
-                    ),
-                    section=piece.section,
-                    strategy=chunk_config.strategy,
-                    code_version=code_version,
-                    chunked_at=chunked_at,
+    with get_reporter().model_task(model.name, "chunk", len(document_ids)) as task:
+        for document_id, record in zip(
+            document_ids, frame.iter_rows(named=True), strict=True
+        ):
+            task.advance(1)
+            current_ids.add(document_id)
+            raw_text = record[chunk_config.text_field]
+            text = "" if raw_text is None else str(raw_text)
+            document_hash = chunk_input_hash(record, text_field=chunk_config.text_field)
+            if is_incremental:
+                prior = processed_state.get(document_id)
+                if prior == StateValue(document_hash, code_version):
+                    skipped += 1
+                    continue
+                if prior is not None:
+                    changed_ids.append(document_id)
+            processed += 1
+            # Rendered per document, because the values are the document's. The
+            # block is charged against chunk_size before splitting and prepended
+            # after, so every emitted chunk — block included — stays within the
+            # size the embedder was configured for (issue #308).
+            block = render_metadata_block(record, chunk_config.in_text_metadata)
+            try:
+                pieces = split_text(
+                    text, chunk_config, reserved=measure(block, chunk_config) if block else 0
                 )
-            )
-        state_records.append(StateRecord(document_id, document_hash, code_version))
+            except ChunkingError as error:
+                raise RunError(f"Chunk model '{model.name}': {error}") from error
+            carried = {column: record[column] for column in carry_columns}
+            for piece in pieces:
+                rows.append(
+                    chunk_row(
+                        carried=carried,
+                        document_id=document_id,
+                        piece_index=piece.index,
+                        chunk_count=len(pieces),
+                        text=block + piece.text,
+                        section_column=(
+                            chunk_config.headings.column
+                            if chunk_config.headings is not None
+                            else None
+                        ),
+                        section=piece.section,
+                        strategy=chunk_config.strategy,
+                        code_version=code_version,
+                        chunked_at=chunked_at,
+                    )
+                )
+            state_records.append(StateRecord(document_id, document_hash, code_version))
 
     deleted = 0
     if is_incremental:

@@ -37,6 +37,7 @@ from ..llm_map import (
     resolve_llm_runtime,
 )
 from ..profile import ResolvedProfile
+from ..progress import get_reporter
 from ..providers import get_inference_provider
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
@@ -427,19 +428,24 @@ def run_llm_model(
         if work and budget_guard is not None:
             budget_guard.charge_documents(len(work))
         flush_every = config.flush_every
-        for offset in range(0, len(work), flush_every):
-            window = work[offset : offset + flush_every]
-            max_workers = max(1, min(config.max_concurrent, len(window)))
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max_workers
-            ) as pool:
-                # Preserve input order; surface the first failure deterministically.
-                for completed in pool.map(_one, window):
-                    del completed
-            _publish_window(window)
-            # Release this window's completions before the next one runs.
-            for item in window:
-                item.rows = []
+        # One bar across every window, counted in records: the windows are a
+        # memory bound (issue #401), not something the operator tracks.
+        with get_reporter().model_task(model.name, "llm", len(work)) as task:
+            for offset in range(0, len(work), flush_every):
+                window = work[offset : offset + flush_every]
+                max_workers = max(1, min(config.max_concurrent, len(window)))
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers
+                ) as pool:
+                    # Preserve input order; surface the first failure
+                    # deterministically.
+                    for completed in pool.map(_one, window):
+                        del completed
+                        task.advance(1)
+                _publish_window(window)
+                # Release this window's completions before the next one runs.
+                for item in window:
+                    item.rows = []
     except BudgetExceededError as e:
         # Exhaustion fires before the next provider call. Windows already
         # published stay, with their state advanced; the partial window in

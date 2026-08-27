@@ -31,6 +31,7 @@ from ..dag import parse_ref
 from ..embedding import EmbeddingIdentity, embed_texts
 from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
+from ..progress import get_reporter
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
@@ -284,24 +285,40 @@ def run_embed_model(
             ],
         )
 
-    for window in _iter_windows():
-        # Provider failures and publication failures are kept apart on
-        # purpose. `artifact_error_text` exists to sanitize *provider* text;
-        # routing a warehouse error through it hands the raw message to its
-        # fallback, and that message can quote the offending row and the
-        # statement that touched it (issue #401 review).
-        try:
-            _embed_window(window)
-        except Exception as e:
-            raise RunError(
-                f"Embed model '{model.name}' provider execution failed: "
-                f"{artifact_error_text(e)}"
-            ) from e
-        processed += len(window)
-        _publish(window)
-        # Drop the window's vectors before the next one is built. Without
-        # this the generator's reference keeps one extra flush alive.
-        window.clear()
+    # Counted in source rows and advanced per flushed window: the operator
+    # cares how much of the corpus is through, not how many provider requests
+    # it took. `record_ids` is the whole column, so the total is known even
+    # though the windows themselves stream (issue #401).
+    with get_reporter().model_task(model.name, "embed", len(record_ids)) as task:
+        advanced = 0
+        for window in _iter_windows():
+            # Provider failures and publication failures are kept apart on
+            # purpose. `artifact_error_text` exists to sanitize *provider* text;
+            # routing a warehouse error through it hands the raw message to its
+            # fallback, and that message can quote the offending row and the
+            # statement that touched it (issue #401 review).
+            try:
+                _embed_window(window)
+            except Exception as e:
+                raise RunError(
+                    f"Embed model '{model.name}' provider execution failed: "
+                    f"{artifact_error_text(e)}"
+                ) from e
+            processed += len(window)
+            _publish(window)
+            # Advance by *source rows consumed*, not window size: rows the
+            # generator dropped as unchanged never reach a window, so a
+            # mostly-incremental run would otherwise leave the bar near zero
+            # while the model was in fact nearly done.
+            consumed = processed + skipped
+            task.advance(consumed - advanced)
+            advanced = consumed
+            # Drop the window's vectors before the next one is built. Without
+            # this the generator's reference keeps one extra flush alive.
+            window.clear()
+        # Rows skipped after the final window are consumed but never advanced
+        # above, so close the bar out on the total it was opened with.
+        task.advance(len(record_ids) - advanced)
 
     try:
         if not publisher.published_any and use_full:

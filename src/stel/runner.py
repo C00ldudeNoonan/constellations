@@ -194,6 +194,12 @@ def run_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    log.info(
+        "resolved profile '%s' target '%s' -> %s warehouse",
+        project.profile,
+        resolved.target_name,
+        resolved.warehouse.type,
+    )
     adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
@@ -241,6 +247,20 @@ def run_project(
             "`stel run`/`build`."
         )
 
+    reporter = get_reporter()
+    reporter.run_started(
+        len(selected),
+        target=resolved.target_name,
+        warehouse=resolved.warehouse.type,
+        project_total=len(models),
+    )
+    log.info(
+        "selected %d of %d model(s)",
+        len(selected),
+        len(models),
+        extra=REPORTER_ECHO_EXTRA,
+    )
+
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
@@ -270,6 +290,7 @@ def run_project(
 
     started_at = datetime.now(UTC).isoformat()
     with adapter:
+        log.info("connected to %s warehouse", resolved.warehouse.type)
         if threads > 1 and len(selected) > 1:
             results_by_name = _run_in_batches(dag, selected, adapter, _run, threads)
         else:
@@ -293,6 +314,8 @@ def run_project(
             what="the run log",
         )
 
+    errored = sum(1 for r in results if r.errors)
+    reporter.run_finished(ok=len(results) - errored, errored=errored, skipped=0)
     return results
 
 
@@ -332,6 +355,12 @@ def build_project(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    log.info(
+        "resolved profile '%s' target '%s' -> %s warehouse",
+        project.profile,
+        resolved.target_name,
+        resolved.warehouse.type,
+    )
     adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
@@ -379,6 +408,20 @@ def build_project(
             "`stel run`/`build`."
         )
 
+    reporter = get_reporter()
+    reporter.run_started(
+        len(selected),
+        target=resolved.target_name,
+        warehouse=resolved.warehouse.type,
+        project_total=len(models),
+    )
+    log.info(
+        "selected %d of %d model(s)",
+        len(selected),
+        len(models),
+        extra=REPORTER_ECHO_EXTRA,
+    )
+
     required_sources = set(dag.required_sources(selected))
     source_docs = _discover_sources(
         [source for source in sources if source.name in required_sources],
@@ -396,9 +439,11 @@ def build_project(
     blocked: set[str] = set()
 
     with adapter:
+        log.info("connected to %s warehouse", resolved.warehouse.type)
         for name in selected:
             if name in blocked:
                 out.skipped.append(name)
+                reporter.model_skipped(name, "upstream failed")
                 continue
             model = models_by_name[name]
             try:
@@ -424,6 +469,11 @@ def build_project(
                         errors=[_artifact_error_text(e)],
                     )
                 )
+                # _run_model raised before reaching its own model_finished, so
+                # the ledger would skip this model entirely without this.
+                reporter.model_finished(
+                    name, _model_kind_label(model), 0, 0.0, None, failed=True
+                )
                 blocked |= dag.descendants(name)
                 continue
 
@@ -432,6 +482,7 @@ def build_project(
                 blocked |= dag.descendants(name)
                 continue
 
+            log.info("testing %s", name)
             model_tests = (
                 []
                 if model.search is not None
@@ -445,9 +496,26 @@ def build_project(
                 )
             )
             out.test_results.extend(model_tests)
+            if model_tests:
+                log.info(
+                    "tested %s: %d passed, %d failed",
+                    name,
+                    sum(1 for t in model_tests if t.status == "pass"),
+                    sum(1 for t in model_tests if t.status == "fail"),
+                )
             if any(t.is_hard_failure for t in model_tests):
                 blocked |= dag.descendants(name)
 
+    errored = sum(1 for r in out.run_results if r.errors)
+    hard_failed = {t.model_name for t in out.test_results if t.is_hard_failure}
+    # A model whose run succeeded but whose tests hard-failed is not "ok" — the
+    # footer would otherwise disagree with the exit code.
+    errored += len(hard_failed - {r.model_name for r in out.run_results if r.errors})
+    reporter.run_finished(
+        ok=len(out.run_results) - errored,
+        errored=errored,
+        skipped=len(out.skipped),
+    )
     return out
 
 
@@ -691,7 +759,12 @@ def _run_model(
         extra=REPORTER_ECHO_EXTRA,
     )
     get_reporter().model_finished(
-        model.name, result.rows_written, result.duration_seconds, result.status
+        model.name,
+        kind,
+        result.rows_written,
+        result.duration_seconds,
+        result.status,
+        failed=bool(result.errors),
     )
     return result
 

@@ -9,9 +9,10 @@ compatibility.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
 from ..config.model import EMBED_METADATA_FIELDS, ModelConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
-from ..embedding import EmbeddingIdentity, embed_texts
+from ..embedding import EmbeddingIdentity, embed_texts, estimate_embed_requests
 from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
 from ..progress import get_reporter
@@ -42,6 +43,8 @@ from .errors import artifact_error_text
 from .usage import add_provider_usage
 from .values import scalarize
 from .warehouse import warehouse_options
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -262,7 +265,16 @@ def run_embed_model(
         for offset in range(0, len(pending), config.batch_size):
             batch = pending[offset : offset + config.batch_size]
             if budget_guard is not None:
-                budget_guard.ensure_headroom()
+                # One logical batch may fan into many billed requests --
+                # Vertex issues one per text for gemini-embedding models --
+                # so reserve what the provider says it will bill, not 1.
+                budget_guard.ensure_headroom(
+                    next_calls=estimate_embed_requests(
+                        [item.text for item in batch],
+                        identity,
+                        profile_options=embedding_options.provider_options,
+                    )
+                )
             embedded = embed_texts(
                 [item.text for item in batch],
                 identity,
@@ -383,6 +395,7 @@ def run_embed_model(
             # would report a corpus as done that the cap just cut short.
             task.advance(len(record_ids) - advanced)
 
+    deleted_count = 0
     try:
         if run_status is not None:
             pass  # a budget stop mutates nothing further
@@ -402,6 +415,7 @@ def run_embed_model(
                 state_scope=state_scope,
                 state_record_keys=removed,
             )
+            deleted_count = len(removed)
     except AdapterError as e:
         raise RunError(str(e)) from e
 
@@ -425,7 +439,10 @@ def run_embed_model(
         provider_implementation=identity.implementation,
         documents_processed=processed,
         documents_skipped=skipped,
-        documents_deleted=len(removed),
+        # What was executed, not what was planned: a budget stop skips the
+        # deletion pass, and a manifest claiming mutations that did not occur
+        # is the kind of lie an operator acts on (issue #407 review).
+        documents_deleted=deleted_count,
         rows_written=publisher.rows_written,
         metrics=metrics,
         artifact_metadata={"embedding": identity.to_dict()},
@@ -528,35 +545,55 @@ class _EmbeddingReuseReader:
         """The typed id column value for a stringified record id, if present."""
         return self._target_keys.get(record_id)
 
+    # Bounded independently of flush_every: the window size is a publication
+    # cadence with no upper limit, while TableReadRequest caps batch_size at
+    # 100,000 and an IN list is SQL parameters -- copying the window length
+    # into either turns a legal `flush_every: 200000` into a resume that
+    # fails before embedding begins.
+    _LOOKUP_KEYS_PER_READ = 10_000
+
     def rows_for(self, record_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         if not self._usable:
             return {}
         typed = [
-            self._target_keys[record_id]
+            key
             for record_id in record_ids
-            if record_id in self._target_keys
+            if (key := self._target_keys.get(record_id)) is not None
+            # A key the predicate contract cannot carry (DuckDB DECIMAL,
+            # BigQuery NUMERIC) skips reuse rather than failing the resume:
+            # the row re-embeds -- correct output, paid call -- which is the
+            # same price the row would pay if its text had changed. The old
+            # whole-target dict handled these ids, so this is the one
+            # narrowing the bounded path makes, and it is a cost, not a
+            # correctness change.
+            and isinstance(key, str | int | float | bool | date | datetime)
         ]
-        if not typed:
-            return {}
-        predicate = ReadPredicate(
-            self._id_field,
-            ReadPredicateOperator.IN,
-            tuple(typed),
-        )
+        if len(typed) < len(record_ids):
+            log.debug(
+                "embed reuse lookup skipped %d id(s) with non-scalar key types",
+                len(record_ids) - len(typed),
+            )
         found: dict[str, dict[str, Any]] = {}
-        with self._adapter.table_snapshot(
-            self._table,
-            columns=list(self._columns),
-            predicate=predicate,
-            batch_size=len(typed),
-        ) as snapshot:
-            for batch in snapshot:
-                frame = pl.from_arrow(batch)
-                assert isinstance(frame, pl.DataFrame)
-                for row in frame.iter_rows(named=True):
-                    key = row.get(self._id_field)
-                    if key is not None:
-                        found[str(key)] = row
+        for offset in range(0, len(typed), self._LOOKUP_KEYS_PER_READ):
+            chunk = typed[offset : offset + self._LOOKUP_KEYS_PER_READ]
+            predicate = ReadPredicate(
+                self._id_field,
+                ReadPredicateOperator.IN,
+                tuple(chunk),
+            )
+            with self._adapter.table_snapshot(
+                self._table,
+                columns=list(self._columns),
+                predicate=predicate,
+                batch_size=len(chunk),
+            ) as snapshot:
+                for batch in snapshot:
+                    frame = pl.from_arrow(batch)
+                    assert isinstance(frame, pl.DataFrame)
+                    for row in frame.iter_rows(named=True):
+                        key = row.get(self._id_field)
+                        if key is not None:
+                            found[str(key)] = row
         return found
 
 

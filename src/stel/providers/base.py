@@ -1226,6 +1226,18 @@ def resolve_provider_model(
 
 
 class EmbeddingProvider(BaseProvider):
+    def estimate_provider_requests(self, request: EmbeddingRequest) -> int:
+        """How many billed requests `embed()` would issue for this request.
+
+        Budget headroom is reserved *before* a call, but a provider may split
+        one logical batch into many billed requests -- Vertex turns a 128-text
+        gemini-embedding batch into 128 concurrent calls -- so reserving one
+        slot per batch lets a run overshoot max_api_calls by the fan-out
+        factor. The default is honest for providers that do not split.
+        """
+        del request
+        return 1
+
     def embed(
         self,
         request: EmbeddingRequest,

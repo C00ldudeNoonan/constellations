@@ -29,6 +29,7 @@ SUPPORTED_TESTS = {
     "drift",
     "golden",
     "llm_judge",
+    "embedding_canary",
 }
 
 _COLUMN_STATS = {"mean", "min", "max", "sum", "stddev", "median", "quantile"}
@@ -56,7 +57,7 @@ class ParsedTestSpec:
     def ref_target(self) -> str | None:
         """The model this test depends on via a `to:` ref (relationships parent,
         or the drift baseline), so the DAG builds it first."""
-        if self.name not in {"relationships", "drift", "golden"}:
+        if self.name not in {"relationships", "drift", "golden", "embedding_canary"}:
             return None
         target = self.argument["to"]
         match = _REF_PATTERN.match(target)
@@ -317,6 +318,29 @@ def _validate_argument(name: str, argument: Any) -> None:
             bins = options["bins"]
             if isinstance(bins, bool) or not isinstance(bins, int) or bins < 2:
                 raise TestSpecError(f"Test '{name}' bins must be an integer >= 2")
+        return
+    if name == "embedding_canary":
+        options = _options(
+            name,
+            argument,
+            required={"to", "min_similarity"},
+            optional={"text_column", "vector_column", "enabled"},
+        )
+        if "enabled" in options and not isinstance(options["enabled"], bool):
+            raise TestSpecError(f"Test '{name}' enabled must be a boolean")
+        _require_nonempty_string(name, options["to"], "to")
+        # Deliberately no default: the right threshold is the provider's
+        # measured replica-noise floor, and any number shipped here would be
+        # a guess wearing a default's authority (issue #305). The docs carry
+        # the measurement recipe.
+        min_similarity = _finite_number(name, options["min_similarity"], "min_similarity")
+        if not 0.0 < min_similarity <= 1.0:
+            raise TestSpecError(
+                f"Test '{name}' min_similarity must be in (0, 1]"
+            )
+        for key in ("text_column", "vector_column"):
+            if key in options:
+                _require_nonempty_string(name, options[key], key)
         return
     if name == "golden":
         options = _options(

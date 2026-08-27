@@ -1377,10 +1377,21 @@ Peak memory is one flush rather than the corpus, and a run that dies at hour
 28 keeps every row it already paid for — the next run resumes at the last
 flush instead of re-embedding everything (issue #401).
 
-The resume itself is bounded too: a resumed run reads the existing target's
+The input is bounded the same way. An embed run reads its upstream's schema
+from a zero-row probe, streams the id column once to validate it and count the
+corpus, then streams the rows themselves in batches to fill each flush window
+— it never materializes the upstream as a single frame (issue #410). Before
+that, a *fresh* run's peak was O(corpus) no matter how small `flush_every`
+was, because the whole upstream was read before the first provider call.
+
+The resume is bounded too: a resumed run reads the existing target's
 id column once (streamed and projected — no vectors), then looks up reuse
 candidates one window at a time by key, so resuming a large corpus never
 costs more memory than running it.
+
+Both paths need `streaming_tabular_reads` from the adapter. It is checked at
+preflight, so a warehouse without it fails before credentials are resolved
+rather than partway through a corpus.
 
 Embed runs also charge the run-scope budget in `profiles.yml`. The
 enforceable dimensions are `max_api_calls`, `max_input_tokens`, and

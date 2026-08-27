@@ -458,3 +458,171 @@ def test_error_text_never_carries_the_database_path(tmp_path: Path) -> None:
     assert "duckdb_vector_search_failed" in str(caught.value)
     assert str(tmp_path) not in str(caught.value)
     assert "no_such_column" not in str(caught.value)
+
+
+# ─── review follow-ups (PR #400) ────────────────────────────────────────────
+
+MULTI_FIELD_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.string()),
+        pa.field("title", pa.string()),
+        pa.field("body", pa.string()),
+        pa.field("embedding", pa.list_(pa.float32(), 3)),
+    ]
+)
+
+
+def _multi_field_spec(name: str) -> CollectionSpec:
+    return CollectionSpec(
+        logical_name="ctx",
+        physical_name=name,
+        id_field="id",
+        text_fields=("title", "body"),
+        full_text_fields=("title", "body"),
+        attribute_fields=(),
+        scalar_index_fields=(),
+        display_fields=("title", "body"),
+        vector_field="embedding",
+        vector_dimensions=3,
+        distance_metric="cosine",
+        vector_search="exact",
+        config_fingerprint="cfg1",
+        descriptor='{"distance_metric": "cosine"}',
+        legacy_config_fingerprint="legacy1",
+        arrow_schema=MULTI_FIELD_SCHEMA,
+    )
+
+
+def test_bm25_scores_only_the_requested_field(tmp_path: Path) -> None:
+    """Core calls text_search once per declared full-text field and fuses each
+    as its own RRF leg. Scoring the combined index on every call would enter
+    one ranking under several labels and let RRF count a single match twice,
+    so each leg has to be scoped to its own field.
+
+    The single-field fixture elsewhere cannot catch this: with one field the
+    combined index and the per-field index are the same index.
+    """
+    store = DuckDBStore(
+        DuckDBConfig(path=str(tmp_path / "multi.duckdb")),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+    with store:
+        name = store.physical_collection("ctx")
+        spec = _multi_field_spec(name)
+        store.create_collection(spec)
+        store.upsert(
+            name,
+            [
+                IndexedRow(
+                    "a",
+                    {
+                        "id": "a",
+                        "title": "inflation report",
+                        "body": "the labor market cooled",
+                        "embedding": [1.0, 0.0, 0.0],
+                    },
+                    "fp-a",
+                ),
+                IndexedRow(
+                    "b",
+                    {
+                        "id": "b",
+                        "title": "labor digest",
+                        "body": "tariffs rose",
+                        "embedding": [0.0, 1.0, 0.0],
+                    },
+                    "fp-b",
+                ),
+            ],
+            id_field="id",
+            mutation_digest="d1",
+        )
+        store.ensure_indexes(spec)
+
+        by_title = store.text_search(name, "labor", text_field="title", limit=5)
+        by_body = store.text_search(name, "labor", text_field="body", limit=5)
+
+        # "labor" is in b's title and a's body. Each leg must see only its own.
+        assert by_title.column("id").to_pylist() == ["b"]
+        assert by_body.column("id").to_pylist() == ["a"]
+
+
+def test_lock_directory_does_not_move_when_the_parent_appears(
+    tmp_path: Path,
+) -> None:
+    """The lock path must come from configuration alone.
+
+    Entering the store creates the database's parent directory. If the lock
+    location depended on whether that parent existed, the first publisher and
+    the second would resolve different directories, lock different inodes, and
+    both believe they held the fence — during first publication, exactly when
+    a recovery is most likely to be running concurrently.
+    """
+    database = tmp_path / "not-created-yet" / "store.duckdb"
+    store = DuckDBStore(
+        DuckDBConfig(path=str(database)),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+
+    before = store._lock_dir()
+    with store:
+        during = store._lock_dir()
+    after = store._lock_dir()
+
+    assert before == during == after
+
+
+def test_two_publishers_contend_even_on_a_fresh_directory(tmp_path: Path) -> None:
+    database = tmp_path / "fresh" / "store.duckdb"
+    first = DuckDBStore(
+        DuckDBConfig(path=str(database)),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+    second = DuckDBStore(
+        DuckDBConfig(path=str(database)),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+    with first, second:
+        collection = first.physical_collection("ctx")
+
+        with first.publisher_fence(collection):
+            with pytest.raises(RetrievalError, match="publisher_lock_held"):
+                with second.publisher_fence(collection):
+                    pass
+
+
+def test_an_unknown_template_placeholder_is_a_configuration_error() -> None:
+    """Rejected at the profile boundary rather than as a raw KeyError raised
+    from inside a publish."""
+    with pytest.raises(ValueError, match="only"):
+        DuckDBConfig(
+            path="./x.duckdb",
+            collection_template="{project}__{target}__{collection}__{unknown}",
+        )
+
+
+def test_configured_hnsw_search_effort_reaches_the_connection(
+    tmp_path: Path,
+) -> None:
+    """An accepted option that is never read leaves an operator tuning recall
+    against a value with no effect."""
+    store = DuckDBStore(
+        DuckDBConfig(path=str(tmp_path / "ef.duckdb"), hnsw_ef_search=99),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+    with store:
+        row = store._connection().execute(
+            "SELECT current_setting('hnsw_ef_search')"
+        ).fetchone()
+
+    assert row is not None and int(row[0]) == 99

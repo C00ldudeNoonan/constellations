@@ -63,7 +63,7 @@ from .base import (
     reject_generation_shaped_collection_name,
     validate_generation_token,
 )
-from .locks import PublisherLock, default_host_lock_base
+from .locks import PublisherLock
 from .registry import register
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -134,12 +134,22 @@ class DuckDBConfig(RetrievalStoreConfig):
     @field_validator("collection_template")
     @classmethod
     def _validate_template(cls, value: str) -> str:
-        required = {"project", "target", "collection"}
-        present = set(re.findall(r"{(\w+)}", value))
-        if not required.issubset(present):
-            raise ValueError(
-                "collection_template must reference {project}, {target}, and {collection}"
+        # Rendering it is the check. A subset test accepts an unknown
+        # placeholder and defers the failure to `physical_collection`, where
+        # it surfaces as a raw KeyError from deep in a publish rather than as
+        # a configuration error at the profile boundary.
+        if not value or any(separator in value for separator in ("/", "\\", "..")):
+            raise ValueError("collection_template must be a safe collection name template")
+        try:
+            rendered = value.format(
+                project="project", target="target", collection="collection"
             )
+        except (KeyError, IndexError, ValueError):
+            raise ValueError(
+                "collection_template may use only {project}, {target}, and {collection}"
+            ) from None
+        if not _IDENTIFIER_RE.fullmatch(rendered):
+            raise ValueError("collection_template renders an invalid collection name")
         return value
 
     def local_data_path(self) -> Path:
@@ -290,6 +300,10 @@ class DuckDBStore(RetrievalStore):
                 ) from None
         if self._config.hnsw_experimental_persistence:
             conn.execute("SET hnsw_enable_experimental_persistence = true")
+        # Applied per connection, not per query: an option accepted and never
+        # read would leave an operator tuning recall against a value that has
+        # no effect.
+        conn.execute(f"SET hnsw_ef_search = {int(self._config.hnsw_ef_search)}")
 
     def _connection(self) -> Any:
         conn = self._conn
@@ -350,15 +364,24 @@ class DuckDBStore(RetrievalStore):
         )
 
     def _lock_dir(self) -> Path:
+        """Where this store's publisher locks live.
+
+        Resolved purely from configuration, never from what happens to exist
+        on disk. An earlier version fell back to a host-wide directory when
+        the database's parent was missing -- but entering the store creates
+        that parent, so the first publisher and the second could resolve
+        different directories, take locks on different inodes, and both
+        believe they held the fence. A lock path that moves when a directory
+        appears is not a lock.
+
+        A DuckDB database is always a local file, so the lock belongs beside
+        it: every publisher on the host contends on the same inode.
+        `publisher_fence` creates the directory before locking.
+        """
         override = self._config.publisher_lock_dir
-        if override is not None:
-            base = Path(override)
-        else:
-            parent = self._config.local_data_path().parent
-            if parent.exists() or not parent.parts:
-                return parent
-            base = default_host_lock_base(self.store_type())
-        return base / self.safe_descriptor().safe_target_identity[:32]
+        if override is None:
+            return self._config.local_data_path().parent
+        return Path(override) / self.safe_descriptor().safe_target_identity[:32]
 
     # ── catalog ─────────────────────────────────────────────────────────────
 
@@ -679,6 +702,8 @@ class DuckDBStore(RetrievalStore):
         _validate_query_projection(columns)
         if not query or not query.strip():
             raise RetrievalError("DuckDB text search requires a query string")
+        if not _IDENTIFIER_RE.fullmatch(text_field):
+            raise RetrievalError("DuckDB text field name is invalid")
         conn = self._connection()
         schema = self._arrow_schema(conn, collection)
         id_field = self._id_field(conn, collection, schema)
@@ -686,12 +711,20 @@ class DuckDBStore(RetrievalStore):
         where = _compile_predicates(predicates)
         clause = f" AND {where}" if where else ""
         index_schema = _quote_identifier(f"fts_main_{collection}")
+        # `fields :=` scopes BM25 to the requested column. Core calls this
+        # once per declared full-text field and fuses each as its own RRF leg,
+        # so scoring the whole combined index every time would enter the same
+        # ranking under several labels and let RRF count one match repeatedly.
+        # (Note the `:=` -- create_fts_index takes `=` for its options, this
+        # takes `:=`.)
+        #
         # The BM25 score is NULL for a non-matching row, so the NOT NULL test
         # is the match filter, not an optimization.
         return self._query_arrow(
             conn,
             f"SELECT {projection}, _score FROM (SELECT *, {index_schema}.match_bm25("
-            f"{_quote_identifier(id_field)}, ?) AS _score "
+            f"{_quote_identifier(id_field)}, ?, fields := {_sql_string(text_field)}"
+            f") AS _score "
             f"FROM {_quote_identifier(collection)}) "
             f"WHERE _score IS NOT NULL{clause} "
             f"ORDER BY _score DESC LIMIT {limit}",

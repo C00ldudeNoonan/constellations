@@ -49,6 +49,7 @@ from .execution import ml as _ml_execution
 from .execution import search as _search_execution
 from .execution import transform as _transform_execution
 from .execution import usage as _usage_execution
+from .logging_setup import REPORTER_ECHO_EXTRA
 from .manifest import compute_modified_models
 from .paths import resolve_within_project
 from .profile import (
@@ -506,7 +507,12 @@ def _discover_sources(
         # report the pre-filter — and for GCS pre-file-pattern — count, so
         # without this a captured run could show hundreds discovered while
         # processing zero after --source-filter.
-        log.info("Source '%s': %d document(s) selected", source.name, len(refs))
+        log.info(
+            "Source '%s': %d document(s) selected",
+            source.name,
+            len(refs),
+            extra=REPORTER_ECHO_EXTRA,
+        )
         reporter.source_discovered(source.name, len(refs))
         out[source.name] = DiscoveredSource(backend=backend, refs=refs)
     return out
@@ -682,6 +688,7 @@ def _run_model(
         result.rows_written,
         result.duration_seconds,
         f" [{result.status}]" if result.status else "",
+        extra=REPORTER_ECHO_EXTRA,
     )
     get_reporter().model_finished(
         model.name, result.rows_written, result.duration_seconds, result.status

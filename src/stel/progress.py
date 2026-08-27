@@ -2,9 +2,16 @@
 
 Verbose mode (``-v``, ``STEL_VERBOSE=1``) attaches a live per-model progress
 bar to stderr for the extraction loop and prints one line per source-discovery
-completion. Non-TTY callers (Dagster captures, redirected stderr) fall back to
-the plain ``log.info`` lines already emitted by discovery/extraction/runner, so
-the same wiring works in both places without duplicating output on a terminal.
+completion. Non-TTY callers (Dagster captures, redirected stderr) get the plain
+``log.info`` lines emitted by discovery/extraction/runner instead, since a
+carriage-return bar redrawn every flush is noise in a captured stream.
+
+On a TTY the log channel runs *alongside* the bar rather than in place of it
+(issue #403): records reach :meth:`ProgressReporter.detail`, which buffers them
+while a bar is live and flushes them once it finishes. Before that, a terminal
+run saw only the four events this module renders itself, so provider batch
+polls and source-scan lines were visible only when stderr was redirected —
+watching a run live showed strictly less than piping it to a file.
 
 The active reporter is module-global to mirror the existing ``logging`` pattern:
 extraction and the runner query :func:`get_reporter` instead of threading a
@@ -14,7 +21,9 @@ reporter argument through every executor.
 from __future__ import annotations
 
 import sys
+import threading
 import time
+from collections import deque
 from types import TracebackType
 from typing import Any, Protocol, Self, TextIO
 
@@ -39,6 +48,7 @@ class ProgressReporter(Protocol):
         self, model_name: str, rows: int, duration: float, status: str | None
     ) -> None: ...
     def publication(self, message: str) -> None: ...
+    def detail(self, message: str) -> None: ...
 
 
 class _NullTask:
@@ -70,6 +80,9 @@ class _NullReporter:
         return
 
     def publication(self, message: str) -> None:
+        return
+
+    def detail(self, message: str) -> None:
         return
 
 
@@ -125,9 +138,17 @@ class _TerminalTask:
                 self._reporter._bar_finished()
 
 
+# Deferred detail lines are dropped oldest-first past this many. A bar that
+# stays live for hours (a provider batch poll every few seconds) would otherwise
+# hold every line it produced in memory to print them all at once, which helps
+# nobody: the operator wants the tail. Overflow is reported, never silent.
+_MAX_DEFERRED_LINES = 500
+
+
 class _TerminalReporter:
     """Terminal-friendly reporter. Per-model progress bars go on stderr; source
-    discovery and model-finished status get one-line summaries above the bar."""
+    discovery, model-finished status, publication telemetry and forwarded log
+    records get one-line summaries around the bar."""
 
     def __init__(self, stream: TextIO) -> None:
         self._stream = stream
@@ -136,20 +157,47 @@ class _TerminalReporter:
         # concurrent models (run --threads N) uses the log channel, not the
         # reporter — so a single counter and buffer suffice.
         self._bar_depth = 0
-        self._pending: list[str] = []
+        self._pending: deque[str] = deque(maxlen=_MAX_DEFERRED_LINES)
+        self._dropped = 0
+        # Forwarded log records arrive on provider worker threads (extraction
+        # fans out over a pool), so the buffer is not single-threaded the way
+        # the publication-only version was.
+        self._lock = threading.Lock()
 
     def _echo(self, message: str) -> None:
         click.echo(message, file=self._stream)
 
+    def _defer_or_echo(self, line: str) -> None:
+        """Print now, or hold until the live bar finishes. ``click.echo`` does
+        not clear and redraw a ``click.progressbar``, so writing while one is
+        active smears it."""
+        with self._lock:
+            if self._bar_depth > 0:
+                if len(self._pending) == self._pending.maxlen:
+                    self._dropped += 1
+                self._pending.append(line)
+                return
+        self._echo(line)
+
     def _bar_started(self) -> None:
-        self._bar_depth += 1
+        with self._lock:
+            self._bar_depth += 1
 
     def _bar_finished(self) -> None:
-        self._bar_depth = max(0, self._bar_depth - 1)
-        if self._bar_depth == 0 and self._pending:
-            for message in self._pending:
-                self._echo(f"[publish] {message}")
+        with self._lock:
+            self._bar_depth = max(0, self._bar_depth - 1)
+            if self._bar_depth > 0:
+                return
+            pending = list(self._pending)
+            dropped = self._dropped
             self._pending.clear()
+            self._dropped = 0
+        # Echo outside the lock: click.echo touches the stream, and a reentrant
+        # log record from another thread would otherwise deadlock behind it.
+        if dropped:
+            self._echo(f"... {dropped:,} earlier detail line(s) dropped ...")
+        for message in pending:
+            self._echo(message)
 
     def source_discovered(self, source_name: str, count: int) -> None:
         self._echo(f"[source] {source_name}: discovered {count:,} object(s)")
@@ -171,13 +219,15 @@ class _TerminalReporter:
 
     def publication(self, message: str) -> None:
         # Publication telemetry (issue #292) fires per flush, inside the model's
-        # live progress bar. click.echo does not clear/redraw the bar, so echoing
-        # now would smear it — buffer while a bar is active and flush the lines
-        # once the task exits; echo immediately when no bar is live.
-        if self._bar_depth > 0:
-            self._pending.append(message)
-        else:
-            self._echo(f"[publish] {message}")
+        # live progress bar, so it takes the deferral path.
+        self._defer_or_echo(f"[publish] {message}")
+
+    def detail(self, message: str) -> None:
+        """Render one already-formatted line from the forwarded log channel.
+
+        No prefix: the record arrives pre-formatted by the logging handler,
+        which supplies its own timestamp/level/logger shape."""
+        self._defer_or_echo(message)
 
 
 def _format_duration(seconds: float) -> str:

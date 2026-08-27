@@ -51,7 +51,7 @@ from .profile import (
     resolve_llm_options,
     resolve_profile,
 )
-from .progress import configure_progress
+from .progress import configure_progress, get_reporter
 from .prompts import (
     PromptLockError,
     check_lock,
@@ -138,20 +138,26 @@ def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _enable_verbose_output(verbose_count: int, *, bars_safe: bool = True) -> None:
-    """Install exactly one verbose channel — the TTY progress bar/reporter when
-    stderr is a TTY, otherwise the INFO log handler. Both share stderr, so
-    running them together would corrupt the ``click.progressbar`` redraws and
-    double-print discovery / model boundary events (once from the log call,
-    once from the reporter callback).
+    """Install the verbose channels — on a TTY, the progress bar/reporter *and*
+    the INFO log handler routed through it; otherwise the log handler writing to
+    stderr directly.
 
-    ``bars_safe=False`` forces the log channel even on a TTY: when models run
-    concurrently (``run --threads N`` over multiple models) each opens its own
-    ``click.progressbar`` on the one stderr and their redraws interleave. INFO
-    log records are emitted atomically under the logging lock, so lines from
-    parallel models stay individually intact."""
+    The two used to be mutually exclusive to keep plain ``log.info`` writes from
+    smearing the ``click.progressbar`` redraws, which meant a terminal saw only
+    the four events the reporter renders itself — provider batch polls and
+    source-scan lines were visible only when stderr was redirected (issue #403).
+    Routing records through the reporter keeps the bar intact (they are deferred
+    while one is live) without losing the text. Events the reporter also emits
+    as a callback carry ``REPORTER_ECHO_EXTRA`` so they print once, not twice.
+
+    ``bars_safe=False`` forces the plain log channel even on a TTY: when models
+    run concurrently (``run --threads N`` over multiple models) each opens its
+    own ``click.progressbar`` on the one stderr and their redraws interleave.
+    INFO log records are emitted atomically under the logging lock, so lines
+    from parallel models stay individually intact."""
     verbosity = resolve_verbosity(verbose_count)
     if bars_safe and configure_progress(verbosity):
-        configure_verbose_logging(0)
+        configure_verbose_logging(verbosity, reporter=get_reporter())
     else:
         configure_progress(0)
         configure_verbose_logging(verbosity)

@@ -12,8 +12,14 @@ from click.testing import CliRunner
 
 from stel import progress as progress_module
 from stel.cli import _enable_verbose_output, cli
-from stel.logging_setup import configure_verbose_logging, resolve_verbosity
+from stel.logging_setup import (
+    REPORTER_ECHO_EXTRA,
+    _ReporterHandler,
+    configure_verbose_logging,
+    resolve_verbosity,
+)
 from stel.progress import (
+    _MAX_DEFERRED_LINES,
     _NullReporter,
     _TerminalReporter,
     configure_progress,
@@ -189,12 +195,14 @@ def test_null_reporter_task_advances_no_op() -> None:
         task.advance(3)  # must not raise
 
 
-def test_enable_verbose_output_tty_uses_only_reporter(
+def test_enable_verbose_output_tty_routes_log_through_reporter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When stderr is a TTY, the reporter owns output — the INFO log handler
-    must not attach or per-flush lines would collide with the progress-bar
-    redraws and every discovery/model event would double-print."""
+    """On a TTY the reporter owns the terminal, but the log handler still
+    attaches — routed through the reporter so records defer past a live bar
+    instead of smearing it (issue #403). Before that fix the handler was torn
+    down here, so every log.info the reporter does not itself render was lost
+    on a terminal and visible only when stderr was redirected."""
     class _FakeTTY(io.StringIO):
         def isatty(self) -> bool:
             return True
@@ -202,8 +210,98 @@ def test_enable_verbose_output_tty_uses_only_reporter(
     monkeypatch.setattr("sys.stderr", _FakeTTY())
     _enable_verbose_output(1)
     logger = logging.getLogger("stel")
-    assert getattr(logger, "_stel_verbose_handler", None) is None
+    handler = getattr(logger, "_stel_verbose_handler", None)
+    assert isinstance(handler, _ReporterHandler)
     assert isinstance(get_reporter(), _TerminalReporter)
+
+
+def test_tty_verbose_forwards_plain_log_records_to_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression #403 names: a provider batch poll or a source-scan line
+    has no reporter callback, so on a TTY it used to vanish entirely."""
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _FakeTTY()
+    monkeypatch.setattr("sys.stderr", stream)
+    _enable_verbose_output(1)
+    logging.getLogger("stel.providers.anthropic").info(
+        "batch %s: in_progress (processing=%d)", "batch_abc", 42
+    )
+    assert "batch_abc" in stream.getvalue()
+    assert "processing=42" in stream.getvalue()
+
+
+def test_tty_verbose_drops_records_the_reporter_already_renders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both channels are live on a TTY, so an event with a reporter callback
+    must print once. The marker travels on the record, not at the call site:
+    the emitting module does not know which channel is installed."""
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _FakeTTY()
+    monkeypatch.setattr("sys.stderr", stream)
+    _enable_verbose_output(1)
+    log = logging.getLogger("stel.runner")
+    log.info("finished raw_invoices", extra=REPORTER_ECHO_EXTRA)
+    assert "finished raw_invoices" not in stream.getvalue()
+    # The reporter's own callback is what renders it.
+    get_reporter().model_finished("raw_invoices", 3, 1.0, None)
+    assert "raw_invoices" in stream.getvalue()
+
+
+def test_non_tty_verbose_keeps_reporter_echo_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A captured run has no reporter, so the marked record is the only copy of
+    the event and must survive."""
+    stream = io.StringIO()
+    monkeypatch.setattr("sys.stderr", stream)
+    _enable_verbose_output(1)
+    logging.getLogger("stel.runner").info(
+        "finished raw_invoices", extra=REPORTER_ECHO_EXTRA
+    )
+    assert "finished raw_invoices" in stream.getvalue()
+
+
+def test_forwarded_log_records_defer_past_a_live_bar() -> None:
+    """A record arriving mid-bar must not be written straight to the stream —
+    click.echo does not clear/redraw the bar, so it would smear."""
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _FakeTTY()
+    reporter = _TerminalReporter(stream)
+    task = reporter.model_task("m", "extraction", 3)
+    with task:
+        reporter.detail("polled batch batch_abc")
+        assert "batch_abc" not in stream.getvalue()
+    assert "polled batch batch_abc" in stream.getvalue()
+
+
+def test_deferred_detail_lines_are_capped_and_overflow_is_reported() -> None:
+    """An hours-long bar must not hold every line it produced. Oldest lines are
+    dropped, and the drop is stated rather than silently swallowed."""
+    class _FakeTTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _FakeTTY()
+    reporter = _TerminalReporter(stream)
+    overflow = 5
+    with reporter.model_task("m", "extraction", 3):
+        for i in range(_MAX_DEFERRED_LINES + overflow):
+            reporter.detail(f"line-{i}")
+    text = stream.getvalue()
+    assert f"{overflow} earlier detail line(s) dropped" in text
+    assert "line-0" not in text
+    assert f"line-{_MAX_DEFERRED_LINES + overflow - 1}" in text
 
 
 def test_enable_verbose_output_non_tty_uses_only_log_handler(
@@ -289,6 +387,40 @@ def test_verbose_build_emits_progress_and_summary_to_stderr(
     # double-print.
     assert "[done]" not in result.stderr
     assert "[source]" not in result.stderr
+
+
+def test_tty_verbose_run_shows_both_reporter_and_log_lines_once(
+    tmp_path: Path, example_project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end on the reporter channel (issue #403). Forcing the TTY branch
+    rather than faking sys.stderr, because CliRunner owns that stream.
+
+    Three things at once: a line only the reporter renders, a line only the log
+    channel carries, and an event both know about appearing exactly once."""
+    monkeypatch.delenv("STEL_VERBOSE", raising=False)
+    monkeypatch.setattr("stel.progress._is_tty", lambda _stream: True)
+    dst = _copy_example(tmp_path, example_project_dir)
+    generate_invoices(3, dst / "data" / "invoices", seed=1)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--project-dir", str(dst), "run", "-v"])
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+    err = result.stderr
+
+    # Reporter-only rendering: no log call produces these prefixes.
+    assert "[source]" in err
+    assert "[done]" in err
+    # Log-only: `Source '...': scanning <dir>` has no reporter callback, and was
+    # invisible on a terminal before this fix.
+    assert "scanning" in err
+    assert "starting raw_invoices" in err
+    # Both channels know about model completion; it must render once.
+    assert err.count("raw_invoices") >= 1
+    assert "finished raw_invoices" not in err  # suppressed in favor of [done]
+    assert err.count("[done]   raw_invoices") == 1
+    # Likewise source selection: the reporter's [source] line, not the log's.
+    assert "document(s) selected" not in err
+    assert err.count("[source] vendor_invoices") == 1
 
 
 def test_stel_verbose_env_var_enables_logging_without_flag(

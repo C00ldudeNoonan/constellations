@@ -339,17 +339,27 @@ def search(
         store_type=store_config.type,
     )
     logical_collection = search_config.collection or model.name
+    state_descriptor = store.state_descriptor(logical_collection)
     state_scope = StateScope.for_target_descriptor(
         model.name,
         stage="retrieval_publish",
-        descriptor=store.state_descriptor(logical_collection).descriptor(),
+        descriptor=state_descriptor.descriptor(),
+    )
+    # Only read when the current key misses, to tell "never published" apart
+    # from "published before #355 re-keyed the scope" (issue #413).
+    legacy_state_scope = StateScope.for_target_descriptor(
+        model.name,
+        stage="retrieval_publish",
+        descriptor=state_descriptor.legacy_descriptor(),
     )
     candidate_limit = request.candidate_limit or min(max(request.limit * 4, 50), 1000)
 
     try:
         with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
             coordinator = ServingCoordinator(adapter)
-            lease = coordinator.acquire_query(state_scope)
+            lease = coordinator.acquire_query(
+                state_scope, legacy_scope=legacy_state_scope
+            )
             try:
                 if lease.config_fingerprint != expected_fingerprint:
                     raise SearchError(

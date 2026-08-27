@@ -1059,6 +1059,7 @@ class DuckDBAdapter(WarehouseAdapter):
             else:
                 cursor.execute(f"SELECT {projection} FROM {table_ref}{where_sql}")
             reader = cursor.to_arrow_reader(request.batch_size)
+            snapshot_reader = reader
             fingerprint = canonical_fingerprint(
                 {
                     "adapter": self.adapter_type(),
@@ -1100,11 +1101,16 @@ class DuckDBAdapter(WarehouseAdapter):
             def close() -> None:
                 nonlocal transaction_open
                 try:
-                    if transaction_open:
-                        cursor.execute("ROLLBACK")
-                        transaction_open = False
+                    # An unexhausted reader keeps the database file pinned; close it
+                    # before the cursor so the file handle is actually released.
+                    snapshot_reader.close()
                 finally:
-                    cursor.close()
+                    try:
+                        if transaction_open:
+                            cursor.execute("ROLLBACK")
+                            transaction_open = False
+                    finally:
+                        cursor.close()
 
             snapshot_ref = TableReadSnapshot(
                 schema=reader.schema,

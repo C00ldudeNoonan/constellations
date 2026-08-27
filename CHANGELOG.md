@@ -2,6 +2,98 @@
 
 ## Unreleased
 
+## v0.13.0 - 2026-08-27
+
+### Upgrading
+
+- **Array-valued attribute filters changed shape (issue #397).** `eq`, `ne`,
+  and `in` against an `array[string]` search attribute were previously
+  accepted and compiled to SQL the engine could not evaluate as intended;
+  they now raise, and the new `array_contains_any` operator (JSON-array
+  value) is the one accepted for array fields. Update any `--filter` calls or
+  saved queries that touched array attributes.
+- **A full refresh of an embed or llm model is no longer one atomic swap
+  (issue #401).** The first flush replaces the target and later flushes merge
+  into it, so an interrupted rebuild leaves a partially rebuilt table that
+  the next run completes from state. The trade is deliberate: the previous
+  behavior could not rebuild a large corpus at all.
+- No incremental state is invalidated by this release. The new cadence
+  options (`embed.flush_every`, `llm.flush_every`) are excluded from
+  `code_version`, so existing corpora do not re-embed or re-generate.
+
+### Long-running provider stages fail cheap and resume exactly (issue #401)
+
+The incident behind this: a 3.6M-chunk embed run spent 28 hours of paid
+Vertex calls and lost every one to a MemoryError at the final end-of-run
+publish.
+
+- **Embed models publish and advance state every `flush_every` rows**
+  (default 5000). Peak memory is one flush rather than three corpus-sized
+  structures; a failure keeps every published window, and the re-run pays
+  only for what was actually lost.
+- **llm map models flush the same way** (`flush_every`, default 1000) — one
+  provider call per input made them the most expensive all-or-nothing stage.
+  Fan-out models publish per window through parent-scoped child replacement.
+- **The resume path is bounded.** Resuming used to load the whole existing
+  target (vectors included, ~90GB at 3.6M chunks) before the first provider
+  call; it now streams the id column once and looks up vector reuse one
+  window at a time, keyed and projected.
+- **The run budget finally sees embeds.** `max_api_calls`,
+  `max_input_tokens`, and `max_documents` gate embed runs; reservations
+  account for provider request fan-out (a 128-text gemini-embedding batch is
+  128 billed requests, and is reserved as such). A budget stop behaves like a
+  crash at the same point and reports `budget_exceeded`; raising the cap
+  resumes for the remainder.
+- **One checkpoint ordering for every flushing stage** (`FlushPublisher`): a
+  rebuild clears state before its first write, state advances only after the
+  write lands, and publication failures never carry warehouse error text into
+  run artifacts.
+
+### DuckDB-native search store (issue #371)
+
+- `type: duckdb` retrieval stores serve vector (`vss`) and BM25 (`fts`)
+  search from a DuckDB file — optionally the warehouse file itself, so a
+  DuckDB-warehouse project stands up no second system. Needs no extra.
+- Approximate (HNSW) indexing is an explicit opt-in
+  (`hnsw_experimental_persistence: true`) because DuckDB's HNSW index is not
+  WAL-covered; exact search is the default and returns the same rows.
+- Hybrid is core-composed RRF over both legs; per-field BM25 scoring keeps
+  multi-field text models correctly fused.
+- A shared store conformance suite now runs every registered retrieval store
+  (LanceDB and DuckDB) against the same contract, gated on declared
+  capabilities.
+- `examples/agent_transcripts` gains a `dev_duckdb` target that switches
+  stores by configuration alone, with tests asserting identical results
+  across both.
+
+### Governed context over the network (issues #392, #397)
+
+- **`stel mcp serve --transport streamable-http|sse --host --port`** serves
+  many callers with a per-request principal; the stdio environment resolver
+  is refused at startup for network transports. Caller identity comes from
+  proxy-set headers behind an authenticating proxy
+  (`--trust-proxy-principal-headers`).
+- **Operator-owned grants (`--grants-relation`)** move authorization from
+  caller-supplied claims to a warehouse relation keyed by subject: a forged
+  tenant or access-group header buys nothing. Malformed grant rows surface as
+  configuration errors, not denials, and the query log records the tenant the
+  policy actually filtered to rather than the tenant the caller claimed.
+- **Array-valued policy attributes work** (`access_groups: array[string]`,
+  the documented agent-context shape): compiled by set overlap on both the
+  prefilter and the row recheck, in both authorization providers.
+
+### CLI
+
+- `stel build` streams a running ledger by default instead of printing one
+  final table, and the verbose log channel stays alive alongside the TTY
+  progress bar.
+
+### Fixes
+
+- DuckDB table snapshots close their Arrow reader on close, so an
+  unexhausted snapshot no longer pins the database file (#408).
+
+
 ## v0.12.0 - 2026-08-26
 
 ### Upgrading: one reprocess, paid once (issues #363, #385)

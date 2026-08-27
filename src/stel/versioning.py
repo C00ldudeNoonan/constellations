@@ -141,7 +141,7 @@ def compute_code_version(
         "llm": (
             dict(effective_llm)
             if effective_llm is not None
-            else llm.model_dump(exclude={"max_concurrent", "max_retries"})
+            else llm.model_dump(exclude={"max_concurrent", "max_retries", "flush_every"})
             if llm
             else None
         ),

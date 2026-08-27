@@ -1345,12 +1345,53 @@ Peak memory is one flush rather than the corpus, and a run that dies at hour
 28 keeps every row it already paid for — the next run resumes at the last
 flush instead of re-embedding everything (issue #401).
 
-One consequence worth stating plainly: a **full refresh** of an embed model is
+**llm map models** flush the same way, on `flush_every` inputs (default
+1000). This is the stage where an all-or-nothing write costs the most: one
+provider call per input, so a failure — or a budget ceiling — near the end of
+a long run used to discard every completion already paid for. Windows already
+published now stay, with their state advanced, and only the partial window in
+flight is re-called:
+
+```yaml
+- name: filing_facts
+  depends_on: [ref('filing_registry')]
+  llm:
+    provider: vertex
+    model: gemini-2.5-flash
+    input_field: body
+    prompt: extract_facts
+    flush_every: 500
+  materialization: incremental
+```
+
+For `output_cardinality: many` each window publishes through
+`replace_children` scoped to that window's parents, so a later window never
+disturbs children an earlier one published.
+
+One consequence worth stating plainly: a **full refresh** of an embed or llm
+model is
 no longer a single atomic swap. The first flush replaces the target and later
 flushes merge into it, so an interrupted rebuild leaves a partially rebuilt
 table that the next run completes from state. That is a deliberate trade — the
 alternative is the previous behavior, where a corpus large enough to matter
 could not be rebuilt at all.
+
+### Which stages checkpoint
+
+| Stage | Cadence knob | Default | Why |
+| --- | --- | --- | --- |
+| `extraction` | `flush_every`, `publish_every` | 5000, 1 | Parser and backend cost |
+| `transform` | `commit_every` | 1000 | CPU over changed parents |
+| `embed` | `flush_every` | 5000 | **Metered provider spend** |
+| `llm` | `flush_every` | 1000 | **One provider call per row** |
+| `search` | per-batch upsert | — | Publishes and advances state per batch |
+| `chunk`, `ml`, `eval` | none | — | CPU-only; a re-run costs time, not money |
+
+The rule behind the table: a stage checkpoints when losing its work costs more
+than the bookkeeping. `chunk`, `ml`, and `eval` publish once because redoing
+them is cheap and deterministic. Everything that spends money, or runs long
+enough that losing the run hurts, publishes as it goes and advances state only
+for what it actually wrote.
 
 Like `flush_every`, `commit_every` is excluded from `code_version` — it changes
 execution cadence, never output content, so tuning it does not invalidate

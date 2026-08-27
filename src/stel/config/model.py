@@ -502,6 +502,12 @@ class LLMTransformConfig(BaseModel):
     max_tokens: int = Field(default=2048, gt=0, le=1_000_000)
     max_concurrent: int = Field(default=8, gt=0, le=1_000)
     max_retries: int = Field(default=4, ge=0)
+    # Completed rows publish and advance state every N inputs (issue #401's
+    # pattern, applied to the stage that costs the most per row: one provider
+    # call each). Without it a failure or budget exhaustion at input 500,000
+    # discards every completion already paid for. Excluded from code_version
+    # alongside max_concurrent/max_retries: execution cadence, not identity.
+    flush_every: int = Field(default=1000, gt=0)
     # For output_cardinality: many — the fan-out row's stable primary key
     # (f"{id_value}__{ordinal}") and its position within the parent's output.
     row_id_field: str = Field(default="llm_row_id", min_length=1)

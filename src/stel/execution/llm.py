@@ -39,6 +39,7 @@ from ..llm_map import (
 from ..profile import ResolvedProfile
 from ..providers import get_inference_provider
 from ..versioning import compute_model_code_version
+from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
 from .cost import budget_cost_estimator
 from .errors import artifact_error_text
@@ -335,102 +336,144 @@ def run_llm_model(
 
     run_status: str | None = None
     errors: list[str] = []
+    rows_generated = 0
+    key_col = (
+        config.row_id_field
+        if config.output_cardinality == "many"
+        else config.id_field
+    )
+    use_full = model.materialization == "full" or full_refresh or rebuild_target
+    output_schema = _llm_output_schema(model, config, source)
+    publisher = FlushPublisher(
+        adapter,
+        model_name=model.name,
+        state_scope=state_scope,
+        use_full=use_full,
+    )
+
+    def _publish_window(window: list[_LLMWork]) -> None:
+        """Publish one window's completions, then advance state for its inputs.
+
+        Publish-then-state, matching extraction (#139) and embed (#401): an
+        interrupted run never records an input it did not write, so the re-run
+        re-calls the provider only for what was actually lost. That matters
+        more here than anywhere else in the pipeline — an llm map model spends
+        one provider call per input, so a failure at input 500,000 used to
+        discard half a million paid completions.
+        """
+        nonlocal rows_generated
+        now = datetime.now(UTC).isoformat()
+        window_rows: list[dict[str, Any]] = []
+        for item in window:
+            window_rows.extend(
+                _llm_output_rows(
+                    item, config=config, runtime=runtime, generated_at=now
+                )
+            )
+        rows_generated += len(window_rows)
+        output = _llm_output_frame(window_rows, schema=output_schema, model=model)
+        state_records = [
+            StateRecord(item.record_id, item.input_fingerprint, code_version)
+            for item in window
+        ]
+        fan_out = config.output_cardinality == "many"
+        publisher.publish(
+            write_full=lambda: adapter.materialize_full(
+                model.name,
+                output,
+                options=warehouse_opts,
+            ),
+            write_incremental=lambda: (
+                # Scoped to this window's parents, so it never disturbs
+                # children published by an earlier window.
+                adapter.replace_children(
+                    model.name,
+                    parent_key=config.id_field,
+                    parent_ids=[item.id_value for item in window],
+                    child_key=key_col,
+                    new_rows=output,
+                    state_scope=state_scope,
+                    state_records=state_records,
+                    on_schema_change=(
+                        model.on_schema_change
+                        if publisher.first_publication
+                        else "append_new_columns"
+                    ),
+                    options=warehouse_opts,
+                )
+                if fan_out
+                else adapter.materialize_incremental(
+                    model.name,
+                    output,
+                    key_col=key_col,
+                    on_schema_change=(
+                        model.on_schema_change
+                        if publisher.first_publication
+                        else "append_new_columns"
+                    ),
+                    options=warehouse_opts,
+                    update_when_changed=model.update_when_changed,
+                )
+                if window_rows
+                else 0
+            ),
+            state_records=state_records,
+            # replace_children applies the state records in the same
+            # transaction as the rows, so the publisher must not repeat it.
+            advances_state_itself=fan_out and not (use_full and publisher.first_publication),
+        )
+
     try:
         if work and budget_guard is not None:
             budget_guard.charge_documents(len(work))
-        if work:
-            max_workers = max(1, min(config.max_concurrent, len(work)))
+        flush_every = config.flush_every
+        for offset in range(0, len(work), flush_every):
+            window = work[offset : offset + flush_every]
+            max_workers = max(1, min(config.max_concurrent, len(window)))
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers
             ) as pool:
                 # Preserve input order; surface the first failure deterministically.
-                for completed in pool.map(_one, work):
+                for completed in pool.map(_one, window):
                     del completed
+            _publish_window(window)
+            # Release this window's completions before the next one runs.
+            for item in window:
+                item.rows = []
     except BudgetExceededError as e:
-        # Exhaustion fires before the next provider call. This model writes once
-        # at the end, so nothing is published and state is unchanged; return a
-        # budget_exceeded result (with partial usage) so run_project records the
-        # status and skips descendants instead of aborting the invocation.
+        # Exhaustion fires before the next provider call. Windows already
+        # published stay, with their state advanced; the partial window in
+        # flight is discarded and re-called next run, matching how extraction
+        # treats an unpublished buffer. Return budget_exceeded so run_project
+        # records the status and skips descendants.
         run_status = "budget_exceeded"
         errors.append(f"BudgetExceededError: {e}")
+    except RunError:
+        raise
     except Exception as e:
         raise RunError(
             f"llm model '{model.name}' provider execution failed: "
             f"{artifact_error_text(e)}"
         ) from e
 
-    output_rows: list[dict[str, Any]] = []
-    rows_written = 0
     if run_status is None:
-        now = datetime.now(UTC).isoformat()
-        output_schema = _llm_output_schema(model, config, source)
-        for item in work:
-            output_rows.extend(
-                _llm_output_rows(
-                    item, config=config, runtime=runtime, generated_at=now
-                )
-            )
-        output = _llm_output_frame(output_rows, schema=output_schema, model=model)
-        state_records = [
-            StateRecord(item.record_id, item.input_fingerprint, code_version)
-            for item in work
-        ]
-        key_col = (
-            config.row_id_field
-            if config.output_cardinality == "many"
-            else config.id_field
-        )
-
-        use_full = model.materialization == "full" or full_refresh or rebuild_target
         try:
-            if use_full:
-                rows_written = adapter.materialize_full(
+            if not publisher.published_any and use_full:
+                # Nothing to write, but a rebuild still owes the target its table.
+                adapter.replace_state(state_scope, [])
+                publisher.rows_written += adapter.materialize_full(
                     model.name,
-                    output,
+                    _llm_output_frame([], schema=output_schema, model=model),
                     options=warehouse_opts,
                 )
-                adapter.replace_state(state_scope, state_records)
-            else:
-                if config.output_cardinality == "many":
-                    rows_written = adapter.replace_children(
-                        model.name,
-                        parent_key=config.id_field,
-                        parent_ids=[item.id_value for item in work],
-                        child_key=key_col,
-                        new_rows=output,
-                        state_scope=state_scope,
-                        state_records=state_records,
-                        on_schema_change=model.on_schema_change,
-                        options=warehouse_opts,
-                    )
-                    if removed:
-                        adapter.delete_rows_and_state(
-                            model.name,
-                            key_col=config.id_field,
-                            keys=removed_id_values,
-                            state_scope=state_scope,
-                            state_record_keys=removed,
-                        )
-                else:
-                    if output_rows:
-                        rows_written = adapter.materialize_incremental(
-                            model.name,
-                            output,
-                            key_col=key_col,
-                            on_schema_change=model.on_schema_change,
-                            options=warehouse_opts,
-                            update_when_changed=model.update_when_changed,
-                        )
-                    if removed:
-                        adapter.delete_rows_and_state(
-                            model.name,
-                            key_col=config.id_field,
-                            keys=removed_id_values,
-                            state_scope=state_scope,
-                            state_record_keys=removed,
-                        )
-                    if state_records:
-                        adapter.upsert_state(state_scope, state_records)
+            if removed and not use_full:
+                adapter.delete_rows_and_state(
+                    model.name,
+                    key_col=config.id_field,
+                    keys=removed_id_values,
+                    state_scope=state_scope,
+                    state_record_keys=removed,
+                )
         except AdapterError as e:
             raise RunError(str(e)) from e
 
@@ -440,7 +483,7 @@ def run_llm_model(
         # every input was skipped (no provider calls this run).
         "api_calls": usage_totals.get("api_calls", 0),
         "cache_hits": usage_totals.get("cache_hits", 0),
-        "rows_generated": len(output_rows),
+        "rows_generated": rows_generated,
         "inputs_processed": len(work),
         **usage_totals,
     }
@@ -457,7 +500,7 @@ def run_llm_model(
         documents_processed=len(work),
         documents_skipped=skipped,
         documents_deleted=len(removed),
-        rows_written=rows_written,
+        rows_written=publisher.rows_written,
         errors=errors,
         metrics=metrics,
         artifact_metadata={"llm": runtime.identity()},

@@ -32,6 +32,7 @@ from ..embedding import EmbeddingIdentity, embed_texts
 from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
 from ..versioning import compute_model_code_version
+from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
 from .errors import artifact_error_text
 from .usage import add_provider_usage
@@ -130,14 +131,18 @@ def run_embed_model(
     cache_hits = 0
     embedded_count = 0
     processed = 0
-    rows_written = 0
     usage_totals: dict[str, int | float] = {}
     provider_batches = 0
     provider_calls = 0
     use_full = model.materialization == "full" or full_refresh or rebuild_target
-    first_publication = True
-    published_any = False
     now = datetime.now(UTC).isoformat()
+    output_schema = _embedding_output_schema(source, vector_field=config.vector_field)
+    publisher = FlushPublisher(
+        adapter,
+        model_name=model.name,
+        state_scope=state_scope,
+        use_full=use_full,
+    )
 
     def _window(record_id: str, record: dict[str, Any]) -> _EmbedWork | None:
         """Decide this record's fate without holding anything corpus-sized."""
@@ -237,11 +242,12 @@ def run_embed_model(
     def _publish(window: list[_EmbedWork]) -> None:
         """Publish one flush, then advance state for exactly its rows.
 
-        Publish-then-state, matching extraction (#139): an interrupted run
-        never records a row it did not write, so the next run re-embeds only
-        what was actually lost.
+        Ordering is `FlushPublisher`'s, not this module's: a full rebuild
+        clears state before its first write, state advances only after a write
+        lands, and a warehouse failure is reported without the warehouse's own
+        text. Those rules are identical for every flushing stage, and the one
+        time each stage implemented them separately they diverged.
         """
-        nonlocal rows_written, first_publication, published_any
         frame = pl.DataFrame(
             [
                 _embedding_row(
@@ -251,70 +257,61 @@ def run_embed_model(
                     embedded_at=item.embedded_at or now,
                 )
                 for item in window
-            ]
+            ],
+            schema=output_schema,
         )
-        state_records = [
-            StateRecord(item.record_id, item.input_fingerprint, code_version)
-            for item in window
-        ]
-        if use_full and first_publication:
-            # The first flush of a rebuild replaces the target; later flushes
-            # merge into it. This is the one real trade in #401: a full
-            # refresh is no longer a single atomic swap, so an interrupted
-            # rebuild leaves a partially rebuilt table that the next run
-            # completes from state. The alternative is the status quo, where
-            # a large corpus cannot be rebuilt at all.
-            rows_written += adapter.materialize_full(
+        publisher.publish(
+            write_full=lambda: adapter.materialize_full(
                 model.name,
                 frame,
                 options=warehouse_opts,
-            )
-            adapter.replace_state(state_scope, state_records)
-        else:
-            rows_written += adapter.materialize_incremental(
+            ),
+            write_incremental=lambda: adapter.materialize_incremental(
                 model.name,
                 frame,
                 key_col=config.id_field,
-                # Run-over-run drift is the model's policy on the first
-                # publication; later publications in the same run union
-                # within-run drift, exactly as extraction does.
                 on_schema_change=(
                     model.on_schema_change
-                    if first_publication
+                    if publisher.first_publication
                     else "append_new_columns"
                 ),
                 options=warehouse_opts,
                 update_when_changed=model.update_when_changed,
-            )
-            adapter.upsert_state(state_scope, state_records)
-        first_publication = False
-        published_any = True
+            ),
+            state_records=[
+                StateRecord(item.record_id, item.input_fingerprint, code_version)
+                for item in window
+            ],
+        )
 
-    try:
-        for window in _iter_windows():
+    for window in _iter_windows():
+        # Provider failures and publication failures are kept apart on
+        # purpose. `artifact_error_text` exists to sanitize *provider* text;
+        # routing a warehouse error through it hands the raw message to its
+        # fallback, and that message can quote the offending row and the
+        # statement that touched it (issue #401 review).
+        try:
             _embed_window(window)
-            processed += len(window)
-            _publish(window)
-            # Drop the window's vectors before the next one is built. Without
-            # this the generator's reference keeps one extra flush alive.
-            window.clear()
-    except AdapterError as e:
-        raise RunError(str(e)) from e
-    except Exception as e:
-        raise RunError(
-            f"Embed model '{model.name}' provider execution failed: "
-            f"{artifact_error_text(e)}"
-        ) from e
+        except Exception as e:
+            raise RunError(
+                f"Embed model '{model.name}' provider execution failed: "
+                f"{artifact_error_text(e)}"
+            ) from e
+        processed += len(window)
+        _publish(window)
+        # Drop the window's vectors before the next one is built. Without
+        # this the generator's reference keeps one extra flush alive.
+        window.clear()
 
     try:
-        if not published_any and use_full:
+        if not publisher.published_any and use_full:
             # Nothing to write, but a rebuild still owes the target its table.
-            rows_written = adapter.materialize_full(
+            adapter.replace_state(state_scope, [])
+            publisher.rows_written += adapter.materialize_full(
                 model.name,
                 _empty_embedding_frame(source, vector_field=config.vector_field),
                 options=warehouse_opts,
             )
-            adapter.replace_state(state_scope, [])
         if removed and not use_full:
             adapter.delete_rows_and_state(
                 model.name,
@@ -345,7 +342,7 @@ def run_embed_model(
         documents_processed=processed,
         documents_skipped=skipped,
         documents_deleted=len(removed),
-        rows_written=rows_written,
+        rows_written=publisher.rows_written,
         metrics=metrics,
         artifact_metadata={"embedding": identity.to_dict()},
     )
@@ -438,11 +435,19 @@ def _embedding_row(
     return row
 
 
-def _empty_embedding_frame(
+def _embedding_output_schema(
     source: pl.DataFrame,
     *,
     vector_field: str,
-) -> pl.DataFrame:
+) -> dict[str, Any]:
+    """The output schema, fixed for the whole run.
+
+    Every flush frame is built with this rather than inferred from its own
+    rows (issue #401 review). A passthrough column that happens to be all-NULL
+    in the first flush would otherwise infer as Null, the target column would
+    be created from that, and a later flush carrying real values would fail on
+    conversion -- after its provider calls had been paid for.
+    """
     schema: dict[str, Any] = dict(source.schema)
     schema.update(
         {
@@ -456,4 +461,14 @@ def _empty_embedding_frame(
             "embedded_at": pl.String,
         }
     )
-    return pl.DataFrame(schema=schema)
+    return schema
+
+
+def _empty_embedding_frame(
+    source: pl.DataFrame,
+    *,
+    vector_field: str,
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        schema=_embedding_output_schema(source, vector_field=vector_field)
+    )

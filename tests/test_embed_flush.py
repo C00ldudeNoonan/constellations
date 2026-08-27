@@ -251,3 +251,71 @@ def test_publications_are_bounded_by_flush_every(
     assert heights, "the embed model never published"
     assert max(heights) <= 2
     assert sum(heights) == DOCUMENTS
+
+
+# ─── review follow-ups (PR #402) ────────────────────────────────────────────
+
+
+def test_a_column_null_in_the_first_flush_does_not_break_a_later_one(
+    tmp_path: Path,
+) -> None:
+    """Every flush frame is built with a schema fixed for the whole run.
+
+    Inferring each frame from its own rows lets a passthrough column that
+    happens to be all-NULL in the opening flush create the target column from
+    `Null`. The later flush carrying real values then fails on conversion —
+    after its provider calls have been paid for, which is precisely the loss
+    this issue exists to stop.
+    """
+    project = _project(tmp_path, flush_every=2)
+    # `note` is absent from the first four documents and present afterwards,
+    # so with flush_every=2 the first two flushes see nothing but NULL.
+    (project / "models" / "documents.yml").write_text(
+        (project / "models" / "documents.yml")
+        .read_text(encoding="utf-8")
+        .replace("fields: [title, body]", "fields: [title, body, note]"),
+        encoding="utf-8",
+    )
+    for index in range(DOCUMENTS):
+        payload: dict[str, Any] = {"title": f"Release {index}", "body": f"body {index}"}
+        if index >= 4:
+            payload["note"] = f"note {index}"
+        (project / "data" / f"doc{index}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    run_project(project)
+
+    notes = _query(
+        project,
+        'SELECT note FROM "db".docs.document_embeddings ORDER BY chunk_id',
+    )
+    assert len(notes) == DOCUMENTS
+    assert sum(1 for note in notes if note[0] is not None) == DOCUMENTS - 4
+
+
+def test_a_warehouse_failure_is_not_reported_as_a_provider_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publication errors and provider errors take different sanitizers.
+    Routing a warehouse error through the provider path hands its raw text to
+    the fallback, and that text can quote the offending row and the SQL."""
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    secret = "row value 123-45-6789 in INSERT INTO"
+
+    def exploding(self: Any, *args: Any, **kwargs: Any) -> Any:
+        del self, args, kwargs
+        raise ValueError(secret)
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    monkeypatch.setattr(DuckDBAdapter, "materialize_full", exploding)
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", exploding)
+
+    with pytest.raises(RunError) as caught:
+        run_project(project, select="document_embeddings")
+
+    assert secret not in str(caught.value)
+    assert "provider execution failed" not in str(caught.value)

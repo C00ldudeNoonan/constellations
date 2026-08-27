@@ -88,3 +88,28 @@ produced it; the ordinal prefix keeps repeated prompts ("continue") from
 colliding. Tool exhaust never reaches the index: each call is reduced to its
 name, an argument fingerprint, its outcome, and the byte count of the output
 that was dropped.
+
+## Serving from DuckDB instead of LanceDB
+
+`profiles.yml` carries a second target, `dev_duckdb`, that publishes the same
+index to a DuckDB-native store (issue #371):
+
+```bash
+stel build --target dev_duckdb
+```
+
+Nothing under `models/` changes. The search model names a store *alias*, not a
+store type, so which engine serves it is a target concern — which is the point
+of the exercise: the switch is configuration, not model logic.
+
+The DuckDB target points its retrieval store at `target/transcripts.duckdb` —
+the warehouse file itself. Vector search (`vss`) and BM25 (`fts`) run in the
+same database as the canonical rows, so this target stands up no second
+system; `target/lancedb/` is never created.
+
+Both targets return identical results for vector, text, and hybrid queries
+over this corpus, which `tests/test_duckdb_search_example.py` asserts rather
+than asserts about. Hybrid is worth noting: neither store computes it. Each
+serves the two legs and stel fuses them with RRF, so the fused ranking
+matching across stores is a property of the legs agreeing, not of a shared
+implementation.

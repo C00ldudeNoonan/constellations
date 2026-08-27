@@ -83,7 +83,7 @@ The core install stays lean. Add only the feature groups a project uses:
 | `bigquery` | BigQuery warehouse adapter |
 | `gcs` | Google Cloud Storage document sources |
 | `vertex` | Google Vertex AI text embeddings (`google-genai`) |
-| `lancedb` | Local LanceDB search-index publication and queries |
+| `lancedb` | Local LanceDB search-index publication and queries (the `duckdb` search store needs no extra) |
 | [`mcp`](mcp.md) | Read-only governed context server over MCP stdio |
 | `all` | Every optional feature above |
 
@@ -1833,8 +1833,10 @@ uv run stel prompts check
 
 A `search:` resource publishes exactly one upstream warehouse model to an
 independently configured retrieval store. It is a leaf serving resource, not a
-warehouse relation. Install `stel[lancedb]`, configure the operator-owned
-store in `profiles.yml`, and explicitly opt in to public indexes:
+warehouse relation. Two stores ship: `duckdb`, which needs no extra and can
+live in the warehouse file itself, and `lancedb`, which needs
+`stel[lancedb]`. Configure the operator-owned store in `profiles.yml` and
+explicitly opt in to public indexes:
 
 ```yaml
 my_project:
@@ -1853,6 +1855,90 @@ my_project:
             type: lancedb
             path: ./target/lancedb
 ```
+
+### DuckDB-native search
+
+When the warehouse is already DuckDB, a separate retrieval system is an extra
+moving part for no reason. The `duckdb` store serves vector and full-text
+search from a DuckDB file — optionally the same file as the warehouse — using
+the `vss` and `fts` extensions:
+
+```yaml
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: duckdb
+            path: ./target/stel.duckdb
+```
+
+`duckdb` is a core dependency, so this needs no extra; the `vss` and `fts`
+extensions are installed on first connect, which requires network access once
+(an air-gapped host must have them pre-installed). The store opens its own
+connection and closes only that connection, so pointing it at the warehouse
+file does not close the database out from under the warehouse adapter.
+
+Three behaviors are worth knowing before choosing it:
+
+**Approximate vector search is opt-in.** DuckDB will not build a persistent
+HNSW index unless `hnsw_experimental_persistence` is set, because that index
+is not covered by the write-ahead log and a crash can leave it inconsistent
+with the table. stel will not set that flag for you: declaring
+`vector: {search: approximate}` without it fails at publish with an
+explanation rather than silently accepting the risk. Exact search needs no
+index and returns the same rows — the cost of declining is latency, not
+correctness:
+
+```yaml
+          local:
+            type: duckdb
+            path: ./target/stel.duckdb
+            hnsw_experimental_persistence: true
+            hnsw_ef_construction: 128
+            hnsw_m: 16
+```
+
+**Indexes are rebuilt at publish, not maintained.** DuckDB's HNSW index does
+not compact on delete, so an incrementally churned index would grow without
+bound; the BM25 index is a snapshot of the table at build time rather than a
+live view. Both are rebuilt when a publish completes, which keeps publish cost
+predictable and query cost flat.
+
+**Hybrid search is composed, not native.** DuckDB has no operator that blends
+`vss` and `fts` ranking, so hybrid runs both legs and stel fuses them with
+RRF. This is a supported shape, not a limitation of the store's honesty about
+itself.
+
+Ownership is stamped in the table comment and read back through DuckDB's
+catalog, so a table stel did not create is refused rather than published into.
+
+#### What is and is not atomic
+
+Stating this explicitly because the guarantees differ from a remote store's,
+and the difference is invisible until it matters:
+
+- **One upsert batch is atomic.** It runs as a single statement inside a real
+  transaction, so a partial batch is not a state any reader can observe.
+- **A delete batch is atomic**, for the same reason.
+- **A publish as a whole is not.** Creating the collection, writing rows, and
+  rebuilding indexes are separate transactions. A crash between them leaves a
+  collection that exists and is stamped but whose indexes lag its rows;
+  re-running the publish converges it.
+- **Index rebuilds are not atomic with the writes they follow.** Between the
+  bulk mutation and the rebuild, full-text queries reflect the previous BM25
+  snapshot. Vector queries are unaffected, since exact search reads the table
+  directly.
+- **Concurrent readers during a publish see the collection mid-update.** stel
+  fences concurrent *publishers* on one host, but it does not snapshot the
+  collection for readers, and DuckDB offers no rename-based swap that would
+  give one without a second copy of the data.
+
+The single-host publisher lock is the boundary from issue #152 and is unchanged
+here: it excludes another publisher on the same machine and cannot fence one on
+another machine sharing the file. DuckDB's own single-writer rule does catch
+that case, but as a lock error rather than as coordination — stel reports it
+as `duckdb_database_locked` so it reads as a concurrent publisher rather than
+a misconfiguration.
 
 The project model declares the portable serving contract:
 

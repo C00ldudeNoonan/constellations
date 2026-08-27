@@ -27,7 +27,12 @@ from typing import Any, Protocol
 
 from ..adapters.base import ReadPredicate, ReadPredicateOperator
 from ..search import SearchFilter, SearchFilterOperator
-from .authorization import AuthorizationError, PolicyAttribute, Principal
+from .authorization import (
+    AuthorizationError,
+    PolicyAttribute,
+    Principal,
+    policy_values_overlap,
+)
 
 # Columns the grants relation must provide. Named rather than inferred so a
 # relation that drifted fails with the missing column instead of silently
@@ -194,16 +199,23 @@ class GrantAuthorizationProvider:
         granted = _granted_values(self._store, principal.subject_id)
         filters: list[SearchFilter] = []
         for attribute in attributes:
-            if attribute.data_type == "array[string]":
-                raise AuthorizationError(
-                    "The active retrieval store cannot compile array-valued "
-                    "policy claims"
-                )
             values = granted.get(attribute.name, ())
             if not values:
                 raise AuthorizationError(
                     "The caller has no grant for every required policy attribute"
                 )
+            if attribute.data_type == "array[string]":
+                # Several grant rows for one attribute already collect into a
+                # set, which is exactly the shape an overlap test wants
+                # (issue #397).
+                filters.append(
+                    SearchFilter(
+                        attribute.name,
+                        SearchFilterOperator.ARRAY_CONTAINS_ANY,
+                        values,
+                    )
+                )
+                continue
             filters.append(
                 SearchFilter(
                     attribute.name,
@@ -243,6 +255,10 @@ class GrantAuthorizationProvider:
         for attribute in attributes:
             allowed = granted.get(attribute.name, ())
             value = row.get(attribute.name)
+            if attribute.data_type == "array[string]":
+                if not policy_values_overlap(value, allowed):
+                    return False
+                continue
             if not isinstance(value, str) or value not in allowed:
                 return False
         return True

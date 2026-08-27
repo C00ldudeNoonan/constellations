@@ -59,9 +59,16 @@ class SearchFilterOperator(StrEnum):
     GREATER_THAN = "gt"
     GREATER_THAN_OR_EQUAL = "ge"
     IN = "in"
+    # Overlap against an array-valued attribute (issue #397): "the row's
+    # groups include at least one of mine". IN cannot express this -- it asks
+    # whether a scalar column is one of several values, which is the inverse.
+    ARRAY_CONTAINS_ANY = "array_contains_any"
 
 
 SearchScalar = str | int | float | bool | date | datetime
+_TUPLE_VALUED_FILTER_OPERATORS = frozenset(
+    {SearchFilterOperator.IN, SearchFilterOperator.ARRAY_CONTAINS_ANY}
+)
 _SCORE_COLUMNS = ("_distance", "_score", "_relevance_score")
 _RESERVED_SCORE_COLUMNS = frozenset(_SCORE_COLUMNS)
 
@@ -80,10 +87,12 @@ class SearchFilter:
         except ValueError:
             raise ValueError("search filter operator is invalid") from None
         object.__setattr__(self, "operator", operator)
-        if operator == SearchFilterOperator.IN:
+        if operator in _TUPLE_VALUED_FILTER_OPERATORS:
             values = tuple(self.value) if isinstance(self.value, list | tuple) else ()
             if not values:
-                raise ValueError("search IN filters require at least one value")
+                raise ValueError(
+                    f"search {operator.value} filters require at least one value"
+                )
             object.__setattr__(self, "value", values)
         elif isinstance(self.value, list | tuple):
             raise ValueError("search scalar filters require one value")
@@ -295,6 +304,7 @@ def search(
         request,
         store.capabilities(),
         store_type=store_config.type,
+        policy_filters=policy_filters,
     )
     if search_config.access == "governed":
         if request.consistency != "strong":
@@ -430,6 +440,7 @@ def _validate_capabilities(
     capabilities: Any,
     *,
     store_type: str,
+    policy_filters: Sequence[SearchFilter],
 ) -> None:
     search_config = model.search
     assert search_config is not None
@@ -453,6 +464,13 @@ def _validate_capabilities(
         required[RetrievalFeature.METADATA_FILTERING] = "query filters"
     if search_config.access == "governed":
         required[RetrievalFeature.METADATA_FILTERING] = "mandatory policy prefilters"
+    if any(
+        item.operator == SearchFilterOperator.ARRAY_CONTAINS_ANY
+        for item in (*request.filters, *policy_filters)
+    ):
+        required[RetrievalFeature.ARRAY_CONTAINMENT_FILTERS] = (
+            "array-valued attribute filters"
+        )
     try:
         capabilities.require(required, store_type=store_type)
     except RetrievalCapabilityError as error:
@@ -556,6 +574,7 @@ def _resolve_policy_predicates(
             raise SearchError(
                 f"Field '{item.field}' is not a policy attribute of this search index"
             )
+        _reject_operator_type_mismatch(item, attribute)
         value = _coerce_filter_value(item.value, attribute)
         predicates.append(
             RetrievalPredicate(
@@ -586,11 +605,13 @@ def _resolve_predicates(
         attribute = attributes.get(item.field)
         if attribute is None or attribute.filter_role not in {"user", "user_and_policy"}:
             raise SearchError(f"Field '{item.field}' is not available for user filtering")
+        _reject_operator_type_mismatch(item, attribute)
         value = _coerce_filter_value(item.value, attribute)
         if item.operator not in {
             SearchFilterOperator.EQUAL,
             SearchFilterOperator.NOT_EQUAL,
             SearchFilterOperator.IN,
+            SearchFilterOperator.ARRAY_CONTAINS_ANY,
         } and attribute.data_type in {"boolean", "array[string]"}:
             raise SearchError(
                 f"Operator '{item.operator.value}' is not valid for field '{item.field}'"
@@ -603,6 +624,33 @@ def _resolve_predicates(
             )
         )
     return tuple(predicates)
+
+
+def _reject_operator_type_mismatch(
+    item: SearchFilter,
+    attribute: SearchAttributeConfig,
+) -> None:
+    """Keep array overlap and scalar comparison from being used for each other.
+
+    Both directions are silent failures otherwise. `array_contains_any` on a
+    scalar column asks a question the column cannot answer, and a scalar
+    operator on an array column compares a list against one value -- which a
+    store may reject, or may quietly evaluate false for every row, leaving a
+    governed query that returns nothing and looks like an empty result set.
+    """
+    is_array_attribute = attribute.data_type == "array[string]"
+    uses_overlap = item.operator == SearchFilterOperator.ARRAY_CONTAINS_ANY
+    if uses_overlap and not is_array_attribute:
+        raise SearchError(
+            f"Operator '{item.operator.value}' requires an array-valued field, "
+            f"but '{item.field}' is declared {attribute.data_type}"
+        )
+    if is_array_attribute and not uses_overlap:
+        raise SearchError(
+            f"Field '{item.field}' is array-valued, so it must be filtered with "
+            f"'{SearchFilterOperator.ARRAY_CONTAINS_ANY.value}', not "
+            f"'{item.operator.value}'"
+        )
 
 
 def _coerce_filter_value(

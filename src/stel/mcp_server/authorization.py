@@ -146,6 +146,23 @@ def _current_http_request() -> Any:
     return getattr(context, "request", None) if context is not None else None
 
 
+def policy_values_overlap(
+    row_value: Any,
+    allowed: SearchScalar | tuple[SearchScalar, ...],
+) -> bool:
+    """Whether an array-valued row attribute shares an element with the policy.
+
+    An absent or empty list is refused, matching the scalar rule: a row that
+    carries no value for a required attribute is not thereby public. Non-string
+    elements are ignored rather than coerced, so a malformed row cannot match
+    by stringification, and a bare string is not treated as a one-element list.
+    """
+    if not isinstance(row_value, list | tuple):
+        return False
+    permitted = allowed if isinstance(allowed, tuple) else (allowed,)
+    return any(item in permitted for item in row_value if isinstance(item, str))
+
+
 class AuthorizationProvider(Protocol):
     def search_policy_filters(
         self,
@@ -183,15 +200,23 @@ class ClaimAuthorizationProvider:
             return ()
         filters: list[SearchFilter] = []
         for attribute in attributes:
-            if attribute.data_type == "array[string]":
-                raise AuthorizationError(
-                    "The active retrieval store cannot compile array-valued policy claims"
-                )
             value = self._claim_value(principal, attribute.name)
             if value is None or value == ():
                 raise AuthorizationError(
                     "The caller has no trusted value for every required policy attribute"
                 )
+            if attribute.data_type == "array[string]":
+                # The row holds a list and the claim is the set to overlap it
+                # with, so a single claim still compiles to a one-element set
+                # rather than an equality test against a list (issue #397).
+                filters.append(
+                    SearchFilter(
+                        attribute.name,
+                        SearchFilterOperator.ARRAY_CONTAINS_ANY,
+                        value if isinstance(value, tuple) else (value,),
+                    )
+                )
+                continue
             operator = (
                 SearchFilterOperator.IN
                 if isinstance(value, tuple)
@@ -236,6 +261,15 @@ class ClaimAuthorizationProvider:
             row_value = row.get(attribute.name)
             if claim is None or row_value is None:
                 return False
+            if attribute.data_type == "array[string]":
+                # The row holds a list, so the question is overlap, not
+                # membership. Comparing the list against the claim tuple
+                # rejects every row, including the ones the prefilter just
+                # selected (issue #397).
+                if not policy_values_overlap(row_value, claim):
+                    return False
+                matched = True
+                continue
             if isinstance(claim, tuple):
                 if row_value not in claim:
                     return False
@@ -263,7 +297,9 @@ class ClaimAuthorizationProvider:
             return principal.policy_claims[field]
         if field in {"tenant", "tenant_id"}:
             return principal.tenant_id
-        if field in {"access_group", "group"}:
+        # `access_groups` is the name the agent-context contract documents for
+        # the array-valued form; the singular aliases predate it (issue #397).
+        if field in {"access_groups", "access_group", "group"}:
             return principal.access_groups
         return None
 

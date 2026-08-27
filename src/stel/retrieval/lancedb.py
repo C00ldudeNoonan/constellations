@@ -250,6 +250,9 @@ class LanceDBStore(RetrievalStore):
                     # `add_columns` widens a live table without rewriting
                     # its rows (issue #344).
                     RetrievalFeature.ONLINE_SCHEMA_EVOLUTION,
+                    # DataFusion's `array_has_any` expresses set overlap
+                    # against a list column (issue #397).
+                    RetrievalFeature.ARRAY_CONTAINMENT_FILTERS,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                     # Build under a private name, drop later; the swap itself
                     # is a warehouse row update, not a LanceDB operation
@@ -877,6 +880,10 @@ def _compile_predicates(predicates: Sequence[RetrievalPredicate]) -> str | None:
             assert isinstance(predicate.value, tuple)
             values = ", ".join(_sql_literal(value) for value in predicate.value)
             clauses.append(f"{field} IN ({values})")
+        elif predicate.operator == RetrievalPredicateOperator.ARRAY_CONTAINS_ANY:
+            assert isinstance(predicate.value, tuple)
+            values = ", ".join(_sql_literal(value) for value in predicate.value)
+            clauses.append(f"array_has_any({field}, [{values}])")
         else:
             assert not isinstance(predicate.value, tuple)
             clauses.append(

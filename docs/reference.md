@@ -1904,10 +1904,23 @@ stel search --model chunk_search --query "labor market" \
 ```
 
 Filters are repeatable `FIELD OP VALUE` triples. Operators are `eq`, `ne`,
-`lt`, `le`, `gt`, `ge`, and `in`; `in` takes a JSON array. Values are parsed
-against the attribute's declared type, and only attributes with
-`filter_role: user` can be supplied by a caller. Multiple filters are combined
-with AND.
+`lt`, `le`, `gt`, `ge`, `in`, and `array_contains_any`; the last two take a
+JSON array. Values are parsed against the attribute's declared type, and only
+attributes with `filter_role: user` can be supplied by a caller. Multiple
+filters are combined with AND.
+
+An `array[string]` attribute holds a list per row, so it is filtered by
+overlap and `array_contains_any` is the only operator accepted for it — the
+scalar operators would compare a whole list against one value:
+
+```bash
+stel search --model chunk_search --query "inflation"   --filter access_groups array_contains_any '["analysts", "ops"]'
+```
+
+The row matches when its list shares at least one value with the array given.
+The retrieval store must advertise the `array_containment_filters` capability;
+one that cannot express overlap refuses the query rather than dropping the
+filter.
 
 Every declared `data_type` is filterable, temporal types included:
 

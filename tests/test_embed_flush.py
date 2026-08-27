@@ -319,3 +319,275 @@ def test_a_warehouse_failure_is_not_reported_as_a_provider_failure(
 
     assert secret not in str(caught.value)
     assert "provider execution failed" not in str(caught.value)
+
+
+# ─── the resume path is bounded (issue #401 follow-up) ──────────────────────
+
+
+def test_resume_never_reads_the_whole_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix for the accumulate-everything run made a second wall reachable:
+    on resume, the old code read the entire existing target -- vectors
+    included -- into Python dicts before the first provider call. ~25KB per
+    768-dim row is ~90GB at 3.6M chunks, on a path only reachable once the
+    corpus has already proven itself that large.
+
+    Asserted where it is observable: a resume may read the target only
+    through zero-row schema probes and projected snapshot reads, never as a
+    full read_table materialization.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)  # first run publishes the target
+
+    full_reads: list[str] = []
+    original = DuckDBAdapter.read_table
+
+    def spy(self: Any, table: str, *, limit: int | None = None) -> Any:
+        if table == "document_embeddings" and limit != 0:
+            full_reads.append(table)
+        return original(self, table, limit=limit)
+
+    monkeypatch.setattr(DuckDBAdapter, "read_table", spy)
+    # Touch one chunk's text so the resume has real work to do.
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        connection.execute(
+            "UPDATE \"db\".docs.document_chunks SET text = 'revised' "
+            "WHERE chunk_id = (SELECT min(chunk_id) FROM \"db\".docs.document_chunks)"
+        )
+    finally:
+        connection.close()
+
+    run_project(project, select="document_embeddings")
+
+    assert full_reads == []
+
+
+def test_resume_still_reuses_vectors_for_metadata_only_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole-target load existed to serve vector reuse. The bounded
+    per-window lookup must keep serving it, or every metadata-only change
+    becomes a paid re-embedding -- correct output, silent cost."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+
+    # A run over an unchanged corpus: everything skips via state, no provider
+    # calls, no reuse needed. Then force fingerprints to move without moving
+    # text, which is exactly the reuse case: state misses, text hash matches.
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # Mutate an existing passthrough column so every fingerprint moves
+        # while every text hash stays put -- the exact reuse case.
+        connection.execute(
+            "UPDATE \"db\".docs.document_chunks SET title = title || ' (reclassified)'"
+        )
+    finally:
+        connection.close()
+
+    [result] = run_project(project, select="document_embeddings")
+
+    # Every row was re-fingerprinted, none re-embedded.
+    assert result.documents_processed == DOCUMENTS
+    assert calls["n"] == 0
+    assert result.metrics["cache_hits"] == DOCUMENTS
+
+
+# ─── the run budget can finally see embed spend ─────────────────────────────
+
+
+def test_a_budget_stop_is_graceful_and_resumable(tmp_path: Path) -> None:
+    """Embeds were the only provider-spending stage the run budget could not
+    gate: --max-cost stopped extraction and llm calls while a Vertex embed
+    run spent freely. And a cap is only worth having if hitting it behaves
+    like a crash at the same point -- published windows stay, state covers
+    exactly them, and raising the cap resumes for the remainder.
+    """
+    project = _project(tmp_path, flush_every=2)
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      llm:\n"
+        "        provider: deterministic\n"
+        "        model: deterministic-v1\n"
+        "        budget:\n"
+        "          max_api_calls: 4\n",
+        encoding="utf-8",
+    )
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+
+    [capped] = run_project(project, select="document_embeddings")
+
+    assert capped.status == "budget_exceeded"
+    assert any("BudgetExceededError" in error for error in capped.errors)
+    # Two windows of two landed before the cap; nothing after it mutated.
+    assert _embedded_count(project) == 4
+
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8").replace(
+            "max_api_calls: 4", "max_api_calls: 100"
+        ),
+        encoding="utf-8",
+    )
+    [resumed] = run_project(project, select="document_embeddings")
+
+    assert resumed.status is None
+    assert resumed.metrics["provider_calls"] == DOCUMENTS - 4
+    assert _embedded_count(project) == DOCUMENTS
+
+
+# ─── review follow-ups (PR #407) ────────────────────────────────────────────
+
+
+def test_headroom_reserves_every_split_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider may fan one logical batch into many billed requests --
+    Vertex issues one per text for gemini-embedding models. Reserving one
+    slot per batch would let max_api_calls: 1 admit all of them before the
+    charge lands; the reservation must match what the provider says it will
+    bill."""
+    monkeypatch.setattr(
+        DeterministicEmbeddingProvider,
+        "estimate_provider_requests",
+        lambda self, request: len(request.texts),
+    )
+    project = _project(tmp_path, flush_every=7)
+    # batch_size 7 in one window; a fan-out-aware reservation of 7 must trip
+    # a cap of 4 BEFORE the first call, so nothing is billed at all.
+    model_path = project / "models" / "documents.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace(
+            "batch_size: 1", "batch_size: 7"
+        ),
+        encoding="utf-8",
+    )
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      llm:\n"
+        "        provider: deterministic\n"
+        "        model: deterministic-v1\n"
+        "        budget:\n"
+        "          max_api_calls: 4\n",
+        encoding="utf-8",
+    )
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+
+    [capped] = run_project(project, select="document_embeddings")
+
+    assert capped.status == "budget_exceeded"
+    assert capped.metrics["provider_calls"] == 0
+    # Nothing was billed, so nothing was published -- not even the table.
+    tables = _query(
+        project,
+        "SELECT table_name FROM duckdb_tables() "
+        "WHERE table_name = 'document_embeddings'",
+    )
+    assert tables == []
+
+
+def test_a_budget_stop_does_not_claim_deletions_it_skipped(
+    tmp_path: Path,
+) -> None:
+    """The budget stop skips the removed-row deletion pass; the result must
+    say zero, not the plan. A manifest claiming mutations that did not occur
+    is the kind of lie an operator acts on."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # Remove one upstream chunk and change two rows' text, so the run has
+        # a deletion to plan and enough provider work for a cap of 1 (the
+        # ledger's floor) to trip mid-window, before the deletion pass.
+        connection.execute(
+            'DELETE FROM "db".docs.document_chunks WHERE chunk_id = '
+            '(SELECT min(chunk_id) FROM "db".docs.document_chunks)'
+        )
+        connection.execute(
+            "UPDATE \"db\".docs.document_chunks SET text = 'revised-' || chunk_id "
+            "WHERE chunk_id IN (SELECT chunk_id FROM \"db\".docs.document_chunks "
+            "ORDER BY chunk_id DESC LIMIT 2)"
+        )
+    finally:
+        connection.close()
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      llm:\n"
+        "        provider: deterministic\n"
+        "        model: deterministic-v1\n"
+        "        budget:\n"
+        "          max_api_calls: 1\n",
+        encoding="utf-8",
+    )
+
+    [capped] = run_project(project, select="document_embeddings")
+
+    assert capped.status == "budget_exceeded"
+    assert capped.documents_deleted == 0
+    # The removed row is still in the target, consistent with the report.
+    assert _embedded_count(project) == DOCUMENTS
+
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8").replace(
+            "max_api_calls: 1", "max_api_calls: 100"
+        ),
+        encoding="utf-8",
+    )
+    [resumed] = run_project(project, select="document_embeddings")
+
+    assert resumed.documents_deleted == 1
+    assert _embedded_count(project) == DOCUMENTS - 1
+
+
+def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    """The read-predicate contract carries strings, numbers, bools, and
+    temporals -- not decimal.Decimal, which a DuckDB DECIMAL or BigQuery
+    NUMERIC id column produces. The old whole-target dict handled those ids,
+    so the bounded path must not turn them into a failed resume: it skips
+    reuse for such rows (a paid re-embed, same price as changed text), never
+    an error."""
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.execute(
+            'CREATE TABLE "w".docs.emb ('
+            "chunk_id DECIMAL(10, 2), embedding_input_hash VARCHAR, "
+            "embedding_config_hash VARCHAR, embedding DOUBLE[], "
+            "embedded_at VARCHAR)"
+        )
+        adapter.execute(
+            "INSERT INTO \"w\".docs.emb VALUES (1.50, 'h', 'g', [0.1], 't')"
+        )
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic", model="m", dimensions=1,
+                id_field="chunk_id", vector_field="embedding",
+            ),
+        )
+
+        assert reader.target_key("1.50") is not None
+        assert reader.rows_for(["1.50"]) == {}

@@ -1377,6 +1377,25 @@ Peak memory is one flush rather than the corpus, and a run that dies at hour
 28 keeps every row it already paid for — the next run resumes at the last
 flush instead of re-embedding everything (issue #401).
 
+The resume itself is bounded too: a resumed run reads the existing target's
+id column once (streamed and projected — no vectors), then looks up reuse
+candidates one window at a time by key, so resuming a large corpus never
+costs more memory than running it.
+
+Embed runs also charge the run-scope budget in `profiles.yml`. The
+enforceable dimensions are `max_api_calls`, `max_input_tokens`, and
+`max_documents` — embedding *cost* is not modeled, so `max_cost_usd` does not
+gate embeds. A budget stop behaves exactly like a crash at the same point:
+published windows stay, state covers exactly them, and the run reports
+`budget_exceeded` so descendants are skipped rather than fed a partial
+corpus. Raising the cap resumes for the remainder:
+
+```yaml
+      llm:
+        budget:
+          max_api_calls: 40000   # shared across every model in the invocation
+```
+
 **llm map models** flush the same way, on `flush_every` inputs (default
 1000). This is the stage where an all-or-nothing write costs the most: one
 provider call per input, so a failure — or a budget ceiling — near the end of

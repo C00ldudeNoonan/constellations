@@ -257,6 +257,36 @@ def _embedding_config_hash(
     )
 
 
+def estimate_embed_requests(
+    texts: Sequence[str],
+    identity: EmbeddingIdentity,
+    *,
+    profile_options: Mapping[str, Any] | None = None,
+    input_type: Literal["document", "query"] = "document",
+) -> int:
+    """Billed requests `embed_texts` would issue for this batch (issue #401).
+
+    Used to reserve budget headroom before the call; deliberately skips the
+    identity checks `embed_texts` performs, because those raise on their own
+    when the real call follows.
+    """
+    provider = get_embedding_provider(
+        identity.provider,
+        profile_options=profile_options,
+    )
+    return max(
+        1,
+        provider.estimate_provider_requests(
+            EmbeddingRequest(
+                model=identity.model,
+                texts=tuple(texts),
+                dimensions=identity.dimensions,
+                input_type=input_type,
+            )
+        ),
+    )
+
+
 def embed_texts(
     texts: Sequence[str],
     identity: EmbeddingIdentity,

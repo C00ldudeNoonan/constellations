@@ -207,6 +207,14 @@ class VertexEmbeddingProvider(EmbeddingProvider):
                 safe_for_display=True,
             )
 
+    def estimate_provider_requests(self, request: EmbeddingRequest) -> int:
+        options = self.profile_options
+        if not isinstance(options, VertexEmbeddingOptions):
+            return 1
+        # The same split `_embed` will perform; deterministic and local, so
+        # the reservation matches the bill exactly rather than approximating.
+        return len(_split_requests(request, options))
+
     def _embed(
         self,
         request: EmbeddingRequest,

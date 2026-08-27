@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Embed input reads are bounded (issue #410)
+
+The input half of the #401 memory work. #401 streamed the output and #407
+bounded the resume lookup, but a fresh embed run still read its whole upstream
+into one frame before anything else happened, so peak memory stayed O(corpus)
+on precisely the run that matters. A 7.3GB chunk table climbed ~1.2GiB/min for
+six minutes with zero flushes committed and zero provider calls made; a 10GiB
+container would have been OOM-killed at read time.
+
+- An embed run now takes the upstream schema from a zero-row probe, streams
+  the id column once to validate it and count the corpus, and streams the rows
+  themselves in batches to fill each flush window. Peak residency is a flush
+  window plus a read batch, end to end.
+- Upstream id validation (NULL, empty, duplicate) still runs ahead of the
+  embedding loop, so a contract violation fails before any provider spend
+  rather than after the corpus is paid for.
+- `streaming_tabular_reads` is now required of an adapter for embed models and
+  checked at preflight, not mid-run.
+- No incremental state is invalidated: `input_fingerprint` values are
+  unchanged across the new read path, so existing corpora do not re-embed.
+
 ## v0.13.0 - 2026-08-27
 
 ### Upgrading

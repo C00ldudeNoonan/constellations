@@ -310,6 +310,14 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
             )
+        if model.embed is not None:
+            # Embed reads its upstream as a stream rather than one frame
+            # (issue #410), on every run and not only on resume. Required at
+            # preflight so a warehouse without it fails before credentials and
+            # provider spend, not partway through a corpus.
+            required[WarehouseCapability.STREAMING_TABULAR_READS] = (
+                "bounded embed input reads"
+            )
         # Derived enum checks count: they are schema tests the adapter must
         # support, and finding that out after materialization would move a
         # predictable configuration failure past warehouse mutation (#304).

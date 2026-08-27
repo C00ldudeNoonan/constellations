@@ -47,6 +47,15 @@ from .warehouse import warehouse_options
 log = logging.getLogger(__name__)
 
 
+# Read batch sizes for the two input passes (issue #410). Deliberately not
+# derived from `flush_every`: that is a publication cadence with no upper bound,
+# while these bound *residency*. The id pass is projected to one narrow column
+# so it can afford a wide batch; the row pass carries the full record, text
+# included, so it stays an order of magnitude smaller.
+_ID_BATCH_ROWS = 100_000
+_INPUT_BATCH_ROWS = 10_000
+
+
 @dataclass
 class _EmbedWork:
     record_id: str
@@ -76,18 +85,26 @@ def run_embed_model(
             "`depends_on:`"
         )
     upstream = parse_ref(model.depends_on[0])
-    source = adapter.read_table(upstream)
-    missing = sorted({config.id_field, config.text_field} - set(source.columns))
+    # A zero-row read for the contract, not the corpus (issue #410). The
+    # previous `read_table(upstream)` pulled the whole upstream into one frame
+    # before anything else happened, so a fresh run's peak was O(corpus) no
+    # matter what #401 did downstream of it: a 7.3GB chunk table climbed for
+    # six minutes with no flush committed and no provider call made. Column
+    # names and dtypes are all this needs, and both survive a limit-0 read.
+    schema_probe = adapter.read_table(upstream, limit=0)
+    missing = sorted({config.id_field, config.text_field} - set(schema_probe.columns))
     if missing:
         raise RunError(
             f"Embed model '{model.name}': upstream '{upstream}' is missing "
             f"required column(s): {', '.join(missing)}. Available: "
-            f"{sorted(source.columns)}"
+            f"{sorted(schema_probe.columns)}"
         )
     generated = set(EMBED_METADATA_FIELDS) | {config.vector_field}
     generated_names = {name.casefold() for name in generated}
     collisions = sorted(
-        column for column in source.columns if column.casefold() in generated_names
+        column
+        for column in schema_probe.columns
+        if column.casefold() in generated_names
     )
     if collisions:
         raise RunError(
@@ -95,7 +112,13 @@ def run_embed_model(
             f"generated embedding column(s): {', '.join(collisions)}"
         )
 
-    record_ids = _embed_record_ids(source, config.id_field, model.name)
+    # One projected pass over the id column, before any spend. Kept ahead of
+    # the embedding loop rather than folded into it so a NULL, empty, or
+    # duplicate id still fails the run before the first provider call instead
+    # of after the corpus has been paid for.
+    current_ids, upstream_rows = _stream_upstream_ids(
+        adapter, upstream, config.id_field, model.name
+    )
     embedding_options = resolve_embedding_options(config.provider, resolved)
     identity = EmbeddingIdentity.from_config(
         config,
@@ -137,7 +160,6 @@ def run_embed_model(
     # of pretending to fail.
     budget_guard = BudgetGuard(None, run_budget) if run_budget is not None else None
 
-    current_ids = set(record_ids)
     removed = sorted(set(processed_state) - current_ids)
     removed_target_keys: list[Any] = (
         [
@@ -158,7 +180,9 @@ def run_embed_model(
     provider_calls = 0
     use_full = model.materialization == "full" or full_refresh or rebuild_target
     now = datetime.now(UTC).isoformat()
-    output_schema = _embedding_output_schema(source, vector_field=config.vector_field)
+    output_schema = _embedding_output_schema(
+        schema_probe, vector_field=config.vector_field
+    )
     publisher = FlushPublisher(
         adapter,
         model_name=model.name,
@@ -241,18 +265,25 @@ def run_embed_model(
         provider calls were lost with it.
         """
         window: list[_EmbedWork] = []
-        for record_id, record in zip(
-            record_ids,
-            source.iter_rows(named=True),
-            strict=True,
-        ):
-            item = _window(record_id, record)
-            if item is None:
-                continue
-            window.append(item)
-            if len(window) >= flush_every:
-                yield window
-                window = []
+        # Streamed, not zipped against a pre-read frame (issue #410). The id
+        # comes off each record rather than from a parallel list, so this needs
+        # no correspondence with the id pass above -- which matters, because
+        # `table_snapshot` does not promise an ordering and the two passes are
+        # separate snapshots.
+        with adapter.table_snapshot(
+            upstream, batch_size=_INPUT_BATCH_ROWS
+        ) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for record in frame.iter_rows(named=True):
+                    item = _window(str(record[config.id_field]), record)
+                    if item is None:
+                        continue
+                    window.append(item)
+                    if len(window) >= flush_every:
+                        yield window
+                        window = []
         if window:
             yield window
 
@@ -349,9 +380,9 @@ def run_embed_model(
     errors: list[str] = []
     # Counted in source rows and advanced per flushed window: the operator
     # cares how much of the corpus is through, not how many provider requests
-    # it took. `record_ids` is the whole column, so the total is known even
-    # though the windows themselves stream (issue #401).
-    with get_reporter().model_task(model.name, "embed", len(record_ids)) as task:
+    # it took. The id pass already counted the upstream, so the total is known
+    # even though both the windows and the read itself stream (issues #401, #410).
+    with get_reporter().model_task(model.name, "embed", upstream_rows) as task:
         advanced = 0
         for window in _iter_windows():
             # Provider failures and publication failures are kept apart on
@@ -393,7 +424,7 @@ def run_embed_model(
             # advanced above, so close the bar out on the total it was opened
             # with. A budget stop leaves the bar where it stopped: filling it
             # would report a corpus as done that the cap just cut short.
-            task.advance(len(record_ids) - advanced)
+            task.advance(upstream_rows - advanced)
 
     deleted_count = 0
     try:
@@ -404,7 +435,9 @@ def run_embed_model(
             adapter.replace_state(state_scope, [])
             publisher.rows_written += adapter.materialize_full(
                 model.name,
-                _empty_embedding_frame(source, vector_field=config.vector_field),
+                _empty_embedding_frame(
+                    schema_probe, vector_field=config.vector_field
+                ),
                 options=warehouse_opts,
             )
         if removed and not use_full and run_status is None:
@@ -449,32 +482,60 @@ def run_embed_model(
     )
 
 
-def _embed_record_ids(
-    frame: pl.DataFrame,
+def _stream_upstream_ids(
+    adapter: WarehouseAdapter,
+    table: str,
     id_field: str,
     model_name: str,
-) -> list[str]:
-    values = frame[id_field].to_list()
-    null_count = sum(value is None for value in values)
+) -> tuple[set[str], int]:
+    """Validate the upstream id column and return its distinct ids and row count.
+
+    One projected, streamed pass (issue #410). Residency is proportional to the
+    *key count*, not the row width -- the same trade `_EmbeddingReuseReader`
+    already makes for the target -- so a corpus whose rows carry long text
+    costs a set of ids here rather than a frame of everything.
+
+    Deliberately eager rather than folded into the embedding loop: NULL, empty
+    and duplicate ids are contract violations the run should die on before it
+    has paid a provider for a single call.
+    """
+    ids: set[str] = set()
+    total = 0
+    null_count = 0
+    empty_count = 0
+    with adapter.table_snapshot(
+        table, columns=[id_field], batch_size=_ID_BATCH_ROWS
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            for value in frame[id_field].to_list():
+                total += 1
+                if value is None:
+                    null_count += 1
+                    continue
+                record_id = str(value)
+                if not record_id:
+                    empty_count += 1
+                    continue
+                ids.add(record_id)
     if null_count:
         raise RunError(
             f"Embed model '{model_name}': upstream `{id_field}` contains "
             f"{null_count} NULL value(s)"
         )
-    record_ids = [str(value) for value in values]
-    empty_count = sum(not value for value in record_ids)
     if empty_count:
         raise RunError(
             f"Embed model '{model_name}': upstream `{id_field}` contains "
             f"{empty_count} empty value(s)"
         )
-    duplicate_count = len(record_ids) - len(set(record_ids))
+    duplicate_count = total - len(ids)
     if duplicate_count:
         raise RunError(
             f"Embed model '{model_name}': upstream `{id_field}` contains "
             f"{duplicate_count} duplicate value(s)"
         )
-    return record_ids
+    return ids, total
 
 
 class _EmbeddingReuseReader:

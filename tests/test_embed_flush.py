@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 
 from stel.execution.contracts import RunError
@@ -364,6 +365,128 @@ def test_resume_never_reads_the_whole_target(
     run_project(project, select="document_embeddings")
 
     assert full_reads == []
+
+
+def test_a_fresh_run_never_reads_the_whole_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The input half of the same wall (issue #410). #401 streamed the output
+    and #407 bounded the resume lookup, but a fresh run still did
+    `read_table(upstream)` -- one `SELECT *` into one frame -- before anything
+    else happened. On the 3.6M-chunk corpus memory climbed ~1.2GiB/min for six
+    minutes with zero flushes committed and zero provider calls made: a 10GiB
+    container would have been OOM-killed at read time, before any of the flush
+    machinery engaged.
+
+    Asserted the same way the resume guard is: the upstream may be touched
+    only by a zero-row schema probe and by streamed snapshot reads, never as a
+    full read_table materialization.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+
+    full_reads: list[str] = []
+    original = DuckDBAdapter.read_table
+
+    def spy(self: Any, table: str, *, limit: int | None = None) -> Any:
+        if table == "document_chunks" and limit != 0:
+            full_reads.append(table)
+        return original(self, table, limit=limit)
+
+    monkeypatch.setattr(DuckDBAdapter, "read_table", spy)
+    run_project(project, select="document_embeddings")  # fresh: no prior target
+
+    assert full_reads == []
+    assert _embedded_count(project) == DOCUMENTS
+
+
+def test_streaming_the_input_preserves_input_fingerprints(tmp_path: Path) -> None:
+    """The upgrade hazard #410 has to clear before it is worth shipping.
+
+    `input_fingerprint` is a hash of the *whole* upstream record, and
+    incremental state compares against it. If reading the upstream in Arrow
+    batches produced even subtly different Python values than reading it whole
+    -- a dtype widened, a datetime unit shifted -- every existing embed model
+    would silently re-embed its entire corpus on upgrade. That failure is
+    metered provider spend and it raises nothing, so it is pinned here rather
+    than left to the end-to-end tests, which only ever exercise one path.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter, DuckDBWarehouseConfig
+    from stel.hashing import canonical_fingerprint
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+
+    config = DuckDBWarehouseConfig(
+        path=project / "target" / "db.duckdb", schema_name="docs"
+    )
+    with DuckDBAdapter(config) as adapter:
+        whole = adapter.read_table("document_chunks")
+        # The dtypes the output schema is now built from must survive a
+        # zero-row read, or a passthrough column lands in the target as the
+        # wrong type.
+        assert dict(adapter.read_table("document_chunks", limit=0).schema) == dict(
+            whole.schema
+        )
+
+        def _fingerprint(record: dict[str, Any]) -> str:
+            return canonical_fingerprint(
+                record, domain="embedding-input-row", version=1
+            )
+
+        read_whole = {
+            str(row["chunk_id"]): _fingerprint(row)
+            for row in whole.iter_rows(named=True)
+        }
+        streamed: dict[str, str] = {}
+        with adapter.table_snapshot("document_chunks", batch_size=2) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for row in frame.iter_rows(named=True):
+                    streamed[str(row["chunk_id"])] = _fingerprint(row)
+
+    assert read_whole  # the corpus is not empty, or this proves nothing
+    assert streamed == read_whole
+
+
+def test_a_duplicate_upstream_id_still_fails_before_any_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Id validation moved into a streamed pass; it must stay *ahead* of the
+    embedding loop. Folding it into the loop would turn a contract violation
+    in the last batch into a failure the operator pays for the whole corpus to
+    discover."""
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        connection.execute(
+            'INSERT INTO "db".docs.document_chunks '
+            'SELECT * FROM "db".docs.document_chunks LIMIT 1'
+        )
+    finally:
+        connection.close()
+
+    calls = 0
+    original = DeterministicEmbeddingProvider._embed
+
+    def counted(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counted)
+
+    with pytest.raises(RunError, match="duplicate"):
+        run_project(project, select="document_embeddings")
+    assert calls == 0
 
 
 def test_resume_still_reuses_vectors_for_metadata_only_changes(

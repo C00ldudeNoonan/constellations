@@ -421,6 +421,15 @@ class EmbedConfig(BaseModel):
     dimensions: int = Field(gt=0, le=65_536)
     batch_size: int = Field(default=128, gt=0, le=10_000)
     max_retries: int = Field(default=4, ge=0)
+    # Embedded rows publish to the warehouse every N rows, advancing state for
+    # exactly those rows (issue #401). Embeds were the last all-or-nothing
+    # stage and the worst one to leave that way: their re-run cost is metered
+    # provider spend, not CPU, so an end-of-run failure threw away every paid
+    # call. Peak memory is now one flush rather than the corpus. Excluded from
+    # code_version like extraction's: it changes execution cadence, never
+    # output content -- including it would re-embed every existing corpus at
+    # provider prices on upgrade.
+    flush_every: int = Field(default=5000, gt=0)
 
     @model_validator(mode="after")
     def _validate_fields(self) -> EmbedConfig:

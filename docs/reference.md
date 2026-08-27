@@ -1325,9 +1325,38 @@ that is a single batch: identical behavior, one MERGE. Lower it when a run is
 long enough that losing it hurts; raise it to cut MERGE count, and BigQuery
 bytes billed, on runs that rarely fail.
 
+**Embed models** flush the same way, and for them the argument is sharper. A
+failed extraction or transform costs CPU to redo; a failed embed costs the
+provider bill again. Embedded rows publish and advance state every
+`flush_every` rows (default 5000):
+
+```yaml
+- name: chunk_embeddings
+  depends_on: [ref('document_chunks')]
+  embed:
+    provider: vertex
+    model: text-embedding-005
+    dimensions: 768
+    flush_every: 2000   # publish and bank 2000 embedded rows at a time
+  materialization: incremental
+```
+
+Peak memory is one flush rather than the corpus, and a run that dies at hour
+28 keeps every row it already paid for — the next run resumes at the last
+flush instead of re-embedding everything (issue #401).
+
+One consequence worth stating plainly: a **full refresh** of an embed model is
+no longer a single atomic swap. The first flush replaces the target and later
+flushes merge into it, so an interrupted rebuild leaves a partially rebuilt
+table that the next run completes from state. That is a deliberate trade — the
+alternative is the previous behavior, where a corpus large enough to matter
+could not be rebuilt at all.
+
 Like `flush_every`, `commit_every` is excluded from `code_version` — it changes
 execution cadence, never output content, so tuning it does not invalidate
-existing state.
+existing state. The same holds for an embed model's `flush_every`: it must
+not move `code_version`, because that would silently re-embed every existing
+corpus at provider prices.
 
 Incremental writes are atomic per publication: DuckDB uses a transaction and
 BigQuery loads a unique staging table then executes one `MERGE`. Missing,

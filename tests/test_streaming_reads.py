@@ -101,6 +101,25 @@ def test_duckdb_streams_projected_filtered_batches_from_one_snapshot(
         assert snapshot.closed
 
 
+def test_duckdb_unconsumed_snapshot_releases_the_database_file(tmp_path: Path) -> None:
+    path = tmp_path / "unconsumed.duckdb"
+    with create_adapter(_duckdb_config(path)) as adapter:
+        adapter.materialize_full(
+            "records",
+            pl.DataFrame({"record_id": ["a", "b", "c"], "value": [1, 2, 3]}),
+        )
+        with adapter.table_snapshot("records", batch_size=1):
+            pass  # opened for its schema only; never iterated
+
+    # An unexhausted Arrow reader used to keep the database file pinned, so this
+    # read-write re-open failed on Windows with "used by another process".
+    connection = duckdb.connect(str(path))
+    try:
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
 def test_duckdb_snapshot_is_immutable_during_concurrent_change(tmp_path: Path) -> None:
     path = tmp_path / "snapshot.duckdb"
     with create_adapter(_duckdb_config(path)) as adapter:

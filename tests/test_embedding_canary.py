@@ -335,3 +335,104 @@ def test_disabled_by_default_skips_visibly_and_bills_nothing(
     assert result.status == "skipped"
     assert "enabled: true" in result.message
     assert calls["n"] == 0
+
+
+# ─── review follow-ups (PR #415): billed like any other embed path ──────────
+
+
+def _count_embeds(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    from stel.providers.deterministic import DeterministicEmbeddingProvider
+
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    return calls
+
+
+def test_an_exhausted_run_budget_stops_the_canary_before_billing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The canary is a billed embed path, so it charges the same run ledger
+    ordinary embed execution does. A scheduled canary must not be the one
+    caller the operator's cap cannot see -- that was the entire lesson of the
+    #401 budget work, relearned here in miniature."""
+    project = _project(tmp_path)
+    _write_baseline(project, _blessed_vectors(project))
+    # Build first, cap afterwards: since #407 the run budget also gates the
+    # embed model itself, and a cap present during the build would stop the
+    # corpus before the canary ever had a target to test.
+    run_project(project)
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      llm:\n"
+        "        provider: deterministic\n"
+        "        model: deterministic-v1\n"
+        "        budget:\n"
+        "          max_documents: 2\n",  # three probes exceed it
+        encoding="utf-8",
+    )
+
+    calls = _count_embeds(monkeypatch)
+    [result] = _canary_results(project)
+
+    assert result.status == "fail"
+    assert "budget exceeded" in result.message
+    assert calls["n"] == 0
+
+
+def test_a_bad_baseline_fails_before_any_billed_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed baseline guarantees a failing verdict; paying the probe cap
+    on every scheduled run to learn what the committed file already shows is
+    spend with no information in it."""
+    project = _project(tmp_path)
+    blessed = _blessed_vectors(project)
+    _write_baseline(project, [[*vector, 0.0] for vector in blessed])
+    run_project(project)
+
+    calls = _count_embeds(monkeypatch)
+    [result] = _canary_results(project)
+
+    assert result.status == "fail"
+    assert "no probes were embedded" in result.message
+    assert calls["n"] == 0
+
+
+def test_the_models_retry_limit_reaches_the_canary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that sets max_retries: 0 to avoid repeated billed attempts
+    must not have the canary quietly retry four times anyway."""
+    import stel.checks.schema as schema_module
+
+    project = _project(tmp_path)
+    _write_baseline(project, _blessed_vectors(project))
+    model_path = project / "models" / "m.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace(
+            "      vector_field: embedding_out\n",
+            "      vector_field: embedding_out\n      max_retries: 0\n",
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+
+    seen: dict[str, Any] = {}
+    original = schema_module.embed_texts
+
+    def spying(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(schema_module, "embed_texts", spying)
+    [result] = _canary_results(project)
+
+    assert result.status == "pass", result.message
+    assert seen["max_retries"] == 0

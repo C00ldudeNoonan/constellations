@@ -14,7 +14,8 @@ import polars as pl
 
 from ..adapters import WarehouseAdapter
 from ..adapters.base import TEST_FAILURES_TABLE_PREFIX
-from ..embedding import EmbeddingIdentity, embed_texts
+from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
+from ..embedding import EmbeddingIdentity, embed_texts, estimate_embed_requests
 from ..execution.errors import artifact_error_text
 from ..profile import resolve_embedding_options
 
@@ -181,7 +182,13 @@ def _run_named_test(
     if test_name == "embedding_canary":
         return [
             _embedding_canary(
-                model_name, table_ref, adapter, arg, resolved, embed_config
+                model_name,
+                table_ref,
+                adapter,
+                arg,
+                resolved,
+                embed_config,
+                run_budget,
             )
         ]
     raise UnknownTestError(
@@ -1736,6 +1743,7 @@ def _embedding_canary(
     arg: Any,
     resolved: ResolvedProfile | None,
     embed_config: Any,
+    run_budget: BudgetLedger | None = None,
 ) -> TestResult:
     """Detect provider drift under a pinned model name (issue #305).
 
@@ -1827,21 +1835,87 @@ def _embedding_canary(
     # failure message names probes by ordinal.
     rows.sort(key=lambda item: item[0])
 
+    # Every baseline vector is validated BEFORE the provider is contacted
+    # (issue #305 review): a malformed baseline guarantees a failing verdict,
+    # and paying the full probe cap on every scheduled run to learn what the
+    # committed file already shows is spend with no information in it.
+    expected_dimensions = int(embed_config.dimensions)
+    baselines: list[list[float]] = []
+    invalid: list[str] = []
+    for ordinal, (_text, raw_vector) in enumerate(rows, start=1):
+        baseline = _canary_baseline_vector(raw_vector)
+        if baseline is None:
+            invalid.append(f"probe {ordinal}: not a numeric array")
+            continue
+        if len(baseline) != expected_dimensions:
+            invalid.append(
+                f"probe {ordinal}: {len(baseline)} dimensions, model declares "
+                f"{expected_dimensions}"
+            )
+            continue
+        if all(value == 0.0 for value in baseline):
+            invalid.append(f"probe {ordinal}: zero vector has no direction")
+            continue
+        baselines.append(baseline)
+    if invalid:
+        detail = "; ".join(invalid[:5])
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=(
+                f"{len(invalid)} of {len(rows)} baseline vector(s) in "
+                f"'{baseline_model}' are unusable ({detail}); no probes were "
+                "embedded. Re-bless the baseline"
+            ),
+        )
+
     embedding_options = resolve_embedding_options(embed_config.provider, resolved)
     identity = EmbeddingIdentity.from_config(
         embed_config,
         profile_options=embedding_options.provider_options,
     )
-    # Provider construction, credential resolution, and the calls all stay
-    # inside the boundary: a provider failure becomes a failed check with the
-    # provider's sanitized text, not an exception that aborts the test run.
+    probe_texts = [text for text, _ in rows]
+    # Provider construction, credential resolution, budget exhaustion, and the
+    # calls all stay inside the boundary: each becomes a failed check, not an
+    # exception that aborts the test run. The canary is a billed embed path,
+    # so it charges the same run ledger ordinary embed execution does -- a
+    # scheduled canary must not be the one caller the operator's cap cannot
+    # see (issue #305 review).
+    guard = BudgetGuard(None, run_budget) if run_budget is not None else None
     try:
+        if guard is not None:
+            guard.charge_documents(len(rows))
+            guard.ensure_headroom(
+                next_calls=estimate_embed_requests(
+                    probe_texts,
+                    identity,
+                    profile_options=embedding_options.provider_options,
+                )
+            )
         embedded = embed_texts(
-            [text for text, _ in rows],
+            probe_texts,
             identity,
             credential_env=embedding_options.api_key_env,
             profile_options=embedding_options.provider_options,
+            max_retries=embed_config.max_retries,
             timeout_seconds=embedding_options.timeout_seconds,
+        )
+        if guard is not None:
+            guard.charge_metrics(
+                {
+                    **embedded.usage.to_metrics(),
+                    "api_calls": embedded.provider_requests,
+                }
+            )
+    except BudgetExceededError as error:
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=f"run budget exceeded before canary probes ran: {error}",
         )
     except Exception as error:
         return TestResult(
@@ -1857,17 +1931,12 @@ def _embedding_canary(
 
     worst = 1.0
     failures: list[str] = []
-    for ordinal, ((_text, baseline_vector), vector) in enumerate(
-        zip(rows, embedded.vectors, strict=True), start=1
+    for ordinal, (baseline, vector) in enumerate(
+        zip(baselines, embedded.vectors, strict=True), start=1
     ):
-        baseline = _canary_baseline_vector(baseline_vector)
-        if baseline is None:
-            failures.append(
-                f"probe {ordinal}: baseline vector is not a numeric array"
-            )
-            worst = 0.0
-            continue
         if len(baseline) != len(vector):
+            # Upfront validation checked the *declared* dimensions; a provider
+            # returning something else anyway is drift of the loudest kind.
             failures.append(
                 f"probe {ordinal}: baseline has {len(baseline)} dimensions, "
                 f"provider returned {len(vector)}"

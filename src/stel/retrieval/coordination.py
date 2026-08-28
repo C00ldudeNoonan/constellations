@@ -585,15 +585,47 @@ class ServingCoordinator:
 
     # ─── query leases ─────────────────────────────────────────────────────
 
-    def acquire_query(self, scope: StateScope) -> QueryLease:
+    def _raise_if_rekey_pending(
+        self, scope: StateScope, legacy_scope: StateScope
+    ) -> None:
+        """Name the one-time re-key when the ledger row is only under the old key.
+
+        Costs one extra read, and only on a path that is already failing. The
+        alternative — re-keying here, under a query — would have a read
+        silently mutate the ledger it is reading, which is the publisher's job
+        and needs the publish lease that a query does not hold.
+        """
+        if legacy_scope.target_identity == scope.target_identity:
+            return
+        if self._read_row(legacy_scope) is None:
+            return
+        raise ServingNotReadyError(
+            f"Search index '{scope.model_name}' still has its publication state "
+            "under the pre-0.13 serving key, where nothing looks for it. Run "
+            f"`stel serving migrate-scope {scope.model_name}` to move it — the "
+            "rows and embeddings are intact and it does not republish or "
+            "re-embed anything."
+        )
+
+    def acquire_query(
+        self, scope: StateScope, *, legacy_scope: StateScope | None = None
+    ) -> QueryLease:
         """Acquire a shared lease pinned to the ready generation.
 
         The lease insert is conditioned on a publisher-free ready ledger at
         the observed fence; a post-insert verification read closes the race
         with a publisher claiming in between (the publisher's claim is itself
         conditioned on no lease rows existing).
+
+        `legacy_scope` only changes what the failure *says* (issue #413). An
+        index published before #355 re-keyed the serving scope keeps its ledger
+        row under the old key, and a miss on the new key is indistinguishable
+        here from never having been published — so the caller passes the old
+        key and gets told to re-key instead of to re-embed.
         """
         row = self._read_row(scope)
+        if row is None and legacy_scope is not None:
+            self._raise_if_rekey_pending(scope, legacy_scope)
         if row is None or row[1] == STATUS_UNPUBLISHED:
             raise ServingNotReadyError(
                 "This search index has not been published; run `stel run`"

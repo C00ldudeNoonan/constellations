@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### A pre-0.13 search index now says how to recover (issue #413)
+
+0.13's serving re-key (#355) left indexes published under 0.11/0.12 with their
+ledger row under the old key, where nothing looks for it — and the query path
+could not tell that apart from never having been published, so it said
+`run 'stel run'`. That sends an operator to re-embed a corpus when a one-time
+`stel serving migrate-scope` was all it needed. Reported after a live LanceDB
+index went dark on upgrade and was recovered by republishing every collection.
+
+- A query against a scope whose state is still under the pre-0.13 key now names
+  `stel serving migrate-scope <model>` and says the rows and embeddings are
+  intact. The extra ledger read happens only on the already-failing path.
+- The v0.13.0 upgrade notes below now mention the re-key and the command; their
+  omission is why this surfaced as a live outage rather than a release-note
+  chore.
+- The re-key is still not automatic on read: it mutates the ledger, which is
+  the publisher's job and needs the publish lease a query does not hold. See
+  #413 for the discussion.
+
 ### Embed input reads are bounded (issue #410)
 
 The input half of the #401 memory work. #401 streamed the output and #407
@@ -27,6 +46,13 @@ container would have been OOM-killed at read time.
 
 ### Upgrading
 
+- **A search index published before 0.13 needs a one-time re-key (issue #355).**
+  The serving scope moved from the physical collection to the logical one, so an
+  existing index keeps its publication state under a key nothing reads, and
+  queries against it fail until it is moved. Run
+  `stel serving migrate-scope <search-index>` once per affected index — it is
+  idempotent, touches no rows, and does not republish or re-embed. *(Note added
+  after release: its absence here caused a live read outage — issue #413.)*
 - **Array-valued attribute filters changed shape (issue #397).** `eq`, `ne`,
   and `in` against an `array[string]` search attribute were previously
   accepted and compiled to SQL the engine could not evaluate as intended;

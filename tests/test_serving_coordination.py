@@ -829,6 +829,68 @@ def _legacy_scope(model_name: str = "context_search") -> StateScope:
     )
 
 
+def test_a_query_against_an_unmigrated_scope_names_the_rekey(
+    coordinator: Any,
+) -> None:
+    """Issue #413: an index published before #355 keeps its ledger row under the
+    old key, and a miss on the new key looked exactly like never having been
+    published — so the error sent operators to `stel run`, i.e. to re-embed a
+    corpus, when a one-time re-key was all it needed. A live 0.11 index went
+    dark on upgrade and was recovered by republishing every collection."""
+    legacy, current = _legacy_scope(), _scope()
+    lease = coordinator.acquire_publish(
+        legacy, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+
+    with pytest.raises(ServingNotReadyError) as caught:
+        coordinator.acquire_query(current, legacy_scope=legacy)
+
+    message = str(caught.value)
+    assert "stel serving migrate-scope context_search" in message
+    # The point of the message: it must not send the operator to re-embed.
+    assert "stel run" not in message
+
+
+def test_a_genuinely_unpublished_scope_still_says_unpublished(
+    coordinator: Any,
+) -> None:
+    """The re-key hint must not swallow the ordinary case: nothing under either
+    key means nothing was ever published."""
+    with pytest.raises(ServingNotReadyError) as caught:
+        coordinator.acquire_query(_scope(), legacy_scope=_legacy_scope())
+    assert "has not been published" in str(caught.value)
+
+
+def test_the_rekey_hint_costs_nothing_once_the_scope_is_migrated(
+    coordinator: Any,
+) -> None:
+    """After `migrate-scope` the row is under the current key, so the query
+    resolves normally and never consults the legacy one."""
+    legacy, current = _legacy_scope(), _scope()
+    lease = coordinator.acquire_publish(
+        legacy, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+    )
+    assert coordinator.rekey_scope(legacy, current) == 1
+
+    query = coordinator.acquire_query(current, legacy_scope=legacy)
+    try:
+        assert query.pinned_generation == "gen1"
+    finally:
+        coordinator.release_query(query)
+
+
 def test_state_retrieval_target_keys_on_logical_not_physical() -> None:
     """The whole point of #355: two physical names, one stable serving identity.
 

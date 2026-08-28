@@ -2377,8 +2377,11 @@ require already knowing the active generation that row names.
 
 An index published before this change keeps its ledger row and publication
 state under the old key, where nothing looks for it. stel treats an index with
-unreachable publication state as unpublished, so the next run re-embeds it in
-full. Move it instead — once per affected index:
+unreachable publication state as unpublished, which has two consequences and
+the first one bites immediately: **queries fail** ("still has its publication
+state under the pre-0.13 serving key") until the index is moved, and the next
+run would re-embed it in full. The rows and embeddings are intact throughout.
+Move it — once per affected index:
 
 ```bash
 stel serving migrate-scope chunk_search

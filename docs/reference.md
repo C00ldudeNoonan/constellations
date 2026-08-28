@@ -3682,6 +3682,34 @@ integration — see
 [`docs/orchestration-dagster.md`](orchestration-dagster.md) (use
 `emit-dbt-sources --dagster-meta` to pin the Dagster asset keys).
 
+## Memory and corpus size
+
+stel targets a bounded-memory contract: for every model kind, peak memory
+follows the flush window, the per-parent unit, and the number of distinct keys
+— never the corpus in bytes. The intent is that corpus size is bounded by
+warehouse capacity rather than process memory.
+
+Size the key term when you size a container: stages that reconcile deletions
+hold every id at once, at roughly 108 bytes each, so a 3.6M-row corpus costs
+~370MB per key set and a resuming embed holds two. That scales with row count
+rather than row width, which is what makes a large corpus finish at all, but it
+is not constant.
+
+It holds today for extraction, transform (incremental), embed, and search
+publication. It does **not** yet hold for `chunk:`
+([#423](https://github.com/C00ldudeNoonan/constellations/issues/423)) or
+`llm:` ([#424](https://github.com/C00ldudeNoonan/constellations/issues/424)),
+which still read their whole upstream — so size those two against your corpus
+until they land. Some stages read whole tables by contract and always will:
+classic ML training fits a single matrix, a transform full refresh needs every
+parent, and `concept-cloud` builds one artifact from several models at once.
+
+The invariant, what it costs a stage to hold it, and what enforces it are in
+[`docs/architecture/bounded-memory.md`](architecture/bounded-memory.md).
+
+On DuckDB, remember that the engine sizes its own buffer pool separately — see
+[Bounding DuckDB's memory](#bounding-duckdbs-memory).
+
 ## Benchmarks
 
 ```bash

@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Upgrading
+
+- **A full refresh of a chunk model is no longer one atomic swap (issue
+  #423).** The first window replaces the target and later windows merge into
+  it, so an interrupted rebuild leaves a partially rebuilt table that the next
+  run completes from state. Exactly the trade v0.13.0 made for embed and llm
+  (#401), for the same reason: the previous behavior could not rebuild a large
+  corpus at all.
+- **A keyed BigQuery table snapshot is now two query jobs (issue #418).** The
+  added statement aggregates a single column, so it is cheap next to the
+  payload it stopped the warehouse from buffering, but it is billed and it
+  shows up in query counts.
+- **DuckDB is now bounded by a detected container ceiling (issue #412).**
+  Inside a cgroup, stel hands DuckDB 75% of the limit instead of letting it
+  size from host RAM. Set `memory_limit:` on the warehouse profile to choose
+  the number yourself, or `memory_limit: none` to restore DuckDB's own
+  default. Workstation runs are unaffected.
+- No incremental state is invalidated by this release. `chunk.flush_every` is
+  excluded from `code_version` like every other flush cadence, and the streamed
+  reads added for chunk and embed produce byte-identical input fingerprints —
+  both pinned by tests, because a silent re-chunk would cascade into a full
+  re-embed at provider cost.
+
+### Incremental transform residency is pinned (issue #383)
+
+The transform incident's binding constraint — `_parent_groups` materializing
+every parent's rows as Python dicts — was fixed by #384 and #385, but the last
+measurement on #383 predates #385 by four hours, so the shape was never
+re-checked. It is now asserted rather than inferred: with *every* parent
+changed (the re-key case that caused the OOM), rows arrive one `commit_every`
+batch at a time and no whole-table frame is materialized. A full refresh still
+reads every parent in one frame, which is the recorded exception — the python
+transform contract hands the user one DataFrame — and is now pinned as such so
+the bounded case is not mistaken for a general guarantee.
+
 ### Chunk models hold the bounded-memory contract (issue #423)
 
 Found by #414's audit. Chunk was unbounded on **both** sides: it read the whole

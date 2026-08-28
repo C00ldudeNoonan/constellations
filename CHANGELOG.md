@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### The bounded-memory contract, stated and enforced (issue #414)
+
+One root cause reached production five times through five stages (#385, #402,
+#407, #411, #420). Each fix was local and correct; the sequence says the
+missing piece was an invariant, not another patch.
+
+- **Stated**: for every model kind, peak memory is O(flush window) +
+  O(per-parent unit), never O(corpus). See
+  `docs/architecture/bounded-memory.md`.
+- **Enforced on shape**: every `adapter.read_table()` call site in `src/stel`
+  is classified — bounded, an exception with its reason, or a gap with its
+  tracking issue — and an AST scan fails when a new one appears unclassified.
+- **Enforced on property**: stages run with the adapter instrumented to record
+  how many rows they materialize at once, so a regression to a whole-table read
+  fails with the call site named.
+- **Two gaps found by the audit and filed**: `chunk:` (#423) and `llm:` (#424)
+  still read their whole upstream. The audit corrected #414's premise that
+  #410 had wired the last unbounded path.
+
 ### BigQuery search publish no longer dies on a large table (issue #418)
 
 A keyed table snapshot computed its key-domain validation as two unpartitioned

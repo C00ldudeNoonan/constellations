@@ -1,0 +1,3 @@
+name: dbt_doc_suggestions
+version: '0.1.0'
+profile: dbt_doc_suggestions

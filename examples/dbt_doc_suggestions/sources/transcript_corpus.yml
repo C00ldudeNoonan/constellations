@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  # The exchange-grain corpus from examples/agent_transcripts (#360). Each
+  # chunk row is one exchange — a human prompt plus everything it caused — so
+  # a row is the unit of evidence this analysis reasons about.
+  #
+  # `warehouse://` rather than `ref()`: the corpus is a relation another
+  # project built, and a document pipeline over its rows is the documented
+  # way to read one. No new primitive (#361).
+  - name: transcript_exchanges
+    # catalog.schema.table: the analysis writes into its own `suggestions`
+    # schema, so the corpus must be named in full rather than resolved
+    # against this project's default schema.
+    path: warehouse://transcripts.transcripts.document_chunks
+    key_column: context_id

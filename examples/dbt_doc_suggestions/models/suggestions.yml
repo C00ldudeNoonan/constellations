@@ -1,0 +1,91 @@
+version: 2
+
+models:
+  # 1. The corpus, as rows. Only the columns the analysis reasons about are
+  #    declared, and the exchange's full text is deliberately NOT among
+  #    them: a drafted description must never quote transcript body text,
+  #    which may be free-text a session opted out of capturing (#361 rule
+  #    4 — sensitivity travels). Headings are the human's own prompt.
+  - name: exchange_rows
+    description: "Exchange-grain rows from the agent-transcript corpus (#360)"
+    source: ref('transcript_exchanges')
+    extraction:
+      backend: json
+      options:
+        # `upstream_document_id` is the corpus's own per-session link (one
+        # value per session document). The chunk's `document_id` would be
+        # the friendlier name but collides with stel's reserved lineage
+        # columns, and `session_id` lives on the registry, not on chunks.
+        fields: [upstream_document_id, exchange_heading, files_touched]
+    materialization: incremental
+    tests:
+      - not_null: [document_id]
+
+  # 2. Which models are under-documented, and how much evidence says so.
+  #    Pure SQL: no rows move through stel, and the threshold that decides
+  #    what is worth drafting is applied before any provider call.
+  - name: documentation_gaps
+    description: "dbt models the corpus shows agents repeatedly reading"
+    transform:
+      type: sql
+      path: sql/documentation_gaps.sql
+    materialization: full
+    fields:
+      - {name: gap_id, data_type: string}
+      - {name: project_key, data_type: string}
+      - {name: dbt_model, data_type: string}
+      - {name: evidence_count, data_type: integer}
+      - {name: evidence_sessions, data_type: string}
+      - {name: evidence_prompts, data_type: string}
+    tests:
+      - not_null: [gap_id, dbt_model, evidence_count]
+      - unique: gap_id
+      # The analysis-side threshold is a contract, not a comment in the SQL:
+      # a change that lets one-session candidates through fails here.
+      - accepted_range: {column: evidence_count, min: 3}
+
+  # 3. Draft the prose. One billed call per gap, which is why step 2 filters
+  #    first. The prompt is versioned like any other, so #303 provenance
+  #    applies to every description this proposes.
+  - name: drafted_descriptions
+    description: "Proposed dbt model descriptions, drafted from prompt evidence"
+    depends_on: [ref('documentation_gaps')]
+    llm:
+      id_field: gap_id
+      input_field: evidence_prompts
+      prompt: |
+        You are drafting a `description:` for a dbt model, to be reviewed by a
+        human before it is merged. Below are the questions people actually
+        asked in sessions where an agent had to open this model's SQL because
+        no description existed.
+
+        Write one or two sentences describing what the model contains, in the
+        voice of dbt documentation. Describe the model, not the questions. If
+        the questions do not establish what the model contains, return an
+        empty string rather than guessing — an absent suggestion costs nothing
+        and a wrong one costs a reviewer's trust.
+    fields:
+      - name: suggested_description
+        type: string
+        description: "Proposed dbt `description:` prose, or empty if unclear"
+    materialization: incremental
+    tests:
+      - not_null: [gap_id]
+
+  # 4. The contract `stel suggest dbt --from` reads. Column names and meanings
+  #    are fixed by #381; this model exists to satisfy that contract exactly.
+  - name: dbt_doc_candidates
+    description: "Reviewable dbt documentation candidates with their provenance"
+    transform:
+      type: sql
+      path: sql/dbt_doc_candidates.sql
+    materialization: full
+    fields:
+      - {name: dbt_model, data_type: string}
+      - {name: dbt_column, data_type: string}
+      - {name: suggested_description, data_type: string}
+      - {name: evidence_count, data_type: integer}
+      - {name: evidence_sessions, data_type: string}
+    tests:
+      - not_null: [dbt_model, suggested_description, evidence_count]
+      - unique: dbt_model

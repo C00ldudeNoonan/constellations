@@ -2,11 +2,38 @@
 
 ## The contract
 
-> For every model kind, peak memory is O(flush window) + O(per-parent unit),
-> never O(corpus).
+> For every model kind, peak memory is O(flush window) + O(per-parent unit) +
+> O(distinct keys) — never O(corpus **bytes**).
 
 Corpus size should be bounded by warehouse capacity, not by process memory. A
-run that cannot fit its input in RAM should still finish.
+run whose input does not fit in RAM should still finish.
+
+### The key term is real, and deliberate
+
+The third term is not a rounding error and should not be read as one. Stages
+that reconcile deletions hold every id at once: `_stream_upstream_ids` and
+`_stream_document_ids` return a `set[str]` of the upstream keys, and a resuming
+embed additionally holds `_EmbeddingReuseReader._target_keys` for the existing
+target. Measured, a Python string set costs ~108 bytes per id:
+
+| corpus | one key set | a resuming embed (two) |
+|---|---|---|
+| 200k rows | 21 MB | 42 MB |
+| 3.6M rows | ~370 MB | ~740 MB |
+
+What the fixes bought is that this scales with row *count* and not row *width*
+— for the 3.6M-chunk corpus, ~370MB of ids instead of ~7GB of text and vectors.
+That is the difference between a run that finishes in a 4GB container and one
+that cannot finish at all. But it is not constant, and an operator sizing a
+container needs the number rather than the word "bounded".
+
+Eliminating it means pushing removal detection into the warehouse as an
+anti-join rather than a Python set difference — tracked as issue #428.
+
+**The residency tests do not cover this term.** They measure the largest single
+frame or batch an adapter hands a stage, which is exactly the O(corpus bytes)
+failure the incidents were; a cumulative container is invisible to them. That
+limitation is why the term is written down here.
 
 This is stated as an invariant rather than left as a property of each stage
 because the same root cause reached production five times, through five

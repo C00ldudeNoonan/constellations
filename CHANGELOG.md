@@ -9,7 +9,9 @@ One root cause reached production five times through five stages (#385, #402,
 missing piece was an invariant, not another patch.
 
 - **Stated**: for every model kind, peak memory is O(flush window) +
-  O(per-parent unit), never O(corpus). See
+  O(per-parent unit) + O(distinct keys), never O(corpus bytes). The key term is
+  quantified rather than waved at — ~108 bytes per id, so ~370MB for a
+  3.6M-row corpus, and a resuming embed holds two such sets. See
   `docs/architecture/bounded-memory.md`.
 - **Enforced on shape**: every `adapter.read_table()` call site in `src/stel`
   is classified — bounded, an exception with its reason, or a gap with its

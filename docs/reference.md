@@ -3685,9 +3685,15 @@ integration — see
 ## Memory and corpus size
 
 stel targets a bounded-memory contract: for every model kind, peak memory
-follows the flush window and the per-parent unit, never the corpus. The intent
-is that corpus size is bounded by warehouse capacity rather than process
-memory.
+follows the flush window, the per-parent unit, and the number of distinct keys
+— never the corpus in bytes. The intent is that corpus size is bounded by
+warehouse capacity rather than process memory.
+
+Size the key term when you size a container: stages that reconcile deletions
+hold every id at once, at roughly 108 bytes each, so a 3.6M-row corpus costs
+~370MB per key set and a resuming embed holds two. That scales with row count
+rather than row width, which is what makes a large corpus finish at all, but it
+is not constant.
 
 It holds today for extraction, transform (incremental), embed, and search
 publication. It does **not** yet hold for `chunk:`

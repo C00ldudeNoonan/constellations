@@ -8,7 +8,14 @@ fixed individually and each fix was right — but the sequence says the missing
 piece is an invariant, not another patch.
 
 **The contract.** For every model kind, peak memory is O(flush window) +
-O(per-parent unit), never O(corpus).
+O(per-parent unit) + O(distinct keys), never O(corpus **bytes**).
+
+The key term is deliberate and these tests do not cover it: stages that
+reconcile deletions hold every id at once (~108 bytes each, so ~370MB for a
+3.6M-row corpus), and a cumulative container like that is invisible to a
+per-frame measurement. What is asserted here is the O(corpus bytes) failure the
+incidents actually were. `docs/architecture/bounded-memory.md` carries the key
+term and its numbers, and issue #428 tracks removing it.
 
 `adapter.read_table()` is the primitive that breaks it: it is `SELECT *` into
 one Polars frame, so any call on a corpus-scale relation is corpus-scale
@@ -45,6 +52,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from stel.adapters.duckdb import DuckDBAdapter
+from stel.execution.embed import _INPUT_BATCH_ROWS
+from stel.runner import run_project
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "stel"
 
@@ -337,10 +348,18 @@ class _CountingSnapshot:
         self._inner = inner
         self._seen = seen
 
-    def __iter__(self) -> Iterator[Any]:
+    def iter_batches(self) -> Iterator[Any]:
+        """Traverse the snapshot, recording each batch's size.
+
+        Named rather than left in `__iter__`: this drives the warehouse read.
+        """
         for batch in self._inner:
             self._seen.record_batch(batch.num_rows)
             yield batch
+
+    def __iter__(self) -> Iterator[Any]:
+        # O(1): hands back the generator, does not consume it.
+        return self.iter_batches()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -354,8 +373,6 @@ def _measure_residency(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Residency]:
     alive at once, and that is a number the code states, not one an allocator
     reports.
     """
-    from stel.adapters.duckdb import DuckDBAdapter
-
     seen = _Residency()
     real_read = DuckDBAdapter.read_table
     real_snapshot = DuckDBAdapter.table_snapshot
@@ -433,8 +450,6 @@ def test_extraction_never_materializes_more_than_its_flush_window(
 ) -> None:
     """Extraction has been flush-bounded since #77; pinned here as a contract
     rather than an implementation detail."""
-    from stel.runner import run_project
-
     project = _embed_project(tmp_path, docs=_CORPUS_DOCS)
     with _measure_residency(monkeypatch) as seen:
         run_project(project, select="document_registry")
@@ -453,8 +468,6 @@ def test_embed_never_materializes_the_corpus(
     A regression to `read_table(upstream)` shows up here as a frame the size of
     the chunk table, whatever the machine or allocator says about memory.
     """
-    from stel.runner import run_project
-
     project = _embed_project(tmp_path, docs=_CORPUS_DOCS)
     run_project(project, select="document_registry")
     run_project(project, select="document_chunks")
@@ -482,9 +495,6 @@ def test_embed_residency_is_capped_by_a_constant_not_the_corpus(
     number of rows alive at once is `_INPUT_BATCH_ROWS`, a constant in the
     source, rather than anything derived from the input.
     """
-    from stel.execution.embed import _INPUT_BATCH_ROWS
-    from stel.runner import run_project
-
     project = _embed_project(tmp_path, docs=_CORPUS_DOCS)
     run_project(project, select="document_registry")
     run_project(project, select="document_chunks")

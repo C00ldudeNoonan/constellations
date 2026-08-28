@@ -25,12 +25,21 @@ from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
 from ..progress import get_reporter
 from ..versioning import compute_code_version
+from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
 from .values import scalarize
 from .warehouse import warehouse_options
 
 _CHUNK_GENERATED_FIELDS = CHUNK_GENERATED_FIELDS
 _CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
+
+# Read batch sizes for the two input passes (issue #423), matching embed's.
+# The id pass is projected to one narrow column so it can afford a wide batch;
+# the row pass carries the document text and stays an order of magnitude
+# smaller. Neither is derived from `flush_every`, which is a publication
+# cadence with no upper bound while these bound residency.
+_ID_BATCH_ROWS = 100_000
+_INPUT_BATCH_ROWS = 1_000
 
 
 def run_chunk_model(
@@ -49,7 +58,12 @@ def run_chunk_model(
             "`depends_on:` (the extraction model to chunk)"
         )
     upstream = parse_ref(model.depends_on[0])
-    frame = adapter.read_table(upstream)
+    # A zero-row read for the contract, not the corpus (issue #423). Chunk used
+    # to pull the whole upstream registry into one frame before splitting
+    # anything — the #410 hole one stage earlier, and worse placed, since chunk
+    # feeds embed and its input is the document registry.
+    schema_probe = adapter.read_table(upstream, limit=0)
+    frame = schema_probe
     if chunk_config.text_field not in frame.columns:
         raise RunError(
             f"Chunk model '{model.name}': upstream '{upstream}' has no column "
@@ -80,7 +94,8 @@ def run_chunk_model(
             f"{missing_metadata}, which upstream '{upstream}' does not have. "
             f"Available: {sorted(frame.columns)}"
         )
-    document_ids = chunk_document_ids(frame, model.name)
+    # One projected pass over the id column, before anything is written.
+    current_ids, upstream_rows = _stream_document_ids(adapter, upstream, model.name)
 
     code_version = compute_code_version(
         extraction=None,
@@ -103,62 +118,165 @@ def run_chunk_model(
     ]
     chunked_at = datetime.now(UTC).isoformat()
 
-    rows: list[dict[str, Any]] = []
     state_records: list[StateRecord] = []
     processed = 0
     skipped = 0
-    current_ids: set[str] = set()
-    changed_ids: list[str] = []
+    flush_every = chunk_config.flush_every
+    use_full = model.materialization == "full" or full_refresh
+    # An explicit dtype for the section column: a first window whose pattern
+    # matched no headings supplies only nulls, which polars infers as `Null`
+    # and DuckDB materializes as an integer column — so the next window that
+    # does find a heading fails converting a string into it (Codex review,
+    # #343, and the same failure mode as the append-only logs in #333). Fixed
+    # for the whole run rather than inferred per window, which is exactly the
+    # hazard windowed publication introduces.
+    section_schema = (
+        {chunk_config.headings.column: pl.String}
+        if chunk_config.headings is not None
+        else None
+    )
+    publisher = FlushPublisher(
+        adapter,
+        model_name=model.name,
+        state_scope=state_scope,
+        use_full=use_full,
+    )
 
-    with get_reporter().model_task(model.name, "chunk", len(document_ids)) as task:
-        for document_id, record in zip(
-            document_ids, frame.iter_rows(named=True), strict=True
-        ):
-            task.advance(1)
-            current_ids.add(document_id)
-            raw_text = record[chunk_config.text_field]
-            text = "" if raw_text is None else str(raw_text)
-            document_hash = chunk_input_hash(record, text_field=chunk_config.text_field)
-            if is_incremental:
-                prior = processed_state.get(document_id)
-                if prior == StateValue(document_hash, code_version):
-                    skipped += 1
-                    continue
-                if prior is not None:
-                    changed_ids.append(document_id)
-            processed += 1
-            # Rendered per document, because the values are the document's. The
-            # block is charged against chunk_size before splitting and prepended
-            # after, so every emitted chunk — block included — stays within the
-            # size the embedder was configured for (issue #308).
-            block = render_metadata_block(record, chunk_config.in_text_metadata)
-            try:
-                pieces = split_text(
-                    text, chunk_config, reserved=measure(block, chunk_config) if block else 0
-                )
-            except ChunkingError as error:
-                raise RunError(f"Chunk model '{model.name}': {error}") from error
-            carried = {column: record[column] for column in carry_columns}
-            for piece in pieces:
-                rows.append(
-                    chunk_row(
-                        carried=carried,
-                        document_id=document_id,
-                        piece_index=piece.index,
-                        chunk_count=len(pieces),
-                        text=block + piece.text,
-                        section_column=(
-                            chunk_config.headings.column
-                            if chunk_config.headings is not None
-                            else None
-                        ),
-                        section=piece.section,
-                        strategy=chunk_config.strategy,
-                        code_version=code_version,
-                        chunked_at=chunked_at,
+    def _publish_window(
+        window_rows: list[dict[str, Any]],
+        window_state: list[StateRecord],
+        window_changed: list[str],
+    ) -> None:
+        chunk_frame = (
+            pl.DataFrame(window_rows, schema_overrides=section_schema)
+            if window_rows
+            else pl.DataFrame()
+        )
+        publisher.publish(
+            write_full=lambda: adapter.materialize_full(
+                model.name,
+                chunk_frame,
+                options=parsed_warehouse_options,
+            ),
+            write_incremental=lambda: adapter.replace_children(
+                model.name,
+                parent_key="document_id",
+                parent_ids=window_changed,
+                child_key="chunk_id",
+                new_rows=chunk_frame,
+                state_scope=state_scope,
+                state_records=window_state,
+                on_schema_change=model.on_schema_change,
+                options=parsed_warehouse_options,
+            ),
+            state_records=window_state,
+            # replace_children applies the state records in the same
+            # transaction as the rows; the full-replace branch does not.
+            advances_state_itself=not (use_full and publisher.first_publication),
+        )
+
+    window_rows: list[dict[str, Any]] = []
+    window_state: list[StateRecord] = []
+    window_changed: list[str] = []
+    window_documents = 0
+
+    with get_reporter().model_task(model.name, "chunk", upstream_rows) as task:
+        # Streamed, not read whole (issue #423). The id comes off each record
+        # rather than from a parallel list, so this needs no correspondence
+        # with the id pass above — which matters, because `table_snapshot`
+        # promises no ordering and the two passes are separate snapshots.
+        with adapter.table_snapshot(
+            upstream, batch_size=_INPUT_BATCH_ROWS
+        ) as snapshot:
+            for batch in snapshot:
+                batch_frame = pl.from_arrow(batch)
+                assert isinstance(batch_frame, pl.DataFrame)
+                for record in batch_frame.iter_rows(named=True):
+                    task.advance(1)
+                    document_id = str(record["document_id"])
+                    raw_text = record[chunk_config.text_field]
+                    text = "" if raw_text is None else str(raw_text)
+                    document_hash = chunk_input_hash(
+                        record, text_field=chunk_config.text_field
                     )
-                )
-            state_records.append(StateRecord(document_id, document_hash, code_version))
+                    if is_incremental:
+                        prior = processed_state.get(document_id)
+                        if prior == StateValue(document_hash, code_version):
+                            skipped += 1
+                            continue
+                        if prior is not None:
+                            window_changed.append(document_id)
+                    processed += 1
+                    # Rendered per document, because the values are the
+                    # document's. The block is charged against chunk_size
+                    # before splitting and prepended after, so every emitted
+                    # chunk — block included — stays within the size the
+                    # embedder was configured for (issue #308).
+                    block = render_metadata_block(
+                        record, chunk_config.in_text_metadata
+                    )
+                    try:
+                        pieces = split_text(
+                            text,
+                            chunk_config,
+                            reserved=measure(block, chunk_config) if block else 0,
+                        )
+                    except ChunkingError as error:
+                        raise RunError(
+                            f"Chunk model '{model.name}': {error}"
+                        ) from error
+                    carried = {column: record[column] for column in carry_columns}
+                    for piece in pieces:
+                        window_rows.append(
+                            chunk_row(
+                                carried=carried,
+                                document_id=document_id,
+                                piece_index=piece.index,
+                                chunk_count=len(pieces),
+                                text=block + piece.text,
+                                section_column=(
+                                    chunk_config.headings.column
+                                    if chunk_config.headings is not None
+                                    else None
+                                ),
+                                section=piece.section,
+                                strategy=chunk_config.strategy,
+                                code_version=code_version,
+                                chunked_at=chunked_at,
+                            )
+                        )
+                    record_state = StateRecord(
+                        document_id, document_hash, code_version
+                    )
+                    window_state.append(record_state)
+                    state_records.append(record_state)
+                    window_documents += 1
+                    if window_documents >= flush_every:
+                        try:
+                            _publish_window(
+                                window_rows, window_state, window_changed
+                            )
+                        except AdapterError as error:
+                            raise RunError(str(error)) from error
+                        # Drop the window's rows before the next one is built;
+                        # holding them is the O(corpus) the windows exist to
+                        # avoid, and chunking amplifies, so the output is
+                        # larger than the input it came from.
+                        window_rows = []
+                        window_state = []
+                        window_changed = []
+                        window_documents = 0
+
+    if window_documents or not publisher.published_any:
+        # The trailing partial window, and the empty-run case: a rebuild still
+        # owes the target its (possibly empty) table.
+        try:
+            _publish_window(window_rows, window_state, window_changed)
+        except AdapterError as error:
+            raise RunError(str(error)) from error
+        window_rows = []
+        window_state = []
+        window_changed = []
 
     deleted = 0
     # A subset invocation deliberately narrows what the run sees, so absence
@@ -181,42 +299,7 @@ def run_chunk_model(
             )
             deleted = len(removed)
 
-    rows_written = 0
-    # An explicit dtype for the section column: a first batch whose pattern
-    # matched no headings supplies only nulls, which polars infers as `Null`
-    # and DuckDB materializes as an integer column — so the next batch that
-    # does find a heading fails converting a string into it (Codex review,
-    # #343, and the same failure mode as the append-only logs in #333).
-    section_schema = (
-        {chunk_config.headings.column: pl.String}
-        if chunk_config.headings is not None
-        else None
-    )
-    chunk_frame = (
-        pl.DataFrame(rows, schema_overrides=section_schema) if rows else pl.DataFrame()
-    )
-    if model.materialization == "full" or full_refresh:
-        rows_written = adapter.materialize_full(
-            model.name,
-            chunk_frame,
-            options=parsed_warehouse_options,
-        )
-        adapter.replace_state(state_scope, state_records)
-    else:
-        try:
-            rows_written = adapter.replace_children(
-                model.name,
-                parent_key="document_id",
-                parent_ids=changed_ids,
-                child_key="chunk_id",
-                new_rows=chunk_frame,
-                state_scope=state_scope,
-                state_records=state_records,
-                on_schema_change=model.on_schema_change,
-                options=parsed_warehouse_options,
-            )
-        except AdapterError as error:
-            raise RunError(str(error)) from error
+    rows_written = publisher.rows_written
 
     return ModelRunResult(
         model_name=model.name,
@@ -229,28 +312,91 @@ def run_chunk_model(
     )
 
 
-def chunk_document_ids(frame: pl.DataFrame, model_name: str) -> list[str]:
-    raw_ids = frame["document_id"].to_list()
-    null_count = sum(value is None for value in raw_ids)
+def _reject_bad_document_ids(
+    model_name: str,
+    *,
+    total: int,
+    distinct: int,
+    null_count: int,
+    empty_count: int,
+) -> None:
+    """The `document_id` contract, from counts rather than from the values.
+
+    Shared so the frame-based and streamed passes cannot drift into reporting
+    the same violation differently.
+    """
     if null_count:
         raise RunError(
             f"Chunk model '{model_name}': upstream `document_id` contains "
             f"{null_count} NULL value(s)"
         )
-    document_ids = [str(value) for value in raw_ids]
-    empty_count = sum(not value for value in document_ids)
     if empty_count:
         raise RunError(
             f"Chunk model '{model_name}': upstream `document_id` contains "
             f"{empty_count} empty value(s)"
         )
-    duplicate_count = len(document_ids) - len(set(document_ids))
+    duplicate_count = total - distinct
     if duplicate_count:
         raise RunError(
             f"Chunk model '{model_name}': upstream `document_id` contains "
             f"{duplicate_count} duplicate value(s)"
         )
+
+
+def chunk_document_ids(frame: pl.DataFrame, model_name: str) -> list[str]:
+    raw_ids = frame["document_id"].to_list()
+    document_ids = [str(value) for value in raw_ids if value is not None]
+    _reject_bad_document_ids(
+        model_name,
+        total=len(raw_ids),
+        distinct=len({value for value in document_ids if value}),
+        null_count=sum(value is None for value in raw_ids),
+        empty_count=sum(not value for value in document_ids),
+    )
     return document_ids
+
+
+def _stream_document_ids(
+    adapter: WarehouseAdapter, table: str, model_name: str
+) -> tuple[set[str], int]:
+    """Validate the upstream `document_id` column and return it, streamed.
+
+    One projected pass (issue #423). Residency is proportional to the *key
+    count* rather than the row width, which for a document registry is the
+    difference between a set of ids and several gigabytes of text.
+
+    Eager rather than folded into the chunk loop: a NULL, empty, or duplicate
+    id is a contract violation the run should die on before it has written
+    anything, not partway through publishing windows.
+    """
+    ids: set[str] = set()
+    total = 0
+    null_count = 0
+    empty_count = 0
+    with adapter.table_snapshot(
+        table, columns=["document_id"], batch_size=_ID_BATCH_ROWS
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            for value in frame["document_id"].to_list():
+                total += 1
+                if value is None:
+                    null_count += 1
+                    continue
+                document_id = str(value)
+                if not document_id:
+                    empty_count += 1
+                    continue
+                ids.add(document_id)
+    _reject_bad_document_ids(
+        model_name,
+        total=total,
+        distinct=len(ids),
+        null_count=null_count,
+        empty_count=empty_count,
+    )
+    return ids, total
 
 
 def chunk_input_hash(record: dict[str, Any], *, text_field: str) -> str:

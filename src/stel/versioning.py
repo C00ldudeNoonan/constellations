@@ -120,7 +120,7 @@ def compute_code_version(
         "ml": ml.model_dump(mode="json", exclude={"artifact": {"external"}})
         if ml
         else None,
-        "chunk": chunk.model_dump() if chunk else None,
+        "chunk": chunk.model_dump(exclude={"flush_every"}) if chunk else None,
         # Scoring configuration changes what the metric rows mean, so it
         # invalidates them like any other row-content change (issue #309).
         "eval": eval_config.model_dump() if eval_config else None,

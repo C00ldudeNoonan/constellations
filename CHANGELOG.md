@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Chunk models hold the bounded-memory contract (issue #423)
+
+Found by #414's audit. Chunk was unbounded on **both** sides: it read the whole
+upstream registry into one frame, and accumulated every chunk row for a single
+end-of-run publish. The worst-placed of the remaining gaps — chunk feeds embed,
+so a corpus could be OOM-killed here before any of embed's bounded-memory work
+was reached — and chunking *amplifies*, so the accumulated output was larger
+than the input it came from.
+
+- The upstream schema comes from a zero-row probe, `document_id` is validated
+  in one projected streamed pass before anything is written, and documents
+  stream in batches.
+- Chunks publish every `chunk.flush_every` documents (new, default 5000)
+  through the same `FlushPublisher` embed and llm use, so an interrupted run
+  keeps its published windows and resumes from state.
+- `chunk.flush_every` is excluded from `code_version` like every other flush
+  cadence: it changes execution, never chunk content, so no existing corpus
+  re-chunks.
+- No incremental state is invalidated: `chunk_input_hash` values are unchanged
+  across the new read path, pinned by a test rather than assumed.
+
 ### The bounded-memory contract, stated and enforced (issue #414)
 
 One root cause reached production five times through five stages (#385, #402,

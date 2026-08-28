@@ -46,6 +46,7 @@ different stages, and each fix was correct and local:
 | #407 | embed resume | the whole existing target, vectors included |
 | #410 → #411 | embed input | `read_table(upstream)` before the first provider call |
 | #418 → #420 | BigQuery snapshot | an unpartitioned `OVER()` made the warehouse buffer the projection |
+| #423 → #425 | chunk | whole upstream registry in, every chunk row accumulated out |
 
 The sequence is the argument. Five local fixes did not converge on a bounded
 system, because nothing said what bounded meant.
@@ -99,9 +100,6 @@ everything. Neither replaces measuring a real corpus.
 Tracked, and the list may only shrink — `test_the_unbounded_list_only_shrinks`
 fails if a stage is added to it:
 
-- **#423 — chunk** reads its whole upstream registry before chunking anything.
-  The worst-placed of the two: chunk feeds embed, so a corpus can be
-  OOM-killed here before any of embed's bounded-memory work is reached.
 - **#424 — llm** reads its whole upstream before the first provider call, and
   its whole existing target to collect id values. The #410 and #407 holes,
   unfixed for the stage where a re-run costs the most per row.

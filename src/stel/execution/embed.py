@@ -76,6 +76,8 @@ def run_embed_model(
     resolved: ResolvedProfile,
     full_refresh: bool,
     run_budget: BudgetLedger | None = None,
+    subset_run: bool = False,
+    read_predicates: Sequence[ReadPredicate] = (),
 ) -> ModelRunResult:
     assert model.embed is not None
     config = model.embed
@@ -99,6 +101,16 @@ def run_embed_model(
             f"required column(s): {', '.join(missing)}. Available: "
             f"{sorted(schema_probe.columns)}"
         )
+    filter_missing = sorted(
+        {predicate.column for predicate in read_predicates}
+        - set(schema_probe.columns)
+    )
+    if filter_missing:
+        raise RunError(
+            f"Embed model '{model.name}': --read-filter column(s) "
+            f"{', '.join(filter_missing)} are not in upstream '{upstream}'. "
+            f"Available: {sorted(schema_probe.columns)}"
+        )
     generated = set(EMBED_METADATA_FIELDS) | {config.vector_field}
     generated_names = {name.casefold() for name in generated}
     collisions = sorted(
@@ -117,7 +129,7 @@ def run_embed_model(
     # duplicate id still fails the run before the first provider call instead
     # of after the corpus has been paid for.
     current_ids, upstream_rows = _stream_upstream_ids(
-        adapter, upstream, config.id_field, model.name
+        adapter, upstream, config.id_field, model.name, predicates=read_predicates
     )
     embedding_options = resolve_embedding_options(config.provider, resolved)
     identity = EmbeddingIdentity.from_config(
@@ -160,7 +172,10 @@ def run_embed_model(
     # of pretending to fail.
     budget_guard = BudgetGuard(None, run_budget) if run_budget is not None else None
 
-    removed = sorted(set(processed_state) - current_ids)
+    # A subset run reads a deliberate slice of the upstream, so every id
+    # outside the slice would look removed; reconciliation belongs to the
+    # next unfiltered run (issue #417).
+    removed = sorted(set(processed_state) - current_ids) if not subset_run else []
     removed_target_keys: list[Any] = (
         [
             key
@@ -271,7 +286,9 @@ def run_embed_model(
         # `table_snapshot` does not promise an ordering and the two passes are
         # separate snapshots.
         with adapter.table_snapshot(
-            upstream, batch_size=_INPUT_BATCH_ROWS
+            upstream,
+            batch_size=_INPUT_BATCH_ROWS,
+            predicate=list(read_predicates),
         ) as snapshot:
             for batch in snapshot:
                 frame = pl.from_arrow(batch)
@@ -487,6 +504,7 @@ def _stream_upstream_ids(
     table: str,
     id_field: str,
     model_name: str,
+    predicates: Sequence[ReadPredicate] = (),
 ) -> tuple[set[str], int]:
     """Validate the upstream id column and return its distinct ids and row count.
 
@@ -504,7 +522,10 @@ def _stream_upstream_ids(
     null_count = 0
     empty_count = 0
     with adapter.table_snapshot(
-        table, columns=[id_field], batch_size=_ID_BATCH_ROWS
+        table,
+        columns=[id_field],
+        batch_size=_ID_BATCH_ROWS,
+        predicate=list(predicates),
     ) as snapshot:
         for batch in snapshot:
             frame = pl.from_arrow(batch)

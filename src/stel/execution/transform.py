@@ -154,6 +154,8 @@ def run_transform_model(
     resolved: ResolvedProfile,
     full_refresh: bool = False,
     run_budget: BudgetLedger | None = None,
+    subset_run: bool = False,
+    read_predicates: Sequence[ReadPredicate] = (),
 ) -> ModelRunResult:
     assert model.transform is not None
     if model.transform.type != "python":
@@ -237,6 +239,8 @@ def run_transform_model(
             parent_source=parent_source,
             full_refresh=full_refresh,
             result=result,
+            subset_run=subset_run,
+            read_predicates=read_predicates,
         )
 
     output = _invoke_transform(transform_fn, deps, ctx, model)
@@ -340,6 +344,8 @@ def _run_incremental_transform(
     parent_source: str,
     full_refresh: bool,
     result: ModelRunResult,
+    subset_run: bool = False,
+    read_predicates: Sequence[ReadPredicate] = (),
 ) -> ModelRunResult:
     """Generalize the chunk-model incremental pattern to a declared one-to-many
     transform: skip unchanged parents, invoke the transform only on changed/new
@@ -383,6 +389,7 @@ def _run_incremental_transform(
         parent_source,
         contract.parent_source_key,
         model_name=model.name,
+        predicates=read_predicates,
     )
     current_keys = set(digests_by_parent)
 
@@ -409,8 +416,13 @@ def _run_incremental_transform(
         processed_parents.append(parent_key)
         state_records.append(StateRecord(parent_key, fingerprint, code_version))
 
+    # Under a subset run the classification pass saw a deliberate slice of
+    # the parents, so every other partition's parent would look removed;
+    # reconciliation belongs to the next unfiltered run (issue #417).
     removed = (
-        [key for key in prior_state if key not in current_keys] if is_incremental else []
+        [key for key in prior_state if key not in current_keys]
+        if is_incremental and not subset_run
+        else []
     )
 
     # No changed or new parents: at most some removed parents need deleting.
@@ -733,6 +745,7 @@ def _stream_parent_digests(
     key_col: str,
     *,
     model_name: str,
+    predicates: Sequence[ReadPredicate] = (),
 ) -> dict[str, list[str]]:
     """Per-parent row digests, in first-appearance parent order.
 
@@ -747,8 +760,15 @@ def _stream_parent_digests(
     """
     digests: dict[str, list[str]] = {}
     with adapter.table_snapshot(
-        table, batch_size=_CLASSIFY_BATCH_ROWS
+        table, batch_size=_CLASSIFY_BATCH_ROWS, predicate=list(predicates)
     ) as snapshot:
+        for predicate in predicates:
+            if predicate.column not in snapshot.schema.names:
+                raise RunError(
+                    f"Incremental transform '{model_name}': --read-filter "
+                    f"column '{predicate.column}' is not in parent source "
+                    f"'{table}'. Available: {sorted(snapshot.schema.names)}"
+                )
         if key_col not in snapshot.schema.names:
             raise RunError(
                 f"Incremental transform '{model_name}': parent_source is missing "

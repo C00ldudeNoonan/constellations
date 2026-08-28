@@ -894,6 +894,18 @@ def _model_kind(model: ModelConfig) -> str:
     "filtered run never deletes and cannot be combined with --full-refresh.",
 )
 @click.option(
+    "--read-filter",
+    "read_filter",
+    multiple=True,
+    nargs=3,
+    metavar="FIELD OP VALUE",
+    help="Narrow what transform parent reads and embed source reads see, as a "
+    "typed predicate pushed down to the warehouse (repeatable; ops: eq, ne, "
+    "lt, le, gt, ge, in -- 'in' takes a JSON array). Additive/upsert-only, "
+    "like --source-filter: a filtered run never deletes and cannot be "
+    "combined with --full-refresh.",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -911,6 +923,7 @@ def run(
     threads: int,
     state: Path | None,
     source_filter: tuple[str, ...],
+    read_filter: tuple[tuple[str, str, str], ...],
     json_output: bool,
     verbose: int,
 ) -> None:
@@ -947,6 +960,7 @@ def run(
             threads=threads,
             state=state,
             source_filter=source_filter,
+            read_filter=read_filter,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1099,6 +1113,18 @@ def _usage_summary(
     "filtered run never deletes and cannot be combined with --full-refresh.",
 )
 @click.option(
+    "--read-filter",
+    "read_filter",
+    multiple=True,
+    nargs=3,
+    metavar="FIELD OP VALUE",
+    help="Narrow what transform parent reads and embed source reads see, as a "
+    "typed predicate pushed down to the warehouse (repeatable; ops: eq, ne, "
+    "lt, le, gt, ge, in -- 'in' takes a JSON array). Additive/upsert-only, "
+    "like --source-filter: a filtered run never deletes and cannot be "
+    "combined with --full-refresh.",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1116,6 +1142,7 @@ def build(
     store_failures: bool,
     state: Path | None,
     source_filter: tuple[str, ...],
+    read_filter: tuple[tuple[str, str, str], ...],
     json_output: bool,
     verbose: int,
 ) -> None:
@@ -1138,6 +1165,7 @@ def build(
             store_failures=store_failures,
             state=state,
             source_filter=source_filter,
+            read_filter=read_filter,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e

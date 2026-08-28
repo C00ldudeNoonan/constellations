@@ -3145,6 +3145,66 @@ rates, and centroid-distance outliers in process. A zero or NaN embedding is a
 common silent provider failure, and near-zero variance catches representation
 collapse — both invisible to `not_null`.
 
+**`embedding_canary`** covers the one failure every check above is blind to: a
+hosted model alias re-resolving to a new snapshot under a pinned name, with
+your code, config, and input text byte-identical. Config hashes are computed
+from your own inputs and cannot observe the provider; the structural checks
+pass on any well-formed vectors. The canary re-embeds a handful of frozen
+probe strings and compares against a blessed, committed baseline by cosine
+similarity — the measure retrieval already ranks by, so the threshold means
+"would this difference change a search result":
+
+```yaml
+- name: chunk_embeddings
+  embed:
+    provider: vertex
+    model: gemini-embedding-001
+    ...
+  tests:
+    - embedding_canary:
+        enabled: true                       # off by default; see below
+        to: ref('embedding_canary_baseline')  # a committed model: text + vector
+        min_similarity: 0.999                 # your provider's measured floor
+```
+
+The baseline is an ordinary model you `ref()` — probe text in a `text` column
+and the blessed vector in an `embedding` column (`text_column` /
+`vector_column` override the names; a JSON-encoded array string works, which
+is how extraction stores one). Every probe re-embeds through the *tested
+model's own* provider identity, and probes are capped at 64 rows: a canary is
+a handful of frozen sentences, not a corpus.
+
+Three deliberate behaviors:
+
+- **`enabled: false` is the default, and the skip is visible.** `stel build`
+  runs model tests automatically, every probe is a billed provider call, and
+  drift happens on the provider's schedule rather than yours — so the canary
+  belongs to a scheduled `stel test --select <model>` invocation, not to every
+  ad-hoc build. A disabled canary reports `skipped`, never `pass`.
+- **`min_similarity` has no default.** The right threshold is your provider's
+  measured replica-noise floor, and any shipped number would be a guess
+  wearing a default's authority. Measure it: embed the same probe N times
+  across separate calls and take the worst pairwise cosine —
+
+  ```python
+  from stel.embedding import EmbeddingIdentity, embed_texts
+  from stel.config.model import EmbedConfig
+
+  identity = EmbeddingIdentity.from_config(EmbedConfig(
+      provider="vertex", model="gemini-embedding-001", dimensions=768))
+  runs = [embed_texts(["frozen probe sentence"], identity).vectors[0]
+          for _ in range(20)]
+  ```
+
+  Set `min_similarity` with real margin *below* the observed floor.
+- **Degenerate baselines fail rather than pass.** An empty baseline, a
+  zero vector, or a dimension mismatch all fail the check — a monitor that
+  can only pass is worse than none.
+
+When the canary trips, the response is a human decision, not an automatic
+re-embed: bless a new baseline (accepting the provider's new behavior), or
+re-embed the corpus so index and queries agree again.
+
 **Inspecting failures.** Pass `--store-failures` to `stel test` or `stel
 build` to persist the offending rows of each failing test to a
 `stel_test_failures__<model>__<test>[__<column>]` table (replaced each run).

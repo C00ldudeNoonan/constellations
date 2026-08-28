@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import json
 import math
 import re
 from collections import Counter
@@ -13,11 +14,16 @@ import polars as pl
 
 from ..adapters import WarehouseAdapter
 from ..adapters.base import TEST_FAILURES_TABLE_PREFIX
+from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
+from ..embedding import EmbeddingIdentity, embed_texts, estimate_embed_requests
+from ..execution.errors import artifact_error_text
+from ..profile import resolve_embedding_options
 
 if TYPE_CHECKING:
     from ..budget import BudgetLedger
     from ..profile import ResolvedProfile
 from ..test_specs import (
+    _REF_PATTERN,
     SUPPORTED_TESTS,
     TestSpecError,
     parse_test_spec,
@@ -34,7 +40,7 @@ class TestResult:
     test_name: str
     model_name: str
     column: str | None
-    status: str  # "pass" | "warn" | "fail"
+    status: str  # "pass" | "warn" | "fail" | "skipped"
     message: str = ""
     severity: str = "error"
     failures_table: str | None = None
@@ -60,6 +66,7 @@ def evaluate_test_spec(
     store_failures: bool = False,
     resolved: ResolvedProfile | None = None,
     run_budget: BudgetLedger | None = None,
+    embed_config: Any = None,
 ) -> list[TestResult]:
     """Parse one test spec and run it.
 
@@ -84,6 +91,7 @@ def evaluate_test_spec(
             store_failures,
             resolved,
             run_budget,
+            embed_config,
         ),
         parsed.severity,
     )
@@ -120,6 +128,7 @@ def _run_named_test(
     store_failures: bool = False,
     resolved: ResolvedProfile | None = None,
     run_budget: BudgetLedger | None = None,
+    embed_config: Any = None,
 ) -> list[TestResult]:
     if test_name == "not_null":
         return _not_null(model_name, table_ref, adapter, arg, store_failures)
@@ -170,6 +179,18 @@ def _run_named_test(
         return [_golden(model_name, table_ref, adapter, arg, store_failures)]
     if test_name == "llm_judge":
         return [_llm_judge(model_name, table_ref, adapter, arg, resolved, run_budget)]
+    if test_name == "embedding_canary":
+        return [
+            _embedding_canary(
+                model_name,
+                table_ref,
+                adapter,
+                arg,
+                resolved,
+                embed_config,
+                run_budget,
+            )
+        ]
     raise UnknownTestError(
         f"Unknown test '{test_name}'. Supported: {sorted(SUPPORTED_TESTS)}"
     )
@@ -1705,3 +1726,282 @@ def _fuzzy_contains(needle: str, haystack: str, min_score: float) -> bool:
             return True
         best = max(best, score)
     return best >= min_score
+
+
+# Probes are re-embedded on every canary run, and each probe is provider
+# spend. A cap makes the cost structurally bounded rather than a doc
+# recommendation: a canary is a handful of frozen sentences, and a
+# thousand-row "baseline" is a misuse that should fail loudly, not bill
+# quietly.
+_CANARY_MAX_PROBES = 64
+
+
+def _embedding_canary(
+    model_name: str,
+    table_ref: str,
+    adapter: WarehouseAdapter,
+    arg: Any,
+    resolved: ResolvedProfile | None,
+    embed_config: Any,
+    run_budget: BudgetLedger | None = None,
+) -> TestResult:
+    """Detect provider drift under a pinned model name (issue #305).
+
+    Every other embedding check is blind to this failure: the provider
+    re-resolving a hosted alias to a new snapshot with our code, config, and
+    input text byte-identical. Config hashes are computed from our own inputs
+    and cannot see it; structural checks pass on any well-formed vectors. The
+    canary re-embeds frozen probe strings and compares against a blessed,
+    committed baseline by cosine similarity -- the measure retrieval already
+    ranks by, so the threshold means "would this difference change a search
+    result" rather than "how many decimal places are acceptable".
+    """
+    del table_ref  # the canary reads the baseline, not the model's own rows
+    opts = _require_dict("embedding_canary", arg)
+    if not opts.get("enabled", False):
+        # Off by default, and the skip is *visible* -- a silently-passing
+        # disabled canary would be the "monitor that can only pass" the design
+        # forbids. `stel build` runs model tests automatically, drift happens
+        # on the provider's schedule rather than ours, and every probe is a
+        # billed call, so the canary belongs to an explicit scheduled
+        # invocation, not to every ad-hoc build (issue #305).
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=None,
+            status="skipped",
+            message=(
+                "Canary disabled (the default): probes are billed provider "
+                "calls, so enable it (`enabled: true`) for the scheduled "
+                "invocation that owns drift detection"
+            ),
+        )
+    to = str(opts["to"])
+    min_similarity = float(opts["min_similarity"])
+    text_column = str(opts.get("text_column", "text"))
+    vector_column = str(opts.get("vector_column", "embedding"))
+    if embed_config is None:
+        raise UnknownTestError(
+            "embedding_canary only applies to a model with an `embed:` block; "
+            "the canary re-embeds with that model's own provider identity, "
+            "which is the thing being monitored"
+        )
+    if resolved is None:
+        raise UnknownTestError(
+            "embedding_canary requires a resolved profile to reach the "
+            "embedding provider"
+        )
+
+    match = _REF_PATTERN.match(to)
+    baseline_model = match.group(1) if match else to.strip()
+    baseline_ref = adapter.table_ref(baseline_model)
+    schema = adapter.query_df(f"SELECT * FROM {baseline_ref} LIMIT 0")
+    missing = sorted({text_column, vector_column} - set(schema.columns))
+    if missing:
+        raise UnknownTestError(
+            f"embedding_canary baseline '{baseline_model}' is missing "
+            f"column(s): {', '.join(missing)}. Available: {sorted(schema.columns)}"
+        )
+    frame = adapter.query_df(
+        f"SELECT {adapter.quote_ident(text_column)} AS probe_text, "
+        f"{adapter.quote_ident(vector_column)} AS baseline_vector "
+        f"FROM {baseline_ref}"
+    )
+    rows = [
+        (str(text), vector)
+        for text, vector in frame.iter_rows()
+        if text is not None and str(text).strip() and vector is not None
+    ]
+    if not rows:
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=(
+                f"Baseline '{baseline_model}' has no usable probe rows; a "
+                "canary with no probes can only ever pass, which is worse "
+                "than no canary"
+            ),
+        )
+    if len(rows) > _CANARY_MAX_PROBES:
+        raise UnknownTestError(
+            f"embedding_canary baseline '{baseline_model}' has {len(rows)} "
+            f"probe rows; the cap is {_CANARY_MAX_PROBES}. Probes are "
+            "re-embedded (billed) every run -- a canary is a handful of "
+            "frozen sentences, not a corpus"
+        )
+    # Deterministic probe order: SQL row order is not guaranteed, and the
+    # failure message names probes by ordinal.
+    rows.sort(key=lambda item: item[0])
+
+    # Every baseline vector is validated BEFORE the provider is contacted
+    # (issue #305 review): a malformed baseline guarantees a failing verdict,
+    # and paying the full probe cap on every scheduled run to learn what the
+    # committed file already shows is spend with no information in it.
+    expected_dimensions = int(embed_config.dimensions)
+    baselines: list[list[float]] = []
+    invalid: list[str] = []
+    for ordinal, (_text, raw_vector) in enumerate(rows, start=1):
+        baseline = _canary_baseline_vector(raw_vector)
+        if baseline is None:
+            invalid.append(f"probe {ordinal}: not a numeric array")
+            continue
+        if len(baseline) != expected_dimensions:
+            invalid.append(
+                f"probe {ordinal}: {len(baseline)} dimensions, model declares "
+                f"{expected_dimensions}"
+            )
+            continue
+        if all(value == 0.0 for value in baseline):
+            invalid.append(f"probe {ordinal}: zero vector has no direction")
+            continue
+        baselines.append(baseline)
+    if invalid:
+        detail = "; ".join(invalid[:5])
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=(
+                f"{len(invalid)} of {len(rows)} baseline vector(s) in "
+                f"'{baseline_model}' are unusable ({detail}); no probes were "
+                "embedded. Re-bless the baseline"
+            ),
+        )
+
+    embedding_options = resolve_embedding_options(embed_config.provider, resolved)
+    identity = EmbeddingIdentity.from_config(
+        embed_config,
+        profile_options=embedding_options.provider_options,
+    )
+    probe_texts = [text for text, _ in rows]
+    # Provider construction, credential resolution, budget exhaustion, and the
+    # calls all stay inside the boundary: each becomes a failed check, not an
+    # exception that aborts the test run. The canary is a billed embed path,
+    # so it charges the same run ledger ordinary embed execution does -- a
+    # scheduled canary must not be the one caller the operator's cap cannot
+    # see (issue #305 review).
+    guard = BudgetGuard(None, run_budget) if run_budget is not None else None
+    try:
+        if guard is not None:
+            guard.charge_documents(len(rows))
+            guard.ensure_headroom(
+                next_calls=estimate_embed_requests(
+                    probe_texts,
+                    identity,
+                    profile_options=embedding_options.provider_options,
+                )
+            )
+        embedded = embed_texts(
+            probe_texts,
+            identity,
+            credential_env=embedding_options.api_key_env,
+            profile_options=embedding_options.provider_options,
+            max_retries=embed_config.max_retries,
+            timeout_seconds=embedding_options.timeout_seconds,
+        )
+        if guard is not None:
+            guard.charge_metrics(
+                {
+                    **embedded.usage.to_metrics(),
+                    "api_calls": embedded.provider_requests,
+                }
+            )
+    except BudgetExceededError as error:
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=f"run budget exceeded before canary probes ran: {error}",
+        )
+    except Exception as error:
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=(
+                "Canary re-embedding failed: "
+                f"{artifact_error_text(error)}"
+            ),
+        )
+
+    worst = 1.0
+    failures: list[str] = []
+    for ordinal, (baseline, vector) in enumerate(
+        zip(baselines, embedded.vectors, strict=True), start=1
+    ):
+        if len(baseline) != len(vector):
+            # Upfront validation checked the *declared* dimensions; a provider
+            # returning something else anyway is drift of the loudest kind.
+            failures.append(
+                f"probe {ordinal}: baseline has {len(baseline)} dimensions, "
+                f"provider returned {len(vector)}"
+            )
+            worst = 0.0
+            continue
+        similarity = _cosine_similarity(baseline, list(vector))
+        worst = min(worst, similarity)
+        if similarity < min_similarity:
+            failures.append(f"probe {ordinal}: cosine {similarity:.6f}")
+    if failures:
+        return TestResult(
+            test_name="embedding_canary",
+            model_name=model_name,
+            column=vector_column,
+            status="fail",
+            message=(
+                f"{len(failures)} of {len(rows)} probe(s) drifted below "
+                f"min_similarity {min_similarity:g} against baseline "
+                f"'{baseline_model}' ({'; '.join(failures[:5])}). The "
+                "provider's behavior moved under a pinned model name; a "
+                "human decides whether to bless a new baseline or re-embed "
+                "the corpus"
+            ),
+        )
+    return _pass(
+        "embedding_canary",
+        model_name,
+        vector_column,
+        f"{len(rows)} probe(s) within min_similarity {min_similarity:g} "
+        f"(worst cosine {worst:.6f})",
+    )
+
+
+def _canary_baseline_vector(value: Any) -> list[float] | None:
+    """Coerce a baseline cell to a numeric vector, or None if it is not one.
+
+    A committed baseline usually arrives through extraction, which stores a
+    JSON array as its text -- so a JSON-encoded string is as legitimate a
+    shape as a native list column, and rejecting it would make the canary
+    unusable with the very "ordinary committed model" the design calls for.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, list | tuple) or not value:
+        return None
+    out: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int | float):
+            return None
+        if not math.isfinite(float(item)):
+            return None
+        out.append(float(item))
+    return out
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        # A zero vector has no direction; calling it "similar" to anything
+        # would let a degenerate baseline or response pass the canary.
+        return 0.0
+    return dot / (norm_a * norm_b)

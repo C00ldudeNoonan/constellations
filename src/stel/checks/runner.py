@@ -152,6 +152,7 @@ def run_model_tests(
                     store_failures=store_failures,
                     resolved=resolved,
                     run_budget=run_budget,
+                    embed_config=model.embed,
                 )
             )
         except UnknownTestError as e:

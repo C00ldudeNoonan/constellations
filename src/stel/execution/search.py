@@ -71,6 +71,7 @@ def run_search_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool = False,
+    subset_run: bool = False,
 ) -> ModelRunResult:
     search = model.search
     assert search is not None
@@ -329,12 +330,16 @@ def run_search_model(
                 # Stale discovery streams state pages whose keys no longer
                 # exist upstream, in ascending key order — complete even for
                 # an empty upstream, with residency bounded by one page.
+                # A subset invocation upstream means an id absent from this
+                # run's view is not stale; reconciliation belongs to the next
+                # unfiltered run, exactly as rebuild already skips it
+                # (issue #417).
                 stale_pages = (
                     reconciler.iter_stale_pages(
                         upstream_table=upstream,
                         key_column=search.id_field,
                     )
-                    if not rebuild
+                    if not rebuild and not subset_run
                     else _no_stale_pages()
                 )
                 try:
@@ -379,7 +384,15 @@ def run_search_model(
                     raise RunError(
                         "Retrieval collection failed post-publication configuration validation"
                     )
-                if metadata.row_count != rows_seen:
+                # A subset run retains records its narrowed view did not
+                # cover, so the collection legitimately holds MORE rows than
+                # this run saw; fewer still means the store lost rows
+                # (issue #417).
+                if (
+                    metadata.row_count < rows_seen
+                    if subset_run
+                    else metadata.row_count != rows_seen
+                ):
                     raise RunError(
                         "Retrieval collection failed post-publication row-count validation"
                     )

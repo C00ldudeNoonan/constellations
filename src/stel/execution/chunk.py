@@ -39,6 +39,7 @@ def run_chunk_model(
     project_dir: Path,
     adapter: WarehouseAdapter,
     full_refresh: bool,
+    subset_run: bool = False,
 ) -> ModelRunResult:
     assert model.chunk is not None
     chunk_config = model.chunk
@@ -160,7 +161,12 @@ def run_chunk_model(
             state_records.append(StateRecord(document_id, document_hash, code_version))
 
     deleted = 0
-    if is_incremental:
+    # A subset invocation deliberately narrows what the run sees, so absence
+    # is not removal: skipping the delete pass is the same promise
+    # --source-filter already makes for extraction (#266), extended one model
+    # kind downstream (issue #417). Reconciliation is the job of the next
+    # unfiltered run.
+    if is_incremental and not subset_run:
         removed = [
             document_id
             for document_id in processed_state

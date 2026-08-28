@@ -433,6 +433,28 @@ declaration. Configuration failures exit 2.
   than falling back to the whole bucket prefix** — so K filters cost K cheap
   listings and batch size stays an orchestration knob. A glob with no static
   segment (`'*/2024*'`) has nothing to narrow on and lists everything.
+- `--read-filter FIELD OP VALUE` (repeatable) extends the same partitioned-run
+  seam past extraction to `ref()`-based models (issue #417). It builds a typed
+  predicate pushed down to the warehouse and narrows what **python transform
+  parent reads** and **embed source reads** see — ops are `eq`, `ne`, `lt`,
+  `le`, `gt`, `ge`, and `in` (a JSON array of strings):
+
+  ```bash
+  stel build --select document_embeddings --read-filter cik eq 0000320193
+  stel build --select sec_document_text --read-filter filing_date ge 2024-01-01
+  ```
+
+  Either filter flag makes the **whole invocation** a subset run: chunk,
+  transform, embed, and search-index models all skip their removed-row
+  reconciliation, because absence from a deliberately narrowed run is not
+  removal — a partitioned invocation must never delete every other
+  partition's rows. Reconciliation is deferred, not lost: the next unfiltered
+  run performs it. Like `--source-filter`, a read filter is rejected with
+  `--full-refresh`, and every selected transform/embed model must be
+  incremental — a full materialization would replace its whole table with
+  the slice. Values are passed as strings; a filter on a typed column relies
+  on the warehouse's comparison semantics for string literals against that
+  type, so prefer string partition keys.
 
 ### Upgrading a warehouse built before the rename
 

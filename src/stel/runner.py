@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import fnmatch
+import json
 import logging
 import os
 import shutil
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any, cast
 
 from .adapters import (
+    ReadPredicate,
+    ReadPredicateOperator,
     TableReadSnapshot,
     WarehouseAdapter,
     create_adapter,
@@ -173,6 +176,7 @@ def run_project(
     threads: int = 1,
     state: Path | None = None,
     source_filter: Sequence[str] = (),
+    read_filter: Sequence[tuple[str, str, str]] = (),
 ) -> list[ModelRunResult]:
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
@@ -191,6 +195,24 @@ def run_project(
         if source_filter
         else False
     )
+    # Guarded like _prepare_subset_run above: `state:` selectors cannot
+    # resolve this early (no manifest is loaded yet), and with no filter there
+    # is nothing to validate.
+    read_predicates = (
+        _prepare_read_filter(
+            read_filter,
+            full_refresh=full_refresh,
+            selected=dag.select_models(select=select, exclude=exclude),
+            models=models,
+        )
+        if read_filter
+        else ()
+    )
+    # A read filter narrows what ref()-based models see, which is exactly the
+    # situation --source-filter describes for extraction: absence from a
+    # deliberately narrowed run is not removal. Presence of either flag makes
+    # the whole invocation additive (issue #417).
+    subset_run = subset_run or bool(read_predicates)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -286,6 +308,7 @@ def run_project(
             threads=threads,
             run_budget=run_budget,
             subset_run=subset_run,
+            read_predicates=read_predicates,
         )
 
     started_at = datetime.now(UTC).isoformat()
@@ -331,6 +354,7 @@ def build_project(
     store_failures: bool = False,
     state: Path | None = None,
     source_filter: Sequence[str] = (),
+    read_filter: Sequence[tuple[str, str, str]] = (),
 ) -> BuildResult:
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
@@ -352,6 +376,24 @@ def build_project(
         if source_filter
         else False
     )
+    # Guarded like _prepare_subset_run above: `state:` selectors cannot
+    # resolve this early (no manifest is loaded yet), and with no filter there
+    # is nothing to validate.
+    read_predicates = (
+        _prepare_read_filter(
+            read_filter,
+            full_refresh=full_refresh,
+            selected=dag.select_models(select=select, exclude=exclude),
+            models=models,
+        )
+        if read_filter
+        else ()
+    )
+    # A read filter narrows what ref()-based models see, which is exactly the
+    # situation --source-filter describes for extraction: absence from a
+    # deliberately narrowed run is not removal. Presence of either flag makes
+    # the whole invocation additive (issue #417).
+    subset_run = subset_run or bool(read_predicates)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -459,6 +501,7 @@ def build_project(
                     threads=threads,
                     run_budget=run_budget,
                     subset_run=subset_run,
+                    read_predicates=read_predicates,
                 )
             except RunError as e:
                 out.run_results.append(
@@ -637,6 +680,92 @@ def _prepare_subset_run(
     return True
 
 
+_READ_FILTER_OPERATORS = {
+    "eq": ReadPredicateOperator.EQUAL,
+    "ne": ReadPredicateOperator.NOT_EQUAL,
+    "lt": ReadPredicateOperator.LESS_THAN,
+    "le": ReadPredicateOperator.LESS_THAN_OR_EQUAL,
+    "gt": ReadPredicateOperator.GREATER_THAN,
+    "ge": ReadPredicateOperator.GREATER_THAN_OR_EQUAL,
+    "in": ReadPredicateOperator.IN,
+}
+
+
+def _prepare_read_filter(
+    read_filter: Sequence[tuple[str, str, str]],
+    *,
+    full_refresh: bool,
+    selected: Sequence[str],
+    models: list[ModelConfig],
+) -> tuple[ReadPredicate, ...]:
+    """Validate `--read-filter` and build the typed predicates (issue #417).
+
+    A read filter narrows what transform parent reads and embed source reads
+    see, so it carries the same additive contract as --source-filter -- and
+    two constraints follow directly:
+
+    - **Not with --full-refresh.** A full refresh rebuilds from what it reads;
+      rebuilding from a slice silently truncates the model to the slice.
+    - **Only onto incremental transform/embed models.** A `materialization:
+      full` model replaces its whole table from its (now narrowed) read --
+      the same truncation, without the flag to warn about it.
+    """
+    if not read_filter:
+        return ()
+    if full_refresh:
+        raise RunError(
+            "--read-filter cannot be combined with --full-refresh: a filtered "
+            "read rebuilds from a slice, which would silently truncate the "
+            "model to that slice."
+        )
+    selected_set = set(selected)
+    unsafe: list[str] = []
+    for model in models:
+        if model.name not in selected_set:
+            continue
+        narrowed = model.embed is not None or (
+            model.transform is not None and model.transform.type == "python"
+        )
+        if narrowed and model.materialization != "incremental":
+            unsafe.append(f"{model.name} (materialization: {model.materialization})")
+    if unsafe:
+        raise RunError(
+            "--read-filter narrows what a model reads, so every selected "
+            "transform/embed model must be incremental -- a full "
+            "materialization would replace the whole table with the slice. "
+            "Unsafe: " + ", ".join(sorted(unsafe))
+        )
+    predicates: list[ReadPredicate] = []
+    for column, operator_name, raw_value in read_filter:
+        operator = _READ_FILTER_OPERATORS.get(operator_name)
+        if operator is None:
+            raise RunError(
+                f"--read-filter operator '{operator_name}' is not one of "
+                f"{sorted(_READ_FILTER_OPERATORS)}"
+            )
+        value: Any
+        if operator is ReadPredicateOperator.IN:
+            try:
+                decoded = json.loads(raw_value)
+            except json.JSONDecodeError:
+                raise RunError(
+                    "--read-filter 'in' takes a JSON array of strings"
+                ) from None
+            if (
+                not isinstance(decoded, list)
+                or not decoded
+                or not all(isinstance(item, str) for item in decoded)
+            ):
+                raise RunError(
+                    "--read-filter 'in' takes a non-empty JSON array of strings"
+                )
+            value = tuple(decoded)
+        else:
+            value = raw_value
+        predicates.append(ReadPredicate(column, operator, value))
+    return tuple(predicates)
+
+
 def _run_budget_ledger(resolved: ResolvedProfile) -> BudgetLedger | None:
     """One shared run-scope ledger; every LLM extraction model charges it."""
     if resolved.llm is None or resolved.llm.budget is None:
@@ -657,6 +786,7 @@ def _run_model(
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
+    read_predicates: Sequence[ReadPredicate] = (),
 ) -> ModelRunResult:
     kind = _model_kind_label(model)
     log.info("starting %s (%s)", model.name, kind)
@@ -699,6 +829,8 @@ def _run_model(
                 resolved=resolved,
                 full_refresh=full_refresh,
                 run_budget=run_budget,
+                subset_run=subset_run,
+                read_predicates=read_predicates,
             )
     elif model.chunk is not None:
         result = _run_chunk_model(
@@ -706,6 +838,7 @@ def _run_model(
             project_dir=project_dir,
             adapter=adapter,
             full_refresh=full_refresh,
+            subset_run=subset_run,
         )
     elif model.embed is not None:
         result = _run_embed_model(
@@ -716,6 +849,8 @@ def _run_model(
             resolved=resolved,
             full_refresh=full_refresh,
             run_budget=run_budget,
+            subset_run=subset_run,
+            read_predicates=read_predicates,
         )
     elif model.llm is not None:
         result = _run_llm_model(
@@ -736,6 +871,7 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            subset_run=subset_run,
         )
     elif model.eval is not None:
         result = _run_eval_model(

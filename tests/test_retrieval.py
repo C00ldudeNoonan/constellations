@@ -1794,3 +1794,27 @@ def test_a_failure_after_activation_keeps_the_activated_state(
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         # The activated generation's state survives the failed cleanup.
         assert adapter.fetch_state(scope) != {}
+
+
+def test_a_subset_invocation_defers_stale_reconciliation(tmp_path: Path) -> None:
+    """Issue #417: under a subset run, an id absent from this run's view is
+    not stale. A partitioned orchestration upstream must not have the search
+    index deleting every other partition's records — reconciliation belongs
+    to the next unfiltered run, which must still perform it."""
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    first = run_project(tmp_path, select="context_search")
+    assert first[0].rows_inserted == 2
+
+    # The upstream shrinks by one record, and the invocation is a subset run
+    # (read_filter present). The vanished record must survive.
+    _materialize_upstream(tmp_path, _rows(version=2))
+    [filtered] = run_project(
+        tmp_path,
+        select="context_search",
+        read_filter=[("category", "eq", "macro")],
+    )
+    assert filtered.documents_deleted == 0
+
+    [unfiltered] = run_project(tmp_path, select="context_search")
+    assert unfiltered.documents_deleted == 1

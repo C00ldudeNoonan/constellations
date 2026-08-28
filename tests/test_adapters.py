@@ -996,17 +996,25 @@ def test_the_memory_limit_reaches_cursors_too(tmp_path: Path) -> None:
 
 def test_memory_limit_none_leaves_duckdb_unbounded(tmp_path: Path) -> None:
     """The explicit opt-out: an operator who wants DuckDB's own sizing, and no
-    detection either, has to be able to say so."""
+    detection either, has to be able to say so.
+
+    Compared against a raw `duckdb.connect()` rather than against another
+    adapter: on a cgroup-constrained test runner the other adapter would detect
+    the runner's own ceiling and legitimately differ, making this pass or fail
+    on the host rather than on the behavior.
+    """
     unbounded = parse_warehouse_config(
         {"type": "duckdb", "path": str(tmp_path / "a.duckdb"), "memory_limit": "none"}
     )
-    default = parse_warehouse_config(
-        {"type": "duckdb", "path": str(tmp_path / "b.duckdb")}
-    )
-    with create_adapter(unbounded) as one, create_adapter(default) as two:
-        assert _duckdb_setting(one, "memory_limit") == _duckdb_setting(
-            two, "memory_limit"
-        )
+    with create_adapter(unbounded) as adapter:
+        opted_out = _duckdb_setting(adapter, "memory_limit")
+    raw = duckdb.connect()
+    try:
+        row = raw.execute("SELECT current_setting('memory_limit')").fetchone()
+        assert row is not None
+    finally:
+        raw.close()
+    assert opted_out == str(row[0])
 
 
 def test_a_malformed_memory_limit_is_rejected_at_config_time(tmp_path: Path) -> None:
@@ -1090,7 +1098,6 @@ def test_cgroup_v1_is_read_when_v2_is_absent(
         ("9223372036854771712", 64 * 1024**3, "v1 spells it as a sentinel"),
         (str(64 * 1024**3), 64 * 1024**3, "a ceiling at physical RAM is no ceiling"),
         (str(128 * 1024**3), 64 * 1024**3, "nor is one above it"),
-        (str(256 * 1024**2), 64 * 1024**3, "too small to be worth spilling into"),
         ("0", 64 * 1024**3, "a zero ceiling is not a real one"),
         (str(4 * 1024**3), None, "no way to tell whether it is a constraint"),
     ],
@@ -1109,6 +1116,31 @@ def test_detection_declines_rather_than_guessing(
 
     _fake_cgroup(monkeypatch, tmp_path, contents=contents, physical=physical)
     assert _detected_memory_limit() is None, why
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected"),
+    [
+        (4 * 1024**3, "3072MiB"),
+        (512 * 1024**2, "384MiB"),
+        (256 * 1024**2, "192MiB"),
+        (32 * 1024**2, "24MiB"),
+    ],
+)
+def test_a_small_container_is_still_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ceiling: int, expected: str
+) -> None:
+    """The containers that need this most must not be the ones that miss out.
+
+    An earlier revision declined below ~683MiB on the theory that a tiny limit
+    would only make DuckDB thrash — which left a 256MiB cgroup with the
+    host-sized default, i.e. exactly the OOM this exists to prevent. Slow beats
+    killed, and DuckDB accepts limits down to 16MiB.
+    """
+    from stel.adapters.duckdb import _detected_memory_limit
+
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(ceiling))
+    assert _detected_memory_limit() == expected
 
 
 def test_an_explicit_limit_wins_over_detection(
@@ -1180,6 +1212,8 @@ def test_a_relative_temp_directory_resolves_against_the_project(tmp_path: Path) 
     large run finally needed it, somewhere the operator did not put it."""
     project = tmp_path / "project"
     project.mkdir()
+    from stel.adapters.duckdb import DuckDBWarehouseConfig
+
     config = parse_warehouse_config(
         {
             "type": "duckdb",
@@ -1188,6 +1222,7 @@ def test_a_relative_temp_directory_resolves_against_the_project(tmp_path: Path) 
             "temp_directory": "./target/spill",
         }
     ).absolutize(project)
+    assert isinstance(config, DuckDBWarehouseConfig)
     assert config.temp_directory == (project / "target" / "spill").resolve()
     with create_adapter(config) as adapter:
         assert _duckdb_setting(adapter, "temp_directory") == str(config.temp_directory)

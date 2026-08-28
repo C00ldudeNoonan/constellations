@@ -188,10 +188,17 @@ _MEMORY_LIMIT_PATTERN = re.compile(
 # frames, provider buffers, the flush window. stel's own peak is bounded by
 # design (issues #401, #410), so the remainder is headroom rather than a budget.
 _CGROUP_MEMORY_FRACTION = 0.75
-# Below this, the fraction produces a limit too small to be useful and DuckDB
-# would spend the run spilling. Left unset instead, so the failure is DuckDB's
-# honest out-of-memory rather than a thrash we induced.
-_MIN_DETECTED_LIMIT_BYTES = 512 * 1024 * 1024
+# The smallest limit worth handing DuckDB. There is no engine floor — DuckDB
+# accepts 16MiB — so this exists only to keep a pathological ceiling from
+# producing a limit of zero after integer division.
+#
+# Deliberately *not* a threshold below which detection declines: an earlier
+# revision skipped detection under ~683MiB on the theory that a tiny limit
+# would only make DuckDB thrash. That inverted the fix for the containers that
+# need it most — a 256MiB or 512MiB cgroup got no bound at all and kept the
+# host-sized default, which is the OOM this exists to prevent. Slow beats
+# killed, and the operator can still override.
+_MIN_DETECTED_LIMIT_BYTES = 16 * 1024 * 1024
 
 _CGROUP_V2_MAX = Path("/sys/fs/cgroup/memory.max")
 _CGROUP_V1_MAX = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
@@ -254,9 +261,9 @@ def _detected_memory_limit() -> str | None:
     ceiling = _read_cgroup_limit_bytes()
     if ceiling is None:
         return None
-    budget = int(ceiling * _CGROUP_MEMORY_FRACTION)
-    if budget < _MIN_DETECTED_LIMIT_BYTES:
-        return None
+    budget = max(int(ceiling * _CGROUP_MEMORY_FRACTION), _MIN_DETECTED_LIMIT_BYTES)
+    # Never hand DuckDB more than the ceiling itself, however small that is.
+    budget = min(budget, ceiling)
     return f"{budget // (1024 * 1024)}MiB"
 
 

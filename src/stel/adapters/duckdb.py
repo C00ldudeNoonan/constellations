@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from hashlib import blake2b
@@ -176,6 +178,95 @@ def _update_arrow_digest(digest: Any, batch: pa.RecordBatch) -> None:
     digest.update(payload)
 
 
+_MEMORY_LIMIT_PATTERN = re.compile(
+    r"^\d+(\.\d+)?\s*(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB)$", re.IGNORECASE
+)
+
+# Fraction of a detected container ceiling handed to DuckDB. DuckDB's own
+# default is 80% of physical RAM; this is deliberately lower because inside a
+# container that same ceiling also has to hold the Python process — Polars
+# frames, provider buffers, the flush window. stel's own peak is bounded by
+# design (issues #401, #410), so the remainder is headroom rather than a budget.
+_CGROUP_MEMORY_FRACTION = 0.75
+# The smallest limit worth handing DuckDB. There is no engine floor — DuckDB
+# accepts 16MiB — so this exists only to keep a pathological ceiling from
+# producing a limit of zero after integer division.
+#
+# Deliberately *not* a threshold below which detection declines: an earlier
+# revision skipped detection under ~683MiB on the theory that a tiny limit
+# would only make DuckDB thrash. That inverted the fix for the containers that
+# need it most — a 256MiB or 512MiB cgroup got no bound at all and kept the
+# host-sized default, which is the OOM this exists to prevent. Slow beats
+# killed, and the operator can still override.
+_MIN_DETECTED_LIMIT_BYTES = 16 * 1024 * 1024
+
+_CGROUP_V2_MAX = Path("/sys/fs/cgroup/memory.max")
+_CGROUP_V1_MAX = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+
+def _read_cgroup_limit_bytes() -> int | None:
+    """The container memory ceiling, or None when not running under one.
+
+    Reads the standard cgroup mount rather than resolving this process's own
+    cgroup path: container runtimes mount the container's own cgroup there, and
+    the delegated-subtree cases where that is wrong are ones where an operator
+    can set `memory_limit` explicitly. Not DuckDB-specific in principle — it
+    lives here because this is its only caller.
+    """
+    for path in (_CGROUP_V2_MAX, _CGROUP_V1_MAX):
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            # An unreadable cgroup file is not worth failing a run over; it
+            # just means no detection.
+            continue
+        # v2 spells unlimited as "max"; v1 as a sentinel near 2**63. Either
+        # way, and for any ceiling at or above physical RAM, there is no
+        # container constraint to respect and DuckDB's own default is right.
+        if raw == "max" or not raw.isdigit():
+            return None
+        value = int(raw)
+        physical = _physical_memory_bytes()
+        if value <= 0 or physical is None or value >= physical:
+            return None
+        return value
+    return None
+
+
+def _physical_memory_bytes() -> int | None:
+    """Host RAM, or None where the platform cannot say.
+
+    `os.sysconf` does not exist on Windows. Only reached when a cgroup file was
+    found, so in practice this is Linux — the guard keeps the module importable
+    and type-checkable everywhere.
+    """
+    sysconf = getattr(os, "sysconf", None)
+    if sysconf is None:
+        return None
+    try:
+        return int(sysconf("SC_PAGE_SIZE")) * int(sysconf("SC_PHYS_PAGES"))
+    except (OSError, ValueError):
+        return None
+
+
+def _detected_memory_limit() -> str | None:
+    """A DuckDB size string derived from the container ceiling, or None.
+
+    Advisory only: an explicit `memory_limit:` in the profile always wins, and
+    this never raises a limit DuckDB would otherwise have chosen — it only
+    supplies one where DuckDB would otherwise size itself from host RAM.
+    """
+    ceiling = _read_cgroup_limit_bytes()
+    if ceiling is None:
+        return None
+    budget = max(int(ceiling * _CGROUP_MEMORY_FRACTION), _MIN_DETECTED_LIMIT_BYTES)
+    # Never hand DuckDB more than the ceiling itself, however small that is.
+    budget = min(budget, ceiling)
+    return f"{budget // (1024 * 1024)}MiB"
+
+
 class DuckDBWarehouseConfig(WarehouseConfig):
     """DuckDB warehouse config, local or MotherDuck.
 
@@ -191,6 +282,15 @@ class DuckDBWarehouseConfig(WarehouseConfig):
     type: Literal["duckdb"] = "duckdb"
     path: Path
     token: CredentialReference | None = Field(default=None, repr=False, exclude=True)
+    # DuckDB sizes its buffer pool from *host* RAM, which is the wrong number
+    # inside a container: the cgroup ceiling is invisible to it, so it will grow
+    # past the limit the kernel actually kills at (issue #412). `memory_limit`
+    # is a DuckDB size string ("4GB", "512MB"); the literal "none" opts out of
+    # both this setting and the cgroup detection that would otherwise apply one.
+    memory_limit: str | None = None
+    # Where DuckDB spills once it hits that limit. Defaults to DuckDB's own
+    # choice, which for a file-backed database is a directory beside the file.
+    temp_directory: Path | None = None
 
     @classmethod
     def prepare_profile_input(cls, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -206,6 +306,24 @@ class DuckDBWarehouseConfig(WarehouseConfig):
                     "variable"
                 ) from None
         return prepared
+
+    @model_validator(mode="after")
+    def _validate_memory_limit(self) -> DuckDBWarehouseConfig:
+        """Reject a malformed size here rather than at connect.
+
+        DuckDB's own rejection arrives from inside the native driver, partway
+        into a run that has already resolved credentials — exactly the class of
+        failure preflight validation exists to move earlier.
+        """
+        if self.memory_limit is None or self.memory_limit.strip().lower() == "none":
+            return self
+        if not _MEMORY_LIMIT_PATTERN.match(self.memory_limit.strip()):
+            raise ValueError(
+                f"`memory_limit` must be a DuckDB size string such as '4GB' or "
+                f"'512MiB', or 'none' to leave DuckDB unbounded; got "
+                f"{self.memory_limit!r}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _token_requires_motherduck(self) -> DuckDBWarehouseConfig:
@@ -242,9 +360,17 @@ class DuckDBWarehouseConfig(WarehouseConfig):
         return remainder.split("?", 1)[0]
 
     def absolutize(self, project_dir: Path) -> DuckDBWarehouseConfig:
+        # `temp_directory` resolves the same way `path` does. DuckDB creates it
+        # lazily — only on an actual spill — so a CWD-relative reading would
+        # not surface until a large run finally needed it, somewhere the
+        # operator did not put it.
+        updates: dict[str, Any] = {}
+        if self.temp_directory is not None:
+            updates["temp_directory"] = (project_dir / self.temp_directory).resolve()
         if self.is_motherduck:
-            return self
-        return self.model_copy(update={"path": (project_dir / self.path).resolve()})
+            return self.model_copy(update=updates) if updates else self
+        updates["path"] = (project_dir / self.path).resolve()
+        return self.model_copy(update=updates)
 
     def storage_location(self) -> str:
         return str(self.path)
@@ -338,8 +464,40 @@ class DuckDBAdapter(WarehouseAdapter):
         # either way. Verified before making this change, because a hash that
         # differed by developer timezone would have been a far worse bug.
         self._con.execute(f"SET TimeZone='{_SESSION_TIME_ZONE}'")
+        self._apply_memory_settings(config)
         row = self._con.execute("SELECT current_database()").fetchone()
         self._catalog = row[0] if row else "memory"
+
+    def _apply_memory_settings(self, config: DuckDBWarehouseConfig) -> None:
+        """Bound DuckDB's buffer pool (issue #412).
+
+        Unset, DuckDB sizes itself from *host* RAM. Inside a container that is
+        the wrong number in the dangerous direction: the cgroup ceiling is
+        invisible to it, so it grows past the limit the kernel kills at, and a
+        streamed read that is bounded on stel's side still OOMs the process.
+
+        `memory_limit` and `temp_directory` are GLOBAL settings, so one
+        application at connect covers the cursors too — unlike `TimeZone`
+        above, which each fresh cursor session has to be told again (#339).
+        """
+        if config.temp_directory is not None:
+            self.connection.execute(
+                "SET temp_directory=?", [str(config.temp_directory)]
+            )
+        configured = config.memory_limit
+        if configured is not None and configured.strip().lower() == "none":
+            # An explicit opt-out: leave DuckDB unbounded and skip detection.
+            return
+        limit = configured or _detected_memory_limit()
+        if limit is None:
+            return
+        self.connection.execute("SET memory_limit=?", [limit])
+        if configured is None:
+            log.info(
+                "bounded DuckDB memory to %s from the detected container ceiling; "
+                "set `memory_limit:` on the warehouse profile to override",
+                limit,
+            )
 
     def _cursor(self) -> Any:
         """A cursor with this adapter's session settings applied.

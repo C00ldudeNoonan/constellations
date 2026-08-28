@@ -947,3 +947,282 @@ def test_list_tables_excludes_staging_tables(tmp_path: Path) -> None:
         adapter.materialize_full("model_a", pl.DataFrame({"x": [1]}))
         adapter.materialize_full("stel_staging__model_a", pl.DataFrame({"x": [1]}))
         assert adapter.list_tables() == ["model_a"]
+
+
+# ─── DuckDB memory bounding (issue #412) ────────────────────────────────────
+#
+# DuckDB sizes its buffer pool from *host* RAM. Inside a container that is the
+# wrong number in the dangerous direction: the cgroup ceiling is invisible to
+# it, so it grows past the limit the kernel actually kills at, and a read that
+# is bounded on stel's side still OOMs the process.
+
+
+def _duckdb_setting(adapter: Any, name: str) -> str:
+    return str(
+        adapter.connection.execute(f"SELECT current_setting('{name}')").fetchone()[0]
+    )
+
+
+def _duckdb_cursor_setting(adapter: Any, name: str) -> str:
+    """Read a setting from a fresh cursor session rather than the connection."""
+    cursor = adapter.connection.cursor()
+    row = cursor.execute(f"SELECT current_setting('{name}')").fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def test_an_explicit_memory_limit_reaches_duckdb(tmp_path: Path) -> None:
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "memory_limit": "512MB"}
+    )
+    with create_adapter(config) as adapter:
+        assert "MiB" in _duckdb_setting(adapter, "memory_limit")
+
+
+def test_the_memory_limit_reaches_cursors_too(tmp_path: Path) -> None:
+    """`connection.cursor()` opens a fresh session, which is how the TimeZone
+    pin was missed once already (#339). `memory_limit` is GLOBAL so it carries
+    — asserted rather than assumed, because the streaming reads that most need
+    the bound all run on cursors."""
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "memory_limit": "512MB"}
+    )
+    with create_adapter(config) as adapter:
+        parent = _duckdb_setting(adapter, "memory_limit")
+        found = _duckdb_cursor_setting(adapter, "memory_limit")
+    assert found == parent
+    assert "MiB" in found
+
+
+def test_memory_limit_none_leaves_duckdb_unbounded(tmp_path: Path) -> None:
+    """The explicit opt-out: an operator who wants DuckDB's own sizing, and no
+    detection either, has to be able to say so.
+
+    Compared against a raw `duckdb.connect()` rather than against another
+    adapter: on a cgroup-constrained test runner the other adapter would detect
+    the runner's own ceiling and legitimately differ, making this pass or fail
+    on the host rather than on the behavior.
+    """
+    unbounded = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "a.duckdb"), "memory_limit": "none"}
+    )
+    with create_adapter(unbounded) as adapter:
+        opted_out = _duckdb_setting(adapter, "memory_limit")
+    raw = duckdb.connect()
+    try:
+        row = raw.execute("SELECT current_setting('memory_limit')").fetchone()
+        assert row is not None
+    finally:
+        raw.close()
+    assert opted_out == str(row[0])
+
+
+def test_a_malformed_memory_limit_is_rejected_at_config_time(tmp_path: Path) -> None:
+    """Not at connect, from inside the native driver, partway into a run that
+    already resolved credentials."""
+    with pytest.raises(AdapterConfigError, match="memory_limit"):
+        parse_warehouse_config(
+            {
+                "type": "duckdb",
+                "path": str(tmp_path / "w.duckdb"),
+                "memory_limit": "as much as it takes",
+            }
+        )
+
+
+def test_temp_directory_reaches_duckdb(tmp_path: Path) -> None:
+    """A bounded DuckDB spills; it needs somewhere to spill to."""
+    spill = tmp_path / "spill"
+    config = parse_warehouse_config(
+        {
+            "type": "duckdb",
+            "path": str(tmp_path / "w.duckdb"),
+            "memory_limit": "512MB",
+            "temp_directory": str(spill),
+        }
+    )
+    with create_adapter(config) as adapter:
+        assert _duckdb_setting(adapter, "temp_directory") == str(spill)
+
+
+def _fake_cgroup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    contents: str,
+    v2: bool = True,
+    physical: int | None = 64 * 1024**3,
+) -> None:
+    """Stand in for the cgroup mount, which no test can create for real."""
+    from stel.adapters import duckdb as duckdb_adapter
+
+    present = tmp_path / ("memory.max" if v2 else "memory.limit_in_bytes")
+    present.write_text(contents, encoding="utf-8")
+    absent = tmp_path / "absent"
+    monkeypatch.setattr(
+        duckdb_adapter, "_CGROUP_V2_MAX", present if v2 else absent
+    )
+    monkeypatch.setattr(
+        duckdb_adapter, "_CGROUP_V1_MAX", absent if v2 else present
+    )
+    monkeypatch.setattr(
+        duckdb_adapter, "_physical_memory_bytes", lambda: physical
+    )
+
+
+def test_a_container_ceiling_bounds_duckdb_without_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The incident shape: an operator who never heard of `memory_limit` gets a
+    DuckDB that respects the cgroup instead of the host."""
+    from stel.adapters.duckdb import _detected_memory_limit
+
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(4 * 1024**3))
+    # 75% of a 4GiB ceiling, leaving the rest for the Python process.
+    assert _detected_memory_limit() == "3072MiB"
+
+
+def test_cgroup_v1_is_read_when_v2_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from stel.adapters.duckdb import _detected_memory_limit
+
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(8 * 1024**3), v2=False)
+    assert _detected_memory_limit() == "6144MiB"
+
+
+@pytest.mark.parametrize(
+    ("contents", "physical", "why"),
+    [
+        ("max", 64 * 1024**3, "v2 spells unlimited as a word"),
+        ("9223372036854771712", 64 * 1024**3, "v1 spells it as a sentinel"),
+        (str(64 * 1024**3), 64 * 1024**3, "a ceiling at physical RAM is no ceiling"),
+        (str(128 * 1024**3), 64 * 1024**3, "nor is one above it"),
+        ("0", 64 * 1024**3, "a zero ceiling is not a real one"),
+        (str(4 * 1024**3), None, "no way to tell whether it is a constraint"),
+    ],
+)
+def test_detection_declines_rather_than_guessing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    contents: str,
+    physical: int | None,
+    why: str,
+) -> None:
+    """Every case where the ceiling is absent, unlimited, or not actually a
+    constraint leaves DuckDB's own sizing alone — detection is advisory and
+    must never invent a limit."""
+    from stel.adapters.duckdb import _detected_memory_limit
+
+    _fake_cgroup(monkeypatch, tmp_path, contents=contents, physical=physical)
+    assert _detected_memory_limit() is None, why
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected"),
+    [
+        (4 * 1024**3, "3072MiB"),
+        (512 * 1024**2, "384MiB"),
+        (256 * 1024**2, "192MiB"),
+        (32 * 1024**2, "24MiB"),
+    ],
+)
+def test_a_small_container_is_still_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ceiling: int, expected: str
+) -> None:
+    """The containers that need this most must not be the ones that miss out.
+
+    An earlier revision declined below ~683MiB on the theory that a tiny limit
+    would only make DuckDB thrash — which left a 256MiB cgroup with the
+    host-sized default, i.e. exactly the OOM this exists to prevent. Slow beats
+    killed, and DuckDB accepts limits down to 16MiB.
+    """
+    from stel.adapters.duckdb import _detected_memory_limit
+
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(ceiling))
+    assert _detected_memory_limit() == expected
+
+
+def test_an_explicit_limit_wins_over_detection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(4 * 1024**3))
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "memory_limit": "700MB"}
+    )
+    with create_adapter(config) as adapter:
+        # 700MB, not the 3072MiB detection would have chosen.
+        assert _duckdb_setting(adapter, "memory_limit").startswith("667")
+
+
+def test_none_opts_out_of_detection_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`none` means "leave DuckDB alone", not "fall through to detection" —
+    otherwise there would be no way to get host-sized behavior in a container."""
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(4 * 1024**3))
+    opted_out = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "a.duckdb"), "memory_limit": "none"}
+    )
+    with create_adapter(opted_out) as adapter:
+        assert "3072" not in _duckdb_setting(adapter, "memory_limit")
+
+
+def test_detection_applies_at_connect_with_no_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The whole point of #412: an unconfigured project in a 4GiB container gets
+    a DuckDB bounded by the cgroup rather than by 80% of the host's RAM."""
+    _fake_cgroup(monkeypatch, tmp_path, contents=str(4 * 1024**3))
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb")}
+    )
+    with create_adapter(config) as adapter:
+        assert _duckdb_setting(adapter, "memory_limit").startswith("3.0 GiB")
+
+
+def test_no_container_means_no_change_in_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Outside a container nothing is detected, so an ordinary workstation run
+    keeps exactly the DuckDB sizing it had before this change."""
+    from stel.adapters import duckdb as duckdb_adapter
+
+    absent = tmp_path / "absent"
+    monkeypatch.setattr(duckdb_adapter, "_CGROUP_V2_MAX", absent)
+    monkeypatch.setattr(duckdb_adapter, "_CGROUP_V1_MAX", absent)
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb")}
+    )
+    with create_adapter(config) as adapter:
+        bounded = _duckdb_setting(adapter, "memory_limit")
+    raw = duckdb.connect()
+    try:
+        row = raw.execute("SELECT current_setting('memory_limit')").fetchone()
+        assert row is not None
+        native = str(row[0])
+    finally:
+        raw.close()
+    assert bounded == native
+
+
+def test_a_relative_temp_directory_resolves_against_the_project(tmp_path: Path) -> None:
+    """The same rule `path` follows. DuckDB creates the directory lazily — only
+    on an actual spill — so a CWD-relative reading would not surface until a
+    large run finally needed it, somewhere the operator did not put it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    from stel.adapters.duckdb import DuckDBWarehouseConfig
+
+    config = parse_warehouse_config(
+        {
+            "type": "duckdb",
+            "path": "./target/w.duckdb",
+            "memory_limit": "512MB",
+            "temp_directory": "./target/spill",
+        }
+    ).absolutize(project)
+    assert isinstance(config, DuckDBWarehouseConfig)
+    assert config.temp_directory == (project / "target" / "spill").resolve()
+    with create_adapter(config) as adapter:
+        assert _duckdb_setting(adapter, "temp_directory") == str(config.temp_directory)

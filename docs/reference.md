@@ -711,6 +711,39 @@ not wrap it in `env_var()`. stel deliberately rejects secret-value
 interpolation in this field so validation errors and resolved configuration
 cannot contain the key.
 
+### Bounding DuckDB's memory
+
+DuckDB sizes its buffer pool from **host** RAM — about 80% of it. Inside a
+container that is the wrong number in the dangerous direction: the cgroup
+ceiling is invisible to DuckDB, so it will grow past the limit the kernel
+actually kills the process at, and a read that is bounded on stel's side still
+gets OOM-killed.
+
+stel therefore detects a container ceiling and hands DuckDB 75% of it, leaving
+the remainder for the Python process — the frames, provider buffers, and flush
+window, all of which are bounded by design. Detection is advisory: it only
+supplies a limit where DuckDB would otherwise size itself from the host, never
+raises one, and does nothing at all outside a container, so a workstation run
+is unaffected.
+
+Override it per target when you know better:
+
+```yaml
+warehouse:
+  type: duckdb
+  path: ./target/stel.duckdb
+  memory_limit: 4GB           # a DuckDB size string; wins over detection
+  temp_directory: /var/tmp/stel   # where a bounded DuckDB spills
+```
+
+`memory_limit: none` opts out of both the setting and the detection, restoring
+DuckDB's own host-sized default. A malformed size is rejected when the profile
+is validated rather than from inside the driver partway through a run.
+
+Set `temp_directory` when the default — a directory beside the database file —
+is on a volume too small to spill into. A bounded DuckDB spills rather than
+failing, so it needs somewhere to go.
+
 ### MotherDuck
 
 MotherDuck is the managed deployment of DuckDB — the same `type: duckdb`

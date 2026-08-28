@@ -554,9 +554,13 @@ def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> Non
     assert "COUNTIF" not in payload_sql
     assert "OVER" not in payload_sql
     assert "SELECT `record_id`, `value`" in payload_sql
-    # Both statements bind the predicate rather than inlining it.
+    # Both statements bind the predicate rather than inlining it, and both
+    # bypass the query cache: a cached aggregate would be answering about a
+    # different read than the one it guards, and the generation fence compares
+    # table etags rather than query results, so it could not see that.
     for _sql, job_config in client.queries:
         assert job_config.query_parameters[0].value == sentinel
+        assert job_config.use_query_cache is False
 
 
 def test_bigquery_key_failure_is_sanitized_and_cancels_result() -> None:

@@ -1581,8 +1581,11 @@ DuckDB holds one MVCC read transaction through the context, derives a content
 generation fingerprint while consuming it, and performs a second bounded scan
 before successful close to reject a newer table version. BigQuery pages one
 uncached query result and rejects the read if the table generation changes
-while the snapshot is opened or consumed; normal query billing and the
-profile's `maximum_bytes_billed` limit still apply. Both adapters push
+while the snapshot is opened or consumed. A read that names a key column adds
+one further uncached aggregate over that column alone, ahead of the payload
+query, so the key check never makes BigQuery buffer the projection; it is
+cheap next to the payload, but it is a second job and normal query billing and
+the profile's `maximum_bytes_billed` limit apply to both. Both adapters push
 projection and predicates into the warehouse. Predicate values are bound
 parameters and redacted from diagnostics.
 

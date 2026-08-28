@@ -19,7 +19,14 @@ on BigQuery at all.
 - An invalid key domain no longer costs a scan of the payload: the read is
   never started, rather than started and cancelled.
 - Validation applies the read's own predicates, so a filtered read is checked
-  against the rows it will actually return.
+  against the rows it will actually return, and bypasses the query cache like
+  the payload query it guards — a cached aggregate would describe a different
+  table state than the read, and the generation fence compares table etags
+  rather than query results.
+- A keyed BigQuery snapshot is now two query jobs rather than one. The
+  aggregate scans a single column, so it is cheap next to the payload it
+  replaced buffering for, but it is billed. `docs/reference.md` and
+  `docs/architecture/adapter-capabilities.md` describe the new shape.
 
 ### DuckDB respects a container ceiling (issue #412)
 

@@ -102,11 +102,19 @@ validation means a successful DuckDB snapshot reads the projected relation
 twice. Its generation fingerprint is `None` until every primary batch has been
 consumed; an early-close path cannot be published as a complete generation.
 
-BigQuery executes one uncached query job and pages its immutable result through
-the REST Arrow iterator. The configured page size also caps emitted batches.
+BigQuery executes one uncached query job for the payload and pages its
+immutable result through the REST Arrow iterator. The configured page size also
+caps emitted batches. A read that names a `key_column` runs one further
+uncached aggregate over that column alone, before the payload job starts, to
+check the key domain — so an invalid key never costs a scan of the payload, and
+the payload query carries no analytic frame that would make BigQuery buffer the
+whole projection to compute it (issue #418). Both statements apply the read's
+predicates and bypass the query cache, so the aggregate always describes the
+same table state the payload will read.
+
 Table `etag`/modification metadata is checked before the first page and after
-full consumption; a changed generation fails rather than allowing a serving
-publisher to mark the read ready. The fingerprint hashes the safe table
+full consumption, spanning both statements; a changed generation fails rather
+than allowing a serving publisher to mark the read ready. The fingerprint hashes the safe table
 generation, query-job identity, and semantic read shape. A separate stable
 generation fingerprint omits the query job. Query cost remains
 subject to the active profile's project, priority, retry, timeout, and

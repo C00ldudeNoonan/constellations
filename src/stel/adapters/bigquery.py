@@ -1288,12 +1288,18 @@ class BigQueryAdapter(WarehouseAdapter):
         arrive first.
         """
         key = self.quote_ident(request.key_column or "")
-        rows = self.rows(
+        # Uncached, like the payload query it guards. A cached aggregate would
+        # be answering about a different read than the one about to run, and
+        # the generation fence around the snapshot could not see the
+        # difference — the fence compares table etags, not query results.
+        job = self._start_query(
             f"SELECT COUNTIF({key} IS NULL), "
             f"COUNT({key}) - COUNT(DISTINCT {key}) "
             f"FROM {self.table_ref(request.table)}{where_sql}",
             list(params),
+            use_query_cache=False,
         )
+        rows = [tuple(row.values()) for row in job.result()]
         null_count = int(rows[0][0]) if rows else 0
         duplicate_count = int(rows[0][1]) if rows else 0
         if null_count or duplicate_count:

@@ -267,3 +267,132 @@ def test_a_missing_filter_column_names_the_available_ones(tmp_path: Path) -> Non
             select="document_embeddings",
             read_filter=[("no_such_column", "eq", "x")],
         )
+
+
+# ─── review follow-ups (PR #421) ────────────────────────────────────────────
+
+_PARENT_TRANSFORM = '''
+from __future__ import annotations
+
+import polars as pl
+
+from stel.hashing import canonical_fingerprint
+from stel.transforms import IncrementalContract, TransformContext
+
+_SCHEMA = {
+    "token_id": pl.String(),
+    "document_id": pl.String(),
+    "chunk_index": pl.Int64(),
+}
+
+
+def declared_incremental_contract(options):
+    return IncrementalContract(
+        parent_key="document_id",
+        child_key="token_id",
+        parent_source="document_chunks",
+        parent_source_key="document_id",
+    )
+
+
+def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
+    frame = deps["document_chunks"]
+    rows = [
+        {
+            "token_id": canonical_fingerprint(
+                {"c": str(r["chunk_id"])}, domain="test.token"
+            ),
+            "document_id": str(r["document_id"]),
+            "chunk_index": int(r["chunk_index"]),
+        }
+        for r in frame.iter_rows(named=True)
+    ]
+    return pl.DataFrame(rows, schema=_SCHEMA)
+'''
+
+
+def _project_with_multi_row_parents(tmp_path: Path) -> Path:
+    """A parent with several upstream rows — the shape the bug needed.
+
+    `chunk_size: 20` splits each body into multiple chunks, so one
+    `document_id` owns several rows of the transform's parent source. A read
+    filter that selects only some of them is then the case where the
+    classification pass and the scoped reread can disagree.
+    """
+    project = _project(tmp_path)
+    model_path = project / "models" / "documents.yml"
+    text = model_path.read_text(encoding="utf-8")
+    text = text.replace("chunk_size: 1000", "chunk_size: 20")
+    text += (
+        "  - name: chunk_tokens\n"
+        "    depends_on: [ref('document_chunks')]\n"
+        "    transform:\n      type: python\n"
+        "      module: transforms.chunk_tokens\n"
+        "    materialization: incremental\n"
+    )
+    model_path.write_text(text, encoding="utf-8")
+    (project / "transforms").mkdir(exist_ok=True)
+    (project / "transforms" / "chunk_tokens.py").write_text(
+        _PARENT_TRANSFORM, encoding="utf-8"
+    )
+    for index in range(DOCUMENTS):
+        (project / "data" / f"doc{index}.json").write_text(
+            json.dumps(
+                {
+                    "title": f"Release {index}",
+                    "body": " ".join(f"word{index}x{n}" for n in range(12)),
+                }
+            ),
+            encoding="utf-8",
+        )
+    return project
+
+
+def test_a_filtered_transform_over_a_multi_row_parent_runs(tmp_path: Path) -> None:
+    """The classification pass hashes the filtered rows; the scoped reread must
+    see the same slice. Rereading by parent key alone returns rows
+    classification never saw, and the verification that exists to catch a
+    concurrent upstream replacement correctly reports the parent as changed —
+    aborting every filtered transform over a parent with several rows.
+    """
+    project = _project_with_multi_row_parents(tmp_path)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    run_project(project, select="chunk_tokens")
+    _mutate(
+        project,
+        "UPDATE \"db\".docs.document_chunks SET text = 'revised ' || text "
+        "WHERE chunk_index = 0",
+    )
+
+    # Selects a strict subset of each parent's rows.
+    [result] = run_project(
+        project,
+        select="chunk_tokens",
+        read_filter=[("chunk_index", "eq", "0")],
+    )
+
+    assert result.status is None, result.errors
+
+
+def test_read_filter_composes_with_a_state_selector(tmp_path: Path) -> None:
+    """`--read-filter` with `state:modified` must not claim `--state` is
+    missing when it was supplied: read-filter validation needs the resolved
+    selection, which needs the manifest."""
+    from stel.manifest import write_manifest
+
+    project = _project(tmp_path)
+    run_project(project)
+    write_manifest(project, target=None, profiles_dir=None)
+    state_dir = project / "target"
+
+    results = run_project(
+        project,
+        select="state:modified",
+        state=state_dir,
+        read_filter=[("title", "eq", "Release 1")],
+    )
+
+    # Nothing changed since the manifest, so nothing is selected — the point
+    # is that resolving the selector did not raise.
+    assert results == []

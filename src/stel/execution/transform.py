@@ -487,7 +487,11 @@ def _run_incremental_transform(
         # composed with #379's batching): peak follows the commit batch, which
         # is tighter than either change gives on its own.
         batch_rows = _read_parent_rows(
-            adapter, parent_source, contract.parent_source_key, keys=batch
+            adapter,
+            parent_source,
+            contract.parent_source_key,
+            keys=batch,
+            predicates=read_predicates,
         )
         _verify_classified_rows(
             batch_rows,
@@ -804,6 +808,7 @@ def _read_parent_rows(
     key_col: str,
     *,
     keys: Sequence[str] | None,
+    predicates: Sequence[ReadPredicate] = (),
 ) -> pl.DataFrame:
     """The parent rows the transform will actually see.
 
@@ -816,18 +821,36 @@ def _read_parent_rows(
     if not keys:
         return adapter.read_table(table).clear()
     frames = [
-        _read_keyed_chunk(adapter, table, key_col, tuple(keys[start : start + _READ_KEY_CHUNK]))
+        _read_keyed_chunk(
+            adapter,
+            table,
+            key_col,
+            tuple(keys[start : start + _READ_KEY_CHUNK]),
+            predicates=predicates,
+        )
         for start in range(0, len(keys), _READ_KEY_CHUNK)
     ]
     return frames[0] if len(frames) == 1 else pl.concat(frames, how="vertical")
 
 
 def _read_keyed_chunk(
-    adapter: WarehouseAdapter, table: str, key_col: str, keys: tuple[str, ...]
+    adapter: WarehouseAdapter,
+    table: str,
+    key_col: str,
+    keys: tuple[str, ...],
+    *,
+    predicates: Sequence[ReadPredicate] = (),
 ) -> pl.DataFrame:
-    predicate = ReadPredicate(
-        column=key_col, operator=ReadPredicateOperator.IN, value=keys
-    )
+    # The read filter rides along with the key predicate, and must: the
+    # classification pass hashed the *filtered* rows, so a reread by parent key
+    # alone returns rows classification never saw. `_verify_classified_rows`
+    # then correctly reports the parent as changed and aborts the run -- which
+    # is what a filtered transform over a multi-row parent did before this
+    # (issue #417 review).
+    predicate = [
+        ReadPredicate(column=key_col, operator=ReadPredicateOperator.IN, value=keys),
+        *predicates,
+    ]
     batches: list[pl.DataFrame] = []
     with adapter.table_snapshot(
         table, batch_size=_CLASSIFY_BATCH_ROWS, predicate=predicate

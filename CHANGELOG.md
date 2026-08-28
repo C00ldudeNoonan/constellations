@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.14.0 - 2026-08-28
+
 ### Upgrading
 
 - **A full refresh of a chunk model is no longer one atomic swap (issue
@@ -24,6 +26,57 @@
   reads added for chunk and embed produce byte-identical input fingerprints —
   both pinned by tests, because a silent re-chunk would cascade into a full
   re-embed at provider cost.
+
+### The BigQuery pre-release gate now sees keyed snapshots
+
+`docs/release.md` trusts `test_every_bigquery_operation_is_live_tested_or_listed_as_debt`
+to catch BigQuery code shipping without a live test. `table_snapshot` was
+invisible to it: the method lives on `WarehouseAdapter` and BigQuery overrides
+only the private `_open_table_snapshot`, so neither the class introspection nor
+the underscore filter reached it — the same blind spot that let `append_rows`
+and `read_relation` ship uncovered in v0.10.0.
+
+That path is what every search publication reads through, and #418 rewrote it.
+It is now named in the gate and has a live integration test.
+
+### Partitioned runs: `subset_run` past extraction, and `--read-filter` (issue #417)
+
+`runner.py` computed `subset_run` per invocation and passed it to every
+dispatch, but only extraction's signature accepted it — chunk, python
+transforms, embed, and search_index all reconciled deletions ungated, so a
+partitioned invocation would have had each partition silently deleting every
+other partition's rows.
+
+- All four kinds now gate their reconciliation, and search's stale-page pass
+  skips the same way `rebuild` already does. Deferred, never lost: the next
+  unfiltered run still reconciles.
+- New `--read-filter FIELD OP VALUE` pushes a predicate into the read, so a
+  partitioned job moves only its slice.
+- A read-filtered transform over a multi-row parent aborted, because
+  classification saw the filtered rows while the scoped reread did not: the
+  read filter now rides along with the key predicate. The watch path applies
+  filters too, and `--read-filter` with a `state:` selector no longer claims
+  `--state` is missing.
+
+### Embedding drift canary (issue #305)
+
+A hosted embedding alias can re-resolve to a new snapshot with your code,
+config, and input text byte-identical. Config hashes are computed from *your*
+inputs and structurally cannot observe that, and the existing structural checks
+pass on any well-formed vectors, so retrieval degrades silently.
+
+The opt-in `embedding_canary` test re-embeds a handful of frozen sentences and
+compares them against a committed baseline model, failing below a
+`min_similarity` floor you measure for your provider.
+
+### `stel suggest`: the analysis half (issue #361)
+
+#381 shipped the patching half — rendering candidate rows as a reviewable diff
+— but nothing produced a candidate row, so the loop never closed. A new example
+project fills the contract relation: the transcript corpus in through a
+`warehouse://` source, documentation gaps found by SQL, prose drafted by an
+`llm:` model, and the candidate contract assembled for `stel suggest dbt
+--from`. No new primitive.
 
 ### Incremental transform residency is pinned (issue #383)
 

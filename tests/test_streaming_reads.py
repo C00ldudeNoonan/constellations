@@ -447,6 +447,25 @@ class _FakeBigQueryJob:
         self.cancelled = True
 
 
+class _FakeAggregateRow:
+    def __init__(self, values: tuple[Any, ...]) -> None:
+        self._values = values
+
+    def values(self) -> tuple[Any, ...]:
+        return self._values
+
+
+class _FakeAggregateJob:
+    """The key-domain aggregate: one row of scalars, no Arrow payload."""
+
+    def __init__(self, null_count: int, duplicate_count: int) -> None:
+        self._row = _FakeAggregateRow((null_count, duplicate_count))
+        self.job_id = "safe-aggregate-job-id"
+
+    def result(self, **_kwargs: Any) -> list[_FakeAggregateRow]:
+        return [self._row]
+
+
 class _FakeBigQueryClient:
     def __init__(
         self,
@@ -461,6 +480,10 @@ class _FakeBigQueryClient:
         self.null_count = null_count
         self.duplicate_count = duplicate_count
         self.queries: list[tuple[str, Any]] = []
+        self.validation_queries: list[str] = []
+        # None until the *payload* query runs. An invalid key domain now fails
+        # before that happens, so this staying None is the assertion that the
+        # expensive read was never started (issue #418).
         self.job: _FakeBigQueryJob | None = None
         self.get_table_calls = 0
 
@@ -475,17 +498,14 @@ class _FakeBigQueryClient:
             num_rows=len(next(iter(self.data.values()))) if self.data else 0,
         )
 
-    def query(self, sql: str, job_config: Any = None, **_kwargs: Any) -> _FakeBigQueryJob:
+    def query(self, sql: str, job_config: Any = None, **_kwargs: Any) -> Any:
         self.queries.append((sql, job_config))
-        columns = dict(self.data)
-        null_match = re.search(r"stel_read_nulls_[0-9a-f]+", sql)
-        duplicate_match = re.search(r"stel_read_duplicates_[0-9a-f]+", sql)
-        row_count = len(next(iter(columns.values()))) if columns else 0
-        if null_match is not None:
-            columns[null_match.group()] = pa.array([self.null_count] * row_count)
-        if duplicate_match is not None:
-            columns[duplicate_match.group()] = pa.array([self.duplicate_count] * row_count)
-        self.job = _FakeBigQueryJob(pa.table(columns))
+        if "COUNT(DISTINCT" in sql:
+            # The key-domain aggregate is its own statement since #418; it
+            # returns one row of scalars, not the payload.
+            self.validation_queries.append(sql)
+            return _FakeAggregateJob(self.null_count, self.duplicate_count)
+        self.job = _FakeBigQueryJob(pa.table(dict(self.data)))
         return self.job
 
 
@@ -524,11 +544,23 @@ def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> Non
     assert client.job.page_size == 2
     assert client.job.rows is not None
     assert client.job.rows.max_queue_size == 1
-    sql, job_config = client.queries[0]
-    assert sentinel not in sql
-    assert "COUNTIF" in sql
-    assert "SELECT `record_id`, `value`" in sql
-    assert job_config.query_parameters[0].value == sentinel
+    validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
+    assert sentinel not in validation_sql
+    assert sentinel not in payload_sql
+    # The key domain is checked over the key column alone, in its own
+    # statement; the payload carries no analytic frame at all (issue #418).
+    assert "COUNTIF(`record_id` IS NULL)" in validation_sql
+    assert "`value`" not in validation_sql
+    assert "COUNTIF" not in payload_sql
+    assert "OVER" not in payload_sql
+    assert "SELECT `record_id`, `value`" in payload_sql
+    # Both statements bind the predicate rather than inlining it, and both
+    # bypass the query cache: a cached aggregate would be answering about a
+    # different read than the one it guards, and the generation fence compares
+    # table etags rather than query results, so it could not see that.
+    for _sql, job_config in client.queries:
+        assert job_config.query_parameters[0].value == sentinel
+        assert job_config.use_query_cache is False
 
 
 def test_bigquery_key_failure_is_sanitized_and_cancels_result() -> None:
@@ -546,7 +578,11 @@ def test_bigquery_key_failure_is_sanitized_and_cancels_result() -> None:
             list(snapshot)
 
     _assert_sentinel_absent_from_error(exc_info.value, "sensitive-row")
-    assert client.job is not None and client.job.cancelled
+    # Nothing to cancel: validation now runs before the payload query is
+    # started, so an invalid key domain never costs a scan of the payload
+    # (issue #418). Previously the read had been launched and then cancelled.
+    assert client.job is None
+    assert client.validation_queries
 
 
 def test_bigquery_generation_change_fails_final_validation() -> None:

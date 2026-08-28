@@ -895,13 +895,6 @@ def _bigquery_table_generation(table: Any) -> str:
     )
 
 
-def _empty_record_batch(schema: pa.Schema) -> pa.RecordBatch:
-    return pa.RecordBatch.from_arrays(
-        [pa.array([], type=field.type) for field in schema],
-        schema=schema,
-    )
-
-
 @register
 class BigQueryAdapter(WarehouseAdapter):
     def __init__(
@@ -1272,6 +1265,49 @@ class BigQueryAdapter(WarehouseAdapter):
 
     # ─── querying ────────────────────────────────────────────────────────
 
+    def _validate_read_key_domain(
+        self,
+        request: TableReadRequest,
+        where_sql: str,
+        params: list[Any],
+    ) -> None:
+        """Check the read key has no NULLs and no duplicates, over the key alone.
+
+        This used to ride along with the payload as two unpartitioned `OVER()`
+        analytic columns (issue #418). Without a `PARTITION BY`, BigQuery
+        buffers the whole result in a single worker to compute them — including
+        a 768-float embedding column — so a search publish over 920k rows died
+        with "Resources exceeded ... analytic OVER() clauses: 99%" while a 23k
+        row index published fine. Scale-dependent, so it shipped unnoticed.
+
+        One aggregate over the key column is kilobytes where the payload is
+        gigabytes, and BigQuery bills columns scanned, so the extra statement
+        costs far less than the projection it no longer has to buffer. It also
+        matches what the DuckDB adapter has always done, and validates the
+        whole key domain up front rather than at whichever batch happens to
+        arrive first.
+        """
+        key = self.quote_ident(request.key_column or "")
+        # Uncached, like the payload query it guards. A cached aggregate would
+        # be answering about a different read than the one about to run, and
+        # the generation fence around the snapshot could not see the
+        # difference — the fence compares table etags, not query results.
+        job = self._start_query(
+            f"SELECT COUNTIF({key} IS NULL), "
+            f"COUNT({key}) - COUNT(DISTINCT {key}) "
+            f"FROM {self.table_ref(request.table)}{where_sql}",
+            list(params),
+            use_query_cache=False,
+        )
+        rows = [tuple(row.values()) for row in job.result()]
+        null_count = int(rows[0][0]) if rows else 0
+        duplicate_count = int(rows[0][1]) if rows else 0
+        if null_count or duplicate_count:
+            raise AdapterError(
+                "Table snapshot key domain is invalid: "
+                f"{null_count} NULL and {duplicate_count} duplicate value(s)"
+            )
+
     def _start_query(
         self,
         sql: str,
@@ -1344,31 +1380,12 @@ class BigQueryAdapter(WarehouseAdapter):
                 else ", ".join(self.quote_ident(column) for column in request.columns)
             )
             output_names = request.columns or available_names
-            hidden_null: str | None = None
-            hidden_duplicate: str | None = None
-            if request.key_column is None:
-                sql = (
-                    f"SELECT {projection} FROM "
-                    f"{self.table_ref(request.table)}{where_sql}"
-                )
-            else:
-                suffix = uuid4().hex
-                hidden_key = f"stel_read_key_{suffix}"
-                hidden_null = f"stel_read_nulls_{suffix}"
-                hidden_duplicate = f"stel_read_duplicates_{suffix}"
-                key = self.quote_ident(request.key_column)
-                sql = (
-                    "WITH stel_read_source AS ("
-                    f"SELECT {projection}, {key} AS {self.quote_ident(hidden_key)} "
-                    f"FROM {self.table_ref(request.table)}{where_sql}"
-                    ") SELECT * EXCEPT("
-                    f"{self.quote_ident(hidden_key)}), "
-                    f"COUNTIF({self.quote_ident(hidden_key)} IS NULL) OVER() AS "
-                    f"{self.quote_ident(hidden_null)}, "
-                    f"COUNT({self.quote_ident(hidden_key)}) OVER() - "
-                    f"COUNT(DISTINCT {self.quote_ident(hidden_key)}) OVER() AS "
-                    f"{self.quote_ident(hidden_duplicate)} FROM stel_read_source"
-                )
+            if request.key_column is not None:
+                self._validate_read_key_domain(request, where_sql, params)
+            sql = (
+                f"SELECT {projection} FROM "
+                f"{self.table_ref(request.table)}{where_sql}"
+            )
 
             job = self._start_query(sql, params, use_query_cache=False)
             schema_probe = job.to_arrow(
@@ -1405,7 +1422,6 @@ class BigQueryAdapter(WarehouseAdapter):
 
             def batches() -> Iterator[pa.RecordBatch]:
                 nonlocal fully_consumed
-                validated_key_domain = request.key_column is None
                 batch: pa.RecordBatch | None = None
                 projected: pa.RecordBatch | None = None
                 batch_failure: AdapterError | None = None
@@ -1413,31 +1429,6 @@ class BigQueryAdapter(WarehouseAdapter):
                 try:
                     assert arrow_batches is not None
                     for batch in arrow_batches:
-                        if not validated_key_domain:
-                            assert hidden_null is not None
-                            assert hidden_duplicate is not None
-                            null_index = batch.schema.get_field_index(hidden_null)
-                            duplicate_index = batch.schema.get_field_index(
-                                hidden_duplicate
-                            )
-                            if null_index < 0 or duplicate_index < 0:
-                                batch = _empty_record_batch(batch.schema)
-                                raise AdapterError(
-                                    "BigQuery snapshot omitted key-domain "
-                                    "validation fields"
-                                )
-                            null_count = int(batch.column(null_index)[0].as_py())
-                            duplicate_count = int(
-                                batch.column(duplicate_index)[0].as_py()
-                            )
-                            if null_count or duplicate_count:
-                                batch = _empty_record_batch(batch.schema)
-                                raise AdapterError(
-                                    "Table snapshot key domain is invalid: "
-                                    f"{null_count} NULL and {duplicate_count} "
-                                    "duplicate value(s)"
-                                )
-                            validated_key_domain = True
                         projected = batch.select(output_indices)
                         for offset in range(0, len(projected), request.batch_size):
                             yield projected.slice(offset, request.batch_size)

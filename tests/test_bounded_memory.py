@@ -54,6 +54,7 @@ from typing import Any
 import pytest
 
 from stel.adapters.duckdb import DuckDBAdapter
+from stel.execution import transform as transform_module
 from stel.execution.embed import _INPUT_BATCH_ROWS
 from stel.runner import run_project
 
@@ -524,4 +525,186 @@ def test_embed_residency_is_capped_by_a_constant_not_the_corpus(
     assert resident <= _INPUT_BATCH_ROWS, (
         f"embed held {resident} rows at once, above the {_INPUT_BATCH_ROWS}-row "
         "read batch that is supposed to cap it (issue #414)."
+    )
+
+
+# ─── transform residency (issues #383, #385, #379) ──────────────────────────
+
+_TRANSFORM_COMMIT_EVERY = 3
+
+_TOKENS_TRANSFORM = """
+from __future__ import annotations
+
+import polars as pl
+
+from stel.hashing import canonical_fingerprint
+from stel.transforms import IncrementalContract, TransformContext
+
+
+def declared_incremental_contract(options):
+    return IncrementalContract(
+        parent_key="document_id",
+        child_key="token_id",
+        parent_source_key="document_id",
+    )
+
+
+def run(deps: dict[str, pl.DataFrame], ctx: TransformContext) -> pl.DataFrame:
+    frame = next(iter(deps.values()))
+    rows = []
+    for record in frame.iter_rows(named=True):
+        document_id = str(record["document_id"])
+        for position, word in enumerate(str(record.get("body") or "").split()):
+            rows.append(
+                {
+                    "token_id": canonical_fingerprint(
+                        {"document_id": document_id, "position": position},
+                        domain="test.token",
+                    ),
+                    "document_id": document_id,
+                    "position": position,
+                    "word": word,
+                }
+            )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "token_id": pl.String(),
+            "document_id": pl.String(),
+            "position": pl.Int64(),
+            "word": pl.String(),
+        },
+    )
+"""
+
+
+def _transform_project(root: Path, *, docs: int) -> Path:
+    project = root / "proj"
+    (project / "models").mkdir(parents=True)
+    (project / "sources").mkdir()
+    (project / "transforms").mkdir()
+    (project / "data" / "docs").mkdir(parents=True)
+    (project / "stel_project.yml").write_text(
+        "name: docs\nversion: '0.1.0'\nprofile: docs\n", encoding="utf-8"
+    )
+    (project / "profiles.yml").write_text(
+        "docs:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
+        "        type: duckdb\n        path: ./target/db.duckdb\n"
+        "        schema: docs\n",
+        encoding="utf-8",
+    )
+    (project / "sources" / "src.yml").write_text(
+        "version: 2\nsources:\n  - name: raw_docs\n    path: data/docs\n"
+        "    file_pattern: '*.json'\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "documents.yml").write_text(
+        "version: 2\nmodels:\n  - name: documents\n"
+        "    source: ref('raw_docs')\n    extraction:\n      backend: json\n"
+        "      options:\n        fields: [body]\n"
+        "    materialization: incremental\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "doc_lengths.yml").write_text(
+        "version: 2\nmodels:\n  - name: doc_lengths\n"
+        "    depends_on: [ref('documents')]\n"
+        "    transform:\n      type: python\n"
+        "      module: transforms.doc_lengths\n"
+        f"      commit_every: {_TRANSFORM_COMMIT_EVERY}\n"
+        "    materialization: incremental\n",
+        encoding="utf-8",
+    )
+    (project / "transforms" / "doc_lengths.py").write_text(
+        _TOKENS_TRANSFORM, encoding="utf-8"
+    )
+    for index in range(docs):
+        (project / "data" / "docs" / f"doc{index}.json").write_text(
+            json.dumps({"body": f"body text for document {index}"}),
+            encoding="utf-8",
+        )
+    return project
+
+
+def test_an_incremental_transform_reads_per_commit_batch_not_per_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #383, and the question its stale last comment left open.
+
+    The reported incident was a re-key: `code_version` moved, so *every* parent
+    was classified changed, and the run OOM-killed a 10GiB container. The last
+    data point on that issue — still dying at 16GiB — predates #385 by four
+    hours, so nobody had measured the shape since.
+
+    This is that measurement. Every parent changes, and the rows still arrive
+    one `commit_every` batch at a time (#385 composed with #379's batching)
+    rather than as one corpus-sized frame.
+    """
+    docs = _TRANSFORM_COMMIT_EVERY * 4
+    project = _transform_project(tmp_path, docs=docs)
+    run_project(project, select="documents")
+    run_project(project, select="doc_lengths")
+
+    # Move every parent, the way a re-key does.
+    for index in range(docs):
+        (project / "data" / "docs" / f"doc{index}.json").write_text(
+            json.dumps({"body": f"revised body for document {index}"}),
+            encoding="utf-8",
+        )
+    run_project(project, select="documents")
+
+    # The parent rows the transform is actually handed, per invocation.
+    handed: list[int] = []
+    real_read = transform_module._read_parent_rows
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        frame = real_read(*args, **kwargs)
+        handed.append(frame.height)
+        return frame
+
+    monkeypatch.setattr(transform_module, "_read_parent_rows", spy)
+    with _measure_residency(monkeypatch) as seen:
+        run_project(project, select="doc_lengths")
+
+    assert handed, "the transform never read its parent"
+    assert max(handed) <= _TRANSFORM_COMMIT_EVERY, (
+        f"an incremental transform with every parent changed was handed "
+        f"{max(handed)} parents at once, above its commit batch of "
+        f"{_TRANSFORM_COMMIT_EVERY}. The point of #385 composed with #379 is "
+        "that a re-key costs a batch at a time, not a corpus (issue #383)."
+    )
+    assert len(handed) > 1, (
+        "every parent changed, so this must have taken several batches — one "
+        "call means the batching did not engage and the assertion above is "
+        "passing vacuously"
+    )
+    # And no whole-table frame anywhere: classification streams the parent and
+    # keeps only a ~32-byte digest per row (#385), so `read_table` is not on
+    # this path at all.
+    assert seen.largest_frame_rows == 0, (
+        f"the incremental path materialized {seen.largest_frame_rows} rows via "
+        f"{seen.largest_frame_source}"
+    )
+
+
+def test_a_full_refresh_transform_is_the_recorded_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same story, asserted so it stays a known trade.
+
+    A full refresh reads every parent in one frame, because the python
+    transform contract hands the user one DataFrame and a rebuild means all of
+    them. That is the `exception` verdict in _READ_TABLE_SITES, and it is worth
+    a test so nobody later reads the bounded case above and assumes transform
+    is bounded everywhere.
+    """
+    docs = _TRANSFORM_COMMIT_EVERY * 4
+    project = _transform_project(tmp_path, docs=docs)
+    run_project(project, select="documents")
+
+    with _measure_residency(monkeypatch) as seen:
+        run_project(project, select="doc_lengths", full_refresh=True)
+
+    assert seen.largest_frame_rows == docs, (
+        "a full refresh is expected to read every parent at once; if this now "
+        "reads less, the exception recorded in _READ_TABLE_SITES is stale."
     )

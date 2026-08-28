@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### DuckDB respects a container ceiling (issue #412)
+
+DuckDB sizes its buffer pool from *host* RAM, so inside a container it grows
+past the limit the kernel kills at — a read bounded on stel's side still gets
+OOM-killed. Found while measuring #410: streaming a table with DuckDB's default
+limit grew 594MB → 1756MB across a 100k → 400k row corpus; with a limit set it
+stayed flat at 450MB → 505MB.
+
+- stel now detects a cgroup ceiling and hands DuckDB 75% of it, leaving the
+  rest for the Python process. Advisory only: it never raises a limit, does
+  nothing outside a container, and an explicit setting always wins.
+- New DuckDB warehouse profile fields: `memory_limit` (a DuckDB size string, or
+  `none` to opt out of both the setting and detection) and `temp_directory`
+  (where a bounded DuckDB spills). A malformed size is rejected at profile
+  validation rather than from inside the driver mid-run.
+- Workstation runs are unaffected — with no container ceiling to detect,
+  DuckDB keeps exactly the sizing it had before.
+
 ### A pre-0.13 search index now says how to recover (issue #413)
 
 0.13's serving re-key (#355) left indexes published under 0.11/0.12 with their

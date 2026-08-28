@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### BigQuery search publish no longer dies on a large table (issue #418)
+
+A keyed table snapshot computed its key-domain validation as two unpartitioned
+`OVER()` analytic columns attached to the payload. Without a `PARTITION BY`,
+BigQuery buffers the whole result in a single worker to produce two scalars —
+including a 768-float embedding column — so publishing a search index over
+920k rows failed with `Resources exceeded ... analytic OVER() clauses: 99%`,
+while a 23k-row index published fine. Scale-dependent, so it shipped unnoticed;
+`search` models always pass a key column, so no large corpus could be indexed
+on BigQuery at all.
+
+- The key domain is now validated by one aggregate over the key column alone,
+  before the payload query starts. The payload carries no analytic frame.
+  This is what the DuckDB adapter has always done; BigQuery was the outlier.
+- An invalid key domain no longer costs a scan of the payload: the read is
+  never started, rather than started and cancelled.
+- Validation applies the read's own predicates, so a filtered read is checked
+  against the rows it will actually return.
+
 ### DuckDB respects a container ceiling (issue #412)
 
 DuckDB sizes its buffer pool from *host* RAM, so inside a container it grows

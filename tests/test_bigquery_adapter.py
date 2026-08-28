@@ -14,12 +14,15 @@ from types import SimpleNamespace
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
 import pytest
 from pydantic import ValidationError
 
 from stel.adapters import (
     AdapterError,
     LegacyWarehouseNamesError,
+    ReadPredicate,
+    ReadPredicateOperator,
     StaleStateFenceError,
     StateAbsenceProbe,
     StateRecord,
@@ -214,7 +217,9 @@ class _FakeClient:
         self.listing: list[str] = []
         self.other_datasets: dict[str, list[str]] = {}
         self.dropped: list[str] = []
-        self.query_results: list[_FakeJob] = []
+        # Any, not list[_FakeJob]: snapshot reads queue a job that serves
+        # Arrow batches rather than rows (issue #418).
+        self.query_results: list[Any] = []
 
     def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
         self.queries.append((sql, job_config))
@@ -3812,3 +3817,119 @@ def test_every_bigquery_operation_is_live_tested_or_listed_as_debt() -> None:
         f"{sorted(now_covered)} now has live coverage — remove it from "
         "_UNCOVERED_BY_LIVE_TESTS so the ratchet keeps tightening."
     )
+
+
+# ─── keyed table snapshots (issue #418) ─────────────────────────────────────
+#
+# The key-domain check used to ride along with the payload as two unpartitioned
+# OVER() analytic columns. Without a PARTITION BY, BigQuery buffers the whole
+# result in one worker to compute them — embedding column included — so a
+# search publish over 920k rows died with "Resources exceeded ... analytic
+# OVER() clauses: 99%" while a 23k-row index published fine. Scale-dependent,
+# so it shipped with no test at all; these are that test.
+
+
+class _FakeSnapshotJob:
+    """A query job that can serve a schema probe and an Arrow batch stream."""
+
+    def __init__(self, table: pa.Table, *, job_id: str = "job-1") -> None:
+        self._table = table
+        self.job_id = job_id
+
+    def to_arrow(self, **_kwargs: Any) -> pa.Table:
+        return self._table.slice(0, 1)
+
+    def result(self, **_kwargs: Any) -> Any:
+        table = self._table
+
+        class _Rows:
+            def to_arrow_iterable(self, **_inner: Any) -> Any:
+                return iter(table.to_batches())
+
+        return _Rows()
+
+
+def _snapshot_adapter(rows: dict[str, list[Any]], *, nulls: int = 0, dupes: int = 0):
+    """An adapter whose client answers a key-domain aggregate, then a payload."""
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = list(rows)
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": len(
+        next(iter(rows.values()))
+    )}
+    payload = pa.table(rows)
+    client.query_results = [
+        _FakeJob(rows=[(nulls, dupes)]),  # the key-domain aggregate
+        _FakeSnapshotJob(payload),  # the payload read
+    ]
+    return _adapter(client), client
+
+
+def test_a_keyed_snapshot_keeps_analytic_functions_out_of_the_payload() -> None:
+    """The bug in one assertion: the payload query must carry no OVER() clause,
+    because the projection it would buffer includes the vector column."""
+    adapter, client = _snapshot_adapter(
+        {"chunk_id": ["a", "b"], "embedding": [[1.0], [2.0]]}
+    )
+    with adapter.table_snapshot("chunks", key_column="chunk_id") as snapshot:
+        collected = [batch.num_rows for batch in snapshot]
+
+    assert collected == [2]
+    validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
+    assert "OVER()" not in payload_sql
+    assert "OVER (" not in payload_sql
+    assert "stel_read_source" not in payload_sql
+    # The key domain is still checked — over the key column alone.
+    assert "COUNT(DISTINCT `chunk_id`)" in validation_sql
+    assert "embedding" not in validation_sql
+
+
+def test_a_keyed_snapshot_still_rejects_a_null_key() -> None:
+    adapter, _client = _snapshot_adapter({"chunk_id": ["a"]}, nulls=1)
+    with pytest.raises(AdapterError, match="key domain is invalid"):
+        with adapter.table_snapshot("chunks", key_column="chunk_id"):
+            pass
+
+
+def test_a_keyed_snapshot_still_rejects_a_duplicate_key() -> None:
+    adapter, _client = _snapshot_adapter({"chunk_id": ["a", "a"]}, dupes=1)
+    with pytest.raises(AdapterError, match="key domain is invalid"):
+        with adapter.table_snapshot("chunks", key_column="chunk_id"):
+            pass
+
+
+def test_key_validation_is_refused_before_the_payload_query_runs() -> None:
+    """An invalid key must not cost a scan of the payload — the whole point of
+    doing the aggregate first rather than reading it off the first batch."""
+    adapter, client = _snapshot_adapter({"chunk_id": ["a", "a"]}, dupes=1)
+    with pytest.raises(AdapterError, match="key domain is invalid"):
+        with adapter.table_snapshot("chunks", key_column="chunk_id"):
+            pass
+    assert len(client.queries) == 1
+
+
+def test_an_unkeyed_snapshot_runs_one_query_and_no_validation() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 2}
+    client.query_results = [_FakeSnapshotJob(pa.table({"chunk_id": ["a", "b"]}))]
+    adapter = _adapter(client)
+    with adapter.table_snapshot("chunks") as snapshot:
+        assert [batch.num_rows for batch in snapshot] == [2]
+    assert len(client.queries) == 1
+    assert "COUNT(DISTINCT" not in client.queries[0][0]
+
+
+def test_key_validation_carries_the_read_predicates() -> None:
+    """It must validate the rows the read will actually return, not the whole
+    table — a filtered read with a duplicate outside the filter is valid."""
+    adapter, client = _snapshot_adapter(
+        {"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]}
+    )
+    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL")
+    with adapter.table_snapshot(
+        "chunks", key_column="chunk_id", predicate=predicate
+    ) as snapshot:
+        list(snapshot)
+    validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
+    assert "WHERE" in validation_sql
+    assert "WHERE" in payload_sql

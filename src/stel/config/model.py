@@ -352,6 +352,12 @@ class ChunkConfig(BaseModel):
     in_text_metadata: list[str] = Field(default_factory=list)
     # Attribute each chunk to the heading it falls under (issue #332).
     headings: HeadingConfig | None = None
+    # Documents per publish window (issue #423). Chunking *amplifies*: one
+    # registry row becomes many chunk rows, so the accumulated output is larger
+    # than the input it came from, and holding either whole is O(corpus).
+    # Excluded from code_version like every other flush cadence — it changes
+    # execution, never chunk content.
+    flush_every: int = Field(default=5000, gt=0)
     options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("in_text_metadata")

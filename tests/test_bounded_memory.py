@@ -106,10 +106,9 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         "execution/chunk.py",
         "run_chunk_model",
         1,
-        GAP,
-        "issue #423: reads the whole upstream registry into one frame before "
-        "chunking anything — the #410 hole one stage earlier, and worse placed, "
-        "since chunk feeds embed and its input is the ~5GB document registry",
+        BOUNDED,
+        "a zero-row probe for the column contract; documents stream in batches "
+        "and chunks publish every `flush_every` documents (issue #423)",
     ),
     (
         "execution/llm.py",
@@ -294,7 +293,6 @@ def test_the_unbounded_list_only_shrinks() -> None:
         if verdict == GAP
     )
     assert gaps == [
-        "execution/chunk.py::run_chunk_model",
         "execution/llm.py::_existing_llm_id_values",
         "execution/llm.py::run_llm_model",
     ], (
@@ -458,6 +456,27 @@ def test_extraction_never_materializes_more_than_its_flush_window(
         f"{seen.largest_frame_source}, above its flush window of "
         f"{_FLUSH_EVERY}. Peak must follow the window, not the corpus (#414)."
     )
+
+
+def test_chunk_never_materializes_the_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #423. Chunk is the worst place to hold a corpus: it sits upstream
+    of embed and its input is the document registry, so a regression here is
+    reached before any of embed's bounded-memory work matters. It also
+    *amplifies* — one registry row becomes many chunk rows — so the accumulated
+    output is larger than the input it came from."""
+    project = _embed_project(tmp_path, docs=_CORPUS_DOCS)
+    run_project(project, select="document_registry")
+    with _measure_residency(monkeypatch) as seen:
+        run_project(project, select="document_chunks")
+
+    assert seen.largest_frame_rows == 0, (
+        f"chunk materialized a {seen.largest_frame_rows}-row frame via "
+        f"{seen.largest_frame_source}. Its only whole-relation read is a "
+        "zero-row schema probe (#423); anything else is the corpus."
+    )
+    assert seen.largest_batch_rows > 0, "the streamed read did not run at all"
 
 
 def test_embed_never_materializes_the_corpus(

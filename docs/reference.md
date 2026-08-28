@@ -1499,6 +1499,7 @@ could not be rebuilt at all.
 | --- | --- | --- | --- |
 | `extraction` | `flush_every`, `publish_every` | 5000, 1 | Parser and backend cost |
 | `transform` | `commit_every` | 1000 | CPU over changed parents |
+| `chunk` | `flush_every` | 5000 | Chunk rows amplify the input |
 | `embed` | `flush_every` | 5000 | **Metered provider spend** |
 | `llm` | `flush_every` | 1000 | **One provider call per row** |
 | `search` | per-batch upsert | — | Publishes and advances state per batch |
@@ -3695,12 +3696,11 @@ hold every id at once, at roughly 108 bytes each, so a 3.6M-row corpus costs
 rather than row width, which is what makes a large corpus finish at all, but it
 is not constant.
 
-It holds today for extraction, transform (incremental), embed, and search
-publication. It does **not** yet hold for `chunk:`
-([#423](https://github.com/C00ldudeNoonan/constellations/issues/423)) or
-`llm:` ([#424](https://github.com/C00ldudeNoonan/constellations/issues/424)),
-which still read their whole upstream — so size those two against your corpus
-until they land. Some stages read whole tables by contract and always will:
+It holds today for extraction, transform (incremental), chunk, embed, and
+search publication. It does **not** yet hold for `llm:`
+([#424](https://github.com/C00ldudeNoonan/constellations/issues/424)), which
+still reads its whole upstream and its whole existing target — so size that one
+against your corpus until it lands. Some stages read whole tables by contract and always will:
 classic ML training fits a single matrix, a transform full refresh needs every
 parent, and `concept-cloud` builds one artifact from several models at once.
 

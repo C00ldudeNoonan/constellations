@@ -1246,3 +1246,146 @@ def _write_document(project: Path, name: str, body: str) -> None:
     (project / "data" / "docs" / f"{name}.json").write_text(
         json.dumps({"doc_id": name, "body": body})
     )
+
+
+# ─── bounded input reads (issue #423) ───────────────────────────────────────
+
+
+def test_streaming_the_input_preserves_chunk_input_hashes(tmp_path: Path) -> None:
+    """The upgrade hazard #423 has to clear before it is worth shipping.
+
+    `chunk_input_hash` is computed from the upstream record and incremental
+    state compares against it. If reading the registry in Arrow batches
+    produced even subtly different Python values than reading it whole — a
+    widened dtype, a shifted datetime unit — every existing corpus would
+    silently re-chunk, and everything downstream of it would re-embed at full
+    provider cost. That failure raises nothing, so it is pinned directly rather
+    than left to the end-to-end tests, which only ever exercise one read path.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter, DuckDBWarehouseConfig
+    from stel.execution.chunk import chunk_input_hash
+
+    config = DuckDBWarehouseConfig(path=tmp_path / "w.duckdb", schema_name="main")
+    with DuckDBAdapter(config) as adapter:
+        adapter.materialize_full(
+            "registry",
+            pl.DataFrame(
+                {
+                    "document_id": ["a", "b", "c"],
+                    "text": ["one", "two", None],
+                    "count": [1, 2, 3],
+                    "ratio": [1.5, 2.5, None],
+                    "flag": [True, False, True],
+                    "seen_at": [datetime(2024, 1, 1, 12, 30, tzinfo=UTC)] * 3,
+                    "tags": [["x", "y"], ["z"], []],
+                }
+            ),
+        )
+        whole = adapter.read_table("registry")
+        # The dtypes the chunk contract now reads from a zero-row probe must
+        # survive it, or a carried column lands in the target as the wrong type.
+        assert dict(adapter.read_table("registry", limit=0).schema) == dict(
+            whole.schema
+        )
+
+        read_whole = {
+            str(row["document_id"]): chunk_input_hash(row, text_field="text")
+            for row in whole.iter_rows(named=True)
+        }
+        streamed: dict[str, str] = {}
+        with adapter.table_snapshot("registry", batch_size=2) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for row in frame.iter_rows(named=True):
+                    streamed[str(row["document_id"])] = chunk_input_hash(
+                        row, text_field="text"
+                    )
+
+    assert read_whole  # not vacuous
+    assert streamed == read_whole
+
+
+def test_chunk_never_reads_the_whole_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asserted where it is observable: the upstream may be touched only by a
+    zero-row schema probe and by streamed snapshot reads."""
+    from stel.adapters.duckdb import DuckDBAdapter
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path)
+    _write_doc(project, "a.json", "Doc A", ". ".join(f"s {i}" for i in range(30)))
+    _write_doc(project, "b.json", "Doc B", "short body")
+    run_project(project, select="document_registry")
+
+    full_reads: list[str] = []
+    original = DuckDBAdapter.read_table
+
+    def spy(self: Any, table: str, *, limit: int | None = None) -> Any:
+        if table == "document_registry" and limit != 0:
+            full_reads.append(table)
+        return original(self, table, limit=limit)
+
+    monkeypatch.setattr(DuckDBAdapter, "read_table", spy)
+    run_project(project, select="document_chunks")
+    assert full_reads == []
+
+
+def _set_chunk_flush_every(project: Path, value: int) -> None:
+    path = project / "models" / "chunks.yml"
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text.replace("    chunk:\n", f"    chunk:\n      flush_every: {value}\n"),
+        encoding="utf-8",
+    )
+
+
+def test_chunk_publishes_at_window_boundaries(tmp_path: Path) -> None:
+    """Chunk amplifies — one registry row becomes many chunk rows — so holding
+    the output until the end is the larger of the two O(corpus) problems. A
+    failure partway through must leave the earlier windows published."""
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path, chunk_size=40)
+    _set_chunk_flush_every(project, 1)
+    _write_doc(project, "a.json", "Doc A", ". ".join(f"s {i}" for i in range(30)))
+    _write_doc(project, "b.json", "Doc B", "another body here")
+    run_project(project, select="document_registry")
+
+    published: list[int] = []
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    original = DuckDBAdapter.replace_children
+
+    def spy(self: Any, table: str, **kwargs: Any) -> Any:
+        written = original(self, table, **kwargs)
+        published.append(written)
+        return written
+
+    DuckDBAdapter.replace_children = spy  # type: ignore[method-assign]
+    try:
+        run_project(project, select="document_chunks")
+    finally:
+        DuckDBAdapter.replace_children = original  # type: ignore[method-assign]
+
+    # One publication per document, not one for the whole run.
+    assert len(published) > 1
+
+
+def test_chunk_flush_every_does_not_move_code_version(tmp_path: Path) -> None:
+    """A publication cadence must not invalidate state: changing it would
+    re-chunk and re-embed a corpus for an execution-only setting."""
+    from stel.config.model import ChunkConfig
+    from stel.versioning import compute_code_version
+
+    def version(flush_every: int) -> str:
+        return compute_code_version(
+            extraction=None,
+            transform=None,
+            chunk=ChunkConfig(flush_every=flush_every),
+            depends_on=["registry"],
+            project_dir=tmp_path,
+        )
+
+    assert version(5000) == version(7)

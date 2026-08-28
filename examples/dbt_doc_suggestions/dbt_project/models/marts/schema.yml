@@ -1,0 +1,14 @@
+version: 2
+
+models:
+  # `fct_orders` has no description — the gap this example's analysis detects
+  # and `stel suggest dbt` proposes a patch for.
+  - name: fct_orders
+    columns:
+      - name: order_id
+        description: "Primary key"
+
+  # `dim_customers` already has one. The patching half never overwrites an
+  # existing description, so this model must come out of the run untouched.
+  - name: dim_customers
+    description: "One row per customer, with lifetime order totals."

@@ -1,0 +1,24 @@
+dbt_doc_suggestions:
+  target: dev
+  outputs:
+    dev:
+      # The analysis reads the agent-transcript corpus and writes its results
+      # back beside it, so the warehouse IS the transcripts database. Run
+      # `examples/agent_transcripts` first; this project has nothing to read
+      # until that corpus exists.
+      warehouse:
+        type: duckdb
+        path: ../agent_transcripts/target/transcripts.duckdb
+        schema: suggestions
+      llm:
+        # Offline by default so the example runs in CI with no credentials and
+        # no spend. Swap for a real provider to get descriptions worth reading:
+        #   provider: vertex
+        #   model: gemini-2.5-flash
+        provider: deterministic
+        model: deterministic-v1
+        # A cap on the analysis itself, not just the CLI: drafting a
+        # description is a billed call per candidate model, and a corpus that
+        # suddenly names hundreds of models should stop rather than spend.
+        budget:
+          max_api_calls: 50

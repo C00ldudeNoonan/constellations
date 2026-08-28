@@ -1,0 +1,38 @@
+{
+  "schema_version": "transcript/v1.1",
+  "harness": "codex",
+  "session_id": "3a1f0002-2222-7bbb-8ccc-00000000f002",
+  "source_path": "/fixtures/3a1f0002-2222-7bbb-8ccc-00000000f002.jsonl",
+  "project_path": "/work/analytics",
+  "git_branch": "main",
+  "started_at": "2026-08-24T11:30:00Z",
+  "ended_at": "2026-08-24T11:30:00Z",
+  "exchange_count": 1,
+  "tools_used": [
+    "Read"
+  ],
+  "files_touched": [
+    "models/marts/fct_orders.sql"
+  ],
+  "text": "## [0] Does fct_orders include cancelled orders?\n\nNothing documents this. Reading models/marts/fct_orders.sql shows a filter excluding cancelled and test orders, so the grain is one row per completed order.\n\n- tool Read (ok, 812B) args:aa11bb22cc33\n\nFiles: models/marts/fct_orders.sql\n",
+  "exchanges": [
+    {
+      "ordinal": 0,
+      "heading": "[0] Does fct_orders include cancelled orders?",
+      "started_at": "2026-08-24T11:30:00Z",
+      "ended_at": "2026-08-24T11:30:00Z",
+      "prompt_chars": 41,
+      "prompt_truncated": false,
+      "assistant_chars": 156,
+      "tool_calls": 1,
+      "tool_errors": 0,
+      "tools_used": [
+        "Read"
+      ],
+      "files_touched": [
+        "models/marts/fct_orders.sql"
+      ],
+      "context_calls": 0
+    }
+  ]
+}

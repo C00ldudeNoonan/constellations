@@ -945,6 +945,7 @@ def run(
             exclude=exclude,
             threads=threads,
             source_filter=source_filter,
+            read_filter=read_filter,
         )
         return
 

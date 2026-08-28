@@ -195,24 +195,12 @@ def run_project(
         if source_filter
         else False
     )
-    # Guarded like _prepare_subset_run above: `state:` selectors cannot
-    # resolve this early (no manifest is loaded yet), and with no filter there
-    # is nothing to validate.
-    read_predicates = (
-        _prepare_read_filter(
-            read_filter,
-            full_refresh=full_refresh,
-            selected=dag.select_models(select=select, exclude=exclude),
-            models=models,
-        )
-        if read_filter
-        else ()
-    )
-    # A read filter narrows what ref()-based models see, which is exactly the
-    # situation --source-filter describes for extraction: absence from a
-    # deliberately narrowed run is not removal. Presence of either flag makes
-    # the whole invocation additive (issue #417).
-    subset_run = subset_run or bool(read_predicates)
+    # Deliberately NOT resolved here. `--read-filter` with a `state:` selector
+    # needs the modified set, which needs the manifest, which is loaded below
+    # -- so validating this early raises "selector requires --state" for a
+    # caller who supplied --state (issue #417 review). Validation happens once
+    # the real selection exists.
+    read_predicates: tuple[ReadPredicate, ...] = ()
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -247,6 +235,16 @@ def run_project(
             models=models,
             adapter=adapter,
         )
+    if read_filter:
+        read_predicates = _prepare_read_filter(
+            read_filter,
+            full_refresh=full_refresh,
+            selected=selected,
+            models=models,
+        )
+        # Either filter flag makes the whole invocation additive: absence from
+        # a deliberately narrowed run is not removal (issue #417).
+        subset_run = True
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )
@@ -376,24 +374,12 @@ def build_project(
         if source_filter
         else False
     )
-    # Guarded like _prepare_subset_run above: `state:` selectors cannot
-    # resolve this early (no manifest is loaded yet), and with no filter there
-    # is nothing to validate.
-    read_predicates = (
-        _prepare_read_filter(
-            read_filter,
-            full_refresh=full_refresh,
-            selected=dag.select_models(select=select, exclude=exclude),
-            models=models,
-        )
-        if read_filter
-        else ()
-    )
-    # A read filter narrows what ref()-based models see, which is exactly the
-    # situation --source-filter describes for extraction: absence from a
-    # deliberately narrowed run is not removal. Presence of either flag makes
-    # the whole invocation additive (issue #417).
-    subset_run = subset_run or bool(read_predicates)
+    # Deliberately NOT resolved here. `--read-filter` with a `state:` selector
+    # needs the modified set, which needs the manifest, which is loaded below
+    # -- so validating this early raises "selector requires --state" for a
+    # caller who supplied --state (issue #417 review). Validation happens once
+    # the real selection exists.
+    read_predicates: tuple[ReadPredicate, ...] = ()
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
@@ -428,6 +414,16 @@ def build_project(
             models=models,
             adapter=adapter,
         )
+    if read_filter:
+        read_predicates = _prepare_read_filter(
+            read_filter,
+            full_refresh=full_refresh,
+            selected=selected,
+            models=models,
+        )
+        # Either filter flag makes the whole invocation additive: absence from
+        # a deliberately narrowed run is not removal (issue #417).
+        subset_run = True
     validate_retrieval_capabilities(
         [model for model in models if model.name in set(selected)], project, resolved
     )

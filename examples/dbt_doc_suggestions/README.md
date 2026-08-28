@@ -64,6 +64,29 @@ example runs in CI with no credentials and no spend. Descriptions worth
 reading need a real provider — swap the `llm:` block for `vertex` or
 `anthropic`.
 
+## Two things a real corpus forces
+
+**Paths arrive verbatim.** The transcript converter stores `file_path` exactly
+as the harness recorded it, so real sessions carry absolute paths and, on
+Windows, backslashes. The gap SQL normalizes separators before matching, and
+the shipped fixtures deliberately mix POSIX and Windows forms — fixtures full
+of tidy relative paths would let a broken filter look correct while finding
+nothing on real data.
+
+**One corpus holds every project.** Under the documented global transcript
+sync, sessions from every repository land together. Evidence is grouped by the
+repository directory above `models/`, so three unrelated repos each touching
+`models/marts/fct_orders.sql` never pool their prompts into one threshold-
+clearing gap. `dbt_doc_candidates` then scopes to a single project — set it to
+yours; `stel suggest --dbt-project` patches one repository, and a candidate
+built from another's sessions would be a description applied to a model that
+merely shares a filename.
+
+The key is the directory *name*, not the full prefix: the same repo cloned to
+`/home/dev/repos/analytics` and `C:/Users/dev/repos/analytics` is one project,
+and grouping on the full path would split its evidence across machines — the
+same threshold failing from the opposite direction.
+
 ## Rules this example holds
 
 - **The threshold lives in the analysis, not only the CLI.** `--min-evidence`

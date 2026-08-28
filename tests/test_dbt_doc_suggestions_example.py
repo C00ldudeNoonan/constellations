@@ -188,3 +188,53 @@ def test_evidence_prompts_are_headings_not_bodies(built: dict[str, Path]) -> Non
     # Every line is a heading the human wrote, not assistant prose.
     assert all(line.startswith("[") for line in text.splitlines() if line.strip())
     assert "fct_orders" in text
+
+
+# ─── review follow-ups (PR #422) ────────────────────────────────────────────
+
+
+def test_absolute_and_windows_paths_are_matched(built: dict[str, Path]) -> None:
+    """`file_path` is stored verbatim by the transcript converter, so real
+    sessions carry absolute paths and, on Windows, backslashes. A filter
+    written against tidy relative POSIX paths matches none of them — the
+    analysis would run clean and produce nothing, forever.
+
+    The fixtures deliberately mix both forms, and the candidate below is built
+    from three sessions that between them use POSIX and Windows paths.
+    """
+    stored = _rows(
+        built,
+        "SELECT files_touched FROM suggestions.exchange_rows "
+        "WHERE files_touched LIKE '%fct_orders%'",
+    )
+    raw = " ".join(str(row[0]) for row in stored)
+
+    assert "C:\\\\" in raw or "C:\\" in raw, raw
+    assert "/home/" in raw
+    # Both forms reached the same gap.
+    gaps = _rows(
+        built,
+        "SELECT evidence_count FROM suggestions.documentation_gaps "
+        "WHERE dbt_model = 'fct_orders' AND project_key = 'analytics'",
+    )
+    assert gaps == [(3,)]
+
+
+def test_evidence_never_pools_across_repositories(built: dict[str, Path]) -> None:
+    """Sessions from every project land in one corpus. Three repositories each
+    touching `models/marts/fct_orders.sql` must not clear the threshold
+    together and produce a description applied to whichever project
+    `stel suggest --dbt-project` happened to name."""
+    gaps = _rows(
+        built,
+        "SELECT project_key, evidence_count FROM suggestions.documentation_gaps "
+        "WHERE dbt_model = 'fct_orders' ORDER BY project_key",
+    )
+
+    # `billing` also touched a file named fct_orders.sql, in one session. It
+    # is counted separately and never reaches the threshold.
+    assert ("analytics", 3) in gaps
+    assert all(key != "billing" or count < 3 for key, count in gaps)
+    # And it is not a candidate: the candidate model scopes to one project.
+    candidates = _rows(built, f"SELECT dbt_model FROM {CANDIDATES}")
+    assert candidates == [("fct_orders",)]

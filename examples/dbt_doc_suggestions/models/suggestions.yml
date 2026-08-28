@@ -32,6 +32,7 @@ models:
     materialization: full
     fields:
       - {name: gap_id, data_type: string}
+      - {name: project_key, data_type: string}
       - {name: dbt_model, data_type: string}
       - {name: evidence_count, data_type: integer}
       - {name: evidence_sessions, data_type: string}

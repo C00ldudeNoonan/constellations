@@ -1,0 +1,38 @@
+{
+  "schema_version": "transcript/v1.1",
+  "harness": "codex",
+  "session_id": "3a1f0004-4444-7bbb-8ccc-00000000f004",
+  "source_path": "/fixtures/3a1f0004-4444-7bbb-8ccc-00000000f004.jsonl",
+  "project_path": "/work/analytics",
+  "git_branch": "main",
+  "started_at": "2026-08-25T08:10:00Z",
+  "ended_at": "2026-08-25T08:10:00Z",
+  "exchange_count": 1,
+  "tools_used": [
+    "Read"
+  ],
+  "files_touched": [
+    "/home/dev/repos/billing/models/marts/fct_orders.sql"
+  ],
+  "text": "## [0] What does fct_orders mean in the billing repo?\n\nDifferent repository entirely; read its SQL to answer.\n\n- tool Read (ok, 812B) args:aa11bb22cc33\n\nFiles: /home/dev/repos/billing/models/marts/fct_orders.sql\n",
+  "exchanges": [
+    {
+      "ordinal": 0,
+      "heading": "[0] What does fct_orders mean in the billing repo?",
+      "started_at": "2026-08-25T08:10:00Z",
+      "ended_at": "2026-08-25T08:10:00Z",
+      "prompt_chars": 46,
+      "prompt_truncated": false,
+      "assistant_chars": 54,
+      "tool_calls": 1,
+      "tool_errors": 0,
+      "tools_used": [
+        "Read"
+      ],
+      "files_touched": [
+        "/home/dev/repos/billing/models/marts/fct_orders.sql"
+      ],
+      "context_calls": 0
+    }
+  ]
+}

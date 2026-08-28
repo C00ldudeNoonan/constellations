@@ -17,27 +17,47 @@ with touched as (
     select
         e.upstream_document_id as session_key,
         e.exchange_heading,
-        f.file_path
+        -- Paths arrive exactly as the harness recorded them: `file_path` is
+        -- stored verbatim, so real sessions carry absolute paths and, on
+        -- Windows, backslashes. Matching `models/%` against those finds
+        -- nothing, and the analysis would run clean while producing zero
+        -- candidates forever (#361 review). Normalize before anything reads
+        -- the path.
+        replace(f.file_path, '\', '/') as file_path
     from {{ ref('exchange_rows') }} as e,
          unnest(from_json(e.files_touched, '["VARCHAR"]')) as f(file_path)
     where e.files_touched is not null
 ),
 dbt_models as (
     select
-        -- `models/marts/fct_orders.sql` -> `fct_orders`. Anchored to the
+        -- The repository directory immediately above `models/`. Sessions
+        -- from every project land in one corpus under the documented global
+        -- sync, so without this three unrelated repos each touching
+        -- `models/marts/fct_orders.sql` would pool their prompts, clear the
+        -- threshold together, and produce a description applied to whichever
+        -- project `stel suggest` was pointed at (#361 review).
+        --
+        -- The directory name rather than the whole prefix: the same repo
+        -- cloned to `/home/dev/repos/analytics` and
+        -- `C:/Users/dev/repos/analytics` is one project, and grouping on the
+        -- full path would split its evidence across machines -- which fails
+        -- the same threshold from the opposite direction.
+        regexp_extract(file_path, '([^/]+)/models/', 1) as project_key,
+        -- `.../models/marts/fct_orders.sql` -> `fct_orders`. Anchored to the
         -- dbt convention the patching half already enforces: it only ever
-        -- edits `models/**/*.yml`, so only paths under models/ can produce
-        -- a suggestion it could apply.
-        regexp_extract(file_path, '([^/]+)\.sql$', 1) as dbt_model,
+        -- edits `models/**/*.yml`, so only paths under models/ can produce a
+        -- suggestion it could apply.
+        regexp_extract(file_path, 'models/.*/([^/]+)\.sql$', 1) as dbt_model,
         session_key,
         exchange_heading
     from touched
-    where file_path like 'models/%'
-      and file_path like '%.sql'
-      and regexp_extract(file_path, '([^/]+)\.sql$', 1) <> ''
+    where regexp_extract(file_path, 'models/.*/([^/]+)\.sql$', 1) <> ''
 )
 select
-    dbt_model as gap_id,
+    -- The gap is per project *and* model: evidence never crosses repository
+    -- boundaries, and the key records which repository it came from.
+    project_key || '::' || dbt_model as gap_id,
+    project_key,
     dbt_model,
     count(distinct session_key) as evidence_count,
     -- Sorted so the provenance a reviewer reads is stable across runs, and
@@ -52,7 +72,7 @@ select
     string_agg(distinct exchange_heading, E'\n' order by exchange_heading)
         as evidence_prompts
 from dbt_models
-group by 1, 2
+group by 1, 2, 3
 -- The analysis-side threshold. Three separate sessions before a gap is worth
 -- a provider call; raise it for a busy corpus, never lower it to zero.
 having count(distinct session_key) >= 3

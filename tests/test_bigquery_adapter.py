@@ -48,6 +48,7 @@ from stel.adapters.base import (
     TEST_FAILURES_TABLE_PREFIX,
 )
 from stel.adapters.bigquery import (
+    _STATE_CLUSTER_FIELDS,
     BigQueryAdapter,
     BigQueryWarehouseConfig,
     BigQueryWarehouseOptions,
@@ -568,17 +569,68 @@ def test_state_table_create_uses_v2_schema() -> None:
     assert "input_fingerprint STRING NOT NULL" in sql
     assert "document_id" not in sql
     assert "content_hash" not in sql
+    # issue #431: clustered on exactly the MERGE join-key order, so a new
+    # deployment never sees the unclustered-scan cost at all.
+    assert (
+        "CLUSTER BY model_name, state_scope, target_identity, record_key" in sql
+    )
 
 
 def test_state_table_v2_schema_is_an_exact_noop() -> None:
     client = _FakeClient()
     client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
+    client.table_meta["proj.ds.stel_state"] = {
+        "clustering_fields": list(_STATE_CLUSTER_FIELDS)
+    }
     adapter = _adapter(client)
 
     adapter._ensure_state_table()
 
+    # One metadata read to confirm clustering, no queries or drops: the
+    # steady-state path issue #431 exists to make cheap.
     assert client.queries == []
     assert client.dropped == []
+
+
+def test_state_table_v2_schema_missing_clustering_is_reclustered() -> None:
+    """A table created before this fix -- current columns, old physical
+    layout -- must be rebuilt clustered, not silently accepted (issue #431).
+    """
+    client = _FakeClient()
+    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
+    # Three queries in order: the staging CREATE (no rows needed), the
+    # verification SELECT COUNT(*) (the pair that must match), then the
+    # COPY swap (no rows needed) -- matching FakeClient.query()'s FIFO pop.
+    client.query_results = [_FakeJob(), _FakeJob(rows=[(3, 3)]), _FakeJob()]
+    adapter = _adapter(client)
+
+    adapter._ensure_state_table()
+
+    assert len(client.queries) == 3
+    create_sql = client.queries[0][0]
+    assert "CREATE TABLE" in create_sql and "IF NOT EXISTS" not in create_sql
+    assert f"SELECT * FROM {adapter._state_ref}" in create_sql
+    assert "CLUSTER BY model_name, state_scope, target_identity, record_key" in create_sql
+    copy_sql = client.queries[2][0]
+    assert copy_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`stel_state` COPY")
+    assert len(client.dropped) == 1
+    assert client.dropped[0].startswith("proj.ds.stel_staging__state_migration_v2__")
+
+
+def test_state_table_recluster_count_mismatch_keeps_existing_table() -> None:
+    """A verified copy, same as the v1 migration: an interrupted recluster
+    must not leave a truncated stel_state -- every model would then look
+    unprocessed rather than the run failing loudly."""
+    client = _FakeClient()
+    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
+    client.query_results = [_FakeJob(rows=[(3, 1)])]
+    adapter = _adapter(client)
+
+    with pytest.raises(AdapterError, match="row-count verification failed"):
+        adapter._ensure_state_table()
+
+    assert all(" COPY " not in sql for sql, _ in client.queries)
+    assert len(client.dropped) == 1
 
 
 def test_state_table_rejects_unrecognized_schema_without_mutation() -> None:
@@ -645,7 +697,13 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
     assert copy_sql.endswith(f"COPY {migration_ref}")
     assert protected_table_ids.isdisjoint(client.dropped)
 
+    # The v1 migration goes through _create_state_table_sql, so the table it
+    # produced is already clustered -- re-checking must find that and stay a
+    # noop rather than immediately queuing a recluster of what it just built.
     client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
+    client.table_meta["proj.ds.stel_state"] = {
+        "clustering_fields": list(_STATE_CLUSTER_FIELDS)
+    }
     adapter._ensure_state_table()
     assert len(client.queries) == 4
 

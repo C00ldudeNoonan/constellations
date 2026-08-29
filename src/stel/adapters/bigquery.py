@@ -1230,14 +1230,21 @@ class BigQueryAdapter(WarehouseAdapter):
         self._replace_state_table(source_select)
 
     def _recluster_state_table(self) -> None:
-        """Rebuild stel_state with the clustered layout, rows unchanged.
+        """Set stel_state's clustering columns via an in-place metadata patch.
 
-        Same verified-copy path as the v1 migration (issue #294), for the
-        same reason: a raw CREATE-OR-REPLACE that died mid-query would leave
-        the production table half-rewritten, and a truncated state table
-        makes every model look unprocessed rather than failing loudly.
+        Deliberately not the v1 migration's CREATE/verify/COPY rebuild: that
+        path snapshots the table with a CTAS and later swaps it in, and a
+        concurrent MERGE landing between the snapshot and the swap would be
+        silently discarded even though the row count still matches (issue
+        #431 review). `tables.patch` on `clustering_fields` changes only
+        table metadata -- existing writers keep MERGE-ing the live table
+        throughout, nothing is copied or swapped, and BigQuery reclusters the
+        existing data in the background at no query cost. New writes land
+        clustered immediately.
         """
-        self._replace_state_table(f"SELECT * FROM {self._state_ref}")
+        bq_table = self.client.get_table(self._table_id(_STATE_TABLE))
+        bq_table.clustering_fields = list(_STATE_CLUSTER_FIELDS)
+        self.client.update_table(bq_table, ["clustering_fields"])
 
     def _replace_state_table(self, source_select: str) -> None:
         """CREATE the rebuilt table under a staging name, verify its row

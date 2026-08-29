@@ -221,6 +221,7 @@ class _FakeClient:
         # Any, not list[_FakeJob]: snapshot reads queue a job that serves
         # Arrow batches rather than rows (issue #418).
         self.query_results: list[Any] = []
+        self.updated_tables: list[tuple[Any, list[str]]] = []
 
     def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
         self.queries.append((sql, job_config))
@@ -244,7 +245,9 @@ class _FakeClient:
             else SimpleNamespace(name=field, field_type="STRING", mode="NULLABLE")
             for field in self.tables[table_id]
         ]
-        return SimpleNamespace(schema=schema, **self.table_meta.get(table_id, {}))
+        return SimpleNamespace(
+            schema=schema, _fake_table_id=table_id, **self.table_meta.get(table_id, {})
+        )
 
     def list_tables(self, dataset_id: str) -> list[Any]:
         # `listing` is the configured dataset. `other_datasets` covers the
@@ -263,6 +266,13 @@ class _FakeClient:
 
     def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
         self.dropped.append(table_id)
+
+    def update_table(self, table: Any, fields: list[str]) -> Any:
+        self.updated_tables.append((table, list(fields)))
+        meta = self.table_meta.setdefault(table._fake_table_id, {})
+        for field in fields:
+            meta[field] = getattr(table, field)
+        return table
 
     def close(self) -> None:
         pass
@@ -594,43 +604,32 @@ def test_state_table_v2_schema_is_an_exact_noop() -> None:
 
 def test_state_table_v2_schema_missing_clustering_is_reclustered() -> None:
     """A table created before this fix -- current columns, old physical
-    layout -- must be rebuilt clustered, not silently accepted (issue #431).
+    layout -- must have its clustering fields set, not silently accepted
+    (issue #431).
+
+    This is an in-place metadata patch, not a rebuild (PR #433 review): a
+    CTAS/verify/COPY rebuild snapshots the table and later swaps it in, and a
+    concurrent MERGE landing between the snapshot and the swap would be
+    silently discarded even though the row count still matched. Patching
+    `clustering_fields` changes only metadata -- no snapshot, no swap,
+    nothing for a concurrent writer to race.
     """
     client = _FakeClient()
     client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
-    # Three queries in order: the staging CREATE (no rows needed), the
-    # verification SELECT COUNT(*) (the pair that must match), then the
-    # COPY swap (no rows needed) -- matching FakeClient.query()'s FIFO pop.
-    client.query_results = [_FakeJob(), _FakeJob(rows=[(3, 3)]), _FakeJob()]
     adapter = _adapter(client)
 
     adapter._ensure_state_table()
 
-    assert len(client.queries) == 3
-    create_sql = client.queries[0][0]
-    assert "CREATE TABLE" in create_sql and "IF NOT EXISTS" not in create_sql
-    assert f"SELECT * FROM {adapter._state_ref}" in create_sql
-    assert "CLUSTER BY model_name, state_scope, target_identity, record_key" in create_sql
-    copy_sql = client.queries[2][0]
-    assert copy_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`stel_state` COPY")
-    assert len(client.dropped) == 1
-    assert client.dropped[0].startswith("proj.ds.stel_staging__state_migration_v2__")
-
-
-def test_state_table_recluster_count_mismatch_keeps_existing_table() -> None:
-    """A verified copy, same as the v1 migration: an interrupted recluster
-    must not leave a truncated stel_state -- every model would then look
-    unprocessed rather than the run failing loudly."""
-    client = _FakeClient()
-    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
-    client.query_results = [_FakeJob(rows=[(3, 1)])]
-    adapter = _adapter(client)
-
-    with pytest.raises(AdapterError, match="row-count verification failed"):
-        adapter._ensure_state_table()
-
-    assert all(" COPY " not in sql for sql, _ in client.queries)
-    assert len(client.dropped) == 1
+    # No queries and nothing dropped: a metadata patch, not a rebuild.
+    assert client.queries == []
+    assert client.dropped == []
+    assert len(client.updated_tables) == 1
+    table, fields = client.updated_tables[0]
+    assert fields == ["clustering_fields"]
+    assert table.clustering_fields == list(_STATE_CLUSTER_FIELDS)
+    assert client.table_meta["proj.ds.stel_state"]["clustering_fields"] == list(
+        _STATE_CLUSTER_FIELDS
+    )
 
 
 def test_state_table_rejects_unrecognized_schema_without_mutation() -> None:

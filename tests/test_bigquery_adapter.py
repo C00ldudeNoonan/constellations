@@ -3746,6 +3746,79 @@ def test_integration_rename_table_carries_a_table_and_its_rows() -> None:
 # backs full materialization, `materialize_sql_*` back SQL models, and
 # `replace_children` backs incremental child-row deletion. Each is dialect
 # specific and currently proven only against a fake client.
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_keyed_table_snapshot_streams_and_validates() -> None:
+    """Live cover for the keyed snapshot path (issues #190, #418).
+
+    This path had none, and was invisible to the gate below: `table_snapshot`
+    is defined on `WarehouseAdapter` and BigQuery overrides only the private
+    `_open_table_snapshot`, so neither class introspection nor the underscore
+    filter reached it. It is the mechanism every search publication reads
+    through, and #418 rewrote it — the key-domain check moved out of two
+    unpartitioned `OVER()` columns attached to the payload, which made BigQuery
+    buffer the whole projection in one worker and killed any large publish.
+
+    What only a live run can show: that the two statements the rewrite emits
+    are accepted and stream, and that an invalid key domain is refused without
+    the payload query ever starting.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "chunks",
+                pl.DataFrame(
+                    {
+                        "chunk_id": [f"c{index}" for index in range(50)],
+                        "symbol": ["AAPL"] * 25 + ["MSFT"] * 25,
+                        "body": [f"body {index}" for index in range(50)],
+                    }
+                ),
+            )
+
+            with adapter.table_snapshot(
+                "chunks", key_column="chunk_id", batch_size=10
+            ) as snapshot:
+                rows = sum(batch.num_rows for batch in snapshot)
+                assert snapshot.schema.names == ["chunk_id", "symbol", "body"]
+            assert rows == 50
+
+            # Projection and predicate reach BigQuery, and the key check
+            # applies the same predicate rather than the whole table.
+            with adapter.table_snapshot(
+                "chunks",
+                columns=("chunk_id", "symbol"),
+                key_column="chunk_id",
+                predicate=ReadPredicate(
+                    "symbol", ReadPredicateOperator.EQUAL, "AAPL"
+                ),
+                batch_size=10,
+            ) as snapshot:
+                filtered = sum(batch.num_rows for batch in snapshot)
+                assert snapshot.schema.names == ["chunk_id", "symbol"]
+            assert filtered == 25
+
+            # A duplicate key is refused, and refused before the payload runs.
+            adapter.append_rows(
+                "chunks",
+                pl.DataFrame(
+                    {"chunk_id": ["c0"], "symbol": ["AAPL"], "body": ["dupe"]}
+                ),
+            )
+            with pytest.raises(AdapterError, match="key domain is invalid"):
+                with adapter.table_snapshot("chunks", key_column="chunk_id"):
+                    pass
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
 _UNCOVERED_BY_LIVE_TESTS = frozenset(
     {
         "clear_state",
@@ -3771,7 +3844,9 @@ _UNCOVERED_BY_LIVE_TESTS = frozenset(
 # Base-class operations that issue BigQuery SQL through the adapter. They are
 # not overridden by BigQueryAdapter, so class introspection alone would miss
 # them — which is precisely how the #322/#333 additions escaped the gate.
-_EXTRA_LIVE_GATE_OPERATIONS = frozenset({"read_relation", "relation_row_count"})
+_EXTRA_LIVE_GATE_OPERATIONS = frozenset(
+    {"read_relation", "relation_row_count", "table_snapshot"}
+)
 
 
 def _live_integration_source() -> str:

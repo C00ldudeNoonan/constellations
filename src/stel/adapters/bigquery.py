@@ -186,6 +186,22 @@ _STATE_V2_COLUMNS = (
     ("code_version", "STRING", "REQUIRED"),
     ("last_run_at", "TIMESTAMP", "REQUIRED"),
 )
+# Every state write is a MERGE joining on exactly these four columns, in this
+# order (issue #431). An unclustered stel_state scans the whole table per
+# MERGE -- on a 2.36M-row production table, measured at 404MB billed per
+# write, 4,413 writes, 99.7% of one publish's BigQuery bill. Clustering on
+# the join-key prefix is the fix BigQuery's own MERGE-pruning is built for;
+# no partitioning column exists here (model_name is a STRING, and BigQuery
+# native partitioning wants DATE/TIMESTAMP/DATETIME/INT64-range) and nothing
+# in the read or write paths filters by last_run_at, so partitioning on it
+# would add metadata overhead for no pruning benefit -- clustering alone is
+# the effective fix and #431's own sibling measurement confirms it.
+_STATE_CLUSTER_FIELDS = (
+    "model_name",
+    "state_scope",
+    "target_identity",
+    "record_key",
+)
 
 
 def _bigquery() -> Any:
@@ -1128,10 +1144,16 @@ class BigQueryAdapter(WarehouseAdapter):
         if columns is None:
             self.execute(self._create_state_table_sql(_STATE_TABLE))
             return
-        if columns == _STATE_V2_COLUMNS:
-            return
         if columns == _STATE_V1_COLUMNS:
             self._migrate_v1_state()
+            return
+        if columns == _STATE_V2_COLUMNS:
+            # A table created before this fix, or one a prior --full-refresh
+            # of something else happened to recreate without it, still has
+            # the current columns but the old (unclustered) physical layout.
+            # Checked once per connection, not per write (issue #431).
+            if not self._state_is_clustered():
+                self._recluster_state_table()
             return
 
         shape = ", ".join(name for name, _type, _mode in columns)
@@ -1140,6 +1162,11 @@ class BigQueryAdapter(WarehouseAdapter):
             f"v2 shape, found columns: {shape or '(none)'}. Back up the table and "
             "run --full-refresh after resolving the state schema."
         )
+
+    def _state_is_clustered(self) -> bool:
+        bq_table = self.client.get_table(self._table_id(_STATE_TABLE))
+        fields = tuple(getattr(bq_table, "clustering_fields", None) or ())
+        return fields == _STATE_CLUSTER_FIELDS
 
     def _create_state_table_sql(
         self,
@@ -1150,6 +1177,7 @@ class BigQueryAdapter(WarehouseAdapter):
     ) -> str:
         action = "CREATE TABLE IF NOT EXISTS" if if_not_exists else "CREATE TABLE"
         suffix = f"\n            AS {select}" if select is not None else ""
+        cluster_by = ", ".join(_STATE_CLUSTER_FIELDS)
         return f"""
             {action} {self.table_ref(table)} (
                 model_name STRING NOT NULL,
@@ -1159,7 +1187,8 @@ class BigQueryAdapter(WarehouseAdapter):
                 input_fingerprint STRING NOT NULL,
                 code_version STRING NOT NULL,
                 last_run_at TIMESTAMP NOT NULL
-            ){suffix}
+            )
+            CLUSTER BY {cluster_by}{suffix}
         """
 
     def _state_columns(self, table: str) -> tuple[tuple[str, str, str], ...] | None:
@@ -1177,8 +1206,6 @@ class BigQueryAdapter(WarehouseAdapter):
         )
 
     def _migrate_v1_state(self) -> None:
-        migration_table = f"{_STATE_MIGRATION_PREFIX}{uuid4().hex}"
-        migration_ref = self.table_ref(migration_table)
         source_select = (
             "SELECT model_name AS model_name, "
             "'materialization' AS state_scope, "
@@ -1200,6 +1227,34 @@ class BigQueryAdapter(WarehouseAdapter):
                 "(model_name, document_id) keys contain duplicates. Back up and "
                 "deduplicate the state table before retrying."
             )
+        self._replace_state_table(source_select)
+
+    def _recluster_state_table(self) -> None:
+        """Set stel_state's clustering columns via an in-place metadata patch.
+
+        Deliberately not the v1 migration's CREATE/verify/COPY rebuild: that
+        path snapshots the table with a CTAS and later swaps it in, and a
+        concurrent MERGE landing between the snapshot and the swap would be
+        silently discarded even though the row count still matches (issue
+        #431 review). `tables.patch` on `clustering_fields` changes only
+        table metadata -- existing writers keep MERGE-ing the live table
+        throughout, nothing is copied or swapped, and BigQuery reclusters the
+        existing data in the background at no query cost. New writes land
+        clustered immediately.
+        """
+        bq_table = self.client.get_table(self._table_id(_STATE_TABLE))
+        bq_table.clustering_fields = list(_STATE_CLUSTER_FIELDS)
+        self.client.update_table(bq_table, ["clustering_fields"])
+
+    def _replace_state_table(self, source_select: str) -> None:
+        """CREATE the rebuilt table under a staging name, verify its row
+        count against the table it will replace, then swap it in via COPY --
+        which carries over the CLUSTER BY (and any future PARTITION BY)
+        `_create_state_table_sql` declares, so the production table ends up
+        with the same physical layout as the staging one it copied.
+        """
+        migration_table = f"{_STATE_MIGRATION_PREFIX}{uuid4().hex}"
+        migration_ref = self.table_ref(migration_table)
         migration_created = False
         try:
             self.execute(

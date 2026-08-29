@@ -48,6 +48,7 @@ from stel.adapters.base import (
     TEST_FAILURES_TABLE_PREFIX,
 )
 from stel.adapters.bigquery import (
+    _STATE_CLUSTER_FIELDS,
     BigQueryAdapter,
     BigQueryWarehouseConfig,
     BigQueryWarehouseOptions,
@@ -220,6 +221,7 @@ class _FakeClient:
         # Any, not list[_FakeJob]: snapshot reads queue a job that serves
         # Arrow batches rather than rows (issue #418).
         self.query_results: list[Any] = []
+        self.updated_tables: list[tuple[Any, list[str]]] = []
 
     def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
         self.queries.append((sql, job_config))
@@ -243,7 +245,9 @@ class _FakeClient:
             else SimpleNamespace(name=field, field_type="STRING", mode="NULLABLE")
             for field in self.tables[table_id]
         ]
-        return SimpleNamespace(schema=schema, **self.table_meta.get(table_id, {}))
+        return SimpleNamespace(
+            schema=schema, _fake_table_id=table_id, **self.table_meta.get(table_id, {})
+        )
 
     def list_tables(self, dataset_id: str) -> list[Any]:
         # `listing` is the configured dataset. `other_datasets` covers the
@@ -262,6 +266,13 @@ class _FakeClient:
 
     def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
         self.dropped.append(table_id)
+
+    def update_table(self, table: Any, fields: list[str]) -> Any:
+        self.updated_tables.append((table, list(fields)))
+        meta = self.table_meta.setdefault(table._fake_table_id, {})
+        for field in fields:
+            meta[field] = getattr(table, field)
+        return table
 
     def close(self) -> None:
         pass
@@ -568,17 +579,57 @@ def test_state_table_create_uses_v2_schema() -> None:
     assert "input_fingerprint STRING NOT NULL" in sql
     assert "document_id" not in sql
     assert "content_hash" not in sql
+    # issue #431: clustered on exactly the MERGE join-key order, so a new
+    # deployment never sees the unclustered-scan cost at all.
+    assert (
+        "CLUSTER BY model_name, state_scope, target_identity, record_key" in sql
+    )
 
 
 def test_state_table_v2_schema_is_an_exact_noop() -> None:
+    client = _FakeClient()
+    client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
+    client.table_meta["proj.ds.stel_state"] = {
+        "clustering_fields": list(_STATE_CLUSTER_FIELDS)
+    }
+    adapter = _adapter(client)
+
+    adapter._ensure_state_table()
+
+    # One metadata read to confirm clustering, no queries or drops: the
+    # steady-state path issue #431 exists to make cheap.
+    assert client.queries == []
+    assert client.dropped == []
+
+
+def test_state_table_v2_schema_missing_clustering_is_reclustered() -> None:
+    """A table created before this fix -- current columns, old physical
+    layout -- must have its clustering fields set, not silently accepted
+    (issue #431).
+
+    This is an in-place metadata patch, not a rebuild (PR #433 review): a
+    CTAS/verify/COPY rebuild snapshots the table and later swaps it in, and a
+    concurrent MERGE landing between the snapshot and the swap would be
+    silently discarded even though the row count still matched. Patching
+    `clustering_fields` changes only metadata -- no snapshot, no swap,
+    nothing for a concurrent writer to race.
+    """
     client = _FakeClient()
     client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
     adapter = _adapter(client)
 
     adapter._ensure_state_table()
 
+    # No queries and nothing dropped: a metadata patch, not a rebuild.
     assert client.queries == []
     assert client.dropped == []
+    assert len(client.updated_tables) == 1
+    table, fields = client.updated_tables[0]
+    assert fields == ["clustering_fields"]
+    assert table.clustering_fields == list(_STATE_CLUSTER_FIELDS)
+    assert client.table_meta["proj.ds.stel_state"]["clustering_fields"] == list(
+        _STATE_CLUSTER_FIELDS
+    )
 
 
 def test_state_table_rejects_unrecognized_schema_without_mutation() -> None:
@@ -645,7 +696,13 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
     assert copy_sql.endswith(f"COPY {migration_ref}")
     assert protected_table_ids.isdisjoint(client.dropped)
 
+    # The v1 migration goes through _create_state_table_sql, so the table it
+    # produced is already clustered -- re-checking must find that and stay a
+    # noop rather than immediately queuing a recluster of what it just built.
     client.tables["proj.ds.stel_state"] = list(_STATE_V2_SCHEMA)
+    client.table_meta["proj.ds.stel_state"] = {
+        "clustering_fields": list(_STATE_CLUSTER_FIELDS)
+    }
     adapter._ensure_state_table()
     assert len(client.queries) == 4
 

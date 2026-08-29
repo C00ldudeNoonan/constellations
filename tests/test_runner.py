@@ -445,7 +445,22 @@ def test_threaded_run_parallelizes_independent_branches(fresh_project: Path) -> 
     assert monthly[0][0] > 0
 
 
-def test_serialized_adapter_holds_lock_for_snapshot_lifetime() -> None:
+def test_serialized_adapter_releases_the_lock_while_a_snapshot_streams() -> None:
+    """The lock guards the open, not the stream (issue #432).
+
+    It used to span the whole context, added by #158 to serialize search
+    snapshots. That predates the generation fence: a snapshot now opens on a
+    dedicated cursor, checks the table generation before its first batch and
+    after full consumption, and fails rather than serving a read the warehouse
+    changed underneath (`test_duckdb_snapshot_is_immutable_during_concurrent_change`).
+    Safety comes from the fence; the lock was redundancy on top of it.
+
+    Redundancy that cost everything: a streaming stage holds its snapshot open
+    for its entire run, provider calls included, so under `--threads N` the
+    first model to open one blocked every other until it finished. And no model
+    in a parallel batch can be writing another's snapshot source — batches are
+    topological generations, so their members are mutually independent.
+    """
     snapshot_entered = threading.Event()
     release_snapshot = threading.Event()
     second_call_finished = threading.Event()
@@ -472,12 +487,15 @@ def test_serialized_adapter_holds_lock_for_snapshot_lifetime() -> None:
     first.start()
     assert snapshot_entered.wait(timeout=2)
     second.start()
-    assert not second_call_finished.wait(timeout=0.05)
+    # The point of the change: another model's warehouse call goes through
+    # while the snapshot is still streaming.
+    assert second_call_finished.wait(timeout=2), (
+        "a warehouse call blocked while a snapshot was open, so --threads N "
+        "still serializes streaming stages end to end (issue #432)"
+    )
     release_snapshot.set()
     first.join(timeout=2)
     second.join(timeout=2)
-    assert second_call_finished.is_set()
-
 
 def test_clean_preserves_duckdb(fresh_project: Path) -> None:
     invoices_dir = fresh_project / "data" / "invoices"

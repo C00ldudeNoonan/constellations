@@ -426,6 +426,13 @@ class EmbedConfig(BaseModel):
     vector_field: str = Field(default="embedding", min_length=1)
     dimensions: int = Field(gt=0, le=65_536)
     batch_size: int = Field(default=128, gt=0, le=10_000)
+    # Provider batches issued at once (issue #432). `embed:` was the only
+    # provider stage with no executor-level concurrency: batches went out one
+    # at a time and waited, so the only overlap was whatever a provider managed
+    # *inside* one call — which meant none at all for a provider that does not
+    # split. Mirrors `llm.max_concurrent`, and is excluded from code_version
+    # for the same reason: execution cadence, not identity.
+    max_concurrent: int = Field(default=8, gt=0, le=1_000)
     max_retries: int = Field(default=4, ge=0)
     # Embedded rows publish to the warehouse every N rows, advancing state for
     # exactly those rows (issue #401). Embeds were the last all-or-nothing

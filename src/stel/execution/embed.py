@@ -312,17 +312,23 @@ def run_embed_model(
     def _embed_batch(batch: list[_EmbedWork]) -> None:
         """Embed one provider batch. Runs on a worker thread."""
         nonlocal provider_batches, provider_calls
+        reserved = 0
         if budget_guard is not None:
             # One logical batch may fan into many billed requests --
             # Vertex issues one per text for gemini-embedding models --
             # so reserve what the provider says it will bill, not 1.
-            budget_guard.ensure_headroom(
-                next_calls=estimate_embed_requests(
-                    [item.text for item in batch],
-                    identity,
-                    profile_options=embedding_options.provider_options,
-                )
+            #
+            # Reserved rather than merely checked: with batches in flight
+            # concurrently, admitting against the pre-charge total lets every
+            # worker through the same cap (issue #432 review). The charge lands
+            # at admission and `settle_calls` adds whatever the provider billed
+            # beyond it.
+            reserved = estimate_embed_requests(
+                [item.text for item in batch],
+                identity,
+                profile_options=embedding_options.provider_options,
             )
+            budget_guard.reserve_calls(reserved)
         embedded = embed_texts(
             [item.text for item in batch],
             identity,
@@ -337,14 +343,12 @@ def run_embed_model(
             provider_calls += embedded.provider_requests
             add_provider_usage(usage_totals, embedded.usage.to_metrics())
             if budget_guard is not None:
-                # Embedding usage carries no api_calls key -- the request
-                # count is provider_requests -- so fold it in explicitly or
-                # max_api_calls silently never trips for embeds.
-                budget_guard.charge_metrics(
-                    {
-                        **embedded.usage.to_metrics(),
-                        "api_calls": embedded.provider_requests,
-                    }
+                # Tokens and cost only; the calls were charged at admission.
+                # Embedding usage carries no api_calls key -- the request count
+                # is provider_requests -- so nothing here double-counts them.
+                budget_guard.charge_metrics(embedded.usage.to_metrics())
+                budget_guard.settle_calls(
+                    reserved=reserved, actual=embedded.provider_requests
                 )
         # Each item is written by exactly one batch, so the vectors need no
         # lock; only the shared counters above do.

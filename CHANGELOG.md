@@ -23,6 +23,13 @@ Two independent throttles, both invisible until measured.
   `embed.max_concurrent` (default 8) mirrors `llm.max_concurrent` and is
   excluded from `code_version`, so tuning throughput never re-embeds a corpus.
 
+Budget enforcement had to become atomic to allow this. `ensure_headroom` then
+charge-on-return is a check-then-act: sequentially fine, but concurrent workers
+all pass admission against the same pre-charge total, so a `max_api_calls: 1`
+cap would buy one call per worker. `BudgetGuard.reserve_calls()` now charges a
+call when it is *admitted* and settles the difference once the provider reports
+what it billed. `llm:` has the same pre-existing race and is tracked as #435.
+
 If you are on Vertex, `batch_size` and `max_concurrent` compose with
 `provider_options.max_concurrent_requests`: a batch too small to split leaves
 the provider's own pool with nothing to overlap.

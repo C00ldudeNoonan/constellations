@@ -84,24 +84,23 @@ def test_the_snapshot_open_is_still_guarded(tmp_path: Path) -> None:
     protects."""
     with _adapter(tmp_path) as adapter:
         adapter.materialize_full("rows", pl.DataFrame({"id": ["a"]}))
-        held: list[bool] = []
+        lock = threading.Lock()
+        held_during_open: list[bool] = []
+        real_snapshot = adapter.table_snapshot
 
-        class _WatchingLock:
-            def __init__(self) -> None:
-                self._lock = threading.Lock()
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            held_during_open.append(lock.locked())
+            return real_snapshot(*args, **kwargs)
 
-            def __enter__(self) -> None:
-                self._lock.acquire()
-                held.append(True)
-
-            def __exit__(self, *exc: object) -> None:
-                self._lock.release()
-
-        guarded = _SerializedAdapter(adapter, _WatchingLock())  # type: ignore[arg-type]
+        adapter.table_snapshot = spy  # type: ignore[method-assign]
+        guarded = _SerializedAdapter(adapter, lock)
         with guarded.table_snapshot("rows") as snapshot:
-            opened_under_lock = len(held)
             list(snapshot)
-    assert opened_under_lock >= 1, "the snapshot open was not guarded"
+
+    assert held_during_open == [True], (
+        "the snapshot open ran without the lock, but creating its cursor "
+        "touches the shared connection the lock protects"
+    )
 
 
 def test_a_failing_snapshot_still_closes_under_the_lock(tmp_path: Path) -> None:
@@ -284,3 +283,69 @@ def test_embed_max_concurrent_does_not_move_code_version(tmp_path: Path) -> None
         )
 
     assert version(8) == version(64)
+
+
+def test_a_call_cap_is_not_overrun_by_concurrent_batches() -> None:
+    """The #432 review finding: admission and reservation must be one step.
+
+    `ensure_headroom` then charge-on-return is a check-then-act. Sequentially
+    that is fine — nothing runs between the two — but with batches in flight
+    concurrently every worker passes admission against the same pre-charge
+    total, and a `max_api_calls: 1` cap silently buys as many calls as there
+    are workers.
+    """
+    from stel.budget import (
+        BudgetExceededError,
+        BudgetGuard,
+        BudgetLedger,
+        LLMBudgetConfig,
+    )
+
+    guard = BudgetGuard(
+        BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="model"), None
+    )
+    admitted = 0
+    refused = 0
+    lock = threading.Lock()
+    start = threading.Barrier(4, timeout=10)
+
+    def worker() -> None:
+        nonlocal admitted, refused
+        start.wait()
+        try:
+            guard.reserve_calls(1)
+        except BudgetExceededError:
+            with lock:
+                refused += 1
+        else:
+            with lock:
+                admitted += 1
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert admitted == 1, (
+        f"{admitted} workers were admitted against max_api_calls=1; a spending "
+        "cap that admits more than it allows is not a cap"
+    )
+    assert refused == 3
+
+
+def test_settling_charges_only_what_the_provider_billed_beyond_the_reservation() -> None:
+    """A fan-out larger than estimated still lands on the ledger, and an
+    over-estimate is left conservative rather than refunded — failing safe."""
+    from stel.budget import BudgetGuard, BudgetLedger, LLMBudgetConfig
+
+    ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=100), scope="model")
+    guard = BudgetGuard(ledger, None)
+
+    guard.reserve_calls(2)
+    guard.settle_calls(reserved=2, actual=5)
+    assert ledger.snapshot()["api_calls"] == 5
+
+    guard.reserve_calls(4)
+    guard.settle_calls(reserved=4, actual=1)
+    assert ledger.snapshot()["api_calls"] == 9, "an over-estimate must not refund"

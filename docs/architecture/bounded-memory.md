@@ -63,6 +63,11 @@ A stage holds the contract when all of these are true:
   that column, not the payload beside it — on both sides of the wire (#418).
 - **Output publishes per window.** `FlushPublisher` writes and advances state
   every `flush_every` rows, so a failure re-pays one window rather than the run.
+- **Mutable-target reuse retries whole reads.** An embed resume reads its own
+  target between publications. If BigQuery metadata advances across that
+  immutable query result, the reader discards the attempted lookup and retries
+  a bounded number of complete projected snapshots; upstream reads remain
+  fail-closed on their first generation change.
 - **Validation that can fail the run happens first.** A NULL or duplicate key
   should fail before the first provider call, not after the corpus is paid for.
 

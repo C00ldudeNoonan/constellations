@@ -22,6 +22,7 @@ from .base import (
     StateValue,
     TableReadRequest,
     TableReadSnapshot,
+    TableSnapshotGenerationChangedError,
     WarehouseAdapter,
     WarehouseCapability,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "TableReadRequest",
     "TableReadSnapshot",
     "TableRename",
+    "TableSnapshotGenerationChangedError",
     "UnknownAdapterError",
     "WarehouseAdapter",
     "WarehouseCapability",

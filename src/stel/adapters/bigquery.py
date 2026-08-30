@@ -74,6 +74,7 @@ from .base import (
     StateValue,
     TableReadRequest,
     TableReadSnapshot,
+    TableSnapshotGenerationChangedError,
     WarehouseAdapter,
     WarehouseCapability,
     change_predicate,
@@ -1454,7 +1455,9 @@ class BigQueryAdapter(WarehouseAdapter):
                 self.client.get_table(table_id)
             )
             if current_generation != initial_generation:
-                raise AdapterError("BigQuery table changed while opening its snapshot")
+                raise TableSnapshotGenerationChangedError(
+                    "BigQuery table changed while opening its snapshot"
+                )
             output_indices = [
                 query_schema.get_field_index(name) for name in output_names
             ]
@@ -1525,7 +1528,9 @@ class BigQueryAdapter(WarehouseAdapter):
                     assert validation_failure_cause is not None
                     raise validation_failure from validation_failure_cause
                 if generation != initial_generation:
-                    raise AdapterError("BigQuery table changed during its snapshot read")
+                    raise TableSnapshotGenerationChangedError(
+                        "BigQuery table changed during its snapshot read"
+                    )
 
             def close() -> None:
                 if fully_consumed or job is None:

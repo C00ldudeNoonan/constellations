@@ -41,6 +41,7 @@ from .base import (
     StateValue,
     TableReadRequest,
     TableReadSnapshot,
+    TableSnapshotGenerationChangedError,
     WarehouseAdapter,
     WarehouseCapability,
     change_predicate,
@@ -1254,7 +1255,9 @@ class DuckDBAdapter(WarehouseAdapter):
                     raise AdapterError("DuckDB table snapshot was not fully consumed")
                 current_digest = self._current_table_digest(request)
                 if current_digest != snapshot_digest:
-                    raise AdapterError("DuckDB table changed during its snapshot read")
+                    raise TableSnapshotGenerationChangedError(
+                        "DuckDB table changed during its snapshot read"
+                    )
 
             def close() -> None:
                 nonlocal transaction_open

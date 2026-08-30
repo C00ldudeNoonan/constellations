@@ -1428,6 +1428,15 @@ provider bill again. Embedded rows publish and advance state every
   materialization: incremental
 ```
 
+`embed.max_concurrent` (default 8) is how many provider batches are in flight
+at once. It is the throughput knob: raising it overlaps provider latency, and
+`batch_size` decides how much work each request carries. On Vertex the two
+compose — a batch is split again by `max_texts_per_request` and
+`max_tokens_per_request`, and those splits are issued concurrently, so a
+`batch_size` too small to split leaves `provider_options.max_concurrent_requests`
+with nothing to overlap. Neither setting is part of `code_version`, so tuning
+throughput never re-embeds a corpus.
+
 Peak memory is one flush rather than the corpus, and a run that dies at hour
 28 keeps every row it already paid for — the next run resumes at the last
 flush instead of re-embedding everything (issue #401).
@@ -1500,7 +1509,7 @@ could not be rebuilt at all.
 | `extraction` | `flush_every`, `publish_every` | 5000, 1 | Parser and backend cost |
 | `transform` | `commit_every` | 1000 | CPU over changed parents |
 | `chunk` | `flush_every` | 5000 | Chunk rows amplify the input |
-| `embed` | `flush_every` | 5000 | **Metered provider spend** |
+| `embed` | `flush_every`, `max_concurrent` | 5000, 8 | **Metered provider spend** |
 | `llm` | `flush_every` | 1000 | **One provider call per row** |
 | `search` | per-batch upsert | — | Publishes and advances state per batch |
 | `chunk`, `ml`, `eval` | none | — | CPU-only; a re-run costs time, not money |

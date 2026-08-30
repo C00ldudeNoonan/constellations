@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Concurrency: `--threads` stops serializing streaming stages, and embed overlaps its batches (issue #432)
+
+Two independent throttles, both invisible until measured.
+
+- **`_SerializedAdapter` held the shared lock for a snapshot's whole context.**
+  A streaming stage keeps that context open for its entire run — provider calls
+  and publishes included — so under `--threads N` the first model to open a
+  snapshot blocked every other one until it finished. Serialized execution, not
+  serialized I/O. It arrived with the bounded-memory work: before #411 and
+  #423, embed and chunk read through `read_table`, which takes the generic
+  per-call lock and releases it. The lock now guards the open and the close;
+  the stream runs unlocked, which is safe for the same reason
+  `state_page_reader` always did it — both open a dedicated cursor — and the
+  generation fence, not the lock, is what rejects a table that changed
+  underneath.
+- **`embed:` had no executor-level concurrency.** Provider batches went out one
+  at a time and blocked, so the only overlap was whatever a provider arranged
+  inside a single call: none at all for one that does not split. New
+  `embed.max_concurrent` (default 8) mirrors `llm.max_concurrent` and is
+  excluded from `code_version`, so tuning throughput never re-embeds a corpus.
+
+Budget enforcement had to become atomic to allow this. `ensure_headroom` then
+charge-on-return is a check-then-act: sequentially fine, but concurrent workers
+all pass admission against the same pre-charge total, so a `max_api_calls: 1`
+cap would buy one call per worker. `BudgetGuard.reserve_calls()` now charges a
+call when it is *admitted* and settles the difference once the provider reports
+what it billed. `llm:` has the same pre-existing race and is tracked as #435.
+
+If you are on Vertex, `batch_size` and `max_concurrent` compose with
+`provider_options.max_concurrent_requests`: a batch too small to split leaves
+the provider's own pool with nothing to overlap.
+
 ## v0.14.0 - 2026-08-28
 
 ### Upgrading

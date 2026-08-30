@@ -73,6 +73,13 @@ def compute_document_id(scope: str, relative_path: str) -> str:
     ).hexdigest()
 
 
+# Embed settings that shape execution rather than output. Excluded from
+# code_version so tuning throughput never re-embeds a corpus at provider cost.
+_EMBED_EXECUTION_FIELDS = frozenset(
+    {"batch_size", "max_retries", "flush_every", "max_concurrent"}
+)
+
+
 def compute_code_version(
     *,
     extraction: ExtractionConfig | None,
@@ -128,7 +135,7 @@ def compute_code_version(
             dict(effective_embedding)
             if effective_embedding is not None
             else {
-                **embed.model_dump(exclude={"batch_size", "max_retries", "flush_every"}),
+                **embed.model_dump(exclude=set(_EMBED_EXECUTION_FIELDS)),
                 "identity": EmbeddingIdentity.from_config(embed).to_dict(),
             }
             if embed
@@ -276,7 +283,7 @@ def compute_model_code_version(
             resolved,
         )
         effective_embedding = {
-            **model.embed.model_dump(exclude={"batch_size", "max_retries", "flush_every"}),
+            **model.embed.model_dump(exclude=set(_EMBED_EXECUTION_FIELDS)),
             "identity": EmbeddingIdentity.from_config(
                 model.embed,
                 profile_options=embedding_options.provider_options,

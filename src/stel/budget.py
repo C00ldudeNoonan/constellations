@@ -186,6 +186,9 @@ class BudgetGuard:
             ledger for ledger in (model_ledger, run_ledger) if ledger is not None
         ]
         self._cost_estimator = cost_estimator
+        # Makes admission-plus-reservation one step across both ledgers; see
+        # `reserve_calls`.
+        self._admission = threading.Lock()
 
     @property
     def active(self) -> bool:
@@ -206,6 +209,38 @@ class BudgetGuard:
     def ensure_headroom(self, *, next_calls: int = 1) -> None:
         for ledger in self._ledgers:
             ledger.ensure_headroom(next_calls=next_calls)
+
+    def reserve_calls(self, count: int) -> None:
+        """Admit `count` provider calls and charge them in one step.
+
+        `ensure_headroom` then `charge_*` is a check-then-act: sequential
+        callers are fine because nothing runs between the two, but concurrent
+        ones all pass admission against the same pre-charge total and every one
+        of them proceeds. With `max_api_calls: 1` and two workers in flight,
+        both are admitted and two calls are billed — the cap silently buys more
+        than it says (issue #432 review).
+
+        Reserving under one lock closes that: a call is charged when it is
+        admitted, not when it returns, so the cap counts work in flight.
+        `settle_calls` charges the difference once the provider says what it
+        actually billed.
+
+        The lock is the guard's own, so it covers both ledgers together. It
+        does not extend across *models* sharing the run ledger — a smaller
+        overrun that predates this, tracked as issue #435.
+        """
+        with self._admission:
+            self.ensure_headroom(next_calls=count)
+            self.charge_usage(api_calls=count)
+
+    def settle_calls(self, *, reserved: int, actual: int) -> None:
+        """Charge whatever the provider billed beyond the reservation.
+
+        Only ever adds. An over-estimate leaves the ledger conservative, which
+        fails safe: the run stops early rather than spending past the cap.
+        """
+        if actual > reserved:
+            self.charge_usage(api_calls=actual - reserved)
 
     def charge_usage(
         self,

@@ -136,15 +136,39 @@ class _SerializedAdapter:
         predicate: Any = None,
         key_column: str | None = None,
     ) -> Iterator[TableReadSnapshot]:
+        """Guard the open; stream unlocked (issue #432).
+
+        Holding the lock across the whole context serialized `--threads N` down
+        to one model at a time, because a streaming stage keeps its snapshot
+        open for its entire run — provider calls and publishes included. That is
+        not serialized I/O, it is serialized execution, and it arrived with the
+        bounded-memory work: before #411 and #423, embed and chunk read through
+        `read_table`, which takes the generic per-call lock and releases it.
+
+        Streaming unlocked is safe for the same reason `state_page_reader` has
+        always been: both adapters open a **dedicated cursor** for the snapshot
+        (`DuckDBAdapter._cursor()`, BigQuery's own query job), so the read does
+        not share the session the lock protects. Creating that cursor does touch
+        the shared connection, so the open stays guarded.
+        """
         with self._lock:
-            with self._adapter.table_snapshot(
+            manager = self._adapter.table_snapshot(
                 table,
                 columns=columns,
                 batch_size=batch_size,
                 predicate=predicate,
                 key_column=key_column,
-            ) as snapshot:
-                yield snapshot
+            )
+            snapshot = manager.__enter__()
+        try:
+            yield snapshot
+        except BaseException as error:
+            with self._lock:
+                if not manager.__exit__(type(error), error, error.__traceback__):
+                    raise
+        else:
+            with self._lock:
+                manager.__exit__(None, None, None)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._adapter, name)

@@ -9,7 +9,9 @@ compatibility.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -191,6 +193,9 @@ def run_embed_model(
     embedded_count = 0
     processed = 0
     usage_totals: dict[str, int | float] = {}
+    # Guards the counters and the budget ledger once provider
+    # batches run concurrently (issue #432).
+    usage_lock = threading.Lock()
     provider_batches = 0
     provider_calls = 0
     use_full = model.materialization == "full" or full_refresh or rebuild_target
@@ -304,49 +309,81 @@ def run_embed_model(
         if window:
             yield window
 
-    def _embed_window(window: list[_EmbedWork]) -> None:
-        nonlocal provider_batches, provider_calls, embedded_count
-        pending = [item for item in window if item.vector is None]
-        embedded_count += len(pending)
-        if pending and budget_guard is not None:
-            budget_guard.charge_documents(len(pending))
-        for offset in range(0, len(pending), config.batch_size):
-            batch = pending[offset : offset + config.batch_size]
-            if budget_guard is not None:
-                # One logical batch may fan into many billed requests --
-                # Vertex issues one per text for gemini-embedding models --
-                # so reserve what the provider says it will bill, not 1.
-                budget_guard.ensure_headroom(
-                    next_calls=estimate_embed_requests(
-                        [item.text for item in batch],
-                        identity,
-                        profile_options=embedding_options.provider_options,
-                    )
-                )
-            embedded = embed_texts(
+    def _embed_batch(batch: list[_EmbedWork]) -> None:
+        """Embed one provider batch. Runs on a worker thread."""
+        nonlocal provider_batches, provider_calls
+        reserved = 0
+        if budget_guard is not None:
+            # One logical batch may fan into many billed requests --
+            # Vertex issues one per text for gemini-embedding models --
+            # so reserve what the provider says it will bill, not 1.
+            #
+            # Reserved rather than merely checked: with batches in flight
+            # concurrently, admitting against the pre-charge total lets every
+            # worker through the same cap (issue #432 review). The charge lands
+            # at admission and `settle_calls` adds whatever the provider billed
+            # beyond it.
+            reserved = estimate_embed_requests(
                 [item.text for item in batch],
                 identity,
-                input_ids=[item.record_id for item in batch],
-                credential_env=embedding_options.api_key_env,
                 profile_options=embedding_options.provider_options,
-                max_retries=config.max_retries,
-                timeout_seconds=embedding_options.timeout_seconds,
             )
+            budget_guard.reserve_calls(reserved)
+        embedded = embed_texts(
+            [item.text for item in batch],
+            identity,
+            input_ids=[item.record_id for item in batch],
+            credential_env=embedding_options.api_key_env,
+            profile_options=embedding_options.provider_options,
+            max_retries=config.max_retries,
+            timeout_seconds=embedding_options.timeout_seconds,
+        )
+        with usage_lock:
             provider_batches += 1
             provider_calls += embedded.provider_requests
             add_provider_usage(usage_totals, embedded.usage.to_metrics())
             if budget_guard is not None:
-                # Embedding usage carries no api_calls key -- the request
-                # count is provider_requests -- so fold it in explicitly or
-                # max_api_calls silently never trips for embeds.
-                budget_guard.charge_metrics(
-                    {
-                        **embedded.usage.to_metrics(),
-                        "api_calls": embedded.provider_requests,
-                    }
+                # Tokens and cost only; the calls were charged at admission.
+                # Embedding usage carries no api_calls key -- the request count
+                # is provider_requests -- so nothing here double-counts them.
+                budget_guard.charge_metrics(embedded.usage.to_metrics())
+                budget_guard.settle_calls(
+                    reserved=reserved, actual=embedded.provider_requests
                 )
-            for item, vector in zip(batch, embedded.vectors, strict=True):
-                item.vector = vector
+        # Each item is written by exactly one batch, so the vectors need no
+        # lock; only the shared counters above do.
+        for item, vector in zip(batch, embedded.vectors, strict=True):
+            item.vector = vector
+
+    def _embed_window(window: list[_EmbedWork]) -> None:
+        nonlocal embedded_count
+        pending = [item for item in window if item.vector is None]
+        embedded_count += len(pending)
+        if pending and budget_guard is not None:
+            budget_guard.charge_documents(len(pending))
+        batches = [
+            pending[offset : offset + config.batch_size]
+            for offset in range(0, len(pending), config.batch_size)
+        ]
+        if not batches:
+            return
+        # Issue the window's batches concurrently (issue #432). Embed was the
+        # only provider stage with no executor-level concurrency: batches went
+        # out one at a time and blocked, so the sole overlap was whatever a
+        # provider arranged *inside* one call -- none at all for a provider
+        # that does not split, and none across batches even for one that does.
+        #
+        # `pool.map` preserves input order and re-raises the first failure
+        # deterministically, which is what the budget and error paths below
+        # already assume.
+        workers = max(1, min(config.max_concurrent, len(batches)))
+        if workers == 1:
+            for batch in batches:
+                _embed_batch(batch)
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for _ in pool.map(_embed_batch, batches):
+                pass
 
     def _publish(window: list[_EmbedWork]) -> None:
         """Publish one flush, then advance state for exactly its rows.

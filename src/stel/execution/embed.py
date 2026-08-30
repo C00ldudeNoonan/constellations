@@ -12,9 +12,10 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from functools import partial
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from ..adapters import (
     StateRecord,
     StateScope,
     StateValue,
+    TableSnapshotGenerationChangedError,
     WarehouseAdapter,
 )
 from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
@@ -613,7 +615,15 @@ class _EmbeddingReuseReader:
     - **Reuse columns, one window at a time.** A keyed IN predicate over the
       window's typed ids, projected to the hash/vector columns, so residency
       is bounded by `flush_every` whatever the corpus size.
+
+    The target is mutable by design: every successful window publishes before
+    the next lookup. A BigQuery query result is immutable, but eventually
+    consistent table metadata can advance while that result is being consumed.
+    Generation-change retries therefore live here, at the only caller that can
+    discard an advisory target read safely; upstream snapshots remain strict.
     """
+
+    _SNAPSHOT_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -647,18 +657,44 @@ class _EmbeddingReuseReader:
             # A pre-embed table (or an older contract) has nothing to reuse;
             # the old whole-table loader answered {} here too.
             return
+        self._target_keys = self._retry_snapshot_read(self._read_target_keys_once)
+        self._usable = True
+
+    def _read_target_keys_once(self) -> dict[str, Any]:
+        target_keys: dict[str, Any] = {}
         with self._adapter.table_snapshot(
             self._table,
             columns=[self._id_field],
             batch_size=100_000,
         ) as snapshot:
             for batch in snapshot:
-                frame = pl.from_arrow(batch)
-                assert isinstance(frame, pl.DataFrame)
-                for value in frame[self._id_field].to_list():
-                    if value is not None:
-                        self._target_keys[str(value)] = value
-        self._usable = True
+                target_keys.update(self._target_keys_from_batch(batch))
+        return target_keys
+
+    def _target_keys_from_batch(self, batch: Any) -> dict[str, Any]:
+        frame = pl.from_arrow(batch)
+        assert isinstance(frame, pl.DataFrame)
+        return {
+            str(value): value
+            for value in frame[self._id_field].to_list()
+            if value is not None
+        }
+
+    def _retry_snapshot_read[T](self, operation: Callable[[], T]) -> T:
+        for attempt in range(1, self._SNAPSHOT_ATTEMPTS + 1):
+            try:
+                return operation()
+            except TableSnapshotGenerationChangedError:
+                if attempt == self._SNAPSHOT_ATTEMPTS:
+                    raise
+                log.debug(
+                    "embed reuse target '%s' changed during snapshot; "
+                    "discarding the attempt and retrying (%d/%d)",
+                    self._table,
+                    attempt,
+                    self._SNAPSHOT_ATTEMPTS,
+                )
+        raise AssertionError("unreachable")
 
     def target_key(self, record_id: str) -> Any | None:
         """The typed id column value for a stringified record id, if present."""
@@ -695,25 +731,36 @@ class _EmbeddingReuseReader:
         found: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(typed), self._LOOKUP_KEYS_PER_READ):
             chunk = typed[offset : offset + self._LOOKUP_KEYS_PER_READ]
-            predicate = ReadPredicate(
-                self._id_field,
-                ReadPredicateOperator.IN,
-                tuple(chunk),
+            found.update(
+                self._retry_snapshot_read(partial(self._read_rows_for_chunk, chunk))
             )
-            with self._adapter.table_snapshot(
-                self._table,
-                columns=list(self._columns),
-                predicate=predicate,
-                batch_size=len(chunk),
-            ) as snapshot:
-                for batch in snapshot:
-                    frame = pl.from_arrow(batch)
-                    assert isinstance(frame, pl.DataFrame)
-                    for row in frame.iter_rows(named=True):
-                        key = row.get(self._id_field)
-                        if key is not None:
-                            found[str(key)] = row
         return found
+
+    def _read_rows_for_chunk(self, chunk: Sequence[Any]) -> dict[str, dict[str, Any]]:
+        predicate = ReadPredicate(
+            self._id_field,
+            ReadPredicateOperator.IN,
+            tuple(chunk),
+        )
+        found: dict[str, dict[str, Any]] = {}
+        with self._adapter.table_snapshot(
+            self._table,
+            columns=list(self._columns),
+            predicate=predicate,
+            batch_size=len(chunk),
+        ) as snapshot:
+            for batch in snapshot:
+                found.update(self._rows_from_batch(batch))
+        return found
+
+    def _rows_from_batch(self, batch: Any) -> dict[str, dict[str, Any]]:
+        frame = pl.from_arrow(batch)
+        assert isinstance(frame, pl.DataFrame)
+        return {
+            str(key): row
+            for row in frame.iter_rows(named=True)
+            if (key := row.get(self._id_field)) is not None
+        }
 
 
 def _coerce_embedding_vector(

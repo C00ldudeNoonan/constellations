@@ -37,6 +37,10 @@ class AdapterError(Exception):
     pass
 
 
+class TableSnapshotGenerationChangedError(AdapterError):
+    """A snapshot attempt crossed a relation-generation change."""
+
+
 def sanitized_adapter_cause(error: Exception) -> AdapterError:
     """Retain only a native exception's type in a diagnostic-safe cause chain."""
     return AdapterError(f"Native adapter error type: {type(error).__name__}")

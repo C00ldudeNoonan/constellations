@@ -1453,6 +1453,14 @@ id column once (streamed and projected — no vectors), then looks up reuse
 candidates one window at a time by key, so resuming a large corpus never
 costs more memory than running it.
 
+On BigQuery the reuse target is also the table each window just updated. If
+table metadata advances while one of those immutable query results is being
+consumed, stel discards that entire advisory lookup and retries a bounded
+number of complete projected reads. This also lets a new run settle after a
+server-side write left behind by an interrupted predecessor. Upstream snapshot
+reads do not retry generation changes, and a continuously changing target still
+fails the run.
+
 Both paths need `streaming_tabular_reads` from the adapter. It is checked at
 preflight, so a warehouse without it fails before credentials are resolved
 rather than partway through a corpus.

@@ -12,6 +12,8 @@ cadence changes execution, never output.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -714,3 +716,72 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
 
         assert reader.target_key("1.50") is not None
         assert reader.rows_for(["1.50"]) == {}
+
+
+def test_reuse_reader_retries_complete_mutable_target_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from stel.adapters import (
+        TableSnapshotGenerationChangedError,
+        create_adapter,
+        parse_warehouse_config,
+    )
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["a"],
+                    "embedding_input_hash": ["input-hash"],
+                    "embedding_config_hash": ["config-hash"],
+                    "embedding": [[0.1]],
+                    "embedded_at": ["2026-08-30T00:00:00+00:00"],
+                }
+            ),
+        )
+        original_snapshot = adapter.table_snapshot
+        snapshot_calls = 0
+        changing_calls = {1, 3}
+
+        @contextmanager
+        def changing_snapshot(*args: Any, **kwargs: Any) -> Iterator[Any]:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            this_call = snapshot_calls
+            with original_snapshot(*args, **kwargs) as snapshot:
+                yield snapshot
+            if this_call in changing_calls:
+                raise TableSnapshotGenerationChangedError(
+                    "simulated target generation change"
+                )
+
+        monkeypatch.setattr(adapter, "table_snapshot", changing_snapshot)
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic",
+                model="m",
+                dimensions=1,
+                id_field="chunk_id",
+                vector_field="embedding",
+            ),
+        )
+
+        assert snapshot_calls == 2
+        assert reader.rows_for(["a"])["a"]["embedding_input_hash"] == "input-hash"
+        assert snapshot_calls == 4
+
+        changing_calls.update({5, 6, 7})
+        with pytest.raises(
+            TableSnapshotGenerationChangedError,
+            match="simulated target generation change",
+        ):
+            reader.rows_for(["a"])
+        assert snapshot_calls == 7

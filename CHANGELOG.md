@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### BigQuery embed resumes no longer collide with their own flushes (issue #436)
+
+An incremental `embed:` run reads reuse candidates from its own target between
+flushes. BigQuery's query result is immutable, but the table metadata used by
+the generation fence can advance while that result is consumed after the
+previous synchronous `MERGE` has already returned. The same race occurs when a
+new run overlaps a server-side write left behind by a killed predecessor.
+
+Snapshot generation changes now have a typed adapter error. The mutable-target
+reuse reader catches only that error, discards every row from the attempted
+lookup, and retries the complete projected read up to three times. Continuous
+changes still fail after the bound, and ordinary upstream snapshots continue
+to fail immediately rather than accepting a different generation.
+
 ### Concurrency: `--threads` stops serializing streaming stages, and embed overlaps its batches (issue #432)
 
 Two independent throttles, both invisible until measured.

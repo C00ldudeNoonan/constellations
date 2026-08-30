@@ -120,6 +120,17 @@ generation fingerprint omits the query job. Query cost remains
 subject to the active profile's project, priority, retry, timeout, and
 `maximum_bytes_billed` settings.
 
+Generation changes raise `TableSnapshotGenerationChangedError`, a typed
+`AdapterError`. Ordinary upstream readers propagate it and fail closed. A
+consumer reading a target it deliberately mutates may retry only after
+discarding the entire attempted read; the embedding reuse reader does this for
+at most three complete projected snapshots. This handles a BigQuery metadata
+transition caused by its preceding flush (or a completed orphaned write from a
+killed predecessor) without exposing partially accepted rows. A target that
+keeps changing still exhausts the bound and fails. Reuse candidates remain
+advisory: their stored input and embedding-config hashes must match before a
+vector is accepted.
+
 `ReadPredicate` supports equality, inequality, ordered comparisons, membership,
 and NULL checks over strict scalar values. Membership tuples are non-empty and
 homogeneous. Reprs redact values, and adapter errors never include row or

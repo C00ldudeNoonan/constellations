@@ -19,6 +19,7 @@ from stel.adapters import (
     ReadPredicateOperator,
     TableReadRequest,
     TableReadSnapshot,
+    TableSnapshotGenerationChangedError,
     WarehouseCapability,
     create_adapter,
     parse_warehouse_config,
@@ -592,9 +593,23 @@ def test_bigquery_generation_change_fails_final_validation() -> None:
     )
     adapter = _bigquery_adapter(client)
 
-    with pytest.raises(AdapterError, match="changed during"):
+    with pytest.raises(TableSnapshotGenerationChangedError, match="changed during"):
         with adapter.table_snapshot("records") as snapshot:
             assert len(list(snapshot)) == 1
+
+
+def test_bigquery_generation_change_fails_snapshot_open_with_typed_error() -> None:
+    client = _FakeBigQueryClient(
+        {"record_id": pa.array(["a"])},
+        generations=["generation-a", "generation-b"],
+    )
+    adapter = _bigquery_adapter(client)
+
+    with pytest.raises(
+        TableSnapshotGenerationChangedError, match="changed while opening"
+    ):
+        with adapter.table_snapshot("records"):
+            pass
 
 
 def test_bigquery_empty_relation_keeps_typed_schema() -> None:

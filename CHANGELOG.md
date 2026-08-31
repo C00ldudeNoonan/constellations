@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Native llm models stream inputs and resume ids (issue #424)
+
+Native `llm:` models no longer load their entire upstream relation, build a
+corpus-sized work list, or read generated target columns into memory on resume.
+A zero-row probe supplies the schema; projected id/input snapshots first
+validate and classify the corpus, then fill one `flush_every` work window at a
+time. Existing targets are projected to the typed id column and streamed in
+fixed-size batches for deletion reconciliation.
+
+The eager classification pass preserves two cost-safety contracts: invalid ids
+still fail before the first provider call, and `max_documents` still rejects
+an over-cap run before any partial publication. Streamed and whole-frame input
+fingerprints are pinned as equivalent so upgrading cannot silently regenerate
+an existing corpus at provider cost.
+
 ### Concurrent provider work no longer multiplies execution-budget caps (issue #435)
 
 Native `llm:` workers used a check-then-act sequence: check the shared ledger,

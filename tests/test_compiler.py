@@ -63,6 +63,29 @@ def test_capability_preflight_rejects_missing_typed_reads(
         validate_warehouse_capabilities([model], "vector_only")
 
 
+def test_capability_preflight_rejects_llm_without_streaming_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = ModelConfig(
+        name="facts",
+        depends_on=["ref('raw')"],
+        llm={"input_field": "body", "prompt": "classify"},
+        fields=[{"name": "sentiment"}],
+    )
+    available = frozenset(WarehouseCapability) - {
+        WarehouseCapability.STREAMING_TABULAR_READS,
+    }
+    monkeypatch.setattr(
+        "stel.compiler.adapter_capabilities",
+        lambda _adapter_type: available,
+    )
+
+    with pytest.raises(
+        ConfigError, match=r"streaming_tabular_reads.*bounded llm input reads"
+    ):
+        validate_warehouse_capabilities([model], "eager_only")
+
+
 def test_capability_preflight_rejects_sql_tests_without_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

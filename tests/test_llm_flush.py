@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 
 from stel.execution.contracts import RunError
@@ -224,6 +225,92 @@ def test_flush_size_does_not_change_the_output(tmp_path: Path) -> None:
         return _query(project, columns)
 
     assert _run(1) == _run(2) == _run(1000)
+
+
+def test_streaming_the_input_preserves_input_fingerprints(tmp_path: Path) -> None:
+    """A streamed read must not silently re-bill an existing corpus.
+
+    Incremental state compares this fingerprint to decide whether to call the
+    provider. If Arrow batches produced different Python values than the old
+    whole-frame path, every existing native llm model would regenerate on its
+    first run after this change without raising an error.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter, DuckDBWarehouseConfig
+    from stel.hashing import canonical_fingerprint
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="registry")
+
+    def _fingerprint(record: dict[str, Any]) -> str:
+        value = record.get("body")
+        content = "" if value is None else str(value)
+        return canonical_fingerprint(
+            {"content": content}, domain="llm-input-content", version=1
+        )
+
+    config = DuckDBWarehouseConfig(
+        path=project / "target" / "db.duckdb", schema_name="docs"
+    )
+    with DuckDBAdapter(config) as adapter:
+        whole = adapter.read_table("registry")
+        assert dict(adapter.read_table("registry", limit=0).schema) == dict(
+            whole.schema
+        )
+        read_whole = {
+            str(row["document_id"]): _fingerprint(row)
+            for row in whole.iter_rows(named=True)
+        }
+        streamed: dict[str, str] = {}
+        with adapter.table_snapshot(
+            "registry", columns=["document_id", "body"], batch_size=2
+        ) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for row in frame.iter_rows(named=True):
+                    streamed[str(row["document_id"])] = _fingerprint(row)
+
+    assert read_whole
+    assert streamed == read_whole
+
+
+def test_duplicate_ids_fail_before_any_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streamed validation must remain an unpaid preflight."""
+    import stel.execution.llm as llm_module
+
+    project = _project(tmp_path, flush_every=2)
+    run_project(project, select="registry")
+    first, second = [
+        row[0]
+        for row in _query(
+            project,
+            'SELECT document_id FROM "db".docs.registry ORDER BY document_id LIMIT 2',
+        )
+    ]
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        connection.execute(
+            'UPDATE "db".docs.registry SET document_id = ? WHERE document_id = ?',
+            [first, second],
+        )
+    finally:
+        connection.close()
+
+    calls = 0
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("provider must not be called")
+
+    monkeypatch.setattr(llm_module, "execute_map_item", forbidden)
+
+    with pytest.raises(RunError, match="duplicate value"):
+        run_project(project, select="facts")
+
+    assert calls == 0
 
 
 def test_flush_every_does_not_move_code_version(tmp_path: Path) -> None:

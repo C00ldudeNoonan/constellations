@@ -318,6 +318,13 @@ def validate_warehouse_capabilities(
             required[WarehouseCapability.STREAMING_TABULAR_READS] = (
                 "bounded embed input reads"
             )
+        if model.llm is not None:
+            # Native llm uses projected snapshots for both its validation
+            # pass and flush-window generation (issue #424). Declare that
+            # dependency before runtime resolution can touch provider config.
+            required[WarehouseCapability.STREAMING_TABULAR_READS] = (
+                "bounded llm input reads"
+            )
         # Derived enum checks count: they are schema tests the adapter must
         # support, and finding that out after materialization would move a
         # predictable configuration failure past warehouse mutation (#304).

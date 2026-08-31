@@ -11,12 +11,12 @@ run whose input does not fit in RAM should still finish.
 ### The key term is real, and deliberate
 
 The third term is not a rounding error and should not be read as one. Stages
-that reconcile deletions hold every id at once: `_stream_upstream_ids` and
-`_stream_document_ids` return a `set[str]` of the upstream keys, and a resuming
-embed additionally holds `_EmbeddingReuseReader._target_keys` for the existing
-target. Measured, a Python string set costs ~108 bytes per id:
+that reconcile deletions hold every id at once: `_stream_upstream_ids`,
+`_stream_document_ids`, and the native llm input plan retain a `set[str]` of
+the upstream keys. A resuming embed or llm run also retains the existing
+target's typed-id map. Measured, a Python string set costs ~108 bytes per id:
 
-| corpus | one key set | a resuming embed (two) |
+| corpus | one key set | a resuming embed/llm run (two) |
 |---|---|---|
 | 200k rows | 21 MB | 42 MB |
 | 3.6M rows | ~370 MB | ~740 MB |
@@ -36,8 +36,8 @@ failure the incidents were; a cumulative container is invisible to them. That
 limitation is why the term is written down here.
 
 This is stated as an invariant rather than left as a property of each stage
-because the same root cause reached production five times, through five
-different stages, and each fix was correct and local:
+because the same root cause kept reaching different stages, and each fix was
+correct and local:
 
 | incident | stage | what was corpus-sized |
 |---|---|---|
@@ -47,9 +47,10 @@ different stages, and each fix was correct and local:
 | #410 → #411 | embed input | `read_table(upstream)` before the first provider call |
 | #418 → #420 | BigQuery snapshot | an unpartitioned `OVER()` made the warehouse buffer the projection |
 | #423 → #425 | chunk | whole upstream registry in, every chunk row accumulated out |
+| #424 | llm input/resume | whole upstream and target reads, plus every changed input accumulated as work |
 
-The sequence is the argument. Five local fixes did not converge on a bounded
-system, because nothing said what bounded meant.
+The sequence is the argument. Local fixes did not converge on a bounded system,
+because nothing said what bounded meant.
 
 ## What the invariant costs a stage
 
@@ -80,7 +81,7 @@ in a table — `bounded`, `exception` with a reason, or `gap` with a tracking
 issue — and an AST scan fails when a new one appears unclassified. `read_table`
 is `SELECT *` into one frame, so an unreviewed call on a corpus-scale relation
 is an O(corpus) peak. This makes a whole-table read an argued decision rather
-than the default that five incidents made it.
+than the default that repeated incidents made it.
 
 *The property.* A stage is run against a real warehouse with the adapter
 instrumented to record how many rows it ever materializes at once. A regression
@@ -100,14 +101,10 @@ stel's side, and no call-site audit would have found it. The property test
 needs a warehouse and a fixture, so it covers a stage at a time rather than
 everything. Neither replaces measuring a real corpus.
 
-## Where it does not hold yet
+## Known gaps
 
-Tracked, and the list may only shrink — `test_the_unbounded_list_only_shrinks`
-fails if a stage is added to it:
-
-- **#424 — llm** reads its whole upstream before the first provider call, and
-  its whole existing target to collect id values. The #410 and #407 holes,
-  unfixed for the stage where a re-run costs the most per row.
+The audit currently records no unbounded pipeline-stage gaps.
+`test_the_unbounded_list_only_shrinks` fails if one is added silently.
 
 Stages that read whole tables *by contract* are recorded as exceptions with
 their reasons in the same table — classic ML training fits one matrix, a

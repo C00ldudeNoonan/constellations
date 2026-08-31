@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,14 @@ _LLM_METADATA_COLUMNS = (
     "generated_at",
 )
 
+# Read batch sizes for the two projected paths (issue #424). These are
+# deliberately independent of `flush_every`: publication cadence is
+# operator-configurable and has no upper bound, while these constants bound
+# warehouse-read residency. Existing-target ids are narrow; input batches also
+# carry the potentially large prompt content and therefore stay smaller.
+_ID_BATCH_ROWS = 100_000
+_INPUT_BATCH_ROWS = 10_000
+
 
 @dataclass
 class _LLMWork:
@@ -71,32 +80,94 @@ class _LLMWork:
     generated_at: str | None = None
 
 
-def _llm_record_ids(
-    frame: pl.DataFrame,
-    id_field: str,
+@dataclass(frozen=True)
+class _LLMInputPlan:
+    current_ids: set[str]
+    work_count: int
+    skipped: int
+
+
+def _llm_content_fingerprint(value: Any) -> tuple[str, str]:
+    content = "" if value is None else str(value)
+    return content, canonical_fingerprint(
+        {"content": content},
+        domain="llm-input-content",
+        version=1,
+    )
+
+
+def _stream_llm_input_plan(
+    adapter: WarehouseAdapter,
+    table: str,
+    *,
+    config: LLMTransformConfig,
     model_name: str,
-) -> tuple[list[str], list[Any]]:
-    values = frame[id_field].to_list()
-    null_count = sum(value is None for value in values)
+    processed_state: dict[str, StateValue],
+    code_version: str,
+) -> _LLMInputPlan:
+    """Validate and classify every input without retaining corpus text.
+
+    This eager projected pass stays ahead of provider execution for two public
+    contracts: invalid ids fail before any paid call, and `max_documents` can
+    reject a run before its first publication. The cumulative id set is the
+    known O(distinct keys) reconciliation trade tracked by issue #428; input
+    text and row frames remain bounded by `_INPUT_BATCH_ROWS`.
+    """
+    current_ids: set[str] = set()
+    total = 0
+    null_count = 0
+    empty_count = 0
+    work_count = 0
+    skipped = 0
+    with adapter.table_snapshot(
+        table,
+        columns=[config.id_field, config.input_field],
+        batch_size=_INPUT_BATCH_ROWS,
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            for record in frame.iter_rows(named=True):
+                total += 1
+                id_value = record[config.id_field]
+                if id_value is None:
+                    null_count += 1
+                    continue
+                record_id = str(id_value)
+                if not record_id:
+                    empty_count += 1
+                    continue
+                current_ids.add(record_id)
+                _, input_fingerprint = _llm_content_fingerprint(
+                    record[config.input_field]
+                )
+                if processed_state.get(record_id) == StateValue(
+                    input_fingerprint, code_version
+                ):
+                    skipped += 1
+                else:
+                    work_count += 1
     if null_count:
         raise RunError(
-            f"llm model '{model_name}': upstream `{id_field}` contains "
+            f"llm model '{model_name}': upstream `{config.id_field}` contains "
             f"{null_count} NULL value(s)"
         )
-    record_ids = [str(value) for value in values]
-    empty_count = sum(not value for value in record_ids)
     if empty_count:
         raise RunError(
-            f"llm model '{model_name}': upstream `{id_field}` contains "
+            f"llm model '{model_name}': upstream `{config.id_field}` contains "
             f"{empty_count} empty value(s)"
         )
-    duplicate_count = len(record_ids) - len(set(record_ids))
+    duplicate_count = total - len(current_ids)
     if duplicate_count:
         raise RunError(
-            f"llm model '{model_name}': upstream `{id_field}` contains "
+            f"llm model '{model_name}': upstream `{config.id_field}` contains "
             f"{duplicate_count} duplicate value(s)"
         )
-    return record_ids, list(values)
+    return _LLMInputPlan(
+        current_ids=current_ids,
+        work_count=work_count,
+        skipped=skipped,
+    )
 
 
 def _existing_llm_id_values(
@@ -105,14 +176,66 @@ def _existing_llm_id_values(
     *,
     id_field: str,
 ) -> dict[str, Any]:
-    existing = adapter.read_table(table)
-    if id_field not in existing.columns:
+    # Probe without opening an unconsumed DuckDB Arrow reader; rows then stream
+    # as the one narrow column deletion reconciliation actually needs (#424).
+    if id_field not in adapter.read_table(table, limit=0).columns:
         return {}
     mapping: dict[str, Any] = {}
-    for value in existing[id_field].to_list():
-        if value is not None:
-            mapping.setdefault(str(value), value)
+    with adapter.table_snapshot(
+        table,
+        columns=[id_field],
+        batch_size=_ID_BATCH_ROWS,
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            for value in frame[id_field].to_list():
+                if value is not None:
+                    mapping.setdefault(str(value), value)
     return mapping
+
+
+def _iter_llm_work_windows(
+    adapter: WarehouseAdapter,
+    table: str,
+    *,
+    config: LLMTransformConfig,
+    processed_state: dict[str, StateValue],
+    code_version: str,
+) -> Iterator[list[_LLMWork]]:
+    """Stream changed inputs into flush-sized work windows."""
+    window: list[_LLMWork] = []
+    with adapter.table_snapshot(
+        table,
+        columns=[config.id_field, config.input_field],
+        batch_size=_INPUT_BATCH_ROWS,
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            for record in frame.iter_rows(named=True):
+                id_value = record[config.id_field]
+                record_id = str(id_value)
+                content, input_fingerprint = _llm_content_fingerprint(
+                    record[config.input_field]
+                )
+                if processed_state.get(record_id) == StateValue(
+                    input_fingerprint, code_version
+                ):
+                    continue
+                window.append(
+                    _LLMWork(
+                        record_id=record_id,
+                        id_value=id_value,
+                        input_fingerprint=input_fingerprint,
+                        content=content,
+                    )
+                )
+                if len(window) >= config.flush_every:
+                    yield window
+                    window = []
+    if window:
+        yield window
 
 
 def _llm_output_schema(
@@ -223,17 +346,25 @@ def run_llm_model(
             "`depends_on:`"
         )
     upstream = parse_ref(model.depends_on[0])
-    source = adapter.read_table(upstream)
-    missing = sorted({config.id_field, config.input_field} - set(source.columns))
+    # Contract-only probe. Both input passes below project the two columns they
+    # need and consume bounded Arrow batches instead of materializing the
+    # upstream relation (#424).
+    schema_probe = adapter.read_table(upstream, limit=0)
+    missing = sorted(
+        {config.id_field, config.input_field} - set(schema_probe.columns)
+    )
     if missing:
         raise RunError(
             f"llm model '{model.name}': upstream '{upstream}' is missing required "
-            f"column(s): {', '.join(missing)}. Available: {sorted(source.columns)}"
+            f"column(s): {', '.join(missing)}. Available: "
+            f"{sorted(schema_probe.columns)}"
         )
     generated = set(_LLM_METADATA_COLUMNS) | {field.name for field in model.fields}
     if config.output_cardinality == "many":
         generated |= {config.row_id_field, config.ordinal_field}
-    collisions = sorted(column for column in source.columns if column in generated)
+    collisions = sorted(
+        column for column in schema_probe.columns if column in generated
+    )
     if collisions:
         raise RunError(
             f"llm model '{model.name}': upstream '{upstream}' already contains "
@@ -251,7 +382,6 @@ def run_llm_model(
     except LLMMapError as e:
         raise RunError(f"llm model '{model.name}': {e}") from e
 
-    record_ids, id_values = _llm_record_ids(source, config.id_field, model.name)
     code_version = compute_model_code_version(
         model,
         project,
@@ -268,43 +398,26 @@ def run_llm_model(
         if is_incremental and not rebuild_target
         else {}
     )
+    input_plan = _stream_llm_input_plan(
+        adapter,
+        upstream,
+        config=config,
+        model_name=model.name,
+        processed_state=processed_state,
+        code_version=code_version,
+    )
     existing_id_values = (
         _existing_llm_id_values(adapter, model.name, id_field=config.id_field)
         if is_incremental and not rebuild_target
         else {}
     )
 
-    current_ids = set(record_ids)
-    removed = sorted(set(processed_state) - current_ids)
+    removed = sorted(set(processed_state) - input_plan.current_ids)
     removed_id_values = [
         existing_id_values[record_id]
         for record_id in removed
         if record_id in existing_id_values
     ]
-
-    work: list[_LLMWork] = []
-    skipped = 0
-    for record_id, id_value, record in zip(
-        record_ids, id_values, source.iter_rows(named=True), strict=True
-    ):
-        content_value = record[config.input_field]
-        content = "" if content_value is None else str(content_value)
-        input_fingerprint = canonical_fingerprint(
-            {"content": content},
-            domain="llm-input-content",
-            version=1,
-        )
-        if processed_state.get(record_id) == StateValue(input_fingerprint, code_version):
-            skipped += 1
-            continue
-        work.append(
-            _LLMWork(
-                record_id=record_id,
-                id_value=id_value,
-                input_fingerprint=input_fingerprint,
-                content=content,
-            )
-        )
 
     budget_guard: BudgetGuard | None = None
     if run_budget is not None:
@@ -344,7 +457,7 @@ def run_llm_model(
         else config.id_field
     )
     use_full = model.materialization == "full" or full_refresh or rebuild_target
-    output_schema = _llm_output_schema(model, config, source)
+    output_schema = _llm_output_schema(model, config, schema_probe)
     publisher = FlushPublisher(
         adapter,
         model_name=model.name,
@@ -425,14 +538,28 @@ def run_llm_model(
         )
 
     try:
-        if work and budget_guard is not None:
-            budget_guard.charge_documents(len(work))
-        flush_every = config.flush_every
+        if input_plan.work_count and budget_guard is not None:
+            # Preserve the native llm contract: an over-cap corpus is rejected
+            # before any provider call or partial publication. The projected
+            # planning pass above makes that possible without retaining work.
+            budget_guard.charge_documents(input_plan.work_count)
         # One bar across every window, counted in records: the windows are a
         # memory bound (issue #401), not something the operator tracks.
-        with get_reporter().model_task(model.name, "llm", len(work)) as task:
-            for offset in range(0, len(work), flush_every):
-                window = work[offset : offset + flush_every]
+        with get_reporter().model_task(
+            model.name, "llm", input_plan.work_count
+        ) as task:
+            windows = (
+                _iter_llm_work_windows(
+                    adapter,
+                    upstream,
+                    config=config,
+                    processed_state=processed_state,
+                    code_version=code_version,
+                )
+                if input_plan.work_count
+                else ()
+            )
+            for window in windows:
                 max_workers = max(1, min(config.max_concurrent, len(window)))
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max_workers
@@ -446,6 +573,7 @@ def run_llm_model(
                 # Release this window's completions before the next one runs.
                 for item in window:
                     item.rows = []
+                window.clear()
     except BudgetExceededError as e:
         # Exhaustion fires before the next provider call. Windows already
         # published stay, with their state advanced; the partial window in
@@ -456,6 +584,8 @@ def run_llm_model(
         errors.append(f"BudgetExceededError: {e}")
     except RunError:
         raise
+    except AdapterError as e:
+        raise RunError(str(e)) from e
     except Exception as e:
         raise RunError(
             f"llm model '{model.name}' provider execution failed: "
@@ -490,7 +620,7 @@ def run_llm_model(
         "api_calls": usage_totals.get("api_calls", 0),
         "cache_hits": usage_totals.get("cache_hits", 0),
         "rows_generated": rows_generated,
-        "inputs_processed": len(work),
+        "inputs_processed": input_plan.work_count,
         **usage_totals,
     }
     return ModelRunResult(
@@ -503,8 +633,8 @@ def run_llm_model(
         provider_implementation=runtime.implementation,
         prompt_name=runtime.prompt_name,
         prompt_version=runtime.prompt_version,
-        documents_processed=len(work),
-        documents_skipped=skipped,
+        documents_processed=input_plan.work_count,
+        documents_skipped=input_plan.skipped,
         documents_deleted=len(removed),
         rows_written=publisher.rows_written,
         errors=errors,

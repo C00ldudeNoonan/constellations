@@ -1,6 +1,6 @@
 """The bounded-memory contract, and the audit that keeps it honest (issue #414).
 
-One root cause has now produced four incidents on the same corpus: a stage
+One root cause has repeatedly produced incidents on the same corpus: a stage
 holds something proportional to the corpus rather than to its flush window.
 Transforms (#383/#385), embed output (#401/#402), the embed resume lookup
 (#407), embed input (#410), and BigQuery's snapshot key check (#418) were each
@@ -56,6 +56,7 @@ import pytest
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.execution import transform as transform_module
 from stel.execution.embed import _INPUT_BATCH_ROWS
+from stel.execution.llm import _INPUT_BATCH_ROWS as _LLM_INPUT_BATCH_ROWS
 from stel.runner import run_project
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "stel"
@@ -115,17 +116,17 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         "execution/llm.py",
         "run_llm_model",
         1,
-        GAP,
-        "issue #424: reads the whole upstream into one frame before the first "
-        "provider call — the #410 hole, unfixed for llm",
+        BOUNDED,
+        "a zero-row probe for the column contract; projected input rows stream "
+        "in fixed-size batches and only one flush window is retained (#424)",
     ),
     (
         "execution/llm.py",
         "_existing_llm_id_values",
         1,
-        GAP,
-        "issue #424: reads the entire existing target, generated text columns "
-        "included, to build a map of id values — the #407 hole, unfixed for llm",
+        BOUNDED,
+        "a zero-row probe for the target id contract; the typed id column "
+        "streams projected without generated text columns (#424)",
     ),
     (
         "classic_ml/classifier.py",
@@ -285,21 +286,19 @@ def test_the_unbounded_list_only_shrinks() -> None:
     """The gaps are tracked, and no new one may be added silently.
 
     Per #414: the list of stages that do not yet hold the contract may only
-    shrink. Fixing #423 or #424 means deleting its row, not editing this
-    number down after the fact.
+    shrink. A fixed call site may remain in the audit when its `read_table`
+    becomes a bounded schema probe, but it must be reclassified with the
+    bounded row path named explicitly.
     """
     gaps = sorted(
         f"{module}::{qualname}"
         for module, qualname, _count, verdict, _why in _READ_TABLE_SITES
         if verdict == GAP
     )
-    assert gaps == [
-        "execution/llm.py::_existing_llm_id_values",
-        "execution/llm.py::run_llm_model",
-    ], (
+    assert gaps == [], (
         "The set of stages known to break the bounded-memory contract changed. "
-        "Removing one is the goal — delete its row. Adding one needs an issue "
-        "and a line here saying why it shipped unbounded."
+        "Removing one is the goal. Adding one needs an issue and a line here "
+        "saying why it shipped unbounded."
     )
 
 
@@ -433,6 +432,14 @@ def _embed_project(root: Path, *, docs: int) -> Path:
         "      text_field: text\n      id_field: chunk_id\n"
         "      vector_field: embedding\n      dimensions: 4\n      batch_size: 8\n"
         f"      flush_every: {_FLUSH_EVERY}\n"
+        "    materialization: incremental\n"
+        "  - name: document_facts\n"
+        "    depends_on: [ref('document_registry')]\n"
+        "    llm:\n      input_field: body\n      prompt: classify\n"
+        "      provider: deterministic\n      model: contract-v1\n"
+        "      id_field: document_id\n"
+        f"      flush_every: {_FLUSH_EVERY}\n"
+        "    fields:\n      - {name: sentiment, type: string}\n"
         "    materialization: incremental\n",
         encoding="utf-8",
     )
@@ -525,6 +532,48 @@ def test_embed_residency_is_capped_by_a_constant_not_the_corpus(
     assert resident <= _INPUT_BATCH_ROWS, (
         f"embed held {resident} rows at once, above the {_INPUT_BATCH_ROWS}-row "
         "read batch that is supposed to cap it (issue #414)."
+    )
+
+
+def test_llm_never_materializes_the_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #424: neither the input nor generated target is a whole frame.
+
+    The second run is deliberately unchanged. It still has to reconcile every
+    input id and existing target id, but it should make no provider calls and
+    should read both relations through projected, bounded snapshots.
+    """
+    project = _embed_project(tmp_path, docs=_CORPUS_DOCS)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_facts")
+
+    with _measure_residency(monkeypatch) as seen:
+        [result] = run_project(project, select="document_facts")
+
+    assert result.metrics["provider_calls"] == 0
+    assert seen.largest_frame_rows == 0, (
+        f"llm materialized a {seen.largest_frame_rows}-row frame via "
+        f"{seen.largest_frame_source}. Its only whole-relation reads should "
+        "be zero-row schema probes; input and target rows must stream (#424)."
+    )
+    assert seen.largest_batch_rows > 0, "the streamed reads did not run at all"
+
+
+def test_llm_residency_is_capped_by_a_constant_not_the_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _embed_project(tmp_path, docs=_CORPUS_DOCS)
+    run_project(project, select="document_registry")
+
+    with _measure_residency(monkeypatch) as seen:
+        run_project(project, select="document_facts")
+
+    resident = max(seen.largest_frame_rows, seen.largest_batch_rows)
+    assert resident <= _LLM_INPUT_BATCH_ROWS, (
+        f"llm held {resident} rows at once, above the "
+        f"{_LLM_INPUT_BATCH_ROWS}-row read batch that is supposed to cap it "
+        "(issue #424)."
     )
 
 

@@ -1042,10 +1042,9 @@ Notes and boundaries:
 - **Run count and overlap stay project responsibilities.** For **extraction**
   models, `flush_every` (default 5000) splits a run into flush-sized batches and
   `publish_every` (default 1, issue #293) coalesces that many flushes per `MERGE`,
-  so together they govern how many MERGEs an extraction run issues; other
-  incremental kinds (`embed`, `llm`, SQL transforms) publish their whole output in
-  a single `MERGE` per run, and `chunk` models fully replace, so neither applies
-  to them. Neither clustering nor
+  so together they govern how many MERGEs an extraction run issues. Other model
+  kinds use their own checkpoint cadence and do not read `publish_every`. Neither
+  clustering nor
   `update_when_changed` coordinates overlapping orchestrator runs against the
   same target. The publication telemetry from issue #292 (`-v` /
   `STEL_VERBOSE`) surfaces each MERGE's job id and bytes processed so you can
@@ -1507,6 +1506,18 @@ flight is re-called:
     flush_every: 500
   materialization: incremental
 ```
+
+Input memory is bounded independently of corpus size. Native llm models take
+their schema from a zero-row probe, stream only the id and input columns to
+validate ids and classify changed records before provider spend, then stream
+those columns again to fill one `flush_every` work window at a time. On an
+incremental resume, the existing generated target is projected to its id
+column and streamed in fixed-size batches; generated text is never loaded just
+to reconcile deletions (issue #424).
+
+The preliminary classification scan is intentional. It preserves the
+`max_documents` contract that an over-cap run stops before its first provider
+call or publication, while still avoiding a corpus-sized list of input text.
 
 For `output_cardinality: many` each window publishes through
 `replace_children` scoped to that window's parents, so a later window never

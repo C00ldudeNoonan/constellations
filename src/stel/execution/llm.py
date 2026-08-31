@@ -323,11 +323,11 @@ def run_llm_model(
     provider_calls = 0
 
     def _one(item: _LLMWork) -> _LLMWork:
-        if budget_guard is not None:
-            budget_guard.ensure_headroom()
-        rows, usage = execute_map_item(item.content, runtime)
-        if budget_guard is not None:
-            budget_guard.charge_metrics(usage)
+        rows, usage = execute_map_item(
+            item.content,
+            runtime,
+            budget=budget_guard,
+        )
         with usage_lock:
             nonlocal provider_calls
             provider_calls += 1

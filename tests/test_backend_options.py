@@ -19,6 +19,7 @@ from stel.backends import (
     register_backend_option_contract,
     validate_backend_options,
 )
+from stel.budget import BudgetExceededError, BudgetGuard, BudgetLedger, LLMBudgetConfig
 from stel.cli import cli
 from stel.credentials import CredentialReference
 
@@ -37,6 +38,34 @@ def test_shipped_backends_expose_distinct_implementation_identities() -> None:
 
     assert len(identities) == len(list_backends())
     assert all(identity.startswith("stel/") for identity in identities)
+
+
+def test_default_budget_hook_preserves_legacy_backend_accounting(tmp_path: Path) -> None:
+    calls = 0
+
+    class LegacyBackend(BaseBackend):
+        def name(self) -> str:
+            return "legacy-budget-test"
+
+        def supported_formats(self) -> list[str]:
+            return [".txt"]
+
+        def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+            del path, options
+            nonlocal calls
+            calls += 1
+            return ExtractionResult({}, metrics={"api_calls": 1, "input_tokens": 2})
+
+    ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="run")
+    guard = BudgetGuard(None, ledger)
+    backend = LegacyBackend()
+
+    backend.extract_with_budget(tmp_path / "unused.txt", {}, budget=guard)
+    with pytest.raises(BudgetExceededError):
+        backend.extract_with_budget(tmp_path / "unused.txt", {}, budget=guard)
+
+    assert calls == 1
+    assert ledger.snapshot()["input_tokens"] == 2
 
 
 def test_implementation_identity_excludes_the_release(

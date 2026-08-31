@@ -78,7 +78,7 @@ def test_build_fields_spec_maps_types() -> None:
 
 def test_execute_map_item_cardinality_one() -> None:
     runtime = _runtime(output_cardinality="one")
-    rows, usage = execute_map_item("doc1", runtime)
+    rows, usage = execute_map_item("doc1", runtime, budget=None)
     assert rows == [{"label": "doc1-one", "score": 7}]
     assert usage["api_calls"] == 1
     assert usage["input_tokens"] == 3
@@ -86,7 +86,7 @@ def test_execute_map_item_cardinality_one() -> None:
 
 def test_execute_map_item_cardinality_many_fans_out() -> None:
     runtime = _runtime(output_cardinality="many")
-    rows, _usage = execute_map_item("doc1", runtime)
+    rows, _usage = execute_map_item("doc1", runtime, budget=None)
     assert rows == [
         {"label": "doc1-a", "score": 1},
         {"label": "doc1-b", "score": 2},
@@ -103,7 +103,7 @@ def test_execute_map_item_projects_to_declared_fields() -> None:
         model="fake-small",
     )
     runtime = resolve_llm_runtime(config, fields, resolved=None)
-    rows, _usage = execute_map_item("doc1", runtime)
+    rows, _usage = execute_map_item("doc1", runtime, budget=None)
     assert rows == [{"label": "doc1-one", "score": 7, "missing": None}]
 
 

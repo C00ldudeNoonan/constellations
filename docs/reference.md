@@ -327,6 +327,16 @@ budget stops the model with the distinct `budget_exceeded` status: `full`
 materializations publish nothing, and incremental runs keep only chunks that
 already committed with their state. Token and spend caps are measured from
 responses, so the stopping call may overshoot the cap by at most one response.
+Native `llm:` workers reserve uncached calls before submitting them, so
+`max_concurrent` cannot multiply an API-call cap. When an input-token,
+output-token, or spend cap is active, provider admission on that ledger is
+serialized until the preceding response is charged; ledgers without those caps
+keep their configured concurrency. Admission belongs to the ledger, so the
+run-scope cap coordinates every model and provider stage sharing it, including
+LLM extraction, native batches, embeddings, LLM checks, and model-assertion
+relations. A run-wide API cap therefore cannot admit one extra call per model,
+and a response-measured cap overshoots by at most one response across the whole
+run. Cache hits consume no call budget.
 
 The built-in `vllm` provider supports local, Docker, Kubernetes, and remote
 OpenAI-compatible endpoints. See the [vLLM provider guide](vllm.md) for

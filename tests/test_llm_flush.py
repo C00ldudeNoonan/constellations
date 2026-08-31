@@ -10,6 +10,7 @@ accurate about the mechanism and expensive about the consequence.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,16 +23,33 @@ from stel.runner import run_project
 INPUTS = 7
 
 
-def _project(tmp_path: Path, *, flush_every: int, cardinality: str = "one") -> Path:
+def _project(
+    tmp_path: Path,
+    *,
+    flush_every: int,
+    cardinality: str = "one",
+    max_concurrent: int = 1,
+    max_api_calls: int | None = None,
+) -> Path:
     project = tmp_path / "project"
     project.mkdir(parents=True)
     (project / "stel_project.yml").write_text(
         "name: p\nversion: '0.1.0'\nprofile: p\n", encoding="utf-8"
     )
+    budget = (
+        "      llm:\n"
+        "        provider: deterministic\n"
+        "        model: m\n"
+        "        budget:\n"
+        f"          max_api_calls: {max_api_calls}\n"
+        if max_api_calls is not None
+        else ""
+    )
     (project / "profiles.yml").write_text(
         "p:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
         "        type: duckdb\n        path: ./target/db.duckdb\n"
-        "        schema: docs\n",
+        "        schema: docs\n"
+        f"{budget}",
         encoding="utf-8",
     )
     (project / "sources").mkdir()
@@ -50,7 +68,7 @@ def _project(tmp_path: Path, *, flush_every: int, cardinality: str = "one") -> P
         "    llm:\n      input_field: body\n      prompt: p\n"
         "      provider: deterministic\n      model: m\n"
         "      id_field: document_id\n"
-        "      max_concurrent: 1\n"
+        f"      max_concurrent: {max_concurrent}\n"
         f"      flush_every: {flush_every}\n"
         f"      output_cardinality: {cardinality}\n"
         "    fields:\n      - {name: sentiment, type: string}\n"
@@ -125,6 +143,45 @@ def test_the_rerun_only_pays_for_what_was_lost(
 
     assert resumed.metrics["provider_calls"] == INPUTS - 4
     assert _fact_count(project) == INPUTS
+
+
+def test_concurrent_llm_rows_do_not_overrun_the_call_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wire the atomic reservation through the native llm executor itself.
+
+    The barrier makes all four workers finish the old check-before-call before
+    any can report usage. Without reservation all four provider calls run
+    against a cap of one; with it, exactly one reaches the provider.
+    """
+    import stel.execution.llm as llm_module
+
+    project = _project(
+        tmp_path,
+        flush_every=4,
+        max_concurrent=4,
+        max_api_calls=1,
+    )
+    run_project(project, select="registry")
+    original = llm_module.execute_map_item
+    start = threading.Barrier(4, timeout=10)
+
+    def coordinated(
+        content: str,
+        runtime: Any,
+        *,
+        budget: Any = None,
+    ) -> Any:
+        start.wait()
+        return original(content, runtime, budget=budget)
+
+    monkeypatch.setattr(llm_module, "execute_map_item", coordinated)
+
+    [result] = run_project(project, select="facts")
+
+    assert result.status == "budget_exceeded"
+    assert result.metrics["provider_calls"] == 1
+    assert result.metrics["api_calls"] == 1
 
 
 def test_whole_corpus_completes(tmp_path: Path) -> None:

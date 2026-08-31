@@ -204,13 +204,11 @@ class _ProviderRelationInference:
             kwargs["cache_path"] = self._cache_path
         if self._timeout_seconds is not None:
             kwargs["timeout_seconds"] = self._timeout_seconds
-        if self._guard.active:
-            self._guard.ensure_headroom()
-        output, usage = extract_fields_with_usage(
-            _relation_inference_content(pairs, options), **kwargs
+        output, _usage = extract_fields_with_usage(
+            _relation_inference_content(pairs, options),
+            **kwargs,
+            budget=self._guard if self._guard.active else None,
         )
-        if self._guard.active:
-            self._guard.charge_metrics(usage)
         items = output.get("items")
         if not isinstance(items, list):
             # A missing/malformed `items` is a provider-response error, not "no

@@ -8,7 +8,7 @@ import stat
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -177,6 +177,15 @@ class LLMBackend(BaseBackend):
         return [".txt", ".md"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        return self.extract_with_budget(path, options, budget=None)
+
+    def extract_with_budget(
+        self,
+        path: Path,
+        options: dict[str, Any],
+        *,
+        budget: BudgetGuard | None,
+    ) -> ExtractionResult:
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
@@ -220,6 +229,7 @@ class LLMBackend(BaseBackend):
             max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
             max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
             max_concurrent=int(options.get("max_concurrent", _DEFAULT_MAX_CONCURRENT)),
+            budget=budget,
         )
         return ExtractionResult(fields=fields, metrics=usage)
 
@@ -320,8 +330,6 @@ class LLMBackend(BaseBackend):
             nonlocal pending
             if not pending:
                 return
-            if budget is not None:
-                budget.ensure_headroom(next_calls=len(pending))
             requests = [
                 BatchInferenceRequest(
                     f"req-{j}",
@@ -344,50 +352,58 @@ class LLMBackend(BaseBackend):
                 max_tokens=max_tokens,
                 cache_keys=[cache_key for *_rest, cache_key in pending],
             )
-            batch_result, resumed = _run_message_batch(
-                requests,
-                provider=provider_name,
-                poll_seconds=poll_seconds,
-                api_key_env=api_key_env,
-                max_retries=max_retries,
-                poll_max_seconds=poll_max_seconds,
-                batch_timeout_seconds=timeout_seconds,
-                base_url=base_url,
-                request_timeout_seconds=request_timeout_seconds,
-                cache_path=cache_path_obj,
-                job_key=job_key,
-                provider_options=provider_options,
+            admission = (
+                budget.provider_calls(len(pending))
+                if budget is not None
+                else nullcontext(None)
             )
-            batch_metrics["batch_submissions"] += batch_result.batch_submissions
-            batch_metrics["batches_resumed"] += 1 if resumed else 0
-            batch_metrics["batches_completed"] += 1
-            items = {item.request_id: item for item in batch_result.items}
-            for j, (i, _, content_hash, cache_key) in enumerate(pending):
-                resolved = self._resolve_batch_item(
-                    items.get(f"req-{j}"),
+            with admission as reservation:
+                batch_result, resumed = _run_message_batch(
+                    requests,
+                    provider=provider_name,
+                    poll_seconds=poll_seconds,
+                    api_key_env=api_key_env,
+                    max_retries=max_retries,
+                    poll_max_seconds=poll_max_seconds,
+                    batch_timeout_seconds=timeout_seconds,
+                    base_url=base_url,
+                    request_timeout_seconds=request_timeout_seconds,
                     cache_path=cache_path_obj,
-                    cache_key=cache_key,
-                    model=model,
-                    content_hash=content_hash,
-                    schema_hash=schema_hash,
-                    provider_name=provider_name,
-                    provider_identity=provider_identity,
+                    job_key=job_key,
+                    provider_options=provider_options,
                 )
-                if budget is not None and isinstance(resolved, ExtractionResult):
-                    budget.charge_metrics(resolved.metrics)
-                elif isinstance(resolved, ProviderError) and resolved.failure is not None:
-                    # Billed failures consume budget and are reported like
-                    # billed successes (issue #71).
-                    failure = resolved.failure
-                    billed = {
-                        "api_calls": failure.billed_requests,
-                        **failure.usage.to_metrics(),
-                    }
-                    for key, value in billed.items():
-                        failed_totals[key] = failed_totals.get(key, 0) + value
-                    if budget is not None:
-                        budget.charge_metrics(billed)
-                by_index[i] = resolved
+                batch_metrics["batch_submissions"] += batch_result.batch_submissions
+                batch_metrics["batches_resumed"] += 1 if resumed else 0
+                batch_metrics["batches_completed"] += 1
+                items = {item.request_id: item for item in batch_result.items}
+                partition_metrics: list[Mapping[str, Any]] = []
+                for j, (i, _, content_hash, cache_key) in enumerate(pending):
+                    resolved = self._resolve_batch_item(
+                        items.get(f"req-{j}"),
+                        cache_path=cache_path_obj,
+                        cache_key=cache_key,
+                        model=model,
+                        content_hash=content_hash,
+                        schema_hash=schema_hash,
+                        provider_name=provider_name,
+                        provider_identity=provider_identity,
+                    )
+                    if isinstance(resolved, ExtractionResult):
+                        partition_metrics.append(resolved.metrics)
+                    elif isinstance(resolved, ProviderError) and resolved.failure is not None:
+                        # Billed failures consume budget and are reported like
+                        # billed successes (issue #71).
+                        failure = resolved.failure
+                        billed = {
+                            "api_calls": failure.billed_requests,
+                            **failure.usage.to_metrics(),
+                        }
+                        partition_metrics.append(billed)
+                        for key, value in billed.items():
+                            failed_totals[key] = failed_totals.get(key, 0) + value
+                    by_index[i] = resolved
+                if reservation is not None:
+                    reservation.settle_many(partition_metrics)
             pending = []
 
         def _flush_and_record() -> None:
@@ -567,6 +583,7 @@ def extract_fields_with_usage(
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     provider_options: Mapping[str, Any] | None = None,
     output_cardinality: str = "one",
+    budget: BudgetGuard | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
@@ -575,14 +592,19 @@ def extract_fields_with_usage(
 
     This is the shared structured-completion core (issue #144): both the
     document-oriented ``backend: llm`` extraction path (via
-    :meth:`LLMBackend.extract`) and native ``llm:`` map models (via
+    :meth:`LLMBackend.extract_with_budget`) and native ``llm:`` map models (via
     :func:`stel.llm_map.execute_map_item`) route through it, so provider
     resolution, caching, retries, and usage accounting exist in one place.
 
     `output_cardinality` (issue #144) controls the requested output shape:
     ``one`` returns a single object; ``many`` returns ``{"items": [...]}`` for
     the caller to unwrap. The default preserves the single-object extraction
-    contract and its cache keys unchanged."""
+    contract and its cache keys unchanged.
+
+    When `budget` is present, a cache miss reserves the provider call before
+    submitting it and settles measured usage before another response-capped
+    call can be admitted. Cache hits return before admission and remain free.
+    """
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )
@@ -643,35 +665,39 @@ def extract_fields_with_usage(
             provider_options=provider_options,
             output_cardinality=output_cardinality,
         )
-    with _gate(max_concurrent):
-        raw = fn(
-            text,
-            resolved_model,
-            system,
-            fields_spec,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_retries=max_retries,
-        )
+    admission = budget.provider_call() if budget is not None else nullcontext(None)
+    with admission as reservation:
+        with _gate(max_concurrent):
+            raw = fn(
+                text,
+                resolved_model,
+                system,
+                fields_spec,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
 
-    # Injected test fakes may still return bare fields (the pre-#75 contract);
-    # the real call returns (fields, usage).
-    if isinstance(raw, tuple):
-        result_fields, call_usage = raw
-    else:
-        result_fields, call_usage = raw, {}
-    if not isinstance(result_fields, dict):
-        raise ProviderResponseError(
-            "provider structured output must be a mapping",
-            safe_for_display=True,
-        )
-    normalized_usage = ProviderUsage.from_mapping(call_usage).to_metrics()
-    usage = {
-        "api_calls": 1,
-        "cache_hits": 0,
-        **_ZERO_USAGE,
-        **normalized_usage,
-    }
+        # Injected test fakes may still return bare fields (the pre-#75 contract);
+        # the real call returns (fields, usage).
+        if isinstance(raw, tuple):
+            result_fields, call_usage = raw
+        else:
+            result_fields, call_usage = raw, {}
+        if not isinstance(result_fields, dict):
+            raise ProviderResponseError(
+                "provider structured output must be a mapping",
+                safe_for_display=True,
+            )
+        normalized_usage = ProviderUsage.from_mapping(call_usage).to_metrics()
+        usage = {
+            "api_calls": 1,
+            "cache_hits": 0,
+            **_ZERO_USAGE,
+            **normalized_usage,
+        }
+        if reservation is not None:
+            reservation.settle(usage)
 
     if cache_path_obj is not None:
         _cache_put(

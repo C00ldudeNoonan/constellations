@@ -52,6 +52,27 @@ class BaseBackend(ABC):
     @abstractmethod
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult: ...
 
+    def extract_with_budget(
+        self,
+        path: Path,
+        options: dict[str, Any],
+        *,
+        budget: BudgetGuard | None,
+    ) -> ExtractionResult:
+        """Extract one document with an optional provider-budget boundary.
+
+        The default preserves the historical check-before-extract and
+        charge-after-extract behavior for third-party backends. Provider-backed
+        implementations override this so cache lookup can happen before atomic
+        call admission.
+        """
+        if budget is not None:
+            budget.ensure_headroom()
+        result = self.extract(path, options)
+        if budget is not None:
+            budget.charge_metrics(result.metrics)
+        return result
+
     def parse_options(self, options: dict[str, Any]) -> dict[str, Any]:
         """Validate this backend's options and return their canonical form."""
         from .options import validate_backend_options

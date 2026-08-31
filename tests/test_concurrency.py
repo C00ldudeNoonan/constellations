@@ -32,6 +32,7 @@ import polars as pl
 import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
+from stel.budget import LLMBudgetConfig
 from stel.runner import _SerializedAdapter
 
 
@@ -334,6 +335,156 @@ def test_a_call_cap_is_not_overrun_by_concurrent_batches() -> None:
     assert refused == 3
 
 
+@pytest.mark.parametrize(
+    ("config", "usage"),
+    [
+        (LLMBudgetConfig(max_input_tokens=1), {"input_tokens": 1}),
+        (LLMBudgetConfig(max_output_tokens=1), {"output_tokens": 1}),
+        (LLMBudgetConfig(max_cost_usd=0.1), {"reported_cost_usd": 0.1}),
+    ],
+)
+def test_response_measured_caps_admit_at_most_one_overrunning_call(
+    config: LLMBudgetConfig,
+    usage: dict[str, int | float],
+) -> None:
+    """Concurrent rows must preserve the documented one-response overrun.
+
+    Calls cannot reserve tokens or spend before the provider reports them. The
+    guard therefore serializes admission only while one of those caps is
+    active, charges the response before releasing the next waiter, and refuses
+    every waiter once the first response reaches the cap.
+    """
+    from stel.budget import (
+        BudgetExceededError,
+        BudgetGuard,
+        BudgetLedger,
+    )
+
+    guard = BudgetGuard(BudgetLedger(config, scope="model"), None)
+    admitted = 0
+    refused = 0
+    lock = threading.Lock()
+    start = threading.Barrier(4, timeout=10)
+
+    def worker() -> None:
+        nonlocal admitted, refused
+        start.wait()
+        try:
+            with guard.provider_call() as reservation:
+                with lock:
+                    admitted += 1
+                reservation.settle({"api_calls": 1, **usage})
+        except BudgetExceededError:
+            with lock:
+                refused += 1
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert admitted == 1
+    assert refused == 3
+
+
+def test_shared_run_call_cap_is_atomic_across_model_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run ledger, not either model guard, owns cross-model admission."""
+    from stel.budget import BudgetExceededError, BudgetGuard, BudgetLedger
+
+    run_ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="run")
+    guards = [BudgetGuard(None, run_ledger) for _ in range(4)]
+    original_check = run_ledger.ensure_headroom
+    checked = 0
+    checked_lock = threading.Lock()
+    concurrent_checks = threading.Event()
+    start = threading.Barrier(4, timeout=10)
+    admitted = 0
+    refused = 0
+    result_lock = threading.Lock()
+
+    def coordinated_check(*, next_calls: int = 1) -> None:
+        nonlocal checked
+        original_check(next_calls=next_calls)
+        with checked_lock:
+            checked += 1
+            if checked > 1:
+                concurrent_checks.set()
+        concurrent_checks.wait(timeout=1)
+
+    monkeypatch.setattr(run_ledger, "ensure_headroom", coordinated_check)
+
+    def worker(guard: BudgetGuard) -> None:
+        nonlocal admitted, refused
+        start.wait()
+        try:
+            with guard.provider_call() as reservation:
+                reservation.settle({"api_calls": 1})
+            with result_lock:
+                admitted += 1
+        except BudgetExceededError:
+            with result_lock:
+                refused += 1
+
+    threads = [threading.Thread(target=worker, args=(guard,)) for guard in guards]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads), "budget admission deadlocked"
+    assert admitted == 1
+    assert refused == 3
+    assert run_ledger.snapshot()["api_calls"] == 1
+
+
+def test_shared_response_cap_serializes_different_model_guards() -> None:
+    """The shared run lock stays held until the admitted response is charged."""
+    from stel.budget import BudgetExceededError, BudgetGuard, BudgetLedger
+
+    run_ledger = BudgetLedger(LLMBudgetConfig(max_input_tokens=1), scope="run")
+    guards = [
+        BudgetGuard(
+            BudgetLedger(LLMBudgetConfig(max_api_calls=10), scope=f"model {index}"),
+            run_ledger,
+        )
+        for index in range(2)
+    ]
+    entered = 0
+    refused = 0
+    lock = threading.Lock()
+    concurrent_entries = threading.Event()
+    start = threading.Barrier(2, timeout=10)
+
+    def worker(guard: BudgetGuard) -> None:
+        nonlocal entered, refused
+        start.wait()
+        try:
+            with guard.provider_call() as reservation:
+                with lock:
+                    entered += 1
+                    if entered > 1:
+                        concurrent_entries.set()
+                concurrent_entries.wait(timeout=1)
+                reservation.settle({"api_calls": 1, "input_tokens": 1})
+        except BudgetExceededError:
+            with lock:
+                refused += 1
+
+    threads = [threading.Thread(target=worker, args=(guard,)) for guard in guards]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads), "ledger lock ordering deadlocked"
+    assert entered == 1
+    assert refused == 1
+    assert run_ledger.snapshot()["input_tokens"] == 1
+
+
 def test_settling_charges_only_what_the_provider_billed_beyond_the_reservation() -> None:
     """A fan-out larger than estimated still lands on the ledger, and an
     over-estimate is left conservative rather than refunded — failing safe."""
@@ -349,3 +500,37 @@ def test_settling_charges_only_what_the_provider_billed_beyond_the_reservation()
     guard.reserve_calls(4)
     guard.settle_calls(reserved=4, actual=1)
     assert ledger.snapshot()["api_calls"] == 9, "an over-estimate must not refund"
+
+
+def test_batch_settlement_preserves_each_response_cost_source() -> None:
+    """One reported cost must not suppress estimates for sibling responses."""
+    from stel.budget import BudgetGuard, BudgetLedger, LLMBudgetConfig
+
+    estimated_inputs: list[int] = []
+    ledger = BudgetLedger(LLMBudgetConfig(max_cost_usd=1.0), scope="run")
+    guard = BudgetGuard(
+        None,
+        ledger,
+        cost_estimator=lambda metrics: estimated_inputs.append(
+            int(metrics["input_tokens"])
+        )
+        or 0.2,
+    )
+
+    with guard.provider_calls(2) as reservation:
+        reservation.settle_many(
+            (
+                {"api_calls": 1, "input_tokens": 10, "reported_cost_usd": 0.1},
+                {"api_calls": 1, "input_tokens": 20},
+            )
+        )
+
+    assert estimated_inputs == [20]
+    assert ledger.snapshot() == {
+        "documents": 0,
+        "total_bytes": 0,
+        "api_calls": 2,
+        "input_tokens": 30,
+        "output_tokens": 0,
+        "cost_usd": 0.3,
+    }

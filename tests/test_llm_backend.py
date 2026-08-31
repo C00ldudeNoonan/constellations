@@ -721,6 +721,83 @@ def test_extract_with_usage_cache_hit_is_zero_tokens(tmp_path: Path) -> None:
     }
 
 
+def test_cached_response_does_not_consume_reserved_call_budget(tmp_path: Path) -> None:
+    """Budget admission belongs after cache lookup: a cache hit costs no call."""
+    from stel.backends.llm_backend import extract_fields_with_usage
+    from stel.budget import BudgetGuard, BudgetLedger, LLMBudgetConfig
+
+    calls = 0
+
+    def fake(
+        content: str,
+        model: str,
+        system: str,
+        fields_spec: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        del content, model, system, fields_spec, kwargs
+        nonlocal calls
+        calls += 1
+        return {"x": 1}, {"input_tokens": 3, "output_tokens": 2}
+
+    ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="run")
+    guard = BudgetGuard(None, ledger)
+    kwargs: dict[str, Any] = {
+        "fields_spec": [{"name": "x"}],
+        "call_api": fake,
+        "cache_path": tmp_path / "cache.duckdb",
+        "budget": guard,
+    }
+
+    _, first_usage = extract_fields_with_usage("same text", **kwargs)
+    _, cached_usage = extract_fields_with_usage("same text", **kwargs)
+
+    assert first_usage["api_calls"] == 1
+    assert cached_usage["api_calls"] == 0
+    assert calls == 1
+    assert ledger.snapshot()["api_calls"] == 1
+
+
+def test_failed_provider_call_keeps_its_reservation_without_masking_error() -> None:
+    """A failed submission may have billed, so its reservation fails safe."""
+    from stel.backends.llm_backend import extract_fields_with_usage
+    from stel.budget import (
+        BudgetExceededError,
+        BudgetGuard,
+        BudgetLedger,
+        LLMBudgetConfig,
+    )
+
+    calls = 0
+
+    def failing(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider failed")
+
+    ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="run")
+    guard = BudgetGuard(None, ledger)
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        extract_fields_with_usage(
+            "first",
+            fields_spec=[{"name": "x"}],
+            call_api=failing,
+            budget=guard,
+        )
+
+    assert ledger.snapshot()["api_calls"] == 1
+    with pytest.raises(BudgetExceededError, match="max_api_calls"):
+        extract_fields_with_usage(
+            "second",
+            fields_spec=[{"name": "x"}],
+            call_api=failing,
+            budget=guard,
+        )
+    assert calls == 1
+
+
 def test_extract_with_usage_accepts_bare_dict_fake() -> None:
     """Injected call_api fns predating #75 return fields only — still valid."""
     from stel.backends.llm_backend import extract_fields_with_usage

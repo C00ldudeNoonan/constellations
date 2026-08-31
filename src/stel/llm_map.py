@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .backends.llm_backend import extract_fields_with_usage
+from .budget import BudgetGuard
 from .config.model import FieldConfig, LLMTransformConfig
 from .config.profile import DEFAULT_LLM_PROVIDER
 from .credentials import CredentialReference
@@ -289,6 +290,8 @@ def _project_object(obj: Mapping[str, Any], field_names: Sequence[str]) -> dict[
 def execute_map_item(
     content: str,
     runtime: LLMMapRuntime,
+    *,
+    budget: BudgetGuard | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run one input row through the provider and return its projected output rows.
 
@@ -315,7 +318,7 @@ def execute_map_item(
     if runtime.timeout_seconds is not None:
         kwargs["timeout_seconds"] = runtime.timeout_seconds
 
-    output, usage = extract_fields_with_usage(content, **kwargs)
+    output, usage = extract_fields_with_usage(content, budget=budget, **kwargs)
 
     if runtime.output_cardinality == "one":
         objects: list[Mapping[str, Any]] = [output]

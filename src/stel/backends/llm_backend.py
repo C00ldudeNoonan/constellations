@@ -8,7 +8,7 @@ import stat
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -567,6 +567,7 @@ def extract_fields_with_usage(
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     provider_options: Mapping[str, Any] | None = None,
     output_cardinality: str = "one",
+    budget: BudgetGuard | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Like `extract_fields_from_text`, but also returns usage accounting
     (issue #75): api_calls, cache_hits, and token counts for the call. A cache
@@ -582,7 +583,12 @@ def extract_fields_with_usage(
     `output_cardinality` (issue #144) controls the requested output shape:
     ``one`` returns a single object; ``many`` returns ``{"items": [...]}`` for
     the caller to unwrap. The default preserves the single-object extraction
-    contract and its cache keys unchanged."""
+    contract and its cache keys unchanged.
+
+    When `budget` is present, a cache miss reserves the provider call before
+    submitting it and settles measured usage before another response-capped
+    call can be admitted. Cache hits return before admission and remain free.
+    """
     api_key_env, credential_reference_is_valid = _protect_credential_selector(
         api_key_env
     )
@@ -643,35 +649,39 @@ def extract_fields_with_usage(
             provider_options=provider_options,
             output_cardinality=output_cardinality,
         )
-    with _gate(max_concurrent):
-        raw = fn(
-            text,
-            resolved_model,
-            system,
-            fields_spec,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_retries=max_retries,
-        )
+    admission = budget.provider_call() if budget is not None else nullcontext(None)
+    with admission as reservation:
+        with _gate(max_concurrent):
+            raw = fn(
+                text,
+                resolved_model,
+                system,
+                fields_spec,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
 
-    # Injected test fakes may still return bare fields (the pre-#75 contract);
-    # the real call returns (fields, usage).
-    if isinstance(raw, tuple):
-        result_fields, call_usage = raw
-    else:
-        result_fields, call_usage = raw, {}
-    if not isinstance(result_fields, dict):
-        raise ProviderResponseError(
-            "provider structured output must be a mapping",
-            safe_for_display=True,
-        )
-    normalized_usage = ProviderUsage.from_mapping(call_usage).to_metrics()
-    usage = {
-        "api_calls": 1,
-        "cache_hits": 0,
-        **_ZERO_USAGE,
-        **normalized_usage,
-    }
+        # Injected test fakes may still return bare fields (the pre-#75 contract);
+        # the real call returns (fields, usage).
+        if isinstance(raw, tuple):
+            result_fields, call_usage = raw
+        else:
+            result_fields, call_usage = raw, {}
+        if not isinstance(result_fields, dict):
+            raise ProviderResponseError(
+                "provider structured output must be a mapping",
+                safe_for_display=True,
+            )
+        normalized_usage = ProviderUsage.from_mapping(call_usage).to_metrics()
+        usage = {
+            "api_calls": 1,
+            "cache_hits": 0,
+            **_ZERO_USAGE,
+            **normalized_usage,
+        }
+        if reservation is not None:
+            reservation.settle(usage)
 
     if cache_path_obj is not None:
         _cache_put(

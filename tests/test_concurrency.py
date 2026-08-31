@@ -32,6 +32,7 @@ import polars as pl
 import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
+from stel.budget import LLMBudgetConfig
 from stel.runner import _SerializedAdapter
 
 
@@ -331,6 +332,59 @@ def test_a_call_cap_is_not_overrun_by_concurrent_batches() -> None:
         f"{admitted} workers were admitted against max_api_calls=1; a spending "
         "cap that admits more than it allows is not a cap"
     )
+    assert refused == 3
+
+
+@pytest.mark.parametrize(
+    ("config", "usage"),
+    [
+        (LLMBudgetConfig(max_input_tokens=1), {"input_tokens": 1}),
+        (LLMBudgetConfig(max_output_tokens=1), {"output_tokens": 1}),
+        (LLMBudgetConfig(max_cost_usd=0.1), {"reported_cost_usd": 0.1}),
+    ],
+)
+def test_response_measured_caps_admit_at_most_one_overrunning_call(
+    config: LLMBudgetConfig,
+    usage: dict[str, int | float],
+) -> None:
+    """Concurrent rows must preserve the documented one-response overrun.
+
+    Calls cannot reserve tokens or spend before the provider reports them. The
+    guard therefore serializes admission only while one of those caps is
+    active, charges the response before releasing the next waiter, and refuses
+    every waiter once the first response reaches the cap.
+    """
+    from stel.budget import (
+        BudgetExceededError,
+        BudgetGuard,
+        BudgetLedger,
+    )
+
+    guard = BudgetGuard(BudgetLedger(config, scope="model"), None)
+    admitted = 0
+    refused = 0
+    lock = threading.Lock()
+    start = threading.Barrier(4, timeout=10)
+
+    def worker() -> None:
+        nonlocal admitted, refused
+        start.wait()
+        try:
+            with guard.provider_call() as reservation:
+                with lock:
+                    admitted += 1
+                reservation.settle({"api_calls": 1, **usage})
+        except BudgetExceededError:
+            with lock:
+                refused += 1
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert admitted == 1
     assert refused == 3
 
 

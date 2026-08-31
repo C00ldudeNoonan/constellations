@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -72,6 +73,19 @@ class BudgetLedger:
     @property
     def scope(self) -> str:
         return self._scope
+
+    @property
+    def has_response_measured_caps(self) -> bool:
+        """Whether admission must wait for the preceding response's usage."""
+        config = self._config
+        return any(
+            cap is not None
+            for cap in (
+                config.max_input_tokens,
+                config.max_output_tokens,
+                config.max_cost_usd,
+            )
+        )
 
     def charge_documents(self, count: int) -> None:
         cap = self._config.max_documents
@@ -168,6 +182,24 @@ class BudgetLedger:
             }
 
 
+class _ProviderCallReservation:
+    """One pre-charged provider call whose measured usage is not settled yet."""
+
+    def __init__(self, guard: BudgetGuard) -> None:
+        self._guard = guard
+        self._settled = False
+
+    @property
+    def settled(self) -> bool:
+        return self._settled
+
+    def settle(self, metrics: Mapping[str, Any]) -> None:
+        if self._settled:
+            raise RuntimeError("provider-call budget reservation was settled twice")
+        self._guard._charge_reserved_metrics(metrics, reserved_calls=1)
+        self._settled = True
+
+
 class BudgetGuard:
     """Model-scope plus optional run-scope ledgers checked as one unit.
 
@@ -189,6 +221,9 @@ class BudgetGuard:
         # Makes admission-plus-reservation one step across both ledgers; see
         # `reserve_calls`.
         self._admission = threading.Lock()
+        self._serialize_response_admission = any(
+            ledger.has_response_measured_caps for ledger in self._ledgers
+        )
 
     @property
     def active(self) -> bool:
@@ -233,6 +268,43 @@ class BudgetGuard:
             self.ensure_headroom(next_calls=count)
             self.charge_usage(api_calls=count)
 
+    @contextmanager
+    def provider_call(self) -> Iterator[_ProviderCallReservation]:
+        """Reserve one real provider call and settle its response atomically.
+
+        API-call caps can reserve a known unit and release admission immediately,
+        preserving concurrency. Token and spend caps are only known from the
+        response, so their admission lock stays held until usage is settled; this
+        preserves the documented one-response overrun instead of admitting one
+        overrunning response per worker.
+
+        Call this only after a cache miss. A cache hit has no provider call and
+        must consume no call budget.
+        """
+
+        def _admit() -> _ProviderCallReservation:
+            self.ensure_headroom()
+            self.charge_usage(api_calls=1)
+            return _ProviderCallReservation(self)
+
+        if self._serialize_response_admission:
+            with self._admission:
+                reservation = _admit()
+                yield reservation
+                if not reservation.settled:
+                    raise RuntimeError(
+                        "successful provider call did not settle its budget reservation"
+                    )
+            return
+
+        self.reserve_calls(1)
+        reservation = _ProviderCallReservation(self)
+        yield reservation
+        if not reservation.settled:
+            raise RuntimeError(
+                "successful provider call did not settle its budget reservation"
+            )
+
     def settle_calls(self, *, reserved: int, actual: int) -> None:
         """Charge whatever the provider billed beyond the reservation.
 
@@ -264,12 +336,6 @@ class BudgetGuard:
         Provider-reported spend wins over the runner-supplied estimator.
         """
 
-        def _int(key: str) -> int:
-            value = metrics.get(key, 0)
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                return 0
-            return max(int(value), 0)
-
         cost = metrics.get("reported_cost_usd")
         if (
             isinstance(cost, bool)
@@ -283,8 +349,29 @@ class BudgetGuard:
                 else 0.0
             )
         self.charge_usage(
-            api_calls=_int("api_calls"),
-            input_tokens=_int("input_tokens"),
-            output_tokens=_int("output_tokens"),
+            api_calls=self._metric_int(metrics, "api_calls"),
+            input_tokens=self._metric_int(metrics, "input_tokens"),
+            output_tokens=self._metric_int(metrics, "output_tokens"),
             cost_usd=float(cost),
+        )
+
+    @staticmethod
+    def _metric_int(metrics: Mapping[str, Any], key: str) -> int:
+        value = metrics.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return 0
+        return max(int(value), 0)
+
+    def _charge_reserved_metrics(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        reserved_calls: int,
+    ) -> None:
+        self.charge_metrics(
+            {key: value for key, value in metrics.items() if key != "api_calls"}
+        )
+        self.settle_calls(
+            reserved=reserved_calls,
+            actual=self._metric_int(metrics, "api_calls"),
         )

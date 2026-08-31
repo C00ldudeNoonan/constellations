@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Concurrent llm rows no longer multiply execution-budget caps (issue #435)
+
+Native `llm:` workers used a check-then-act sequence: check the shared ledger,
+call the provider, then charge usage. With `max_concurrent: 8`, every worker
+could pass the same pre-call check and a `max_api_calls: 1` policy could submit
+eight calls.
+
+Budget admission now happens at the real provider-call boundary, after cache
+lookup. An uncached call is reserved before submission and its reported API
+count is settled without double-charging; cache hits still consume zero calls.
+Input-token, output-token, and spend caps cannot reserve an unknown response,
+so admission within that model is serialized only while one of those caps is
+configured, preserving the documented one-response overrun. Models without a
+response-measured cap retain their configured concurrency.
+
+The run ledger is still wrapped by one guard per model. Concurrent models can
+therefore each admit one call against a shared run cap; moving admission
+ownership onto the shared ledger remains separate work, as recorded in #435.
+
 ### BigQuery embed resumes no longer collide with their own flushes (issue #436)
 
 An incremental `embed:` run reads reuse candidates from its own target between

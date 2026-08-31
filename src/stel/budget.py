@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -54,15 +54,19 @@ class BudgetLedger:
     """Thread-safe accumulator enforcing one LLMBudgetConfig.
 
     Callers precheck statically knowable limits (documents, file size,
-    request bytes) before doing work, and charge measured usage (calls,
-    tokens, cost) after each provider response. `ensure_headroom()` gates
-    the next provider call on the accumulated totals.
+    request bytes) before doing work. Provider calls are reserved at admission;
+    tokens and cost are charged from each response before another call can use
+    a response-measured cap on this ledger.
     """
 
     def __init__(self, config: LLMBudgetConfig, *, scope: str) -> None:
         self._config = config
         self._scope = scope
         self._lock = threading.Lock()
+        # Shared by every guard that wraps this ledger. The totals lock makes
+        # individual operations thread-safe; this one makes check-plus-charge
+        # admission atomic across models.
+        self._admission = threading.Lock()
         self._documents = 0
         self._total_bytes = 0
         self._api_calls = 0
@@ -185,18 +189,44 @@ class BudgetLedger:
 class _ProviderCallReservation:
     """One pre-charged provider call whose measured usage is not settled yet."""
 
-    def __init__(self, guard: BudgetGuard) -> None:
+    def __init__(self, guard: BudgetGuard, *, reserved_calls: int) -> None:
         self._guard = guard
+        self._reserved_calls = reserved_calls
         self._settled = False
 
     @property
     def settled(self) -> bool:
         return self._settled
 
-    def settle(self, metrics: Mapping[str, Any]) -> None:
+    def settle(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        actual_calls: int | None = None,
+    ) -> None:
+        self.settle_many((metrics,), actual_calls=actual_calls)
+
+    def settle_many(
+        self,
+        metrics: Iterable[Mapping[str, Any]],
+        *,
+        actual_calls: int | None = None,
+    ) -> None:
+        """Settle several responses without collapsing their cost semantics."""
         if self._settled:
             raise RuntimeError("provider-call budget reservation was settled twice")
-        self._guard._charge_reserved_metrics(metrics, reserved_calls=1)
+        measured_calls = 0
+        for item in metrics:
+            measured_calls += self._guard._metric_int(item, "api_calls")
+            self._guard.charge_metrics(
+                {key: value for key, value in item.items() if key != "api_calls"}
+            )
+        if actual_calls is None:
+            actual_calls = measured_calls
+        self._guard.settle_calls(
+            reserved=self._reserved_calls,
+            actual=max(actual_calls, 0),
+        )
         self._settled = True
 
 
@@ -214,16 +244,14 @@ class BudgetGuard:
         *,
         cost_estimator: Callable[[Mapping[str, Any]], float] | None = None,
     ) -> None:
-        self._ledgers = [
-            ledger for ledger in (model_ledger, run_ledger) if ledger is not None
-        ]
+        self._ledgers: list[BudgetLedger] = []
+        for ledger in (model_ledger, run_ledger):
+            if ledger is not None and all(existing is not ledger for existing in self._ledgers):
+                self._ledgers.append(ledger)
         self._cost_estimator = cost_estimator
-        # Makes admission-plus-reservation one step across both ledgers; see
-        # `reserve_calls`.
-        self._admission = threading.Lock()
-        self._serialize_response_admission = any(
-            ledger.has_response_measured_caps for ledger in self._ledgers
-        )
+        # Every guard lists model then run, but identity ordering also keeps
+        # lock acquisition safe if a future caller composes ledgers differently.
+        self._admission_ledgers = tuple(sorted(self._ledgers, key=id))
 
     @property
     def active(self) -> bool:
@@ -260,50 +288,76 @@ class BudgetGuard:
         `settle_calls` charges the difference once the provider says what it
         actually billed.
 
-        The lock is the guard's own, so it covers both ledgers together. It
-        does not extend across *models* sharing the run ledger — a smaller
-        overrun that predates this, tracked as issue #435.
+        Admission locks belong to ledgers, so separate model guards sharing a
+        run ledger cannot admit against the same pre-charge run total.
         """
-        with self._admission:
+        acquired = self._acquire_admission()
+        try:
             self.ensure_headroom(next_calls=count)
             self.charge_usage(api_calls=count)
+        finally:
+            self._release_admission(acquired)
 
     @contextmanager
     def provider_call(self) -> Iterator[_ProviderCallReservation]:
-        """Reserve one real provider call and settle its response atomically.
+        with self.provider_calls(1) as reservation:
+            yield reservation
 
-        API-call caps can reserve a known unit and release admission immediately,
-        preserving concurrency. Token and spend caps are only known from the
-        response, so their admission lock stays held until usage is settled; this
-        preserves the documented one-response overrun instead of admitting one
-        overrunning response per worker.
+    @contextmanager
+    def provider_calls(self, count: int) -> Iterator[_ProviderCallReservation]:
+        """Reserve real provider calls and settle their response atomically.
+
+        API-call caps reserve known units and release their ledger admission
+        locks immediately, preserving concurrency. Token and spend caps are
+        only known from the response, so only those ledgers stay locked until
+        usage is settled. A shared run ledger therefore coordinates every
+        model guard without unnecessarily serializing model-only caps.
 
         Call this only after a cache miss. A cache hit has no provider call and
         must consume no call budget.
         """
+        if count < 1:
+            raise ValueError("provider call reservation must be at least one")
 
-        def _admit() -> _ProviderCallReservation:
-            self.ensure_headroom()
-            self.charge_usage(api_calls=1)
-            return _ProviderCallReservation(self)
+        acquired = self._acquire_admission()
+        try:
+            self.ensure_headroom(next_calls=count)
+            self.charge_usage(api_calls=count)
+            response_ledgers = [
+                ledger for ledger in acquired if ledger.has_response_measured_caps
+            ]
+            for ledger in reversed(acquired):
+                if ledger not in response_ledgers:
+                    ledger._admission.release()
+            acquired = response_ledgers
 
-        if self._serialize_response_admission:
-            with self._admission:
-                reservation = _admit()
-                yield reservation
-                if not reservation.settled:
-                    raise RuntimeError(
-                        "successful provider call did not settle its budget reservation"
-                    )
-            return
-
-        self.reserve_calls(1)
-        reservation = _ProviderCallReservation(self)
-        yield reservation
-        if not reservation.settled:
-            raise RuntimeError(
-                "successful provider call did not settle its budget reservation"
+            reservation = _ProviderCallReservation(
+                self,
+                reserved_calls=count,
             )
+            yield reservation
+            if not reservation.settled:
+                raise RuntimeError(
+                    "successful provider call did not settle its budget reservation"
+                )
+        finally:
+            self._release_admission(acquired)
+
+    def _acquire_admission(self) -> list[BudgetLedger]:
+        acquired: list[BudgetLedger] = []
+        try:
+            for ledger in self._admission_ledgers:
+                ledger._admission.acquire()
+                acquired.append(ledger)
+        except BaseException:
+            self._release_admission(acquired)
+            raise
+        return acquired
+
+    @staticmethod
+    def _release_admission(ledgers: list[BudgetLedger]) -> None:
+        for ledger in reversed(ledgers):
+            ledger._admission.release()
 
     def settle_calls(self, *, reserved: int, actual: int) -> None:
         """Charge whatever the provider billed beyond the reservation.
@@ -361,17 +415,3 @@ class BudgetGuard:
         if isinstance(value, bool) or not isinstance(value, int | float):
             return 0
         return max(int(value), 0)
-
-    def _charge_reserved_metrics(
-        self,
-        metrics: Mapping[str, Any],
-        *,
-        reserved_calls: int,
-    ) -> None:
-        self.charge_metrics(
-            {key: value for key, value in metrics.items() if key != "api_calls"}
-        )
-        self.settle_calls(
-            reserved=reserved_calls,
-            actual=self._metric_int(metrics, "api_calls"),
-        )

@@ -530,20 +530,20 @@ def run_extraction_model(
             ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
                 local_path: Path | None = None
                 try:
-                    if budget_guard is not None:
-                        budget_guard.ensure_headroom()
                     local_path = source_backend.fetch(doc, work_dir)
                     if budget_guard is not None:
                         size = local_path.stat().st_size
                         budget_guard.check_file_bytes(size)
                         budget_guard.charge_bytes(size)
-                    result = backend.extract(local_path, options)
+                    result = backend.extract_with_budget(
+                        local_path,
+                        options,
+                        budget=budget_guard,
+                    )
                     if post_extract is not None:
                         result = post_extract.apply(
                             result, document=doc, local_path=local_path
                         )
-                    if budget_guard is not None:
-                        budget_guard.charge_metrics(result.metrics)
                     return doc, result, None
                 except BudgetExceededError:
                     raise

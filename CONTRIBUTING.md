@@ -40,6 +40,11 @@ repository-level `.github/workflows/` directory.
    `version()` to report that library's version and `parser_identity()` to
    return it as well — a library upgrade must re-key incremental extraction
    state, and stel's own source digests cannot see it (issue #363).
+   A provider-backed backend that participates in execution budgets must also
+   override `extract_with_budget(...)`, perform cache lookup before admission,
+   and reserve and settle each real provider call through the supplied guard.
+   The inherited method retains legacy check-and-charge accounting, but cannot
+   make cache-aware admission atomic around code it does not control.
 4. Register the import in `src/stel/backends/__init__.py` (the side-effect
    import is what triggers `@register`).
 5. Add a synth generator under `src/stel/synth/` if you want to support

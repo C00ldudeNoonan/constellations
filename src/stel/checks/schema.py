@@ -5,6 +5,7 @@ import json
 import math
 import re
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -1661,9 +1662,7 @@ def _llm_judge(
             else None
         )
         for text in sample:
-            if guard is not None:
-                guard.ensure_headroom()
-            output, usage = extract_fields_with_usage(
+            output, _usage = extract_fields_with_usage(
                 text,
                 fields_spec=fields_spec,
                 provider=llm.provider,
@@ -1674,9 +1673,8 @@ def _llm_judge(
                 timeout_seconds=llm.timeout_seconds,
                 provider_options=provider_options,
                 max_tokens=max_output_tokens,
+                budget=guard,
             )
-            if guard is not None:
-                guard.charge_metrics(usage)
             judged += 1
             if bool(output.get("passes")):
                 passed += 1
@@ -1885,30 +1883,30 @@ def _embedding_canary(
     # see (issue #305 review).
     guard = BudgetGuard(None, run_budget) if run_budget is not None else None
     try:
-        if guard is not None:
-            guard.charge_documents(len(rows))
-            guard.ensure_headroom(
-                next_calls=estimate_embed_requests(
-                    probe_texts,
-                    identity,
-                    profile_options=embedding_options.provider_options,
-                )
-            )
-        embedded = embed_texts(
+        reserved = estimate_embed_requests(
             probe_texts,
             identity,
-            credential_env=embedding_options.api_key_env,
             profile_options=embedding_options.provider_options,
-            max_retries=embed_config.max_retries,
-            timeout_seconds=embedding_options.timeout_seconds,
         )
         if guard is not None:
-            guard.charge_metrics(
-                {
-                    **embedded.usage.to_metrics(),
-                    "api_calls": embedded.provider_requests,
-                }
+            guard.charge_documents(len(rows))
+        admission = (
+            guard.provider_calls(reserved) if guard is not None else nullcontext(None)
+        )
+        with admission as reservation:
+            embedded = embed_texts(
+                probe_texts,
+                identity,
+                credential_env=embedding_options.api_key_env,
+                profile_options=embedding_options.provider_options,
+                max_retries=embed_config.max_retries,
+                timeout_seconds=embedding_options.timeout_seconds,
             )
+            if reservation is not None:
+                reservation.settle(
+                    embedded.usage.to_metrics(),
+                    actual_calls=embedded.provider_requests,
+                )
     except BudgetExceededError as error:
         return TestResult(
             test_name="embedding_canary",

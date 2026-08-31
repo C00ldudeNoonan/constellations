@@ -177,6 +177,15 @@ class LLMBackend(BaseBackend):
         return [".txt", ".md"]
 
     def extract(self, path: Path, options: dict[str, Any]) -> ExtractionResult:
+        return self.extract_with_budget(path, options, budget=None)
+
+    def extract_with_budget(
+        self,
+        path: Path,
+        options: dict[str, Any],
+        *,
+        budget: BudgetGuard | None,
+    ) -> ExtractionResult:
         options = self.parse_options(options)
         validate_llm_numeric_options(options)
         provider_name = str(options.get("provider", DEFAULT_LLM_PROVIDER))
@@ -220,6 +229,7 @@ class LLMBackend(BaseBackend):
             max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
             max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
             max_concurrent=int(options.get("max_concurrent", _DEFAULT_MAX_CONCURRENT)),
+            budget=budget,
         )
         return ExtractionResult(fields=fields, metrics=usage)
 
@@ -320,8 +330,6 @@ class LLMBackend(BaseBackend):
             nonlocal pending
             if not pending:
                 return
-            if budget is not None:
-                budget.ensure_headroom(next_calls=len(pending))
             requests = [
                 BatchInferenceRequest(
                     f"req-{j}",
@@ -344,50 +352,58 @@ class LLMBackend(BaseBackend):
                 max_tokens=max_tokens,
                 cache_keys=[cache_key for *_rest, cache_key in pending],
             )
-            batch_result, resumed = _run_message_batch(
-                requests,
-                provider=provider_name,
-                poll_seconds=poll_seconds,
-                api_key_env=api_key_env,
-                max_retries=max_retries,
-                poll_max_seconds=poll_max_seconds,
-                batch_timeout_seconds=timeout_seconds,
-                base_url=base_url,
-                request_timeout_seconds=request_timeout_seconds,
-                cache_path=cache_path_obj,
-                job_key=job_key,
-                provider_options=provider_options,
+            admission = (
+                budget.provider_calls(len(pending))
+                if budget is not None
+                else nullcontext(None)
             )
-            batch_metrics["batch_submissions"] += batch_result.batch_submissions
-            batch_metrics["batches_resumed"] += 1 if resumed else 0
-            batch_metrics["batches_completed"] += 1
-            items = {item.request_id: item for item in batch_result.items}
-            for j, (i, _, content_hash, cache_key) in enumerate(pending):
-                resolved = self._resolve_batch_item(
-                    items.get(f"req-{j}"),
+            with admission as reservation:
+                batch_result, resumed = _run_message_batch(
+                    requests,
+                    provider=provider_name,
+                    poll_seconds=poll_seconds,
+                    api_key_env=api_key_env,
+                    max_retries=max_retries,
+                    poll_max_seconds=poll_max_seconds,
+                    batch_timeout_seconds=timeout_seconds,
+                    base_url=base_url,
+                    request_timeout_seconds=request_timeout_seconds,
                     cache_path=cache_path_obj,
-                    cache_key=cache_key,
-                    model=model,
-                    content_hash=content_hash,
-                    schema_hash=schema_hash,
-                    provider_name=provider_name,
-                    provider_identity=provider_identity,
+                    job_key=job_key,
+                    provider_options=provider_options,
                 )
-                if budget is not None and isinstance(resolved, ExtractionResult):
-                    budget.charge_metrics(resolved.metrics)
-                elif isinstance(resolved, ProviderError) and resolved.failure is not None:
-                    # Billed failures consume budget and are reported like
-                    # billed successes (issue #71).
-                    failure = resolved.failure
-                    billed = {
-                        "api_calls": failure.billed_requests,
-                        **failure.usage.to_metrics(),
-                    }
-                    for key, value in billed.items():
-                        failed_totals[key] = failed_totals.get(key, 0) + value
-                    if budget is not None:
-                        budget.charge_metrics(billed)
-                by_index[i] = resolved
+                batch_metrics["batch_submissions"] += batch_result.batch_submissions
+                batch_metrics["batches_resumed"] += 1 if resumed else 0
+                batch_metrics["batches_completed"] += 1
+                items = {item.request_id: item for item in batch_result.items}
+                partition_metrics: list[Mapping[str, Any]] = []
+                for j, (i, _, content_hash, cache_key) in enumerate(pending):
+                    resolved = self._resolve_batch_item(
+                        items.get(f"req-{j}"),
+                        cache_path=cache_path_obj,
+                        cache_key=cache_key,
+                        model=model,
+                        content_hash=content_hash,
+                        schema_hash=schema_hash,
+                        provider_name=provider_name,
+                        provider_identity=provider_identity,
+                    )
+                    if isinstance(resolved, ExtractionResult):
+                        partition_metrics.append(resolved.metrics)
+                    elif isinstance(resolved, ProviderError) and resolved.failure is not None:
+                        # Billed failures consume budget and are reported like
+                        # billed successes (issue #71).
+                        failure = resolved.failure
+                        billed = {
+                            "api_calls": failure.billed_requests,
+                            **failure.usage.to_metrics(),
+                        }
+                        partition_metrics.append(billed)
+                        for key, value in billed.items():
+                            failed_totals[key] = failed_totals.get(key, 0) + value
+                    by_index[i] = resolved
+                if reservation is not None:
+                    reservation.settle_many(partition_metrics)
             pending = []
 
         def _flush_and_record() -> None:
@@ -576,7 +592,7 @@ def extract_fields_with_usage(
 
     This is the shared structured-completion core (issue #144): both the
     document-oriented ``backend: llm`` extraction path (via
-    :meth:`LLMBackend.extract`) and native ``llm:`` map models (via
+    :meth:`LLMBackend.extract_with_budget`) and native ``llm:`` map models (via
     :func:`stel.llm_map.execute_map_item`) route through it, so provider
     resolution, caching, retries, and usage accounting exist in one place.
 

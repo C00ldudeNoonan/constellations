@@ -3,13 +3,14 @@ from __future__ import annotations
 import shutil
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
 from pydantic import ValidationError
 
 from stel.adapters import parse_warehouse_config
-from stel.budget import BudgetExceededError, BudgetLedger, LLMBudgetConfig
+from stel.budget import BudgetExceededError, BudgetGuard, BudgetLedger, LLMBudgetConfig
 from stel.compiler import validate_project_contract
 from stel.config import load_project
 from stel.config.loader import ConfigError
@@ -658,10 +659,19 @@ def test_model_assertion_charges_and_enforces_run_budget(
 ) -> None:
     from stel.text.transforms import _relations
 
+    def fake(content: str, **kwargs: Any) -> tuple[dict[str, list[Any]], dict[str, int]]:
+        del content
+        guard = kwargs["budget"]
+        assert isinstance(guard, BudgetGuard)
+        with guard.provider_call() as reservation:
+            usage = {"api_calls": 1}
+            reservation.settle(usage)
+        return {"items": []}, usage
+
     monkeypatch.setattr(
         _relations,
         "extract_fields_with_usage",
-        lambda content, **kw: ({"items": []}, {"api_calls": 1}),
+        fake,
     )
     ledger = BudgetLedger(LLMBudgetConfig(max_api_calls=1), scope="run")
     infer = _relations._build_inference(_ma_ctx(run_budget=ledger))

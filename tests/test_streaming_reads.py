@@ -452,15 +452,24 @@ class _FakeBigQueryStorageClient:
         self.read_fails_with: str | None = None
         self.sessions: list[tuple[str, int]] = []
         self.streams: list[_FakeReadRowsStream] = []
+        self.session_parents: list[str] = []
+        self.timeouts: list[Any] = []
 
     def close(self) -> None:
         self.closed = True
 
     def create_read_session(
-        self, *, parent: str, read_session: Any, max_stream_count: int
+        self,
+        *,
+        parent: str,
+        read_session: Any,
+        max_stream_count: int,
+        timeout: Any = None,
     ) -> Any:
         assert parent.startswith("projects/")
         assert max_stream_count == 1
+        self.session_parents.append(parent)
+        self.timeouts.append(timeout)
         self.sessions.append((read_session.table, max_stream_count))
         table = self.payload
         assert table is not None
@@ -473,8 +482,9 @@ class _FakeBigQueryStorageClient:
             ),
         )
 
-    def read_rows(self, name: str) -> _FakeReadRowsStream:
+    def read_rows(self, name: str, timeout: Any = None) -> _FakeReadRowsStream:
         del name
+        self.timeouts.append(timeout)
         assert self.payload is not None
         stream = _FakeReadRowsStream(self.payload, fail_with=self.read_fails_with)
         self.streams.append(stream)

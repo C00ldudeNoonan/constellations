@@ -27,6 +27,14 @@ with these batches would make the positional projection select the wrong
 columns. Projection, predicate binding, key-domain validation, generation
 checks, typed empty results, and early cancellation are unchanged.
 
+The read session is opened under the query execution project, matching where
+the query client runs and bills and where the reference already tells
+operators to grant `bigquery.readsessions`; a split-project profile would
+otherwise need that role on the data project instead. `job_execution_timeout_seconds`
+reaches both the session creation and the row read, and additionally bounds
+the whole download — a per-call deadline alone would never trip on a stream
+that keeps delivering pages slowly.
+
 ## v0.15.1 - 2026-09-01
 
 ### BigQuery snapshots keep wide payloads off the REST result path (issue #441)

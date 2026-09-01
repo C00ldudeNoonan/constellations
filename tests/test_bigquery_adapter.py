@@ -134,6 +134,8 @@ class _FakeStorageReadClient:
         self.storage_order: list[str] | None = None
         self.sessions: list[tuple[str, int]] = []
         self.read_streams: list[str] = []
+        self.session_parents: list[str] = []
+        self.timeouts: list[Any] = []
 
     def close(self) -> None:
         pass
@@ -146,11 +148,18 @@ class _FakeStorageReadClient:
         return table.select(self.storage_order)
 
     def create_read_session(
-        self, *, parent: str, read_session: Any, max_stream_count: int
+        self,
+        *,
+        parent: str,
+        read_session: Any,
+        max_stream_count: int,
+        timeout: Any = None,
     ) -> Any:
         assert parent.startswith("projects/")
         # Bounded memory is part of the snapshot contract, not incidental.
         assert max_stream_count == 1
+        self.session_parents.append(parent)
+        self.timeouts.append(timeout)
         self.sessions.append((read_session.table, max_stream_count))
         table = self._served()
         return SimpleNamespace(
@@ -164,8 +173,9 @@ class _FakeStorageReadClient:
             ),
         )
 
-    def read_rows(self, name: str) -> Any:
+    def read_rows(self, name: str, timeout: Any = None) -> Any:
         self.read_streams.append(name)
+        self.timeouts.append(timeout)
         pages = [_FakeReadPage(batch) for batch in self._served().to_batches()]
         return SimpleNamespace(
             rows=lambda: SimpleNamespace(pages=iter(pages)),
@@ -4266,6 +4276,47 @@ def test_a_snapshot_projects_by_name_when_storage_reorders_columns() -> None:
     assert combined.column("document_id").to_pylist() == ["doc-1", "doc-2"]
     assert combined.column("chunk_id").to_pylist() == ["chunk-1", "chunk-2"]
     assert combined.column("embedding").to_pylist() == [[1.0], [2.0]]
+
+
+def test_a_read_session_is_billed_to_the_execution_project() -> None:
+    """Split-project profiles run and bill queries in execution_project, and
+    the reference tells operators to grant bigquery.readsessions there. A
+    session opened under the data project instead would demand IAM nobody was
+    told to grant, failing every snapshot (PR #444 review)."""
+    payload = pa.table({"chunk_id": ["a"]})
+    client = _FakeClient()
+    client.tables["data-proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["data-proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(
+        client, project="data-proj", execution_project="billing-proj"
+    )
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot("chunks") as snapshot:
+        list(snapshot)
+
+    assert adapter._bqstorage_client.session_parents == ["projects/billing-proj"]
+
+
+def test_the_configured_timeout_reaches_the_storage_read_calls() -> None:
+    """`job_execution_timeout_seconds` used to bound the download because it
+    was passed to the SDK's iterator. Reading the stream directly has to
+    thread it through both calls, or an operator's deadline silently stops
+    covering the part of the read that actually moves the data."""
+    payload = pa.table({"chunk_id": ["a"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client, job_execution_timeout_seconds=42)
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot("chunks") as snapshot:
+        list(snapshot)
+
+    # Both the session creation and the row read, not just one of them.
+    assert adapter._bqstorage_client.timeouts == [42, 42]
 
 
 def test_an_empty_snapshot_still_carries_its_typed_schema() -> None:

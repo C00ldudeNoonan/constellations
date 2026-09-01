@@ -925,19 +925,31 @@ def _read_session_arrow_schema(session: Any) -> pa.Schema:
 
 
 def _storage_read_batches(
-    read_client: Any, session: Any
+    read_client: Any, session: Any, *, timeout: float | None
 ) -> Iterator[pa.RecordBatch]:
     """Stream one read session's Arrow pages, one page held at a time.
 
     A session over an empty result has no streams at all; the typed schema
     still came from the session, so an empty snapshot stays typed.
+
+    `timeout` bounds the read RPC, and a deadline bounds the download that
+    follows it. The RPC timeout alone would not: a stream that keeps
+    delivering pages slowly never exceeds any single call's deadline, and
+    before this path existed the operator's configured timeout covered the
+    whole download.
     """
     streams = list(session.streams)
     if not streams:
         return
-    reader = read_client.read_rows(streams[0].name)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    reader = read_client.read_rows(streams[0].name, timeout=timeout)
     try:
         for page in reader.rows().pages:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise AdapterError(
+                    "BigQuery table snapshot stream did not complete within "
+                    f"{timeout}s"
+                )
             yield page.to_arrow()
     finally:
         cancel = getattr(reader, "cancel", None)
@@ -1237,8 +1249,14 @@ class BigQueryAdapter(WarehouseAdapter):
             f"projects/{destination.project}/datasets/{destination.dataset_id}"
             f"/tables/{destination.table_id}"
         )
+        cfg = self._cfg
         return self._ensure_bqstorage_client().create_read_session(
-            parent=f"projects/{self._cfg.project}",
+            # The session is billed to, and authorized against, the project
+            # the query client itself runs in -- which is execution_project
+            # when one is set, the data project otherwise. Naming the data
+            # project here would demand bigquery.readsessions on it, against
+            # the split-project IAM the reference documents.
+            parent=f"projects/{cfg.execution_project or cfg.project}",
             read_session=storage.types.ReadSession(
                 table=table_path,
                 data_format=storage.types.DataFormat.ARROW,
@@ -1247,6 +1265,7 @@ class BigQueryAdapter(WarehouseAdapter):
             # contract already promises: this payload is deliberately read
             # in bounded memory, not fanned out.
             max_stream_count=1,
+            timeout=cfg.job_execution_timeout_seconds,
         )
 
     def _connect(self) -> None:
@@ -1603,7 +1622,9 @@ class BigQueryAdapter(WarehouseAdapter):
                 [query_schema.field(index) for index in output_indices]
             )
             arrow_batches = _storage_read_batches(
-                self._ensure_bqstorage_client(), session
+                self._ensure_bqstorage_client(),
+                session,
+                timeout=self._cfg.job_execution_timeout_seconds,
             )
 
             def batches() -> Iterator[pa.RecordBatch]:

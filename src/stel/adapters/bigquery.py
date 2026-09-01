@@ -20,6 +20,7 @@ import io
 import logging
 import os
 import re
+import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
@@ -908,6 +909,54 @@ def _bigquery_read_predicates(
     return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
 
+def _read_session_arrow_schema(session: Any) -> pa.Schema:
+    """The Arrow schema the read session's own batches carry.
+
+    This must be the only source of the projected schema and of the
+    positional indices taken against it. The Storage Read API does not
+    promise the requested projection's column order, so pairing a schema
+    obtained anywhere else with these batches would make a positional
+    `select` quietly return the wrong columns -- right types, no error,
+    transposed values (issue #441).
+    """
+    return pa.ipc.read_schema(
+        pa.py_buffer(session.arrow_schema.serialized_schema)
+    )
+
+
+def _storage_read_batches(
+    read_client: Any, session: Any, *, timeout: float | None
+) -> Iterator[pa.RecordBatch]:
+    """Stream one read session's Arrow pages, one page held at a time.
+
+    A session over an empty result has no streams at all; the typed schema
+    still came from the session, so an empty snapshot stays typed.
+
+    `timeout` bounds the read RPC, and a deadline bounds the download that
+    follows it. The RPC timeout alone would not: a stream that keeps
+    delivering pages slowly never exceeds any single call's deadline, and
+    before this path existed the operator's configured timeout covered the
+    whole download.
+    """
+    streams = list(session.streams)
+    if not streams:
+        return
+    deadline = None if timeout is None else time.monotonic() + timeout
+    reader = read_client.read_rows(streams[0].name, timeout=timeout)
+    try:
+        for page in reader.rows().pages:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise AdapterError(
+                    "BigQuery table snapshot stream did not complete within "
+                    f"{timeout}s"
+                )
+            yield page.to_arrow()
+    finally:
+        cancel = getattr(reader, "cancel", None)
+        if callable(cancel):
+            cancel()
+
+
 def _bigquery_table_generation(table: Any) -> str:
     etag = getattr(table, "etag", None)
     modified = getattr(table, "modified", None)
@@ -1153,6 +1202,71 @@ class BigQueryAdapter(WarehouseAdapter):
                 credentials=self._credentials()
             )
         return self._bqstorage_client
+
+    def _await_query_destination(self, job: Any) -> Any:
+        """Wait for a query job, then hand back its destination table.
+
+        Deliberately not `job.result()`: that builds its row iterator through
+        jobs.getQueryResults, which rejects on the *underlying* result size
+        rather than on how many rows were asked for, so a wide projection
+        fails it before any row is read (issue #441). `job.done()` polls
+        jobs.get, which carries no result payload at all.
+
+        Bypassing `result()` also bypasses the exception it would have raised
+        for a failed query, so the job's own terminal error is re-raised here
+        -- only its BigQuery reason code, never the native message, which can
+        quote the SQL and its row values.
+        """
+        timeout = self._cfg.job_execution_timeout_seconds
+        deadline = None if timeout is None else time.monotonic() + timeout
+        delay = 0.5
+        while not job.done(timeout=timeout):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise AdapterError(
+                    "BigQuery table snapshot query did not complete within "
+                    f"{timeout}s"
+                )
+            time.sleep(delay if remaining is None else min(delay, remaining))
+            delay = min(delay * 2, 5.0)
+        error_result = getattr(job, "error_result", None)
+        if error_result:
+            reason = str(error_result.get("reason", "unknown"))
+            raise AdapterError(
+                f"BigQuery table snapshot query failed (reason: {reason})"
+            )
+        destination = getattr(job, "destination", None)
+        if destination is None:
+            raise AdapterError(
+                "BigQuery table snapshot query produced no destination table"
+            )
+        return destination
+
+    def _open_storage_read_session(self, destination: Any) -> Any:
+        """Create a single-stream Arrow read session over a finished table."""
+        storage = _bigquery_storage()
+        table_path = (
+            f"projects/{destination.project}/datasets/{destination.dataset_id}"
+            f"/tables/{destination.table_id}"
+        )
+        cfg = self._cfg
+        return self._ensure_bqstorage_client().create_read_session(
+            # The session is billed to, and authorized against, the project
+            # the query client itself runs in -- which is execution_project
+            # when one is set, the data project otherwise. Naming the data
+            # project here would demand bigquery.readsessions on it, against
+            # the split-project IAM the reference documents.
+            parent=f"projects/{cfg.execution_project or cfg.project}",
+            read_session=storage.types.ReadSession(
+                table=table_path,
+                data_format=storage.types.DataFormat.ARROW,
+            ),
+            # One stream, matching the one-queued-page bound the snapshot
+            # contract already promises: this payload is deliberately read
+            # in bounded memory, not fanned out.
+            max_stream_count=1,
+            timeout=cfg.job_execution_timeout_seconds,
+        )
 
     def _connect(self) -> None:
         self._client = self._make_client()
@@ -1447,7 +1561,6 @@ class BigQueryAdapter(WarehouseAdapter):
     def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
         arrow_batches: Iterator[pa.RecordBatch] | None = None
         params: list[Any] = []
-        rows: Any = None
         job: Any = None
         fully_consumed = False
         failure: AdapterError | None = None
@@ -1480,17 +1593,15 @@ class BigQueryAdapter(WarehouseAdapter):
             )
 
             job = self._start_query(sql, params, use_query_cache=False)
-            # max_results=0 asks jobs.getQueryResults for schema metadata
-            # without materializing even one wide payload row through REST.
-            # The earlier one-row probe failed once vectors plus text crossed
-            # the REST response-size boundary (issue #441).
-            schema_probe = job.to_arrow(
-                create_bqstorage_client=False,
-                max_results=0,
-                timeout=self._cfg.job_execution_timeout_seconds,
-            )
-            query_schema = schema_probe.schema
-            del schema_probe
+            # Nothing on this path may touch jobs.getQueryResults. That
+            # endpoint rejects on the *underlying* result size rather than on
+            # the number of rows requested, so a wide projection (a 768-float
+            # vector beside full chunk text) fails it at max_results=0 exactly
+            # as it did at max_results=1 -- both `job.result()` and
+            # `job.to_arrow()` go through it. The query is awaited via
+            # jobs.get instead, and its finished destination table is streamed
+            # through the Storage Read API (issue #441).
+            destination = self._await_query_destination(job)
             current_generation = _bigquery_table_generation(
                 self.client.get_table(table_id)
             )
@@ -1498,6 +1609,8 @@ class BigQueryAdapter(WarehouseAdapter):
                 raise TableSnapshotGenerationChangedError(
                     "BigQuery table changed while opening its snapshot"
                 )
+            session = self._open_storage_read_session(destination)
+            query_schema = _read_session_arrow_schema(session)
             output_indices = [
                 query_schema.get_field_index(name) for name in output_names
             ]
@@ -1508,14 +1621,9 @@ class BigQueryAdapter(WarehouseAdapter):
             output_schema = pa.schema(
                 [query_schema.field(index) for index in output_indices]
             )
-            rows = job.result(
-                page_size=request.batch_size,
-                timeout=self._cfg.job_execution_timeout_seconds,
-            )
-            arrow_batches = rows.to_arrow_iterable(
-                bqstorage_client=self._ensure_bqstorage_client(),
-                max_queue_size=1,
-                max_stream_count=1,
+            arrow_batches = _storage_read_batches(
+                self._ensure_bqstorage_client(),
+                session,
                 timeout=self._cfg.job_execution_timeout_seconds,
             )
 
@@ -1610,7 +1718,6 @@ class BigQueryAdapter(WarehouseAdapter):
             )
         except AdapterError:
             params.clear()
-            rows = None
             arrow_batches = None
             if job is not None:
                 try:
@@ -1621,7 +1728,6 @@ class BigQueryAdapter(WarehouseAdapter):
             raise
         except Exception as error:
             params.clear()
-            rows = None
             arrow_batches = None
             if job is not None:
                 try:

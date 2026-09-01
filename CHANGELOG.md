@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### BigQuery snapshots leave the REST result endpoint entirely (issue #441)
+
+v0.15.1 moved the snapshot's schema probe from one returned row to zero on the
+premise that requesting no rows would keep a wide payload out of the REST
+response. That premise was wrong: `jobs.getQueryResults` rejects on the size of
+the *underlying* result, not on the number of rows requested, so a relation
+projecting a 768-dimensional vector beside full chunk text failed identically
+at either value and `search:` models over such a relation still could not
+publish.
+
+Both remaining REST result paths are gone. The uncached query is awaited
+through the jobs API without fetching a result page, and its finished
+destination table is streamed through one BigQuery Storage Read session with
+one stream and one queued page. Bypassing the result iterator also bypassed the
+exception it raised for a failed query, so a job's terminal error is now
+re-raised directly, carrying its BigQuery reason code only — never the native
+message, which can quote the SQL and its row values.
+
+The typed Arrow schema and the projection's column positions are both taken
+from the read session itself. The Storage Read API does not return the
+requested projection's column order, so pairing a schema obtained anywhere else
+with these batches would make the positional projection select the wrong
+columns. Projection, predicate binding, key-domain validation, generation
+checks, typed empty results, and early cancellation are unchanged.
+
+The read session is opened under the query execution project, matching where
+the query client runs and bills and where the reference already tells
+operators to grant `bigquery.readsessions`; a split-project profile would
+otherwise need that role on the data project instead. `job_execution_timeout_seconds`
+reaches both the session creation and the row read, and additionally bounds
+the whole download — a per-call deadline alone would never trip on a stream
+that keeps delivering pages slowly.
+
 ## v0.15.1 - 2026-09-01
 
 ### BigQuery snapshots keep wide payloads off the REST result path (issue #441)

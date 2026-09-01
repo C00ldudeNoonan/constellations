@@ -1243,13 +1243,42 @@ class BigQueryAdapter(WarehouseAdapter):
         return destination
 
     def _open_storage_read_session(self, destination: Any) -> Any:
-        """Create a single-stream Arrow read session over a finished table."""
-        storage = _bigquery_storage()
+        """Create a single-stream Arrow read session over a finished job's
+        anonymous destination table."""
         table_path = (
             f"projects/{destination.project}/datasets/{destination.dataset_id}"
             f"/tables/{destination.table_id}"
         )
+        return self._create_read_session(table_path)
+
+    def _open_storage_read_session_for_table(
+        self, table_id: str, selected_fields: list[str]
+    ) -> Any:
+        """Read a table directly through the Storage Read API, no query job.
+
+        An unfiltered projection maps onto this API's own column selection
+        exactly, and skipping the query job means BigQuery never has to
+        materialize an anonymous destination table for the result at all --
+        which is what actually fails (`responseTooLarge`) on a projection
+        wide enough to trip it, upstream of either REST or Storage-API
+        result-reading path (issue #441).
+        """
+        project, dataset, table = table_id.split(".", 2)
+        table_path = f"projects/{project}/datasets/{dataset}/tables/{table}"
+        return self._create_read_session(table_path, selected_fields=selected_fields)
+
+    def _create_read_session(
+        self, table_path: str, *, selected_fields: list[str] | None = None
+    ) -> Any:
+        storage = _bigquery_storage()
         cfg = self._cfg
+        read_options = (
+            None
+            if selected_fields is None
+            else storage.types.ReadSession.TableReadOptions(
+                selected_fields=selected_fields
+            )
+        )
         return self._ensure_bqstorage_client().create_read_session(
             # The session is billed to, and authorized against, the project
             # the query client itself runs in -- which is execution_project
@@ -1260,6 +1289,7 @@ class BigQueryAdapter(WarehouseAdapter):
             read_session=storage.types.ReadSession(
                 table=table_path,
                 data_format=storage.types.DataFormat.ARROW,
+                read_options=read_options,
             ),
             # One stream, matching the one-queued-page bound the snapshot
             # contract already promises: this payload is deliberately read
@@ -1592,16 +1622,35 @@ class BigQueryAdapter(WarehouseAdapter):
                 f"{self.table_ref(request.table)}{where_sql}"
             )
 
-            job = self._start_query(sql, params, use_query_cache=False)
-            # Nothing on this path may touch jobs.getQueryResults. That
-            # endpoint rejects on the *underlying* result size rather than on
-            # the number of rows requested, so a wide projection (a 768-float
-            # vector beside full chunk text) fails it at max_results=0 exactly
-            # as it did at max_results=1 -- both `job.result()` and
-            # `job.to_arrow()` go through it. The query is awaited via
-            # jobs.get instead, and its finished destination table is streamed
-            # through the Storage Read API (issue #441).
-            destination = self._await_query_destination(job)
+            # An unfiltered, explicitly projected read never needs a query
+            # job at all: it maps directly onto the Storage Read API's own
+            # column selection. Going through a query here is what actually
+            # fails on a table this wide -- BigQuery has to materialize an
+            # anonymous destination table for the query result, and that
+            # materialization itself is rejected (`responseTooLarge`) before
+            # either REST or Storage-API result path is ever reached. No
+            # amount of changing how the result is *read* could have fixed
+            # that (issue #441); only not running the query does.
+            #
+            # Predicated reads keep the query path -- translating predicates
+            # into a Storage Read `row_restriction` was explicitly out of
+            # scope for this fix, and the failing shape in practice (a search
+            # publish reading its own embeddings table back) is unfiltered.
+            if not where_sql and request.columns is not None:
+                job = None
+                session = self._open_storage_read_session_for_table(
+                    table_id, list(request.columns)
+                )
+            else:
+                job = self._start_query(sql, params, use_query_cache=False)
+                # Nothing on this path may touch jobs.getQueryResults. That
+                # endpoint rejects on the *underlying* result size rather
+                # than on the number of rows requested, so a wide projection
+                # fails it at max_results=0 exactly as it did at
+                # max_results=1 -- both `job.result()` and `job.to_arrow()`
+                # go through it. The query is awaited via jobs.get instead.
+                destination = self._await_query_destination(job)
+                session = self._open_storage_read_session(destination)
             current_generation = _bigquery_table_generation(
                 self.client.get_table(table_id)
             )
@@ -1609,7 +1658,6 @@ class BigQueryAdapter(WarehouseAdapter):
                 raise TableSnapshotGenerationChangedError(
                     "BigQuery table changed while opening its snapshot"
                 )
-            session = self._open_storage_read_session(destination)
             query_schema = _read_session_arrow_schema(session)
             output_indices = [
                 query_schema.get_field_index(name) for name in output_names

@@ -896,6 +896,14 @@ while retaining stel's no-subprocess ADC loading on Windows.
 pip install 'stel[bigquery]'
 ```
 
+The extra includes both the BigQuery query client and the BigQuery Storage
+Read client. The Storage API is enabled with the BigQuery API, but the runtime
+principal needs roles/bigquery.readSessionUser (or equivalent
+bigquery.readsessions permissions) on the query execution project
+(execution_project when set, otherwise project), plus its existing table
+access on the data project. Bounded snapshot payloads use that API so wide
+vectors and document text do not pass through the REST result endpoint.
+
 ```yaml
 my_project:
   target: prod
@@ -1625,15 +1633,17 @@ with adapter.table_snapshot(
 
 DuckDB holds one MVCC read transaction through the context, derives a content
 generation fingerprint while consuming it, and performs a second bounded scan
-before successful close to reject a newer table version. BigQuery pages one
-uncached query result and rejects the read if the table generation changes
-while the snapshot is opened or consumed. A read that names a key column adds
-one further uncached aggregate over that column alone, ahead of the payload
-query, so the key check never makes BigQuery buffer the projection; it is
-cheap next to the payload, but it is a second job and normal query billing and
-the profile's `maximum_bytes_billed` limit apply to both. Both adapters push
-projection and predicates into the warehouse. Predicate values are bound
-parameters and redacted from diagnostics.
+before successful close to reject a newer table version. BigQuery asks the
+uncached query result for zero rows to establish its typed Arrow schema, then
+streams the payload through one BigQuery Storage Read stream with one queued
+page. It rejects the read if the table generation changes while the snapshot
+is opened or consumed. A read that names a key column adds one further
+uncached aggregate over that column alone, ahead of the payload query, so the
+key check never makes BigQuery buffer the projection; it is cheap next to the
+payload, but it is a second job and normal query billing and the profile's
+`maximum_bytes_billed` limit apply to both. Both adapters push projection
+and predicates into the warehouse. Predicate values are bound parameters and
+redacted from diagnostics.
 
 Batch ordering is deliberately unspecified. Consumers must use stable row keys
 and must keep the context open through their final snapshot validation. The

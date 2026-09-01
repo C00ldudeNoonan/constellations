@@ -118,6 +118,14 @@ def test_keyfile_absolutized_relative_to_project(tmp_path: Path) -> None:
 # ─── SQL dialect ────────────────────────────────────────────────────────────
 
 
+class _FakeStorageReadClient:
+    def __init__(self) -> None:
+        self.transport = self
+
+    def close(self) -> None:
+        pass
+
+
 def _adapter(client: Any = None, **cfg_extra: Any) -> BigQueryAdapter:
     cfg = parse_warehouse_config(
         {"type": "bigquery", "project": "proj", "dataset": "ds", **cfg_extra}
@@ -126,6 +134,7 @@ def _adapter(client: Any = None, **cfg_extra: Any) -> BigQueryAdapter:
     assert isinstance(adapter, BigQueryAdapter)
     if client is not None:
         adapter._client = client
+        adapter._bqstorage_client = _FakeStorageReadClient()
     return adapter
 
 
@@ -4013,14 +4022,20 @@ class _FakeSnapshotJob:
         self._table = table
         self.job_id = job_id
 
-    def to_arrow(self, **_kwargs: Any) -> pa.Table:
-        return self._table.slice(0, 1)
+    def to_arrow(self, **kwargs: Any) -> pa.Table:
+        assert kwargs["max_results"] == 0
+        return self._table.slice(0, 0)
 
     def result(self, **_kwargs: Any) -> Any:
         table = self._table
 
         class _Rows:
-            def to_arrow_iterable(self, **_inner: Any) -> Any:
+            def to_arrow_iterable(self, **kwargs: Any) -> Any:
+                assert isinstance(
+                    kwargs["bqstorage_client"], _FakeStorageReadClient
+                )
+                assert kwargs["max_queue_size"] == 1
+                assert kwargs["max_stream_count"] == 1
                 return iter(table.to_batches())
 
         return _Rows()

@@ -97,6 +97,10 @@ _INSTALL_HINT = (
     "BigQuery support requires google-cloud-bigquery. "
     "Install it with: pip install 'stel[bigquery]'"
 )
+_STORAGE_INSTALL_HINT = (
+    "BigQuery streaming reads require google-cloud-bigquery-storage. "
+    "Install it with: pip install 'stel[bigquery]'"
+)
 
 
 def _adc_file_path() -> Path | None:
@@ -211,6 +215,14 @@ def _bigquery() -> Any:
     except ImportError as e:
         raise AdapterError(_INSTALL_HINT) from e
     return bigquery
+
+
+def _bigquery_storage() -> Any:
+    try:
+        from google.cloud import bigquery_storage
+    except ImportError as e:
+        raise AdapterError(_STORAGE_INSTALL_HINT) from e
+    return bigquery_storage
 
 
 def _not_found_error() -> type[Exception]:
@@ -919,6 +931,7 @@ class BigQueryAdapter(WarehouseAdapter):
     ) -> None:
         super().__init__(config, project_dir=project_dir)
         self._client: Any = None
+        self._bqstorage_client: Any = None
 
     @classmethod
     def adapter_type(cls) -> str:
@@ -1133,13 +1146,28 @@ class BigQueryAdapter(WarehouseAdapter):
             default_query_job_config=self._default_job_config(),
         )
 
+    def _ensure_bqstorage_client(self) -> Any:
+        if self._bqstorage_client is None:
+            storage = _bigquery_storage()
+            self._bqstorage_client = storage.BigQueryReadClient(
+                credentials=self._credentials()
+            )
+        return self._bqstorage_client
+
     def _connect(self) -> None:
         self._client = self._make_client()
 
     def _close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        bqstorage_client = self._bqstorage_client
+        client = self._client
+        self._bqstorage_client = None
+        self._client = None
+        try:
+            if bqstorage_client is not None:
+                bqstorage_client.transport.close()
+        finally:
+            if client is not None:
+                client.close()
 
     def _ensure_schema(self) -> None:
         bigquery = _bigquery()
@@ -1452,9 +1480,13 @@ class BigQueryAdapter(WarehouseAdapter):
             )
 
             job = self._start_query(sql, params, use_query_cache=False)
+            # max_results=0 asks jobs.getQueryResults for schema metadata
+            # without materializing even one wide payload row through REST.
+            # The earlier one-row probe failed once vectors plus text crossed
+            # the REST response-size boundary (issue #441).
             schema_probe = job.to_arrow(
                 create_bqstorage_client=False,
-                max_results=1,
+                max_results=0,
                 timeout=self._cfg.job_execution_timeout_seconds,
             )
             query_schema = schema_probe.schema
@@ -1481,8 +1513,9 @@ class BigQueryAdapter(WarehouseAdapter):
                 timeout=self._cfg.job_execution_timeout_seconds,
             )
             arrow_batches = rows.to_arrow_iterable(
-                bqstorage_client=None,
+                bqstorage_client=self._ensure_bqstorage_client(),
                 max_queue_size=1,
+                max_stream_count=1,
                 timeout=self._cfg.job_execution_timeout_seconds,
             )
 
@@ -1596,8 +1629,11 @@ class BigQueryAdapter(WarehouseAdapter):
                 except Exception:
                     pass
             job = None
-            failure = AdapterError("BigQuery table snapshot could not be opened")
             failure_cause = sanitized_adapter_cause(error)
+            failure = AdapterError(
+                "BigQuery table snapshot could not be opened "
+                f"({failure_cause})"
+            )
         if failure is not None:
             assert failure_cause is not None
             raise failure from failure_cause

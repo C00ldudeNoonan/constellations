@@ -419,12 +419,25 @@ class _FakeBigQueryRows:
     def __init__(self, table: pa.Table, page_size: int) -> None:
         self.table = table
         self.page_size = page_size
+        self.bqstorage_client: Any = None
         self.max_queue_size: int | None = None
+        self.max_stream_count: int | None = None
 
     def to_arrow_iterable(self, **kwargs: Any) -> Iterator[pa.RecordBatch]:
-        assert kwargs["bqstorage_client"] is None
+        assert kwargs["bqstorage_client"] is not None
+        self.bqstorage_client = kwargs["bqstorage_client"]
         self.max_queue_size = int(kwargs["max_queue_size"])
+        self.max_stream_count = int(kwargs["max_stream_count"])
         yield from self.table.to_batches(max_chunksize=self.page_size)
+
+
+class _FakeBigQueryStorageClient:
+    def __init__(self) -> None:
+        self.closed = False
+        self.transport = self
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeBigQueryJob:
@@ -432,6 +445,7 @@ class _FakeBigQueryJob:
         self.table = table
         self.job_id = "safe-job-id"
         self.page_size: int | None = None
+        self.schema_probe_max_results: int | None = None
         self.rows: _FakeBigQueryRows | None = None
         self.cancelled = False
 
@@ -441,8 +455,9 @@ class _FakeBigQueryJob:
         return self.rows
 
     def to_arrow(self, **kwargs: Any) -> pa.Table:
-        assert kwargs["max_results"] == 1
-        return self.table.slice(0, 1)
+        self.schema_probe_max_results = int(kwargs["max_results"])
+        assert self.schema_probe_max_results == 0
+        return self.table.slice(0, 0)
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -487,6 +502,7 @@ class _FakeBigQueryClient:
         # expensive read was never started (issue #418).
         self.job: _FakeBigQueryJob | None = None
         self.get_table_calls = 0
+        self.closed = False
 
     def get_table(self, _table_id: str) -> Any:
         index = min(self.get_table_calls, len(self.generations) - 1)
@@ -509,6 +525,9 @@ class _FakeBigQueryClient:
         self.job = _FakeBigQueryJob(pa.table(dict(self.data)))
         return self.job
 
+    def close(self) -> None:
+        self.closed = True
+
 
 def _bigquery_adapter(client: _FakeBigQueryClient) -> BigQueryAdapter:
     config = parse_warehouse_config(
@@ -517,6 +536,7 @@ def _bigquery_adapter(client: _FakeBigQueryClient) -> BigQueryAdapter:
     adapter = create_adapter(config)
     assert isinstance(adapter, BigQueryAdapter)
     adapter._client = client
+    adapter._bqstorage_client = _FakeBigQueryStorageClient()
     return adapter
 
 
@@ -542,9 +562,12 @@ def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> Non
         assert snapshot.generation_fingerprint is not None
 
     assert client.job is not None
+    assert client.job.schema_probe_max_results == 0
     assert client.job.page_size == 2
     assert client.job.rows is not None
+    assert client.job.rows.bqstorage_client is adapter._bqstorage_client
     assert client.job.rows.max_queue_size == 1
+    assert client.job.rows.max_stream_count == 1
     validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
     assert sentinel not in validation_sql
     assert sentinel not in payload_sql
@@ -629,7 +652,9 @@ def test_bigquery_snapshot_open_failure_sanitizes_cause() -> None:
             raise RuntimeError(sentinel)
 
     adapter = _bigquery_adapter(FailingClient({"record_id": pa.array(["a"])}))
-    with pytest.raises(AdapterError, match="could not be opened") as exc_info:
+    with pytest.raises(
+        AdapterError, match=r"could not be opened.*Native adapter error type: RuntimeError"
+    ) as exc_info:
         with adapter.table_snapshot("records"):
             pass
 
@@ -704,6 +729,53 @@ def test_bigquery_early_close_cancels_unconsumed_result() -> None:
         assert next(iter(snapshot)).column(0)[0].as_py() == "a"
 
     assert client.job is not None and client.job.cancelled
+
+
+def test_bigquery_adapter_closes_owned_storage_client() -> None:
+    client = _FakeBigQueryClient({"record_id": pa.array(["a"])})
+    adapter = _bigquery_adapter(client)
+    storage_client = adapter._bqstorage_client
+
+    adapter._close()
+
+    assert isinstance(storage_client, _FakeBigQueryStorageClient)
+    assert storage_client.closed
+    assert client.closed
+    assert adapter._bqstorage_client is None
+
+
+def test_bigquery_adapter_lazily_reuses_storage_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from google.cloud import bigquery_storage
+
+    client = _FakeBigQueryClient({"record_id": pa.array(["a"])})
+    config = parse_warehouse_config(
+        {"type": "bigquery", "project": "project", "dataset": "dataset"}
+    )
+    adapter = create_adapter(config)
+    assert isinstance(adapter, BigQueryAdapter)
+    adapter._client = client
+    credential = object()
+    created: list[Any] = []
+
+    def make_storage_client(*, credentials: Any) -> _FakeBigQueryStorageClient:
+        assert credentials is credential
+        storage_client = _FakeBigQueryStorageClient()
+        created.append(storage_client)
+        return storage_client
+
+    monkeypatch.setattr(adapter, "_credentials", lambda: credential)
+    monkeypatch.setattr(bigquery_storage, "BigQueryReadClient", make_storage_client)
+
+    first = adapter._ensure_bqstorage_client()
+    second = adapter._ensure_bqstorage_client()
+    adapter._close()
+
+    assert first is second
+    assert created == [first]
+    assert first.closed
+    assert client.closed
 
 
 def test_implemented_adapters_declare_streaming_read_capability() -> None:

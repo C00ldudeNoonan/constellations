@@ -96,6 +96,13 @@ def _llm_content_fingerprint(value: Any) -> tuple[str, str]:
     )
 
 
+def _llm_input_columns(config: LLMTransformConfig) -> list[str]:
+    columns = [config.id_field]
+    if config.input_field != config.id_field:
+        columns.append(config.input_field)
+    return columns
+
+
 def _stream_llm_input_plan(
     adapter: WarehouseAdapter,
     table: str,
@@ -121,7 +128,7 @@ def _stream_llm_input_plan(
     skipped = 0
     with adapter.table_snapshot(
         table,
-        columns=[config.id_field, config.input_field],
+        columns=_llm_input_columns(config),
         batch_size=_INPUT_BATCH_ROWS,
     ) as snapshot:
         for batch in snapshot:
@@ -207,7 +214,7 @@ def _iter_llm_work_windows(
     window: list[_LLMWork] = []
     with adapter.table_snapshot(
         table,
-        columns=[config.id_field, config.input_field],
+        columns=_llm_input_columns(config),
         batch_size=_INPUT_BATCH_ROWS,
     ) as snapshot:
         for batch in snapshot:

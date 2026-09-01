@@ -235,8 +235,11 @@ For a source checkout, replace the `--with stel[...]` portion with
 With `method: oauth` (gcloud Application Default Credentials), stel loads the
 ADC file directly and never shells out to `gcloud`, because a `gcloud` child
 process would inherit the MCP stdio pipes and can hang the server on Windows.
-Run `gcloud auth application-default login` once so the ADC file exists. If
-your environment resolves credentials another way, setting
+Run `gcloud auth application-default login` once so the ADC file exists. stel
+keeps the scopes granted to gcloud user ADC rather than replacing them with
+the profile's dbt-compatible default list; credential types that require
+scoping still receive the configured `scopes`. If your environment resolves
+credentials another way, setting
 `GOOGLE_APPLICATION_CREDENTIALS` to the ADC file path in the server's `env`
 block forces the no-subprocess path explicitly:
 

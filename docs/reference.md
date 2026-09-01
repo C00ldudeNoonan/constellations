@@ -885,6 +885,13 @@ environment-backed `keyfile_json:`, or environment-backed `token` /
 set. (dbt's `dataproc_*` fields don't apply: stel transforms run
 in-process, not on Dataproc.)
 
+For gcloud user ADC, stel preserves the scopes granted by
+`gcloud auth application-default login`; it does not replace them with the
+profile's dbt-compatible default list. Credential types that require scoping,
+including service-account and external-account ADC, still receive the
+configured `scopes`. This matches Google Auth's normal discovery behavior
+while retaining stel's no-subprocess ADC loading on Windows.
+
 ```
 pip install 'stel[bigquery]'
 ```

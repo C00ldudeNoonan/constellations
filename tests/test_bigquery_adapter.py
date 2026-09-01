@@ -2614,8 +2614,10 @@ def test_credentials_oauth_adc_file_loads_without_gcloud_shellout(
     shells out to `gcloud config config-helper`, and under `stel mcp serve`
     that child inherits the MCP stdio pipes and hangs on Windows (#365)."""
     import google.auth
+    import google.auth.credentials
 
     captured: dict[str, Any] = {}
+    loaded = object()
     sentinel = object()
 
     adc = tmp_path / "application_default_credentials.json"
@@ -2624,18 +2626,61 @@ def test_credentials_oauth_adc_file_loads_without_gcloud_shellout(
 
     def fake_load(path: str, scopes: Any = None) -> tuple[Any, None]:
         captured["path"] = path
-        captured["scopes"] = scopes
-        return sentinel, None
+        captured["load_scopes"] = scopes
+        return loaded, None
+
+    def fake_scope_if_required(
+        credentials: Any,
+        scopes: Any,
+        default_scopes: Any = None,
+    ) -> Any:
+        captured["credentials"] = credentials
+        captured["applied_scopes"] = scopes
+        captured["default_scopes"] = default_scopes
+        return sentinel
 
     def fail_default(scopes: Any = None) -> tuple[Any, None]:
         raise AssertionError("google.auth.default() must not be reached")
 
     monkeypatch.setattr(google.auth, "load_credentials_from_file", fake_load)
     monkeypatch.setattr(google.auth, "default", fail_default)
+    monkeypatch.setattr(
+        google.auth.credentials,
+        "with_scopes_if_required",
+        fake_scope_if_required,
+    )
 
     assert _adapter()._credentials() is sentinel
     assert captured["path"] == str(adc)
-    assert list(captured["scopes"]) == _bq_cfg().scopes
+    assert captured["load_scopes"] is None
+    assert captured["credentials"] is loaded
+    assert list(captured["applied_scopes"]) == _bq_cfg().scopes
+    assert captured["default_scopes"] is None
+
+
+def test_credentials_oauth_adc_preserves_authorized_user_scopes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import google.auth
+    from google.oauth2.credentials import Credentials as UserCredentials
+
+    granted_scopes = ("https://www.googleapis.com/auth/cloud-platform",)
+    credentials = UserCredentials(token="cached-test-token", scopes=granted_scopes)
+    adc = tmp_path / "application_default_credentials.json"
+    adc.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc))
+
+    def fake_load(path: str, scopes: Any = None) -> tuple[Any, None]:
+        assert path == str(adc)
+        assert scopes is None
+        return credentials, None
+
+    monkeypatch.setattr(google.auth, "load_credentials_from_file", fake_load)
+
+    resolved = _adapter()._credentials()
+
+    assert resolved is credentials
+    assert tuple(resolved.scopes) == granted_scopes
 
 
 def test_credentials_oauth_falls_back_to_default_without_adc_file(

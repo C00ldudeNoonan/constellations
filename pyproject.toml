@@ -1,6 +1,6 @@
 [project]
 name = "stel"
-version = "0.15.0"
+version = "0.15.1"
 description = "dbt for unstructured data — declarative pipelines for documents, text, and ML preprocessing"
 readme = "README.md"
 license = { text = "MIT" }

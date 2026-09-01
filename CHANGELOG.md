@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.15.1 - 2026-09-01
+
 ### BigQuery snapshots keep wide payloads off the REST result path (issue #441)
 
 BigQuery's bounded table snapshot opened its query with a one-row Arrow schema

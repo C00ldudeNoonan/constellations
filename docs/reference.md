@@ -1633,21 +1633,29 @@ with adapter.table_snapshot(
 
 DuckDB holds one MVCC read transaction through the context, derives a content
 generation fingerprint while consuming it, and performs a second bounded scan
-before successful close to reject a newer table version. BigQuery awaits the
-uncached query through the jobs API without fetching any result page, then
-streams that finished job's destination table through one BigQuery Storage
-Read stream with one queued page, taking both the typed Arrow schema and the
-projection's column positions from the read session itself. No part of a
-snapshot passes through the REST result endpoint, which rejects on the size of
-the underlying result rather than on the number of rows requested — a wide row
-(an embedding vector beside full document text) exceeds it even when zero rows
-are asked for. It rejects the read if the table generation changes while the snapshot
-is opened or consumed. A read that names a key column adds one further
-uncached aggregate over that column alone, ahead of the payload query, so the
-key check never makes BigQuery buffer the projection; it is cheap next to the
-payload, but it is a second job and normal query billing and the profile's
-`maximum_bytes_billed` limit apply to both. Both adapters push projection
-and predicates into the warehouse. Predicate values are bound parameters and
+before successful close to reject a newer table version. BigQuery reads an
+unfiltered, explicitly projected snapshot directly through the Storage Read
+API's own column selection — no query job at all, and so no anonymous
+destination table for BigQuery to materialize before the read can begin.
+That materialization step is what a wide-enough projection actually exceeds
+(a `responseTooLarge` job failure), upstream of any question about how a
+result is fetched back; skipping it is what makes a snapshot over a
+768-dimensional-vector-plus-document-text relation possible at all. A
+predicated read still runs a query — translating predicates into the Storage
+API's own row-restriction syntax remains unsupported — and streams that
+finished job's destination table through the same Storage Read path instead.
+Either way, the typed Arrow schema and the projection's column positions both
+come from the read session itself, never from the request or a query's own
+schema: the Storage Read API does not return the requested projection's
+column order, so pairing a schema from anywhere else with its batches would
+select the wrong columns by position. It rejects the read if the table
+generation changes while the snapshot is opened or consumed. A read that
+names a key column adds one further uncached aggregate over that column
+alone, ahead of the payload read, so the key check never touches the
+projection; it is cheap next to the payload, but it is its own query and
+normal query billing and the profile's `maximum_bytes_billed` limit apply to
+it. Both adapters push projection and predicates into the warehouse when a
+query runs. Predicate values are bound parameters and
 redacted from diagnostics.
 
 Batch ordering is deliberately unspecified. Consumers must use stable row keys

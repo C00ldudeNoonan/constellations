@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### An unfiltered BigQuery snapshot no longer runs a query at all (issue #441)
+
+Two releases in a row (v0.15.1, v0.15.2) still failed on the reported table,
+each having changed only how a snapshot read its query's result. The actual
+failure is in query *execution*, upstream of both: BigQuery has to
+materialize an anonymous destination table for a query's result, and a
+projection this wide (a 768-dimensional vector beside full chunk text, over
+3.6M rows) exceeds that limit outright — `responseTooLarge`, before either
+result-reading path is ever reached. Its own advice, unearthed once the
+error's reason code stopped being swallowed by the v0.15.2 fix: "Consider
+specifying a destination table in your job configuration."
+
+An unfiltered, explicitly projected snapshot — the shape a search publish
+reading its own embeddings table back actually is — now reads straight
+through the Storage Read API's own column selection, with no query job and
+so no destination table for BigQuery to materialize at all. A predicated read
+still runs a query, since translating predicates into the Storage API's own
+row-restriction syntax was out of scope here, and streams that query's
+destination table exactly as v0.15.2 already did. Either way, the typed
+schema and the projection's column positions both come from the read session
+itself and never from the request, preserving the ordering guarantee v0.15.2
+established. The generation fence, key-domain validation, execution-project
+billing, and configured timeout are unchanged on both paths.
+
 ## v0.15.2 - 2026-09-01
 
 ### BigQuery snapshots leave the REST result endpoint entirely (issue #441)

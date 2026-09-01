@@ -29,6 +29,7 @@ from stel.adapters import (
     StateScope,
     StateScopeFence,
     StateValue,
+    TableSnapshotGenerationChangedError,
     WarehouseCapability,
     adapter_capabilities,
     create_adapter,
@@ -4241,6 +4242,11 @@ def test_a_snapshot_projects_by_name_when_storage_reorders_columns() -> None:
     a positional select transpose values -- same types, no error, provenance
     IDs silently swapped. Shape and not-null tests pass on that, which is
     what makes it expensive to find.
+
+    An unfiltered, explicitly projected read like this one takes the direct
+    Storage Read path (issue #441 round 2), which is the shape that actually
+    hit this in production -- so `client.queries == []` here is not
+    incidental, it is the assertion that this test exercises that path.
     """
     payload = pa.table(
         {
@@ -4252,7 +4258,6 @@ def test_a_snapshot_projects_by_name_when_storage_reorders_columns() -> None:
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = ["document_id", "chunk_id", "embedding"]
     client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 2}
-    client.query_results = [_FakeSnapshotJob(payload)]
     adapter = _adapter(client)
     adapter._bqstorage_client.payload = payload
     # What the service actually did on the reported table: transpose the two
@@ -4269,6 +4274,7 @@ def test_a_snapshot_projects_by_name_when_storage_reorders_columns() -> None:
         assert snapshot.schema.names == ["document_id", "chunk_id", "embedding"]
         batches = list(snapshot)
 
+    assert client.queries == []
     combined = pa.Table.from_batches(batches)
     assert combined.column_names == ["document_id", "chunk_id", "embedding"]
     # Values, not just names: an order-agnostic assertion passes while the
@@ -4317,6 +4323,133 @@ def test_the_configured_timeout_reaches_the_storage_read_calls() -> None:
 
     # Both the session creation and the row read, not just one of them.
     assert adapter._bqstorage_client.timeouts == [42, 42]
+
+
+# ─── skip the query job for an unfiltered projection (issue #441 round 2) ──
+#
+# Two releases in a row (#442, #444) changed how a snapshot *read its
+# result*, and both still failed on the real table: the query job itself
+# fails with `responseTooLarge` before either result path is reached, because
+# BigQuery has to materialize an anonymous destination table for the query
+# result and that materialization is what a wide-enough projection exceeds.
+# An unfiltered, explicitly projected read never needs that job at all.
+
+
+def test_an_unfiltered_projected_snapshot_skips_the_query_entirely() -> None:
+    """The actual fix: no query, no anonymous destination table, so
+    responseTooLarge cannot arise. The read session names the real table
+    directly, not a query result."""
+    payload = pa.table({"chunk_id": ["a", "b"], "embedding": [[1.0], [2.0]]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "embedding"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 2}
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot(
+        "chunks", columns=["chunk_id", "embedding"]
+    ) as snapshot:
+        assert [batch.num_rows for batch in snapshot] == [2]
+
+    # No query at all -- if a query had run, _FakeSnapshotJob would exist to
+    # serve it, but nothing here configured one because nothing should call
+    # client.query() on this path.
+    assert client.queries == []
+    storage = adapter._bqstorage_client
+    assert isinstance(storage, _FakeStorageReadClient)
+    # The real table, not an anonymous query-result table.
+    assert storage.sessions == [
+        ("projects/proj/datasets/ds/tables/chunks", 1)
+    ]
+
+
+def test_a_predicated_snapshot_still_uses_the_query_path() -> None:
+    """A predicate keeps the query path even with explicit columns --
+    translating predicates into a Storage Read `row_restriction` was
+    explicitly out of scope for this fix."""
+    payload = pa.table({"chunk_id": ["a"], "symbol": ["AAPL"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "symbol"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL")
+
+    with adapter.table_snapshot(
+        "chunks", columns=["chunk_id", "symbol"], predicate=predicate
+    ) as snapshot:
+        list(snapshot)
+
+    assert len(client.queries) == 1
+    storage = adapter._bqstorage_client
+    assert isinstance(storage, _FakeStorageReadClient)
+    # Read from the job's anonymous destination, not the base table directly.
+    assert storage.sessions == [
+        ("projects/proj/datasets/_anon/tables/anon_result", 1)
+    ]
+
+
+def test_a_query_still_reports_responsetoolarge_by_reason() -> None:
+    """Locks in the actual root cause this round found: the query job fails
+    with a specific reason before any result-reading path is reached, on the
+    predicated shape that still needs the query. The native message -- which
+    can quote the SQL and its row values -- must not reach the caller."""
+    payload = pa.table({"chunk_id": ["a"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "symbol"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [
+        _FakeSnapshotJob(
+            payload,
+            error_result={
+                "reason": "responseTooLarge",
+                "message": (
+                    "Response too large to return. Consider specifying a "
+                    "destination table in your job configuration."
+                ),
+            },
+        )
+    ]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+    predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL")
+
+    with pytest.raises(AdapterError) as excinfo:
+        with adapter.table_snapshot(
+            "chunks", columns=["chunk_id"], predicate=predicate
+        ):
+            pass
+
+    rendered = str(excinfo.value)
+    assert "responseTooLarge" in rendered
+    assert "destination table" not in rendered
+
+
+def test_a_direct_read_snapshot_still_rejects_a_generation_change() -> None:
+    """The generation fence is table metadata, not query-job state, so it
+    still has to run when the query job is skipped."""
+
+    class _MutatingClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.get_table_calls = 0
+
+        def get_table(self, table_id: str) -> Any:
+            self.get_table_calls += 1
+            if self.get_table_calls >= 2:
+                self.table_meta[table_id]["etag"] = "etag-2"
+            return super().get_table(table_id)
+
+    client = _MutatingClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = pa.table({"chunk_id": ["a"]})
+
+    with pytest.raises(TableSnapshotGenerationChangedError, match="changed while opening"):
+        with adapter.table_snapshot("chunks", columns=["chunk_id"]):
+            pass
 
 
 def test_an_empty_snapshot_still_carries_its_typed_schema() -> None:

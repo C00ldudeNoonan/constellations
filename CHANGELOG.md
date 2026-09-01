@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.15.2 - 2026-09-01
+
 ### BigQuery snapshots leave the REST result endpoint entirely (issue #441)
 
 v0.15.1 moved the snapshot's schema probe from one returned row to zero on the

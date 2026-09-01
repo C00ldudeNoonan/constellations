@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.15.3 - 2026-09-01
+
+### pypdf floor raised to 6.16.1 for three CVEs
+
+CVE-2026-84309 (fixed in 6.16.0), CVE-2026-84310 and CVE-2026-84311 (both
+fixed in 6.16.1) were published against pypdf 6.15.0, which was this
+project's floor. Anyone installing the `pdf` or `all` extra resolved to an
+affected version. The floor is now `>=6.16.1`.
+
 ### An unfiltered BigQuery snapshot no longer runs a query at all (issue #441)
 
 Two releases in a row (v0.15.1, v0.15.2) still failed on the reported table,

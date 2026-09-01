@@ -415,49 +415,96 @@ def test_snapshot_schema_failure_does_not_retain_row_payload() -> None:
     _assert_sentinel_absent_from_error(exc_info.value, sentinel)
 
 
-class _FakeBigQueryRows:
-    def __init__(self, table: pa.Table, page_size: int) -> None:
-        self.table = table
-        self.page_size = page_size
-        self.bqstorage_client: Any = None
-        self.max_queue_size: int | None = None
-        self.max_stream_count: int | None = None
+class _FakeReadRowsStream:
+    def __init__(self, table: pa.Table, *, fail_with: str | None = None) -> None:
+        self._table = table
+        self._fail_with = fail_with
+        self.cancelled = False
 
-    def to_arrow_iterable(self, **kwargs: Any) -> Iterator[pa.RecordBatch]:
-        assert kwargs["bqstorage_client"] is not None
-        self.bqstorage_client = kwargs["bqstorage_client"]
-        self.max_queue_size = int(kwargs["max_queue_size"])
-        self.max_stream_count = int(kwargs["max_stream_count"])
-        yield from self.table.to_batches(max_chunksize=self.page_size)
+    def rows(self) -> Any:
+        if self._fail_with is not None:
+            raise RuntimeError(self._fail_with)
+        pages = [
+            SimpleNamespace(to_arrow=_returning(batch))
+            for batch in self._table.to_batches()
+        ]
+        return SimpleNamespace(pages=iter(pages))
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def _returning(value: Any) -> Any:
+    def _get() -> Any:
+        return value
+
+    return _get
 
 
 class _FakeBigQueryStorageClient:
+    """The Storage Read surface a snapshot uses, in place of the REST result
+    endpoint that issue #441 could not get a wide row through."""
+
     def __init__(self) -> None:
         self.closed = False
         self.transport = self
+        self.payload: pa.Table | None = None
+        self.read_fails_with: str | None = None
+        self.sessions: list[tuple[str, int]] = []
+        self.streams: list[_FakeReadRowsStream] = []
 
     def close(self) -> None:
         self.closed = True
 
+    def create_read_session(
+        self, *, parent: str, read_session: Any, max_stream_count: int
+    ) -> Any:
+        assert parent.startswith("projects/")
+        assert max_stream_count == 1
+        self.sessions.append((read_session.table, max_stream_count))
+        table = self.payload
+        assert table is not None
+        return SimpleNamespace(
+            arrow_schema=SimpleNamespace(
+                serialized_schema=table.schema.serialize()
+            ),
+            streams=(
+                [SimpleNamespace(name="stream-0")] if table.num_rows else []
+            ),
+        )
+
+    def read_rows(self, name: str) -> _FakeReadRowsStream:
+        del name
+        assert self.payload is not None
+        stream = _FakeReadRowsStream(self.payload, fail_with=self.read_fails_with)
+        self.streams.append(stream)
+        return stream
+
 
 class _FakeBigQueryJob:
+    """Awaited through jobs.get. The two getQueryResults entry points raise:
+    both reject on the underlying result size at any requested row count, so
+    a regression that reaches for either must fail here (issue #441)."""
+
     def __init__(self, table: pa.Table) -> None:
         self.table = table
         self.job_id = "safe-job-id"
-        self.page_size: int | None = None
-        self.schema_probe_max_results: int | None = None
-        self.rows: _FakeBigQueryRows | None = None
         self.cancelled = False
+        self.error_result: dict[str, str] | None = None
+        self.done_calls = 0
+        self.destination = SimpleNamespace(
+            project="project", dataset_id="_anon", table_id="anon_result"
+        )
 
-    def result(self, *, page_size: int, timeout: float | None) -> _FakeBigQueryRows:
-        self.page_size = page_size
-        self.rows = _FakeBigQueryRows(self.table, page_size)
-        return self.rows
+    def done(self, **_kwargs: Any) -> bool:
+        self.done_calls += 1
+        return True
 
-    def to_arrow(self, **kwargs: Any) -> pa.Table:
-        self.schema_probe_max_results = int(kwargs["max_results"])
-        assert self.schema_probe_max_results == 0
-        return self.table.slice(0, 0)
+    def result(self, **_kwargs: Any) -> Any:
+        raise AssertionError("snapshot read used job.result() (issue #441)")
+
+    def to_arrow(self, **_kwargs: Any) -> Any:
+        raise AssertionError("snapshot read used job.to_arrow() (issue #441)")
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -503,6 +550,9 @@ class _FakeBigQueryClient:
         self.job: _FakeBigQueryJob | None = None
         self.get_table_calls = 0
         self.closed = False
+        # Set by _bigquery_adapter: the payload query hands its table to the
+        # read session, which is where the snapshot now reads it from.
+        self.storage: Any = None
 
     def get_table(self, _table_id: str) -> Any:
         index = min(self.get_table_calls, len(self.generations) - 1)
@@ -522,7 +572,10 @@ class _FakeBigQueryClient:
             # returns one row of scalars, not the payload.
             self.validation_queries.append(sql)
             return _FakeAggregateJob(self.null_count, self.duplicate_count)
-        self.job = _FakeBigQueryJob(pa.table(dict(self.data)))
+        table = pa.table(dict(self.data))
+        self.job = _FakeBigQueryJob(table)
+        if self.storage is not None:
+            self.storage.payload = table
         return self.job
 
     def close(self) -> None:
@@ -537,6 +590,7 @@ def _bigquery_adapter(client: _FakeBigQueryClient) -> BigQueryAdapter:
     assert isinstance(adapter, BigQueryAdapter)
     adapter._client = client
     adapter._bqstorage_client = _FakeBigQueryStorageClient()
+    client.storage = adapter._bqstorage_client
     return adapter
 
 
@@ -562,12 +616,16 @@ def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> Non
         assert snapshot.generation_fingerprint is not None
 
     assert client.job is not None
-    assert client.job.schema_probe_max_results == 0
-    assert client.job.page_size == 2
-    assert client.job.rows is not None
-    assert client.job.rows.bqstorage_client is adapter._bqstorage_client
-    assert client.job.rows.max_queue_size == 1
-    assert client.job.rows.max_stream_count == 1
+    # Awaited through jobs.get and read from the job's own destination table
+    # through one Storage Read stream — never through getQueryResults, which
+    # rejects a wide row at any requested row count (issue #441).
+    assert client.job.done_calls >= 1
+    storage = adapter._bqstorage_client
+    assert isinstance(storage, _FakeBigQueryStorageClient)
+    assert storage.sessions == [
+        ("projects/project/datasets/_anon/tables/anon_result", 1)
+    ]
+    assert len(storage.streams) == 1
     validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
     assert sentinel not in validation_sql
     assert sentinel not in payload_sql
@@ -667,28 +725,10 @@ def test_bigquery_snapshot_open_failure_sanitizes_cause() -> None:
 def test_bigquery_snapshot_batch_failure_sanitizes_cause() -> None:
     sentinel = "diagnostic-only-batch-error"
 
-    class FailingRows(_FakeBigQueryRows):
-        def __init__(self) -> None:
-            super().__init__(
-                pa.table({"record_id": pa.array([], type=pa.string())}), 1
-            )
-
-        def to_arrow_iterable(self, **_kwargs: Any) -> Iterator[pa.RecordBatch]:
-            raise RuntimeError(sentinel)
-            yield from ()
-
-    class FailingJob(_FakeBigQueryJob):
-        def result(self, *, page_size: int, timeout: float | None) -> FailingRows:
-            del page_size, timeout
-            return FailingRows()
-
-    class FailingClient(_FakeBigQueryClient):
-        def query(self, sql: str, job_config: Any = None, **_kwargs: Any) -> FailingJob:
-            self.queries.append((sql, job_config))
-            self.job = FailingJob(pa.table(self.data))
-            return self.job
-
-    adapter = _bigquery_adapter(FailingClient({"record_id": pa.array(["a"])}))
+    adapter = _bigquery_adapter(_FakeBigQueryClient({"record_id": pa.array(["a"])}))
+    # The stream itself fails mid-read, which is where a native message would
+    # otherwise reach the caller.
+    adapter._bqstorage_client.read_fails_with = sentinel
     with adapter.table_snapshot("records") as snapshot:
         with pytest.raises(AdapterError, match="batch read failed") as exc_info:
             list(snapshot)

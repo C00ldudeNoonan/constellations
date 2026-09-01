@@ -119,11 +119,66 @@ def test_keyfile_absolutized_relative_to_project(tmp_path: Path) -> None:
 
 
 class _FakeStorageReadClient:
+    """The BigQuery Storage Read surface the snapshot path uses.
+
+    Column order is a first-class part of this double. The real API does not
+    promise the requested projection's order back, and a fake that always
+    replayed the requested order could not fail on a positional-select bug
+    (issue #441) -- so `storage_order` reorders both the session schema and
+    the batches, exactly as the service does.
+    """
+
     def __init__(self) -> None:
         self.transport = self
+        self.payload: pa.Table | None = None
+        self.storage_order: list[str] | None = None
+        self.sessions: list[tuple[str, int]] = []
+        self.read_streams: list[str] = []
 
     def close(self) -> None:
         pass
+
+    def _served(self) -> pa.Table:
+        table = self.payload
+        assert table is not None, "no snapshot payload configured"
+        if self.storage_order is None:
+            return table
+        return table.select(self.storage_order)
+
+    def create_read_session(
+        self, *, parent: str, read_session: Any, max_stream_count: int
+    ) -> Any:
+        assert parent.startswith("projects/")
+        # Bounded memory is part of the snapshot contract, not incidental.
+        assert max_stream_count == 1
+        self.sessions.append((read_session.table, max_stream_count))
+        table = self._served()
+        return SimpleNamespace(
+            arrow_schema=SimpleNamespace(
+                serialized_schema=table.schema.serialize()
+            ),
+            # A result with no rows has no streams at all; the schema still
+            # rides on the session, so an empty snapshot stays typed.
+            streams=(
+                [SimpleNamespace(name="stream-0")] if table.num_rows else []
+            ),
+        )
+
+    def read_rows(self, name: str) -> Any:
+        self.read_streams.append(name)
+        pages = [_FakeReadPage(batch) for batch in self._served().to_batches()]
+        return SimpleNamespace(
+            rows=lambda: SimpleNamespace(pages=iter(pages)),
+            cancel=lambda: None,
+        )
+
+
+class _FakeReadPage:
+    def __init__(self, batch: pa.RecordBatch) -> None:
+        self._batch = batch
+
+    def to_arrow(self) -> pa.RecordBatch:
+        return self._batch
 
 
 def _adapter(client: Any = None, **cfg_extra: Any) -> BigQueryAdapter:
@@ -4016,29 +4071,50 @@ def test_every_bigquery_operation_is_live_tested_or_listed_as_debt() -> None:
 
 
 class _FakeSnapshotJob:
-    """A query job that can serve a schema probe and an Arrow batch stream."""
+    """A query job awaited through jobs.get, never through getQueryResults.
 
-    def __init__(self, table: pa.Table, *, job_id: str = "job-1") -> None:
+    `to_arrow()` and `result()` are the two REST result paths that made
+    issue #441 unfixable at any `max_results` -- both raise here, so a
+    regression that reaches for either fails these tests instead of only
+    failing in production against a wide enough table.
+    """
+
+    def __init__(
+        self,
+        table: pa.Table,
+        *,
+        job_id: str = "job-1",
+        error_result: dict[str, str] | None = None,
+        done_after: int = 0,
+    ) -> None:
         self._table = table
         self.job_id = job_id
+        self.error_result = error_result
+        self._done_after = done_after
+        self.done_calls = 0
+        self.cancelled = False
+        self.destination = SimpleNamespace(
+            project="proj", dataset_id="_anon", table_id="anon_result"
+        )
 
-    def to_arrow(self, **kwargs: Any) -> pa.Table:
-        assert kwargs["max_results"] == 0
-        return self._table.slice(0, 0)
+    def done(self, **_kwargs: Any) -> bool:
+        self.done_calls += 1
+        return self.done_calls > self._done_after
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def to_arrow(self, **_kwargs: Any) -> Any:
+        raise AssertionError(
+            "snapshot read used job.to_arrow() (jobs.getQueryResults); it "
+            "rejects on underlying result size at any max_results (#441)"
+        )
 
     def result(self, **_kwargs: Any) -> Any:
-        table = self._table
-
-        class _Rows:
-            def to_arrow_iterable(self, **kwargs: Any) -> Any:
-                assert isinstance(
-                    kwargs["bqstorage_client"], _FakeStorageReadClient
-                )
-                assert kwargs["max_queue_size"] == 1
-                assert kwargs["max_stream_count"] == 1
-                return iter(table.to_batches())
-
-        return _Rows()
+        raise AssertionError(
+            "snapshot read used job.result() (jobs.getQueryResults); it "
+            "rejects on underlying result size at any max_results (#441)"
+        )
 
 
 def _snapshot_adapter(rows: dict[str, list[Any]], *, nulls: int = 0, dupes: int = 0):
@@ -4053,7 +4129,9 @@ def _snapshot_adapter(rows: dict[str, list[Any]], *, nulls: int = 0, dupes: int 
         _FakeJob(rows=[(nulls, dupes)]),  # the key-domain aggregate
         _FakeSnapshotJob(payload),  # the payload read
     ]
-    return _adapter(client), client
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+    return adapter, client
 
 
 def test_a_keyed_snapshot_keeps_analytic_functions_out_of_the_payload() -> None:
@@ -4103,12 +4181,159 @@ def test_an_unkeyed_snapshot_runs_one_query_and_no_validation() -> None:
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = ["chunk_id"]
     client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 2}
-    client.query_results = [_FakeSnapshotJob(pa.table({"chunk_id": ["a", "b"]}))]
+    payload = pa.table({"chunk_id": ["a", "b"]})
+    client.query_results = [_FakeSnapshotJob(payload)]
     adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
     with adapter.table_snapshot("chunks") as snapshot:
         assert [batch.num_rows for batch in snapshot] == [2]
     assert len(client.queries) == 1
     assert "COUNT(DISTINCT" not in client.queries[0][0]
+
+
+# ─── wide-row snapshots read through the Storage API (issue #441) ───────────
+#
+# v0.15.1 moved the schema probe from max_results=1 to max_results=0 on the
+# premise that asking for zero rows would keep a wide payload out of the REST
+# response. It does not: jobs.getQueryResults rejects on the size of the
+# underlying result, so a 768-float vector beside full chunk text 403s at
+# either value. Both REST result paths are gone now, and _FakeSnapshotJob
+# raises if anything reaches for them again.
+
+
+def test_a_wide_snapshot_never_touches_the_rest_result_paths() -> None:
+    """The fix in one assertion: the payload is awaited through jobs.get and
+    streamed from a read session, so neither getQueryResults path is used."""
+    payload = pa.table({"chunk_id": ["a", "b"], "embedding": [[1.0], [2.0]]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "embedding"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 2}
+    job = _FakeSnapshotJob(payload)
+    client.query_results = [job]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot("chunks") as snapshot:
+        assert [batch.num_rows for batch in snapshot] == [2]
+
+    # Awaited via jobs.get, and read from the job's own destination table.
+    assert job.done_calls >= 1
+    assert adapter._bqstorage_client.sessions == [
+        ("projects/proj/datasets/_anon/tables/anon_result", 1)
+    ]
+    assert adapter._bqstorage_client.read_streams == ["stream-0"]
+
+
+def test_a_snapshot_projects_by_name_when_storage_reorders_columns() -> None:
+    """The trap this fix has to avoid. The Storage Read API does not return
+    the requested projection's column order, so taking the schema from the
+    request (or a dry run) while batches arrive in the service's order makes
+    a positional select transpose values -- same types, no error, provenance
+    IDs silently swapped. Shape and not-null tests pass on that, which is
+    what makes it expensive to find.
+    """
+    payload = pa.table(
+        {
+            "document_id": ["doc-1", "doc-2"],
+            "chunk_id": ["chunk-1", "chunk-2"],
+            "embedding": [[1.0], [2.0]],
+        }
+    )
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["document_id", "chunk_id", "embedding"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 2}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+    # What the service actually did on the reported table: transpose the two
+    # id columns and push the vector to the end.
+    adapter._bqstorage_client.storage_order = [
+        "chunk_id",
+        "embedding",
+        "document_id",
+    ]
+
+    with adapter.table_snapshot(
+        "chunks", columns=["document_id", "chunk_id", "embedding"]
+    ) as snapshot:
+        assert snapshot.schema.names == ["document_id", "chunk_id", "embedding"]
+        batches = list(snapshot)
+
+    combined = pa.Table.from_batches(batches)
+    assert combined.column_names == ["document_id", "chunk_id", "embedding"]
+    # Values, not just names: an order-agnostic assertion passes while the
+    # data is transposed.
+    assert combined.column("document_id").to_pylist() == ["doc-1", "doc-2"]
+    assert combined.column("chunk_id").to_pylist() == ["chunk-1", "chunk-2"]
+    assert combined.column("embedding").to_pylist() == [[1.0], [2.0]]
+
+
+def test_an_empty_snapshot_still_carries_its_typed_schema() -> None:
+    """A result with no rows has no read streams at all. The schema rides on
+    the session rather than on a batch, so the snapshot stays typed."""
+    payload = pa.table(
+        {"chunk_id": pa.array([], type=pa.string())},
+        schema=pa.schema([pa.field("chunk_id", pa.string())]),
+    )
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 0}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot("chunks") as snapshot:
+        assert snapshot.schema.field("chunk_id").type == pa.string()
+        assert list(snapshot) == []
+
+    assert adapter._bqstorage_client.read_streams == []
+
+
+def test_a_failed_snapshot_query_reports_its_reason_not_its_message() -> None:
+    """Bypassing job.result() also bypasses the exception it would have
+    raised, so the job's terminal error has to be re-raised here -- carrying
+    the BigQuery reason code only, never the native message, which quotes the
+    SQL and its row values."""
+    payload = pa.table({"chunk_id": ["a"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [
+        _FakeSnapshotJob(
+            payload,
+            error_result={
+                "reason": "accessDenied",
+                "message": "secret-value in row 3 of `proj.ds.chunks`",
+            },
+        )
+    ]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+
+    with pytest.raises(AdapterError) as excinfo:
+        with adapter.table_snapshot("chunks"):
+            pass
+
+    rendered = str(excinfo.value)
+    assert "accessDenied" in rendered
+    assert "secret-value" not in rendered
+    assert "proj.ds.chunks" not in rendered
+
+
+def test_a_snapshot_waits_for_a_job_that_is_not_done_yet() -> None:
+    payload = pa.table({"chunk_id": ["a"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    job = _FakeSnapshotJob(payload, done_after=2)
+    client.query_results = [job]
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot("chunks") as snapshot:
+        assert [batch.num_rows for batch in snapshot] == [1]
+
+    assert job.done_calls == 3
 
 
 def test_key_validation_carries_the_read_predicates() -> None:

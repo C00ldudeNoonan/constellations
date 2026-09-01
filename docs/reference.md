@@ -1633,10 +1633,15 @@ with adapter.table_snapshot(
 
 DuckDB holds one MVCC read transaction through the context, derives a content
 generation fingerprint while consuming it, and performs a second bounded scan
-before successful close to reject a newer table version. BigQuery asks the
-uncached query result for zero rows to establish its typed Arrow schema, then
-streams the payload through one BigQuery Storage Read stream with one queued
-page. It rejects the read if the table generation changes while the snapshot
+before successful close to reject a newer table version. BigQuery awaits the
+uncached query through the jobs API without fetching any result page, then
+streams that finished job's destination table through one BigQuery Storage
+Read stream with one queued page, taking both the typed Arrow schema and the
+projection's column positions from the read session itself. No part of a
+snapshot passes through the REST result endpoint, which rejects on the size of
+the underlying result rather than on the number of rows requested — a wide row
+(an embedding vector beside full document text) exceeds it even when zero rows
+are asked for. It rejects the read if the table generation changes while the snapshot
 is opened or consumed. A read that names a key column adds one further
 uncached aggregate over that column alone, ahead of the payload query, so the
 key check never makes BigQuery buffer the projection; it is cheap next to the

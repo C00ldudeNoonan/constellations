@@ -1081,9 +1081,17 @@ class BigQueryAdapter(WarehouseAdapter):
             # sources such as the GCE metadata server.
             adc_file = _adc_file_path()
             if adc_file is not None:
-                creds, _ = google.auth.load_credentials_from_file(
-                    str(adc_file), scopes=scopes
-                )
+                from google.auth.credentials import with_scopes_if_required
+
+                # Passing scopes into the file loader replaces the grant on
+                # gcloud authorized-user ADC. A normal `application-default
+                # login` grants cloud-platform, so forcing the dbt-compatible
+                # BigQuery/Drive list makes its next refresh fail with
+                # `invalid_scope`. Match google.auth.default(): preserve user
+                # grants, while still scoping service-account and external
+                # credentials that explicitly require it.
+                creds, _ = google.auth.load_credentials_from_file(str(adc_file))
+                creds = with_scopes_if_required(creds, scopes)
             else:
                 creds, _ = google.auth.default(scopes=scopes)
 

@@ -31,6 +31,8 @@ def _project(
     cardinality: str = "one",
     max_concurrent: int = 1,
     max_api_calls: int | None = None,
+    input_field: str = "body",
+    id_field: str = "document_id",
 ) -> Path:
     project = tmp_path / "project"
     project.mkdir(parents=True)
@@ -66,9 +68,9 @@ def _project(
         "    extraction:\n      backend: json\n      options:\n        fields: [body]\n"
         "    materialization: incremental\n"
         "  - name: facts\n    depends_on: [ref('registry')]\n"
-        "    llm:\n      input_field: body\n      prompt: p\n"
+        f"    llm:\n      input_field: {input_field}\n      prompt: p\n"
         "      provider: deterministic\n      model: m\n"
-        "      id_field: document_id\n"
+        f"      id_field: {id_field}\n"
         f"      max_concurrent: {max_concurrent}\n"
         f"      flush_every: {flush_every}\n"
         f"      output_cardinality: {cardinality}\n"
@@ -272,6 +274,20 @@ def test_streaming_the_input_preserves_input_fingerprints(tmp_path: Path) -> Non
 
     assert read_whole
     assert streamed == read_whole
+
+
+def test_one_column_can_supply_the_llm_id_and_input(tmp_path: Path) -> None:
+    """Projected reads must retain a shared id/input column exactly once."""
+    project = _project(
+        tmp_path,
+        flush_every=2,
+        input_field="document_id",
+        id_field="document_id",
+    )
+
+    run_project(project)
+
+    assert _fact_count(project) == INPUTS
 
 
 def test_duplicate_ids_fail_before_any_provider_call(

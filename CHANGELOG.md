@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v0.15.0 - 2026-08-31
+
+### BigQuery user ADC keeps the scopes it was granted
+
+The direct ADC-file path added for Windows MCP startup passed the profile's
+dbt-compatible BigQuery, Cloud Platform, and Drive scopes into Google Auth's
+file loader. For ordinary gcloud user ADC, that replaced the scopes granted by
+`gcloud auth application-default login`; the next token refresh failed with
+`invalid_scope`, so the documented default login could not open BigQuery.
+
+ADC files now load without replacing their grant, then receive configured
+scopes only when their credential type requires scoping. User ADC keeps its
+original grant, service-account and external-account ADC still receive the
+profile scopes, and the no-subprocess guarantee from issue #365 remains intact.
+The live BigQuery pre-release gate found and now covers this path.
+
+### BigQuery state writes cluster on their MERGE keys (issue #431)
+
+`stel_state` is now clustered by `model_name`, `state_scope`,
+`target_identity`, and `record_key`, in the same order used by its MERGE join.
+This lets BigQuery prune state writes instead of scanning the full state table
+for every flush. Existing v2 state tables receive an in-place metadata patch;
+BigQuery reclusters their rows in the background without a copy/swap window or
+lost concurrent writes. The schema-changing v1 migration keeps its verified
+replacement path.
+
 ### Native llm models stream inputs and resume ids (issue #424)
 
 Native `llm:` models no longer load their entire upstream relation, build a
@@ -15,7 +41,9 @@ The eager classification pass preserves two cost-safety contracts: invalid ids
 still fail before the first provider call, and `max_documents` still rejects
 an over-cap run before any partial publication. Streamed and whole-frame input
 fingerprints are pinned as equivalent so upgrading cannot silently regenerate
-an existing corpus at provider cost.
+an existing corpus at provider cost. When `id_field` and `input_field` name the
+same upstream column, projected reads retain it once, preserving configurations
+that were valid before streaming.
 
 ### Concurrent provider work no longer multiplies execution-budget caps (issue #435)
 

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### BigQuery snapshots keep wide payloads off the REST result path (issue #441)
+
+BigQuery's bounded table snapshot opened its query with a one-row Arrow schema
+probe over jobs.getQueryResults. On a multi-million-row relation projecting a
+768-dimensional vector and full chunk text, BigQuery rejected that REST result
+as too large before search publication could read its first batch. The payload
+iterator also passed no Storage Read client, so it retained a second REST
+fallback after the probe.
+
+Schema discovery now requests zero rows while retaining the typed Arrow schema.
+The payload is streamed through one explicitly owned BigQuery Storage Read
+client with one download stream and one queued page, and the client is closed
+with the adapter. Snapshot generation checks, projection, predicate binding,
+typed empty results, and early cancellation remain unchanged. Generic snapshot
+open failures now add only the sanitized native exception type to their public
+message; native warehouse text, SQL, and row values remain hidden.
+
 ## v0.15.0 - 2026-08-31
 
 ### BigQuery user ADC keeps the scopes it was granted

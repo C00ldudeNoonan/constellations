@@ -53,6 +53,7 @@ from stel.adapters.bigquery import (
     BigQueryAdapter,
     BigQueryWarehouseConfig,
     BigQueryWarehouseOptions,
+    _coalesced_batches,
     to_query_parameters,
 )
 from stel.config.identifiers import LEGACY_SCHEMA_NAME
@@ -4534,3 +4535,96 @@ def test_key_validation_carries_the_read_predicates() -> None:
     validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
     assert "WHERE" in validation_sql
     assert "WHERE" in payload_sql
+
+
+# ─── snapshot page size (issue #452) ────────────────────────────────────────
+#
+# The Storage Read API sizes its own Arrow batches, and on a wide table it
+# sizes them small — ~262 rows against a configured 25,000 in production, for a
+# 768-float vector plus full chunk text. Sub-slicing alone made `batch_size` an
+# upper bound rather than a target, so 145 pages became 13,794 and ~9 minutes
+# of fixed publish round-trip became ~14 hours.
+#
+# These assert pages are `batch_size`, not merely *at most* it — the weaker
+# assertion is what let this ship.
+
+
+def _server_batches(rows: int, per_batch: int) -> list[pa.RecordBatch]:
+    """A stream shaped like the service's: many batches, all under batch_size."""
+    return [
+        pa.RecordBatch.from_pydict(
+            {"id": [f"r{index}" for index in range(start, min(start + per_batch, rows))]}
+        )
+        for start in range(0, rows, per_batch)
+    ]
+
+
+def test_small_server_batches_are_coalesced_to_the_configured_page() -> None:
+    """The #452 regression. 200 rows arriving 2 at a time must publish as four
+    pages of 50, not a hundred pages of 2."""
+    pages = list(_coalesced_batches(iter(_server_batches(200, 2)), [0], 50))
+    assert [page.num_rows for page in pages] == [50, 50, 50, 50]
+
+
+def test_coalescing_preserves_every_row_in_order() -> None:
+    """Repacking must not lose or reorder rows: the publish loop keys on them."""
+    pages = list(_coalesced_batches(iter(_server_batches(97, 3)), [0], 25))
+    seen = [value for page in pages for value in page.column(0).to_pylist()]
+    assert seen == [f"r{index}" for index in range(97)]
+    assert [page.num_rows for page in pages] == [25, 25, 25, 22]
+
+
+def test_an_oversized_server_batch_carries_its_remainder() -> None:
+    """A remainder emitted short rather than carried would alternate full and
+    stub pages whenever the server's size does not divide `batch_size`."""
+    pages = list(_coalesced_batches(iter(_server_batches(120, 40)), [0], 25))
+    assert [page.num_rows for page in pages] == [25, 25, 25, 25, 20]
+
+
+def test_a_server_batch_larger_than_the_page_is_split() -> None:
+    pages = list(_coalesced_batches(iter(_server_batches(100, 100)), [0], 30))
+    assert [page.num_rows for page in pages] == [30, 30, 30, 10]
+
+
+def test_an_empty_stream_yields_nothing() -> None:
+    assert list(_coalesced_batches(iter([]), [0], 25)) == []
+
+
+def test_coalescing_applies_the_projection() -> None:
+    """The projection is positional against the session schema, which the
+    service does not promise to return in the requested order (issue #441)."""
+    batches = [
+        pa.RecordBatch.from_pydict({"a": [1, 2], "b": ["x", "y"]}),
+        pa.RecordBatch.from_pydict({"a": [3], "b": ["z"]}),
+    ]
+    pages = list(_coalesced_batches(iter(batches), [1], 3))
+    assert [page.schema.names for page in pages] == [["b"]]
+    assert pages[0].column(0).to_pylist() == ["x", "y", "z"]
+
+
+def test_a_snapshot_read_publishes_full_pages_end_to_end() -> None:
+    """Through the adapter, not just the helper: the fake serves the payload's
+    own chunking, so a table built from small batches reproduces the service's
+    shape."""
+    small = [
+        pa.RecordBatch.from_pydict({"chunk_id": [f"c{index}", f"c{index + 1}"]})
+        for index in range(0, 40, 2)
+    ]
+    payload = pa.Table.from_batches(small)
+    assert len(payload.to_batches()) == 20, "the fixture must serve small batches"
+
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 40}
+    adapter = _adapter(client)
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot(
+        "chunks", columns=("chunk_id",), batch_size=10
+    ) as snapshot:
+        pages = [batch.num_rows for batch in snapshot]
+
+    assert pages == [10, 10, 10, 10], (
+        f"pages were {pages}; the Storage Read stream's own batch sizes are "
+        "reaching the publish loop instead of the configured batch_size (#452)"
+    )

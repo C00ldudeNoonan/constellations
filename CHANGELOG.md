@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Snapshot reads honor `batch_size` again (issue #452)
+
+#441 moved BigQuery snapshots onto the Storage Read API, which sizes its own
+Arrow batches — and on a wide table it sizes them small. The batch generator
+only sub-sliced what the server handed it, never accumulated, so `batch_size`
+became an upper bound rather than a target. The old query path had honored it
+through `job.result(page_size=...)`; the direct path had no equivalent.
+
+Measured on a production corpus: ~262 rows per page against a configured
+25,000. The publish loop does fixed work per page — two ledger reads and a
+MERGE, ~3.7s — so 145 pages became 13,794, turning ~9 minutes of round-trip
+into ~14 hours, and throughput fell below what the same corpus managed before
+#441.
+
+- Server batches are now coalesced up to `batch_size` before being emitted, and
+  the remainder of an oversized page is carried rather than emitted short, so a
+  stream of large batches does not alternate full and stub pages.
+- Residency is still bounded by `batch_size`. A drain briefly holds the page
+  twice, since combining copies the accumulated chunks into contiguous buffers.
+- The reporter's GCS throttling on the same run is very likely downstream of
+  this: 13,794 tiny upserts produce far more Lance data files, and far more
+  GETs to merge them, than 145 large ones. Worth re-checking before treating it
+  as its own bug.
+
 ### A failed search publish no longer takes a healthy index offline (issue #449)
 
 A publication that failed cleared the ledger's `active_generation`

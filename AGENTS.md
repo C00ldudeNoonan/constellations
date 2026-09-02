@@ -18,6 +18,9 @@ Use these maintained references rather than copying volatile feature lists:
   shipped behavior and user guidance.
 - `CONTRIBUTING.md` — extension contracts and contributor workflow.
 - `docs/release.md` — release process.
+- `docs/adr/` — decision records: what was ruled out and why. Read the index
+  before revisiting a design that looks arbitrary, and add one when a decision
+  had a real alternative a contributor would plausibly try.
 - GitHub issues labeled `roadmap` — planning context. Verify every claim against
   current code, tests, and user docs before describing it as implemented.
 

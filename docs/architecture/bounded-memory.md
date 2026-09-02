@@ -10,30 +10,45 @@ run whose input does not fit in RAM should still finish.
 
 ### The key term is real, and deliberate
 
-The third term is not a rounding error and should not be read as one. Stages
-that reconcile deletions hold every id at once: `_stream_upstream_ids`,
-`_stream_document_ids`, and the native llm input plan retain a `set[str]` of
-the upstream keys. A resuming embed or llm run also retains the existing
-target's typed-id map. Measured, a Python string set costs ~108 bytes per id:
+The third term is not a rounding error and should not be read as one, though
+it is smaller than it was. Measured, a Python string set costs ~108 bytes per
+id:
 
-| corpus | one key set | a resuming embed/llm run (two) |
+| corpus | one key set | two (a resuming run) |
 |---|---|---|
 | 200k rows | 21 MB | 42 MB |
 | 3.6M rows | ~370 MB | ~740 MB |
 
-What the fixes bought is that this scales with row *count* and not row *width*
-— for the 3.6M-chunk corpus, ~370MB of ids instead of ~7GB of text and vectors.
-That is the difference between a run that finishes in a 4GB container and one
-that cannot finish at all. But it is not constant, and an operator sizing a
-container needs the number rather than the word "bounded".
+**Removal detection no longer pays it.** Chunk and embed reconciled deletions
+by set difference in Python, holding both key domains however little had
+changed. Issue #428 moved that into the warehouse as a paged anti-join: the
+engine evaluates absence and yields only the keys to delete, one bounded page
+at a time, so an unchanged corpus surfaces nothing and emptying an upstream
+entirely still costs a page rather than the corpus.
 
-Eliminating it means pushing removal detection into the warehouse as an
-anti-join rather than a Python set difference — tracked as issue #428.
+Two exceptions survive, and an operator sizing a container needs both:
+
+- **An id column the engine cannot cast identically to Python's `str()`** —
+  booleans, floats, temporals — reconciles in Python and does hold the id
+  domain. State keys are written as `str(value)`; DuckDB and BigQuery both
+  cast a boolean to `true` where Python writes `True`, and an anti-join on
+  that mismatch would report every unchanged row as absent and delete it. A
+  string or integer id stays on the bounded path.
+- **The fingerprint comparison** — the incremental state a stage compares
+  against, and on a resuming embed the map from state key to the target's
+  typed id. Both scale with row count rather than row width, which is what
+  makes a large corpus finish at all, but neither is constant.
+
+What that width-independence buys is real: for the 3.6M-chunk corpus, ~370MB
+of ids rather than ~7GB of text and vectors — the difference between a run
+that finishes in a 4GB container and one that cannot finish at all.
 
 **The residency tests do not cover this term.** They measure the largest single
 frame or batch an adapter hands a stage, which is exactly the O(corpus bytes)
 failure the incidents were; a cumulative container is invisible to them. That
-limitation is why the term is written down here.
+limitation is why the term is written down here — and why #428 shipped its own
+measurement instead: two tests count the keys the anti-join actually surfaces
+to Python, which is a cumulative quantity the residency harness cannot see.
 
 This is stated as an invariant rather than left as a property of each stage
 because the same root cause kept reaching different stages, and each fix was

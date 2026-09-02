@@ -278,6 +278,24 @@ verification inside the adapter, and advertise
 contract tests cover multi-page domains, empty scopes, cursor misuse,
 interleaved deletions, and fenced-replacement rollback.
 
+## Recording a decision
+
+When a change makes a call that had a real alternative — one a competent
+contributor would plausibly try — write a decision record in `docs/adr/`.
+Start from `docs/adr/0000-template.md`, add a row to the index, and link it
+from the issue or PR that prompted it.
+
+The section that pays for the practice is **Alternatives considered**: each
+option that was genuinely on the table, ending in the specific reason it lost.
+A measured negative result — "we tried it and it cost X" — is the highest-value
+thing in the repository and the first thing lost to time, so cite the number
+and say where it came from.
+
+Records are numbered and immutable. Superseding one means writing the next and
+marking the old superseded, never editing a decision in place; how the thinking
+changed is the record's value. Not every change needs one, and a change with no
+rejected alternative is just the code.
+
 ## Commit style
 
 Conventional commits not required, but tight subject lines please:

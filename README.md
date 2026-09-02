@@ -205,6 +205,9 @@ third-party projects or sensitive documents.
 - **[Warehouse-native SQL models](docs/architecture/sql-models.md)**
   — implemented `transform.type: sql` contract (compiled `ref()`, the SQL/Jinja
   trust boundary, and full/incremental adapter materialization).
+- **[Decision records](docs/adr/README.md)**
+  — numbered, append-only records of decisions that had a real alternative,
+  and the specific reason it lost.
 - **[Changelog](CHANGELOG.md)**
 
 ## License

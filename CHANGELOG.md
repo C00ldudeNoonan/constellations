@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.15.4 - 2026-09-02
+
 ### Snapshot reads honor `batch_size` again (issue #452)
 
 #441 moved BigQuery snapshots onto the Storage Read API, which sizes its own

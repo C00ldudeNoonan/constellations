@@ -27,6 +27,7 @@ from ..adapters import (
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
+    StateAbsenceProbe,
     StateRecord,
     StateScope,
     StateValue,
@@ -41,6 +42,7 @@ from ..embedding import EmbeddingIdentity, embed_texts, estimate_embed_requests
 from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
 from ..progress import get_reporter
+from ..state_reconciliation import iter_validated_state_pages
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
@@ -58,6 +60,9 @@ log = logging.getLogger(__name__)
 # so it can afford a wide batch; the row pass carries the full record, text
 # included, so it stays an order of magnitude smaller.
 _ID_BATCH_ROWS = 100_000
+# Removals page through the warehouse anti-join; bounded like any other
+# state read, and small by construction (issue #428).
+_REMOVAL_PAGE_ROWS = 10_000
 _INPUT_BATCH_ROWS = 10_000
 
 
@@ -133,7 +138,7 @@ def run_embed_model(
     # the embedding loop rather than folded into it so a NULL, empty, or
     # duplicate id still fails the run before the first provider call instead
     # of after the corpus has been paid for.
-    current_ids, upstream_rows = _stream_upstream_ids(
+    upstream_rows = _validate_upstream_ids(
         adapter, upstream, config.id_field, model.name, predicates=read_predicates
     )
     embedding_options = resolve_embedding_options(config.provider, resolved)
@@ -180,7 +185,13 @@ def run_embed_model(
     # A subset run reads a deliberate slice of the upstream, so every id
     # outside the slice would look removed; reconciliation belongs to the
     # next unfiltered run (issue #417).
-    removed = sorted(set(processed_state) - current_ids) if not subset_run else []
+    removed = (
+        _removed_state_keys(
+            adapter, state_scope, upstream=upstream, id_field=config.id_field
+        )
+        if not subset_run and is_incremental and not rebuild_target
+        else []
+    )
     removed_target_keys: list[Any] = (
         [
             key
@@ -531,47 +542,58 @@ def run_embed_model(
     )
 
 
-def _stream_upstream_ids(
+def _validate_upstream_ids(
     adapter: WarehouseAdapter,
     table: str,
     id_field: str,
     model_name: str,
     predicates: Sequence[ReadPredicate] = (),
-) -> tuple[set[str], int]:
-    """Validate the upstream id column and return its distinct ids and row count.
+) -> int:
+    """Validate the upstream id column and return its row count.
 
-    One projected, streamed pass (issue #410). Residency is proportional to the
-    *key count*, not the row width -- the same trade `_EmbeddingReuseReader`
-    already makes for the target -- so a corpus whose rows carry long text
-    costs a set of ids here rather than a frame of everything.
+    One projected, streamed pass (issue #410) that keeps **no** id (issue
+    #428). It used to accumulate a `set[str]` of every distinct id, purely so
+    the caller could subtract it from the state keys to find removals; that
+    set was the last O(corpus) term in the bounded-memory contract, measured
+    at ~370MB over 3.6M rows and ~740MB on a resume, spent before any work
+    began. Removal detection is a warehouse anti-join now
+    (`_removed_state_keys`), so nothing here has to remember what it saw.
 
-    Deliberately eager rather than folded into the embedding loop: NULL, empty
-    and duplicate ids are contract violations the run should die on before it
-    has paid a provider for a single call.
+    NULL and empty ids are still counted while streaming, which costs two
+    integers. Duplicates cannot be found that way without holding the domain,
+    so `key_column` hands that check to the warehouse: both adapters evaluate
+    it as one aggregate over the key alone at snapshot open.
+
+    Still deliberately eager: these are contract violations the run should die
+    on before it has paid a provider for a single call, and snapshot open --
+    where the key-domain aggregate runs -- is before the first batch, let
+    alone the first embedding.
     """
-    ids: set[str] = set()
     total = 0
     null_count = 0
     empty_count = 0
-    with adapter.table_snapshot(
-        table,
-        columns=[id_field],
-        batch_size=_ID_BATCH_ROWS,
-        predicate=list(predicates),
-    ) as snapshot:
-        for batch in snapshot:
-            frame = pl.from_arrow(batch)
-            assert isinstance(frame, pl.DataFrame)
-            for value in frame[id_field].to_list():
-                total += 1
-                if value is None:
-                    null_count += 1
-                    continue
-                record_id = str(value)
-                if not record_id:
-                    empty_count += 1
-                    continue
-                ids.add(record_id)
+    try:
+        with adapter.table_snapshot(
+            table,
+            columns=[id_field],
+            batch_size=_ID_BATCH_ROWS,
+            predicate=list(predicates),
+            key_column=id_field,
+        ) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for value in frame[id_field].to_list():
+                    total += 1
+                    if value is None:
+                        null_count += 1
+                    elif not str(value):
+                        empty_count += 1
+    except AdapterError as error:
+        raise RunError(
+            f"Embed model '{model_name}': upstream `{id_field}` is not a valid "
+            f"key domain ({error})"
+        ) from None
     if null_count:
         raise RunError(
             f"Embed model '{model_name}': upstream `{id_field}` contains "
@@ -582,13 +604,35 @@ def _stream_upstream_ids(
             f"Embed model '{model_name}': upstream `{id_field}` contains "
             f"{empty_count} empty value(s)"
         )
-    duplicate_count = total - len(ids)
-    if duplicate_count:
-        raise RunError(
-            f"Embed model '{model_name}': upstream `{id_field}` contains "
-            f"{duplicate_count} duplicate value(s)"
-        )
-    return ids, total
+    return total
+
+
+def _removed_state_keys(
+    adapter: WarehouseAdapter,
+    scope: StateScope,
+    *,
+    upstream: str,
+    id_field: str,
+) -> list[str]:
+    """State keys with no matching upstream row, found by the warehouse.
+
+    The anti-join #428 asks for. The engine evaluates absence and returns only
+    the keys to delete, which is small by construction -- a run that removed
+    nothing pages through nothing -- where the set difference it replaces cost
+    the whole key domain on both sides regardless of how little changed.
+
+    Pages are bounded and arrive in ascending key order, so the result needs
+    no sort. `state_page_reader` holds one snapshot across pages, so a
+    concurrent write cannot make the scan skip or repeat a key.
+    """
+    probe = StateAbsenceProbe(table=upstream, key_column=id_field)
+    removed: list[str] = []
+    with adapter.state_page_reader(
+        scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
+    ) as reader:
+        for page in iter_validated_state_pages(reader):
+            removed.extend(record.record_key for record in page)
+    return removed
 
 
 class _EmbeddingReuseReader:

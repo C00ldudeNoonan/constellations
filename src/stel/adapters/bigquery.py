@@ -3620,10 +3620,16 @@ class BigQueryAdapter(WarehouseAdapter):
                     "State absence probe relation "
                     f"'{probe.table}.{probe.key_column}' is unavailable"
                 )
+            # `record_key` is always a STRING, because state keys are the
+            # stringified id. The probe column need not be -- a numeric id is
+            # a supported contract for embed -- and BigQuery refuses to
+            # compare STRING to INT64 rather than coercing, so the cast is
+            # what lets removal detection run against a typed key at all
+            # (issue #428).
             absence_sql = (
                 " AND NOT EXISTS (SELECT 1 FROM "
                 f"{self.table_ref(probe.table)} AS probe FOR SYSTEM_TIME AS OF ? "
-                f"WHERE probe.{self.quote_ident(probe.key_column)} = "
+                f"WHERE CAST(probe.{self.quote_ident(probe.key_column)} AS STRING) = "
                 "state.record_key)"
             )
         nonce = uuid4().hex

@@ -21,6 +21,7 @@ from stel.retrieval import (
 )
 from stel.retrieval.coordination import (
     RECOVERY_ERROR_CODE,
+    STATUS_DEGRADED,
     STATUS_FAILED,
     STATUS_PUBLISHING,
     STATUS_READY,
@@ -654,7 +655,10 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
         ],
     )
     assert recovered.exit_code == 0, recovered.output
-    assert "status=failed" in recovered.output
+    # Degraded, not failed: the crashed publisher never wrote the generation
+    # that was live, so recovery leaves it serving queries while the failure
+    # stays on the record (issue #449).
+    assert "status=degraded" in recovered.output
 
     results = run_project(project)
     assert results[-1].serving_resource is not None
@@ -1160,9 +1164,12 @@ def test_a_query_lease_pins_the_collection_it_resolved(coordinator: Any) -> None
     coordinator.release_query(query)
 
 
-def test_failure_clears_the_activation_pointer_with_the_generation(
+def test_an_in_place_failure_clears_both_pointers_and_stops_serving(
     coordinator: Any,
 ) -> None:
+    """An in-place publish writes into the collection the pointer names, so a
+    failure may have corrupted what was live. Neither pointer can be trusted
+    and nothing may be served — the case `degraded` deliberately excludes."""
     scope = _scope()
     lease = coordinator.acquire_publish(
         scope, expected_code_version="v1", config_fingerprint="cfg1"
@@ -1182,19 +1189,101 @@ def test_failure_clears_the_activation_pointer_with_the_generation(
     entry = coordinator.status(scope)
     assert entry.status == STATUS_FAILED
     assert entry.active_collection is None
-    # Safe only because a failed row is refused to readers; a private-generation
-    # rebuild will have to preserve the pointer instead.
+    assert entry.active_generation is None
     with pytest.raises(ServingNotReadyError):
         coordinator.acquire_query(scope)
 
 
-def test_recover_preserves_the_activation_pointer(coordinator: Any) -> None:
-    """Recovery must not strand a generation-served index.
+def test_a_rebuild_failure_keeps_serving_the_previous_generation(
+    coordinator: Any,
+) -> None:
+    """The common case #449 is about, and the one that does not need a crash:
+    a private generation build writes where nothing reads, so its failure
+    leaves the live generation correct. The index keeps answering from it."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    retry = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    # What search.py passes on a rebuild: both pointers handed back.
+    coordinator.mark_failed(
+        retry,
+        safe_error_code="publish_failed",
+        active_collection="proj__dev__ctx__ga1b2",
+        active_generation="gen1",
+    )
 
-    It rebuilds the ledger row, so the pointer has to be carried across. The
-    scope stays failed either way — this only keeps the record of which
-    physical collection holds the data, which a republish or a retirement
-    sweep needs to avoid dropping the live generation.
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
+    assert entry.safe_error_code == "publish_failed"
+
+    query = coordinator.acquire_query(scope)
+    assert query.pinned_generation == "gen1"
+    assert query.pinned_collection == "proj__dev__ctx__ga1b2"
+    coordinator.release_query(query)
+
+
+def test_a_successful_publish_clears_degraded(coordinator: Any) -> None:
+    """Degraded is not sticky: the point is that it heals on the next publish
+    that works, without an operator having to clear anything."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    failed = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_failed(
+        failed,
+        safe_error_code="publish_failed",
+        active_collection="proj__dev__ctx__ga1b2",
+        active_generation="gen1",
+    )
+    assert coordinator.status(scope).status == STATUS_DEGRADED
+
+    retry = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg2"
+    )
+    coordinator.mark_ready(
+        retry,
+        active_generation="gen2",
+        config_fingerprint="cfg2",
+        counts=(3, 0, 0, 0),
+        active_collection="proj__dev__ctx__gc3d4",
+    )
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_READY
+    assert entry.active_generation == "gen2"
+    assert entry.safe_error_code is None
+
+
+def test_recover_keeps_serving_the_generation_it_recovered(coordinator: Any) -> None:
+    """Recovery must not take a healthy index offline.
+
+    It rebuilds the ledger row, so both activation pointers have to be carried
+    across (issues #355, #449). A crashed publisher was writing a *new*
+    generation; the one that was live is untouched, so the scope is left
+    `degraded` — still answering queries from it — rather than `failed`, which
+    admits nothing until the next successful publish. On a large corpus that
+    is hours of a working index being unavailable for no reason.
     """
     scope = _scope()
     lease = coordinator.acquire_publish(
@@ -1210,8 +1299,32 @@ def test_recover_preserves_the_activation_pointer(coordinator: Any) -> None:
 
     entry = coordinator.recover(scope, owner_terminated=True)
 
-    assert entry.status == STATUS_FAILED
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
     assert entry.active_collection == "proj__dev__ctx__ga1b2"
-    # Still unreadable, so preserving the pointer changes nothing for readers.
+    # The failure stays on the record: degraded must not read as healthy.
+    assert entry.safe_error_code == RECOVERY_ERROR_CODE
+
+    # And the index actually answers, pinned to the generation it recovered.
+    query = coordinator.acquire_query(scope)
+    assert query.pinned_generation == "gen1"
+    assert query.pinned_collection == "proj__dev__ctx__ga1b2"
+    coordinator.release_query(query)
+
+
+def test_recover_leaves_a_scope_with_no_generation_failed(coordinator: Any) -> None:
+    """The other half: an in-place publish's failure already cleared the
+    generation because it may have corrupted what was live. There is nothing
+    safe to serve, so recovery leaves the scope failed and admits nothing."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_failed(lease, safe_error_code="store_error")
+
+    entry = coordinator.recover(scope, owner_terminated=True)
+
+    assert entry.status == STATUS_FAILED
+    assert entry.active_generation is None
     with pytest.raises(ServingNotReadyError):
         coordinator.acquire_query(scope)

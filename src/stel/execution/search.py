@@ -133,7 +133,13 @@ def run_search_model(
             )
             # A null activation pointer means the unsuffixed default, which is
             # what every index published before generations existed uses.
-            active_collection = coordinator.status(state_scope).active_collection
+            serving_entry = coordinator.status(state_scope)
+            active_collection = serving_entry.active_collection
+            # The generation serving queries before this publish. A rebuild
+            # that fails hands it back so the index keeps answering from it
+            # (issue #449); an in-place publish must not, having written into
+            # what it names.
+            previous_generation = serving_entry.active_generation
             default_collection = store.physical_collection(logical_collection)
             rebuild = _rebuild_requested(
                 model, full_refresh=full_refresh
@@ -459,9 +465,13 @@ def run_search_model(
                 error,
                 counts=(inserted, updated, skipped, deleted),
                 # A rebuild builds where nothing is reading, so a failure
-                # leaves the previous generation intact and still correct.
-                # An in-place publish may have corrupted what it wrote into.
+                # leaves the previous generation intact and still correct --
+                # both pointers survive, and the scope stays servable from
+                # that generation (issues #355, #449). An in-place publish may
+                # have corrupted what it wrote into, so neither pointer may be
+                # trusted and the scope goes unavailable.
                 active_collection=active_collection if rebuild else None,
+                active_generation=previous_generation if rebuild else None,
             )
         if isinstance(error, RunError):
             raise
@@ -633,6 +643,7 @@ def _mark_search_publication_failed(
     *,
     counts: tuple[int, int, int, int],
     active_collection: str | None = None,
+    active_generation: str | None = None,
 ) -> None:
     """Record the failure under a safe code; a stale fence has nothing to record."""
     if isinstance(error, ServingCoordinationError):
@@ -649,6 +660,7 @@ def _mark_search_publication_failed(
             safe_error_code=code,
             counts=counts,
             active_collection=active_collection,
+            active_generation=active_generation,
         )
 
 

@@ -2491,9 +2491,25 @@ stel serving recover chunk_search --owner-terminated
 ```
 
 Recovery advances the fencing token (so a surviving zombie fails its next
-check), clears leases, and leaves the scope failed until the next `stel run`
-republishes it. After upgrading to this contract, run `stel run` once per
-search index to establish its ledger before querying.
+check) and clears leases. It grants nobody publication authority — a new
+publisher still claims the scope in the ordinary way. After upgrading to this
+contract, run `stel run` once per search index to establish its ledger before
+querying.
+
+A failed or recovered publication does not necessarily stop queries. A
+generation build writes to a collection nothing is reading, so its failure
+leaves the previously-active generation correct, and the scope is left
+`degraded`: it keeps answering queries from that generation, and the recorded
+`safe_error_code` stays visible in `stel serving status` so a pipeline that
+has been broken for days does not hide behind a working endpoint. The next
+successful publish returns it to `ready` with no operator action.
+
+An in-place publish is the exception. It writes into the collection the
+activation pointer names, so a failure there may have corrupted what was
+live; both pointers are cleared, the scope becomes `failed`, and queries are
+refused until a successful republish. `--full-refresh` and a rebuild-forcing
+config change both take the generation path, so the common failure leaves the
+index serving.
 
 #### Migrating the serving scope
 

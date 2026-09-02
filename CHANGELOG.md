@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### A failed search publish no longer takes a healthy index offline (issue #449)
+
+A publication that failed cleared the ledger's `active_generation`
+unconditionally, and queries admit only on a named generation — so any failed
+publish, and any `stel serving recover` after a crashed one, took a
+previously-healthy index out of service until the next successful publish. On
+a large corpus that is hours of avoidable downtime, and it lands exactly when
+a publish is most likely to be interrupted: a long one.
+
+The generation pointer now carries the same asymmetry `active_collection`
+already had (#355). A private generation build writes where nothing is
+reading, so its failure leaves the previously-active generation untouched and
+still correct; both pointers survive and the scope is left `degraded`, still
+serving queries from that generation. An in-place publish writes into the
+collection the pointer names, so a failure there may have corrupted what was
+live: both pointers are cleared and the scope becomes `failed`, refusing
+queries as before. `stel serving recover` follows the same rule.
+
+`degraded` always retains its `safe_error_code`, so a broken pipeline stays
+visible in `stel serving status` rather than hiding behind a working endpoint,
+and it heals on the next successful publish with no operator action.
+
 ## v0.15.3 - 2026-09-01
 
 ### pypdf floor raised to 6.16.1 for three CVEs

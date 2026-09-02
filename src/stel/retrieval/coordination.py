@@ -47,6 +47,16 @@ STATUS_PUBLISHING = "publishing"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 STATUS_UNPUBLISHED = "unpublished"
+# A publication failed, but the generation that was live before it is intact
+# and still named, so queries keep being served from it (issue #449). The
+# distinction from `failed` is what the scope can still do, not how bad the
+# failure was: `degraded` always carries its `safe_error_code` too, so a
+# pipeline that has been broken for days is visible in `stel serving status`
+# rather than hidden behind a working endpoint.
+STATUS_DEGRADED = "degraded"
+# The statuses a query may be served from. `degraded` qualifies because the
+# generation it names was never written by the publication that failed.
+SERVABLE_STATUSES = (STATUS_READY, STATUS_DEGRADED)
 
 RECOVERY_ERROR_CODE = "administrative_recovery"
 
@@ -558,26 +568,30 @@ class ServingCoordinator:
         safe_error_code: str,
         counts: tuple[int, int, int, int] = (0, 0, 0, 0),
         active_collection: str | None = None,
+        active_generation: str | None = None,
     ) -> None:
-        """Record a failed publication; the scope becomes unavailable to queries.
+        """Record a failed publication, retaining the previous generation when
+        the failure cannot have touched it.
 
-        The active generation is always cleared: an in-place publish that
-        failed midway may have mutated it, and there is no way to tell from
-        here whether it did.
+        Both pointers carry the same asymmetry, for the same reason (issues
+        #355, #449). An in-place publish writes into the collection the
+        pointer names, so a failure there may have corrupted what was live:
+        both pointers must go, and the scope becomes unavailable to queries —
+        the default. A private generation build writes where nothing is
+        reading, so a failure leaves the previously-active generation
+        untouched and still correct; that path passes both existing pointers
+        back, and the scope stays servable as `degraded`.
 
-        `active_collection` is the asymmetry (issue #355). An in-place publish
-        writes into the collection the pointer names, so a failure there may
-        have corrupted it and the pointer must go — the default. A private
-        generation build writes somewhere nothing is reading; a failure leaves
-        the previous generation untouched and still correct, so that path
-        passes the existing pointer to keep it. Clearing it there would drop a
-        healthy generation out of resolution and force a full re-embed, which
-        is the cost issue #355 exists to avoid.
+        Clearing them on a rebuild would drop a healthy generation out of
+        resolution and force a full re-embed — the cost #355 exists to avoid —
+        and, because queries admit only on a named generation, would also take
+        a working index offline until the next successful publish, which on a
+        large corpus is hours away (#449).
         """
         self._finish(
             lease,
-            status=STATUS_FAILED,
-            active_generation=None,
+            status=STATUS_DEGRADED if active_generation else STATUS_FAILED,
+            active_generation=active_generation or None,
             active_collection=active_collection,
             safe_error_code=validate_safe_error_code(safe_error_code),
             counts=counts,
@@ -634,7 +648,7 @@ class ServingCoordinator:
             raise ServingBusyError(
                 "A publisher is reconciling this search index; retry after it completes"
             )
-        if row[1] != STATUS_READY or row[5] is None:
+        if row[1] not in SERVABLE_STATUSES or row[5] is None:
             raise ServingNotReadyError(
                 "This search index has no ready publication; re-run `stel run` "
                 "and resolve any recorded failure first"
@@ -656,7 +670,7 @@ class ServingCoordinator:
             WHERE EXISTS (
                 SELECT 1 FROM {ledger}
                 WHERE model_name = ? AND stage = ? AND target_identity = ?
-                  AND status = ? AND publication_id IS NULL
+                  AND status IN (?, ?) AND publication_id IS NULL
                   AND fencing_token = ? AND active_generation = ?
             )
             """,
@@ -667,7 +681,7 @@ class ServingCoordinator:
                 pinned_generation,
                 config_fingerprint,
                 *self._scope_params(scope),
-                STATUS_READY,
+                *SERVABLE_STATUSES,
                 fencing_token,
                 pinned_generation,
             ],
@@ -696,12 +710,12 @@ class ServingCoordinator:
         return lease
 
     def validate_query(self, lease: QueryLease) -> None:
-        """Re-verify the pinned generation is still the ready, fenced one."""
+        """Re-verify the pinned generation is still the served, fenced one."""
         row = self._read_row(lease.scope)
         if (
             row is None
             or int(row[0]) != lease.fencing_token
-            or row[1] != STATUS_READY
+            or row[1] not in SERVABLE_STATUSES
             or row[2] is not None
             or row[5] != lease.pinned_generation
         ):
@@ -721,9 +735,14 @@ class ServingCoordinator:
         """Explicitly reassign authority after every old owner is terminated.
 
         There is no timeout-based stealing: the operator asserts termination,
-        the fence advances so any surviving zombie fails its next
-        verification, and the scope is left failed until a fresh publication
-        succeeds.
+        and the fence advances so any surviving zombie fails its next
+        verification. Recovery grants nobody publication authority — a new
+        publisher still has to claim the scope in the ordinary way.
+
+        The scope is left `degraded` rather than `failed` when a previously
+        active generation survives, so queries keep being served from it while
+        the recorded failure stays visible (issue #449). Only a scope with no
+        servable generation is left `failed`.
         """
         if not owner_terminated:
             raise ServingCoordinationError(
@@ -731,28 +750,55 @@ class ServingCoordinator:
                 "re-run with the owner-terminated confirmation"
             )
         ledger = self._ref(LEDGER_TABLE)
-        # Recovery rebuilds the row, so the activation pointer has to be read
-        # before it is deleted and carried across (issue #355). Losing it
-        # would strand a generation-served index: the pointer is the only
-        # record of which physical collection is live, and without it the
-        # logical name falls back to the unsuffixed default, which for a
-        # generation build does not hold the data. The scope is left failed
-        # either way, so carrying it forward is inert for readers — it just
-        # keeps the information a republish or a retirement sweep needs.
+        # Recovery rebuilds the row, so the activation pointers have to be
+        # read before it is deleted and carried across (issues #355, #449).
+        # Losing them strands a generation-served index: `active_collection`
+        # is the only record of which physical collection is live, and
+        # `active_generation` is what a query admits on, so dropping either
+        # takes a healthy index offline until the next successful publish —
+        # hours, on a large corpus. `config_fingerprint` comes along because
+        # query admission pins it into the lease.
+        #
+        # All three are read from one row rather than independently: pairing a
+        # generation with another row's collection would name a pointer pair
+        # that was never live together.
+        #
         # Read tolerantly: recovery also repairs a ledger corrupted by
         # duplicate creation races, and `_read_row` refuses exactly that case.
         # Among duplicates the highest fence is the one that got furthest.
         pointer = self._adapter.rows(
             f"""
-            SELECT active_collection FROM {ledger}
+            SELECT active_generation, active_collection, config_fingerprint
+            FROM {ledger}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
-              AND active_collection IS NOT NULL
+              AND active_generation IS NOT NULL
             ORDER BY fencing_token DESC
             LIMIT 1
             """,
             self._scope_params(scope),
         )
-        active_collection = str(pointer[0][0]) if pointer else None
+        if pointer:
+            active_generation: str | None = str(pointer[0][0])
+            active_collection = None if pointer[0][1] is None else str(pointer[0][1])
+            config_fingerprint = None if pointer[0][2] is None else str(pointer[0][2])
+        else:
+            # No servable generation survives -- an in-place publish's failure
+            # already cleared it, or the scope never had one. Fall back to any
+            # surviving collection pointer so a republish and the retirement
+            # sweep still know what is out there.
+            legacy = self._adapter.rows(
+                f"""
+                SELECT active_collection FROM {ledger}
+                WHERE model_name = ? AND stage = ? AND target_identity = ?
+                  AND active_collection IS NOT NULL
+                ORDER BY fencing_token DESC
+                LIMIT 1
+                """,
+                self._scope_params(scope),
+            )
+            active_generation = None
+            active_collection = str(legacy[0][0]) if legacy else None
+            config_fingerprint = None
         self._adapter.execute(
             f"""
             DELETE FROM {self._ref(LEASE_TABLE)}
@@ -781,19 +827,22 @@ class ServingCoordinator:
             f"""
             INSERT INTO {ledger} (
                 model_name, stage, target_identity, row_id, fencing_token,
-                status, safe_error_code, active_collection, rows_inserted,
+                status, safe_error_code, active_generation, active_collection,
+                config_fingerprint, rows_inserted,
                 rows_updated, rows_skipped, rows_deleted, completed_at
             )
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP
             FROM (SELECT 1) AS seed
             """,
             [
                 *self._scope_params(scope),
                 uuid4().hex,
                 next_fence,
-                STATUS_FAILED,
+                STATUS_DEGRADED if active_generation else STATUS_FAILED,
                 RECOVERY_ERROR_CODE,
+                active_generation,
                 active_collection,
+                config_fingerprint,
             ],
         )
         return self.status(scope)

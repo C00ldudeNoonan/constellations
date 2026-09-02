@@ -133,7 +133,16 @@ def run_search_model(
             )
             # A null activation pointer means the unsuffixed default, which is
             # what every index published before generations existed uses.
-            active_collection = coordinator.status(state_scope).active_collection
+            serving_entry = coordinator.status(state_scope)
+            active_collection = serving_entry.active_collection
+            # The generation serving queries before this publish, and the
+            # configuration it was published under. A rebuild that fails hands
+            # both back so the index keeps answering from it (issue #449); an
+            # in-place publish must not, having written into what it names.
+            # The fingerprint travels with the generation because the claim
+            # below overwrites the ledger's with this run's configuration.
+            previous_generation = serving_entry.active_generation
+            previous_fingerprint = serving_entry.config_fingerprint
             default_collection = store.physical_collection(logical_collection)
             rebuild = _rebuild_requested(
                 model, full_refresh=full_refresh
@@ -183,6 +192,12 @@ def run_search_model(
                 state_scope,
                 expected_code_version=code_version,
                 config_fingerprint=spec.config_fingerprint,
+                # A rebuild writes to a private generation, so the live one
+                # stays servable if this publisher dies; an in-place publish
+                # mutates what is live, and the claim clears the pointer so a
+                # crash recovers to `failed` rather than serving a half-
+                # rewritten collection (issue #449).
+                preserves_active_generation=rebuild,
             )
             with store.publisher_fence(physical), store:
                 if rebuild:
@@ -453,15 +468,29 @@ def run_search_model(
             with suppress(AdapterError):
                 adapter.clear_state(state_scope)
         if publish_lease is not None:
+            # A claim exists, so the pre-publish read of the serving entry ran
+            # and both of these are bound.
+            retain_previous = bool(
+                rebuild and previous_generation and previous_fingerprint
+            )
             _mark_search_publication_failed(
                 coordinator,
                 publish_lease,
                 error,
                 counts=(inserted, updated, skipped, deleted),
                 # A rebuild builds where nothing is reading, so a failure
-                # leaves the previous generation intact and still correct.
-                # An in-place publish may have corrupted what it wrote into.
-                active_collection=active_collection if rebuild else None,
+                # leaves the previous generation intact and still correct --
+                # both pointers survive, and the scope stays servable from
+                # that generation (issues #355, #449). An in-place publish may
+                # have corrupted what it wrote into, so neither pointer may be
+                # trusted and the scope goes unavailable.
+                # Retained only when the previous generation's own
+                # configuration is known: a generation advertised under the
+                # configuration this run was building for would be handed to
+                # readers as answering for a configuration it never had.
+                active_collection=active_collection if retain_previous else None,
+                active_generation=previous_generation if retain_previous else None,
+                config_fingerprint=previous_fingerprint if retain_previous else None,
             )
         if isinstance(error, RunError):
             raise
@@ -633,6 +662,8 @@ def _mark_search_publication_failed(
     *,
     counts: tuple[int, int, int, int],
     active_collection: str | None = None,
+    active_generation: str | None = None,
+    config_fingerprint: str | None = None,
 ) -> None:
     """Record the failure under a safe code; a stale fence has nothing to record."""
     if isinstance(error, ServingCoordinationError):
@@ -649,6 +680,8 @@ def _mark_search_publication_failed(
             safe_error_code=code,
             counts=counts,
             active_collection=active_collection,
+            active_generation=active_generation,
+            config_fingerprint=config_fingerprint,
         )
 
 

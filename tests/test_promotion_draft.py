@@ -328,31 +328,96 @@ def test_an_output_outside_the_project_is_refused(tmp_path, monkeypatch) -> None
     assert not outside.exists()
 
 
-@pytest.mark.skipif(
-    not hasattr(__import__("os"), "symlink"), reason="platform has no symlinks"
-)
-def test_a_symlinked_output_is_refused_before_anything_is_written(
-    tmp_path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    """A dangling link is the sharp case: `exists()` reports false, so the
-    overwrite guard sees a free path and writes straight through the link.
-    The loader refuses to read a symlinked golden set, so writing one would
-    also produce a file nothing loads (PR #451 review)."""
+def test_the_symlink_walk_checks_every_path_component(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Exercises the walk without needing the symlink privilege, so it runs
+    on Windows too -- the real-symlink tests below skip there, and this guard
+    is worth checking on the machine it is written on."""
+    from stel.cli_services.context import ConfigClickError
+    from stel.cli_services.promote import _writable_output
+
+    project = tmp_path / "project"
+    (project / "golden_sets").mkdir(parents=True)
+    linked = project / "golden_sets"
+
+    def fake_is_symlink(self: Path) -> bool:
+        return self == linked
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+
+    with pytest.raises(ConfigClickError, match="symlink"):
+        _writable_output(Path("golden_sets/search.yml"), project)
+
+
+def test_the_symlink_walk_terminates_on_an_ordinary_path(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from stel.cli_services.promote import _writable_output
+
+    project = tmp_path / "project"
+    (project / "golden_sets").mkdir(parents=True)
+
+    resolved = _writable_output(Path("golden_sets/search.yml"), project)
+
+    assert resolved == (project / "golden_sets" / "search.yml").resolve()
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
     import os
 
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError, AttributeError) as error:
+        # Windows without the developer-mode privilege.
+        pytest.skip(f"cannot create symlink: {error}")
+
+
+def test_a_symlinked_output_escaping_the_project_is_refused(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Caught by the containment check, which resolves through the link."""
+    from stel.cli_services import promote as service
+    from stel.config.loader import ConfigError
+
+    project = tmp_path / "project"
+    (project / "golden_sets").mkdir(parents=True)
+    victim = tmp_path / "victim.yml"
+    _symlink_or_skip(project / "golden_sets" / "search.yml", victim)
+    monkeypatch.setattr(service, "read_candidates", lambda *a, **k: [_row()])
+
+    with pytest.raises(ConfigError, match="outside the project"):
+        service.promote_from_candidates(
+            project,
+            profiles_dir=None,
+            target=None,
+            relation="analytics.candidates",
+            output=Path("golden_sets/search.yml"),
+            promoted_by="alex",
+            today=date(2026, 9, 2),
+            write=True,
+        )
+
+    assert not victim.exists()
+
+
+def test_a_symlinked_output_inside_the_project_is_refused(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """The case containment cannot catch, and the reason the literal walk
+    exists: the link stays inside the project, so resolving through it lands
+    somewhere legitimate. It is still a write to a path the operator did not
+    name, and the loader will not read a golden set through a link.
+
+    Deliberately dangling, which is the sharp version: `exists()` follows the
+    link and reports false, so the overwrite guard would see a free path and
+    write straight through it -- `--force` bypassed without `--force`.
+    """
     from stel.cli_services import promote as service
     from stel.cli_services.context import ConfigClickError
 
     project = tmp_path / "project"
     (project / "golden_sets").mkdir(parents=True)
-    victim = tmp_path / "victim.yml"
-    link = project / "golden_sets" / "search.yml"
-    try:
-        os.symlink(victim, link)
-    except OSError as error:  # Windows without the privilege
-        pytest.skip(f"cannot create symlink: {error}")
-
+    victim = project / "not_the_named_path.yml"
+    _symlink_or_skip(project / "golden_sets" / "search.yml", victim)
     monkeypatch.setattr(service, "read_candidates", lambda *a, **k: [_row()])
+
     with pytest.raises(ConfigClickError, match="symlink"):
         service.promote_from_candidates(
             project,
@@ -365,6 +430,30 @@ def test_a_symlinked_output_is_refused_before_anything_is_written(
             write=True,
         )
 
-    # The dangling target was never created: refused before the write, and
-    # without needing --force to have been withheld.
     assert not victim.exists()
+
+
+def test_a_symlinked_parent_directory_is_refused(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Not just the file: a linked parent redirects the write just as well."""
+    from stel.cli_services import promote as service
+    from stel.cli_services.context import ConfigClickError
+
+    project = tmp_path / "project"
+    real = project / "real_dir"
+    real.mkdir(parents=True)
+    _symlink_or_skip(project / "golden_sets", real)
+    monkeypatch.setattr(service, "read_candidates", lambda *a, **k: [_row()])
+
+    with pytest.raises(ConfigClickError, match="symlink"):
+        service.promote_from_candidates(
+            project,
+            profiles_dir=None,
+            target=None,
+            relation="analytics.candidates",
+            output=Path("golden_sets/search.yml"),
+            promoted_by="alex",
+            today=date(2026, 9, 2),
+            write=True,
+        )
+
+    assert not (real / "search.yml").exists()

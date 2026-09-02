@@ -3830,8 +3830,13 @@ warehouse capacity rather than process memory.
 
 Size the key term when you size a container. Chunk and embed no longer hold a
 key set to reconcile deletions: the warehouse evaluates the anti-join and
-returns only the keys to delete, so an unchanged corpus surfaces nothing at all
-and a large one costs a bounded page. What remains of the key term is the
+yields only the keys to delete, one bounded page at a time, so an unchanged
+corpus surfaces nothing and emptying the upstream entirely still costs a page
+rather than the corpus. The exception is an `id_field` whose type the engine
+does not cast to text identically to Python — booleans, floats, temporals —
+which reconcile in Python instead and do hold the id domain, because a
+mismatched comparison there would report every row as removed and delete it.
+Use a string or integer id to stay on the bounded path. What remains of the key term is the
 incremental state a stage compares fingerprints against, and — on a resuming
 embed — the map from state key to the target's typed id, which exists because a
 state key is a string and the id column need not be. Both scale with row count

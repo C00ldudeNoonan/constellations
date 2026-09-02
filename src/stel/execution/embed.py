@@ -12,7 +12,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -48,7 +48,7 @@ from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
 from .errors import artifact_error_text
 from .usage import add_provider_usage
-from .values import scalarize
+from .values import scalarize, warehouse_key_cast_matches_python
 from .warehouse import warehouse_options
 
 log = logging.getLogger(__name__)
@@ -184,22 +184,14 @@ def run_embed_model(
 
     # A subset run reads a deliberate slice of the upstream, so every id
     # outside the slice would look removed; reconciliation belongs to the
-    # next unfiltered run (issue #417).
-    removed = (
-        _removed_state_keys(
-            adapter, state_scope, upstream=upstream, id_field=config.id_field
-        )
-        if not subset_run and is_incremental and not rebuild_target
-        else []
+    # next unfiltered run (issue #417). Deferred to the delete site below and
+    # consumed one page at a time, so a run that removes the whole corpus
+    # holds a page rather than the corpus (PR #457 review).
+    reconcile_removals = (
+        not subset_run and is_incremental and not rebuild_target
     )
-    removed_target_keys: list[Any] = (
-        [
-            key
-            for record_id in removed
-            if (key := reuse_reader.target_key(record_id)) is not None
-        ]
-        if reuse_reader is not None
-        else []
+    removals_in_warehouse = warehouse_key_cast_matches_python(
+        schema_probe.schema[config.id_field]
     )
     flush_every = config.flush_every
     skipped = 0
@@ -500,15 +492,33 @@ def run_embed_model(
                 ),
                 options=warehouse_opts,
             )
-        if removed and not use_full and run_status is None:
-            adapter.delete_rows_and_state(
-                model.name,
-                key_col=config.id_field,
-                keys=removed_target_keys,
-                state_scope=state_scope,
-                state_record_keys=removed,
-            )
-            deleted_count = len(removed)
+        if reconcile_removals and not use_full and run_status is None:
+            for removed_page in _iter_removed_state_keys(
+                adapter,
+                state_scope,
+                upstream=upstream,
+                id_field=config.id_field,
+                in_warehouse=removals_in_warehouse,
+                processed_state=processed_state,
+                predicates=read_predicates,
+            ):
+                page_target_keys: list[Any] = (
+                    [
+                        key
+                        for record_id in removed_page
+                        if (key := reuse_reader.target_key(record_id)) is not None
+                    ]
+                    if reuse_reader is not None
+                    else []
+                )
+                adapter.delete_rows_and_state(
+                    model.name,
+                    key_col=config.id_field,
+                    keys=page_target_keys,
+                    state_scope=state_scope,
+                    state_record_keys=removed_page,
+                )
+                deleted_count += len(removed_page)
     except AdapterError as e:
         raise RunError(str(e)) from e
 
@@ -607,32 +617,61 @@ def _validate_upstream_ids(
     return total
 
 
-def _removed_state_keys(
+def _iter_removed_state_keys(
     adapter: WarehouseAdapter,
     scope: StateScope,
     *,
     upstream: str,
     id_field: str,
-) -> list[str]:
-    """State keys with no matching upstream row, found by the warehouse.
+    in_warehouse: bool,
+    processed_state: Mapping[str, StateValue],
+    predicates: Sequence[ReadPredicate] = (),
+) -> Iterator[list[str]]:
+    """Yield bounded pages of state keys with no matching upstream row.
 
-    The anti-join #428 asks for. The engine evaluates absence and returns only
-    the keys to delete, which is small by construction -- a run that removed
-    nothing pages through nothing -- where the set difference it replaces cost
-    the whole key domain on both sides regardless of how little changed.
+    The anti-join #428 asks for: the engine evaluates absence and yields only
+    the keys to delete, where the set difference it replaces cost the whole
+    key domain on both sides however little had changed. Pages arrive in
+    ascending key order under one snapshot, so a concurrent write cannot make
+    the scan skip or repeat a key.
 
-    Pages are bounded and arrive in ascending key order, so the result needs
-    no sort. `state_page_reader` holds one snapshot across pages, so a
-    concurrent write cannot make the scan skip or repeat a key.
+    A **generator of pages**, not a list, so residency stays bounded even when
+    the removal set is not -- an upstream emptied to zero rows removes the
+    whole corpus, and materializing that would put the term back that this
+    change exists to remove (PR #457 review).
+
+    `in_warehouse` is false for id columns whose warehouse cast does not
+    reproduce `str(value)` (see `warehouse_key_cast_matches_python`). Those
+    reconcile in Python, where both sides go through the same `str()` that
+    wrote the key: it costs the id domain again, but a wrong answer here
+    deletes data.
     """
-    probe = StateAbsenceProbe(table=upstream, key_column=id_field)
-    removed: list[str] = []
-    with adapter.state_page_reader(
-        scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
-    ) as reader:
-        for page in iter_validated_state_pages(reader):
-            removed.extend(record.record_key for record in page)
-    return removed
+    if in_warehouse:
+        probe = StateAbsenceProbe(table=upstream, key_column=id_field)
+        with adapter.state_page_reader(
+            scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
+        ) as reader:
+            for page in iter_validated_state_pages(reader):
+                keys = [record.record_key for record in page]
+                if keys:
+                    yield keys
+        return
+    current: set[str] = set()
+    with adapter.table_snapshot(
+        upstream,
+        columns=[id_field],
+        batch_size=_ID_BATCH_ROWS,
+        predicate=list(predicates),
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            current.update(
+                str(value) for value in frame[id_field].to_list() if value is not None
+            )
+    missing = sorted(set(processed_state) - current)
+    for offset in range(0, len(missing), _REMOVAL_PAGE_ROWS):
+        yield missing[offset : offset + _REMOVAL_PAGE_ROWS]
 
 
 class _EmbeddingReuseReader:

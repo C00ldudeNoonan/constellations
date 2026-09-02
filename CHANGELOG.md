@@ -28,6 +28,14 @@ Two consequences worth naming:
   id is a supported contract for embed — and BigQuery refuses `STRING = INT64`
   rather than coercing, so removal detection against a typed key would have
   failed there.
+- Only string and integer id columns take the warehouse path. A cast is not a
+  general substitute for Python's `str()`: a boolean id is written to state as
+  `True` and cast by both engines to `true`, so the anti-join would call every
+  unchanged row absent and delete it. Types whose cast cannot be proven
+  identical reconcile in Python, which costs the id domain but cannot silently
+  delete a corpus.
+- Removals are deleted a page at a time rather than collected first, so
+  emptying an upstream entirely does not rebuild the term this change removes.
 
 ## v0.15.4 - 2026-09-02
 

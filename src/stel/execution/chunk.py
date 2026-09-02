@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from ..state_reconciliation import iter_validated_state_pages
 from ..versioning import compute_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
-from .values import scalarize
+from .values import scalarize, warehouse_key_cast_matches_python
 from .warehouse import warehouse_options
 
 _CHUNK_GENERATED_FIELDS = CHUNK_GENERATED_FIELDS
@@ -290,15 +291,22 @@ def run_chunk_model(
     # kind downstream (issue #417). Reconciliation is the job of the next
     # unfiltered run.
     if is_incremental and not subset_run:
-        removed = _removed_state_keys(adapter, state_scope, upstream=upstream)
-        if removed:
+        for removed_page in _iter_removed_state_keys(
+            adapter,
+            state_scope,
+            upstream=upstream,
+            in_warehouse=warehouse_key_cast_matches_python(
+                schema_probe.schema["document_id"]
+            ),
+            processed_state=processed_state,
+        ):
             adapter.delete_rows_and_state(
                 model.name,
                 key_col="document_id",
-                keys=removed,
+                keys=removed_page,
                 state_scope=state_scope,
             )
-            deleted = len(removed)
+            deleted += len(removed_page)
 
     rows_written = publisher.rows_written
 
@@ -413,25 +421,57 @@ def _validate_document_ids(
     return total
 
 
-def _removed_state_keys(
-    adapter: WarehouseAdapter, scope: StateScope, *, upstream: str
-) -> list[str]:
-    """State keys with no matching upstream document, found by the warehouse.
+def _iter_removed_state_keys(
+    adapter: WarehouseAdapter,
+    scope: StateScope,
+    *,
+    upstream: str,
+    in_warehouse: bool,
+    processed_state: Mapping[str, StateValue],
+) -> Iterator[list[str]]:
+    """Yield bounded pages of state keys with no matching upstream document.
 
-    The anti-join #428 asks for: the engine evaluates absence and returns only
-    the keys to delete, which is small by construction, where the set
-    difference it replaces cost the whole key domain on both sides however
-    little had changed. Pages arrive bounded and in ascending key order under
-    one snapshot, so a concurrent write cannot make the scan skip or repeat.
+    The anti-join #428 asks for: the engine evaluates absence and yields only
+    the keys to delete, where the set difference it replaces cost the whole
+    key domain on both sides however little had changed. Pages arrive in
+    ascending key order under one snapshot, so a concurrent write cannot make
+    the scan skip or repeat a key.
+
+    A **generator of pages**, not a list: an upstream emptied to zero rows
+    removes the whole corpus, and materializing that would put back the term
+    this change exists to remove (PR #457 review).
+
+    `in_warehouse` is false for a `document_id` whose warehouse cast does not
+    reproduce `str(value)` (see `warehouse_key_cast_matches_python`). Those
+    reconcile in Python, where both sides go through the same `str()` that
+    wrote the key: it costs the id domain again, but a wrong answer here
+    deletes data.
     """
-    probe = StateAbsenceProbe(table=upstream, key_column="document_id")
-    removed: list[str] = []
-    with adapter.state_page_reader(
-        scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
-    ) as reader:
-        for page in iter_validated_state_pages(reader):
-            removed.extend(record.record_key for record in page)
-    return removed
+    if in_warehouse:
+        probe = StateAbsenceProbe(table=upstream, key_column="document_id")
+        with adapter.state_page_reader(
+            scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
+        ) as reader:
+            for page in iter_validated_state_pages(reader):
+                keys = [record.record_key for record in page]
+                if keys:
+                    yield keys
+        return
+    current: set[str] = set()
+    with adapter.table_snapshot(
+        upstream, columns=["document_id"], batch_size=_ID_BATCH_ROWS
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            current.update(
+                str(value)
+                for value in frame["document_id"].to_list()
+                if value is not None
+            )
+    missing = sorted(set(processed_state) - current)
+    for offset in range(0, len(missing), _REMOVAL_PAGE_ROWS):
+        yield missing[offset : offset + _REMOVAL_PAGE_ROWS]
 
 
 def chunk_input_hash(record: dict[str, Any], *, text_field: str) -> str:

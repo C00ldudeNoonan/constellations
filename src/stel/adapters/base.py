@@ -31,6 +31,7 @@ from pydantic import BaseModel, ValidationError
 from ..config.identifiers import DEFAULT_SCHEMA_NAME, LEGACY_SCHEMA_NAME
 from ..config.profile import WarehouseConfig
 from ..hashing import canonical_fingerprint
+from ..timing import PhaseTimings
 
 
 class AdapterError(Exception):
@@ -620,11 +621,20 @@ class TableReadSnapshot:
         close: Callable[[], None],
         ordering: ReadOrdering = ReadOrdering.UNSPECIFIED,
         generation_fingerprint: str | None = None,
+        timings: PhaseTimings | None = None,
     ) -> None:
         _validate_read_fingerprint(fingerprint)
         if generation_fingerprint is not None:
             _validate_read_fingerprint(generation_fingerprint)
         self.schema = schema
+        # Adapter-side attribution of the read, when the adapter can separate
+        # its phases (issue #454). A caller timing `next(batches)` measures
+        # transfer *and* decode *and* any client-side copy together, which is
+        # precisely the distinction #454 needs -- compressing a client that is
+        # already CPU-bound on decode makes it slower, so a conflated number
+        # can argue for the opposite of the right change. Empty when the
+        # adapter does not break the read down.
+        self.timings = timings if timings is not None else PhaseTimings()
         self.fingerprint = fingerprint
         self._generation_fingerprint = generation_fingerprint
         self.ordering = ordering

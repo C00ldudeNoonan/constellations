@@ -1461,3 +1461,49 @@ def test_recover_leaves_a_scope_with_no_generation_failed(coordinator: Any) -> N
     assert entry.active_generation is None
     with pytest.raises(ServingNotReadyError):
         coordinator.acquire_query(scope)
+
+
+def test_a_search_publish_attributes_its_phases(tmp_path: Path) -> None:
+    """The path #452 was actually about. That publish was dominated by
+    per-page round trips — ~3.7s of ledger reads and a MERGE per page, 13,794
+    pages — and nothing in the run said so, which is why it took a hand count
+    to find. `read`, `store_write` and `state` separate the three candidates
+    (#432 item 1)."""
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+
+    results = run_project(project)
+
+    [search] = [r for r in results if r.kind == "search"]
+    for phase in ("seconds_read", "seconds_store_write", "seconds_state"):
+        assert phase in search.metrics, search.metrics
+        assert search.metrics[phase] >= 0.0
+
+
+def test_search_timings_cover_deletion_and_activation(tmp_path: Path) -> None:
+    """A run whose work is deletion must not report only `seconds_read`.
+
+    The stale-removal pass and generation activation do real store and state
+    work; leaving them outside every phase meant an incremental run that
+    removed rows attributed almost nothing, which defeats the point of having
+    attribution at all (PR #460 review).
+    """
+    import json
+
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    # Remove the upstream rows so the next publish is deletion-dominated.
+    data = project / "data" / "inflation.json"
+    data.unlink()
+
+    results = run_project(project)
+
+    [search] = [r for r in results if r.kind == "search"]
+    assert search.documents_deleted > 0, "expected a deletion-dominated publish"
+    # The phases exist on a run that did no upserts at all.
+    assert "seconds_store_write" in search.metrics
+    assert "seconds_state" in search.metrics
+    assert json.dumps(search.metrics)  # metrics stay JSON-serializable

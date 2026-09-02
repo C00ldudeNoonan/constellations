@@ -43,6 +43,7 @@ from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
 from ..progress import get_reporter
 from ..state_reconciliation import iter_validated_state_pages
+from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
@@ -88,6 +89,46 @@ def run_embed_model(
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
+) -> ModelRunResult:
+    """Run the model, keeping its timings even if it fails.
+
+    A slow failure is the one worth diagnosing, and `PhaseTimings.phase()`
+    deliberately credits work that raised -- but the runner builds a fresh
+    result on `RunError`, so without carrying them across the boundary that
+    attribution never reaches the operator (PR #460 review).
+    """
+    timings = PhaseTimings()
+    try:
+        return _run_embed_model(
+            model=model,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            full_refresh=full_refresh,
+            run_budget=run_budget,
+            subset_run=subset_run,
+            read_predicates=read_predicates,
+            timings=timings,
+        )
+    except RunError as error:
+        if not error.metrics:
+            error.metrics = timings.as_metrics()
+        raise
+
+
+def _run_embed_model(
+    *,
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool,
+    run_budget: BudgetLedger | None = None,
+    subset_run: bool = False,
+    read_predicates: Sequence[ReadPredicate] = (),
+    timings: PhaseTimings,
 ) -> ModelRunResult:
     assert model.embed is not None
     config = model.embed
@@ -301,7 +342,16 @@ def run_embed_model(
             batch_size=_INPUT_BATCH_ROWS,
             predicate=list(read_predicates),
         ) as snapshot:
-            for batch in snapshot:
+            batches = iter(snapshot)
+            while True:
+                # Only the pull is credited to `read`. The row shaping below
+                # is stel's own CPU, and folding it in here would stop this
+                # answering the question #454 actually asks -- how much of a
+                # snapshot read is waiting on the warehouse.
+                with timings.phase("read"):
+                    batch = next(batches, None)
+                if batch is None:
+                    break
                 frame = pl.from_arrow(batch)
                 assert isinstance(frame, pl.DataFrame)
                 for record in frame.iter_rows(named=True):
@@ -312,6 +362,11 @@ def run_embed_model(
                     if len(window) >= flush_every:
                         yield window
                         window = []
+            # The adapter splits its own read into transfer, decode and
+            # client-side copy where it can; `read` above is the total time
+            # blocked pulling, and only the adapter can attribute inside it
+            # (issue #454).
+            timings.merge(snapshot.timings)
         if window:
             yield window
 
@@ -329,7 +384,7 @@ def run_embed_model(
             if budget_guard is not None
             else nullcontext(None)
         )
-        with admission as reservation:
+        with admission as reservation, timings.phase("provider"):
             embedded = embed_texts(
                 texts,
                 identity,
@@ -404,29 +459,30 @@ def run_embed_model(
             ],
             schema=output_schema,
         )
-        publisher.publish(
-            write_full=lambda: adapter.materialize_full(
-                model.name,
-                frame,
-                options=warehouse_opts,
-            ),
-            write_incremental=lambda: adapter.materialize_incremental(
-                model.name,
-                frame,
-                key_col=config.id_field,
-                on_schema_change=(
-                    model.on_schema_change
-                    if publisher.first_publication
-                    else "append_new_columns"
+        with timings.phase("publish"):
+            publisher.publish(
+                write_full=lambda: adapter.materialize_full(
+                    model.name,
+                    frame,
+                    options=warehouse_opts,
                 ),
-                options=warehouse_opts,
-                update_when_changed=model.update_when_changed,
-            ),
-            state_records=[
-                StateRecord(item.record_id, item.input_fingerprint, code_version)
-                for item in window
-            ],
-        )
+                write_incremental=lambda: adapter.materialize_incremental(
+                    model.name,
+                    frame,
+                    key_col=config.id_field,
+                    on_schema_change=(
+                        model.on_schema_change
+                        if publisher.first_publication
+                        else "append_new_columns"
+                    ),
+                    options=warehouse_opts,
+                    update_when_changed=model.update_when_changed,
+                ),
+                state_records=[
+                    StateRecord(item.record_id, item.input_fingerprint, code_version)
+                    for item in window
+                ],
+            )
 
     run_status: str | None = None
     errors: list[str] = []
@@ -530,6 +586,10 @@ def run_embed_model(
         "rows_embedded": embedded_count,
         "metadata_updates": cache_hits,
         **usage_totals,
+        # Where the wall clock went (#432). Summed across threads, so these
+        # can exceed `duration_seconds` once provider batches overlap -- that
+        # ratio is the concurrency actually achieved, and is the point.
+        **timings.as_metrics(),
     }
     return ModelRunResult(
         model_name=model.name,

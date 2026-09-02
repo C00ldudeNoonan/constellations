@@ -601,3 +601,89 @@ def test_removing_the_whole_corpus_deletes_page_by_page(
     assert (
         _query(project, 'SELECT count(*) FROM "db".docs.document_embeddings')[0][0] == 0
     )
+
+
+# ─── wall-clock attribution (issue #432 item 1) ─────────────────────────────
+
+
+def test_an_embed_run_attributes_its_phases(tmp_path: Path) -> None:
+    """#432 opens by asking where an embed run's wall clock goes — provider
+    wait, warehouse write, the read — and says everything it proposes after
+    that is a guess about which term dominates. Nothing in a run said so."""
+    project = _embedding_project(tmp_path)
+
+    results = run_project(project)
+
+    [embed] = [r for r in results if r.kind == "embed"]
+    for phase in ("seconds_provider", "seconds_publish", "seconds_read"):
+        assert phase in embed.metrics, embed.metrics
+        assert embed.metrics[phase] >= 0.0
+
+
+def test_phase_totals_reach_run_results_json(tmp_path: Path) -> None:
+    """The deliverable is a number an operator reads after a production run,
+    not one only a test can see."""
+    from stel.manifest import write_run_results
+
+    project = _embedding_project(tmp_path)
+    results = run_project(project)
+
+    path = write_run_results(project, results)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    row = next(
+        r for r in payload["results"] if r["model_name"] == "document_embeddings"
+    )
+    assert "seconds_provider" in row["metrics"]
+    # Beside the wall clock: summed phase time can exceed it once provider
+    # batches overlap, and that ratio is the concurrency actually achieved.
+    assert "duration_seconds" in row
+
+
+def test_a_failing_model_carries_its_timings_out_with_the_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow failure is the one worth diagnosing. `PhaseTimings.phase()`
+    credits work that raised on purpose, so the executor attaches what it
+    measured to the error rather than losing it at the boundary."""
+    from stel.execution import embed as embed_module
+
+    project = _embedding_project(tmp_path)
+
+    def explode(*, timings: Any, **kwargs: Any) -> Any:
+        timings.add("provider", 12.5)
+        raise RunError("provider exploded after real work")
+
+    monkeypatch.setattr(embed_module, "_run_embed_model", explode)
+
+    with pytest.raises(RunError) as excinfo:
+        run_project(project)
+
+    assert excinfo.value.metrics["seconds_provider"] == 12.5
+
+
+def test_a_failed_model_reports_its_timings_in_run_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`build_project` is the resilient path: it records a failed model rather
+    than propagating. Without carrying metrics across that boundary the
+    attribution of a slow failure never reaches run_results.json (PR #460
+    review)."""
+    from stel.execution import embed as embed_module
+    from stel.runner import build_project
+
+    project = _embedding_project(tmp_path)
+
+    def explode(*, timings: Any, **kwargs: Any) -> Any:
+        timings.add("provider", 7.25)
+        raise RunError("provider exploded after real work")
+
+    monkeypatch.setattr(embed_module, "_run_embed_model", explode)
+
+    outcome = build_project(project)
+
+    [failed] = [
+        r for r in outcome.run_results if r.model_name == "document_embeddings"
+    ]
+    assert failed.errors
+    assert failed.metrics["seconds_provider"] == 7.25

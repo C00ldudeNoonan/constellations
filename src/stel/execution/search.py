@@ -56,6 +56,7 @@ from ..retrieval import (
 from ..retrieval.base import GENERATION_MARKER
 from ..retrieval.retention import retire_superseded_generations
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
+from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
 
@@ -72,6 +73,42 @@ def run_search_model(
     resolved: ResolvedProfile,
     full_refresh: bool = False,
     subset_run: bool = False,
+) -> ModelRunResult:
+    """Publish the model, keeping its timings even if it fails.
+
+    A publish that dies hours in is exactly the one whose attribution matters,
+    and the runner builds a fresh result on `RunError` (PR #460 review).
+    """
+    timings = PhaseTimings()
+    try:
+        return _run_search_model(
+            model=model,
+            models_by_name=models_by_name,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            full_refresh=full_refresh,
+            subset_run=subset_run,
+            timings=timings,
+        )
+    except RunError as error:
+        if not error.metrics:
+            error.metrics = timings.as_metrics()
+        raise
+
+
+def _run_search_model(
+    *,
+    model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool = False,
+    subset_run: bool = False,
+    timings: PhaseTimings,
 ) -> ModelRunResult:
     search = model.search
     assert search is not None
@@ -226,7 +263,22 @@ def run_search_model(
                         existing = store.inspect_collection(physical) or existing
                     _validate_collection_schema(existing.schema, spec)
 
-                for ordinal, batch in enumerate(snapshot):
+                batches = iter(snapshot)
+                ordinal = -1
+                while True:
+                    # Only the pull is credited to `read`: the row shaping
+                    # below is stel's own CPU. Publishing this corpus was
+                    # dominated by per-page round trips (#452), so which of
+                    # these three terms is large is the whole question.
+                    with timings.phase("read"):
+                        batch = next(batches, None)
+                    if batch is None:
+                        # Only the adapter can attribute inside a read, so its
+                        # transfer/decode/copy split is folded in once the
+                        # stream is drained (issue #454).
+                        timings.merge(snapshot.timings)
+                        break
+                    ordinal += 1
                     indexed = _indexed_rows(
                         batch,
                         model,
@@ -247,11 +299,12 @@ def run_search_model(
                         UpstreamRecord(row.record_id, row.input_fingerprint)
                         for row in indexed
                     ]
-                    prior_state = (
-                        reconciler.prior_state_for(upstream_records)
-                        if upstream_records
-                        else {}
-                    )
+                    with timings.phase("state"):
+                        prior_state = (
+                            reconciler.prior_state_for(upstream_records)
+                            if upstream_records
+                            else {}
+                        )
                     outcome = reconciler.classify(
                         upstream_records,
                         prior=prior_state,
@@ -292,12 +345,13 @@ def run_search_model(
                                 },
                                 domain="dbt-ml-search-governed-revoke-batch",
                             )
-                            receipt = store.delete(
-                                physical,
-                                changed_ids,
-                                id_field=search.id_field,
-                                mutation_digest=revoke_digest,
-                            )
+                            with timings.phase("store_write"):
+                                receipt = store.delete(
+                                    physical,
+                                    changed_ids,
+                                    id_field=search.id_field,
+                                    mutation_digest=revoke_digest,
+                                )
                             if not receipt.acknowledged or len(receipt.outcomes) != len(
                                 changed_ids
                             ):
@@ -314,12 +368,13 @@ def run_search_model(
                         },
                         domain="dbt-ml-search-upsert-batch",
                     )
-                    receipt = store.upsert(
-                        physical,
-                        pending,
-                        id_field=search.id_field,
-                        mutation_digest=digest,
-                    )
+                    with timings.phase("store_write"):
+                        receipt = store.upsert(
+                            physical,
+                            pending,
+                            id_field=search.id_field,
+                            mutation_digest=digest,
+                        )
                     if not receipt.acknowledged or len(receipt.outcomes) != len(pending):
                         raise RunError(
                             "Retrieval store did not return an exact durable upsert receipt"
@@ -328,16 +383,17 @@ def run_search_model(
                     # rows: a later failure leaves those rows durably
                     # published and correctly recorded, while readiness stays
                     # gated by the serving ledger.
-                    coordinator.verify_publish(publish_lease)
-                    adapter.upsert_state(
-                        publish_scope,
-                        [
-                            StateRecord(
-                                row.record_id, row.input_fingerprint, code_version
-                            )
-                            for row in pending
-                        ],
-                    )
+                    with timings.phase("state"):
+                        coordinator.verify_publish(publish_lease)
+                        adapter.upsert_state(
+                            publish_scope,
+                            [
+                                StateRecord(
+                                    row.record_id, row.input_fingerprint, code_version
+                                )
+                                for row in pending
+                            ],
+                        )
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
@@ -373,12 +429,13 @@ def run_search_model(
                             },
                             domain="dbt-ml-search-delete-batch",
                         )
-                        receipt = store.delete(
-                            physical,
-                            record_ids,
-                            id_field=search.id_field,
-                            mutation_digest=digest,
-                        )
+                        with timings.phase("store_write"):
+                            receipt = store.delete(
+                                physical,
+                                record_ids,
+                                id_field=search.id_field,
+                                mutation_digest=digest,
+                            )
                         if not receipt.acknowledged or len(receipt.outcomes) != len(
                             record_ids
                         ):
@@ -386,7 +443,8 @@ def run_search_model(
                                 "Retrieval store did not return an exact durable "
                                 "delete receipt"
                             )
-                        adapter.delete_state(publish_scope, record_ids)
+                        with timings.phase("state"):
+                            adapter.delete_state(publish_scope, record_ids)
                         deleted += len(record_ids)
                 finally:
                     stale_pages.close()
@@ -429,13 +487,14 @@ def run_search_model(
             # publish would skip rows the old collection never received.
             # `state_swapped` lets the failure path clear that state, so the
             # next run reconciles against nothing and republishes in full.
-            _activate_generation(
-                adapter,
-                serving_scope=state_scope,
-                publish_scope=publish_scope,
-                lease=publish_lease,
-                page_size=search.batch_size,
-            )
+            with timings.phase("state"):
+                _activate_generation(
+                    adapter,
+                    serving_scope=state_scope,
+                    publish_scope=publish_scope,
+                    lease=publish_lease,
+                    page_size=search.batch_size,
+                )
             state_swapped = True
         coordinator.mark_ready(
             publish_lease,
@@ -509,6 +568,9 @@ def run_search_model(
         rows_written=rows_written,
         rows_inserted=inserted,
         rows_updated=updated,
+        # Where the wall clock went, so a slow publish can be attributed
+        # rather than guessed at (#432, #454).
+        metrics=timings.as_metrics(),
         serving_resource={
             "type": "retrieval_index",
             "store_type": store_config.type,

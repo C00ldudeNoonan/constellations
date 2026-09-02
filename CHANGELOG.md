@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Runs report where their wall clock went (issue #432)
+
+Both open performance issues on the streaming stages begin by asking for the
+same measurement, and neither could be answered from a run. #432 wants
+wall-clock attribution for a production embed — provider wait, warehouse
+write, read — and says plainly that everything it proposes after that "is a
+guess about which term dominates, and the answer decides the order". #454
+wants to know what share of a snapshot read is transfer rather than decode,
+because compressing a client that is already CPU-bound makes it slower.
+
+`embed:` and `search:` models now carry `seconds_<phase>` in their
+`run_results.json` metrics: for embed `provider`, `publish` and `read`; for
+search `read`, `store_write` and `state` — the last being the per-page ledger
+reads and state MERGE that dominated the publish in #452 without anything in
+the run saying so. Totals are summed across threads, so they can exceed the
+model's `duration_seconds` once provider batches overlap; that ratio is the
+concurrency actually achieved, and both numbers are reported for exactly that
+reason.
+
+On BigQuery the read is broken down further, because only the adapter can:
+`read_transfer`, `read_decode` and `read_coalesce`. That split is what #454
+actually turns on — compression trades wire bytes for client CPU, so a read
+already dominated by decode gets slower under it, and a single conflated
+"read" number would argue for the wrong change half the time.
+
+A model that fails still reports what it measured, and search timings cover
+the deletion and activation paths as well as the upsert, so a run whose work
+was deletion is attributed rather than reporting almost nothing.
+
+This measures rather than optimizes. Nothing is faster for it — the point is
+that the next decision rests on a number instead of a guess, and that a fixed
+regression cannot go quiet again the way the `batch_size` collapse did.
+
 ### Candidate classification labels from the transcript corpus (issue #456)
 
 The `eval:` half of #329 phase 3, and the last piece of it. The retrieval half

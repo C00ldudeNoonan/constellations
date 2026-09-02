@@ -56,6 +56,7 @@ from ..retrieval import (
 from ..retrieval.base import GENERATION_MARKER
 from ..retrieval.retention import retire_superseded_generations
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
+from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
 
@@ -109,6 +110,11 @@ def run_search_model(
     active_generation: str | None = None
     state_swapped = False
     superseded_collection: str | None = None
+    # Where the wall clock went (#432). Publishing this corpus was dominated
+    # by per-page round trips (#452 measured ~3.7s of ledger reads and a MERGE
+    # per page, 13,794 pages), so which of these terms is large is the
+    # question both open performance issues open by asking.
+    timings = PhaseTimings()
 
     try:
         # Publication-state residency is bounded (issue #153): reconciliation
@@ -226,7 +232,18 @@ def run_search_model(
                         existing = store.inspect_collection(physical) or existing
                     _validate_collection_schema(existing.schema, spec)
 
-                for ordinal, batch in enumerate(snapshot):
+                batches = iter(snapshot)
+                ordinal = -1
+                while True:
+                    # Only the pull is credited to `read`: the row shaping
+                    # below is stel's own CPU. Publishing this corpus was
+                    # dominated by per-page round trips (#452), so which of
+                    # these three terms is large is the whole question.
+                    with timings.phase("read"):
+                        batch = next(batches, None)
+                    if batch is None:
+                        break
+                    ordinal += 1
                     indexed = _indexed_rows(
                         batch,
                         model,
@@ -247,11 +264,12 @@ def run_search_model(
                         UpstreamRecord(row.record_id, row.input_fingerprint)
                         for row in indexed
                     ]
-                    prior_state = (
-                        reconciler.prior_state_for(upstream_records)
-                        if upstream_records
-                        else {}
-                    )
+                    with timings.phase("state"):
+                        prior_state = (
+                            reconciler.prior_state_for(upstream_records)
+                            if upstream_records
+                            else {}
+                        )
                     outcome = reconciler.classify(
                         upstream_records,
                         prior=prior_state,
@@ -314,12 +332,13 @@ def run_search_model(
                         },
                         domain="dbt-ml-search-upsert-batch",
                     )
-                    receipt = store.upsert(
-                        physical,
-                        pending,
-                        id_field=search.id_field,
-                        mutation_digest=digest,
-                    )
+                    with timings.phase("store_write"):
+                        receipt = store.upsert(
+                            physical,
+                            pending,
+                            id_field=search.id_field,
+                            mutation_digest=digest,
+                        )
                     if not receipt.acknowledged or len(receipt.outcomes) != len(pending):
                         raise RunError(
                             "Retrieval store did not return an exact durable upsert receipt"
@@ -328,16 +347,17 @@ def run_search_model(
                     # rows: a later failure leaves those rows durably
                     # published and correctly recorded, while readiness stays
                     # gated by the serving ledger.
-                    coordinator.verify_publish(publish_lease)
-                    adapter.upsert_state(
-                        publish_scope,
-                        [
-                            StateRecord(
-                                row.record_id, row.input_fingerprint, code_version
-                            )
-                            for row in pending
-                        ],
-                    )
+                    with timings.phase("state"):
+                        coordinator.verify_publish(publish_lease)
+                        adapter.upsert_state(
+                            publish_scope,
+                            [
+                                StateRecord(
+                                    row.record_id, row.input_fingerprint, code_version
+                                )
+                                for row in pending
+                            ],
+                        )
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
@@ -509,6 +529,9 @@ def run_search_model(
         rows_written=rows_written,
         rows_inserted=inserted,
         rows_updated=updated,
+        # Where the wall clock went, so a slow publish can be attributed
+        # rather than guessed at (#432, #454).
+        metrics=timings.as_metrics(),
         serving_resource={
             "type": "retrieval_index",
             "store_type": store_config.type,

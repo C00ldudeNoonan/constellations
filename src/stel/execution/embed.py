@@ -43,6 +43,7 @@ from ..hashing import canonical_fingerprint
 from ..profile import ResolvedProfile, resolve_embedding_options
 from ..progress import get_reporter
 from ..state_reconciliation import iter_validated_state_pages
+from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
@@ -202,6 +203,9 @@ def run_embed_model(
     # Guards the counters and the budget ledger once provider
     # batches run concurrently (issue #432).
     usage_lock = threading.Lock()
+    # Where the wall clock actually goes. Both #432 and #454 open by asking
+    # for this and neither is answerable from a run without it.
+    timings = PhaseTimings()
     provider_batches = 0
     provider_calls = 0
     use_full = model.materialization == "full" or full_refresh or rebuild_target
@@ -301,7 +305,16 @@ def run_embed_model(
             batch_size=_INPUT_BATCH_ROWS,
             predicate=list(read_predicates),
         ) as snapshot:
-            for batch in snapshot:
+            batches = iter(snapshot)
+            while True:
+                # Only the pull is credited to `read`. The row shaping below
+                # is stel's own CPU, and folding it in here would stop this
+                # answering the question #454 actually asks -- how much of a
+                # snapshot read is waiting on the warehouse.
+                with timings.phase("read"):
+                    batch = next(batches, None)
+                if batch is None:
+                    break
                 frame = pl.from_arrow(batch)
                 assert isinstance(frame, pl.DataFrame)
                 for record in frame.iter_rows(named=True):
@@ -329,7 +342,7 @@ def run_embed_model(
             if budget_guard is not None
             else nullcontext(None)
         )
-        with admission as reservation:
+        with admission as reservation, timings.phase("provider"):
             embedded = embed_texts(
                 texts,
                 identity,
@@ -404,29 +417,30 @@ def run_embed_model(
             ],
             schema=output_schema,
         )
-        publisher.publish(
-            write_full=lambda: adapter.materialize_full(
-                model.name,
-                frame,
-                options=warehouse_opts,
-            ),
-            write_incremental=lambda: adapter.materialize_incremental(
-                model.name,
-                frame,
-                key_col=config.id_field,
-                on_schema_change=(
-                    model.on_schema_change
-                    if publisher.first_publication
-                    else "append_new_columns"
+        with timings.phase("publish"):
+            publisher.publish(
+                write_full=lambda: adapter.materialize_full(
+                    model.name,
+                    frame,
+                    options=warehouse_opts,
                 ),
-                options=warehouse_opts,
-                update_when_changed=model.update_when_changed,
-            ),
-            state_records=[
-                StateRecord(item.record_id, item.input_fingerprint, code_version)
-                for item in window
-            ],
-        )
+                write_incremental=lambda: adapter.materialize_incremental(
+                    model.name,
+                    frame,
+                    key_col=config.id_field,
+                    on_schema_change=(
+                        model.on_schema_change
+                        if publisher.first_publication
+                        else "append_new_columns"
+                    ),
+                    options=warehouse_opts,
+                    update_when_changed=model.update_when_changed,
+                ),
+                state_records=[
+                    StateRecord(item.record_id, item.input_fingerprint, code_version)
+                    for item in window
+                ],
+            )
 
     run_status: str | None = None
     errors: list[str] = []
@@ -530,6 +544,10 @@ def run_embed_model(
         "rows_embedded": embedded_count,
         "metadata_updates": cache_hits,
         **usage_totals,
+        # Where the wall clock went (#432). Summed across threads, so these
+        # can exceed `duration_seconds` once provider batches overlap -- that
+        # ratio is the concurrency actually achieved, and is the point.
+        **timings.as_metrics(),
     }
     return ModelRunResult(
         model_name=model.name,

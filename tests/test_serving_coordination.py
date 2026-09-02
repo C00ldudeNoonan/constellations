@@ -1461,3 +1461,21 @@ def test_recover_leaves_a_scope_with_no_generation_failed(coordinator: Any) -> N
     assert entry.active_generation is None
     with pytest.raises(ServingNotReadyError):
         coordinator.acquire_query(scope)
+
+
+def test_a_search_publish_attributes_its_phases(tmp_path: Path) -> None:
+    """The path #452 was actually about. That publish was dominated by
+    per-page round trips — ~3.7s of ledger reads and a MERGE per page, 13,794
+    pages — and nothing in the run said so, which is why it took a hand count
+    to find. `read`, `store_write` and `state` separate the three candidates
+    (#432 item 1)."""
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+
+    results = run_project(project)
+
+    [search] = [r for r in results if r.kind == "search"]
+    for phase in ("seconds_read", "seconds_store_write", "seconds_state"):
+        assert phase in search.metrics, search.metrics
+        assert search.metrics[phase] >= 0.0

@@ -95,16 +95,28 @@ split is the point:
 
 | model | kind | what it does |
 |---|---|---|
-| `correction_inputs` | `transform:` built-in | one row per exchange: its prose, and the context ids it retrieved |
+| `correction_inputs` | `transform:` built-in | one row per *pair* of exchanges: the claim, the turn that may correct it, and the ids behind the claim |
 | `drafted_corrections` | `llm:` | did the human correct a stated value, and to what |
 | `classification_label_candidates` | `transform:` sql | the shape `eval.expected` reads |
+
+**A correction spans two exchanges.** An exchange is one human prompt plus the
+answer to it, so a human correcting an answer does so in the *next* prompt.
+The claim is in exchange N, the correction in N+1, and the records behind the
+claim were retrieved by N — so all three have to travel together. Reading ids
+from the correcting exchange would key the label to whatever the agent looked
+up *after* being told it was wrong, or drop the correction entirely whenever
+the follow-up searched nothing.
+
+The rendered `## [n]` heading **is** the human's turn — a single-line prompt
+appears nowhere else — so the classifier input keeps headings, and the prompt
+tells the model to read them as the human's words.
 
 **The ids are the constraint.** `eval:` joins expected labels to predictions
 on a key, so a correction is only ground truth if it attaches to a *record*.
 The ids an exchange retrieved are the only record identity a transcript
-names — so an exchange that retrieved nothing produces no candidate, however
-clearly it corrects something. That is a real limit on what this can derive,
-not an oversight.
+names — so a pair whose earlier exchange retrieved nothing produces no
+candidate, however clearly it corrects something. That is a real limit on
+what this can derive, not an oversight.
 
 **Only an explicit correction counts.** Agreement, restatement, and a fresh
 question are not corrections, and the prompt says so at length: an absent

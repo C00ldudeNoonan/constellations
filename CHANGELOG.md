@@ -9,8 +9,11 @@ shipped across #387, #388 and #451; this derives the other kind of ground
 truth — a label a human corrected — from the same corpus, in three models that
 add no new model kind (#329 rule 3):
 
-- `correction_inputs`, a built-in transform emitting one row per exchange with
-  that exchange's prose and the context ids it retrieved;
+- `correction_inputs`, a built-in transform emitting one row per *pair* of
+  consecutive exchanges — the claim, the human turn that may correct it, and
+  the context ids retrieved while making the claim. A correction lands in the
+  next prompt, and the records behind a wrong answer were retrieved by the
+  earlier exchange, so all three travel together;
 - an ordinary `llm:` model judging whether the human corrected a stated value;
 - a SQL transform shaping the result into what `eval.expected` reads.
 

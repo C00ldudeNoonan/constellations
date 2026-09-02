@@ -70,7 +70,9 @@ def test_transcripts_example_reruns_incrementally(tmp_path: Path) -> None:
     # Unchanged landing corpus: the keyed-reference incremental contract
     # (issue #364) skips every session on the second run.
     assert chunks.documents_processed == 0
-    assert chunks.documents_skipped == 2
+    # Three landing sessions: two from #360, plus the correction session #456
+    # added so the corpus actually contains the shape that issue is about.
+    assert chunks.documents_skipped == 3
 
 
 def test_transcripts_example_derives_candidate_judgments(tmp_path: Path) -> None:
@@ -85,8 +87,12 @@ def test_transcripts_example_derives_candidate_judgments(tmp_path: Path) -> None
         "SELECT harness, judgment, context_id, id_space, query_fingerprint "
         'FROM "transcripts".transcripts.retrieval_judgment_candidates',
     )
-    judgments = sorted(judgment for _h, judgment, *_rest in rows)
-    assert judgments == ["cited", "returned_not_cited", "zero_result"]
+    # A set, not a list: what this asserts is that all three kinds appear and
+    # are distinguishable. Counting them would make the test a hostage to how
+    # many sessions the corpus happens to hold — as it was when #456 added
+    # one.
+    judgments = {judgment for _h, judgment, *_rest in rows}
+    assert judgments == {"cited", "returned_not_cited", "zero_result"}
 
     for _harness, judgment, context_id, id_space, fingerprint in rows:
         assert fingerprint, "a candidate with no fingerprint cannot be promoted"
@@ -114,15 +120,26 @@ def test_correction_inputs_carry_prose_and_the_ids_it_could_correct(
 
     rows = _rows(
         project,
-        "SELECT exchange_text, candidate_context_ids, id_space "
+        "SELECT exchange_text, candidate_context_ids, id_space, "
+        "exchange_ordinal, answered_exchange_ordinal "
         'FROM "transcripts".transcripts.correction_inputs',
     )
 
-    assert rows, "no exchange in the corpus retrieved context with prose"
-    for text, ids, id_space in rows:
+    assert rows, "no exchange pair in the corpus retrieved context with prose"
+    for text, ids, id_space, correcting, answered in rows:
         assert str(text).strip(), "an input row with no prose has nothing to classify"
         assert json.loads(str(ids)), "an input row with no id has nothing to label"
         assert id_space == "context_id"
+        # The pair, in order: the claim then the turn that may correct it.
+        assert correcting == answered + 1
+
+    # The corpus really does contain a correction, and the classifier can see
+    # both halves of it. Rendered headings are the human's turn, so an input
+    # built by slicing them away would hold the agent's claim and nothing the
+    # human said (PR #458 review).
+    joined = "\n".join(str(text) for text, *_rest in rows)
+    assert "extended tier" in joined, joined
+    assert "standard tier" in joined, joined
 
 
 def test_the_label_chain_reaches_the_eval_expected_shape(tmp_path: Path) -> None:

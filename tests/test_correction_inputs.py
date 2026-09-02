@@ -1,19 +1,34 @@
-"""Exchange-grain rows for the correction classifier (#456, #329 phase 3).
+"""Exchange-pair rows for the correction classifier (#456, #329 phase 3).
 
-The `eval:` half of phase 3 needs labels attached to *records*, and this is
-the step that decides which records an exchange could possibly be correcting.
-Every test here is about a decision the module makes on the reviewer's behalf,
-because those are the ones that quietly produce useless ground truth.
+Documents are built through the **real converter** rather than hand-written.
+The first version of these tests wrote the rendered text by hand, and got it
+wrong in the one way that mattered: the converter renders a single-line human
+prompt *as* the `## [n]` heading and nowhere else, so slicing from after the
+heading fed the classifier assistant prose only — the one turn that can hold a
+correction was the one turn it could not see. A hand-made fixture agreed with
+the bug (PR #458 review). These do not.
 """
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
 import pytest
 
+from stel.transcripts.convert import build_document
+from stel.transcripts.events import (
+    AssistantProse,
+    ContextCall,
+    ParsedSession,
+    ToolCall,
+    UserTurn,
+)
 from stel.transcripts.transforms import correction_inputs
+
+_AT = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
 
 
 class _Ctx:
@@ -23,128 +38,167 @@ class _Ctx:
         self.options = options
 
 
-def _call(**overrides: Any) -> dict[str, Any]:
-    call = {
-        "query_fingerprint": "f" * 32,
-        "context_model": "context_search",
-        "returned_context_ids": ["ctx-1", "ctx-2"],
-        "cited_context_ids": ["ctx-2"],
-        "error_code": None,
-    }
-    call.update(overrides)
-    return call
-
-
-def _document(**overrides: Any) -> dict[str, Any]:
-    document = {
-        "document_id": "doc-1",
-        "session_id": "sess-1",
-        "harness": "claude-code",
-        "text": (
-            "## [1] what form type is this filing\n"
-            "It is a 10-Q.\n\n"
-            "## [2] no, it is a 10-K\n"
-            "You are right, it is a 10-K.\n"
+def _search(*, returned: tuple[str, ...], error_code: str | None = None) -> ToolCall:
+    return ToolCall(
+        name="mcp__stel-context__search_context",
+        args_fingerprint="a" * 32,
+        files=(),
+        ok=error_code is None,
+        result_bytes=100,
+        timestamp=_AT,
+        context=ContextCall(
+            model="context_search",
+            query_fingerprint="f" * 32,
+            query_text=None,
+            returned_context_ids=returned,
+            returned_chunk_ids=(),
+            cited_context_ids=(),
+            zero_results=not returned,
+            error_code=error_code,
         ),
-        "exchanges": [
-            {
-                "ordinal": 1,
-                "heading": "[1] what form type is this filing",
-                "started_at": "2026-09-02T10:00:00",
-                "context_calls": [_call()],
-            },
-            {
-                "ordinal": 2,
-                "heading": "[2] no, it is a 10-K",
-                "started_at": "2026-09-02T10:01:00",
-                "context_calls": [_call()],
-            },
-        ],
-    }
-    document.update(overrides)
-    return document
+    )
 
 
-def _run(*documents: dict[str, Any]) -> pl.DataFrame:
-    frame = pl.DataFrame(documents)
+def _session(*events: Any) -> ParsedSession:
+    return ParsedSession(
+        harness="claude-code",
+        session_id="sess-1",
+        source_path=Path("sess-1.jsonl"),
+        project_path=None,
+        git_branch=None,
+        events=tuple(events),
+    )
+
+
+def _rows(session: ParsedSession) -> pl.DataFrame:
+    document = build_document(session)
+    assert document is not None
+    payload = document.model_dump(mode="json")
+    payload["document_id"] = "doc-1"
+    frame = pl.DataFrame([payload])
     ctx = cast(Any, _Ctx(transcripts="raw_transcripts"))
     return correction_inputs.run({"raw_transcripts": frame}, ctx)
 
 
-# ─── the prose a classifier reads ───────────────────────────────────────────
+def _corrected_session(**overrides: Any) -> ParsedSession:
+    """The shape #456 is about: a claim, then a human correcting it."""
+    search = overrides.get("search", _search(returned=("ctx-1", "ctx-2")))
+    return _session(
+        UserTurn(text="what form type is this filing", timestamp=_AT),
+        search,
+        AssistantProse(text="It is a 10-Q.", timestamp=_AT),
+        UserTurn(text="no, it is a 10-K", timestamp=_AT),
+        AssistantProse(text="You are right.", timestamp=_AT),
+    )
 
 
-def test_each_exchange_carries_its_own_prose() -> None:
-    """Sliced by heading, so a correction in exchange 2 is not read as
-    context for exchange 1 -- the classifier is asked about one turn."""
-    rows = _run(_document()).sort("exchange_ordinal")
-
-    assert rows["exchange_ordinal"].to_list() == [1, 2]
-    assert "It is a 10-Q." in rows["exchange_text"][0]
-    assert "10-K" not in rows["exchange_text"][0]
-    assert "You are right, it is a 10-K." in rows["exchange_text"][1]
+# ─── the classifier must be able to see the correction ──────────────────────
 
 
-def test_a_fingerprint_only_corpus_yields_nothing() -> None:
-    """#329 rule 1: text exists here only because a harness chose to capture
-    it. Without prose there is nothing to classify, and emitting empty rows
-    would invite a classifier to guess from headings alone."""
-    rows = _run(_document(text=""))
+def test_the_human_correction_reaches_the_classifier_input() -> None:
+    """The bug this file exists to prevent. The converter renders a
+    single-line prompt as the heading only, so an input that drops headings
+    contains the agent's claim and nothing the human said — and no prompt,
+    however well written, can find a correction that is not in its input."""
+    rows = _rows(_corrected_session())
 
-    assert rows.height == 0
-
-
-# ─── which records a correction can attach to ───────────────────────────────
-
-
-def test_an_exchange_with_no_context_call_is_not_emitted() -> None:
-    """The constraint that shapes this design: `eval.expected` joins on a key,
-    and a correction with no record to attach to cannot become one. The agent
-    had to retrieve something to be corrected about it."""
-    document = _document()
-    document["exchanges"][0]["context_calls"] = []
-
-    rows = _run(document)
-
-    assert rows["exchange_ordinal"].to_list() == [2]
+    assert rows.height == 1
+    text = rows["exchange_text"][0]
+    assert "no, it is a 10-K" in text, text
+    # And the claim being corrected, so the classifier can judge rather than
+    # guess from an assertion alone.
+    assert "It is a 10-Q." in text
 
 
-def test_cited_ids_come_before_merely_returned_ones() -> None:
-    """Both are candidate subjects -- an agent can be wrong about a chunk it
-    never named -- but the cited one is the better guess, so it leads."""
-    rows = _run(_document())
+def test_a_pair_carries_both_exchanges_in_order() -> None:
+    rows = _rows(_corrected_session())
+
+    text = rows["exchange_text"][0]
+    assert text.index("what form type") < text.index("no, it is a 10-K")
+    # The converter numbers exchanges from zero; the pair is (N, N+1).
+    answered = rows["answered_exchange_ordinal"][0]
+    assert rows["exchange_ordinal"][0] == answered + 1
+
+
+# ─── the ids belong to the exchange that made the claim ─────────────────────
+
+
+def test_ids_come_from_the_answering_exchange_not_the_correcting_one() -> None:
+    """A correction refers to records retrieved *before* it. Taking ids from
+    the correcting exchange would key the label to whatever the agent looked
+    up after being told it was wrong (PR #458 review)."""
+    session = _session(
+        UserTurn(text="what form type is this filing", timestamp=_AT),
+        _search(returned=("answered-ctx",)),
+        AssistantProse(text="It is a 10-Q.", timestamp=_AT),
+        UserTurn(text="no, it is a 10-K", timestamp=_AT),
+        _search(returned=("looked-up-after",)),
+        AssistantProse(text="You are right.", timestamp=_AT),
+    )
+
+    rows = _rows(session)
 
     ids = json.loads(rows["candidate_context_ids"][0])
-    assert ids == ["ctx-2", "ctx-1"]
+    assert ids == ["answered-ctx"]
+    assert "looked-up-after" not in ids
 
 
-def test_a_failed_call_contributes_no_ids() -> None:
-    """A denied or timed-out search returned nothing to be wrong about."""
-    document = _document()
-    document["exchanges"][0]["context_calls"] = [_call(error_code="denied")]
+def test_a_correction_survives_when_the_follow_up_searches_nothing() -> None:
+    """The other half of the same bug: reading ids from the correcting
+    exchange dropped the candidate entirely whenever the human's correction
+    prompted no new search — which is the common case."""
+    rows = _rows(_corrected_session())
 
-    rows = _run(document)
+    assert rows.height == 1
+    assert json.loads(rows["candidate_context_ids"][0]) == ["ctx-1", "ctx-2"]
 
-    assert rows["exchange_ordinal"].to_list() == [2]
+
+def test_an_answer_that_retrieved_nothing_yields_no_pair() -> None:
+    """`eval:` joins on a key, so a correction with no record behind the claim
+    cannot become ground truth."""
+    session = _session(
+        UserTurn(text="what form type is this filing", timestamp=_AT),
+        AssistantProse(text="It is a 10-Q.", timestamp=_AT),
+        UserTurn(text="no, it is a 10-K", timestamp=_AT),
+    )
+
+    assert _rows(session).height == 0
 
 
-def test_the_id_space_is_recorded_on_every_row() -> None:
-    """Promotion has to reconcile against the target index's `id_field`
-    rather than assume it, exactly as the retrieval half does (#380 c3)."""
-    rows = _run(_document())
+def test_a_failed_search_is_not_a_retrieval() -> None:
+    """A denied call returned nothing to be wrong about."""
+    session = _corrected_session(
+        search=_search(returned=("ctx-1",), error_code="denied")
+    )
 
-    assert set(rows["id_space"].to_list()) == {"context_id"}
+    assert _rows(session).height == 0
 
 
 # ─── contracts ──────────────────────────────────────────────────────────────
 
 
-def test_rows_are_keyed_per_exchange_and_stable() -> None:
-    first = _run(_document())
-    second = _run(_document())
+def test_the_id_space_is_recorded_on_every_row() -> None:
+    rows = _rows(_corrected_session())
+
+    assert set(rows["id_space"].to_list()) == {"context_id"}
+
+
+def test_rows_are_keyed_per_pair_and_stable() -> None:
+    first = _rows(_corrected_session())
+    second = _rows(_corrected_session())
 
     assert first["input_id"].to_list() == second["input_id"].to_list()
     assert len(set(first["input_id"].to_list())) == first.height
+
+
+def test_a_single_exchange_session_has_no_pair() -> None:
+    session = _session(
+        UserTurn(text="what form type is this filing", timestamp=_AT),
+        _search(returned=("ctx-1",)),
+        AssistantProse(text="It is a 10-Q.", timestamp=_AT),
+    )
+
+    assert _rows(session).height == 0
 
 
 def test_the_incremental_contract_replaces_a_session_as_a_unit() -> None:
@@ -165,13 +219,18 @@ def test_options_are_validated() -> None:
 
 
 def test_list_columns_survive_a_json_scalarizing_backend() -> None:
-    """Extraction backends disagree about nested types: the json backend
-    scalarizes to a string while an in-memory frame keeps lists. Both reach
-    this transform, so both have to work."""
-    document = _document()
-    document["exchanges"] = json.dumps(document["exchanges"])
+    """The json extraction backend scalarizes nested lists to strings while an
+    in-memory frame keeps them; both reach this transform."""
+    document = build_document(_corrected_session())
+    assert document is not None
+    payload = document.model_dump(mode="json")
+    payload["document_id"] = "doc-1"
+    payload["exchanges"] = json.dumps(payload["exchanges"])
+    ctx = cast(Any, _Ctx(transcripts="raw_transcripts"))
 
-    rows = _run(document)
+    rows = correction_inputs.run(
+        {"raw_transcripts": pl.DataFrame([payload])}, ctx
+    )
 
-    assert rows.height == 2
-    assert json.loads(rows["candidate_context_ids"][0]) == ["ctx-2", "ctx-1"]
+    assert rows.height == 1
+    assert json.loads(rows["candidate_context_ids"][0]) == ["ctx-1", "ctx-2"]

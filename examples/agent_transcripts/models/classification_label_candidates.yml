@@ -8,10 +8,13 @@ version: 2
 # Candidates a human promotes, never goldens. Nothing here is read by `eval:`
 # and nothing promotes itself at any confidence (#329 rule 2).
 models:
-  # 1. One row per exchange, carrying that exchange's prose and the context
-  #    ids it retrieved. The ids are the constraint: a correction has to
-  #    attach to a record to be ground truth, and those are the only record
-  #    identity a transcript names. See the transform's docstring.
+  # 1. One row per *pair* of consecutive exchanges: the agent's claim and the
+  #    human turn that may correct it. A correction lands in the next prompt,
+  #    and the records behind the claim were retrieved by the earlier
+  #    exchange, so both halves have to travel together. The ids are the
+  #    constraint: a correction has to attach to a record to be ground truth,
+  #    and those are the only record identity a transcript names. See the
+  #    transform's docstring.
   - name: correction_inputs
     description: "Exchange prose plus the context ids that exchange retrieved"
     depends_on: [ref('raw_transcripts')]
@@ -40,12 +43,20 @@ models:
       id_field: input_id
       input_field: exchange_text
       prompt: |
-        You are reading one exchange between a human and an AI agent, to find
-        cases where the human corrected a value the agent stated.
+        You are reading two consecutive turns of a conversation between a
+        human and an AI agent, to find cases where the human corrected a value
+        the agent stated.
+
+        Lines beginning `## [n]` are the human's own words. Everything else is
+        the agent: its prose, and reduced one-line records of the tools it
+        called. The agent makes a claim in the first turn; the human may
+        correct it in the second.
 
         Return the corrected value only when the human explicitly asserts a
-        different value for something the agent just claimed — for example the
+        different value for something the agent claimed — for example the
         agent says a filing is a 10-Q and the human replies that it is a 10-K.
+        The value must come from the human's turn, never from the agent
+        agreeing afterwards.
 
         Return an empty string for everything else. In particular:
         - the human agreeing, thanking, or restating what the agent said
@@ -73,8 +84,14 @@ models:
     transform:
       type: sql
       path: sql/classification_label_candidates.sql
-    materialization: incremental
-    unique_key: input_id
+    # Full, not incremental, because this model *filters*: a row whose label
+    # becomes empty -- a changed prompt, a different provider, an input that
+    # went away -- simply stops appearing in staging, and an incremental
+    # merge only replaces keys it can see. The stale candidate would sit
+    # there indefinitely, and a stale candidate is one a human might promote
+    # (PR #458 review). Rebuilding a filtered projection is cheap next to the
+    # `llm:` step above it, which stays incremental.
+    materialization: full
     tests:
       - not_null: [input_id, context_id, expected_label, id_space]
       - unique: input_id

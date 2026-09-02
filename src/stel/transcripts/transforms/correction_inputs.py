@@ -1,32 +1,34 @@
-"""Exchange-grain rows a correction classifier can read (issue #456).
+"""Exchange-pair rows a correction classifier can read (issue #456).
 
 The `eval:` half of #329 phase 3, and the mechanical part of it. Deciding
 whether a human corrected the assistant is a judgement, so it belongs to an
-`llm:` model in an ordinary stel project (#329 rule 3). What that model needs
-first is a row per exchange carrying two things the corpus keeps in different
-places:
+`llm:` model in an ordinary stel project (#329 rule 3). Getting that model the
+right *input* is this module's whole job, and the corpus makes it non-obvious
+in two ways that both have to be handled together (PR #458 review).
 
-- **the prose of that exchange**, sliced out of the session's rendered text by
-  its `## [<ordinal>] ...` heading, which is the same anchor `chunk:` uses for
-  heading attribution;
-- **the context ids that exchange touched**, from `context_calls`
-  (`transcript/v1.1`), because a correction has to attach to a *record* to
-  become an `eval.expected` row and those ids are the only record identity a
-  transcript reliably names.
+**A correction spans two exchanges.** An exchange is one human prompt plus the
+assistant's answer to it, so a human correcting an answer does so in the
+*next* prompt. The claim being corrected is in exchange N; the correction is
+in exchange N+1. A row here is therefore a pair, carrying the rendered text of
+both, and the classifier is told that `## [n]` headings are the human's turn.
 
-**Why the ids are the constraint.** `eval:` scores predictions against
-expected labels joined on a key. A human saying "no, that filing is a 10-K"
-is worthless as ground truth unless we know which filing. The agent had to
-retrieve something to be corrected about it, so the ids its context calls
-returned are the candidate subjects; an exchange with no context call has
-nothing to attach a label to and is not emitted. That is a real limit, not an
-oversight: it means this derives labels only for records the corpus can name.
+**The ids belong to the earlier exchange.** `context_calls` on an exchange are
+the searches made while answering *that* prompt, so the records behind a wrong
+answer were retrieved in exchange N -- not in N+1, where the correction lives.
+Reading ids from the correcting exchange would key a label to whatever the
+agent looked up *after* being corrected, or drop the correction entirely when
+the follow-up searched nothing.
+
+**Why ids are the constraint at all.** `eval:` scores predictions against
+expected labels joined on a key. A human saying "no, that filing is a 10-K" is
+worthless as ground truth unless we know which filing. So a pair is emitted
+only when exchange N retrieved something: that is a real limit on what can be
+derived, not an oversight.
 
 **Sensitivity.** This carries exchange prose, which exists here only because
 the harness chose to capture it -- `transcript/v1` makes text optional and the
 converter keeps what it was given (#329 rule 1). A fingerprint-only corpus
-produces empty prose and therefore no candidates, which is the correct
-outcome rather than a degraded one.
+produces no rows rather than degraded ones.
 
 Nothing here decides anything: it shapes input. The classifier proposes, and
 per #329 rule 2 a human promotes.
@@ -36,6 +38,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from typing import Any
 
 import polars as pl
@@ -58,7 +61,10 @@ _SCHEMA: dict[str, pl.DataType] = {
     "source_document_id": pl.String(),
     "session_id": pl.String(),
     "harness": pl.String(),
+    # The exchange whose prompt may hold the correction.
     "exchange_ordinal": pl.Int64(),
+    # The exchange that made the claim, and whose searches the ids come from.
+    "answered_exchange_ordinal": pl.Int64(),
     "heading": pl.String(),
     "exchange_text": pl.String(),
     "id_space": pl.String(),
@@ -114,41 +120,58 @@ def _document_rows(document: Mapping[str, Any]) -> list[dict[str, Any]]:
     session_id = _text(document.get("session_id"))
     harness = _text(document.get("harness"))
     source_document_id = _text(document.get("document_id"))
-    prose = _exchange_prose(_text(document.get("text")))
+    sections = _exchange_sections(_text(document.get("text")))
+    exchanges = [
+        exchange
+        for exchange in _exchanges(document.get("exchanges"))
+        if isinstance(exchange.get("ordinal"), int)
+    ]
+    exchanges.sort(key=lambda item: int(item["ordinal"]))
+
     rows: list[dict[str, Any]] = []
-    for exchange in _exchanges(document.get("exchanges")):
-        ordinal = exchange.get("ordinal")
-        if not isinstance(ordinal, int):
-            continue
-        context_ids = _touched_context_ids(exchange)
+    for answered, correcting in pairwise(exchanges):
+        answered_ordinal = int(answered["ordinal"])
+        correcting_ordinal = int(correcting["ordinal"])
+        # Ids come from the exchange that produced the claim, not the one that
+        # corrects it. See the module docstring.
+        context_ids = _touched_context_ids(answered)
         if not context_ids:
-            # Nothing to attach a label to; see the module docstring.
             continue
-        text = prose.get(ordinal, "")
+        text = "\n\n".join(
+            part
+            for part in (
+                sections.get(answered_ordinal, ""),
+                sections.get(correcting_ordinal, ""),
+            )
+            if part.strip()
+        )
         if not text.strip():
-            # A fingerprint-only corpus, or an exchange the renderer wrote no
-            # prose for. There is nothing for a classifier to read.
+            # A fingerprint-only corpus: nothing for a classifier to read.
             continue
         rows.append(
             {
                 "input_id": canonical_fingerprint(
-                    {"session": session_id, "exchange": ordinal},
+                    {
+                        "session": session_id,
+                        "answered": answered_ordinal,
+                        "correcting": correcting_ordinal,
+                    },
                     domain="stel.correction-input",
                     version=1,
                 ),
                 "source_document_id": source_document_id,
                 "session_id": session_id,
                 "harness": harness,
-                "exchange_ordinal": ordinal,
-                "heading": _text(exchange.get("heading")),
+                "exchange_ordinal": correcting_ordinal,
+                "answered_exchange_ordinal": answered_ordinal,
+                "heading": _text(correcting.get("heading")),
                 "exchange_text": text,
                 "id_space": ID_SPACE,
-                # A JSON array rather than a list column: the same reason
-                # `_sequence` exists on the sibling transform -- extraction
-                # backends disagree about nested types, and a string crosses
-                # every warehouse unchanged.
+                # A JSON array rather than a list column: extraction backends
+                # disagree about nested types, and a string crosses every
+                # warehouse unchanged.
                 "candidate_context_ids": json.dumps(context_ids),
-                "observed_at": _text(exchange.get("started_at")),
+                "observed_at": _text(correcting.get("started_at")),
             }
         )
     return rows
@@ -177,18 +200,23 @@ def _touched_context_ids(exchange: Mapping[str, Any]) -> list[str]:
     return ordered
 
 
-def _exchange_prose(text: str) -> dict[int, str]:
-    """Slice the rendered session into per-exchange prose by its headings."""
+def _exchange_sections(text: str) -> dict[int, str]:
+    """Slice the rendered session into per-exchange sections, headings kept.
+
+    The heading is not decoration to strip: `_build_exchange` renders the
+    human's prompt *as* the `## [n] ...` line, and a single-line prompt
+    appears nowhere else. Slicing from after the heading -- which this did
+    first -- handed the classifier assistant prose only, so the one turn that
+    can contain a correction was the one turn it could not see (PR #458
+    review).
+    """
     matches = list(_HEADING.finditer(text))
-    prose: dict[int, str] = {}
+    sections: dict[int, str] = {}
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        try:
-            ordinal = int(match.group(1))
-        except ValueError:  # pragma: no cover - the pattern only matches digits
-            continue
-        prose[ordinal] = text[match.end() : end].strip()
-    return prose
+        # The pattern captures `\d+`, so this cannot fail to parse.
+        sections[int(match.group(1))] = text[match.start() : end].strip()
+    return sections
 
 
 def _exchanges(value: Any) -> list[Mapping[str, Any]]:

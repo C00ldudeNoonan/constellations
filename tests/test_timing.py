@@ -110,3 +110,31 @@ def test_totals_are_rounded_to_milliseconds() -> None:
     timings.add("read", 1.23456789)
 
     assert timings.as_metrics()["seconds_read"] == 1.235
+
+
+def test_merge_folds_another_accumulator_in() -> None:
+    """The adapter breaks a read into transfer, decode and client copy because
+    only it can; the executor owns the run's metrics. This is that seam."""
+    run = PhaseTimings()
+    run.add("read", 5.0)
+    adapter = PhaseTimings()
+    adapter.add("read_transfer", 3.0)
+    adapter.add("read_decode", 1.5)
+
+    run.merge(adapter)
+
+    metrics = run.as_metrics()
+    assert metrics["seconds_read"] == 5.0
+    assert metrics["seconds_read_transfer"] == 3.0
+    assert metrics["seconds_read_decode"] == 1.5
+
+
+def test_merge_accumulates_rather_than_replaces() -> None:
+    run = PhaseTimings()
+    run.add("read_transfer", 1.0)
+    other = PhaseTimings()
+    other.add("read_transfer", 2.0)
+
+    run.merge(other)
+
+    assert run.as_metrics()["seconds_read_transfer"] == 3.0

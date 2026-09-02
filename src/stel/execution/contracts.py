@@ -5,7 +5,19 @@ from typing import Any
 
 
 class RunError(Exception):
-    pass
+    """A model failed.
+
+    `metrics` carries partial run metrics across the error boundary. A
+    provider call that failed still spent the time -- `PhaseTimings.phase()`
+    credits it deliberately -- and a *slow* failure is exactly the one an
+    operator needs attributed. Without this the runner builds a fresh result
+    with empty metrics and that timing never reaches `run_results.json`
+    (issue #432, PR #460 review).
+    """
+
+    def __init__(self, *args: Any, metrics: dict[str, Any] | None = None) -> None:
+        super().__init__(*args)
+        self.metrics: dict[str, Any] = metrics or {}
 
 
 @dataclass

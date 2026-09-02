@@ -74,6 +74,42 @@ def run_search_model(
     full_refresh: bool = False,
     subset_run: bool = False,
 ) -> ModelRunResult:
+    """Publish the model, keeping its timings even if it fails.
+
+    A publish that dies hours in is exactly the one whose attribution matters,
+    and the runner builds a fresh result on `RunError` (PR #460 review).
+    """
+    timings = PhaseTimings()
+    try:
+        return _run_search_model(
+            model=model,
+            models_by_name=models_by_name,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            full_refresh=full_refresh,
+            subset_run=subset_run,
+            timings=timings,
+        )
+    except RunError as error:
+        if not error.metrics:
+            error.metrics = timings.as_metrics()
+        raise
+
+
+def _run_search_model(
+    *,
+    model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool = False,
+    subset_run: bool = False,
+    timings: PhaseTimings,
+) -> ModelRunResult:
     search = model.search
     assert search is not None
     if resolved.retrieval is None:
@@ -110,11 +146,6 @@ def run_search_model(
     active_generation: str | None = None
     state_swapped = False
     superseded_collection: str | None = None
-    # Where the wall clock went (#432). Publishing this corpus was dominated
-    # by per-page round trips (#452 measured ~3.7s of ledger reads and a MERGE
-    # per page, 13,794 pages), so which of these terms is large is the
-    # question both open performance issues open by asking.
-    timings = PhaseTimings()
 
     try:
         # Publication-state residency is bounded (issue #153): reconciliation
@@ -242,6 +273,10 @@ def run_search_model(
                     with timings.phase("read"):
                         batch = next(batches, None)
                     if batch is None:
+                        # Only the adapter can attribute inside a read, so its
+                        # transfer/decode/copy split is folded in once the
+                        # stream is drained (issue #454).
+                        timings.merge(snapshot.timings)
                         break
                     ordinal += 1
                     indexed = _indexed_rows(
@@ -310,12 +345,13 @@ def run_search_model(
                                 },
                                 domain="dbt-ml-search-governed-revoke-batch",
                             )
-                            receipt = store.delete(
-                                physical,
-                                changed_ids,
-                                id_field=search.id_field,
-                                mutation_digest=revoke_digest,
-                            )
+                            with timings.phase("store_write"):
+                                receipt = store.delete(
+                                    physical,
+                                    changed_ids,
+                                    id_field=search.id_field,
+                                    mutation_digest=revoke_digest,
+                                )
                             if not receipt.acknowledged or len(receipt.outcomes) != len(
                                 changed_ids
                             ):
@@ -393,12 +429,13 @@ def run_search_model(
                             },
                             domain="dbt-ml-search-delete-batch",
                         )
-                        receipt = store.delete(
-                            physical,
-                            record_ids,
-                            id_field=search.id_field,
-                            mutation_digest=digest,
-                        )
+                        with timings.phase("store_write"):
+                            receipt = store.delete(
+                                physical,
+                                record_ids,
+                                id_field=search.id_field,
+                                mutation_digest=digest,
+                            )
                         if not receipt.acknowledged or len(receipt.outcomes) != len(
                             record_ids
                         ):
@@ -406,7 +443,8 @@ def run_search_model(
                                 "Retrieval store did not return an exact durable "
                                 "delete receipt"
                             )
-                        adapter.delete_state(publish_scope, record_ids)
+                        with timings.phase("state"):
+                            adapter.delete_state(publish_scope, record_ids)
                         deleted += len(record_ids)
                 finally:
                     stale_pages.close()
@@ -449,13 +487,14 @@ def run_search_model(
             # publish would skip rows the old collection never received.
             # `state_swapped` lets the failure path clear that state, so the
             # next run reconciles against nothing and republishes in full.
-            _activate_generation(
-                adapter,
-                serving_scope=state_scope,
-                publish_scope=publish_scope,
-                lease=publish_lease,
-                page_size=search.batch_size,
-            )
+            with timings.phase("state"):
+                _activate_generation(
+                    adapter,
+                    serving_scope=state_scope,
+                    publish_scope=publish_scope,
+                    lease=publish_lease,
+                    page_size=search.batch_size,
+                )
             state_swapped = True
         coordinator.mark_ready(
             publish_lease,

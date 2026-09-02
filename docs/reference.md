@@ -3820,9 +3820,20 @@ run results under `target-path`:
   `read` is a warehouse or transfer problem, and one dominated by `provider`
   is neither.
 
+  On BigQuery the read is broken down further, because only the adapter can:
+  `seconds_read_transfer` (waiting on the Storage Read stream),
+  `seconds_read_decode` (Arrow decode), and `seconds_read_coalesce` (the
+  projection and the copy that batches server pages up to `batch_size`). That
+  split is the one that decides whether compression would help: it trades wire
+  bytes for client CPU, so a read already dominated by decode gets *slower*
+  under it. `seconds_read` is the total time blocked pulling, and the
+  difference between it and those three is unattributed.
+
   These are **summed across threads**, so once provider batches overlap they
   can exceed the model's own `duration_seconds` — that ratio is the
-  concurrency actually achieved, and is why both numbers are reported.
+  concurrency actually achieved, and is why both numbers are reported. A model
+  that *fails* still reports what it measured: a slow failure is the one worth
+  diagnosing.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`stel docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `stel docs serve`.

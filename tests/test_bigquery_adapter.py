@@ -58,6 +58,7 @@ from stel.adapters.bigquery import (
 )
 from stel.config.identifiers import LEGACY_SCHEMA_NAME
 from stel.credentials import ProtectedCredential
+from stel.timing import PhaseTimings
 
 # ─── config ─────────────────────────────────────────────────────────────────
 
@@ -4565,13 +4566,13 @@ def _server_batches(rows: int, per_batch: int) -> list[pa.RecordBatch]:
 def test_small_server_batches_are_coalesced_to_the_configured_page() -> None:
     """The #452 regression. 200 rows arriving 2 at a time must publish as four
     pages of 50, not a hundred pages of 2."""
-    pages = list(_coalesced_batches(iter(_server_batches(200, 2)), [0], 50))
+    pages = list(_coalesced_batches(iter(_server_batches(200, 2)), [0], 50, PhaseTimings()))
     assert [page.num_rows for page in pages] == [50, 50, 50, 50]
 
 
 def test_coalescing_preserves_every_row_in_order() -> None:
     """Repacking must not lose or reorder rows: the publish loop keys on them."""
-    pages = list(_coalesced_batches(iter(_server_batches(97, 3)), [0], 25))
+    pages = list(_coalesced_batches(iter(_server_batches(97, 3)), [0], 25, PhaseTimings()))
     seen = [value for page in pages for value in page.column(0).to_pylist()]
     assert seen == [f"r{index}" for index in range(97)]
     assert [page.num_rows for page in pages] == [25, 25, 25, 22]
@@ -4580,17 +4581,17 @@ def test_coalescing_preserves_every_row_in_order() -> None:
 def test_an_oversized_server_batch_carries_its_remainder() -> None:
     """A remainder emitted short rather than carried would alternate full and
     stub pages whenever the server's size does not divide `batch_size`."""
-    pages = list(_coalesced_batches(iter(_server_batches(120, 40)), [0], 25))
+    pages = list(_coalesced_batches(iter(_server_batches(120, 40)), [0], 25, PhaseTimings()))
     assert [page.num_rows for page in pages] == [25, 25, 25, 25, 20]
 
 
 def test_a_server_batch_larger_than_the_page_is_split() -> None:
-    pages = list(_coalesced_batches(iter(_server_batches(100, 100)), [0], 30))
+    pages = list(_coalesced_batches(iter(_server_batches(100, 100)), [0], 30, PhaseTimings()))
     assert [page.num_rows for page in pages] == [30, 30, 30, 10]
 
 
 def test_an_empty_stream_yields_nothing() -> None:
-    assert list(_coalesced_batches(iter([]), [0], 25)) == []
+    assert list(_coalesced_batches(iter([]), [0], 25, PhaseTimings())) == []
 
 
 def test_coalescing_applies_the_projection() -> None:
@@ -4600,7 +4601,7 @@ def test_coalescing_applies_the_projection() -> None:
         pa.RecordBatch.from_pydict({"a": [1, 2], "b": ["x", "y"]}),
         pa.RecordBatch.from_pydict({"a": [3], "b": ["z"]}),
     ]
-    pages = list(_coalesced_batches(iter(batches), [1], 3))
+    pages = list(_coalesced_batches(iter(batches), [1], 3, PhaseTimings()))
     assert [page.schema.names for page in pages] == [["b"]]
     assert pages[0].column(0).to_pylist() == ["x", "y", "z"]
 

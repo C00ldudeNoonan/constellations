@@ -82,7 +82,7 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
     ),
     (
         "execution/embed.py",
-        "run_embed_model",
+        "_run_embed_model",
         1,
         BOUNDED,
         "a zero-row probe for column names and dtypes; the rows stream in "

@@ -90,6 +90,46 @@ def run_embed_model(
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
 ) -> ModelRunResult:
+    """Run the model, keeping its timings even if it fails.
+
+    A slow failure is the one worth diagnosing, and `PhaseTimings.phase()`
+    deliberately credits work that raised -- but the runner builds a fresh
+    result on `RunError`, so without carrying them across the boundary that
+    attribution never reaches the operator (PR #460 review).
+    """
+    timings = PhaseTimings()
+    try:
+        return _run_embed_model(
+            model=model,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            full_refresh=full_refresh,
+            run_budget=run_budget,
+            subset_run=subset_run,
+            read_predicates=read_predicates,
+            timings=timings,
+        )
+    except RunError as error:
+        if not error.metrics:
+            error.metrics = timings.as_metrics()
+        raise
+
+
+def _run_embed_model(
+    *,
+    model: ModelConfig,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool,
+    run_budget: BudgetLedger | None = None,
+    subset_run: bool = False,
+    read_predicates: Sequence[ReadPredicate] = (),
+    timings: PhaseTimings,
+) -> ModelRunResult:
     assert model.embed is not None
     config = model.embed
     if not model.depends_on or len(model.depends_on) != 1:
@@ -203,9 +243,6 @@ def run_embed_model(
     # Guards the counters and the budget ledger once provider
     # batches run concurrently (issue #432).
     usage_lock = threading.Lock()
-    # Where the wall clock actually goes. Both #432 and #454 open by asking
-    # for this and neither is answerable from a run without it.
-    timings = PhaseTimings()
     provider_batches = 0
     provider_calls = 0
     use_full = model.materialization == "full" or full_refresh or rebuild_target
@@ -325,6 +362,11 @@ def run_embed_model(
                     if len(window) >= flush_every:
                         yield window
                         window = []
+            # The adapter splits its own read into transfer, decode and
+            # client-side copy where it can; `read` above is the total time
+            # blocked pulling, and only the adapter can attribute inside it
+            # (issue #454).
+            timings.merge(snapshot.timings)
         if window:
             yield window
 

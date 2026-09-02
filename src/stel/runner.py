@@ -530,6 +530,11 @@ def build_project(
                         materialization=model.materialization,
                         kind="unknown",
                         errors=[_artifact_error_text(e)],
+                        # Whatever the stage managed to attribute before it
+                        # failed. A slow failure is the one worth diagnosing,
+                        # and dropping its timings here would discard exactly
+                        # the number that explains it.
+                        metrics=getattr(e, "metrics", {}) or {},
                     )
                 )
                 # _run_model raised before reaching its own model_finished, so

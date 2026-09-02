@@ -61,6 +61,22 @@ class PhaseTimings:
         with self._lock:
             self._totals[name] = self._totals.get(name, 0.0) + seconds
 
+    def merge(self, other: PhaseTimings) -> None:
+        """Fold another accumulator's totals in.
+
+        The adapter breaks a read into transfer, decode and client-side copy
+        because only the adapter can (issue #454); the executor owns the
+        run's metrics. This is the seam between them, taken after the stream
+        is drained.
+        """
+        for name, seconds in other.snapshot().items():
+            self.add(name, seconds)
+
+    def snapshot(self) -> dict[str, float]:
+        """Raw totals, unrounded and unprefixed."""
+        with self._lock:
+            return dict(self._totals)
+
     def as_metrics(self) -> dict[str, float]:
         """Phase totals as run-result metrics, rounded to milliseconds.
 

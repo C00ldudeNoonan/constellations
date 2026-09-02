@@ -55,6 +55,7 @@ from ..hashing import canonical_fingerprint
 from ..logging_setup import REPORTER_ECHO_EXTRA
 from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
+from ..timing import PhaseTimings
 from .base import (
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
@@ -925,7 +926,11 @@ def _read_session_arrow_schema(session: Any) -> pa.Schema:
 
 
 def _storage_read_batches(
-    read_client: Any, session: Any, *, timeout: float | None
+    read_client: Any,
+    session: Any,
+    *,
+    timeout: float | None,
+    timings: PhaseTimings,
 ) -> Iterator[pa.RecordBatch]:
     """Stream one read session's Arrow pages, one page held at a time.
 
@@ -944,13 +949,25 @@ def _storage_read_batches(
     deadline = None if timeout is None else time.monotonic() + timeout
     reader = read_client.read_rows(streams[0].name, timeout=timeout)
     try:
-        for page in reader.rows().pages:
+        # Transfer and decode are timed apart because #454 turns on which one
+        # dominates: compression trades wire bytes for client CPU, so a read
+        # that is already decode-bound gets *slower* under it. A single
+        # "read" number cannot tell those apart, and would argue for the
+        # wrong change half the time.
+        pages = iter(reader.rows().pages)
+        while True:
+            with timings.phase("read_transfer"):
+                page = next(pages, None)
+            if page is None:
+                break
             if deadline is not None and time.monotonic() >= deadline:
                 raise AdapterError(
                     "BigQuery table snapshot stream did not complete within "
                     f"{timeout}s"
                 )
-            yield page.to_arrow()
+            with timings.phase("read_decode"):
+                decoded = page.to_arrow()
+            yield decoded
     finally:
         cancel = getattr(reader, "cancel", None)
         if callable(cancel):
@@ -961,6 +978,7 @@ def _coalesced_batches(
     arrow_batches: Iterator[pa.RecordBatch],
     output_indices: list[int],
     batch_size: int,
+    timings: PhaseTimings,
 ) -> Iterator[pa.RecordBatch]:
     """Project each server batch and emit pages of `batch_size` rows.
 
@@ -995,11 +1013,13 @@ def _coalesced_batches(
     pending: list[pa.RecordBatch] = []
     pending_rows = 0
     for batch in arrow_batches:
-        pending.append(batch.select(output_indices))
-        pending_rows += len(pending[-1])
+        with timings.phase("read_coalesce"):
+            pending.append(batch.select(output_indices))
+            pending_rows += len(pending[-1])
         if pending_rows < batch_size:
             continue
-        combined = pa.Table.from_batches(pending).combine_chunks()
+        with timings.phase("read_coalesce"):
+            combined = pa.Table.from_batches(pending).combine_chunks()
         offset = 0
         while combined.num_rows - offset >= batch_size:
             yield from combined.slice(offset, batch_size).to_batches()
@@ -1008,7 +1028,8 @@ def _coalesced_batches(
         pending = remainder.to_batches() if remainder.num_rows else []
         pending_rows = remainder.num_rows
     if pending_rows:
-        combined = pa.Table.from_batches(pending).combine_chunks()
+        with timings.phase("read_coalesce"):
+            combined = pa.Table.from_batches(pending).combine_chunks()
         yield from combined.to_batches(max_chunksize=batch_size)
 
 
@@ -1724,10 +1745,12 @@ class BigQueryAdapter(WarehouseAdapter):
             output_schema = pa.schema(
                 [query_schema.field(index) for index in output_indices]
             )
+            read_timings = PhaseTimings()
             arrow_batches = _storage_read_batches(
                 self._ensure_bqstorage_client(),
                 session,
                 timeout=self._cfg.job_execution_timeout_seconds,
+                timings=read_timings,
             )
 
             def batches() -> Iterator[pa.RecordBatch]:
@@ -1738,7 +1761,10 @@ class BigQueryAdapter(WarehouseAdapter):
                 try:
                     assert arrow_batches is not None
                     for projected in _coalesced_batches(
-                        arrow_batches, output_indices, request.batch_size
+                        arrow_batches,
+                        output_indices,
+                        request.batch_size,
+                        read_timings,
                     ):
                         yield projected
                         projected = None
@@ -1815,6 +1841,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 validate_unchanged=validate_unchanged,
                 close=close,
                 generation_fingerprint=generation_fingerprint,
+                timings=read_timings,
             )
         except AdapterError:
             params.clear()

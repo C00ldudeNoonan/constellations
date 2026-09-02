@@ -543,6 +543,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("embedding-input-text", 1, "d3bff0761e0d18692fd51fa87dc379cd"),
     ("llm-input-content", 1, "03c6810c0553f536003b67bb80e3f124"),
     ("llm-map-config", 1, "5ed9c5ffcb8d96f026b8a3bbd2946510"),
+    ("stel.correction-input", 1, "493291bb0fe948b2f4bae167d8d9956c"),
     ("stel.retrieval-judgment-candidate", 1, "9962684026d2803c4aeaf1a21a6da8e0"),
     ("stel.transcript-tool-args", 1, "fd50cbbb265122dee92aedd63a226410"),
 )

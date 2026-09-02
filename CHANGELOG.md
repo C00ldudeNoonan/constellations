@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Candidate classification labels from the transcript corpus (issue #456)
+
+The `eval:` half of #329 phase 3, and the last piece of it. The retrieval half
+shipped across #387, #388 and #451; this derives the other kind of ground
+truth — a label a human corrected — from the same corpus, in three models that
+add no new model kind (#329 rule 3):
+
+- `correction_inputs`, a built-in transform emitting one row per *pair* of
+  consecutive exchanges — the claim, the human turn that may correct it, and
+  the context ids retrieved while making the claim. A correction lands in the
+  next prompt, and the records behind a wrong answer were retrieved by the
+  earlier exchange, so all three travel together;
+- an ordinary `llm:` model judging whether the human corrected a stated value;
+- a SQL transform shaping the result into what `eval.expected` reads.
+
+**The ids are the constraint, and they shape what this can derive.** `eval:`
+joins expected labels to predictions on a key, so a correction is only ground
+truth if it attaches to a record — and the ids an exchange retrieved are the
+only record identity a transcript names. An exchange that retrieved nothing
+produces no candidate however clearly it corrects something. Failed context
+calls contribute nothing either: they returned nothing to be wrong about.
+
+Sensitivity is unchanged (#329 rule 1): exchange prose exists here only where
+a harness captured it, and a fingerprint-only corpus produces no candidates
+rather than degraded ones. So is rule 2 — nothing is read by `eval:` and
+nothing promotes itself at any confidence, asserted by a test rather than left
+to the naming.
+
+The example ships offline on the `deterministic` provider, which returns a
+stub for every row. It proves the chain and the contract; judging what is
+actually a correction is prompt-shaped and needs a real provider.
+
 ### Removal detection is a warehouse anti-join (issue #428)
 
 Chunk and embed reconciled deletions by set difference in Python, so each held

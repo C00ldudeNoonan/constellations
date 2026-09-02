@@ -1,0 +1,61 @@
+{
+  "schema_version": "transcript/v1.1",
+  "harness": "claude-code",
+  "session_id": "0f5a2c1e-3333-4ccc-8ddd-000000000003",
+  "source_path": "0f5a2c1e-3333-4ccc-8ddd-000000000003.jsonl",
+  "project_path": "/home/dev/repos/analytics",
+  "git_branch": "main",
+  "started_at": "2026-08-30T14:12:00Z",
+  "ended_at": "2026-08-30T14:12:00Z",
+  "exchange_count": 2,
+  "tools_used": [
+    "mcp__stel-context__search_context"
+  ],
+  "files_touched": [],
+  "text": "## [0] which retention tier does the policy doc put audit logs in\n\n- tool mcp__stel-context__search_context (ok, 812B) args:3f9a1c77e2b0\n\nThe policy places audit logs in the standard tier, retained for 90 days.\n\n## [1] no, audit logs are extended tier - 400 days, not standard\n\nYou are right, the extended tier applies to audit logs.\n",
+  "exchanges": [
+    {
+      "ordinal": 0,
+      "heading": "[0] which retention tier does the policy doc put audit logs in",
+      "started_at": "2026-08-30T14:12:00Z",
+      "ended_at": "2026-08-30T14:12:00Z",
+      "prompt_chars": 58,
+      "prompt_truncated": false,
+      "assistant_chars": 72,
+      "tool_calls": 1,
+      "tool_errors": 0,
+      "tools_used": [
+        "mcp__stel-context__search_context"
+      ],
+      "files_touched": [],
+      "context_calls": [
+        {
+          "model": "context_search",
+          "query_fingerprint": "c41d8f2a6b7e40559ac3d18e2f6b90aa",
+          "query_text": null,
+          "returned_context_ids": [
+            "11111111111111111111111111111111"
+          ],
+          "returned_chunk_ids": [],
+          "cited_context_ids": [],
+          "zero_results": false,
+          "error_code": null
+        }
+      ]
+    },
+    {
+      "ordinal": 1,
+      "heading": "[1] no, audit logs are extended tier - 400 days, not standard",
+      "started_at": "2026-08-30T14:12:00Z",
+      "ended_at": "2026-08-30T14:12:00Z",
+      "prompt_chars": 57,
+      "prompt_truncated": false,
+      "assistant_chars": 55,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "tools_used": [],
+      "files_touched": [],
+      "context_calls": []
+    }
+  ]
+}

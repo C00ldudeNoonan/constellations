@@ -12,6 +12,19 @@ agent_transcripts:
           local:
             type: lancedb
             path: ./target/lancedb
+      # The correction classifier (#456). Offline by default so the example
+      # runs in CI with no credentials and no spend; labels worth trusting
+      # need a real provider:
+      #   provider: vertex
+      #   model: gemini-2.5-flash
+      llm:
+        provider: deterministic
+        model: deterministic-v1
+        # A cap on the analysis itself: this is one billed call per exchange
+        # that retrieved context, and a corpus that suddenly grows should
+        # stop rather than spend.
+        budget:
+          max_api_calls: 200
 
     # The same project, served from DuckDB instead of LanceDB. Nothing in
     # models/ changes -- the search model names a store alias, not a store
@@ -31,3 +44,11 @@ agent_transcripts:
           local:
             type: duckdb
             path: ./target/transcripts.duckdb
+      # Same offline classifier as `dev`. A target that omitted it would fall
+      # back to a credentialed provider and fail the run, since the models are
+      # identical across targets by design.
+      llm:
+        provider: deterministic
+        model: deterministic-v1
+        budget:
+          max_api_calls: 200

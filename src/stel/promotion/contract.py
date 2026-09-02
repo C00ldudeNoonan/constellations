@@ -29,6 +29,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 GOLDEN_SET_VERSION = 1
 
+# What `stel promote` writes when the corpus captured no text for a query
+# (issue #380). Rejected on load: a draft that still carries it has not been
+# reviewed, and a golden set is re-run through `search()`, so an unreviewed
+# placeholder would not fail — it would quietly become a test that asks the
+# wrong question and reports whatever it retrieves.
+UNCONFIRMED_QUERY_TEXT = "CONFIRM: the corpus captured no text for this query"
+
 
 class PromotionError(Exception):
     """A promoted golden-set file that cannot be trusted as written."""
@@ -147,6 +154,23 @@ def load_golden_set(path: Path) -> GoldenSetFile:
     if not isinstance(document, dict):
         raise PromotionError(f"{path} must contain a YAML mapping")
     try:
-        return GoldenSetFile.model_validate(document)
+        golden = GoldenSetFile.model_validate(document)
     except ValidationError as error:
         raise PromotionError(f"{path} is not a valid golden set: {error}") from None
+    # Checked here rather than on the model, because `stel promote` has to be
+    # able to *build* a row carrying the placeholder — writing the draft is
+    # the whole point. The rule is that an unreviewed draft must not load, not
+    # that it cannot be represented.
+    unconfirmed = [
+        query.query_id
+        for query in golden.queries
+        if query.query_text.strip() == UNCONFIRMED_QUERY_TEXT
+    ]
+    if unconfirmed:
+        raise PromotionError(
+            f"{path} still carries drafted placeholder query text for "
+            f"{', '.join(unconfirmed)}. The corpus captured no text for "
+            "these, so a reviewer has to write the question each golden "
+            "asks before it can run."
+        )
+    return golden

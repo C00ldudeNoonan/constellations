@@ -26,6 +26,34 @@ into ~14 hours, and throughput fell below what the same corpus managed before
   GETs to merge them, than 145 large ones. Worth re-checking before treating it
   as its own bug.
 
+### `stel promote` drafts a golden set from candidate judgments (issue #380)
+
+The drafting aid #380 left open, and the last piece of #329 phase 3 besides
+`classification_label_candidates`. Writing a promoted golden set by hand
+against a relation of candidate rows is tedious enough to discourage
+promotion, which is the one step the whole feedback loop depends on a human
+performing.
+
+It drafts; it does not promote. The output is a file to read, edit and merge,
+carrying a header that says so, and `--write` is required before anything is
+written at all. An existing file is never overwritten without `--force`,
+because re-drafting over a reviewed file discards the review that is the point
+of the artifact.
+
+Only ids an answer actually cited become `relevant_ids`. An id that was
+returned and not cited is left out rather than recorded as a negative: an
+agent may use a chunk without naming it, so that is absence of evidence, not
+evidence of irrelevance. A query with no citation at all — a zero result, or
+one whose returned ids were never named — is skipped *and reported*, since
+only a human can say what should have matched it.
+
+Query text is filled in from the corpus where it was captured and shown for
+confirmation, a transcribed query being more faithful than a remembered one.
+Where the corpus is fingerprint-only, which is the sensitivity default, the
+drafted row carries a placeholder that `load_golden_set` now refuses by name,
+so an unreviewed draft fails loudly instead of running as a test that asks the
+wrong question.
+
 ### A failed search publish no longer takes a healthy index offline (issue #449)
 
 A publication that failed cleared the ledger's `active_generation`

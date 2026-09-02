@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Removal detection is a warehouse anti-join (issue #428)
+
+Chunk and embed reconciled deletions by set difference in Python, so each held
+every upstream id at once — measured at ~108 bytes per id, ~370MB over a
+3.6M-row corpus, and twice that on a resuming embed, which holds the upstream
+and target key sets at the same time. It was the last O(corpus) term in the
+bounded-memory contract, and it was paid in full on every run regardless of how
+little had changed.
+
+The warehouse evaluates the anti-join now — "which state keys have no matching
+upstream row" — through the same paged, snapshot-consistent state reader search
+publication has used since #153. What reaches Python is only the keys to
+delete, which is small by construction: an unchanged corpus surfaces nothing.
+
+Two consequences worth naming:
+
+- The id-validation pass no longer accumulates ids. NULL and empty ids are
+  still counted while streaming (two integers), and duplicate detection moves
+  to the warehouse via the snapshot's `key_column`, which both adapters
+  already evaluate as one aggregate over the key alone. Validation stays eager,
+  ahead of any provider spend.
+- The state absence probe now compares on an explicit cast to string. State
+  keys are always the stringified id, the probed column need not be — a numeric
+  id is a supported contract for embed — and BigQuery refuses `STRING = INT64`
+  rather than coercing, so removal detection against a typed key would have
+  failed there.
+- Only string and integer id columns take the warehouse path. A cast is not a
+  general substitute for Python's `str()`: a boolean id is written to state as
+  `True` and cast by both engines to `true`, so the anti-join would call every
+  unchanged row absent and delete it. Types whose cast cannot be proven
+  identical reconcile in Python, which costs the id domain but cannot silently
+  delete a corpus.
+- Removals are deleted a page at a time rather than collected first, so
+  emptying an upstream entirely does not rebuild the term this change removes.
+
 ## v0.15.4 - 2026-09-02
 
 ### Snapshot reads honor `batch_size` again (issue #452)

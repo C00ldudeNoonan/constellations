@@ -418,3 +418,186 @@ def test_provider_failure_does_not_publish_rows_or_advance_state(
         )[0][0]
         != old_vector
     )
+
+
+# ─── removal detection is an anti-join, not a set difference (issue #428) ───
+
+
+class _CountingPageReader:
+    """Delegates to a real state page reader, recording page sizes.
+
+    A wrapper rather than a patched method: the reader's own `fetch_page`
+    validates ordering and page bounds, and this has to sit outside that, not
+    replace it.
+    """
+
+    def __init__(self, reader: Any, surfaced: list[int]) -> None:
+        self._reader = reader
+        self._surfaced = surfaced
+
+    def fetch_page(self, cursor: str | None = None) -> Any:
+        page = self._reader.fetch_page(cursor)
+        self._surfaced.append(len(page.records))
+        return page
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._reader, name)
+
+
+def _count_anti_join_keys(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record how many state keys the anti-join actually surfaces to Python.
+
+    Only the probing reader is counted: embed opens others for ordinary state
+    work, and counting those would measure the wrong thing.
+    """
+    from contextlib import contextmanager
+
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    surfaced: list[int] = []
+    original = DuckDBAdapter.state_page_reader
+
+    def counting_reader(self: Any, scope: Any, **kwargs: Any) -> Any:
+        manager = original(self, scope, **kwargs)
+        if kwargs.get("absent_from") is None:
+            return manager
+
+        @contextmanager
+        def wrapper() -> Any:
+            with manager as reader:
+                yield _CountingPageReader(reader, surfaced)
+
+        return wrapper()
+
+    monkeypatch.setattr(DuckDBAdapter, "state_page_reader", counting_reader)
+    return surfaced
+
+
+def test_removal_detection_surfaces_only_the_removed_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The measurement #428 asked for, and the one `test_bounded_memory.py`
+    structurally cannot make: it records the largest single frame, so it
+    cannot see a container that accumulates across batches.
+
+    This measures the cumulative thing directly. Removal detection used to
+    build a `set[str]` of every upstream id and subtract it from every state
+    key -- both key domains in Python, however little had changed. The
+    warehouse evaluates the anti-join now, so what reaches Python is only the
+    keys to delete. Asserting *that* is what catches a regression back to a
+    set: a reintroduced set difference still deletes the right row, so a
+    correctness assertion alone would pass.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    surfaced = _count_anti_join_keys(monkeypatch)
+    # Two documents embedded; remove exactly one of them.
+    _query(
+        project, 'DELETE FROM "db".docs.document_chunks WHERE title = ?', ["Release A"]
+    )
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_deleted == 1
+    # The engine filtered: one key crossed into Python, not the whole domain.
+    assert surfaced, "removal detection did not use the paged anti-join"
+    assert sum(surfaced) == 1
+
+
+def test_removal_detection_pages_nothing_when_nothing_was_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common case, and the one a set difference paid full price for: an
+    unchanged corpus should surface no keys at all."""
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    surfaced = _count_anti_join_keys(monkeypatch)
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_deleted == 0
+    # One page was fetched and it was empty -- the anti-join ran and found
+    # nothing, rather than the anti-join not running at all.
+    assert surfaced == [0]
+
+
+def test_a_boolean_id_reconciles_in_python_not_in_the_warehouse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure mode is deletion, not a slow query (PR #457 review).
+
+    State keys are written as `str(value)`, so a boolean id is stored as
+    `True`; DuckDB and BigQuery both cast booleans to `true`. Pushed into the
+    warehouse, the anti-join matches nothing, calls every unchanged row
+    absent, and the delete pass removes the whole target. So a column whose
+    cast cannot be proven identical reconciles in Python instead, where both
+    sides go through the same `str()` that wrote the key.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    _query(project, 'ALTER TABLE "db".docs.document_chunks ADD COLUMN flag BOOLEAN', [])
+    _query(
+        project,
+        'UPDATE "db".docs.document_chunks SET flag = (title = ?)',
+        ["Release A"],
+    )
+    model_path = project / "models" / "documents.yml"
+    model_path.write_text(
+        model_path.read_text().replace(
+            "      id_field: chunk_id\n", "      id_field: flag\n"
+        )
+    )
+    run_project(project, select="document_embeddings", full_refresh=True)
+    surfaced = _count_anti_join_keys(monkeypatch)
+
+    # Nothing removed upstream, so nothing may be deleted.
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_deleted == 0
+    # And it did not ask the warehouse: the cast would not have matched.
+    assert surfaced == []
+    assert (
+        _query(project, 'SELECT count(*) FROM "db".docs.document_embeddings')[0][0] == 2
+    )
+
+
+def test_removing_the_whole_corpus_deletes_page_by_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Residency has to follow the page, not the removal count (PR #457
+    review). Emptying the upstream removes every row, and accumulating those
+    keys would restore the O(corpus) term this change exists to remove -- so
+    each page is deleted as it arrives.
+
+    The page size is shrunk to 1 rather than building a corpus larger than
+    the real one: what is under test is that deletion is driven per page, and
+    a run that deletes N rows in one call looks identical at any page size
+    unless the pages are small enough to count.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+    from stel.execution import embed as embed_module
+
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    monkeypatch.setattr(embed_module, "_REMOVAL_PAGE_ROWS", 1)
+    delete_batches: list[int] = []
+    original_delete = DuckDBAdapter.delete_rows_and_state
+
+    def counting_delete(
+        self: Any, table: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        keys = kwargs.get("state_record_keys") or kwargs.get("keys") or []
+        delete_batches.append(len(keys))
+        return original_delete(self, table, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "delete_rows_and_state", counting_delete)
+    _query(project, 'DELETE FROM "db".docs.document_chunks', [])
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_deleted == 2
+    # Two single-key deletes, not one delete carrying both keys.
+    assert delete_batches == [1, 1]
+    assert (
+        _query(project, 'SELECT count(*) FROM "db".docs.document_embeddings')[0][0] == 0
+    )

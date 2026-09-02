@@ -3192,7 +3192,10 @@ def test_state_page_reader_absence_probe_time_travels_both_relations() -> None:
     assert "AS probe FOR SYSTEM_TIME AS OF ?" in sql
     assert "FOR SYSTEM_TIME AS OF ? AS" not in sql
     assert "NOT EXISTS" in sql
-    assert "`chunk_id` = state.record_key" in sql
+    # Cast, not a bare comparison: state keys are always STRING, the probe
+    # column need not be, and BigQuery refuses STRING = INT64 rather than
+    # coercing -- so a numeric id would fail removal detection (issue #428).
+    assert "CAST(probe.`chunk_id` AS STRING) = state.record_key" in sql
 
 
 def test_state_page_reader_missing_probe_relation_fails() -> None:

@@ -3828,11 +3828,20 @@ follows the flush window, the per-parent unit, and the number of distinct keys
 — never the corpus in bytes. The intent is that corpus size is bounded by
 warehouse capacity rather than process memory.
 
-Size the key term when you size a container: stages that reconcile deletions
-hold every id at once, at roughly 108 bytes each, so a 3.6M-row corpus costs
-~370MB per key set and a resuming embed holds two. That scales with row count
-rather than row width, which is what makes a large corpus finish at all, but it
-is not constant.
+Size the key term when you size a container. Chunk and embed no longer hold a
+key set to reconcile deletions: the warehouse evaluates the anti-join and
+yields only the keys to delete, one bounded page at a time, so an unchanged
+corpus surfaces nothing and emptying the upstream entirely still costs a page
+rather than the corpus. The exception is an `id_field` whose type the engine
+does not cast to text identically to Python — booleans, floats, temporals —
+which reconcile in Python instead and do hold the id domain, because a
+mismatched comparison there would report every row as removed and delete it.
+Use a string or integer id to stay on the bounded path. What remains of the key term is the
+incremental state a stage compares fingerprints against, and — on a resuming
+embed — the map from state key to the target's typed id, which exists because a
+state key is a string and the id column need not be. Both scale with row count
+rather than row width, which is what makes a large corpus finish at all, but
+neither is constant.
 
 It holds today for extraction, transform (incremental), chunk, embed, and
 search publication. It does **not** yet hold for `llm:`

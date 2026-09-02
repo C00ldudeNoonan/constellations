@@ -1558,9 +1558,14 @@ class DuckDBAdapter(WarehouseAdapter):
                         f"'{request.absent_from.table}."
                         f"{request.absent_from.key_column}' is unavailable"
                     ) from None
+                # `record_key` is always a VARCHAR, because state keys are the
+                # stringified id. The probe column need not be -- a numeric id
+                # is a supported contract for embed -- so the cast keeps the
+                # comparison on the same normalization the keys were written
+                # with, rather than relying on implicit coercion (issue #428).
                 absence_sql = (
                     f" AND NOT EXISTS (SELECT 1 FROM {probe_ref} AS probe "
-                    f"WHERE probe.{probe_key} = state.record_key)"
+                    f"WHERE CAST(probe.{probe_key} AS VARCHAR) = state.record_key)"
                 )
             nonce = uuid4().hex
             scope = request.scope

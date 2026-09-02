@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ import polars as pl
 
 from ..adapters import (
     AdapterError,
+    StateAbsenceProbe,
     StateRecord,
     StateScope,
     StateValue,
@@ -24,10 +26,11 @@ from ..config.model import CHUNK_GENERATED_FIELDS, ModelConfig
 from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
 from ..progress import get_reporter
+from ..state_reconciliation import iter_validated_state_pages
 from ..versioning import compute_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
-from .values import scalarize
+from .values import scalarize, warehouse_key_cast_matches_python
 from .warehouse import warehouse_options
 
 _CHUNK_GENERATED_FIELDS = CHUNK_GENERATED_FIELDS
@@ -39,6 +42,9 @@ _CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
 # smaller. Neither is derived from `flush_every`, which is a publication
 # cadence with no upper bound while these bound residency.
 _ID_BATCH_ROWS = 100_000
+# Removals page through the warehouse anti-join; bounded like any other
+# state read, and small by construction (issue #428).
+_REMOVAL_PAGE_ROWS = 10_000
 _INPUT_BATCH_ROWS = 1_000
 
 
@@ -95,7 +101,7 @@ def run_chunk_model(
             f"Available: {sorted(frame.columns)}"
         )
     # One projected pass over the id column, before anything is written.
-    current_ids, upstream_rows = _stream_document_ids(adapter, upstream, model.name)
+    upstream_rows = _validate_document_ids(adapter, upstream, model.name)
 
     code_version = compute_code_version(
         extraction=None,
@@ -285,19 +291,22 @@ def run_chunk_model(
     # kind downstream (issue #417). Reconciliation is the job of the next
     # unfiltered run.
     if is_incremental and not subset_run:
-        removed = [
-            document_id
-            for document_id in processed_state
-            if document_id not in current_ids
-        ]
-        if removed:
+        for removed_page in _iter_removed_state_keys(
+            adapter,
+            state_scope,
+            upstream=upstream,
+            in_warehouse=warehouse_key_cast_matches_python(
+                schema_probe.schema["document_id"]
+            ),
+            processed_state=processed_state,
+        ):
             adapter.delete_rows_and_state(
                 model.name,
                 key_col="document_id",
-                keys=removed,
+                keys=removed_page,
                 state_scope=state_scope,
             )
-            deleted = len(removed)
+            deleted += len(removed_page)
 
     rows_written = publisher.rows_written
 
@@ -356,47 +365,113 @@ def chunk_document_ids(frame: pl.DataFrame, model_name: str) -> list[str]:
     return document_ids
 
 
-def _stream_document_ids(
+def _validate_document_ids(
     adapter: WarehouseAdapter, table: str, model_name: str
-) -> tuple[set[str], int]:
-    """Validate the upstream `document_id` column and return it, streamed.
+) -> int:
+    """Validate the upstream `document_id` column and return its row count.
 
-    One projected pass (issue #423). Residency is proportional to the *key
-    count* rather than the row width, which for a document registry is the
-    difference between a set of ids and several gigabytes of text.
+    One projected pass (issue #423) that keeps **no** id (issue #428). It used
+    to accumulate a `set[str]` of every distinct id so the caller could
+    subtract it from the state keys; that set was the last O(corpus) term in
+    the bounded-memory contract. Removal detection is a warehouse anti-join
+    now (`_removed_state_keys`), so nothing here has to remember what it saw.
 
-    Eager rather than folded into the chunk loop: a NULL, empty, or duplicate
-    id is a contract violation the run should die on before it has written
-    anything, not partway through publishing windows.
+    NULL and empty ids are still counted while streaming, which costs two
+    integers. Duplicates cannot be found that way without holding the domain,
+    so `key_column` hands that check to the warehouse, which evaluates it as
+    one aggregate over the key alone at snapshot open.
+
+    Still eager: a NULL, empty, or duplicate id is a contract violation the
+    run should die on before it has written anything, not partway through
+    publishing windows.
     """
-    ids: set[str] = set()
     total = 0
     null_count = 0
     empty_count = 0
+    try:
+        with adapter.table_snapshot(
+            table,
+            columns=["document_id"],
+            batch_size=_ID_BATCH_ROWS,
+            key_column="document_id",
+        ) as snapshot:
+            for batch in snapshot:
+                frame = pl.from_arrow(batch)
+                assert isinstance(frame, pl.DataFrame)
+                for value in frame["document_id"].to_list():
+                    total += 1
+                    if value is None:
+                        null_count += 1
+                    elif not str(value):
+                        empty_count += 1
+    except AdapterError as error:
+        raise RunError(
+            f"Chunk model '{model_name}': upstream `document_id` is not a valid "
+            f"key domain ({error})"
+        ) from None
+    _reject_bad_document_ids(
+        model_name,
+        total=total,
+        # Duplicates were rejected by the warehouse above, so the streamed
+        # counts only have to answer for NULL and empty.
+        distinct=total,
+        null_count=null_count,
+        empty_count=empty_count,
+    )
+    return total
+
+
+def _iter_removed_state_keys(
+    adapter: WarehouseAdapter,
+    scope: StateScope,
+    *,
+    upstream: str,
+    in_warehouse: bool,
+    processed_state: Mapping[str, StateValue],
+) -> Iterator[list[str]]:
+    """Yield bounded pages of state keys with no matching upstream document.
+
+    The anti-join #428 asks for: the engine evaluates absence and yields only
+    the keys to delete, where the set difference it replaces cost the whole
+    key domain on both sides however little had changed. Pages arrive in
+    ascending key order under one snapshot, so a concurrent write cannot make
+    the scan skip or repeat a key.
+
+    A **generator of pages**, not a list: an upstream emptied to zero rows
+    removes the whole corpus, and materializing that would put back the term
+    this change exists to remove (PR #457 review).
+
+    `in_warehouse` is false for a `document_id` whose warehouse cast does not
+    reproduce `str(value)` (see `warehouse_key_cast_matches_python`). Those
+    reconcile in Python, where both sides go through the same `str()` that
+    wrote the key: it costs the id domain again, but a wrong answer here
+    deletes data.
+    """
+    if in_warehouse:
+        probe = StateAbsenceProbe(table=upstream, key_column="document_id")
+        with adapter.state_page_reader(
+            scope, page_size=_REMOVAL_PAGE_ROWS, absent_from=probe
+        ) as reader:
+            for page in iter_validated_state_pages(reader):
+                keys = [record.record_key for record in page]
+                if keys:
+                    yield keys
+        return
+    current: set[str] = set()
     with adapter.table_snapshot(
-        table, columns=["document_id"], batch_size=_ID_BATCH_ROWS
+        upstream, columns=["document_id"], batch_size=_ID_BATCH_ROWS
     ) as snapshot:
         for batch in snapshot:
             frame = pl.from_arrow(batch)
             assert isinstance(frame, pl.DataFrame)
-            for value in frame["document_id"].to_list():
-                total += 1
-                if value is None:
-                    null_count += 1
-                    continue
-                document_id = str(value)
-                if not document_id:
-                    empty_count += 1
-                    continue
-                ids.add(document_id)
-    _reject_bad_document_ids(
-        model_name,
-        total=total,
-        distinct=len(ids),
-        null_count=null_count,
-        empty_count=empty_count,
-    )
-    return ids, total
+            current.update(
+                str(value)
+                for value in frame["document_id"].to_list()
+                if value is not None
+            )
+    missing = sorted(set(processed_state) - current)
+    for offset in range(0, len(missing), _REMOVAL_PAGE_ROWS):
+        yield missing[offset : offset + _REMOVAL_PAGE_ROWS]
 
 
 def chunk_input_hash(record: dict[str, Any], *, text_field: str) -> str:

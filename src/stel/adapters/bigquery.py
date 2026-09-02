@@ -957,6 +957,61 @@ def _storage_read_batches(
             cancel()
 
 
+def _coalesced_batches(
+    arrow_batches: Iterator[pa.RecordBatch],
+    output_indices: list[int],
+    batch_size: int,
+) -> Iterator[pa.RecordBatch]:
+    """Project each server batch and emit pages of `batch_size` rows.
+
+    The Storage Read API sizes its own Arrow batches, and on a wide table it
+    sizes them small: a 768-float vector plus full chunk text is ~6KB a row, so
+    a production read came back at ~262 rows per batch against a configured
+    25,000 (issue #452). Sub-slicing alone made `batch_size` an upper bound
+    rather than a target, which turned 145 pages into 13,794 — and every page
+    costs the publish loop two ledger reads and a MERGE, so ~9 minutes of fixed
+    round-trip time became ~14 hours.
+
+    Coalescing has to happen here because the service offers no knob for it.
+    `ReadSession.TableReadOptions` carries `selected_fields`, `row_restriction`,
+    `sample_percentage`, the two serialization-options messages and
+    `response_compression_codec` — nothing that sets rows or bytes per
+    `ReadRowsResponse`. The only documented size bound is a 128MB ceiling per
+    response, which a 6KB row does not approach at 262 rows. So the batch sizes
+    are the backend's to choose and ours to repack.
+
+    Coalescing restores `batch_size` as the thing it claims to be. Residency
+    stays bounded by it: at most one page plus the server batch that completed
+    it is held, and the remainder of an oversized page is carried rather than
+    emitted short, so a stream of large batches does not alternate full and
+    stub pages.
+
+    The one cost worth knowing when sizing a container: a drain briefly holds
+    the page twice, since `combine_chunks` copies the accumulated chunks into
+    contiguous buffers. Peak is ~2x the page — still O(batch_size), never
+    O(corpus), but `batch_size` is capped at 100,000 and a wide row is ~6KB, so
+    the ceiling that setting buys is real.
+    """
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    for batch in arrow_batches:
+        pending.append(batch.select(output_indices))
+        pending_rows += len(pending[-1])
+        if pending_rows < batch_size:
+            continue
+        combined = pa.Table.from_batches(pending).combine_chunks()
+        offset = 0
+        while combined.num_rows - offset >= batch_size:
+            yield from combined.slice(offset, batch_size).to_batches()
+            offset += batch_size
+        remainder = combined.slice(offset)
+        pending = remainder.to_batches() if remainder.num_rows else []
+        pending_rows = remainder.num_rows
+    if pending_rows:
+        combined = pa.Table.from_batches(pending).combine_chunks()
+        yield from combined.to_batches(max_chunksize=batch_size)
+
+
 def _bigquery_table_generation(table: Any) -> str:
     etag = getattr(table, "etag", None)
     modified = getattr(table, "modified", None)
@@ -1677,23 +1732,20 @@ class BigQueryAdapter(WarehouseAdapter):
 
             def batches() -> Iterator[pa.RecordBatch]:
                 nonlocal fully_consumed
-                batch: pa.RecordBatch | None = None
                 projected: pa.RecordBatch | None = None
                 batch_failure: AdapterError | None = None
                 batch_failure_cause: AdapterError | None = None
                 try:
                     assert arrow_batches is not None
-                    for batch in arrow_batches:
-                        projected = batch.select(output_indices)
-                        for offset in range(0, len(projected), request.batch_size):
-                            yield projected.slice(offset, request.batch_size)
+                    for projected in _coalesced_batches(
+                        arrow_batches, output_indices, request.batch_size
+                    ):
+                        yield projected
                         projected = None
-                        batch = None
                     fully_consumed = True
                 except AdapterError:
                     raise
                 except Exception as error:
-                    batch = None
                     projected = None
                     batch_failure = AdapterError(
                         "BigQuery table snapshot batch read failed"

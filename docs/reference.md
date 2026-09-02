@@ -3767,7 +3767,14 @@ stel promote ... --write      # writes it, for review
 ```
 
 Candidates are grouped by `query_fingerprint`, the identity the corpus and the
-MCP query log agree on. What it does and does not do:
+MCP query log agree on. That fingerprint hashes the query string alone, so the
+same question asked of two context models shares one — candidates spanning
+more than one index are **refused**, and `--context-model` narrows them to the
+index the set is for. Merging them would put ids from one index into a set run
+against another, which the `id_space` check cannot catch when both key on the
+same space. The drafted file names its context model in the header.
+
+What it does and does not do:
 
 - **Only `cited` ids become `relevant_ids`.** An id that was returned and not
   cited is left out, because an agent may use a chunk without naming it: that
@@ -3784,7 +3791,9 @@ MCP query log agree on. What it does and does not do:
   that asks the wrong question.
 - **An existing file is never overwritten** without `--force`. It is
   human-owned, and re-drafting over it would discard the review that is the
-  point of the artifact.
+  point of the artifact. `--output` is confined to the project and refuses a
+  path passing through a symlink, matching the loader, which will not read a
+  golden set through one.
 
 ## Artifacts
 

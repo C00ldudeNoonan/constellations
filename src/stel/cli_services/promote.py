@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 
 from ..config import load_project
+from ..paths import resolve_within_project
 from ..profile import resolve_profile
 from ..promotion.contract import UNCONFIRMED_QUERY_TEXT, PromotionError
 from ..promotion.draft import CandidateRow, Draft, draft_golden_set
@@ -27,6 +28,10 @@ from .context import ConfigClickError
 REQUIRED_COLUMNS = (
     "session_id",
     "harness",
+    # Read because `query_fingerprint` hashes the query string alone: without
+    # it, the same question asked of two indexes merges into one golden set
+    # holding ids that exist in neither (PR #451 review).
+    "context_model",
     "query_fingerprint",
     "query_text",
     "id_space",
@@ -37,6 +42,8 @@ REQUIRED_COLUMNS = (
 _HEADER = f"""\
 # Promoted golden set - DRAFTED, NOT PROMOTED.
 #
+# Context model: {{context_model}}
+#
 # `stel promote` proposed these rows from candidate judgments. Nothing here is
 # a promotion until a human has read it and merged it: review this file like
 # any other change.
@@ -46,8 +53,9 @@ _HEADER = f"""\
 #     transcribed from the corpus is shown as captured; any row still reading
 #     "{UNCONFIRMED_QUERY_TEXT}"
 #     has none and will be refused until you write it.
-#   - confirm `id_space` matches the target index's `id_field`. A mismatch is
-#     a hard error at run time, not a silent zero recall.
+#   - confirm `id_space` matches the target index's `id_field`, and that the
+#     context model above is the index this set will be run against. A
+#     mismatch in either is a set whose ids match nothing.
 #   - `relevant_ids` hold only ids an answer actually cited. Ids that were
 #     returned and not cited were deliberately left out: that is absence of
 #     evidence, not evidence of irrelevance.
@@ -86,11 +94,12 @@ def read_candidates(
         CandidateRow(
             session_id="" if row[0] is None else str(row[0]),
             harness=None if row[1] is None else str(row[1]),
-            query_fingerprint="" if row[2] is None else str(row[2]),
-            query_text=None if row[3] is None else str(row[3]),
-            id_space="" if row[4] is None else str(row[4]),
-            context_id=None if row[5] is None else str(row[5]),
-            judgment="" if row[6] is None else str(row[6]),
+            context_model="" if row[2] is None else str(row[2]),
+            query_fingerprint="" if row[3] is None else str(row[3]),
+            query_text=None if row[4] is None else str(row[4]),
+            id_space="" if row[5] is None else str(row[5]),
+            context_id=None if row[6] is None else str(row[6]),
+            judgment="" if row[7] is None else str(row[7]),
         )
         for row in rows
     ]
@@ -103,7 +112,41 @@ def render_golden_set(draft: Draft) -> str:
     # the field order stays the one the contract declares and a re-draft
     # produces a reviewable diff rather than a reordering.
     body = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
-    return _HEADER + body
+    return _HEADER.format(context_model=draft.context_model) + body
+
+
+def _writable_output(output: Path, project_dir: Path) -> Path:
+    """Confine the drafted file to the project and refuse symlinked paths.
+
+    Two reasons, one of which is a hole rather than a policy. `load_golden_set`
+    refuses to *read* a symlinked golden set, so writing one produces a file
+    nothing will load. And a **dangling** symlink makes `exists()` false, so
+    the overwrite guard below would see a free path and write straight through
+    the link — the `--force` protection bypassed silently, and possibly onto a
+    file that has nothing to do with the project (PR #451 review).
+
+    `resolve_within_project` follows links, so it already catches one escaping
+    the project; the literal walk catches the rest.
+    """
+    resolved = resolve_within_project(
+        output,
+        project_dir,
+        surface="--output",
+        hint="A promoted golden set is a project file; keep it in the project.",
+    )
+    probe = project_dir / output
+    project_root = project_dir.resolve()
+    while True:
+        if probe.is_symlink():
+            raise ConfigClickError(
+                f"--output path '{output}' passes through a symlink at "
+                f"{probe}. A promoted golden set is a reviewed file, and the "
+                "loader refuses to read one through a link."
+            )
+        parent = probe.parent
+        if parent == probe or probe.resolve() == project_root:
+            return resolved
+        probe = parent
 
 
 def promote_from_candidates(
@@ -114,6 +157,7 @@ def promote_from_candidates(
     relation: str,
     output: Path,
     promoted_by: str,
+    context_model: str | None = None,
     write: bool = False,
     force: bool = False,
     today: date | None = None,
@@ -135,6 +179,7 @@ def promote_from_candidates(
             rows,
             promoted_by=promoted_by,
             promoted_at=today or date.today(),
+            context_model=context_model,
         )
     except PromotionError as error:
         raise ConfigClickError(str(error)) from error
@@ -142,11 +187,12 @@ def promote_from_candidates(
     rendered = render_golden_set(draft)
     if not write:
         return rendered, draft
-    if output.exists() and not force:
+    destination = _writable_output(output, project_dir)
+    if destination.exists() and not force:
         raise ConfigClickError(
             f"{output} already exists; re-drafting would discard the review "
             "it already carries. Pass --force to overwrite it deliberately."
         )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(rendered, encoding="utf-8")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(rendered, encoding="utf-8")
     return rendered, draft

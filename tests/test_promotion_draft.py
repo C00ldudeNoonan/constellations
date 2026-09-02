@@ -8,6 +8,7 @@ while carrying a question nobody confirmed.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 import yaml
@@ -21,6 +22,7 @@ def _row(**overrides: object) -> CandidateRow:
     fields: dict[str, object] = {
         "session_id": "sess-1",
         "harness": "claude-code",
+        "context_model": "context_search",
         "query_fingerprint": "a" * 32,
         "query_text": "consumer prices inflation",
         "id_space": "context_id",
@@ -166,6 +168,53 @@ def test_the_drafted_id_space_is_carried_from_the_candidates() -> None:
     assert draft.golden_set.id_space == "chunk_id"
 
 
+# ─── one index per golden set (PR #451 review) ──────────────────────────────
+
+
+def test_candidates_spanning_two_context_models_are_refused() -> None:
+    """`query_fingerprint` hashes the query string alone, so the same question
+    asked of two indexes shares one fingerprint. Merging them would put ids
+    from index B into a golden set run against index A — and the `id_space`
+    guard cannot catch it, because both commonly key on the same space. The
+    eval would then report zero recall as though retrieval were broken."""
+    with pytest.raises(PromotionError, match="more than one context model"):
+        _draft(
+            [
+                _row(context_model="context_search", context_id="ctx-1"),
+                _row(context_model="release_search", context_id="ctx-2"),
+            ]
+        )
+
+
+def test_a_context_model_filter_draws_from_one_index() -> None:
+    rows = [
+        _row(context_model="context_search", context_id="ctx-1"),
+        _row(context_model="release_search", context_id="ctx-2"),
+    ]
+
+    draft = draft_golden_set(
+        rows,
+        promoted_by="alex",
+        promoted_at=date(2026, 9, 2),
+        context_model="release_search",
+    )
+
+    assert draft.context_model == "release_search"
+    assert draft.golden_set.queries[0].relevant_ids == ("ctx-2",)
+    # And the reviewer is told which index the file is for.
+    assert "Context model: release_search" in render_golden_set(draft)
+
+
+def test_filtering_to_a_model_with_no_candidates_is_an_error() -> None:
+    with pytest.raises(PromotionError, match="No candidate judgments for"):
+        draft_golden_set(
+            [_row(context_model="context_search")],
+            promoted_by="alex",
+            promoted_at=date(2026, 9, 2),
+            context_model="absent_search",
+        )
+
+
 # ─── the rendered artifact ──────────────────────────────────────────────────
 
 
@@ -251,3 +300,71 @@ def test_an_existing_golden_set_is_never_silently_overwritten(
     # --force is the deliberate escape hatch.
     _service_draft(tmp_path, monkeypatch, [_row()], write=True, force=True)
     assert "a question a human wrote" not in path.read_text(encoding="utf-8")
+
+
+def test_an_output_outside_the_project_is_refused(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A promoted golden set is a project file that gets committed and read by
+    a transform; one written elsewhere is something nothing will load."""
+    from stel.cli_services import promote as service
+    from stel.config.loader import ConfigError
+
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "elsewhere" / "golden.yml"
+    monkeypatch.setattr(service, "read_candidates", lambda *a, **k: [_row()])
+
+    with pytest.raises(ConfigError, match="outside the project"):
+        service.promote_from_candidates(
+            project,
+            profiles_dir=None,
+            target=None,
+            relation="analytics.candidates",
+            output=outside,
+            promoted_by="alex",
+            today=date(2026, 9, 2),
+            write=True,
+        )
+
+    assert not outside.exists()
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "symlink"), reason="platform has no symlinks"
+)
+def test_a_symlinked_output_is_refused_before_anything_is_written(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A dangling link is the sharp case: `exists()` reports false, so the
+    overwrite guard sees a free path and writes straight through the link.
+    The loader refuses to read a symlinked golden set, so writing one would
+    also produce a file nothing loads (PR #451 review)."""
+    import os
+
+    from stel.cli_services import promote as service
+    from stel.cli_services.context import ConfigClickError
+
+    project = tmp_path / "project"
+    (project / "golden_sets").mkdir(parents=True)
+    victim = tmp_path / "victim.yml"
+    link = project / "golden_sets" / "search.yml"
+    try:
+        os.symlink(victim, link)
+    except OSError as error:  # Windows without the privilege
+        pytest.skip(f"cannot create symlink: {error}")
+
+    monkeypatch.setattr(service, "read_candidates", lambda *a, **k: [_row()])
+    with pytest.raises(ConfigClickError, match="symlink"):
+        service.promote_from_candidates(
+            project,
+            profiles_dir=None,
+            target=None,
+            relation="analytics.candidates",
+            output=Path("golden_sets/search.yml"),
+            promoted_by="alex",
+            today=date(2026, 9, 2),
+            write=True,
+        )
+
+    # The dangling target was never created: refused before the write, and
+    # without needing --force to have been withheld.
+    assert not victim.exists()

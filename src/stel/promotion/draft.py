@@ -52,6 +52,7 @@ class CandidateRow:
 
     session_id: str
     harness: str | None
+    context_model: str
     query_fingerprint: str
     query_text: str | None
     id_space: str
@@ -81,6 +82,10 @@ class Draft:
     """A drafted golden set, plus what it declined to draft and why."""
 
     golden_set: GoldenSetFile
+    # The one context model these ids belong to. A golden set is checked
+    # against a single index, so a draft that spanned two would carry ids
+    # that cannot exist in either (see `_resolve_context_model`).
+    context_model: str
     drafted: tuple[DraftedQuery, ...]
     skipped: tuple[SkippedQuery, ...]
 
@@ -107,6 +112,31 @@ def _resolve_id_space(rows: list[CandidateRow]) -> str:
     return spaces[0]
 
 
+def _resolve_context_model(rows: list[CandidateRow]) -> str:
+    """The single index these candidates judge, or refuse to guess.
+
+    `query_fingerprint` hashes the query string alone, so the same question
+    asked of two context models shares one fingerprint. Grouping on it without
+    this check would merge ids from two different indexes into one golden set,
+    and the `id_space` guard cannot catch that — two indexes commonly key on
+    the same space. The result would be a set whose ids simply do not exist in
+    the index it is run against, reported as zero recall (PR #451 review).
+    """
+    models = sorted({row.context_model for row in rows if row.context_model})
+    if not models:
+        raise PromotionError(
+            "Candidate rows name no context model; promotion cannot tell "
+            "which index these ids belong to"
+        )
+    if len(models) > 1:
+        raise PromotionError(
+            "Candidate rows span more than one context model "
+            f"({', '.join(models)}). A golden set is checked against one "
+            "index, so draft one at a time: pass --context-model."
+        )
+    return models[0]
+
+
 def _query_id(fingerprint: str) -> str:
     return f"q-{fingerprint[:12]}"
 
@@ -116,14 +146,25 @@ def draft_golden_set(
     *,
     promoted_by: str,
     promoted_at: date,
+    context_model: str | None = None,
 ) -> Draft:
     """Shape candidate rows into a golden set for a human to review.
 
     Grouped by `query_fingerprint` because that is the identity the corpus and
-    the MCP query log agree on — the join key #329 called the linchpin.
+    the MCP query log agree on — the join key #329 called the linchpin. That
+    key says nothing about *which* index answered, so `context_model` narrows
+    the rows first and a corpus spanning several is refused rather than
+    merged.
     """
     if not rows:
         raise PromotionError("No candidate judgments to draft from")
+    if context_model is not None:
+        rows = [row for row in rows if row.context_model == context_model]
+        if not rows:
+            raise PromotionError(
+                f"No candidate judgments for context model '{context_model}'"
+            )
+    model = _resolve_context_model(rows)
     id_space = _resolve_id_space(rows)
 
     grouped: dict[str, list[CandidateRow]] = defaultdict(list)
@@ -210,6 +251,7 @@ def draft_golden_set(
         golden_set=GoldenSetFile(
             version=GOLDEN_SET_VERSION, id_space=id_space, queries=tuple(queries)
         ),
+        context_model=model,
         drafted=tuple(drafted),
         skipped=tuple(skipped),
     )

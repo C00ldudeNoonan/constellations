@@ -2044,6 +2044,15 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
     help="Who is promoting these rows. Recorded on every row as provenance.",
 )
 @click.option(
+    "--context-model",
+    "context_model",
+    default=None,
+    help=(
+        "Draft only judgments of this context model. Required when the "
+        "candidates span more than one index."
+    ),
+)
+@click.option(
     "--write",
     is_flag=True,
     help="Write the draft. Without this it is printed and nothing changes.",
@@ -2060,6 +2069,7 @@ def promote(
     relation: str,
     output: Path,
     promoted_by: str,
+    context_model: str | None,
     write: bool,
     force: bool,
 ) -> None:
@@ -2084,6 +2094,7 @@ def promote(
             relation=relation,
             output=output,
             promoted_by=promoted_by,
+            context_model=context_model,
             write=write,
             force=force,
         )

@@ -2023,6 +2023,103 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
     )
 
 
+@cli.command()
+@click.option(
+    "--from-candidates",
+    "relation",
+    required=True,
+    help="Relation holding candidate judgments, produced by the transcript project.",
+)
+@click.option(
+    "--output",
+    "output",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Golden-set file to draft, e.g. golden_sets/context_search.yml.",
+)
+@click.option(
+    "--promoted-by",
+    "promoted_by",
+    required=True,
+    help="Who is promoting these rows. Recorded on every row as provenance.",
+)
+@click.option(
+    "--write",
+    is_flag=True,
+    help="Write the draft. Without this it is printed and nothing changes.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite an existing golden-set file, discarding its review.",
+)
+@_project_context_options
+@click.pass_context
+def promote(
+    ctx: click.Context,
+    relation: str,
+    output: Path,
+    promoted_by: str,
+    write: bool,
+    force: bool,
+) -> None:
+    """Draft a golden set from candidate judgments, for review (#380).
+
+    This drafts; it does not promote. The file it writes is the artifact a
+    human reads, edits and merges — nothing becomes a golden until that
+    happens, and no eval reads the candidates it came from.
+
+    Only ids an answer actually cited become `relevant_ids`. Ids that were
+    returned and not cited are left out on purpose: an agent may use a chunk
+    without naming it, so that is absence of evidence, not evidence of
+    irrelevance.
+    """
+    from .cli_services.promote import promote_from_candidates
+
+    try:
+        rendered, draft = promote_from_candidates(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            relation=relation,
+            output=output,
+            promoted_by=promoted_by,
+            write=write,
+            force=force,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except AdapterError as e:
+        raise click.ClickException(str(e)) from e
+
+    if not write:
+        click.echo(rendered, nl=False)
+    click.echo(
+        f"{len(draft.drafted)} quer{'y' if len(draft.drafted) == 1 else 'ies'} "
+        f"drafted{f' to {output}' if write else ''}."
+    )
+    # Shown for confirmation: a transcribed query is more faithful than a
+    # remembered one, but it is still the reviewer who decides it is the
+    # question this golden should ask (#380 constraint 2).
+    for query in draft.drafted:
+        source = "from corpus" if query.text_from_corpus else "NEEDS TEXT"
+        click.echo(f"  {query.query_id} [{source}] {query.query_text}")
+    needs_text = draft.needs_text
+    if needs_text:
+        click.echo(
+            f"{len(needs_text)} quer"
+            f"{'y' if len(needs_text) == 1 else 'ies'} captured no text; "
+            "write the query each one asks before this set will load.",
+            err=True,
+        )
+    for skipped in draft.skipped:
+        click.echo(
+            f"skipped {skipped.query_fingerprint[:12]}: {skipped.reason}", err=True
+        )
+    if not write:
+        click.echo("Re-run with --write to draft the file.")
+
+
 @cli.group()
 def suggest() -> None:
     """Propose context improvements from the agent-transcript corpus (#361)."""

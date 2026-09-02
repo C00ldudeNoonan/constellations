@@ -3751,6 +3751,41 @@ text is the step that turns an observation into a re-runnable test.
 not read: the file is the source of truth, and a promoted golden must survive
 the sessions it came from being rotated away.
 
+### Drafting a golden set from candidates
+
+Writing that file by hand against a relation of candidate rows is tedious and
+error-prone, so `stel promote` drafts it. It drafts; it does not promote —
+the output is a file a human reads, edits and merges, and nothing becomes a
+golden until that happens:
+
+```bash
+stel promote \
+  --from-candidates transcripts.retrieval_judgment_candidates \
+  --output golden_sets/context_search.yml \
+  --promoted-by alex          # prints the draft; nothing is written
+stel promote ... --write      # writes it, for review
+```
+
+Candidates are grouped by `query_fingerprint`, the identity the corpus and the
+MCP query log agree on. What it does and does not do:
+
+- **Only `cited` ids become `relevant_ids`.** An id that was returned and not
+  cited is left out, because an agent may use a chunk without naming it: that
+  is absence of evidence, not evidence of irrelevance. It never becomes an
+  `excluded_id` either.
+- **A query with no citation is skipped and reported**, not dropped. A
+  zero-result query is a real signal, but only a human can say what should
+  have matched it.
+- **`query_text` is filled in from the corpus when it was captured**, and
+  shown for confirmation — a transcribed query is more faithful than a
+  remembered one. Where the corpus is fingerprint-only, which is the
+  sensitivity default, the row carries a placeholder that `load_golden_set`
+  **refuses**: an unreviewed draft fails loudly rather than running as a test
+  that asks the wrong question.
+- **An existing file is never overwritten** without `--force`. It is
+  human-owned, and re-drafting over it would discard the review that is the
+  point of the artifact.
+
 ## Artifacts
 
 `stel compile` writes the manifest; `run` and `build` write the manifest and

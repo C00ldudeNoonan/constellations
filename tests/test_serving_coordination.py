@@ -655,10 +655,12 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
         ],
     )
     assert recovered.exit_code == 0, recovered.output
-    # Degraded, not failed: the crashed publisher never wrote the generation
-    # that was live, so recovery leaves it serving queries while the failure
-    # stays on the record (issue #449).
-    assert "status=degraded" in recovered.output
+    # Failed, not degraded. The abandoned claim was an ordinary in-place
+    # publish, which mutates the collection the activation pointer names — its
+    # claim cleared the pointer precisely so that a crash cannot leave a
+    # half-rewritten collection being served (issue #449). Recovery has no way
+    # to prove otherwise about a publisher that is gone, so it fails closed.
+    assert "status=failed" in recovered.output
 
     results = run_project(project)
     assert results[-1].serving_resource is not None
@@ -1220,6 +1222,9 @@ def test_a_rebuild_failure_keeps_serving_the_previous_generation(
         safe_error_code="publish_failed",
         active_collection="proj__dev__ctx__ga1b2",
         active_generation="gen1",
+        # The configuration gen1 was published under, not the one this failed
+        # publish claimed: the claim already overwrote the ledger's.
+        config_fingerprint="cfg1",
     )
 
     entry = coordinator.status(scope)
@@ -1255,6 +1260,7 @@ def test_a_successful_publish_clears_degraded(coordinator: Any) -> None:
         safe_error_code="publish_failed",
         active_collection="proj__dev__ctx__ga1b2",
         active_generation="gen1",
+        config_fingerprint="cfg1",
     )
     assert coordinator.status(scope).status == STATUS_DEGRADED
 
@@ -1310,6 +1316,133 @@ def test_recover_keeps_serving_the_generation_it_recovered(coordinator: Any) -> 
     assert query.pinned_generation == "gen1"
     assert query.pinned_collection == "proj__dev__ctx__ga1b2"
     coordinator.release_query(query)
+
+
+def test_recover_refuses_to_serve_after_a_crashed_in_place_publish(
+    coordinator: Any,
+) -> None:
+    """The dangerous case, and the reason the claim records its mode.
+
+    A crashed publisher leaves no record of its intent, so recovery cannot ask
+    it what it was doing. An in-place publish mutates the collection the
+    pointer names, so serving that generation after a crash could serve a
+    half-rewritten index. The claim clears the pointer up front, which is what
+    makes recovery fail closed here (PR #450 review).
+    """
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    # An in-place publisher claims the scope, then dies without finishing.
+    coordinator.acquire_publish(
+        scope,
+        expected_code_version="v2",
+        config_fingerprint="cfg1",
+        preserves_active_generation=False,
+    )
+
+    entry = coordinator.recover(scope, owner_terminated=True)
+
+    assert entry.status == STATUS_FAILED
+    assert entry.active_generation is None
+    with pytest.raises(ServingNotReadyError):
+        coordinator.acquire_query(scope)
+
+
+def test_recover_serves_on_after_a_crashed_rebuild(coordinator: Any) -> None:
+    """The mirror image: a rebuild writes to a private generation, so a
+    crashed one leaves the live generation untouched and servable."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    coordinator.acquire_publish(
+        scope,
+        expected_code_version="v2",
+        config_fingerprint="cfg1",
+        preserves_active_generation=True,
+    )
+
+    entry = coordinator.recover(scope, owner_terminated=True)
+
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
+    query = coordinator.acquire_query(scope)
+    assert query.pinned_generation == "gen1"
+    coordinator.release_query(query)
+
+
+def test_a_retained_generation_keeps_its_own_configuration_fingerprint(
+    coordinator: Any,
+) -> None:
+    """A config change forces the rebuild, so the claim overwrote the ledger's
+    fingerprint with the *new* configuration. Retaining the old generation
+    under that fingerprint would advertise the old index as answering for a
+    configuration it was never built for (PR #450 review) -- the reader's
+    first check compares the two, and it must see the generation's own."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg-old"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg-old",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    retry = coordinator.acquire_publish(
+        scope,
+        expected_code_version="v1",
+        config_fingerprint="cfg-new",
+        preserves_active_generation=True,
+    )
+    assert coordinator.status(scope).config_fingerprint == "cfg-new"
+
+    coordinator.mark_failed(
+        retry,
+        safe_error_code="publish_failed",
+        active_collection="proj__dev__ctx__ga1b2",
+        active_generation="gen1",
+        config_fingerprint="cfg-old",
+    )
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_DEGRADED
+    assert entry.config_fingerprint == "cfg-old"
+    query = coordinator.acquire_query(scope)
+    assert query.config_fingerprint == "cfg-old"
+    coordinator.release_query(query)
+
+
+def test_retaining_a_generation_without_its_fingerprint_is_refused(
+    coordinator: Any,
+) -> None:
+    """Fail loudly rather than publish an incoherent ledger row."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    with pytest.raises(ServingCoordinationError, match="configuration"):
+        coordinator.mark_failed(
+            lease,
+            safe_error_code="publish_failed",
+            active_generation="gen1",
+        )
 
 
 def test_recover_leaves_a_scope_with_no_generation_failed(coordinator: Any) -> None:

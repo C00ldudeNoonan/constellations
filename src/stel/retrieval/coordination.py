@@ -408,24 +408,46 @@ class ServingCoordinator:
         *,
         expected_code_version: str,
         config_fingerprint: str,
+        preserves_active_generation: bool = False,
     ) -> PublishLease:
         """Claim exclusive publication authority with a fresh fencing token.
 
         The claim is a conditional update: it succeeds only when no publisher
         owns the scope and no query lease is active. Publication IDs are
         random, so a successful claim is proven by reading back our own ID.
+
+        `preserves_active_generation` says whether this publish writes
+        somewhere nothing is reading (a private generation build) or into the
+        collection the activation pointer names (an in-place publish). An
+        in-place claim clears `active_generation` immediately, which is what
+        lets `recover()` tell the two apart after a crash: a publisher that
+        died leaves no record of its intent, so the claim has to leave one.
+        With the pointer cleared, a crashed in-place publish recovers to
+        `failed` and serves nothing, rather than serving a collection it may
+        have half-rewritten (issue #449 review).
+
+        Clearing it costs readers nothing: query admission already refuses a
+        scope with a publisher on it, so the generation is unservable from the
+        moment the claim lands either way.
+
+        The default is the fail-closed one. A caller that says nothing gets
+        in-place semantics, so forgetting this argument gives up availability
+        rather than serving something corrupt.
         """
         self._ensure_row(scope)
         publication_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
         leases = self._ref(LEASE_TABLE)
+        retain_generation = (
+            "" if preserves_active_generation else ", active_generation = NULL"
+        )
         self._adapter.execute(
             f"""
             UPDATE {ledger}
             SET publication_id = ?, fencing_token = fencing_token + 1,
                 status = ?, expected_code_version = ?, config_fingerprint = ?,
                 safe_error_code = NULL, started_at = CURRENT_TIMESTAMP,
-                completed_at = NULL
+                completed_at = NULL{retain_generation}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id IS NULL
               AND NOT EXISTS (
@@ -487,8 +509,19 @@ class ServingCoordinator:
         safe_error_code: str | None,
         counts: tuple[int, int, int, int],
         active_collection: str | None,
+        config_fingerprint: str | None = None,
     ) -> None:
         inserted, updated, skipped, deleted = counts
+        # Restoring a retained generation's own fingerprint is not optional
+        # bookkeeping: the claim overwrote the ledger's with the *new*
+        # configuration, and query admission pins whatever it finds there. A
+        # retained generation left under the claiming configuration's
+        # fingerprint would be handed to a reader as though it answered under
+        # a configuration it was never built for (issue #449 review).
+        restore_fingerprint = (
+            "" if config_fingerprint is None else ", config_fingerprint = ?"
+        )
+        fingerprint_param = [] if config_fingerprint is None else [config_fingerprint]
         self._adapter.execute(
             f"""
             UPDATE {self._ref(LEDGER_TABLE)}
@@ -496,7 +529,7 @@ class ServingCoordinator:
                 safe_error_code = ?,
                 rows_inserted = ?, rows_updated = ?, rows_skipped = ?,
                 rows_deleted = ?, publication_id = NULL,
-                completed_at = CURRENT_TIMESTAMP
+                completed_at = CURRENT_TIMESTAMP{restore_fingerprint}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id = ? AND fencing_token = ?
             """,
@@ -509,6 +542,7 @@ class ServingCoordinator:
                 updated,
                 skipped,
                 deleted,
+                *fingerprint_param,
                 *self._scope_params(lease.scope),
                 lease.publication_id,
                 lease.fencing_token,
@@ -569,6 +603,7 @@ class ServingCoordinator:
         counts: tuple[int, int, int, int] = (0, 0, 0, 0),
         active_collection: str | None = None,
         active_generation: str | None = None,
+        config_fingerprint: str | None = None,
     ) -> None:
         """Record a failed publication, retaining the previous generation when
         the failure cannot have touched it.
@@ -587,7 +622,18 @@ class ServingCoordinator:
         and, because queries admit only on a named generation, would also take
         a working index offline until the next successful publish, which on a
         large corpus is hours away (#449).
+
+        Retaining a generation requires `config_fingerprint` — the one that
+        generation was published under. The claim overwrote the ledger's with
+        the configuration this failed publish was building for, and query
+        admission pins whatever the ledger holds, so retaining the pointers
+        without it would advertise the old index under the new configuration.
         """
+        if active_generation and config_fingerprint is None:
+            raise ServingCoordinationError(
+                "Retaining an active generation requires the configuration "
+                "fingerprint it was published under"
+            )
         self._finish(
             lease,
             status=STATUS_DEGRADED if active_generation else STATUS_FAILED,
@@ -595,6 +641,7 @@ class ServingCoordinator:
             active_collection=active_collection,
             safe_error_code=validate_safe_error_code(safe_error_code),
             counts=counts,
+            config_fingerprint=config_fingerprint if active_generation else None,
         )
 
     # ─── query leases ─────────────────────────────────────────────────────
@@ -759,28 +806,35 @@ class ServingCoordinator:
         # hours, on a large corpus. `config_fingerprint` comes along because
         # query admission pins it into the lease.
         #
-        # All three are read from one row rather than independently: pairing a
+        # All three come from one row rather than independently: pairing a
         # generation with another row's collection would name a pointer pair
         # that was never live together.
         #
+        # That row is specifically the highest fence — the one that got
+        # furthest — and its generation is taken as-is rather than searched
+        # for. Falling back to an older row's generation would resurrect one
+        # that the in-place publish recorded on the newest row has since
+        # rewritten, which is exactly what the claim cleared it to prevent.
+        #
         # Read tolerantly: recovery also repairs a ledger corrupted by
         # duplicate creation races, and `_read_row` refuses exactly that case.
-        # Among duplicates the highest fence is the one that got furthest.
         pointer = self._adapter.rows(
             f"""
             SELECT active_generation, active_collection, config_fingerprint
             FROM {ledger}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
-              AND active_generation IS NOT NULL
             ORDER BY fencing_token DESC
             LIMIT 1
             """,
             self._scope_params(scope),
         )
-        if pointer:
+        # Both, or neither: a generation whose configuration fingerprint did
+        # not survive cannot be admitted to a query anyway, so degrading on it
+        # would advertise a scope that then refuses every read.
+        if pointer and pointer[0][0] is not None and pointer[0][2] is not None:
             active_generation: str | None = str(pointer[0][0])
             active_collection = None if pointer[0][1] is None else str(pointer[0][1])
-            config_fingerprint = None if pointer[0][2] is None else str(pointer[0][2])
+            config_fingerprint: str | None = str(pointer[0][2])
         else:
             # No servable generation survives -- an in-place publish's failure
             # already cleared it, or the scope never had one. Fall back to any

@@ -2507,9 +2507,19 @@ successful publish returns it to `ready` with no operator action.
 An in-place publish is the exception. It writes into the collection the
 activation pointer names, so a failure there may have corrupted what was
 live; both pointers are cleared, the scope becomes `failed`, and queries are
-refused until a successful republish. `--full-refresh` and a rebuild-forcing
-config change both take the generation path, so the common failure leaves the
-index serving.
+refused until a successful republish. A publisher that is *killed* rather
+than failing cleanly leaves no record of its intent, so the claim records it
+up front: an in-place claim clears the activation pointer when it is taken,
+which is what lets `stel serving recover` fail closed on a crashed in-place
+publish while still serving through a crashed rebuild.
+
+A generation retains the configuration fingerprint it was published under, so
+a rebuild forced by a *configuration change* leaves the old generation
+serving only the queries it can still answer correctly: a query issued under
+the new configuration is refused (`published under a different
+configuration`), because the retained index was never built for it. A
+rebuild forced by `--full-refresh`, where the configuration is unchanged,
+keeps serving normally.
 
 #### Migrating the serving scope
 

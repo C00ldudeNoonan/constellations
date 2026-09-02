@@ -24,6 +24,19 @@ queries as before. `stel serving recover` follows the same rule.
 visible in `stel serving status` rather than hiding behind a working endpoint,
 and it heals on the next successful publish with no operator action.
 
+A publisher that is killed leaves no record of what it was doing, so the
+publication claim now records it up front: an in-place claim clears the
+activation pointer when it is taken. `stel serving recover` therefore fails
+closed on a crashed in-place publish — which may have half-rewritten the live
+collection — while still serving through a crashed generation build.
+
+A retained generation also keeps the configuration fingerprint it was
+published under, rather than the one the failed publish was building for. A
+rebuild forced by a configuration change consequently leaves the old
+generation serving only queries it can still answer correctly; a query under
+the new configuration is refused rather than answered from an index that was
+never built for it.
+
 ## v0.15.3 - 2026-09-01
 
 ### pypdf floor raised to 6.16.1 for three CVEs

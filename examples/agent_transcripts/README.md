@@ -52,10 +52,19 @@ transform:, agent_context:           |            — each chunk's `section` nam
                                     harness, exchange_heading, tools_used,
                                     files_touched
 
-raw_transcripts
-        v
-retrieval_judgment_candidates       transform: built-in, #329 phase 3 —
-                                    candidates a human promotes, never goldens
+raw_transcripts                     #329 phase 3 — candidates a human
+        |                           promotes, never goldens
+        +-----------------------------+
+        v                             v
+retrieval_judgment_candidates   correction_inputs   transform: built-in —
+transform: built-in — one row           |           exchange prose plus the
+per returned id (issue #380)            v           ids it retrieved (#456)
+                                drafted_corrections  llm: did the human
+                                        |            correct a stated value
+                                        v
+                        classification_label_candidates
+                                    transform: sql — the shape
+                                    `eval.expected` reads
 ```
 
 ## Candidate retrieval judgments
@@ -76,7 +85,36 @@ nothing because it failed, not because the corpus lacked a match.
 
 Nothing here is read by `retrieval_tests:` or `eval:`, and nothing promotes
 itself at any confidence — that is #329 rule 2. Promotion is a separate,
-human step (issue #380).
+human step (issue #380); `stel promote` drafts a golden set from these rows
+for a human to review.
+
+## Candidate classification labels
+
+The `eval:` half of the same phase (issue #456), in three models, and the
+split is the point:
+
+| model | kind | what it does |
+|---|---|---|
+| `correction_inputs` | `transform:` built-in | one row per exchange: its prose, and the context ids it retrieved |
+| `drafted_corrections` | `llm:` | did the human correct a stated value, and to what |
+| `classification_label_candidates` | `transform:` sql | the shape `eval.expected` reads |
+
+**The ids are the constraint.** `eval:` joins expected labels to predictions
+on a key, so a correction is only ground truth if it attaches to a *record*.
+The ids an exchange retrieved are the only record identity a transcript
+names — so an exchange that retrieved nothing produces no candidate, however
+clearly it corrects something. That is a real limit on what this can derive,
+not an oversight.
+
+**Only an explicit correction counts.** Agreement, restatement, and a fresh
+question are not corrections, and the prompt says so at length: an absent
+label costs nothing, while a wrong one becomes ground truth a future model is
+scored against.
+
+That last rule lives in the prompt, so the offline `deterministic` provider
+this example ships with cannot demonstrate it — it returns a stub for every
+row. The example proves the chain and the contract; judging what is actually
+a correction needs a real provider.
 
 ## The grain
 

@@ -972,6 +972,14 @@ def _coalesced_batches(
     costs the publish loop two ledger reads and a MERGE, so ~9 minutes of fixed
     round-trip time became ~14 hours.
 
+    Coalescing has to happen here because the service offers no knob for it.
+    `ReadSession.TableReadOptions` carries `selected_fields`, `row_restriction`,
+    `sample_percentage`, the two serialization-options messages and
+    `response_compression_codec` — nothing that sets rows or bytes per
+    `ReadRowsResponse`. The only documented size bound is a 128MB ceiling per
+    response, which a 6KB row does not approach at 262 rows. So the batch sizes
+    are the backend's to choose and ours to repack.
+
     Coalescing restores `batch_size` as the thing it claims to be. Residency
     stays bounded by it: at most one page plus the server batch that completed
     it is held, and the remainder of an oversized page is carried rather than

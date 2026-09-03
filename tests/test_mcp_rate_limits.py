@@ -158,11 +158,42 @@ def test_unauthenticated_requests_share_one_anonymous_bucket() -> None:
             "the third anonymous request should hit the anonymous bucket before "
             "it ever reaches principal resolution"
         )
+        # Named apart from a real caller's refusal: an operator reading logs
+        # needs "an unauthenticated flood" and "one loud tenant" to be
+        # different sentences, because they have different fixes.
+        assert "Unauthenticated" in third.error.message
         # A real caller is unaffected by the anonymous flood.
         _as(resolver, "carol")
         assert _call(service).error is None
     finally:
         service.close()
+
+
+def test_a_named_caller_and_the_anonymous_bucket_refuse_differently() -> None:
+    """The three refusals an operator can see are three different problems.
+
+    Same code and same retryability, so only the message separates "this
+    tenant is loud" from "an unauthenticated flood" from "this deployment is
+    undersized".
+    """
+    service, resolver = _service(
+        max_requests_per_minute=10, max_requests_per_minute_per_principal=1
+    )
+    try:
+        _as(resolver, "alice")
+        assert _call(service).error is None
+        named = _call(service).error
+
+        resolver.principal = None
+        _call(service)
+        anonymous = _call(service).error
+    finally:
+        service.close()
+
+    assert named is not None and anonymous is not None
+    assert named.code is anonymous.code is MCPErrorCode.BUSY
+    assert named.message != anonymous.message
+    assert "Unauthenticated" not in named.message
 
 
 def test_a_resolver_that_raises_counts_as_anonymous() -> None:
@@ -222,15 +253,14 @@ def test_a_per_principal_cap_equal_to_the_global_one_is_allowed() -> None:
 # ─── the per-key table does not leak ───────────────────────────────────────
 
 
-def test_idle_principals_are_swept_once_the_table_is_large(
+def test_idle_principals_are_swept_once_a_window_has_passed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A churn of one-off subjects must not grow the table forever. Keys whose
-    window is empty after trimming are dropped once the table passes the sweep
-    threshold — asserted by driving time forward rather than waiting a minute."""
+    window is empty after trimming are dropped on the first request after a
+    sweep interval — asserted by driving time forward rather than waiting."""
     from stel.mcp_server import service as service_module
 
-    monkeypatch.setattr(service_module, "_SWEEP_KEYS", 4)
     clock = {"now": 1000.0}
     monkeypatch.setattr(service_module, "monotonic", lambda: clock["now"])
 
@@ -244,8 +274,8 @@ def test_idle_principals_are_swept_once_the_table_is_large(
         for subject in ("a", "b", "c", "d", "e"):
             limiter.run(lambda: None, principal_key=subject)
         assert len(limiter._per_principal_times) == 5
-        # A minute later every one of those windows is empty; the next request
-        # pushes the table past the threshold and sweeps them.
+        # A minute later every one of those windows is empty, and a sweep
+        # interval has elapsed, so the next request reclaims them.
         clock["now"] += 61
         limiter.run(lambda: None, principal_key="f")
         assert set(limiter._per_principal_times) == {"f"}

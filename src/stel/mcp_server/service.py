@@ -217,8 +217,16 @@ ResponseT = TypeVar("ResponseT", bound=BaseModel)
 # limiting is on. One caller's worth, not zero: an unauthenticated flood must
 # count against something.
 _ANONYMOUS_KEY = "<anonymous>"
-# Distinct principal keys held before idle ones are swept.
-_SWEEP_KEYS = 1024
+# How often idle principal keys are swept. One window length, so a key is
+# reclaimed within two windows of its last request and the table tracks recent
+# callers rather than every caller ever seen.
+#
+# A size trigger was the first shape of this and is the wrong one: past the
+# threshold every request pays the O(n) sweep, so a deployment with more
+# concurrent principals than the threshold sweeps continuously — the cost
+# scales with legitimate load rather than with the churn the sweep exists to
+# clean up. Elapsed time bounds residency without that coupling.
+_SWEEP_INTERVAL_SECONDS = 60.0
 
 
 def _trim(times: deque[float], cutoff: float) -> deque[float]:
@@ -257,9 +265,10 @@ class _OperationLimiter:
         # cannot turn it into a leak.
         self._per_principal_times: dict[str, deque[float]] = {}
         self._request_lock = Lock()
+        self._last_sweep = monotonic()
         self._timeout_seconds = timeout_seconds
 
-    def run(self, operation: Callable[[], T], *, principal_key: str | None = None) -> T:
+    def run(self, operation: Callable[[], T], *, principal_key: str | None) -> T:
         self._check_rate_limit(principal_key)
         if not self._semaphore.acquire(blocking=False):
             raise ContextServiceError(
@@ -307,9 +316,17 @@ class _OperationLimiter:
                 caller_times = self._per_principal_times.setdefault(key, deque())
                 _trim(caller_times, cutoff)
                 if len(caller_times) >= per_cap:
+                    # Worded apart from the global refusal, and the anonymous
+                    # bucket apart from a named caller: an operator reading
+                    # logs is trying to tell "one tenant is loud" from "an
+                    # unauthenticated flood" from "this deployment is
+                    # undersized", and those have three different fixes.
                     raise ContextServiceError(
                         MCPErrorCode.BUSY,
-                        "This caller is at its request rate limit",
+                        "This caller is at its request rate limit"
+                        if principal_key is not None
+                        else "Unauthenticated callers are at their shared "
+                        "request rate limit",
                         retryable=True,
                     )
             if len(self._request_times) >= self._max_requests_per_minute:
@@ -321,12 +338,14 @@ class _OperationLimiter:
             self._request_times.append(now)
             if caller_times is not None:
                 caller_times.append(now)
-                if len(self._per_principal_times) > _SWEEP_KEYS:
-                    self._sweep_idle_principals(cutoff)
+                self._sweep_idle_principals(now, cutoff)
 
-    def _sweep_idle_principals(self, cutoff: float) -> None:
+    def _sweep_idle_principals(self, now: float, cutoff: float) -> None:
         # Called under the lock. A key whose window is empty after trimming has
         # been idle for the whole minute and holds nothing worth keeping.
+        if now - self._last_sweep < _SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_sweep = now
         for key in [
             key
             for key, times in self._per_principal_times.items()

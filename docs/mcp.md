@@ -132,6 +132,12 @@ Two limits worth knowing before a shared deployment:
   bucket of the same size, so an unauthenticated flood counts against something
   rather than nothing. Unset, nothing changes.
 
+  The refusals are worded apart so logs stay readable: `This caller is at its
+  request rate limit` is one loud tenant, `Unauthenticated callers are at
+  their shared request rate limit` is a flood with no identity, and `The
+  context server is at its request rate limit` means the deployment is
+  undersized. All three are `BUSY` and all three are retryable.
+
 Token verification without a proxy in front is tracked in issue #392.
 
 ## Operator-owned grants

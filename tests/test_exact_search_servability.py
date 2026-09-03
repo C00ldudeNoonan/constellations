@@ -249,7 +249,7 @@ def test_the_limiter_reports_the_timeout_through_that_rule() -> None:
     )
     try:
         with pytest.raises(ContextServiceError) as error:
-            limiter.run(lambda: time.sleep(5))
+            limiter.run(lambda: time.sleep(5), principal_key="subject-1")
     finally:
         limiter.close()
 

@@ -130,7 +130,12 @@ Two limits worth knowing before a shared deployment:
   `--max-requests-per-minute-per-principal` to give each subject its own share
   under that ceiling. Requests with no resolvable principal share one anonymous
   bucket of the same size, so an unauthenticated flood counts against something
-  rather than nothing. Unset, nothing changes.
+  rather than nothing. Unset, nothing changes. The refusals are worded apart so
+  logs stay readable: `This caller is at its request rate limit` is one loud
+  tenant, `Unauthenticated callers are at their shared request rate limit` is a
+  flood with no identity, and `The context server is at its request rate
+  limit` means the deployment is undersized. All three are `BUSY` and all
+  three are retryable.
 
 ### Verifying tokens instead of trusting a proxy
 

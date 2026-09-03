@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.5 - 2026-09-02
 
 ### The network MCP transport verifies bearer tokens itself (issue #392)
 
@@ -60,6 +60,11 @@ from an attack.
   bucket is about what the flood costs everyone else.
 - A request the global ceiling turns away is not also charged to the caller's
   own share: both windows are decided before either is appended to.
+- The three refusals read differently on purpose. `This caller is at its
+  request rate limit`, `Unauthenticated callers are at their shared request
+  rate limit` and `The context server is at its request rate limit` are the
+  same `BUSY` code, but one loud tenant, an unauthenticated flood, and an
+  undersized deployment have three different fixes.
 - Unset, behavior is byte-identical to before: no per-key state is kept and the
   caller is never resolved ahead of the operation.
 

@@ -77,7 +77,17 @@ it — which is precisely the person this redirect is for.
    gcloud auth application-default login
    # or: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
 
-   STEL_BQ_TEST_PROJECT=your-gcp-project uv run pytest -q tests/test_bigquery_adapter.py
+   STEL_BQ_TEST_PROJECT=your-gcp-project uv run pytest -q -rs tests/test_bigquery_adapter.py \
+     tests/test_serving_ledger_live.py
+   ```
+
+   The `VAR=value command` prefix is bash syntax. From PowerShell, set the
+   variable first, or the live tests silently skip and the run reports
+   `1 passed, 1 skipped` as if it had done its job (`-rs` prints the reason):
+
+   ```powershell
+   $env:STEL_BQ_TEST_PROJECT = "your-gcp-project"
+   uv run pytest -q -rs tests/test_bigquery_adapter.py tests/test_serving_ledger_live.py
    ```
 
    The tests create and drop their own scratch datasets. If you cannot run them,

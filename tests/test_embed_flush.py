@@ -691,6 +691,7 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
     from stel.adapters import create_adapter, parse_warehouse_config
     from stel.config.model import EmbedConfig
     from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
 
     config = parse_warehouse_config(
         {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
@@ -712,6 +713,7 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
                 provider="deterministic", model="m", dimensions=1,
                 id_field="chunk_id", vector_field="embedding",
             ),
+            timings=PhaseTimings(),
         )
 
         assert reader.target_key("1.50") is not None
@@ -728,6 +730,7 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
     )
     from stel.config.model import EmbedConfig
     from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
 
     config = parse_warehouse_config(
         {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
@@ -772,6 +775,7 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
                 id_field="chunk_id",
                 vector_field="embedding",
             ),
+            timings=PhaseTimings(),
         )
 
         assert snapshot_calls == 2

@@ -4005,13 +4005,20 @@ run results under `target-path`:
 
   `embed:` and `search:` models add **wall-clock attribution** to `metrics`,
   as `seconds_<phase>` — for embed, `provider` (time waiting on the embedding
-  provider), `publish` (the warehouse write), and `read` (pulling batches from
-  the upstream snapshot); for search, `read`, `store_write` (the retrieval
-  store upsert), and `state` (the ledger reads and state MERGE each page
-  costs). Use them to attribute a slow run rather than guess at it: a publish
-  dominated by `state` is a per-page round-trip problem, one dominated by
-  `read` is a warehouse or transfer problem, and one dominated by `provider`
-  is neither.
+  provider), `publish` (the warehouse write), `read` (pulling batches from
+  the upstream snapshot), and `reuse` (reading the existing target to reclaim
+  vectors, so it appears only on a resume); for search, `read`, `store_write`
+  (the retrieval store upsert), `state` (the ledger reads and state MERGE each
+  page costs), and `index_build` (building the vector index — the same phase
+  name the memory log uses, so peak RSS and wall clock line up). Use them to
+  attribute a slow run rather than guess at it: a publish dominated by `state`
+  is a per-page round-trip problem, one dominated by `read` is a warehouse or
+  transfer problem, one dominated by `index_build` is an ANN-build problem the
+  `index:` choice can move, and one dominated by `provider` is none of those.
+
+  A phase absent from `metrics` did not happen — a first embed run has no
+  `seconds_reuse` because it has nothing to reuse, which is different from
+  reuse that cost nothing.
 
   On BigQuery the read is broken down further, because only the adapter can:
   `seconds_read_transfer` (waiting on the Storage Read stream),

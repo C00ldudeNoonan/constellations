@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### The index build and the resume reads report their wall clock (issue #432)
+
+Two phases of a run were doing real work outside every timing phase, so
+`seconds_*` could sum to a fraction of `duration_seconds` with nothing saying
+where the rest went. Both are on the path a retried production run takes.
+
+- **`seconds_index_build`** on `search:` models — the ANN build, the largest
+  term in a large publish and the operation v0.16.0 just changed the shape of.
+  It shares the name `log_publication_memory` already uses for the same
+  operation, so peak RSS and wall clock now answer under one `index_build`.
+- **`seconds_reuse`** on `embed:` models — reading the existing target to
+  reclaim vectors on a resume: one pass over the id column, then a keyed
+  lookup per window, each a query job and a read session on BigQuery. Reported
+  only when a run actually resumes, since a `0.0` would read as "the lookups
+  were free" rather than "there were none". Kept out of `read`, which answers
+  what share of the *upstream* pull is transfer versus decode (#454).
+
+This measures; nothing is faster for it. Items 2 and 3 of #432 shipped in
+0.14.x, and item 4 (overlapping publication with computation) stays open —
+deliberately, until a production run says which term dominates.
+
 ## v0.16.0 - 2026-09-03
 
 ### The ANN index type is declared, and `ivf_pq` fits where `HnswFlat` did not (issue #476)

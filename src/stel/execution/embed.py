@@ -209,7 +209,7 @@ def _run_embed_model(
     # first provider call, and only on the *resume* path, where the run being
     # resumed has already proven the corpus is large (issue #401 follow-up).
     reuse_reader = (
-        _EmbeddingReuseReader(adapter, model.name, config=config)
+        _EmbeddingReuseReader(adapter, model.name, config=config, timings=timings)
         if is_incremental and not rebuild_target
         else None
     )
@@ -767,9 +767,11 @@ class _EmbeddingReuseReader:
         table: str,
         *,
         config: Any,
+        timings: PhaseTimings,
     ) -> None:
         self._adapter = adapter
         self._table = table
+        self._timings = timings
         self._id_field = config.id_field
         self._columns = (
             config.id_field,
@@ -798,13 +800,14 @@ class _EmbeddingReuseReader:
 
     def _read_target_keys_once(self) -> dict[str, Any]:
         target_keys: dict[str, Any] = {}
-        with self._adapter.table_snapshot(
-            self._table,
-            columns=[self._id_field],
-            batch_size=100_000,
-        ) as snapshot:
-            for batch in snapshot:
-                target_keys.update(self._target_keys_from_batch(batch))
+        with self._timings.phase("reuse"):
+            with self._adapter.table_snapshot(
+                self._table,
+                columns=[self._id_field],
+                batch_size=100_000,
+            ) as snapshot:
+                for batch in snapshot:
+                    target_keys.update(self._target_keys_from_batch(batch))
         return target_keys
 
     def _target_keys_from_batch(self, batch: Any) -> dict[str, Any]:
@@ -879,14 +882,28 @@ class _EmbeddingReuseReader:
             tuple(chunk),
         )
         found: dict[str, dict[str, Any]] = {}
-        with self._adapter.table_snapshot(
-            self._table,
-            columns=list(self._columns),
-            predicate=predicate,
-            batch_size=len(chunk),
-        ) as snapshot:
-            for batch in snapshot:
-                found.update(self._rows_from_batch(batch))
+        # Credited whole -- open, pull, and the dict build -- where the
+        # upstream `read` phase credits only the pull. The difference is not
+        # inconsistency: upstream opens one snapshot per *run*, so its open is
+        # a rounding error and its shaping is the corpus. This opens one per
+        # *window* (a query job and a read session each time on BigQuery), so
+        # the open is the cost this path is most likely to pay, and the
+        # shaping it over-counts is a dict build over at most
+        # `_LOOKUP_KEYS_PER_READ` rows against a warehouse round trip.
+        #
+        # `snapshot.timings` is deliberately *not* merged. The adapter reports
+        # transfer/decode under fixed names, and folding a per-window lookup
+        # into the same keys would destroy the one signal #454 needs: what
+        # share of the *upstream* read is transfer rather than decode.
+        with self._timings.phase("reuse"):
+            with self._adapter.table_snapshot(
+                self._table,
+                columns=list(self._columns),
+                predicate=predicate,
+                batch_size=len(chunk),
+            ) as snapshot:
+                for batch in snapshot:
+                    found.update(self._rows_from_batch(batch))
         return found
 
     def _rows_from_batch(self, batch: Any) -> dict[str, dict[str, Any]]:

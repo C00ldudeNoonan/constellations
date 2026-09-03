@@ -620,6 +620,44 @@ def test_an_embed_run_attributes_its_phases(tmp_path: Path) -> None:
         assert embed.metrics[phase] >= 0.0
 
 
+def test_a_resume_attributes_its_reuse_reads(tmp_path: Path) -> None:
+    """The resume path reads the *target* — once for the id column, then a
+    keyed lookup per window — and reported none of it.
+
+    That is the path a retried production run takes, and its cost scales with
+    windows rather than with the corpus: at `flush_every` over millions of
+    rows it is thousands of keyed reads, each a query job and a read session
+    on BigQuery. Folding it into `read` was not an option; that phase answers
+    what share of the *upstream* pull is transfer versus decode (#454), and a
+    per-window lookup mixed into it destroys the answer.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+
+    # Second run over the same corpus: every row is reusable, so the lookups
+    # run and the provider does not.
+    results = run_project(project)
+
+    [embed] = [r for r in results if r.kind == "embed"]
+    assert "seconds_reuse" in embed.metrics, embed.metrics
+    assert embed.metrics["seconds_reuse"] >= 0.0
+
+
+def test_a_first_run_reports_no_reuse_phase(tmp_path: Path) -> None:
+    """A phase is reported because it happened, not because the stage exists.
+
+    Nothing to resume from means no reuse reader and no reuse read; a
+    `seconds_reuse: 0.0` on a first run would read as "the lookups were free"
+    rather than "there were none".
+    """
+    project = _embedding_project(tmp_path)
+
+    results = run_project(project)
+
+    [embed] = [r for r in results if r.kind == "embed"]
+    assert "seconds_reuse" not in embed.metrics, embed.metrics
+
+
 def test_phase_totals_reach_run_results_json(tmp_path: Path) -> None:
     """The deliverable is a number an operator reads after a production run,
     not one only a test can see."""

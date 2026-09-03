@@ -1548,6 +1548,28 @@ def test_a_search_publish_attributes_its_phases(tmp_path: Path) -> None:
         assert search.metrics[phase] >= 0.0
 
 
+def test_a_search_publish_attributes_its_index_build(tmp_path: Path) -> None:
+    """The ANN build is the largest term in a large publish and was the last
+    one of that size left outside every phase.
+
+    #473 was an index build that exhausted the container; v0.16.0 changed how
+    one is chosen and where it runs. A reader could see `read`, `store_write`
+    and `state` sum to a fraction of `duration_seconds` with nothing saying
+    where the rest went — and the operation the run had just been rebuilt
+    around was the missing term. It shares the name the memory log already
+    uses, so peak RSS and wall clock answer under one `index_build`.
+    """
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+
+    results = run_project(project)
+
+    [search] = [r for r in results if r.kind == "search"]
+    assert "seconds_index_build" in search.metrics, search.metrics
+    assert search.metrics["seconds_index_build"] >= 0.0
+
+
 def test_search_timings_cover_deletion_and_activation(tmp_path: Path) -> None:
     """A run whose work is deletion must not report only `seconds_read`.
 

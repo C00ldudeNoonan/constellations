@@ -584,7 +584,14 @@ def _run_search_model(
                     coordinator.verify_publish(publish_lease)
                     store.create_collection(spec)
                 log_publication_memory(log, model.name, phase="index_build", batch=ordinal + 1)
-                metadata = store.ensure_indexes(spec)
+                # The ANN build is the largest term in a large publish and was
+                # the last one of that size still unattributed: a reader could
+                # see `read`, `store_write` and `state` sum to a fraction of
+                # `duration_seconds` with nothing saying where the rest went.
+                # The memory line above already calls this phase `index_build`,
+                # so peak RSS and wall clock now answer under one name.
+                with timings.phase("index_build"):
+                    metadata = store.ensure_indexes(spec)
                 if not warned_exact:
                     _warn_on_exact_vector_scan(model, spec, metadata.row_count)
                 if metadata.config_fingerprint != spec.config_fingerprint:

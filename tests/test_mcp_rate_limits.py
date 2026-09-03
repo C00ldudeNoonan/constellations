@@ -21,7 +21,10 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
+from stel.cli import cli
+from stel.mcp_server import service as service_module
 from stel.mcp_server.authorization import (
     AuthorizationError,
     ClaimAuthorizationProvider,
@@ -196,6 +199,33 @@ def test_a_named_caller_and_the_anonymous_bucket_refuse_differently() -> None:
     assert "Unauthenticated" not in named.message
 
 
+def test_a_subject_literally_named_anonymous_does_not_share_the_bucket() -> None:
+    """The anonymous key is a private sentinel object, not the string
+    "<anonymous>" (Codex review, #466): an authenticated subject that happens
+    to be named that is not merged with real anonymous traffic."""
+    service, resolver = _service(
+        max_requests_per_minute=10, max_requests_per_minute_per_principal=1
+    )
+    try:
+        _as(resolver, "<anonymous>")
+        assert _call(service).error is None
+
+        resolver.principal = None
+        first = _call(service)
+        assert first.error is not None and first.error.code is MCPErrorCode.MISSING_PRINCIPAL
+
+        _as(resolver, "<anonymous>")
+        second = _call(service)
+        assert second.error is not None, (
+            "the literal-named subject's own share (1/minute) is exhausted "
+            "by its first call above — unrelated to the anonymous flood"
+        )
+        assert second.error.code is MCPErrorCode.BUSY
+        assert "Unauthenticated" not in second.error.message
+    finally:
+        service.close()
+
+
 def test_a_resolver_that_raises_counts_as_anonymous() -> None:
     """A resolver failure is not a free pass past the limiter."""
     service, resolver = _service(
@@ -250,6 +280,30 @@ def test_a_per_principal_cap_equal_to_the_global_one_is_allowed() -> None:
     )
 
 
+def test_the_cli_reports_the_cap_conflict_as_a_configuration_error(
+    tmp_path: Any,
+) -> None:
+    """The validator above raises pydantic's ValidationError, which is not
+    itself a ConfigClickError. Unless mcp_serve catches it, an operator sees a
+    traceback and exit code 1 instead of the usual exit-2 configuration
+    diagnostic every other misconfiguration gets (Codex review, #466)."""
+    (tmp_path / "stel_project.yml").write_text(
+        "name: p\nversion: '0.1.0'\n", encoding="utf-8"
+    )
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir", str(tmp_path),
+            "mcp", "serve",
+            "--transport", "stdio",
+            "--max-requests-per-minute", "10",
+            "--max-requests-per-minute-per-principal", "11",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "exceeds" in result.output
+
+
 # ─── the per-key table does not leak ───────────────────────────────────────
 
 
@@ -259,8 +313,6 @@ def test_idle_principals_are_swept_once_a_window_has_passed(
     """A churn of one-off subjects must not grow the table forever. Keys whose
     window is empty after trimming are dropped on the first request after a
     sweep interval — asserted by driving time forward rather than waiting."""
-    from stel.mcp_server import service as service_module
-
     clock = {"now": 1000.0}
     monkeypatch.setattr(service_module, "monotonic", lambda: clock["now"])
 

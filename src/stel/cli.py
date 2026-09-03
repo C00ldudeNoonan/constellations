@@ -1632,6 +1632,8 @@ def mcp_serve(
     principal. A network transport serves many callers, so it needs an
     identity per request and refuses to start without one.
     """
+    from pydantic import ValidationError
+
     from .mcp_server.authorization import (
         AuthorizationError,
         TrustedHeaderPrincipalResolver,
@@ -1641,17 +1643,22 @@ def mcp_serve(
     from .mcp_server.service import ContextServerSettings
     from .mcp_server.tokens import TokenVerificationError
 
-    settings = ContextServerSettings(
-        timeout_seconds=timeout_seconds,
-        max_concurrency=max_concurrency,
-        max_requests_per_minute=max_requests_per_minute,
-        max_requests_per_minute_per_principal=max_requests_per_minute_per_principal,
-        max_response_bytes=max_response_bytes,
-        max_scan_rows=max_scan_rows,
-    )
     jwt_settings = (jwt_issuer, jwt_audience, jwt_jwks_uri)
     verifying_tokens = any(jwt_settings)
     try:
+        # Constructed inside the try: the per-principal-cap-under-global-cap
+        # cross-field check raises pydantic's ValidationError, which is not
+        # one of _CONFIG_ERRORS and was escaping as a bare traceback with exit
+        # code 1 instead of the usual exit-2 configuration diagnostic (Codex
+        # review, #466).
+        settings = ContextServerSettings(
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+            max_requests_per_minute=max_requests_per_minute,
+            max_requests_per_minute_per_principal=max_requests_per_minute_per_principal,
+            max_response_bytes=max_response_bytes,
+            max_scan_rows=max_scan_rows,
+        )
         if transport == "stdio":
             if trust_proxy_principal_headers:
                 raise ConfigClickError(
@@ -1747,6 +1754,8 @@ def mcp_serve(
             grant_ttl_seconds=grant_ttl_seconds,
             settings=settings,
         )
+    except ValidationError as error:
+        raise ConfigClickError(str(error)) from error
     except (ArtifactCatalogError, AuthorizationError, *_CONFIG_ERRORS) as error:
         raise ConfigClickError(str(error)) from error
     except TokenVerificationError as error:

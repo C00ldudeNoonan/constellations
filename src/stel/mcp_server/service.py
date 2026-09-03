@@ -215,8 +215,10 @@ ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
 # Requests with no resolvable principal share this bucket when per-principal
 # limiting is on. One caller's worth, not zero: an unauthenticated flood must
-# count against something.
-_ANONYMOUS_KEY = "<anonymous>"
+# count against something. A private object, not a string: a subject that
+# happens to be named "<anonymous>" is a legitimate principal and must not
+# share this bucket with real anonymous traffic (Codex review, #466).
+_ANONYMOUS_KEY: object = object()
 # How often idle principal keys are swept. One window length, so a key is
 # reclaimed within two windows of its last request and the table tracks recent
 # callers rather than every caller ever seen.
@@ -260,10 +262,11 @@ class _OperationLimiter:
         self._max_requests_per_minute_per_principal = max_requests_per_minute_per_principal
         self._request_times: deque[float] = deque()
         # One sliding window per principal key (issue #463). Grows with the
-        # number of distinct callers seen in the last minute, and is swept of
-        # idle keys once it passes _SWEEP_KEYS so a churn of one-off subjects
-        # cannot turn it into a leak.
-        self._per_principal_times: dict[str, deque[float]] = {}
+        # number of distinct callers seen in the last minute, and is swept on
+        # a time cadence so a churn of one-off subjects cannot turn it into a
+        # leak. Keyed by `object` rather than `str`: the anonymous bucket's
+        # key is a sentinel, not a string.
+        self._per_principal_times: dict[object, deque[float]] = {}
         self._request_lock = Lock()
         self._last_sweep = monotonic()
         self._timeout_seconds = timeout_seconds

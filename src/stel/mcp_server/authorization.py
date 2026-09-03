@@ -132,6 +132,49 @@ class TrustedHeaderPrincipalResolver:
         )
 
 
+class AccessTokenPrincipalResolver:
+    """Resolve one principal per request from a verified bearer token (#392).
+
+    The counterpart to `TrustedHeaderPrincipalResolver`, and the reason a
+    network deployment does not need a proxy in front: identity comes from a
+    token this server verified itself rather than from a header it was told to
+    believe.
+
+    Only the subject is taken. #396 made grants the authorization source —
+    groups and tenants are looked up by subject, never carried — so a token
+    that claims a tenant or a group gains nothing by claiming it. That is
+    deliberate: the token answers who, the grant store answers what, and
+    neither gets to answer the other's question.
+
+    Outside a request, or when no token was verified, resolves to None and the
+    service refuses the call as unauthenticated.
+    """
+
+    def resolve(self) -> Principal | None:
+        token = _verified_access_token()
+        if token is None:
+            return None
+        subject_id = str(getattr(token, "subject", "") or "").strip()
+        if not subject_id:
+            return None
+        return Principal(subject_id=subject_id)
+
+
+def _verified_access_token() -> Any:
+    """The access token the SDK verified for the call in flight, or None.
+
+    Read through the SDK's contextvar for the same reason the header resolver
+    reads the request that way: the resolver is invoked deep in the service,
+    which has no request parameter, and the `PrincipalResolver` Protocol exists
+    precisely so transports can differ without the service knowing.
+    """
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+    except ImportError:
+        return None
+    return get_access_token()
+
+
 def _current_http_request() -> Any:
     """The Starlette request for the call in flight, or None.
 

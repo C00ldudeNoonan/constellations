@@ -2621,6 +2621,7 @@ lancedb = [
 ]
 mcp = [
     { name = "mcp" },
+    { name = "pyjwt", extra = ["crypto"] },
 ]
 ml = [
     { name = "numpy" },
@@ -2697,6 +2698,7 @@ requires-dist = [
     { name = "presidio-anonymizer", marker = "extra == 'pii'", specifier = ">=2.2" },
     { name = "pyarrow", specifier = ">=16" },
     { name = "pydantic", specifier = ">=2.7" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'mcp'", specifier = ">=2.10" },
     { name = "pypdf", marker = "extra == 'all'", specifier = ">=6.16.1" },
     { name = "pypdf", marker = "extra == 'pdf'", specifier = ">=6.16.1" },
     { name = "pyyaml", specifier = ">=6" },

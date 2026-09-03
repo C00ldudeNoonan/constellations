@@ -1981,6 +1981,7 @@ def _merge_key_spec(name: str) -> CollectionSpec:
         vector_dimensions=None,
         distance_metric=None,
         vector_search=None,
+        vector_index=None,
         config_fingerprint="cfg",
         descriptor="{}",
         legacy_config_fingerprint="legacy",
@@ -2238,3 +2239,28 @@ def test_a_pq_collection_that_shrank_below_the_floor_keeps_publishing(tmp_path: 
 
         assert _vector_index_types(store, name) == ["IvfPq"]
 
+
+def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None:
+    """A new key in a documented artifact is a schema change (AGENTS.md), even
+    an additive one: a consumer pinning version 1 should fail loudly rather
+    than read the wider shape as the narrower. The default is never written,
+    so the only difference between the versions is a declared `index`."""
+    _write_project(tmp_path)
+    resource = next(
+        model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
+    )["output"]["serving_resource"]
+    assert resource["schema_version"] == 2
+    assert "index" not in resource["vector"]
+
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace(
+            "        search: exact\n", "        search: approximate\n        index: ivf_pq\n"
+        ),
+        encoding="utf-8",
+    )
+    resource = next(
+        model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
+    )["output"]["serving_resource"]
+    assert resource["schema_version"] == 2
+    assert resource["vector"]["index"] == "ivf_pq"

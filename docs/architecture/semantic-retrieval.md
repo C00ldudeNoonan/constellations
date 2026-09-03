@@ -1688,7 +1688,7 @@ entry uses the other discriminator:
       "physical_collection": "economic_data__dev__economic_context",
       "scope_fingerprint": "...",
       "materialization": "incremental",
-      "schema_version": 1,
+      "schema_version": 2,
       "config_fingerprint": "...",
       "text_fields": ["text"],
       "return_text_fields": ["text"],

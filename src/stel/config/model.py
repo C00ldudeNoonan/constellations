@@ -639,10 +639,13 @@ class SearchVectorConfig(BaseModel):
 
     @model_validator(mode="after")
     def _index_type_needs_approximate_search(self) -> SearchVectorConfig:
-        # `exact` builds no index at all, so a non-default `index` under it
-        # would be accepted and silently do nothing — the shape this codebase
-        # refuses elsewhere (a flag that looks like a decision and is not).
-        if self.index != DEFAULT_VECTOR_INDEX and self.search != "approximate":
+        # `exact` builds no index at all, so an `index` written under it would
+        # be accepted and silently do nothing — the shape this codebase refuses
+        # elsewhere (a flag that looks like a decision and is not). Judged on
+        # whether the key was *written*, not on its value: spelling out the
+        # default under `exact` is still an operator asserting a choice that
+        # nothing will honor (Codex review, #477).
+        if "index" in self.model_fields_set and self.search != "approximate":
             raise ValueError(
                 f"search.vector.index {self.index!r} only applies to "
                 "search: approximate; exact search builds no vector index"

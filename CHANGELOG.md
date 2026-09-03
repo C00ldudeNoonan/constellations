@@ -28,7 +28,10 @@ zero.
 - `index` under `search: exact` is refused at config time (it would do
   nothing), and any type but `ivf_hnsw_flat` is refused at compile time against
   the DuckDB store, whose vss extension builds one HNSW.
-- The manifest's `vector` block carries `index` only when it is non-default.
+- The manifest's `serving_resource` descriptor moves to `schema_version: 2`:
+  its `vector` block carries `index` when a non-default ANN structure is
+  declared, and nothing else changes — a descriptor written under 1 reads
+  identically, since the default is never written.
 - `ivf_pq` needs 256 rows to train (LanceDB's 8-bit codebook); below that stel
   refuses with `lancedb_pq_corpus_too_small` and names the alternative, instead
   of surfacing a sanitized `lancedb_index_failed` after the whole publish.

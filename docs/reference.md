@@ -2322,8 +2322,8 @@ Three things follow from how the field is stamped:
   `approximate`: an index build over vectors that are already published, no
   re-embed, applied under `on_index_change: online` into a private generation.
 - **`index` applies only to `search: approximate`.** `exact` builds no index,
-  so a non-default `index` under it is refused at config time rather than
-  accepted and ignored. The DuckDB store builds only `ivf_hnsw_flat` (its vss
+  so writing `index` under it — even the default — is refused at config time
+  rather than accepted and ignored. The DuckDB store builds only `ivf_hnsw_flat` (its vss
   extension has one HNSW); declaring another type against it is refused at
   compile time, naming the LanceDB store.
 

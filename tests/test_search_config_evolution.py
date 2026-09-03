@@ -827,11 +827,14 @@ def test_an_index_type_change_alongside_a_dimension_change_still_rebuilds() -> N
     assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
 
 
-def test_an_index_type_under_exact_search_is_refused_at_config_time() -> None:
-    """`exact` builds no index, so a non-default `index` would be accepted and
-    silently do nothing — a flag that looks like a decision and is not."""
+@pytest.mark.parametrize("index", ["ivf_pq", "ivf_hnsw_flat"])
+def test_an_index_type_under_exact_search_is_refused_at_config_time(index: str) -> None:
+    """`exact` builds no index, so an `index` written under it would be accepted
+    and silently do nothing — a flag that looks like a decision and is not.
+    Judged on whether the key was written: spelling out the default is still a
+    choice nothing will honor (Codex review, #477)."""
     with pytest.raises(ValidationError, match="only applies to search: approximate"):
-        _vector_model(search="exact", index="ivf_pq")
+        _vector_model(search="exact", index=index)
 # ─── the merge key is indexed (issue #475) ─────────────────────────────────
 
 

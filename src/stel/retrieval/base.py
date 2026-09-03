@@ -47,12 +47,6 @@ class RetrievalFeature(StrEnum):
     INDEX_READINESS = "index_readiness"
     DURABLE_WRITE_ACK = "durable_write_ack"
     ATOMIC_BATCH_MUTATION = "atomic_batch_mutation"
-    # In-place widening of a published collection (issue #344). Advertised
-    # only by a store that can add columns to a live collection without
-    # rewriting its rows. It permits exactly the changes classification
-    # calls compatible: the design doc is explicit that a broad flag cannot
-    # make an incompatible dimension or type change safe.
-    ONLINE_SCHEMA_EVOLUTION = "online_schema_evolution"
     # Store-side publisher fencing proofs (issue #152). A warehouse fencing
     # token cannot stop a partitioned process from calling an independent
     # store SDK, so publication requires the store to advertise exactly how
@@ -529,20 +523,6 @@ class RetrievalStore(ABC):
 
     @abstractmethod
     def create_collection(self, spec: CollectionSpec) -> CollectionMetadata: ...
-
-    @abstractmethod
-    def evolve_collection(self, spec: CollectionSpec, added: Sequence[str]) -> None:
-        """Widen a live collection to `spec`, in place, without rewriting rows.
-
-        Called only for a change classification has found compatible and only
-        when the store advertises `ONLINE_SCHEMA_EVOLUTION`. `added` names the
-        columns to introduce; they arrive null and are filled by the republish
-        that follows, which costs an index rewrite but no provider calls.
-
-        Implementations must also re-stamp the collection, so a run that
-        evolves and then fails does not leave a widened collection still
-        describing its previous shape.
-        """
 
     @abstractmethod
     def restamp_collection(self, spec: CollectionSpec) -> None:

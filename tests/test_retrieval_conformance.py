@@ -250,19 +250,6 @@ def test_empty_mutations_are_accepted_as_no_ops(store: RetrievalStore) -> None:
     assert deleted.outcomes == ()
 
 
-def test_schema_evolution_preserves_rows(store: RetrievalStore) -> None:
-    _requires(store, RetrievalFeature.ONLINE_SCHEMA_EVOLUTION)
-    name = _populate(store)
-    widened = pa.schema([*list(SCHEMA), pa.field("classification", pa.string())])
-    base = _spec(store, name)
-    spec = CollectionSpec(**{**base.__dict__, "arrow_schema": widened})
-
-    store.evolve_collection(spec, ["classification"])
-
-    metadata = store.inspect_collection(name)
-    assert metadata is not None
-    assert "classification" in metadata.schema.names
-    assert metadata.row_count == len(ROWS)
 
 
 # ─── queries ────────────────────────────────────────────────────────────────

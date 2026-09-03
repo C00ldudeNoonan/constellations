@@ -1255,6 +1255,12 @@ to see the plan first."""
         Predicates are combined with logical AND. Ordering is unspecified; a
         consumer needing deterministic reconciliation must use a separately
         advertised ordered-read capability.
+
+        With `key_column`, the snapshot refuses a key domain containing NULLs
+        or duplicates before yielding its first batch. This is a contract, not
+        an implementation detail: a private-generation search publish appends
+        rows without a keyed merge (#474), so uniqueness has to be established
+        here. An adapter that cannot check it must not accept `key_column`.
         """
         self.require_capability(
             WarehouseCapability.STREAMING_TABULAR_READS,

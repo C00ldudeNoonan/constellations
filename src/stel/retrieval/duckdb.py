@@ -242,7 +242,6 @@ class DuckDBStore(RetrievalStore):
                     # atomic here, unlike a remote store batching over HTTP.
                     RetrievalFeature.DURABLE_WRITE_ACK,
                     RetrievalFeature.ATOMIC_BATCH_MUTATION,
-                    RetrievalFeature.ONLINE_SCHEMA_EVOLUTION,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                     RetrievalFeature.PRIVATE_GENERATION_BUILD,
                 }
@@ -482,25 +481,6 @@ class DuckDBStore(RetrievalStore):
         if created is None:
             raise RetrievalError("DuckDB collection creation was not observable")
         return created
-
-    def evolve_collection(self, spec: CollectionSpec, added: Sequence[str]) -> None:
-        conn = self._connection()
-        existing = set(self._arrow_schema(conn, spec.physical_name).names)
-        missing = [name for name in added if name not in existing]
-        fields = {field.name: field for field in spec.arrow_schema}
-        for name in missing:
-            field = fields.get(name)
-            if field is None:
-                raise RetrievalError(
-                    f"DuckDB cannot add column '{name}': it is not in the target schema"
-                )
-            self._execute(
-                conn,
-                f"ALTER TABLE {_quote_identifier(spec.physical_name)} "
-                f"ADD COLUMN {_quote_identifier(name)} {_duckdb_type(field, spec)}",
-                operation="evolve collection",
-            )
-        self._stamp_collection(conn, spec.physical_name, spec)
 
     def restamp_collection(self, spec: CollectionSpec) -> None:
         self._stamp_collection(self._connection(), spec.physical_name, spec)

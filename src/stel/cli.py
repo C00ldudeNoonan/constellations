@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -1576,6 +1577,47 @@ def mcp() -> None:
     help="HTTPS URL of the issuer's JWKS, used to verify token signatures.",
 )
 @click.option(
+    "--introspection-endpoint",
+    default=None,
+    help=(
+        "HTTPS URL of the issuer's RFC 7662 introspection endpoint. Use this "
+        "instead of the --jwt-* flags when the authorization server issues "
+        "opaque tokens that cannot be verified locally. Costs a round trip "
+        "per token, cached briefly."
+    ),
+)
+@click.option(
+    "--introspection-issuer",
+    default=None,
+    help=(
+        "The issuer every introspected token must name, when the response "
+        "carries one."
+    ),
+)
+@click.option(
+    "--introspection-audience",
+    default=None,
+    help=(
+        "The audience every introspected token must name — this deployment. "
+        "An `active` token is only valid at the issuer, not necessarily for "
+        "you, so an authorization server that omits `aud` cannot be used."
+    ),
+)
+@click.option(
+    "--introspection-client-id",
+    default=None,
+    help="Client id this server authenticates to the introspection endpoint with.",
+)
+@click.option(
+    "--introspection-client-secret-env",
+    default=None,
+    help=(
+        "Name of the environment variable holding the introspection client "
+        "secret. The name, not the secret: a value passed on the command line "
+        "is visible in the process list and the shell history."
+    ),
+)
+@click.option(
     "--trust-proxy-principal-headers",
     is_flag=True,
     help=(
@@ -1616,6 +1658,11 @@ def mcp_serve(
     jwt_issuer: str | None,
     jwt_audience: str | None,
     jwt_jwks_uri: str | None,
+    introspection_endpoint: str | None,
+    introspection_issuer: str | None,
+    introspection_audience: str | None,
+    introspection_client_id: str | None,
+    introspection_client_secret_env: str | None,
     trust_proxy_principal_headers: bool,
     timeout_seconds: float,
     max_concurrency: int,
@@ -1644,7 +1691,16 @@ def mcp_serve(
     from .mcp_server.tokens import TokenVerificationError
 
     jwt_settings = (jwt_issuer, jwt_audience, jwt_jwks_uri)
-    verifying_tokens = any(jwt_settings)
+    introspection_settings = (
+        introspection_endpoint,
+        introspection_issuer,
+        introspection_audience,
+        introspection_client_id,
+        introspection_client_secret_env,
+    )
+    verifying_jwt = any(jwt_settings)
+    introspecting = any(introspection_settings)
+    verifying_tokens = verifying_jwt or introspecting
     try:
         # Constructed inside the try: the per-principal-cap-under-global-cap
         # cross-field check raises pydantic's ValidationError, which is not
@@ -1670,8 +1726,8 @@ def mcp_serve(
                 # Refused rather than ignored: a flag that is accepted and
                 # does nothing looks, from the outside, like authentication.
                 raise ConfigClickError(
-                    "--jwt-issuer, --jwt-audience and --jwt-jwks-uri apply to "
-                    "a network transport; stdio resolves its principal from "
+                    "Token verification (--jwt-* or --introspection-*) applies "
+                    "to a network transport; stdio resolves its principal from "
                     "the operator's environment and would verify nothing."
                 )
             serve_stdio(
@@ -1683,7 +1739,15 @@ def mcp_serve(
                 settings=settings,
             )
             return
-        if verifying_tokens and not all(jwt_settings):
+        if verifying_jwt and introspecting:
+            raise ConfigClickError(
+                "Choose one token verifier. --jwt-* verifies a JWT's signature "
+                "locally against the issuer's published keys; "
+                "--introspection-* asks the issuer about each token instead, "
+                "which is what an opaque token needs. Configuring both leaves "
+                "it ambiguous which one a rejected caller was refused by."
+            )
+        if verifying_jwt and not all(jwt_settings):
             missing = [
                 name
                 for name, value in (
@@ -1696,6 +1760,28 @@ def mcp_serve(
             raise ConfigClickError(
                 "JWT verification needs all three of --jwt-issuer, "
                 f"--jwt-audience and --jwt-jwks-uri; missing {', '.join(missing)}. "
+                "Each is a security boundary, so none of them gets a default."
+            )
+        if introspecting and not all(introspection_settings):
+            missing = [
+                name
+                for name, value in (
+                    ("--introspection-endpoint", introspection_endpoint),
+                    ("--introspection-issuer", introspection_issuer),
+                    ("--introspection-audience", introspection_audience),
+                    ("--introspection-client-id", introspection_client_id),
+                    (
+                        "--introspection-client-secret-env",
+                        introspection_client_secret_env,
+                    ),
+                )
+                if not value
+            ]
+            raise ConfigClickError(
+                "Token introspection needs all five of "
+                "--introspection-endpoint, --introspection-issuer, "
+                "--introspection-audience, --introspection-client-id and "
+                f"--introspection-client-secret-env; missing {', '.join(missing)}. "
                 "Each is a security boundary, so none of them gets a default."
             )
         if verifying_tokens and trust_proxy_principal_headers:
@@ -1711,12 +1797,13 @@ def mcp_serve(
                 "needs its own identity. No per-request principal source is "
                 "configured, and the stdio default would serve every caller as "
                 "one principal — with that principal's tenant filters. Pass "
-                "--jwt-issuer/--jwt-audience/--jwt-jwks-uri to verify tokens, "
-                "or --trust-proxy-principal-headers if an authenticating proxy "
+                "--jwt-issuer/--jwt-audience/--jwt-jwks-uri to verify tokens "
+                "locally, --introspection-* to verify them at the issuer, or "
+                "--trust-proxy-principal-headers if an authenticating proxy "
                 "sets them."
             )
         token_verifier = None
-        if verifying_tokens:
+        if verifying_jwt:
             from .mcp_server.authorization import AccessTokenPrincipalResolver
             from .mcp_server.tokens import JwksTokenVerifier, JwtVerifierConfig
 
@@ -1731,6 +1818,41 @@ def mcp_serve(
             click.echo(
                 f"Serving on {host}:{port} over {transport}. Caller identity "
                 f"comes from bearer tokens verified against {jwt_issuer}.",
+                err=True,
+            )
+        elif introspecting:
+            from .mcp_server.authorization import AccessTokenPrincipalResolver
+            from .mcp_server.introspection import (
+                IntrospectionTokenVerifier,
+                IntrospectionVerifierConfig,
+            )
+
+            secret = os.environ.get(str(introspection_client_secret_env), "")
+            if not secret.strip():
+                # The variable's name is not repeated back: AGENTS.md keeps
+                # credential environment-variable names out of diagnostics, and
+                # the operator just typed it.
+                raise ConfigClickError(
+                    "The environment variable named by "
+                    "--introspection-client-secret-env is unset or empty. It "
+                    "holds the secret this server authenticates to the "
+                    "introspection endpoint with."
+                )
+            token_verifier = IntrospectionTokenVerifier(
+                IntrospectionVerifierConfig(
+                    issuer=str(introspection_issuer),
+                    audience=str(introspection_audience),
+                    introspection_endpoint=str(introspection_endpoint),
+                    client_id=str(introspection_client_id),
+                    client_secret=secret,
+                )
+            )
+            resolver = AccessTokenPrincipalResolver()
+            click.echo(
+                f"Serving on {host}:{port} over {transport}. Caller identity "
+                "comes from bearer tokens introspected at "
+                f"{introspection_issuer}. A revoked token keeps working for up "
+                "to the cache TTL.",
                 err=True,
             )
         else:

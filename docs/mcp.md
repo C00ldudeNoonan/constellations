@@ -186,10 +186,57 @@ policy, and every governed read is refused.
 Enabled together, the headers would decide and the token checking would be
 decoration, so the server refuses to start rather than pick.
 
-What this does not yet do: OAuth token introspection (RFC 7662) for opaque
-tokens, and the MCP authorization spec's metadata endpoints for clients that
-discover the issuer themselves. Both compose with this verifier rather than
-replacing it.
+### Opaque tokens: introspection instead
+
+A JWT verifier needs a token it can read. When the authorization server issues
+**opaque** tokens, ask it about each one instead (RFC 7662):
+
+```bash
+export STEL_MCP_INTROSPECTION_SECRET=…
+stel mcp serve --transport streamable-http --host 0.0.0.0 --port 8000 \
+  --introspection-endpoint https://issuer.example/oauth2/introspect \
+  --introspection-issuer https://issuer.example \
+  --introspection-audience https://stel.example/mcp \
+  --introspection-client-id stel-mcp \
+  --introspection-client-secret-env STEL_MCP_INTROSPECTION_SECRET
+```
+
+All five are required, for the same reason the JWT flags are. The secret is
+passed by **environment variable name**, never as a flag value: a secret on the
+command line is visible in the process list and the shell history. The endpoint
+must be `https` — the caller's token is sent to it in the request body, so
+plaintext hands the credential itself to anyone on the path.
+
+| check | why it is not optional |
+|---|---|
+| `active` is JSON `true` | a truthy string is not a live session |
+| `aud` matches `--introspection-audience` | **the one this scheme cannot skip.** `active` means the token is live *at the issuer*, not that it was minted for you; without this, a token a caller legitimately holds for another service is valid here |
+| `iss` matches, when the response carries one | checked but not demanded — unlike a self-contained JWT, this answer came over TLS from the one endpoint you named, authenticated as a client that server registered |
+| `exp` in the future, when present | `active` should have covered it; a server saying both is not one to read generously |
+| a non-empty `sub` | grants are keyed by subject |
+
+An authorization server that omits `aud` from its introspection response
+**cannot be used**, because the confused-deputy check above becomes impossible.
+Anything that is not a clean `200` — bad client credentials, a down issuer — is
+"cannot vouch for this caller", never "let them in".
+
+**A cache hit is a revocation delay, and that is the trade.** Every request
+would otherwise cost a round trip on a path that already has a timeout budget,
+so a verified token is reused for up to a minute, capped by its own `exp`. That
+is also how long a token revoked at the issuer keeps working here. Failures are
+never cached: it would blunt one repeated bad token while doing nothing about
+distinct invented ones, and every cache keyed by attacker-supplied input is
+memory an unauthenticated caller can grow. Entries are keyed by digest, so the
+cache never holds a live credential in plaintext.
+
+The introspection flags are mutually exclusive with both the JWT flags — which
+one refused a caller would otherwise be ambiguous — and with
+`--trust-proxy-principal-headers`, and are refused on `--transport stdio` for
+the same reason the JWT flags are.
+
+What this does not yet do: the MCP authorization spec's metadata endpoints for
+clients that discover the issuer themselves, rather than being configured with
+it out of band. That composes with either verifier rather than replacing it.
 
 ## Operator-owned grants
 

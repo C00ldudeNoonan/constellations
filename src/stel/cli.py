@@ -1649,6 +1649,8 @@ def mcp_serve(
         max_response_bytes=max_response_bytes,
         max_scan_rows=max_scan_rows,
     )
+    jwt_settings = (jwt_issuer, jwt_audience, jwt_jwks_uri)
+    verifying_tokens = any(jwt_settings)
     try:
         if transport == "stdio":
             if trust_proxy_principal_headers:
@@ -1656,6 +1658,14 @@ def mcp_serve(
                     "--trust-proxy-principal-headers applies to a network "
                     "transport; stdio resolves its principal from the "
                     "operator's environment."
+                )
+            if verifying_tokens:
+                # Refused rather than ignored: a flag that is accepted and
+                # does nothing looks, from the outside, like authentication.
+                raise ConfigClickError(
+                    "--jwt-issuer, --jwt-audience and --jwt-jwks-uri apply to "
+                    "a network transport; stdio resolves its principal from "
+                    "the operator's environment and would verify nothing."
                 )
             serve_stdio(
                 ctx.obj["project_dir"],
@@ -1666,8 +1676,6 @@ def mcp_serve(
                 settings=settings,
             )
             return
-        jwt_settings = (jwt_issuer, jwt_audience, jwt_jwks_uri)
-        verifying_tokens = any(jwt_settings)
         if verifying_tokens and not all(jwt_settings):
             missing = [
                 name

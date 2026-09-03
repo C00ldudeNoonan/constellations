@@ -34,10 +34,26 @@ exactly like a correct one.
 
 **HTTPS only for the key source.** Keys fetched over plaintext can be replaced
 in transit, which makes every other check above decorative.
+
+**Key fetches are bounded, because they sit on the unauthenticated path.** A
+token naming a key id the cached JWKS does not have triggers a refetch — that
+is how a routine key rotation works without a restart. It is also the one
+network call an unauthenticated caller can provoke, before any rate limit
+applies: a stream of syntactically valid tokens with fresh, invented key ids
+would otherwise hit the issuer once per request and hold the server for each
+fetch. So the refetch is taken at most once per `_JWKS_REFRESH_MIN_INTERVAL`,
+concurrent misses coalesce onto that one fetch, the fetch itself has a short
+timeout, and the whole decode runs in a worker thread rather than on the event
+loop. The cost to a legitimate caller is a token signed with a key rotated in
+*during* the interval after an attacker's probe — refused until the interval
+lapses, never accepted wrongly.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from threading import Lock
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
@@ -61,6 +77,13 @@ ALLOWED_ALGORITHMS = (
 # Clock skew tolerated on `exp`/`nbf`. Small on purpose: this widens the window
 # in which a revoked-by-expiry token still works.
 _LEEWAY_SECONDS = 30.0
+
+# How long one JWKS fetch may hold a worker thread. PyJWT's default is 30s,
+# which on the unauthenticated path is 30s of a worker per invented key id.
+_JWKS_FETCH_TIMEOUT_SECONDS = 5.0
+# Minimum spacing between refetches provoked by an unknown key id. A real
+# rotation needs one; anything asking for more than one a minute is probing.
+_JWKS_REFRESH_MIN_INTERVAL_SECONDS = 60.0
 
 
 class TokenVerificationError(Exception):
@@ -111,9 +134,14 @@ class JwksTokenVerifier:
             "jwt", extra="mcp", feature="MCP JWT token verification"
         )
         self._jwt = jwt
-        # Caches keys and refetches on an unknown `kid`, so a routine issuer
-        # key rotation does not need a restart.
-        self._keys = jwt.PyJWKClient(config.jwks_uri)
+        # Caches the key set (PyJWT's default lifespan is five minutes). The
+        # unknown-`kid` refetch that handles rotation is done by
+        # `_signing_key` below, not by PyJWT, so that it can be bounded.
+        self._keys = jwt.PyJWKClient(
+            config.jwks_uri, timeout=_JWKS_FETCH_TIMEOUT_SECONDS
+        )
+        self._refresh_lock = Lock()
+        self._last_refresh_at: float | None = None
 
     async def verify_token(self, token: str) -> Any:
         access_token = import_optional_dependency(
@@ -121,7 +149,9 @@ class JwksTokenVerifier:
             extra="mcp",
             feature="MCP JWT token verification",
         ).AccessToken
-        claims = self._decode(token)
+        # Off the event loop: signature checks are CPU and a cache miss is a
+        # network fetch, and neither may stall every other caller's request.
+        claims = await asyncio.to_thread(self._decode, token)
         if claims is None:
             return None
         subject = str(claims.get("sub") or "").strip()
@@ -143,7 +173,10 @@ class JwksTokenVerifier:
     def _decode(self, token: str) -> dict[str, Any] | None:
         """Verified claims, or None. Never raises on caller-supplied input."""
         try:
-            key = self._keys.get_signing_key_from_jwt(token).key
+            signing_key = self._signing_key(token)
+            if signing_key is None:
+                return None
+            key = signing_key.key
             return dict(
                 self._jwt.decode(
                     token,
@@ -169,3 +202,27 @@ class JwksTokenVerifier:
             # into a log (AGENTS.md: sensitive exception text stays out of
             # logs and artifacts).
             return None
+
+    def _signing_key(self, token: str) -> Any | None:
+        """The published key this token names, or None.
+
+        The same lookup PyJWT's `get_signing_key_from_jwt` performs — cached
+        set first, refetch on a miss — except that the refetch is rate-bounded
+        and shared: under the lock, only the first miss per interval fetches,
+        and the rest read whatever it brought back. The stamp is taken before
+        the fetch so that a slow or failing issuer counts against the interval
+        too, rather than inviting a retry storm while it is down.
+        """
+        kid = self._jwt.get_unverified_header(token).get("kid")
+        key = self._keys.match_kid(self._keys.get_signing_keys(), kid)
+        if key is not None:
+            return key
+        with self._refresh_lock:
+            now = monotonic()
+            last = self._last_refresh_at
+            if last is None or now - last >= _JWKS_REFRESH_MIN_INTERVAL_SECONDS:
+                self._last_refresh_at = now
+                keys = self._keys.get_signing_keys(refresh=True)
+            else:
+                keys = self._keys.get_signing_keys()
+        return self._keys.match_kid(keys, kid)

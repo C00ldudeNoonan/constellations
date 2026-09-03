@@ -29,13 +29,18 @@ stel mcp serve --transport streamable-http   --jwt-issuer https://issuer.example
   JWT flags together are refused: the headers would decide, and the token
   checking would be decoration. A token resolver with no verifier, or a
   verifier with a header resolver, is refused at startup for the same reason.
+- **Key fetches are bounded.** An unknown key id refetches the JWKS at most
+  once a minute, concurrent misses share that fetch, each fetch times out in
+  five seconds, and verification runs off the event loop — because the refetch
+  is the one network call an unauthenticated caller can provoke before any
+  rate limit applies. The JWT flags are refused on `--transport stdio`, where
+  they would be accepted and verify nothing.
 - `pyjwt[crypto]` joins the `mcp` extra. It was already present transitively;
   a feature that authenticates callers must not depend on someone else's
   dependency graph.
 
-Still open from #392: per-tenant warehouse credentials (#395) and per-principal
-rate limiting — `--max-requests-per-minute` remains one global cap, so on a
-shared deployment one caller can still starve the rest.
+Still open from #392: per-tenant warehouse credentials (#395). Per-principal
+rate limiting shipped alongside this as #463.
 
 ### Per-principal rate limiting on the MCP server (issue #463)
 

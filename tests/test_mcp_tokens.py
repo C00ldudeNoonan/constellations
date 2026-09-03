@@ -12,11 +12,13 @@ part that is dangerous.
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
 import pytest
 
+from stel.mcp_server import tokens as tokens_module
 from stel.mcp_server.tokens import (
     ALLOWED_ALGORITHMS,
     JwksTokenVerifier,
@@ -42,24 +44,34 @@ def _config(**overrides: Any) -> JwtVerifierConfig:
     )
 
 
-def _verifier(rsa_key: Any, monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Any:
-    """A verifier whose key lookup returns `rsa_key`'s public half.
-
-    Only the network fetch is stubbed. Signature, issuer, audience, expiry and
-    algorithm checks all run for real.
-    """
-    verifier = JwksTokenVerifier(_config(**overrides))
+def _published_key(rsa_key: Any, kid: str | None = None) -> Any:
+    """What one entry of the issuer's JWKS looks like to the verifier."""
 
     class _Key:
         key = rsa_key.public_key()
+        key_id = kid
 
+    return _Key()
+
+
+def _verifier(rsa_key: Any, monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Any:
+    """A verifier whose published key set is `rsa_key`'s public half.
+
+    Only the network fetch is stubbed — at the key *set*, so the verifier's own
+    lookup by key id runs. Signature, issuer, audience, expiry and algorithm
+    checks all run for real.
+    """
+    verifier = JwksTokenVerifier(_config(**overrides))
+    published = [_published_key(rsa_key)]
     monkeypatch.setattr(
-        verifier._keys, "get_signing_key_from_jwt", lambda _token: _Key()
+        verifier._keys, "get_signing_keys", lambda refresh=False: published
     )
     return verifier
 
 
-def _token(rsa_key: Any, *, algorithm: str = "RS256", **claims: Any) -> str:
+def _token(
+    rsa_key: Any, *, algorithm: str = "RS256", kid: str | None = None, **claims: Any
+) -> str:
     import jwt
 
     payload = {
@@ -70,7 +82,8 @@ def _token(rsa_key: Any, *, algorithm: str = "RS256", **claims: Any) -> str:
         **claims,
     }
     key: Any = rsa_key if algorithm.startswith(("RS", "ES", "PS")) else "secret"
-    return jwt.encode(payload, key, algorithm=algorithm)
+    headers = {"kid": kid} if kid is not None else None
+    return jwt.encode(payload, key, algorithm=algorithm, headers=headers)
 
 
 async def _verify(verifier: Any, token: str) -> Any:
@@ -223,6 +236,99 @@ def test_no_verified_token_resolves_to_no_principal(
     assert AccessTokenPrincipalResolver().resolve() is None
 
 
+# ─── key fetches are bounded, because they sit on the unauthenticated path ──
+
+
+def _recording_key_set(
+    verifier: Any, monkeypatch: pytest.MonkeyPatch, *, on_refresh: list[Any]
+) -> list[bool]:
+    """Stub the JWKS so each call's `refresh` flag is recorded; a refresh
+    returns `on_refresh`, a cache read returns nothing."""
+    calls: list[bool] = []
+
+    def get_signing_keys(refresh: bool = False) -> list[Any]:
+        calls.append(refresh)
+        return on_refresh if refresh else []
+
+    monkeypatch.setattr(verifier._keys, "get_signing_keys", get_signing_keys)
+    return calls
+
+
+@pytest.mark.anyio
+async def test_unknown_key_ids_refresh_the_jwks_at_most_once_per_interval(
+    rsa_key: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attack: syntactically valid tokens with invented key ids, each of
+    which would otherwise cost the issuer a fetch and this server a blocked
+    worker — before any rate limit applies. Five probes, one fetch."""
+    verifier = JwksTokenVerifier(_config())
+    calls = _recording_key_set(verifier, monkeypatch, on_refresh=[])
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(tokens_module, "monotonic", lambda: clock["now"])
+
+    for i in range(5):
+        assert await _verify(verifier, _token(rsa_key, kid=f"probe-{i}")) is None
+    assert calls.count(True) == 1
+
+    clock["now"] += tokens_module._JWKS_REFRESH_MIN_INTERVAL_SECONDS + 1
+    assert await _verify(verifier, _token(rsa_key, kid="probe-later")) is None
+    assert calls.count(True) == 2, "the interval lapsing permits exactly one more"
+
+
+@pytest.mark.anyio
+async def test_a_rotated_key_is_found_by_the_one_refresh(
+    rsa_key: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legitimate case the refetch exists for: the issuer rotated, the
+    cached set is stale, and the token still verifies without a restart."""
+    verifier = JwksTokenVerifier(_config())
+    calls = _recording_key_set(
+        verifier, monkeypatch, on_refresh=[_published_key(rsa_key, kid="rotated")]
+    )
+    token = await _verify(verifier, _token(rsa_key, kid="rotated"))
+    assert token is not None and token.subject == "svc-analytics"
+    assert calls.count(True) == 1
+
+
+@pytest.mark.anyio
+async def test_a_slow_or_failing_issuer_still_counts_against_the_interval(
+    rsa_key: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stamp is taken before the fetch, so an issuer that is down does not
+    invite a retry storm from every probe while it is down."""
+    verifier = JwksTokenVerifier(_config())
+    calls: list[bool] = []
+
+    def failing(refresh: bool = False) -> list[Any]:
+        calls.append(refresh)
+        if refresh:
+            raise OSError("issuer unreachable")
+        return []
+
+    monkeypatch.setattr(verifier._keys, "get_signing_keys", failing)
+    for i in range(3):
+        assert await _verify(verifier, _token(rsa_key, kid=f"probe-{i}")) is None
+    assert calls.count(True) == 1
+
+
+@pytest.mark.anyio
+async def test_verification_runs_off_the_event_loop(
+    rsa_key: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A signature check is CPU and a cache miss is a network fetch; neither
+    may run on the loop thread, where it would stall every other request."""
+    verifier = JwksTokenVerifier(_config())
+    seen: list[int] = []
+
+    def get_signing_keys(refresh: bool = False) -> list[Any]:
+        seen.append(threading.get_ident())
+        return [_published_key(rsa_key)]
+
+    monkeypatch.setattr(verifier._keys, "get_signing_keys", get_signing_keys)
+    assert await _verify(verifier, _token(rsa_key)) is not None
+    assert seen and all(ident != threading.get_ident() for ident in seen)
+
+
 # ─── the transport refuses a half-configured identity plane ────────────────
 
 
@@ -313,6 +419,15 @@ def test_cli_still_refuses_a_network_transport_with_no_identity(tmp_path: Any) -
     assert result.exit_code != 0
     assert "--jwt-issuer" in result.output
     assert "--trust-proxy-principal-headers" in result.output
+
+
+def test_cli_refuses_jwt_flags_on_stdio(tmp_path: Any) -> None:
+    """Accepted-and-ignored would look like authentication from the outside;
+    the proxy flag is already refused on stdio for the same reason."""
+    result = _serve(["--jwt-issuer", ISSUER], tmp_path)
+    assert result.exit_code != 0
+    assert "network transport" in result.output
+    assert "verify nothing" in result.output
 
 
 def test_cli_refuses_a_plaintext_jwks_uri(tmp_path: Any) -> None:

@@ -159,6 +159,16 @@ signature" from "wrong audience" would be a probing oracle:
 | `exp` and `nbf`, with 30s leeway | expiry is the only revocation this scheme has |
 | a non-empty `sub` | grants are keyed by subject; a subjectless token could never be authorized |
 
+**Key fetches are bounded.** A token naming a key id the cached JWKS lacks
+triggers a refetch — that is how a key rotation works without a restart, and it
+is also the one network call an unauthenticated caller can provoke before any
+rate limit applies. So the refetch happens at most once a minute, concurrent
+misses share it, each fetch times out after five seconds, and verification runs
+off the event loop. A token signed with a key rotated in *during* that minute,
+after someone's probe, is refused until the minute lapses — never accepted
+wrongly. The JWT flags are refused on `--transport stdio`, where they would be
+accepted and verify nothing.
+
 **A token establishes identity, never authorization.** Only the subject is
 taken from it. With [operator-owned grants](#operator-owned-grants), groups and
 tenants are looked up by that subject — so a token that *claims* a tenant or a

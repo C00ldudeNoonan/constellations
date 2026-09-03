@@ -248,9 +248,38 @@ one refused a caller would otherwise be ambiguous — and with
 `--trust-proxy-principal-headers`, and are refused on `--transport stdio` for
 the same reason the JWT flags are.
 
-What this does not yet do: the MCP authorization spec's metadata endpoints for
-clients that discover the issuer themselves, rather than being configured with
-it out of band. That composes with either verifier rather than replacing it.
+### Discovery: letting clients find the authorization server
+
+Either verifier also needs `--public-url`, this deployment's externally
+reachable URL:
+
+```bash
+stel mcp serve --transport streamable-http \
+  --public-url https://stel.example/mcp \
+  --jwt-issuer https://issuer.example …
+```
+
+It cannot be derived from `--host`/`--port`, which are what the process binds
+behind a proxy rather than what a caller reaches. With it, the server publishes
+**OAuth 2.0 protected resource metadata** (RFC 9728) at
+`/.well-known/oauth-protected-resource/mcp`:
+
+```json
+{
+  "resource": "https://stel.example/mcp",
+  "authorization_servers": ["https://issuer.example/"],
+  "bearer_methods_supported": ["header"]
+}
+```
+
+and names that document in the `WWW-Authenticate` challenge it returns to an
+unauthenticated caller. A spec-compliant client handed nothing but this
+server's URL can then find out who issues tokens for it, instead of every
+connecting team being told the issuer out of band.
+
+stel is a **resource server**, not an authorization server: it validates tokens
+somebody else issued and does not issue, refresh, or revoke any. The metadata
+says exactly that and no more.
 
 ## Operator-owned grants
 

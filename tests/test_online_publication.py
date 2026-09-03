@@ -11,7 +11,11 @@ import pytest
 from stel.adapters import create_adapter
 from stel.cli_services.serving import resolve_serving_scope
 from stel.retrieval import LanceDBStore, RetrievalError, ServingCoordinator
-from stel.retrieval.coordination import ServingBusyError, StaleServingLeaseError
+from stel.retrieval.coordination import (
+    ServingBusyError,
+    ServingNotReadyError,
+    StaleServingLeaseError,
+)
 from stel.retrieval.retention import retire_superseded_generations
 from stel.runner import RunError, run_project
 from tests.test_retrieval import (
@@ -355,3 +359,38 @@ def test_in_place_publish_still_refuses_active_readers(tmp_path: Path) -> None:
         coordinator.release_query(reader)
         with pytest.raises(StaleServingLeaseError):
             coordinator.validate_query(replace(reader, lease_id="not-held"))
+
+
+def test_online_publish_recovers_a_scope_left_failed_with_no_generation(tmp_path: Path) -> None:
+    """The state #473's reporter is actually in: an in-place publish was killed,
+    `stel serving recover --owner-terminated` ran, and the ledger is `failed`
+    with no active generation. The next `online` run must build a private
+    generation from the warehouse and activate it, with nothing to retain."""
+    scope, resolved = _prepare(tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        coordinator = ServingCoordinator(adapter)
+        before = coordinator.status(scope)
+        assert before.config_fingerprint is not None
+        # A stranded in-place publisher: the claim clears the pointer, then dies.
+        coordinator.acquire_publish(
+            scope, expected_code_version="dead", config_fingerprint=before.config_fingerprint
+        )
+        stranded = coordinator.recover(scope, owner_terminated=True)
+        assert stranded.status == "failed"
+        assert stranded.active_generation is None
+        with pytest.raises(ServingNotReadyError):
+            coordinator.acquire_query(scope)
+
+    [result] = run_project(tmp_path, select="context_search")
+    assert result.rows_written == 2
+
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        coordinator = ServingCoordinator(adapter)
+        after = coordinator.status(scope)
+        assert after.status == "ready"
+        assert after.active_generation is not None
+        assert after.active_collection is not None and "__g" in after.active_collection
+        assert after.config_fingerprint != before.config_fingerprint
+        reader = coordinator.acquire_query(scope)
+        coordinator.validate_query(reader)
+        coordinator.release_query(reader)

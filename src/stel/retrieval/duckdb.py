@@ -189,7 +189,7 @@ class DuckDBStore(RetrievalStore):
         project_name: str,
         target_name: str,
         alias: str,
-        role: StoreRole = StoreRole.INSPECT,
+        role: StoreRole,
     ) -> None:
         if not isinstance(config, DuckDBConfig):
             raise RetrievalError("DuckDB store received incompatible configuration")

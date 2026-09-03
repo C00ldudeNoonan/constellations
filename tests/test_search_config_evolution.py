@@ -31,6 +31,7 @@ from stel.retrieval import (
     CollectionMetadata,
     CollectionSpec,
     IndexedRow,
+    StoreRole,
     classify_changes,
     classify_descriptor_changes,
     collection_config_fingerprint,
@@ -318,7 +319,13 @@ def _real_spec(tmp_path: Path, **overrides: Any) -> tuple[Any, CollectionSpec]:
     from stel.retrieval.lancedb import LanceDBStore
 
     config = parse_store_config({"type": "lancedb", "path": str(tmp_path / "lance")})
-    store = LanceDBStore(config, project_name="demo", target_name="dev", alias="primary")
+    store = LanceDBStore(
+        config,
+        project_name="demo",
+        target_name="dev",
+        alias="primary",
+        role=StoreRole.PUBLISH,
+    )
     spec = _spec(**overrides)
     schema = pa.schema(
         [pa.field("chunk_id", pa.string()), pa.field("text", pa.string())]

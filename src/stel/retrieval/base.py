@@ -372,6 +372,11 @@ class StoreRole(StrEnum):
 
     The role is what a *default* is chosen from; it is not a permission. An
     explicit setting in the profile wins in every role.
+
+    Required of every caller rather than defaulted, deliberately: the right
+    value depends on what the caller is about to do, so a default would hand a
+    publisher or a query process the wrong budget silently — cache churn with
+    nothing saying why (Codex review, #479). A new caller has to choose.
     """
 
     PUBLISH = "publish"
@@ -387,15 +392,12 @@ class RetrievalStore(ABC):
         project_name: str,
         target_name: str,
         alias: str,
-        role: StoreRole = StoreRole.INSPECT,
+        role: StoreRole,
     ) -> None:
         self.config = config
         self.project_name = project_name
         self.target_name = target_name
         self.alias = alias
-        # Defaults to the cheapest role: a caller that has not thought about
-        # this is doing metadata work, and the cost of being wrong that way is
-        # a cache miss rather than a container kill.
         self.role = role
 
     @classmethod

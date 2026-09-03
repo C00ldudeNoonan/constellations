@@ -18,6 +18,7 @@ from stel.retrieval import (
     ServingCoordinator,
     ServingNotReadyError,
     StaleServingLeaseError,
+    StoreRole,
 )
 from stel.retrieval.coordination import (
     RECOVERY_ERROR_CODE,
@@ -426,10 +427,12 @@ def test_lancedb_publisher_lock_excludes_second_publisher(tmp_path: Path) -> Non
 
     config = parse_store_config({"type": "lancedb", "path": str(tmp_path / "lance")})
     store = LanceDBStore(
-        config, project_name="demo", target_name="dev", alias="primary"
+        config, project_name="demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     )
     other = LanceDBStore(
-        config, project_name="demo", target_name="dev", alias="primary"
+        config, project_name="demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store.publisher_fence("demo__dev__context"):
         with pytest.raises(RetrievalError, match="publisher_lock_held"):
@@ -445,7 +448,8 @@ def test_lancedb_publisher_locks_are_per_collection(tmp_path: Path) -> None:
 
     config = parse_store_config({"type": "lancedb", "path": str(tmp_path / "lance")})
     store = LanceDBStore(
-        config, project_name="demo", target_name="dev", alias="primary"
+        config, project_name="demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store.publisher_fence("demo__dev__alpha"), store.publisher_fence(
         "demo__dev__beta"
@@ -593,6 +597,7 @@ def _serving_scope(project: Path, model_name: str = "release_search") -> StateSc
         project_name=project_config.name,
         target_name=resolved.target_name,
         alias=alias,
+        role=StoreRole.PUBLISH,
     )
     logical = model.search.collection or model.name
     return StateScope.for_target_descriptor(

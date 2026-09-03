@@ -17,7 +17,7 @@ import pytest
 
 from stel.credentials import CredentialReference
 from stel.hashing import canonical_fingerprint
-from stel.retrieval import LanceDBStore, RetrievalError, parse_store_config
+from stel.retrieval import LanceDBStore, RetrievalError, StoreRole, parse_store_config
 from stel.retrieval.lancedb import LanceDBConfig
 
 
@@ -29,7 +29,8 @@ def _config(path: str, **extra: object) -> LanceDBConfig:
 
 def _store(config: LanceDBConfig) -> LanceDBStore:
     return LanceDBStore(
-        config, project_name="demo", target_name="dev", alias="primary"
+        config, project_name="demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     )
 
 

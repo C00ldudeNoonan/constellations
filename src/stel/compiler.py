@@ -38,6 +38,7 @@ from .retrieval import (
     PUBLISHER_FENCING_FEATURES,
     RetrievalCapabilityError,
     RetrievalFeature,
+    StoreRole,
     create_store,
     store_class,
 )
@@ -476,6 +477,8 @@ def validate_retrieval_capabilities(
             project_name=project.name,
             target_name=resolved.target_name,
             alias=alias,
+            # Validation only: capabilities and refusals, no data access.
+            role=StoreRole.INSPECT,
         )
         # Asked of the constructed store, not of its capability set: some
         # refusals depend on the resolved store config rather than the store

@@ -27,7 +27,12 @@ from .profile import (
     apply_source_path_overrides,
     resolve_profile,
 )
-from .retrieval import collection_config_fingerprint, create_store, store_class
+from .retrieval import (
+    StoreRole,
+    collection_config_fingerprint,
+    create_store,
+    store_class,
+)
 from .versioning import (
     compute_model_code_version,
     describe_model_embedding,
@@ -417,6 +422,8 @@ def _build_manifest_v2(
                 project_name=project.name,
                 target_name=resolved.target_name,
                 alias=alias,
+                # Descriptors for the manifest; nothing is read or written.
+                role=StoreRole.INSPECT,
             )
             safe = store.safe_descriptor()
             retrieval_targets.append(
@@ -519,6 +526,7 @@ def _model_dict_v2(
         project_name=project.name,
         target_name=resolved.target_name,
         alias=alias,
+        role=StoreRole.INSPECT,
     )
     logical = search.collection or model.name
     state_target = store.state_descriptor(logical)

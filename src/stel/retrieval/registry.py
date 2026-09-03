@@ -51,7 +51,7 @@ def create_store(
     project_name: str,
     target_name: str,
     alias: str,
-    role: StoreRole = StoreRole.INSPECT,
+    role: StoreRole,
 ) -> RetrievalStore:
     cls = _REGISTRY.get(config.type)
     if cls is None:

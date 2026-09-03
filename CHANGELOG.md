@@ -71,9 +71,11 @@ things and both reach it through `create_store`:
   on the index staying resident, and this is not the change that trades that
   away.
 - **inspecting** — compile, manifest, `stel serving` — takes 32 MB / 16 MB and
-  never touches an index. It is also the default for any caller that has not
-  said otherwise, because being wrong that way costs a cache miss rather than a
-  container.
+  never touches an index.
+
+The role is **required** of every caller rather than defaulted: the right value
+depends on what the caller is about to do, so a default would hand a publisher
+or a query process the wrong budget silently, with nothing saying why.
 
 New `index_cache_size_mb` / `metadata_cache_size_mb` on the LanceDB store block
 override the role default, and win in every role — including serving, which is

@@ -79,14 +79,18 @@ def test_serving_keeps_lancedbs_own_defaults() -> None:
     assert session_cache_budget(_config(), StoreRole.SERVE) is None
 
 
-def test_the_default_role_is_the_cheapest_one() -> None:
-    """A caller that has not thought about this is doing metadata work. Being
-    wrong that way costs a cache miss; the other way costs a container."""
-    store = LanceDBStore(
-        _config(), project_name="proj", target_name="dev", alias="default"
-    )
+def test_a_caller_must_choose_a_role() -> None:
+    """No default, deliberately (Codex review, #479).
 
-    assert store.role is StoreRole.INSPECT
+    The right budget depends on what the caller is about to do, so a default
+    would hand a publisher or a query process the wrong one silently — cache
+    churn with nothing saying why. A new caller has to choose, and gets a
+    TypeError rather than a plausible-looking wrong answer.
+    """
+    with pytest.raises(TypeError, match="role"):
+        LanceDBStore(  # ty: ignore[missing-argument]
+            _config(), project_name="proj", target_name="dev", alias="default"
+        )
 
 
 # ─── the profile wins ───────────────────────────────────────────────────────

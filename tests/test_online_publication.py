@@ -10,7 +10,7 @@ import pytest
 
 from stel.adapters import create_adapter
 from stel.cli_services.serving import resolve_serving_scope
-from stel.retrieval import LanceDBStore, RetrievalError, ServingCoordinator
+from stel.retrieval import LanceDBStore, RetrievalError, ServingCoordinator, StoreRole
 from stel.retrieval.coordination import (
     ServingBusyError,
     ServingNotReadyError,
@@ -228,6 +228,7 @@ def test_retirement_waits_for_readers_of_superseded_generations(tmp_path: Path) 
         store = LanceDBStore(
             resolved.retrieval.stores["primary"],
             project_name="retrieval_demo", target_name="dev", alias="primary",
+            role=StoreRole.PUBLISH,
         )
         claim = coordinator.acquire_publish(
             scope, expected_code_version="test", config_fingerprint=current.config_fingerprint,
@@ -259,6 +260,7 @@ def test_online_change_includes_concurrent_warehouse_row_changes(tmp_path: Path)
     with LanceDBStore(
         resolved.retrieval.stores["primary"],
         project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     ) as store:
         hits = store.text_search(entry.active_collection, "inflation", text_field="text", limit=2)
     assert hits.column("title").to_pylist() == ["new title"]
@@ -276,6 +278,7 @@ def test_online_can_replace_with_an_empty_snapshot(tmp_path: Path) -> None:
     with LanceDBStore(
         resolved.retrieval.stores["primary"],
         project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     ) as store:
         metadata = store.inspect_collection(entry.active_collection)
         assert metadata is not None and metadata.row_count == 0
@@ -307,6 +310,7 @@ def test_strategy_can_switch_back_to_exact_without_mutating_ann_generation(
         with LanceDBStore(
             resolved.retrieval.stores["primary"],
             project_name="retrieval_demo", target_name="dev", alias="primary",
+            role=StoreRole.PUBLISH,
         ) as store:
             old_metadata = store.inspect_collection(old.active_collection)
             new_metadata = store.inspect_collection(current.active_collection)
@@ -338,6 +342,7 @@ def test_online_widens_attributes_in_a_private_generation(tmp_path: Path) -> Non
     with LanceDBStore(
         resolved.retrieval.stores["primary"],
         project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
     ) as store:
         original = store.inspect_collection(store.physical_collection("context"))
         updated = store.inspect_collection(entry.active_collection)
@@ -433,6 +438,7 @@ def test_online_index_type_switch_builds_the_declared_type_privately(tmp_path: P
         with LanceDBStore(
             resolved.retrieval.stores["primary"],
             project_name="retrieval_demo", target_name="dev", alias="primary",
+            role=StoreRole.PUBLISH,
         ) as store:
             assert _types(store, old.active_collection) == ["IvfHnswFlat"]
             assert _types(store, current.active_collection) == ["IvfHnswSq"]

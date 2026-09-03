@@ -12,6 +12,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from stel.retrieval import StoreRole
 from stel.retrieval.base import (
     CollectionSpec,
     IndexedRow,
@@ -101,7 +102,8 @@ def _rows() -> list[IndexedRow]:
 def store(tmp_path: Path) -> DuckDBStore:
     config = DuckDBConfig(path=str(tmp_path / "store.duckdb"))
     return DuckDBStore(
-        config, project_name="proj", target_name="dev", alias="default"
+        config, project_name="proj", target_name="dev", alias="default",
+        role=StoreRole.PUBLISH,
     )
 
 
@@ -326,7 +328,8 @@ def test_approximate_index_builds_when_the_opt_in_is_given(tmp_path: Path) -> No
         path=str(tmp_path / "hnsw.duckdb"), hnsw_experimental_persistence=True
     )
     opted_in = DuckDBStore(
-        config, project_name="proj", target_name="dev", alias="default"
+        config, project_name="proj", target_name="dev", alias="default",
+        role=StoreRole.PUBLISH,
     )
     with opted_in:
         _populate(opted_in, vector_search="approximate")
@@ -347,7 +350,8 @@ def test_switching_back_to_exact_takes_the_index_away(tmp_path: Path) -> None:
         path=str(tmp_path / "hnsw.duckdb"), hnsw_experimental_persistence=True
     )
     opted_in = DuckDBStore(
-        config, project_name="proj", target_name="dev", alias="default"
+        config, project_name="proj", target_name="dev", alias="default",
+        role=StoreRole.PUBLISH,
     )
     with opted_in:
         name = _populate(opted_in, vector_search="approximate")
@@ -390,6 +394,7 @@ def test_closing_the_store_leaves_a_shared_warehouse_file_usable(
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     with store:
         _populate(store)
@@ -446,6 +451,7 @@ def test_a_database_held_by_another_process_is_a_distinct_error(
             project_name="proj",
             target_name="dev",
             alias="default",
+            role=StoreRole.PUBLISH,
         )
 
         with pytest.raises(RetrievalError, match="duckdb_database_locked"):
@@ -464,6 +470,7 @@ def test_error_text_never_carries_the_database_path(tmp_path: Path) -> None:
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     with store:
         name = _populate(store)
@@ -536,6 +543,7 @@ def test_bm25_scores_only_the_requested_field(tmp_path: Path) -> None:
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     with store:
         name = store.physical_collection("ctx")
@@ -595,6 +603,7 @@ def test_lock_directory_does_not_move_when_the_parent_appears(
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
 
     before = store._lock_dir()
@@ -612,12 +621,14 @@ def test_two_publishers_contend_even_on_a_fresh_directory(tmp_path: Path) -> Non
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     second = DuckDBStore(
         DuckDBConfig(path=str(database)),
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     with first, second:
         collection = first.physical_collection("ctx")
@@ -648,6 +659,7 @@ def test_configured_hnsw_search_effort_reaches_the_connection(
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     with store:
         row = store._connection().execute(
@@ -692,6 +704,7 @@ def test_preflight_accepts_what_the_store_can_actually_build(
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
     assert (
         opted_in.index_config_refusal(vector_search="approximate", vector_index="ivf_hnsw_flat")
@@ -732,6 +745,7 @@ def test_preflight_refuses_index_types_vss_cannot_build(
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
 
     refusal = opted_in.index_config_refusal(

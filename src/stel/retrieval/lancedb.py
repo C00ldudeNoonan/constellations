@@ -333,7 +333,7 @@ class LanceDBStore(RetrievalStore):
         project_name: str,
         target_name: str,
         alias: str,
-        role: StoreRole = StoreRole.INSPECT,
+        role: StoreRole,
     ) -> None:
         if not isinstance(config, LanceDBConfig):
             raise RetrievalError("LanceDB store received incompatible configuration")

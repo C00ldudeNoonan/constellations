@@ -9,6 +9,8 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -1219,6 +1221,58 @@ def test_classification_heartbeat_fires_within_a_long_scan(
     assert "2 processed" in heartbeats[0]
 
 
+def test_a_heartbeat_fires_while_the_snapshot_read_is_still_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex review (#469 P2): opening a snapshot, or one slow warehouse batch
+    fetch, blocks the reading thread before any row exists to check the
+    per-row heartbeat against — BigQuery's synchronous wait on its query
+    destination is exactly this shape. A background watchdog must still fire
+    from elapsed time alone, proven here by asserting it fires *before* a
+    deliberately slow fake read returns."""
+    from stel.execution import transform as transform_module
+
+    monkeypatch.setattr(transform_module, "_HEARTBEAT_ROWS", 10**9)
+    monkeypatch.setattr(transform_module, "_HEARTBEAT_SECONDS", 0.05)
+
+    fired = threading.Event()
+
+    def _watch_log(*args: object, **kwargs: object) -> None:
+        message = args[0]
+        assert isinstance(message, str)
+        if "classifying parent rows" in (message % args[1:] if args[1:] else message):
+            fired.set()
+
+    monkeypatch.setattr(transform_module.log, "info", _watch_log)
+
+    read_returned = threading.Event()
+
+    class _SlowAdapter:
+        @contextlib.contextmanager
+        def table_snapshot(
+            self, table: str, *, batch_size: int = 10_000, predicate: Any = None
+        ) -> Any:
+            time.sleep(0.5)  # simulate a slow warehouse round trip
+            read_returned.set()
+            frame = pl.DataFrame({"document_id": ["a"]}).to_arrow()
+            yield _FakeSnapshot(frame, batch_size)
+
+    worker = threading.Thread(
+        target=lambda: transform_module._stream_parent_digests(
+            cast(Any, _SlowAdapter()), "documents", "document_id", model_name="m"
+        )
+    )
+    worker.start()
+    try:
+        assert fired.wait(timeout=2.0), "the watchdog never fired"
+        assert not read_returned.is_set(), (
+            "the heartbeat fired only after the blocking read returned, which "
+            "means it was the per-row check, not the watchdog"
+        )
+    finally:
+        worker.join(timeout=5.0)
+
+
 def test_generic_transform_names_each_phase(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1226,7 +1280,9 @@ def test_generic_transform_names_each_phase(
     publish, with no batch boundary to log at — phase lines are the only
     signal it can offer (issue #469)."""
     (tmp_path / "transforms").mkdir()
-    (tmp_path / "transforms" / "word_tokens.py").write_text(_TRANSFORM_SOURCE)
+    (tmp_path / "transforms" / "word_tokens.py").write_text(
+        _TRANSFORM_SOURCE, encoding="utf-8"
+    )
     model = _full_model("word_tokens", "transforms.word_tokens", ["ref('documents')"])
     adapter = _RecordingAdapter(
         {"documents": pl.DataFrame({"document_id": ["docA"], "body": ["alpha beta"]})}

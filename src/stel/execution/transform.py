@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import logging
-from collections.abc import Iterator, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -61,30 +63,65 @@ _HEARTBEAT_SECONDS = 15.0
 
 
 class _Heartbeat:
-    """Tracks whether a periodic progress line has earned its place.
+    """Tracks whether a periodic progress line has earned its place, and can
+    run a background watchdog so one still fires purely from elapsed time
+    while the calling thread is blocked inside a warehouse read (issue #469
+    Codex review): checking only between processed rows misses a slow query
+    or a stalled batch fetch, either of which can hold the thread — with
+    nothing yet to check a heartbeat against — for the run's whole duration.
 
-    Checked once per row: a `monotonic()` call is negligible next to the
-    per-row hashing it sits beside, and only checking at batch boundaries
-    would miss the case a single batch runs long enough to look hung.
+    `update()`/`try_claim()` from the calling thread and the watchdog's own
+    timer share one lock, so whichever notices first claims the heartbeat and
+    the other is a no-op rather than a duplicate log line.
     """
 
     def __init__(self) -> None:
         self._start = monotonic()
         self._at_count = 0
         self._at_time = self._start
+        self._count = 0
+        self._lock = threading.Lock()
 
-    def due(self, count: int) -> bool:
-        return (
-            count - self._at_count >= _HEARTBEAT_ROWS
-            or monotonic() - self._at_time >= _HEARTBEAT_SECONDS
-        )
+    def update(self, count: int) -> None:
+        """Record progress the calling thread has made; no logging here."""
+        with self._lock:
+            self._count = count
 
-    def fire(self, count: int) -> None:
-        self._at_count = count
-        self._at_time = monotonic()
+    def try_claim(self) -> tuple[int, float] | None:
+        """If a heartbeat is due, atomically claims it and returns
+        (count, elapsed) to log. Returns None otherwise, including when
+        another caller (the watchdog, or the row loop) claimed it first."""
+        with self._lock:
+            now = monotonic()
+            if (
+                self._count - self._at_count < _HEARTBEAT_ROWS
+                and now - self._at_time < _HEARTBEAT_SECONDS
+            ):
+                return None
+            self._at_count = self._count
+            self._at_time = now
+            return self._at_count, now - self._start
 
-    def elapsed(self) -> float:
-        return monotonic() - self._start
+    @contextlib.contextmanager
+    def watch(self, log_line: Callable[[int, float], None]) -> Iterator[None]:
+        """Calls `log_line(count, elapsed)` from a background thread whenever
+        a heartbeat is due, covering any stretch where the calling thread is
+        blocked in I/O rather than between rows."""
+        stop = threading.Event()
+
+        def _run() -> None:
+            while not stop.wait(_HEARTBEAT_SECONDS):
+                claimed = self.try_claim()
+                if claimed is not None:
+                    log_line(*claimed)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=_HEARTBEAT_SECONDS)
 
 
 def run_sql_model(
@@ -482,10 +519,12 @@ def _run_incremental_transform(
         return result
 
     if not is_incremental:
-        # This branch is the worst case for silence (issue #469): a first-time
-        # incremental baseline, or a model switching from full to incremental,
-        # reads and transforms every parent in one shot with no batch boundary
-        # to log at. It cannot be split — see the comment at `materialize_full`
+        # `--full-refresh`, or a target that already exists with no
+        # per-parent state (a model switched from `materialization: full`, or
+        # an interrupted first run) — not a plain first run, which classifies
+        # every parent as new and takes the batched path below. This branch
+        # reads and transforms everything in one shot with no batch boundary
+        # to log at, and can't be split — see the comment at `materialize_full`
         # below — so the best available signal is naming each phase as it
         # starts.
         log.info("%s: fetching parent rows for full refresh", model.name)
@@ -841,7 +880,20 @@ def _stream_parent_digests(
     digests: dict[str, list[str]] = {}
     rows_seen = 0
     heartbeat = _Heartbeat()
-    with adapter.table_snapshot(
+
+    def _log_heartbeat(count: int, elapsed: float) -> None:
+        log.info(
+            "%s: classifying parent rows: %d processed (%.1fs elapsed)",
+            model_name,
+            count,
+            elapsed,
+        )
+
+    # The watchdog starts before `table_snapshot()` is even called, since
+    # opening it is itself a blocking warehouse round trip (e.g. BigQuery
+    # waiting on its query destination) with no row yet to check a per-row
+    # heartbeat against.
+    with heartbeat.watch(_log_heartbeat), adapter.table_snapshot(
         table, batch_size=_CLASSIFY_BATCH_ROWS, predicate=list(predicates)
     ) as snapshot:
         for predicate in predicates:
@@ -880,16 +932,14 @@ def _stream_parent_digests(
                 rows_seen += 1
                 # Checked per row, not per batch (issue #469): a single
                 # `_CLASSIFY_BATCH_ROWS` batch of large rows can itself run
-                # long enough to look hung, and a batch boundary alone would
-                # stay silent for the whole thing.
-                if heartbeat.due(rows_seen):
-                    log.info(
-                        "%s: classifying parent rows: %d processed (%.1fs elapsed)",
-                        model_name,
-                        rows_seen,
-                        heartbeat.elapsed(),
-                    )
-                    heartbeat.fire(rows_seen)
+                # long enough to look hung. `update()` keeps the watchdog's
+                # count current; `try_claim()` here catches the common case
+                # (progress between rows) without waiting on the watchdog's
+                # own timer tick.
+                heartbeat.update(rows_seen)
+                claimed = heartbeat.try_claim()
+                if claimed is not None:
+                    _log_heartbeat(*claimed)
     return digests
 
 

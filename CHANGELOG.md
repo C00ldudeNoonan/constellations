@@ -14,13 +14,18 @@ now matches it:
   per flush, and gets a live progress bar under `-v` on a TTY.
 - The classification scan that precedes it — a streamed read of the whole
   parent table — logs a heartbeat every 5,000 rows or 15 seconds, whichever
-  comes first. Time-based matters: a single warehouse batch of large rows can
-  itself run long enough to look hung, so the heartbeat is checked per row,
-  not just at batch boundaries.
-- A full-refresh baseline (a first-time incremental model, or one switched
-  from `materialization: full`) stays one atomic step — batching it would
-  expose a partially built table — but now names its phases as it moves
-  through them: fetching, transforming, publishing.
+  comes first, checked per row rather than at batch boundaries so a single
+  large batch can't outlast it. A background watchdog covers the rest: a
+  slow warehouse query or a stalled batch fetch blocks the reading thread
+  before any row is available to check against, so the heartbeat also fires
+  from elapsed time alone, independent of that thread.
+- A full-refresh baseline — `--full-refresh`, or a target that already exists
+  with no per-parent state (a model switched from `materialization: full`, or
+  an interrupted first run) — stays one atomic step, since batching it would
+  expose a partially built table, but now names its phases as it moves
+  through them: fetching, transforming, publishing. A plain first run with no
+  pre-existing target is unaffected: every parent is new, so it's classified
+  and batched like any other incremental run.
 
 All of this is `-v` / `STEL_VERBOSE=1` output, same as extraction's existing
 progress lines.

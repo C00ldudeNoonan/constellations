@@ -54,9 +54,9 @@ STATUS_UNPUBLISHED = "unpublished"
 # pipeline that has been broken for days is visible in `stel serving status`
 # rather than hidden behind a working endpoint.
 STATUS_DEGRADED = "degraded"
-# The statuses a query may be served from. `degraded` qualifies because the
-# generation it names was never written by the publication that failed.
-SERVABLE_STATUSES = (STATUS_READY, STATUS_DEGRADED)
+# Each status still requires an active generation. Publishing qualifies only
+# for private builds: an in-place claim clears that pointer atomically.
+SERVABLE_STATUSES = (STATUS_READY, STATUS_DEGRADED, STATUS_PUBLISHING)
 
 RECOVERY_ERROR_CODE = "administrative_recovery"
 
@@ -108,6 +108,7 @@ class PublishLease:
     scope: StateScope
     publication_id: str
     fencing_token: int
+    config_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -409,11 +410,12 @@ class ServingCoordinator:
         expected_code_version: str,
         config_fingerprint: str,
         preserves_active_generation: bool = False,
+        expected_fencing_token: int | None = None,
     ) -> PublishLease:
         """Claim exclusive publication authority with a fresh fencing token.
 
         The claim is a conditional update: it succeeds only when no publisher
-        owns the scope and no query lease is active. Publication IDs are
+        owns the scope. In-place writes also require no query leases. IDs are
         random, so a successful claim is proven by reading back our own ID.
 
         `preserves_active_generation` says whether this publish writes
@@ -426,9 +428,9 @@ class ServingCoordinator:
         `failed` and serves nothing, rather than serving a collection it may
         have half-rewritten (issue #449 review).
 
-        Clearing it costs readers nothing: query admission already refuses a
-        scope with a publisher on it, so the generation is unservable from the
-        moment the claim lands either way.
+        Private builds admit readers of the untouched generation, including
+        leases acquired before this claim. Its configuration stays in the
+        ledger until activation; the lease carries the pending configuration.
 
         The default is the fail-closed one. A caller that says nothing gets
         in-place semantics, so forgetting this argument gives up availability
@@ -441,19 +443,32 @@ class ServingCoordinator:
         retain_generation = (
             "" if preserves_active_generation else ", active_generation = NULL"
         )
+        query_guard = (
+            "" if preserves_active_generation else f"""
+                AND NOT EXISTS (
+                    SELECT 1 FROM {leases}
+                    WHERE model_name = ? AND stage = ? AND target_identity = ?
+                )"""
+        )
+        query_params = [] if preserves_active_generation else self._scope_params(scope)
+        planning_guard = "" if expected_fencing_token is None else "AND fencing_token = ?"
+        planning_params = [] if expected_fencing_token is None else [expected_fencing_token]
+        fingerprint_assignment = (
+            "CASE WHEN active_generation IS NOT NULL THEN config_fingerprint ELSE ? END"
+            if preserves_active_generation else "?"
+        )
         self._adapter.execute(
             f"""
             UPDATE {ledger}
             SET publication_id = ?, fencing_token = fencing_token + 1,
-                status = ?, expected_code_version = ?, config_fingerprint = ?,
+                status = ?, expected_code_version = ?,
+                config_fingerprint = {fingerprint_assignment},
                 safe_error_code = NULL, started_at = CURRENT_TIMESTAMP,
                 completed_at = NULL{retain_generation}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM {leases}
-                  WHERE model_name = ? AND stage = ? AND target_identity = ?
-              )
+              {planning_guard}
+              {query_guard}
               AND (
                   SELECT COUNT(*) FROM {ledger}
                   WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -465,7 +480,8 @@ class ServingCoordinator:
                 expected_code_version,
                 config_fingerprint,
                 *self._scope_params(scope),
-                *self._scope_params(scope),
+                *planning_params,
+                *query_params,
                 *self._scope_params(scope),
             ],
         )
@@ -478,6 +494,10 @@ class ServingCoordinator:
                     "Another publisher owns this serving scope; if its process "
                     "is dead, terminate it and run `stel serving recover`"
                 )
+            if expected_fencing_token is not None and int(row[0]) != expected_fencing_token:
+                raise ServingBusyError(
+                    "Serving generation changed while planning publication; retry the run"
+                )
             raise ServingBusyError(
                 "Active query leases block publication for this serving scope"
             )
@@ -485,6 +505,7 @@ class ServingCoordinator:
             scope=scope,
             publication_id=publication_id,
             fencing_token=int(row[0]),
+            config_fingerprint=config_fingerprint,
         )
 
     def verify_publish(self, lease: PublishLease) -> None:
@@ -512,12 +533,8 @@ class ServingCoordinator:
         config_fingerprint: str | None = None,
     ) -> None:
         inserted, updated, skipped, deleted = counts
-        # Restoring a retained generation's own fingerprint is not optional
-        # bookkeeping: the claim overwrote the ledger's with the *new*
-        # configuration, and query admission pins whatever it finds there. A
-        # retained generation left under the claiming configuration's
-        # fingerprint would be handed to a reader as though it answered under
-        # a configuration it was never built for (issue #449 review).
+        # The fingerprint belongs to the generation. Private-build claims
+        # leave the old pair intact; activation replaces both together.
         restore_fingerprint = (
             "" if config_fingerprint is None else ", config_fingerprint = ?"
         )
@@ -582,7 +599,7 @@ class ServingCoordinator:
             raise StaleServingLeaseError(
                 "Serving publication authority was reassigned before activation"
             )
-        if row[4] != config_fingerprint:
+        if lease.config_fingerprint != config_fingerprint:
             raise ServingCoordinationError(
                 "Ready activation does not match the claimed configuration fingerprint"
             )
@@ -593,6 +610,7 @@ class ServingCoordinator:
             active_collection=active_collection,
             safe_error_code=None,
             counts=counts,
+            config_fingerprint=config_fingerprint,
         )
 
     def mark_failed(
@@ -673,10 +691,10 @@ class ServingCoordinator:
     ) -> QueryLease:
         """Acquire a shared lease pinned to the ready generation.
 
-        The lease insert is conditioned on a publisher-free ready ledger at
-        the observed fence; a post-insert verification read closes the race
-        with a publisher claiming in between (the publisher's claim is itself
-        conditioned on no lease rows existing).
+        The insert is conditioned on the observed active generation and fence.
+        Admission rechecks both after insertion, closing a race with cutover
+        before any store I/O. Once admitted, the durable pin survives private
+        builds and cutover; in-place publishers are excluded until it drains.
 
         `legacy_scope` only changes what the failure *says* (issue #413). An
         index published before #355 re-keyed the serving scope keeps its ledger
@@ -691,7 +709,7 @@ class ServingCoordinator:
             raise ServingNotReadyError(
                 "This search index has not been published; run `stel run`"
             )
-        if row[2] is not None:
+        if row[2] is not None and row[5] is None:
             raise ServingBusyError(
                 "A publisher is reconciling this search index; retry after it completes"
             )
@@ -717,7 +735,7 @@ class ServingCoordinator:
             WHERE EXISTS (
                 SELECT 1 FROM {ledger}
                 WHERE model_name = ? AND stage = ? AND target_identity = ?
-                  AND status IN (?, ?) AND publication_id IS NULL
+                  AND status IN (?, ?, ?)
                   AND fencing_token = ? AND active_generation = ?
             )
             """,
@@ -750,21 +768,43 @@ class ServingCoordinator:
                 "A publisher claimed this search index during query admission; retry"
             )
         try:
-            self.validate_query(lease)
+            self.validate_query(lease, require_active=True)
         except ServingCoordinationError:
             self.release_query(lease)
             raise
         return lease
 
-    def validate_query(self, lease: QueryLease) -> None:
-        """Re-verify the pinned generation is still the served, fenced one."""
+    def validate_query(self, lease: QueryLease, *, require_active: bool = False) -> None:
+        """Verify the durable pin, which survives private-generation cutover.
+
+        In-place publishers cannot acquire while any pin exists. Private
+        publishers never mutate pinned collections, and retirement waits for
+        all pins to drain. Recovery deletes pins, fencing out zombie readers.
+        """
         row = self._read_row(lease.scope)
+        held = self._adapter.rows(
+            f"""SELECT 1 FROM {self._ref(LEASE_TABLE)}
+                WHERE model_name = ? AND stage = ? AND target_identity = ?
+                  AND lease_id = ? AND fencing_token = ?
+                  AND pinned_generation = ? AND config_fingerprint = ?""",
+            [
+                *self._scope_params(lease.scope),
+                lease.lease_id,
+                lease.fencing_token,
+                lease.pinned_generation,
+                lease.config_fingerprint,
+            ],
+        )
         if (
             row is None
-            or int(row[0]) != lease.fencing_token
+            or not held
+            or int(row[0]) < lease.fencing_token
             or row[1] not in SERVABLE_STATUSES
-            or row[2] is not None
-            or row[5] != lease.pinned_generation
+            or row[5] is None
+            or (
+                require_active
+                and (int(row[0]) != lease.fencing_token or row[5] != lease.pinned_generation)
+            )
         ):
             raise StaleServingLeaseError(
                 "The pinned search-index generation is no longer active; retry the query"

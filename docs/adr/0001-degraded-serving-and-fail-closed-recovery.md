@@ -1,6 +1,6 @@
 # ADR-0001: A failed publish keeps serving its live generation; recovery fails closed
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0003](0003-reader-safe-online-publication.md)
 - **Date:** 2026-09-02
 - **Prompted by:** #449 (the outage), #450 (the change)
 

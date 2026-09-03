@@ -1351,11 +1351,10 @@ def test_rebuild_policy_replaces_the_index_on_an_incompatible_change(
     assert entry.active_collection is not None and "__g" in entry.active_collection
 
 
-def test_online_policy_compiles_against_a_store_that_advertises_evolution(
+def test_online_policy_compiles_against_a_store_that_builds_private_generations(
     tmp_path: Path,
 ) -> None:
-    """LanceDB can widen a live collection in place, so `online` is a policy it
-    can actually honor — unlike `rebuild`."""
+    """Online updates require an independent generation, not live mutation."""
     _write_project(tmp_path)
     _set_index_change_policy(tmp_path, "online")
     project, sources, models = load_project(tmp_path)
@@ -1365,11 +1364,10 @@ def test_online_policy_compiles_against_a_store_that_advertises_evolution(
     validate_retrieval_capabilities(models, project, resolved)
 
 
-def test_online_policy_is_refused_when_the_store_cannot_evolve(
+def test_online_policy_is_refused_when_the_store_cannot_build_private_generations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The capability is the gate, not the mode name. A store that cannot widen
-    in place must not be handed an `online` policy to honor."""
+    """Reject unsupported publication guarantees before store mutation."""
     from stel.retrieval.base import RetrievalFeature
     from stel.retrieval.lancedb import LanceDBStore
 
@@ -1383,12 +1381,12 @@ def test_online_policy_is_refused_when_the_store_cannot_evolve(
     reduced = replace(
         full,
         features=frozenset(
-            f for f in full.features if f is not RetrievalFeature.ONLINE_SCHEMA_EVOLUTION
+            f for f in full.features if f is not RetrievalFeature.PRIVATE_GENERATION_BUILD
         ),
     )
     monkeypatch.setattr(LanceDBStore, "capabilities", classmethod(lambda cls: reduced))
 
-    with pytest.raises(Exception, match="online_schema_evolution"):
+    with pytest.raises(Exception, match="private_generation_build"):
         validate_retrieval_capabilities(models, project, resolved)
 
 

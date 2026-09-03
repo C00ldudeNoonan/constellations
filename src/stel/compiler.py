@@ -425,8 +425,8 @@ def validate_retrieval_capabilities(
             RetrievalFeature.INDEX_READINESS: "post-publication index validation",
         }
         if search.on_index_change == "online":
-            required[RetrievalFeature.ONLINE_SCHEMA_EVOLUTION] = (
-                "in-place widening for `on_index_change: online`"
+            required[RetrievalFeature.PRIVATE_GENERATION_BUILD] = (
+                "safe generation replacement for `on_index_change: online`"
             )
         if search.vector is not None:
             required[

@@ -442,10 +442,8 @@ def _schema_with(*names: str) -> Any:
     return pa.schema([pa.field(name, pa.string()) for name in names])
 
 
-def test_online_widens_a_compatible_change_instead_of_refusing_it() -> None:
-    """The point of the mode: adding a filterable attribute to a live index
-    must not cost a rebuild, and the vectors are untouched, so it costs no
-    provider calls either."""
+def test_online_gate_refuses_to_widen_the_live_collection() -> None:
+    """The planner must choose a private generation before this gate."""
     stored = _spec()
     widened = replace(
         _spec(
@@ -462,8 +460,9 @@ def test_online_widens_a_compatible_change_instead_of_refusing_it() -> None:
     )
     existing = replace(existing, schema=_schema_with("chunk_id", "text"))
 
-    assert _verify_collection_config(store, existing, widened, policy="online") is True
-    assert store.evolved == [(widened.descriptor, ["section"])]
+    with pytest.raises(RunError, match="private generation"):
+        _verify_collection_config(store, existing, widened, policy="online")
+    assert store.evolved == []
 
 
 def test_online_still_refuses_a_rebuild_change() -> None:
@@ -650,11 +649,8 @@ def test_adding_a_vector_to_a_collection_without_one_requires_a_rebuild() -> Non
     assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
 
 
-def test_online_applies_a_strategy_switch_in_place() -> None:
-    """End to end through the executor's gate: under `online` the collection is
-    evolved with no added columns — there is nothing to widen — and re-stamped,
-    so the publish proceeds against the same collection and `ensure_indexes`
-    builds the ANN index."""
+def test_online_gate_refuses_to_restamp_the_live_strategy() -> None:
+    """A strategy change must not publish its new stamp before index readiness."""
     import pyarrow as pa
 
     schema = pa.schema([pa.field("chunk_id", pa.string())])
@@ -669,10 +665,10 @@ def test_online_applies_a_strategy_switch_in_place() -> None:
         schema=schema,
     )
 
-    evolved = _verify_collection_config(store, existing, spec, policy="online")
-
-    assert evolved is True
-    assert store.evolved == [(spec.descriptor, [])]
+    with pytest.raises(RunError, match="private generation"):
+        _verify_collection_config(store, existing, spec, policy="online")
+    assert store.evolved == []
+    assert store.restamped == []
 
 
 def test_fail_names_the_strategy_switch_and_points_at_online() -> None:

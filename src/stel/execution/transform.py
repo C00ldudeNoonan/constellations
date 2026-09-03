@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import polars as pl
@@ -31,6 +32,7 @@ from ..dag import is_dbt_ref, parse_dbt_ref, parse_ref
 from ..hashing import canonical_fingerprint, canonical_json
 from ..paths import resolve_within_project
 from ..profile import ResolvedProfile
+from ..progress import get_reporter
 from ..providers import get_inference_provider, resolve_provider_model
 from ..sql_models import compile_sql, discover_refs, read_sql_source
 from ..transforms import (
@@ -47,6 +49,42 @@ from .errors import artifact_error_text
 from .warehouse import warehouse_options
 
 log = logging.getLogger(__name__)
+
+# A transform's classification scan and single-shot materialization have no
+# natural per-batch boundary to log at (issue #469): a large parent table can
+# hold the process silent for the run's whole duration, indistinguishable from
+# a hang. A heartbeat fires on whichever comes first — this many more rows
+# seen, or this many seconds since the last one — because a slow per-row scan
+# can go a long time between count milestones.
+_HEARTBEAT_ROWS = 5_000
+_HEARTBEAT_SECONDS = 15.0
+
+
+class _Heartbeat:
+    """Tracks whether a periodic progress line has earned its place.
+
+    Checked once per row: a `monotonic()` call is negligible next to the
+    per-row hashing it sits beside, and only checking at batch boundaries
+    would miss the case a single batch runs long enough to look hung.
+    """
+
+    def __init__(self) -> None:
+        self._start = monotonic()
+        self._at_count = 0
+        self._at_time = self._start
+
+    def due(self, count: int) -> bool:
+        return (
+            count - self._at_count >= _HEARTBEAT_ROWS
+            or monotonic() - self._at_time >= _HEARTBEAT_SECONDS
+        )
+
+    def fire(self, count: int) -> None:
+        self._at_count = count
+        self._at_time = monotonic()
+
+    def elapsed(self) -> float:
+        return monotonic() - self._start
 
 
 def run_sql_model(
@@ -243,7 +281,9 @@ def run_transform_model(
             read_predicates=read_predicates,
         )
 
+    log.info("%s: transforming", model.name)
     output = _invoke_transform(transform_fn, deps, ctx, model)
+    log.info("%s: publishing %d row(s)", model.name, output.height)
     adapter.materialize_full(
         model.name,
         _validate_agent_context_output(output, model),
@@ -442,9 +482,21 @@ def _run_incremental_transform(
         return result
 
     if not is_incremental:
+        # This branch is the worst case for silence (issue #469): a first-time
+        # incremental baseline, or a model switching from full to incremental,
+        # reads and transforms every parent in one shot with no batch boundary
+        # to log at. It cannot be split — see the comment at `materialize_full`
+        # below — so the best available signal is naming each phase as it
+        # starts.
+        log.info("%s: fetching parent rows for full refresh", model.name)
         full_deps = dict(deps)
         full_deps[parent_source] = _read_parent_rows(
             adapter, parent_source, contract.parent_source_key, keys=None
+        )
+        log.info(
+            "%s: transforming %d parent row(s)",
+            model.name,
+            full_deps[parent_source].height,
         )
         output = _validate_agent_context_output(
             _invoke_transform(transform_fn, full_deps, ctx, model), model
@@ -452,6 +504,7 @@ def _run_incremental_transform(
         _validate_incremental_output(
             output, contract, model, set(processed_parents), is_incremental=False
         )
+        log.info("%s: publishing %d row(s)", model.name, output.height)
         # Full refresh: atomic full replace, then reset the per-parent state
         # baseline so the next incremental run classifies correctly. Never
         # batched — `materialize_full` replaces the table in one operation, and
@@ -481,54 +534,77 @@ def _run_incremental_transform(
     changed_set = set(changed)
     records_by_parent = {record.record_key: record for record in state_records}
     rows_written = 0
-    for batch in _batched(processed_parents, model.transform_commit_every()):
-        call_deps = dict(deps)
-        # Rows arrive per batch, scoped to that batch's parents (issue #385
-        # composed with #379's batching): peak follows the commit batch, which
-        # is tighter than either change gives on its own.
-        batch_rows = _read_parent_rows(
-            adapter,
-            parent_source,
-            contract.parent_source_key,
-            keys=batch,
-            predicates=read_predicates,
-        )
-        _verify_classified_rows(
-            batch_rows,
-            contract.parent_source_key,
-            batch,
-            digests_by_parent,
-            model_name=model.name,
-        )
-        call_deps[parent_source] = batch_rows
-        output = _validate_agent_context_output(
-            _invoke_transform(transform_fn, call_deps, ctx, model), model
-        )
-        _validate_incremental_output(
-            output, contract, model, set(batch), is_incremental=True
-        )
-        try:
-            rows_written += adapter.replace_children(
-                model.name,
-                parent_key=contract.parent_key,
-                parent_ids=[key for key in batch if key in changed_set],
-                child_key=contract.child_key,
-                new_rows=output,
-                state_scope=state_scope,
-                state_records=[records_by_parent[key] for key in batch],
-                # Every batch, not just the first (Codex review). A transform's
-                # output schema can be data-dependent, so a later batch may
-                # introduce a column the first never emitted. Forcing `ignore`
-                # after the first batch would drop that column silently while
-                # still advancing the parents' state, making the loss
-                # unrecoverable on later runs. Reconciling every batch costs
-                # nothing when the schema is stable: `plan_schema_change`
-                # early-returns once the column sets match.
-                on_schema_change=model.on_schema_change,
-                options=options,
+    parents_committed = 0
+    # A bar and a log line per batch, the same shape extraction reports each
+    # flush at (issue #469 / #379): the batch boundary is the one point in this
+    # loop with real progress to report, since `_invoke_transform` is opaque
+    # user code between it and the last one.
+    progress_task = get_reporter().model_task(
+        model.name, "transform", len(processed_parents)
+    )
+    progress_task.__enter__()
+    try:
+        for batch in _batched(processed_parents, model.transform_commit_every()):
+            call_deps = dict(deps)
+            # Rows arrive per batch, scoped to that batch's parents (issue #385
+            # composed with #379's batching): peak follows the commit batch,
+            # which is tighter than either change gives on its own.
+            batch_rows = _read_parent_rows(
+                adapter,
+                parent_source,
+                contract.parent_source_key,
+                keys=batch,
+                predicates=read_predicates,
             )
-        except AdapterError as error:
-            raise RunError(str(error)) from error
+            _verify_classified_rows(
+                batch_rows,
+                contract.parent_source_key,
+                batch,
+                digests_by_parent,
+                model_name=model.name,
+            )
+            call_deps[parent_source] = batch_rows
+            output = _validate_agent_context_output(
+                _invoke_transform(transform_fn, call_deps, ctx, model), model
+            )
+            _validate_incremental_output(
+                output, contract, model, set(batch), is_incremental=True
+            )
+            try:
+                batch_rows_written = adapter.replace_children(
+                    model.name,
+                    parent_key=contract.parent_key,
+                    parent_ids=[key for key in batch if key in changed_set],
+                    child_key=contract.child_key,
+                    new_rows=output,
+                    state_scope=state_scope,
+                    state_records=[records_by_parent[key] for key in batch],
+                    # Every batch, not just the first (Codex review). A
+                    # transform's output schema can be data-dependent, so a
+                    # later batch may introduce a column the first never
+                    # emitted. Forcing `ignore` after the first batch would
+                    # drop that column silently while still advancing the
+                    # parents' state, making the loss unrecoverable on later
+                    # runs. Reconciling every batch costs nothing when the
+                    # schema is stable: `plan_schema_change` early-returns once
+                    # the column sets match.
+                    on_schema_change=model.on_schema_change,
+                    options=options,
+                )
+            except AdapterError as error:
+                raise RunError(str(error)) from error
+            rows_written += batch_rows_written
+            parents_committed += len(batch)
+            progress_task.advance(len(batch))
+            log.info(
+                "published %d rows (%d/%d parents) for %s",
+                batch_rows_written,
+                parents_committed,
+                len(processed_parents),
+                model.name,
+            )
+    finally:
+        progress_task.__exit__(None, None, None)
 
     result.rows_written = rows_written
     result.documents_processed = len(processed_parents)
@@ -763,6 +839,8 @@ def _stream_parent_digests(
     for the same reason.
     """
     digests: dict[str, list[str]] = {}
+    rows_seen = 0
+    heartbeat = _Heartbeat()
     with adapter.table_snapshot(
         table, batch_size=_CLASSIFY_BATCH_ROWS, predicate=list(predicates)
     ) as snapshot:
@@ -799,6 +877,19 @@ def _stream_parent_digests(
                         f"'{key_col}' contains null or empty values"
                     )
                 digests.setdefault(str(raw), []).append(_row_digest(row))
+                rows_seen += 1
+                # Checked per row, not per batch (issue #469): a single
+                # `_CLASSIFY_BATCH_ROWS` batch of large rows can itself run
+                # long enough to look hung, and a batch boundary alone would
+                # stay silent for the whole thing.
+                if heartbeat.due(rows_seen):
+                    log.info(
+                        "%s: classifying parent rows: %d processed (%.1fs elapsed)",
+                        model_name,
+                        rows_seen,
+                        heartbeat.elapsed(),
+                    )
+                    heartbeat.fire(rows_seen)
     return digests
 
 

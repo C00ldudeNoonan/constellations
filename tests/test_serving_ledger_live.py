@@ -19,7 +19,7 @@ import pytest
 from stel.adapters import StateScope, create_adapter, parse_warehouse_config
 from stel.adapters.bigquery import BigQueryAdapter
 from stel.retrieval import ServingCoordinator
-from stel.retrieval.coordination import STATUS_DEGRADED, STATUS_READY, ServingNotReadyError
+from stel.retrieval.coordination import STATUS_DEGRADED, STATUS_READY, ServingBusyError
 
 _BQ_PROJECT = os.environ.get("STEL_BQ_TEST_PROJECT")
 
@@ -112,7 +112,9 @@ def exercise_ledger_protocol(coordinator: ServingCoordinator) -> None:
         preserves_active_generation=True,
     )
     assert coordinator.status(empty).config_fingerprint == "cfgA"
-    with pytest.raises(ServingNotReadyError):
+    # Nothing is live and a publisher holds the scope: admission says *busy*,
+    # not *not ready* -- the publisher is the accurate reason.
+    with pytest.raises(ServingBusyError):
         coordinator.acquire_query(empty)
     coordinator.mark_ready(
         claim, active_generation="genA", config_fingerprint="cfgA", counts=(1, 0, 0, 0),

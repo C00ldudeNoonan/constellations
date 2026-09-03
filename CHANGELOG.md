@@ -27,6 +27,11 @@ from an attack.
   undersized deployment have three different fixes.
 - Unset, behavior is byte-identical to before: no per-key state is kept and the
   caller is never resolved ahead of the operation.
+- The anonymous bucket is keyed by a private sentinel rather than the string
+  `"<anonymous>"`, so a subject legitimately named that no longer shares it
+  with real anonymous traffic (Codex review).
+- A per-principal cap set above the global one now reports as the usual exit-2
+  configuration error, rather than a bare traceback (Codex review).
 
 ### `search: exact` no longer publishes an index nothing can query (issue #461)
 

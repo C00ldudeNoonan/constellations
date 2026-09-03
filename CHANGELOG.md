@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.16.0 - 2026-09-03
+
 ### The ANN index type is declared, and `ivf_pq` fits where `HnswFlat` did not (issue #476)
 
 `search: approximate` always built LanceDB's `HnswFlat`, which keeps raw vectors
@@ -198,23 +200,7 @@ now matches it:
 All of this is `-v` / `STEL_VERBOSE=1` output, same as extraction's existing
 progress lines.
 
-### The grants cache no longer grows without bound (security audit)
-
-`WarehouseGrantStore` (issue #392) caches each verified subject's grants for
-`ttl_seconds`, but past expiry an entry was never reclaimed — only ignored and
-overwritten on that subject's next request. A network deployment serving many
-distinct subjects over its lifetime (every subject a token issuer or a
-trusted proxy ever named) grew this table forever, the same unbounded-growth
-shape the per-principal rate-limit table was fixed for in v0.15.5 (issue
-#466), left unfixed here.
-
-The cache is now swept on the same cadence as its own TTL: an expired entry
-is reclaimed on the next write rather than merely superseded. Revocation
-timing is unchanged — an entry still applies until its TTL lapses either way.
-
-## v0.15.5 - 2026-09-02
-
-### The network MCP transport verifies bearer tokens itself (issue #392)
+### The network MCP transport verifies bearer tokens itself (issue #392, PR #465)
 
 #394 gave `stel mcp serve --transport streamable-http|sse` a per-request
 principal, but only through headers an authenticating proxy in front was
@@ -252,7 +238,49 @@ stel mcp serve --transport streamable-http   --jwt-issuer https://issuer.example
   dependency graph.
 
 Still open from #392: per-tenant warehouse credentials (#395). Per-principal
-rate limiting shipped alongside this as #463.
+rate limiting shipped in v0.15.5 as #463.
+
+### The per-principal rate limiter is hardened (issue #463, PRs #467, #470)
+
+#463's per-principal rate limiting (v0.15.5) was implemented twice
+concurrently in two sessions; #466 landed first. Codex reviewed both,
+after #466 had already merged, and five gaps in it are closed here:
+
+- **Idle principal keys sweep on a time cadence, not past a table-size
+  threshold.** The old `_SWEEP_KEYS = 1024` charged an O(n) sweep to every
+  request once more than 1024 principals were tracked concurrently, so the
+  cost scaled with legitimate load rather than with the churn the sweep
+  existed to clean up. One sweep pass per window bounds residency by elapsed
+  time instead.
+- **The anonymous bucket is keyed by a private sentinel, not the string
+  `"<anonymous>"`.** A subject legitimately named that no longer shares the
+  unauthenticated flood's bucket.
+- **The three refusal messages read differently on purpose.** All three are
+  the same `BUSY` code, but a loud tenant, an unauthenticated flood, and an
+  undersized deployment have three different fixes, and only the wording told
+  them apart.
+- **`principal_key` is now required on `_OperationLimiter.run`.** A caller
+  that omitted it silently rate-limited a real principal against the
+  anonymous bucket — it had already happened at one call site.
+- **A per-principal cap set above the global one now fails as the usual
+  exit-2 configuration error**, not a bare pydantic traceback — settings
+  construction moved inside the existing configuration-error handling.
+
+### The grants cache no longer grows without bound (security audit)
+
+`WarehouseGrantStore` (issue #392) caches each verified subject's grants for
+`ttl_seconds`, but past expiry an entry was never reclaimed — only ignored and
+overwritten on that subject's next request. A network deployment serving many
+distinct subjects over its lifetime (every subject a token issuer or a
+trusted proxy ever named) grew this table forever, the same unbounded-growth
+shape the per-principal rate-limit table was fixed for in v0.15.5 (issue
+#466), left unfixed here.
+
+The cache is now swept on the same cadence as its own TTL: an expired entry
+is reclaimed on the next write rather than merely superseded. Revocation
+timing is unchanged — an entry still applies until its TTL lapses either way.
+
+## v0.15.5 - 2026-09-02
 
 ### Per-principal rate limiting on the MCP server (issue #463)
 
@@ -279,9 +307,6 @@ from an attack.
   undersized deployment have three different fixes.
 - Unset, behavior is byte-identical to before: no per-key state is kept and the
   caller is never resolved ahead of the operation.
-- The anonymous bucket is keyed by a private sentinel rather than the string
-  `"<anonymous>"`, so a subject legitimately named that no longer shares it
-  with real anonymous traffic (Codex review).
 - A per-principal cap set above the global one now reports as the usual exit-2
   configuration error, rather than a bare traceback (Codex review).
 

@@ -21,7 +21,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
+from stel.cli import cli
 from stel.mcp_server import service as service_module
 from stel.mcp_server.authorization import (
     AuthorizationError,
@@ -285,10 +287,6 @@ def test_the_cli_reports_the_cap_conflict_as_a_configuration_error(
     itself a ConfigClickError. Unless mcp_serve catches it, an operator sees a
     traceback and exit code 1 instead of the usual exit-2 configuration
     diagnostic every other misconfiguration gets (Codex review, #466)."""
-    from click.testing import CliRunner
-
-    from stel.cli import cli
-
     (tmp_path / "stel_project.yml").write_text(
         "name: p\nversion: '0.1.0'\n", encoding="utf-8"
     )

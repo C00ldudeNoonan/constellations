@@ -575,9 +575,26 @@ Pass `-v` for detail on top of that — per-source discovery lines, the phases
 (profile resolution, warehouse connect, the incremental to-process/unchanged
 split, publication telemetry, test execution), and a live per-model progress
 bar on a TTY. Bars cover the model kinds with a countable unit of work:
-extraction, `llm:`, `embed:` and `chunk:`. `search:` reports indexed batches as
-lines instead, because its read is a one-shot bounded stream with no row count
-to render a bar against.
+extraction, `llm:`, `embed:`, `chunk:`, and an incremental `transform:` batched
+over changed parents. `search:` reports indexed batches as lines instead,
+because its read is a one-shot bounded stream with no row count to render a
+bar against.
+
+A long-running transform reports progress the same way extraction does, so
+silence is never the only signal for whether a run is working or hung (issue
+#469): an incremental transform logs each batch as it commits (`published N
+rows (i/total parents) for <model>`), and its whole-table classification scan
+logs a heartbeat every 5,000 rows or 15 seconds, whichever comes first — a
+count-only signal would go quiet for the whole scan if a single warehouse
+batch of large rows took long enough to look hung. The one case that stays a
+single opaque step is a full-refresh baseline: `--full-refresh`, or a target
+that already exists with no per-parent state (a model switched from
+`materialization: full`, or an interrupted first run). Neither can be batched
+without exposing a partially built table, so both log only their phase
+boundaries — fetching, transforming, publishing — rather than per-row
+progress. A plain first run, with no pre-existing target, is not this case:
+every parent is new, so it goes through classification and the batched commit
+loop like any other incremental run.
 
 On a TTY the log channel and the bar run together: records are routed through
 the progress reporter, which holds them while a bar is live and prints them

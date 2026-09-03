@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Long-running transform models report progress, not silence (issue #469)
+
+A transform over a large corpus used to log `starting <model> (transform)`
+and then nothing until it published — 20+ minutes of silence on a real run,
+indistinguishable from a hang. Extraction already reported steadily; transform
+now matches it:
+
+- An incremental transform logs each batch as it commits: `published N rows
+  (i/total parents) for <model>`, the same shape extraction already reports
+  per flush, and gets a live progress bar under `-v` on a TTY.
+- The classification scan that precedes it — a streamed read of the whole
+  parent table — logs a heartbeat every 5,000 rows or 15 seconds, whichever
+  comes first, checked per row rather than at batch boundaries so a single
+  large batch can't outlast it. A background watchdog covers the rest: a
+  slow warehouse query or a stalled batch fetch blocks the reading thread
+  before any row is available to check against, so the heartbeat also fires
+  from elapsed time alone, independent of that thread.
+- A full-refresh baseline — `--full-refresh`, or a target that already exists
+  with no per-parent state (a model switched from `materialization: full`, or
+  an interrupted first run) — stays one atomic step, since batching it would
+  expose a partially built table, but now names its phases as it moves
+  through them: fetching, transforming, publishing. A plain first run with no
+  pre-existing target is unaffected: every parent is new, so it's classified
+  and batched like any other incremental run.
+
+All of this is `-v` / `STEL_VERBOSE=1` output, same as extraction's existing
+progress lines.
+
 ## v0.15.5 - 2026-09-02
 
 ### The network MCP transport verifies bearer tokens itself (issue #392)

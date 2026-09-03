@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -541,6 +544,17 @@ def _incremental_model(name: str, module: str, depends_on: list[str]):
         depends_on=depends_on,
         transform={"type": "python", "module": module},
         materialization="incremental",
+    )
+
+
+def _full_model(name: str, module: str, depends_on: list[str]):
+    from stel.config.model import ModelConfig
+
+    return ModelConfig(
+        name=name,
+        depends_on=depends_on,
+        transform={"type": "python", "module": module},
+        materialization="full",
     )
 
 
@@ -1129,6 +1143,158 @@ def test_batching_does_not_change_what_gets_published(tmp_path: Path) -> None:
 
     assert _tokens(single) == _tokens(batched)
     assert _state_keys(single) == _state_keys(batched)
+
+
+# ─── progress during a long run, not just at the end (issue #469) ──────────
+
+
+def test_each_committed_batch_logs_its_progress(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A silent run between `starting` and the final ledger line is
+    indistinguishable from a hang. Each batch commit now says how far in the
+    parent set it got, the way extraction reports each flush."""
+    project = _project(tmp_path)
+    _set_commit_every(project, 1)
+    for index in range(3):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    published = [
+        r.message
+        for r in caplog.records
+        if r.name == "stel.execution.transform" and r.message.startswith("published ")
+    ]
+    assert len(published) == 3
+    assert published[0].endswith("(1/3 parents) for word_tokens")
+    assert published[1].endswith("(2/3 parents) for word_tokens")
+    assert published[2].endswith("(3/3 parents) for word_tokens")
+
+
+def test_full_refresh_baseline_names_each_phase(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one-shot full-refresh path (a first-time incremental baseline, or a
+    model switched from full) cannot be batched — see the comment at
+    `materialize_full` in `_run_incremental_transform` — so phase boundaries
+    are the only signal it can offer."""
+    project = _project(tmp_path)
+    _write_doc(project, "a.json", "alpha beta")
+    run_project(project)
+    _write_doc(project, "b.json", "gamma delta")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project, full_refresh=True)
+
+    messages = [r.message for r in caplog.records]
+    assert any("fetching parent rows for full refresh" in m for m in messages)
+    assert any(
+        "transforming" in m and "parent row(s)" in m for m in messages
+    )
+    assert any("publishing" in m and "row(s)" in m for m in messages)
+
+
+def test_classification_heartbeat_fires_within_a_long_scan(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The classification scan reads the whole parent table before any batch
+    exists to log at — the phase the reported hang (issue #469) sat in. A
+    heartbeat must fire mid-scan, not just at its boundary, since a single
+    warehouse batch of large rows can itself run long enough to look hung."""
+    from stel.execution import transform as transform_module
+
+    monkeypatch.setattr(transform_module, "_HEARTBEAT_ROWS", 2)
+    monkeypatch.setattr(transform_module, "_HEARTBEAT_SECONDS", 1_000.0)
+    project = _project(tmp_path)
+    for index in range(5):
+        _write_doc(project, f"d{index}.json", f"word{index}")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    heartbeats = [
+        r.message for r in caplog.records if "classifying parent rows" in r.message
+    ]
+    assert len(heartbeats) >= 2
+    assert "2 processed" in heartbeats[0]
+
+
+def test_a_heartbeat_fires_while_the_snapshot_read_is_still_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex review (#469 P2): opening a snapshot, or one slow warehouse batch
+    fetch, blocks the reading thread before any row exists to check the
+    per-row heartbeat against — BigQuery's synchronous wait on its query
+    destination is exactly this shape. A background watchdog must still fire
+    from elapsed time alone, proven here by asserting it fires *before* a
+    deliberately slow fake read returns."""
+    from stel.execution import transform as transform_module
+
+    monkeypatch.setattr(transform_module, "_HEARTBEAT_ROWS", 10**9)
+    monkeypatch.setattr(transform_module, "_HEARTBEAT_SECONDS", 0.05)
+
+    fired = threading.Event()
+
+    def _watch_log(*args: object, **kwargs: object) -> None:
+        message = args[0]
+        assert isinstance(message, str)
+        if "classifying parent rows" in (message % args[1:] if args[1:] else message):
+            fired.set()
+
+    monkeypatch.setattr(transform_module.log, "info", _watch_log)
+
+    read_returned = threading.Event()
+
+    class _SlowAdapter:
+        @contextlib.contextmanager
+        def table_snapshot(
+            self, table: str, *, batch_size: int = 10_000, predicate: Any = None
+        ) -> Any:
+            time.sleep(0.5)  # simulate a slow warehouse round trip
+            read_returned.set()
+            frame = pl.DataFrame({"document_id": ["a"]}).to_arrow()
+            yield _FakeSnapshot(frame, batch_size)
+
+    worker = threading.Thread(
+        target=lambda: transform_module._stream_parent_digests(
+            cast(Any, _SlowAdapter()), "documents", "document_id", model_name="m"
+        )
+    )
+    worker.start()
+    try:
+        assert fired.wait(timeout=2.0), "the watchdog never fired"
+        assert not read_returned.is_set(), (
+            "the heartbeat fired only after the blocking read returned, which "
+            "means it was the per-row check, not the watchdog"
+        )
+    finally:
+        worker.join(timeout=5.0)
+
+
+def test_generic_transform_names_each_phase(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The simple (non-incremental) transform path is one read, one invoke, one
+    publish, with no batch boundary to log at — phase lines are the only
+    signal it can offer (issue #469)."""
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "word_tokens.py").write_text(
+        _TRANSFORM_SOURCE, encoding="utf-8"
+    )
+    model = _full_model("word_tokens", "transforms.word_tokens", ["ref('documents')"])
+    adapter = _RecordingAdapter(
+        {"documents": pl.DataFrame({"document_id": ["docA"], "body": ["alpha beta"]})}
+    )
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        result = _run_incremental(tmp_path, adapter, model)
+
+    assert result.rows_written == 2
+    messages = [r.message for r in caplog.records]
+    assert "word_tokens: transforming" in messages
+    assert "word_tokens: publishing 2 row(s)" in messages
 
 
 def test_a_failure_mid_run_keeps_the_batches_that_committed(

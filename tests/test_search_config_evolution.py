@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
+from stel.config.model import ModelConfig, SearchVectorConfig
+from stel.config.project import ProjectConfig
+from stel.embedding import effective_search_config
 from stel.execution.contracts import RunError
 from stel.execution.search import (
     _validate_collection_schema,
@@ -32,6 +36,7 @@ from stel.retrieval import (
     legacy_collection_config_fingerprint,
 )
 from stel.retrieval.registry import collection_descriptor
+from stel.versioning import compute_model_code_version
 
 _BASE: dict[str, Any] = {
     "access": "public",
@@ -198,6 +203,7 @@ def _spec(**overrides: Any) -> CollectionSpec:
         vector_dimensions=2,
         distance_metric="cosine",
         vector_search="exact",
+        vector_index=None,
         config_fingerprint=collection_config_fingerprint(config, store_type="lancedb"),
         descriptor=descriptor_json(
             collection_descriptor(config, store_type="lancedb")
@@ -687,3 +693,140 @@ def test_fail_names_the_strategy_switch_and_points_at_online() -> None:
     message = str(error.value)
     assert "on_index_change: online" in message
     assert "requires a rebuild" not in message
+
+
+# ─── The ANN index type is an index-build field too (issue #476) ──────────────
+
+
+def _vector_model(**vector: Any) -> ModelConfig:
+    return ModelConfig(
+        name="ctx",
+        depends_on=["ref('chunks')"],
+        materialization="incremental",
+        search={
+            "access": "public",
+            "id_field": "chunk_id",
+            "document_id_field": "document_id",
+            "chunk_id_field": "chunk_id",
+            "text_fields": ["text"],
+            "return_text_fields": ["text"],
+            "full_text": {"fields": ["text"]},
+            "query": {"modes": ["vector", "text"]},
+            "vector": {
+                "field": "embedding",
+                "dimensions": 2,
+                "metric": "cosine",
+                "embedding": {
+                    "provider": "fixture",
+                    "model": "deterministic-2d-v1",
+                    "provider_contract_version": 2,
+                    "provider_implementation": "tests:v1",
+                    "semantic_config_fingerprint": "deterministic-2d-v1",
+                    "dimensions": 2,
+                },
+                **vector,
+            },
+        },
+    )
+
+
+def test_the_default_index_type_leaves_every_existing_stamp_untouched(
+    tmp_path: Path,
+) -> None:
+    """The trap this field could have sprung: a default that surfaced in any
+    dump of the config would reclassify every published index as changed on
+    the first run after upgrade — ADR-0002's "charge everybody once". Absent
+    means default, at the model itself: a config that never mentions `index`
+    and one that spells out the default are byte-identical in the raw dump, in
+    every collection stamp, and in the code version — the last of which is
+    hashed from a raw dump in `versioning.py`, which is exactly where a
+    consumer-level omission would have leaked."""
+    implicit_model = _vector_model(search="approximate")
+    explicit_model = _vector_model(search="approximate", index="ivf_hnsw_flat")
+    assert implicit_model.search is not None and explicit_model.search is not None
+
+    assert "index" not in implicit_model.search.model_dump()["vector"]
+    assert implicit_model.search.model_dump() == explicit_model.search.model_dump()
+    assert implicit_model.search.model_dump(mode="json") == explicit_model.search.model_dump(
+        mode="json"
+    )
+
+    implicit = effective_search_config(implicit_model, [])
+    explicit = effective_search_config(explicit_model, [])
+    assert implicit == explicit
+    for derive in (
+        lambda payload: collection_config_fingerprint(payload, store_type="lancedb"),
+        lambda payload: descriptor_json(collection_descriptor(payload, store_type="lancedb")),
+        lambda payload: legacy_collection_config_fingerprint(payload, store_type="lancedb"),
+    ):
+        assert derive(implicit) == derive(explicit)
+
+    project = ProjectConfig(name="p")
+    assert compute_model_code_version(
+        implicit_model, project, tmp_path
+    ) == compute_model_code_version(explicit_model, project, tmp_path)
+
+
+def test_a_chosen_index_type_survives_every_serialization() -> None:
+    """The complement: the omission is of the *default* only. A deliberate
+    choice is written in both dump modes and round-trips."""
+    chosen = SearchVectorConfig(
+        field="embedding", dimensions=2, search="approximate", index="ivf_pq", embedding="inherit"
+    )
+
+    assert chosen.model_dump()["index"] == "ivf_pq"
+    assert chosen.model_dump(mode="json")["index"] == "ivf_pq"
+    assert SearchVectorConfig.model_validate(chosen.model_dump()) == chosen
+
+
+def test_a_chosen_index_type_is_recorded_and_classifies_as_an_index_build() -> None:
+    """Only a deliberate choice enters the descriptor, and switching it is the
+    same kind of change as `exact` -> `approximate`: a build over vectors that
+    are already published, not a re-embed."""
+    chosen = effective_search_config(
+        _vector_model(search="approximate", index="ivf_pq"), []
+    )
+    assert chosen["vector"]["index"] == "ivf_pq"
+
+    stored = collection_descriptor(
+        effective_search_config(_vector_model(search="approximate"), []),
+        store_type="lancedb",
+    )["search"]
+    current = collection_descriptor(chosen, store_type="lancedb")["search"]
+    changes = classify_changes(stored, current)
+
+    assert [change.kind for change in changes] == [ChangeKind.COMPATIBLE]
+    assert "index None -> 'ivf_pq'" in changes[0].detail
+    assert "index build" in changes[0].detail
+
+
+def test_switching_mode_and_index_type_together_is_one_compatible_change() -> None:
+    """`exact` -> `approximate` plus a chosen type is the whole #473 retest in
+    one config edit; it must still be a single compatible change."""
+    stored = collection_descriptor(
+        effective_search_config(_vector_model(search="exact"), []), store_type="lancedb"
+    )["search"]
+    current = collection_descriptor(
+        effective_search_config(_vector_model(search="approximate", index="ivf_pq"), []),
+        store_type="lancedb",
+    )["search"]
+
+    assert [c.kind for c in classify_changes(stored, current)] == [ChangeKind.COMPATIBLE]
+
+
+def test_an_index_type_change_alongside_a_dimension_change_still_rebuilds() -> None:
+    """The index-build exemption is exact: bundling it with a change to what a
+    row contains does not launder the latter."""
+    changes = classify_changes(
+        _search(vector=_APPROX_VECTOR),
+        _search(vector={**_APPROX_VECTOR, "index": "ivf_pq", "dimensions": 4}),
+    )
+
+    assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
+
+
+def test_an_index_type_under_exact_search_is_refused_at_config_time() -> None:
+    """`exact` builds no index, so a non-default `index` would be accepted and
+    silently do nothing — a flag that looks like a decision and is not."""
+    with pytest.raises(ValidationError, match="only applies to search: approximate"):
+        _vector_model(search="exact", index="ivf_pq")

@@ -91,6 +91,7 @@ def _spec(store: RetrievalStore, name: str) -> CollectionSpec:
         vector_dimensions=3,
         distance_metric="cosine",
         vector_search="exact",
+        vector_index=None,
         config_fingerprint="cfg1",
         descriptor='{"distance_metric": "cosine"}',
         legacy_config_fingerprint="legacy1",

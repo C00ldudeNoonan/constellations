@@ -13,7 +13,11 @@ from .adapters import (
 )
 from .backends import BackendOptionsError, list_backends, validate_backend_options
 from .config.loader import ConfigError
-from .config.model import ModelConfig, protect_model_llm_credential_option
+from .config.model import (
+    DEFAULT_VECTOR_INDEX,
+    ModelConfig,
+    protect_model_llm_credential_option,
+)
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
 from .config.yaml_diagnostics import ConfigPath
@@ -480,10 +484,18 @@ def validate_retrieval_capabilities(
         # the store turns out to refuse would be discovered after every row had
         # been republished and the serving pointer cleared (Codex review, #461).
         refusal = store.index_config_refusal(
-            vector_search=search.vector.search if search.vector else None
+            vector_search=search.vector.search if search.vector else None,
+            vector_index=search.vector.index if search.vector else None,
         )
         if refusal is not None:
-            raise _model_error(model, refusal, ("search", "vector", "search"))
+            # A non-default index type is the more specific choice, so a
+            # refusal under one is reported against it; otherwise the search
+            # mode is what asked for an index at all.
+            chose_index = (
+                search.vector is not None and search.vector.index != DEFAULT_VECTOR_INDEX
+            )
+            field = "index" if chose_index else "search"
+            raise _model_error(model, refusal, ("search", "vector", field))
         logical = search.collection or model.name
         physical = store.physical_collection(logical)
         key = (store.safe_descriptor().safe_target_identity, physical)

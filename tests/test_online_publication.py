@@ -394,3 +394,49 @@ def test_online_publish_recovers_a_scope_left_failed_with_no_generation(tmp_path
         reader = coordinator.acquire_query(scope)
         coordinator.validate_query(reader)
         coordinator.release_query(reader)
+
+
+def test_online_index_type_switch_builds_the_declared_type_privately(tmp_path: Path) -> None:
+    """A declared index type is a compatible change (issue #476), so switching
+    it lands in a fresh private generation carrying the declared structure,
+    while the old generation — and its `IvfHnswFlat` — keep serving until
+    activation. `ivf_hnsw_sq` here because this fixture has two rows and
+    LanceDB needs 256 to train `ivf_pq`; the PQ build, type switch, and the
+    too-small refusal are covered at the store level."""
+    scope, resolved = _prepare(tmp_path)
+    run_project(tmp_path, select="context_search")  # approximate, default type
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        coordinator = ServingCoordinator(adapter)
+        old = coordinator.status(scope)
+        reader = coordinator.acquire_query(scope)
+        path = tmp_path / "models" / "retrieval.yml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "        search: approximate\n",
+                "        search: approximate\n        index: ivf_hnsw_sq\n",
+            ),
+            encoding="utf-8",
+        )
+        [result] = run_project(tmp_path, select="context_search")
+        assert result.rows_written == 2
+        current = coordinator.status(scope)
+        assert current.active_collection != old.active_collection
+        coordinator.validate_query(reader)
+        coordinator.release_query(reader)
+        assert resolved.retrieval is not None
+        assert old.active_collection is not None and current.active_collection is not None
+
+        def _types(store: Any, name: str) -> list[str]:
+            table = store._open_owned_table(name)
+            return [i.index_type for i in table.list_indices() if i.columns == ["embedding"]]
+
+        with LanceDBStore(
+            resolved.retrieval.stores["primary"],
+            project_name="retrieval_demo", target_name="dev", alias="primary",
+        ) as store:
+            assert _types(store, old.active_collection) == ["IvfHnswFlat"]
+            assert _types(store, current.active_collection) == ["IvfHnswSq"]
+
+    # Unchanged config afterwards: nothing to republish, nothing to rebuild.
+    [rerun] = run_project(tmp_path, select="context_search")
+    assert rerun.rows_written == 0

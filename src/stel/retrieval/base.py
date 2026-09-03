@@ -294,6 +294,10 @@ class CollectionSpec:
     vector_dimensions: int | None
     distance_metric: str | None
     vector_search: str | None
+    # Which ANN structure `approximate` builds (issue #476); None without a
+    # vector. Stores that build one kind refuse the others at compile time via
+    # `index_config_refusal`.
+    vector_index: str | None
     config_fingerprint: str
     # Canonical JSON of the semantic descriptor (issue #344). Persisted with
     # the collection so a later publish can name which field changed rather
@@ -466,7 +470,9 @@ class RetrievalStore(ABC):
             f"Retrieval store '{self.store_type()}' cannot drop collections"
         )
 
-    def index_config_refusal(self, *, vector_search: str | None) -> str | None:
+    def index_config_refusal(
+        self, *, vector_search: str | None, vector_index: str | None
+    ) -> str | None:
         """Why this store instance cannot build the declared index, if it cannot.
 
         Returns None when it can. `capabilities()` is a classmethod and answers
@@ -485,7 +491,7 @@ class RetrievalStore(ABC):
         the serving pointer already cleared by the in-place claim (Codex
         review, #461).
         """
-        del vector_search
+        del vector_search, vector_index
         return None
 
     @abstractmethod

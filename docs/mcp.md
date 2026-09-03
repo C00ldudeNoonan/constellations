@@ -130,15 +130,66 @@ Two limits worth knowing before a shared deployment:
   `--max-requests-per-minute-per-principal` to give each subject its own share
   under that ceiling. Requests with no resolvable principal share one anonymous
   bucket of the same size, so an unauthenticated flood counts against something
-  rather than nothing. Unset, nothing changes.
+  rather than nothing. Unset, nothing changes. The refusals are worded apart so
+  logs stay readable: `This caller is at its request rate limit` is one loud
+  tenant, `Unauthenticated callers are at their shared request rate limit` is a
+  flood with no identity, and `The context server is at its request rate
+  limit` means the deployment is undersized. All three are `BUSY` and all
+  three are retryable.
 
-  The refusals are worded apart so logs stay readable: `This caller is at its
-  request rate limit` is one loud tenant, `Unauthenticated callers are at
-  their shared request rate limit` is a flood with no identity, and `The
-  context server is at its request rate limit` means the deployment is
-  undersized. All three are `BUSY` and all three are retryable.
+### Verifying tokens instead of trusting a proxy
 
-Token verification without a proxy in front is tracked in issue #392.
+When nothing authenticating sits in front of the server, have it verify each
+caller's bearer token itself:
+
+```bash
+stel mcp serve --transport streamable-http --host 0.0.0.0 --port 8000   --jwt-issuer https://issuer.example   --jwt-audience https://stel.example/mcp   --jwt-jwks-uri https://issuer.example/.well-known/jwks.json
+```
+
+All three flags are required and none has a default — each is a security
+boundary, and a default would be stel quietly choosing one. The JWKS URL must
+be `https`: keys fetched in plaintext can be replaced in transit, which makes
+verifying against them meaningless.
+
+Every accepted token has passed all of these, and a token failing any of them
+is refused with the same unauthenticated response — distinguishing "bad
+signature" from "wrong audience" would be a probing oracle:
+
+| check | why it is not optional |
+|---|---|
+| signature against the issuer's JWKS | the token is what it says it is |
+| asymmetric algorithm (`RS*`, `ES*`, `PS*`) | accepting HMAC alongside RSA is the classic JWKS forgery: sign with the public key as the shared secret |
+| `iss` matches `--jwt-issuer` exactly | a token from another issuer is another system's |
+| `aud` matches `--jwt-audience` exactly | the confused-deputy case the MCP authorization spec calls out: without it, a token a caller legitimately holds for *another* service is valid here |
+| `exp` and `nbf`, with 30s leeway | expiry is the only revocation this scheme has |
+| a non-empty `sub` | grants are keyed by subject; a subjectless token could never be authorized |
+
+**Key fetches are bounded.** A token naming a key id the cached JWKS lacks
+triggers a refetch — that is how a key rotation works without a restart, and it
+is also the one network call an unauthenticated caller can provoke before any
+rate limit applies. So the refetch happens at most once a minute, concurrent
+misses share it, each fetch times out after five seconds, and verification runs
+off the event loop. A token signed with a key rotated in *during* that minute,
+after someone's probe, is refused until the minute lapses — never accepted
+wrongly. The JWT flags are refused on `--transport stdio`, where they would be
+accepted and verify nothing.
+
+**A token establishes identity, never authorization.** Only the subject is
+taken from it. With [operator-owned grants](#operator-owned-grants), groups and
+tenants are looked up by that subject — so a token that *claims* a tenant or a
+group gains nothing by claiming it, and a legitimately issued token cannot be
+turned into a privilege escalation by whoever minted it. Use `--grants-relation`
+with token verification; without it, a verified caller has an identity and no
+policy, and every governed read is refused.
+
+`--trust-proxy-principal-headers` and the JWT flags are mutually exclusive.
+Enabled together, the headers would decide and the token checking would be
+decoration, so the server refuses to start rather than pick.
+
+What this does not yet do: OAuth token introspection (RFC 7662) for opaque
+tokens, and the MCP authorization spec's metadata endpoints for clients that
+discover the issuer themselves. Both compose with this verifier rather than
+replacing it.
 
 ## Operator-owned grants
 

@@ -1553,6 +1553,29 @@ def mcp() -> None:
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", type=click.IntRange(1, 65535), default=8000, show_default=True)
 @click.option(
+    "--jwt-issuer",
+    default=None,
+    help=(
+        "Verify each caller's bearer token was issued by this issuer. With "
+        "--jwt-audience and --jwt-jwks-uri, identity comes from the token this "
+        "server verified rather than from a header it was told to trust."
+    ),
+)
+@click.option(
+    "--jwt-audience",
+    default=None,
+    help=(
+        "The audience every accepted token must name — this deployment. "
+        "Required with --jwt-issuer: without it, a token a caller legitimately "
+        "holds for another service is a valid token here."
+    ),
+)
+@click.option(
+    "--jwt-jwks-uri",
+    default=None,
+    help="HTTPS URL of the issuer's JWKS, used to verify token signatures.",
+)
+@click.option(
     "--trust-proxy-principal-headers",
     is_flag=True,
     help=(
@@ -1590,6 +1613,9 @@ def mcp_serve(
     transport: str,
     host: str,
     port: int,
+    jwt_issuer: str | None,
+    jwt_audience: str | None,
+    jwt_jwks_uri: str | None,
     trust_proxy_principal_headers: bool,
     timeout_seconds: float,
     max_concurrency: int,
@@ -1613,6 +1639,7 @@ def mcp_serve(
     from .mcp_server.catalog import ArtifactCatalogError
     from .mcp_server.server import serve_network, serve_stdio
     from .mcp_server.service import ContextServerSettings
+    from .mcp_server.tokens import TokenVerificationError
 
     settings = ContextServerSettings(
         timeout_seconds=timeout_seconds,
@@ -1622,6 +1649,8 @@ def mcp_serve(
         max_response_bytes=max_response_bytes,
         max_scan_rows=max_scan_rows,
     )
+    jwt_settings = (jwt_issuer, jwt_audience, jwt_jwks_uri)
+    verifying_tokens = any(jwt_settings)
     try:
         if transport == "stdio":
             if trust_proxy_principal_headers:
@@ -1629,6 +1658,14 @@ def mcp_serve(
                     "--trust-proxy-principal-headers applies to a network "
                     "transport; stdio resolves its principal from the "
                     "operator's environment."
+                )
+            if verifying_tokens:
+                # Refused rather than ignored: a flag that is accepted and
+                # does nothing looks, from the outside, like authentication.
+                raise ConfigClickError(
+                    "--jwt-issuer, --jwt-audience and --jwt-jwks-uri apply to "
+                    "a network transport; stdio resolves its principal from "
+                    "the operator's environment and would verify nothing."
                 )
             serve_stdio(
                 ctx.obj["project_dir"],
@@ -1639,27 +1676,71 @@ def mcp_serve(
                 settings=settings,
             )
             return
-        if not trust_proxy_principal_headers:
+        if verifying_tokens and not all(jwt_settings):
+            missing = [
+                name
+                for name, value in (
+                    ("--jwt-issuer", jwt_issuer),
+                    ("--jwt-audience", jwt_audience),
+                    ("--jwt-jwks-uri", jwt_jwks_uri),
+                )
+                if not value
+            ]
+            raise ConfigClickError(
+                "JWT verification needs all three of --jwt-issuer, "
+                f"--jwt-audience and --jwt-jwks-uri; missing {', '.join(missing)}. "
+                "Each is a security boundary, so none of them gets a default."
+            )
+        if verifying_tokens and trust_proxy_principal_headers:
+            raise ConfigClickError(
+                "Choose one identity source. --trust-proxy-principal-headers "
+                "believes whatever the proxy sets; JWT verification checks the "
+                "caller's own token. Enabling both means the headers decide, "
+                "and the token checking is decoration."
+            )
+        if not verifying_tokens and not trust_proxy_principal_headers:
             raise ConfigClickError(
                 f"--transport {transport} serves many callers, so each request "
                 "needs its own identity. No per-request principal source is "
                 "configured, and the stdio default would serve every caller as "
                 "one principal — with that principal's tenant filters. Pass "
-                "--trust-proxy-principal-headers if an authenticating proxy "
+                "--jwt-issuer/--jwt-audience/--jwt-jwks-uri to verify tokens, "
+                "or --trust-proxy-principal-headers if an authenticating proxy "
                 "sets them."
             )
-        click.echo(
-            f"Serving on {host}:{port} over {transport}. Caller identity comes "
-            "from proxy-set headers — verify the proxy authenticates and "
-            "overwrites them.",
-            err=True,
-        )
+        token_verifier = None
+        if verifying_tokens:
+            from .mcp_server.authorization import AccessTokenPrincipalResolver
+            from .mcp_server.tokens import JwksTokenVerifier, JwtVerifierConfig
+
+            token_verifier = JwksTokenVerifier(
+                JwtVerifierConfig(
+                    issuer=str(jwt_issuer),
+                    audience=str(jwt_audience),
+                    jwks_uri=str(jwt_jwks_uri),
+                )
+            )
+            resolver: Any = AccessTokenPrincipalResolver()
+            click.echo(
+                f"Serving on {host}:{port} over {transport}. Caller identity "
+                f"comes from bearer tokens verified against {jwt_issuer}.",
+                err=True,
+            )
+        else:
+            resolver = TrustedHeaderPrincipalResolver()
+            click.echo(
+                f"Serving on {host}:{port} over {transport}. Caller identity "
+                "comes from proxy-set headers — verify the proxy authenticates "
+                "and overwrites them.",
+                err=True,
+            )
         serve_network(
             ctx.obj["project_dir"],
             transport=transport,
             host=host,
             port=port,
-            principal_resolver=TrustedHeaderPrincipalResolver(),
+            principal_resolver=resolver,
+            token_verifier=token_verifier,
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
             grants_relation=grants_relation,
@@ -1667,6 +1748,10 @@ def mcp_serve(
             settings=settings,
         )
     except (ArtifactCatalogError, AuthorizationError, *_CONFIG_ERRORS) as error:
+        raise ConfigClickError(str(error)) from error
+    except TokenVerificationError as error:
+        # Raised at construction, before anything listens: a plaintext JWKS
+        # URL or a blank issuer is a configuration mistake, not a runtime one.
         raise ConfigClickError(str(error)) from error
 
 

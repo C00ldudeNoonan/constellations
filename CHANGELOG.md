@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.5 - 2026-09-02
 
 ### Per-principal rate limiting on the MCP server (issue #463)
 

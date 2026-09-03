@@ -16,11 +16,13 @@ the response runs for real.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
 import pytest
 
+from stel.mcp_server import introspection as introspection_module
 from stel.mcp_server.introspection import (
     IntrospectionTokenVerifier,
     IntrospectionVerifierConfig,
@@ -31,7 +33,14 @@ ISSUER = "https://issuer.example"
 AUDIENCE = "https://stel.example/mcp"
 ENDPOINT = "https://issuer.example/oauth2/introspect"
 CLIENT_ID = "stel-mcp"
+SECRET_ENV = "STEL_TEST_INTROSPECTION_SECRET"
 CLIENT_SECRET = "s3cret-value-not-in-any-log"
+
+
+@pytest.fixture(autouse=True)
+def _client_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The config refuses to build without it, by design."""
+    monkeypatch.setenv(SECRET_ENV, CLIENT_SECRET)
 
 
 def _config(**overrides: Any) -> IntrospectionVerifierConfig:
@@ -41,7 +50,7 @@ def _config(**overrides: Any) -> IntrospectionVerifierConfig:
             "audience": AUDIENCE,
             "introspection_endpoint": ENDPOINT,
             "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
+            "client_secret_env": SECRET_ENV,
             **overrides,
         }
     )
@@ -76,14 +85,10 @@ class _FakeClient:
     def __init__(self, script: _Script) -> None:
         self._script = script
 
-    async def __aenter__(self) -> _FakeClient:
-        return self
-
-    async def __aexit__(self, *exc: Any) -> bool:
-        return False
-
     async def post(self, url: str, **kwargs: Any) -> _FakeResponse:
         self._script.calls.append({"url": url, **kwargs})
+        if self._script.gate is not None:
+            await self._script.gate.wait()
         if self._script.error is not None:
             raise self._script.error
         return _FakeResponse(self._script.status_code, self._script.body)
@@ -98,13 +103,23 @@ class _Script:
         body: Any = None,
         status_code: int = 200,
         error: Exception | None = None,
+        gate: Any = None,
     ) -> None:
         self.body = body if body is not None else _body()
         self.status_code = status_code
         self.error = error
+        # Held open to keep requests in flight, for the concurrency bound.
+        self.gate = gate
         self.calls: list[dict[str, Any]] = []
+        self.clients_created = 0
+        self.limits: dict[str, Any] | None = None
+
+    def Limits(self, **kwargs: Any) -> dict[str, Any]:
+        self.limits = kwargs
+        return kwargs
 
     def AsyncClient(self, **kwargs: Any) -> _FakeClient:
+        self.clients_created += 1
         return _FakeClient(self)
 
 
@@ -126,20 +141,52 @@ def test_a_plaintext_endpoint_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ["issuer", "audience", "introspection_endpoint", "client_id", "client_secret"],
+    ["issuer", "audience", "introspection_endpoint", "client_id", "client_secret_env"],
 )
 def test_every_field_is_required(field: str) -> None:
     with pytest.raises(TokenVerificationError, match=field):
         _config(**{field: "   "})
 
 
-def test_the_client_secret_is_not_in_the_config_repr() -> None:
-    """A frozen dataclass renders every field by default, so one traceback
-    through a config object would put the secret in a log."""
-    rendered = repr(_config())
+def test_an_unset_secret_is_refused_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once, at startup — not one refused caller at a time."""
+    monkeypatch.delenv(SECRET_ENV, raising=False)
 
-    assert CLIENT_SECRET not in rendered
-    assert CLIENT_ID in rendered, "only the secret should be hidden"
+    with pytest.raises(TokenVerificationError, match="unset or empty"):
+        _config()
+
+
+def test_the_refusal_does_not_name_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AGENTS.md keeps credential environment-variable names out of
+    diagnostics; the operator just typed this one."""
+    monkeypatch.delenv(SECRET_ENV, raising=False)
+
+    with pytest.raises(TokenVerificationError) as excinfo:
+        _config()
+
+    assert SECRET_ENV not in str(excinfo.value)
+
+
+def test_the_config_never_holds_the_resolved_secret() -> None:
+    """`repr=False` would hide it from `repr()` and from nothing else.
+
+    A resolved credential in a long-lived object survives `asdict()`,
+    `__dict__`, a debugger and any generic dump, so the config carries the
+    variable's name and the value is read where the request is built (PR #487
+    review).
+    """
+    import dataclasses
+
+    config = _config()
+
+    assert CLIENT_SECRET not in repr(config)
+    assert CLIENT_SECRET not in str(dataclasses.asdict(config))
+    assert CLIENT_SECRET not in str(vars(config))
+    assert config.client_secret_env == SECRET_ENV
 
 
 # ─── what the verifier refuses ─────────────────────────────────────────────
@@ -287,6 +334,91 @@ async def test_the_call_authenticates_and_carries_the_token() -> None:
     assert call["data"]["token"] == "opaque-token"
     assert call["data"]["token_type_hint"] == "access_token"
     assert call["auth"] == (CLIENT_ID, CLIENT_SECRET)
+
+
+# ─── the unauthenticated path is bounded ───────────────────────────────────
+
+
+async def _settle() -> None:
+    """Run every ready task to its next real await.
+
+    Turns of the loop rather than a wall-clock sleep, so nothing here depends
+    on machine speed: the bound is asserted after the tasks have had every
+    chance to exceed it, and extra turns can only make a broken bound show.
+    """
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+async def test_one_pooled_client_serves_every_call() -> None:
+    """A client per call meant a TLS handshake per token and no ceiling on the
+    sockets an unauthenticated flood could open (PR #487 review)."""
+    script = _Script()
+    verifier = _verifier(script)
+
+    await verifier.verify_token("token-a")
+    await verifier.verify_token("token-b")
+    await verifier.verify_token("token-c")
+
+    assert len(script.calls) == 3
+    assert script.clients_created == 1
+    assert script.limits == {
+        "max_connections": introspection_module._MAX_CONNECTIONS,
+        "max_keepalive_connections": introspection_module._MAX_CONNECTIONS,
+    }
+
+
+@pytest.mark.anyio
+async def test_only_so_many_introspections_run_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK verifies before any tool runs, so the service's rate limits are
+    downstream of this call. Without a bound of its own, a caller who has
+    proven nothing decides how many outbound requests this server makes."""
+    monkeypatch.setattr(introspection_module, "_MAX_CONCURRENT_INTROSPECTIONS", 2)
+    gate = asyncio.Event()
+    script = _Script(gate=gate)
+    verifier = _verifier(script)
+
+    tasks = [
+        asyncio.create_task(verifier.verify_token(f"token-{n}")) for n in range(6)
+    ]
+    await _settle()
+    in_flight = len(script.calls)
+    gate.set()
+    await asyncio.gather(*tasks)
+
+    assert in_flight == 2, f"{in_flight} requests in flight past the bound of 2"
+    assert len(script.calls) == 6, "every caller was eventually served"
+
+
+@pytest.mark.anyio
+async def test_a_caller_that_cannot_get_a_slot_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusing beats queueing without limit: the queue would itself be the
+    resource an attacker grows. 'Too busy to ask' is the same answer as every
+    other failure here — cannot vouch for this caller."""
+    monkeypatch.setattr(introspection_module, "_MAX_CONCURRENT_INTROSPECTIONS", 1)
+    monkeypatch.setattr(introspection_module, "_SLOT_WAIT_SECONDS", 0.01)
+    gate = asyncio.Event()
+    script = _Script(gate=gate)
+    verifier = _verifier(script)
+
+    held = asyncio.create_task(verifier.verify_token("token-holding-the-slot"))
+    await _settle()
+    # Bounded so a verifier that lost its bound fails this test rather than
+    # hanging it: without the semaphore this call reaches the gated request
+    # and would block until the gate opens, which is after this line.
+    refused = await asyncio.wait_for(
+        verifier.verify_token("token-arriving-under-load"), timeout=5.0
+    )
+    gate.set()
+    await held
+
+    assert refused is None
+    assert len(script.calls) == 1, "the refused caller never reached the issuer"
 
 
 # ─── the cache, which is also the revocation delay ─────────────────────────

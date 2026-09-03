@@ -203,9 +203,13 @@ stel mcp serve --transport streamable-http --host 0.0.0.0 --port 8000 \
 
 All five are required, for the same reason the JWT flags are. The secret is
 passed by **environment variable name**, never as a flag value: a secret on the
-command line is visible in the process list and the shell history. The endpoint
-must be `https` — the caller's token is sent to it in the request body, so
-plaintext hands the credential itself to anyone on the path.
+command line is visible in the process list and the shell history. Only the
+name is held — the value is read at the moment each request is built, so no
+long-lived object carries it into a dump, a debugger, or a crash report, and a
+rotated secret takes effect without a restart. The server refuses to start if
+the variable is unset. The endpoint must be `https` — the caller's token is
+sent to it in the request body, so plaintext hands the credential itself to
+anyone on the path.
 
 | check | why it is not optional |
 |---|---|
@@ -219,6 +223,16 @@ An authorization server that omits `aud` from its introspection response
 **cannot be used**, because the confused-deputy check above becomes impossible.
 Anything that is not a clean `200` — bad client credentials, a down issuer — is
 "cannot vouch for this caller", never "let them in".
+
+**The introspection call is bounded, because it sits on the unauthenticated
+path.** Tokens are verified before any tool runs, so the per-principal and
+global rate limits above are downstream of this: a caller who has proven
+nothing decides how many outbound requests this server makes to your
+authorization server. All introspections share one pooled client with a
+connection ceiling, at most sixteen are in flight at once, and a caller that
+cannot get a slot within two seconds is refused rather than queued — an
+unbounded queue would itself be the resource worth attacking. "Too busy to
+ask" is the same answer as every other failure here.
 
 **A cache hit is a revocation delay, and that is the trade.** Every request
 would otherwise cost a round trip on a path that already has a timeout budget,

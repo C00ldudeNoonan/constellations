@@ -20,8 +20,15 @@ and authorization stays with operator-owned grants.
   demanded: unlike a self-contained JWT, the answer came over TLS from the one
   endpoint the operator named, authenticated as a registered client.
 - **The secret is passed by environment-variable name**, never as a flag value
-  that the process list and shell history would carry, and it is kept out of
-  the config's `repr` so a traceback cannot leak it.
+  that the process list and shell history would carry — and only the name is
+  held. The value is read where each request is built, so no long-lived object
+  carries it into an `asdict()`, a `__dict__`, a debugger, or a crash dump.
+  The server refuses to start if the variable is unset.
+- **The call is bounded, because it sits on the unauthenticated path.** Tokens
+  are verified before any tool runs, so the server's rate limits are downstream
+  of it: introspections share one pooled client with a connection ceiling, at
+  most sixteen run at once, and a caller that cannot get a slot is refused
+  rather than queued.
 - **A cache hit is a revocation delay.** A verified token is reused for up to a
   minute, capped by its own `exp`, which is also how long a revoked token keeps
   working. Failures are never cached, and entries are keyed by digest rather

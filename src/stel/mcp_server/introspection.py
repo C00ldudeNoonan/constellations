@@ -31,16 +31,33 @@ while doing nothing about the shape that matters — distinct invented tokens,
 which miss every time — and every cache keyed by attacker-supplied input is
 memory an unauthenticated caller can grow.
 
+**This whole path is unauthenticated, and it is the one that makes network
+calls.** The SDK verifies a bearer token *before any tool runs*, so the
+service's own concurrency and rate limits are downstream of everything here: a
+caller who has proven nothing decides how many distinct tokens arrive, and each
+cache miss is an outbound request to someone else's authorization server.
+Unbounded, a small parallel flood becomes unbounded sockets here and a denial
+of service there. So the calls share one pooled client with a connection
+ceiling, and only `_MAX_CONCURRENT_INTROSPECTIONS` may be in flight; a caller
+that cannot get a slot promptly is refused rather than queued indefinitely.
+Refusing under load is the correct direction for a verifier — the answer is
+"cannot vouch for this caller", which is what every other failure here says
+too.
+
 **Nothing here reaches a log.** The token is a credential in a request body,
-the response describes a live session, and the client secret authenticates
-this server to the issuer. None of the three appear in a message, an
-exception, or a cache key: entries are keyed by digest, and the secret is kept
-out of the config's `repr` so a traceback cannot carry it.
+the response describes a live session, and the client secret authenticates this
+server to the issuer. None of the three appear in a message, an exception, or a
+cache key: entries are keyed by digest, and the secret is never held at all —
+the config carries the *name* of the environment variable, and the value is
+read at the moment the request is built. `repr=False` would not have been
+enough, since `asdict`, `__dict__`, and a debugger all walk straight past it.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from threading import Lock
 from time import time
 from typing import Any
@@ -53,6 +70,16 @@ from .tokens import TokenVerificationError
 # every unverified caller, so a slow issuer must not become this server's
 # latency.
 _REQUEST_TIMEOUT_SECONDS = 5.0
+
+# In-flight introspections, and the sockets they may hold. Equal on purpose:
+# the point of both is that an unauthenticated flood cannot grow either.
+_MAX_CONCURRENT_INTROSPECTIONS = 16
+_MAX_CONNECTIONS = 16
+
+# How long a caller waits for one of those slots before being refused. Long
+# enough to ride out a burst, short enough that the queue itself cannot become
+# the resource an attacker grows.
+_SLOT_WAIT_SECONDS = 2.0
 
 # Ceiling on how long a verified token is reused without asking again. Also
 # the longest a revoked token keeps working; the two are the same number.
@@ -76,9 +103,12 @@ class IntrospectionVerifierConfig:
     audience: str
     introspection_endpoint: str
     client_id: str
-    # Never in a repr: a frozen dataclass renders every field by default, and
-    # one traceback through a config object would put the secret in a log.
-    client_secret: str = field(repr=False)
+    # The variable's *name*, never the secret it holds. A resolved credential
+    # living in a long-lived config object survives `asdict()`, `__dict__`, a
+    # debugger, and any generic dump; `repr=False` hides it from exactly one of
+    # those. AGENTS.md asks for the reference to be preserved and the value
+    # revealed only where it is used, which is `_client_auth` below.
+    client_secret_env: str
 
     def __post_init__(self) -> None:
         for name in (
@@ -86,13 +116,22 @@ class IntrospectionVerifierConfig:
             "audience",
             "introspection_endpoint",
             "client_id",
-            "client_secret",
+            "client_secret_env",
         ):
             if not str(getattr(self, name)).strip():
-                # Named, not shown. The empty one may be the secret.
                 raise TokenVerificationError(
                     f"token introspection requires a non-empty {name}"
                 )
+        if not os.environ.get(self.client_secret_env, "").strip():
+            # Checked once, at startup, so a misconfiguration is not discovered
+            # one refused caller at a time. The variable's name is not repeated
+            # back: AGENTS.md keeps credential environment-variable names out
+            # of diagnostics.
+            raise TokenVerificationError(
+                "the environment variable named by client_secret_env is unset "
+                "or empty; it holds the secret this server authenticates to "
+                "the introspection endpoint with"
+            )
         scheme = urlparse(self.introspection_endpoint).scheme.lower()
         if scheme != "https":
             raise TokenVerificationError(
@@ -126,6 +165,8 @@ class IntrospectionTokenVerifier:
         )
         self._lock = Lock()
         self._cache: dict[str, _CacheEntry] = {}
+        self._slots = asyncio.Semaphore(_MAX_CONCURRENT_INTROSPECTIONS)
+        self._client: Any = None
 
     async def verify_token(self, token: str) -> Any:
         access_token = import_optional_dependency(
@@ -153,35 +194,76 @@ class IntrospectionTokenVerifier:
             claims=claims,
         )
 
-    async def _introspect(self, token: str) -> dict[str, Any] | None:
-        """The RFC 7662 call. Returns the parsed body, or None for anything
-        that is not a clean 200 — a 401 from bad client credentials and a 503
-        from a down issuer are both "cannot vouch for this caller".
+    def _pooled_client(self) -> Any:
+        """One client for the process, with a ceiling on its sockets.
+
+        A client per call meant a TLS handshake per token and no bound at all
+        on how many an unauthenticated flood could open (PR #487 review). It is
+        created on first use so construction does not require a running loop,
+        and never closed: it lives exactly as long as the server does.
         """
+        if self._client is None:
+            self._client = self._httpx.AsyncClient(
+                timeout=_REQUEST_TIMEOUT_SECONDS,
+                limits=self._httpx.Limits(
+                    max_connections=_MAX_CONNECTIONS,
+                    max_keepalive_connections=_MAX_CONNECTIONS,
+                ),
+            )
+        return self._client
+
+    def _client_auth(self) -> tuple[str, str] | None:
+        """The client credentials, read at the moment of use.
+
+        Resolved here rather than held in the config, so the plaintext secret
+        exists only for the length of one request. Rereading also means a
+        rotated secret takes effect without a restart.
+        """
+        secret = os.environ.get(self._config.client_secret_env, "")
+        if not secret:
+            return None
+        return (self._config.client_id, secret)
+
+    async def _introspect(self, token: str) -> dict[str, Any] | None:
+        """The RFC 7662 call, under the concurrency bound. Returns the parsed
+        body, or None for anything that is not a clean 200 — a 401 from bad
+        client credentials and a 503 from a down issuer are both "cannot vouch
+        for this caller", and so is being too busy to ask.
+        """
+        auth = self._client_auth()
+        if auth is None:
+            # Verified at startup, so reaching here means the variable was
+            # unset under a running server. Unauthenticated introspection would
+            # be refused by the issuer anyway; not asking is the same answer
+            # without the round trip.
+            return None
         try:
-            async with self._httpx.AsyncClient(
-                timeout=_REQUEST_TIMEOUT_SECONDS
-            ) as client:
-                response = await client.post(
-                    self._config.introspection_endpoint,
-                    data={
-                        "token": token,
-                        "token_type_hint": "access_token",
-                    },
-                    # The scheme the RFC names first, and the one every
-                    # authorization server implements.
-                    auth=(self._config.client_id, self._config.client_secret),
-                    headers={"Accept": "application/json"},
-                )
-                if response.status_code != 200:
-                    return None
-                body = response.json()
+            await asyncio.wait_for(self._slots.acquire(), _SLOT_WAIT_SECONDS)
+        except TimeoutError:
+            return None
+        try:
+            response = await self._pooled_client().post(
+                self._config.introspection_endpoint,
+                data={
+                    "token": token,
+                    "token_type_hint": "access_token",
+                },
+                # The scheme the RFC names first, and the one every
+                # authorization server implements.
+                auth=auth,
+                headers={"Accept": "application/json"},
+            )
+            if response.status_code != 200:
+                return None
+            body = response.json()
         except Exception:
             # Transport failure, a timeout, or a body that is not JSON. The
             # text of any of them can quote the request — which carries the
             # token and the client secret — so none of it is logged or
             # re-raised (AGENTS.md: provider response bodies stay out of logs).
             return None
+        finally:
+            self._slots.release()
         return body if isinstance(body, dict) else None
 
     def _accepted_claims(self, body: dict[str, Any]) -> dict[str, Any] | None:

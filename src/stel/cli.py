@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import time
 from collections.abc import Callable
@@ -1827,24 +1826,16 @@ def mcp_serve(
                 IntrospectionVerifierConfig,
             )
 
-            secret = os.environ.get(str(introspection_client_secret_env), "")
-            if not secret.strip():
-                # The variable's name is not repeated back: AGENTS.md keeps
-                # credential environment-variable names out of diagnostics, and
-                # the operator just typed it.
-                raise ConfigClickError(
-                    "The environment variable named by "
-                    "--introspection-client-secret-env is unset or empty. It "
-                    "holds the secret this server authenticates to the "
-                    "introspection endpoint with."
-                )
+            # The variable's name is passed through, not its value: the secret
+            # is read only where the request is built, so no long-lived object
+            # here holds it. The config refuses at startup if it is unset.
             token_verifier = IntrospectionTokenVerifier(
                 IntrospectionVerifierConfig(
                     issuer=str(introspection_issuer),
                     audience=str(introspection_audience),
                     introspection_endpoint=str(introspection_endpoint),
                     client_id=str(introspection_client_id),
-                    client_secret=secret,
+                    client_secret_env=str(introspection_client_secret_env),
                 )
             )
             resolver = AccessTokenPrincipalResolver()

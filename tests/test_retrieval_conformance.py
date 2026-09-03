@@ -24,6 +24,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
+from stel.retrieval import StoreRole
 from stel.retrieval.base import (
     CollectionSpec,
     IndexedRow,
@@ -61,12 +62,14 @@ def _build_store(kind: str, tmp_path: Path) -> RetrievalStore:
             project_name="proj",
             target_name="dev",
             alias="default",
+            role=StoreRole.PUBLISH,
         )
     return LanceDBStore(
         LanceDBConfig(type="lancedb", path=str(tmp_path / "lance")),
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
 
 

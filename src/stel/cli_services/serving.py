@@ -36,7 +36,7 @@ def _resolve_serving_scopes(
     raise ConfigClickError (exit 2); configuration/profile errors propagate for
     the edge to translate."""
     from ..adapters.base import StateScope
-    from ..retrieval import create_store
+    from ..retrieval import StoreRole, create_store
 
     project_config, sources, models = load_project(project_dir)
     validate_project_contract(project_config, sources, models, project_dir)
@@ -59,6 +59,8 @@ def _resolve_serving_scopes(
         project_name=project_config.name,
         target_name=resolved.target_name,
         alias=alias,
+        # Ledger admin: reads the descriptor, never an index.
+        role=StoreRole.INSPECT,
     )
     logical = model.search.collection or model.name
     state_target = store.state_descriptor(logical)

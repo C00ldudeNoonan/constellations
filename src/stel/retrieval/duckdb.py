@@ -60,6 +60,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    StoreRole,
     reject_generation_shaped_collection_name,
     validate_generation_token,
 )
@@ -188,6 +189,7 @@ class DuckDBStore(RetrievalStore):
         project_name: str,
         target_name: str,
         alias: str,
+        role: StoreRole,
     ) -> None:
         if not isinstance(config, DuckDBConfig):
             raise RetrievalError("DuckDB store received incompatible configuration")
@@ -196,6 +198,7 @@ class DuckDBStore(RetrievalStore):
             project_name=project_name,
             target_name=target_name,
             alias=alias,
+            role=role,
         )
         self._config = config
         self._conn: Any | None = None

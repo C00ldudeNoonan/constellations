@@ -47,6 +47,7 @@ from stel.retrieval import (
     RetrievalPredicateOperator,
     ServingCoordinator,
     StaleServingLeaseError,
+    StoreRole,
     collection_config_fingerprint,
     create_store,
 )
@@ -282,6 +283,7 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store:
         metadata = store.inspect_collection("retrieval_demo__dev__context")
@@ -434,6 +436,7 @@ def test_search_state_is_scoped_to_safe_target(tmp_path: Path) -> None:
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     descriptor = store.state_descriptor("context")
     scope = StateScope.for_target_descriptor(
@@ -466,6 +469,7 @@ def test_failed_store_mutation_does_not_advance_state(
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     descriptor = store.state_descriptor("context")
     scope = StateScope.for_target_descriptor(
@@ -515,6 +519,7 @@ def test_failed_index_validation_keeps_receipted_state_and_blocks_readiness(
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     scope = StateScope.for_target_descriptor(
         "context_search",
@@ -565,6 +570,7 @@ def test_failed_snapshot_validation_keeps_receipted_state_and_blocks_readiness(
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     scope = StateScope.for_target_descriptor(
         "context_search",
@@ -634,6 +640,7 @@ def test_unacknowledged_receipt_advances_no_state(
                 project_name=project.name,
                 target_name=resolved.target_name,
                 alias="primary",
+                role=StoreRole.PUBLISH,
             ).state_descriptor("context").descriptor(),
         )
         assert adapter.fetch_state(scope) == {}
@@ -671,6 +678,7 @@ def test_wrong_vector_dimensions_fail_without_store_mutation(tmp_path: Path) -> 
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store:
         assert store.inspect_collection("retrieval_demo__dev__context") is None
@@ -703,6 +711,7 @@ def test_invalid_record_id_fails_before_collection_creation(
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store:
         assert store.inspect_collection("retrieval_demo__dev__context") is None
@@ -762,6 +771,7 @@ def test_empty_input_creates_typed_empty_collection(tmp_path: Path) -> None:
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store:
         metadata = store.inspect_collection("retrieval_demo__dev__context")
@@ -779,6 +789,7 @@ def _store_for(project_dir: Path) -> Any:
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
 
 
@@ -842,6 +853,7 @@ def test_index_config_change_leaves_existing_collection_untouched(tmp_path: Path
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store:
         metadata = store.inspect_collection("retrieval_demo__dev__context")
@@ -876,6 +888,7 @@ def test_tuning_batch_size_does_not_invalidate_the_published_index(
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
     with store:
         metadata = store.inspect_collection("retrieval_demo__dev__context")
@@ -1105,6 +1118,7 @@ def test_lancedb_query_api_rejects_unowned_collections(tmp_path: Path) -> None:
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
 
     with store, pytest.raises(RetrievalError) as raised:
@@ -1143,6 +1157,7 @@ def test_every_declared_attribute_type_round_trips_a_filter(tmp_path: Path) -> N
         project_name=project.name,
         target_name=resolved.target_name,
         alias="primary",
+        role=StoreRole.PUBLISH,
     )
 
     # (attribute, operator, value, expected chunk_ids) — one per data_type.
@@ -1480,6 +1495,7 @@ def _gen_store(tmp_path: Path) -> Any:
         project_name="proj",
         target_name="dev",
         alias="default",
+        role=StoreRole.PUBLISH,
     )
 
 

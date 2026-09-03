@@ -36,6 +36,7 @@ from .retrieval import (
     RetrievalPredicate,
     RetrievalPredicateOperator,
     ServingCoordinator,
+    StoreRole,
     collection_config_fingerprint,
     create_store,
 )
@@ -298,6 +299,8 @@ def search(
         project_name=project_config.name,
         target_name=resolved.target_name,
         alias=alias,
+        # Querying: ANN latency depends on the index staying resident.
+        role=StoreRole.SERVE,
     )
     _validate_capabilities(
         model,

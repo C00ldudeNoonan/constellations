@@ -46,6 +46,7 @@ from ..retrieval import (
     RetrievalFeature,
     ServingCoordinationError,
     ServingCoordinator,
+    StoreRole,
     classify_descriptor_changes,
     collection_config_fingerprint,
     collection_descriptor,
@@ -140,6 +141,8 @@ def _run_search_model(
         project_name=project.name,
         target_name=resolved.target_name,
         alias=alias,
+        # Writing: bounded, so the merge and the index build keep the ceiling.
+        role=StoreRole.PUBLISH,
     )
     projected = search.projected_fields()
     inserted = 0

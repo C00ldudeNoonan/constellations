@@ -13,7 +13,7 @@ from stel.cli import cli
 from stel.config import SearchConfig, load_project
 from stel.manifest import build_manifest
 from stel.profile import resolve_profile
-from stel.retrieval import create_store
+from stel.retrieval import StoreRole, create_store
 from stel.runner import run_project
 from stel.search import (
     SearchError,
@@ -333,6 +333,7 @@ def test_same_request_runs_against_mocked_remote_store(
         project_name=project.name,
         target_name=resolved.target_name,
         alias="local",
+        role=StoreRole.PUBLISH,
     )
     physical = real_store.physical_collection("release_search")
     with real_store:

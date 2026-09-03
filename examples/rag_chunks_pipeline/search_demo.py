@@ -5,7 +5,7 @@ from pathlib import Path
 
 from stel.config import load_project
 from stel.profile import resolve_profile
-from stel.retrieval import create_store
+from stel.retrieval import StoreRole, create_store
 
 PROJECT_DIR = Path(__file__).parent
 
@@ -20,6 +20,8 @@ def main() -> None:
         project_name=project.name,
         target_name=profile.target_name,
         alias="local",
+        # This demo queries, so it wants the serving budget.
+        role=StoreRole.SERVE,
     )
     collection = store.physical_collection("document_chunks")
     with store:

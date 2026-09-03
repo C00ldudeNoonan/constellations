@@ -14,6 +14,7 @@ from pydantic import ConfigDict, Field, field_validator
 
 from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
+from ..memory import container_memory_limit_bytes
 from ..optional_dependencies import (
     import_optional_dependency,
     optional_dependency_version,
@@ -33,6 +34,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    StoreRole,
     reject_generation_shaped_collection_name,
     validate_generation_token,
 )
@@ -40,6 +42,100 @@ from .locks import PublisherLock, default_host_lock_base
 from .registry import register
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+_MB = 1024 * 1024
+
+# Per-role cache budgets in MiB, as (index, metadata), used when the profile
+# names none (issue #479).
+#
+# `SERVE` is absent on purpose rather than set to a large number: leaving the
+# serving path on LanceDB's own defaults keeps ANN query latency exactly as it
+# is today, and this change is not the place to relitigate it. An operator who
+# needs serving bounded — the same 20 GiB container hosting a query process —
+# sets the fields explicitly, which wins in every role.
+#
+# The publisher numbers are bounds, not measurements of need: publish-side
+# session occupancy measured 5 MB on a 600k-row collection (issue #475), so
+# 256 MB is already generous for what the publisher demonstrably uses, while
+# leaving the ceiling to the merge and the index build that actually need it.
+_ROLE_CACHE_BUDGET_MB: dict[StoreRole, tuple[int, int]] = {
+    StoreRole.PUBLISH: (256, 64),
+    StoreRole.INSPECT: (32, 16),
+}
+
+# LanceDB's own defaults, as its Session docs give them.
+_LANCEDB_DEFAULT_BUDGET_MB = (6 * 1024, 1024)
+
+# Share of a detected container ceiling the caches may take between them. The
+# serving process is the one this binds: its default is LanceDB's ~7 GB, which
+# is most of a small container before the query process holds anything. Half
+# leaves the other half to the process itself, and on a container large enough
+# for LanceDB's defaults it does not bind at all — a 20 GiB box allows 10 GiB
+# and the default asks for 7.
+_CEILING_CACHE_SHARE = 0.5
+
+
+def session_cache_budget(
+    config: LanceDBConfig, role: StoreRole
+) -> tuple[int, int] | None:
+    """Cache sizes in bytes as `(index, metadata)`, or None for LanceDB's own.
+
+    An explicit profile setting wins in every role; a role default fills in
+    only what the profile left unset, so bounding one cache does not silently
+    unbound the other.
+
+    A detected container ceiling clamps a *default* but never an explicit
+    setting: the operator may know something the cgroup does not, and this is
+    advisory the same way #412's DuckDB detection is.
+    """
+    default = _ROLE_CACHE_BUDGET_MB.get(role)
+    index_mb = config.index_cache_size_mb
+    metadata_mb = config.metadata_cache_size_mb
+    configured = index_mb is not None and metadata_mb is not None
+    if default is None and index_mb is None and metadata_mb is None:
+        # SERVE, unconfigured: LanceDB's defaults, unless a container ceiling
+        # makes them absurd for the box we are actually on.
+        clamped = _clamped_to_ceiling(_LANCEDB_DEFAULT_BUDGET_MB)
+        return None if clamped is None else _to_bytes(clamped)
+    fallback = default or (0, 0)
+    resolved_index = index_mb if index_mb is not None else fallback[0]
+    resolved_metadata = metadata_mb if metadata_mb is not None else fallback[1]
+    if not resolved_index or not resolved_metadata:
+        # One side configured under a role with no default (SERVE): fill the
+        # other from LanceDB's documented defaults rather than from zero, which
+        # would disable a cache nobody asked to disable.
+        resolved_index = resolved_index or _LANCEDB_DEFAULT_BUDGET_MB[0]
+        resolved_metadata = resolved_metadata or _LANCEDB_DEFAULT_BUDGET_MB[1]
+    resolved = (resolved_index, resolved_metadata)
+    if not configured:
+        resolved = _clamped_to_ceiling(resolved) or resolved
+    return _to_bytes(resolved)
+
+
+def _to_bytes(budget_mb: tuple[int, int]) -> tuple[int, int]:
+    return (budget_mb[0] * _MB, budget_mb[1] * _MB)
+
+
+def _clamped_to_ceiling(budget_mb: tuple[int, int]) -> tuple[int, int] | None:
+    """`budget_mb` reduced to fit a detected container ceiling, or None.
+
+    None means "nothing to say": no ceiling detected, or one roomy enough that
+    the budget already fits. The two caches are scaled together so their
+    relative sizing — which is LanceDB's shape, not ours to reinterpret —
+    survives the clamp, and neither is driven below 1 MB.
+    """
+    ceiling = container_memory_limit_bytes()
+    if ceiling is None:
+        return None
+    allowance_mb = int(ceiling * _CEILING_CACHE_SHARE) // _MB
+    total_mb = budget_mb[0] + budget_mb[1]
+    if total_mb <= allowance_mb:
+        return None
+    scale = allowance_mb / total_mb
+    return (
+        max(int(budget_mb[0] * scale), 1),
+        max(int(budget_mb[1] * scale), 1),
+    )
 
 # Arrow schema metadata written into every collection stel creates. These
 # names live in existing LanceDB collections, so they are data, not code.
@@ -113,6 +209,14 @@ class LanceDBConfig(RetrievalStoreConfig):
     collection_template: str = "{project}__{target}__{collection}"
     timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     minimum_consistency: Literal["strong"] = "strong"
+    # Cache budgets handed to LanceDB's `Session` (issue #479). Unset means
+    # "the role's default" (see `session_cache_budget`), not "LanceDB's":
+    # LanceDB's own are ~6 GB index + 1 GB metadata, which is 7 GB of
+    # unasked-for budget on a memory-limited publisher. These are execution
+    # settings, deliberately absent from `routing_options()` and the safe
+    # descriptor, so changing one cannot reclassify a published collection.
+    index_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
+    metadata_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
 
     @field_validator("path")
     @classmethod
@@ -229,6 +333,7 @@ class LanceDBStore(RetrievalStore):
         project_name: str,
         target_name: str,
         alias: str,
+        role: StoreRole,
     ) -> None:
         if not isinstance(config, LanceDBConfig):
             raise RetrievalError("LanceDB store received incompatible configuration")
@@ -237,6 +342,7 @@ class LanceDBStore(RetrievalStore):
             project_name=project_name,
             target_name=target_name,
             alias=alias,
+            role=role,
         )
         self._config = config
         self._db: Any | None = None
@@ -302,6 +408,16 @@ class LanceDBStore(RetrievalStore):
                 connect_kwargs["storage_options"] = storage_options
         else:
             self._config.local_data_path().mkdir(parents=True, exist_ok=True)
+        budget = session_cache_budget(self._config, self.role)
+        if budget is not None:
+            # Without a Session, LanceDB takes its own defaults (~6 GB index +
+            # 1 GB metadata), which a container ceiling is invisible to
+            # (issue #479, the #412 shape one store over).
+            index_bytes, metadata_bytes = budget
+            connect_kwargs["session"] = lancedb.Session(
+                index_cache_size_bytes=index_bytes,
+                metadata_cache_size_bytes=metadata_bytes,
+            )
         try:
             self._db = lancedb.connect(
                 self._config.connect_target(), **connect_kwargs

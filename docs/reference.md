@@ -2132,6 +2132,44 @@ my_project:
             path: ./target/lancedb
 ```
 
+#### Bounding LanceDB's caches
+
+LanceDB keeps an index cache and a metadata cache whose own defaults are large
+— documented as equivalent to 6 GB and 1 GB. Nothing in a container makes those
+numbers smaller, so on a memory-limited host they are budget the process never
+asked for, on top of whatever the publish itself holds.
+
+stel therefore picks a default from what the process is *doing* with the store:
+
+| role | index cache | metadata cache | why |
+|------|-------------|----------------|-----|
+| publishing (`stel run`) | 256 MB | 64 MB | writing; the merge and the ANN index build need the ceiling, and caching an index being replaced buys nothing |
+| serving (`stel search`, the MCP server) | LanceDB's default | LanceDB's default | ANN latency depends on the index staying resident |
+| inspecting (compile, manifest, `stel serving`) | 32 MB | 16 MB | reads descriptors and row counts; never touches an index |
+
+Either budget can be set explicitly, and an explicit setting wins in every
+role — including serving, which is how you bound a query process that shares a
+container:
+
+```yaml
+          local:
+            type: lancedb
+            path: gs://bucket/prefix
+            index_cache_size_mb: 2048
+            metadata_cache_size_mb: 256
+```
+
+Under a container memory limit, a *default* is scaled down to fit half that
+ceiling, using the same cgroup detection `memory_limit` uses for DuckDB. This
+mostly binds serving: LanceDB's ~7 GB of defaults is most of a 2 GiB container
+before the query process holds anything, while a 20 GiB one allows 10 GiB and
+nothing is clamped. An explicit setting is never scaled — the operator may
+know something the cgroup does not.
+
+These are execution settings, not identity: changing one does not alter the
+store's descriptor, so it cannot reclassify a published collection or strand
+its incremental state.
+
 ### DuckDB-native search
 
 When the warehouse is already DuckDB, a separate retrieval system is an extra

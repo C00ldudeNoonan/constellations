@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -19,6 +18,7 @@ from ..config.profile import WarehouseConfig
 from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
 from ..logging_setup import REPORTER_ECHO_EXTRA
+from ..memory import container_memory_limit_bytes
 from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
 from .base import (
@@ -201,56 +201,6 @@ _CGROUP_MEMORY_FRACTION = 0.75
 # killed, and the operator can still override.
 _MIN_DETECTED_LIMIT_BYTES = 16 * 1024 * 1024
 
-_CGROUP_V2_MAX = Path("/sys/fs/cgroup/memory.max")
-_CGROUP_V1_MAX = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-
-
-def _read_cgroup_limit_bytes() -> int | None:
-    """The container memory ceiling, or None when not running under one.
-
-    Reads the standard cgroup mount rather than resolving this process's own
-    cgroup path: container runtimes mount the container's own cgroup there, and
-    the delegated-subtree cases where that is wrong are ones where an operator
-    can set `memory_limit` explicitly. Not DuckDB-specific in principle — it
-    lives here because this is its only caller.
-    """
-    for path in (_CGROUP_V2_MAX, _CGROUP_V1_MAX):
-        if not path.is_file():
-            continue
-        try:
-            raw = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            # An unreadable cgroup file is not worth failing a run over; it
-            # just means no detection.
-            continue
-        # v2 spells unlimited as "max"; v1 as a sentinel near 2**63. Either
-        # way, and for any ceiling at or above physical RAM, there is no
-        # container constraint to respect and DuckDB's own default is right.
-        if raw == "max" or not raw.isdigit():
-            return None
-        value = int(raw)
-        physical = _physical_memory_bytes()
-        if value <= 0 or physical is None or value >= physical:
-            return None
-        return value
-    return None
-
-
-def _physical_memory_bytes() -> int | None:
-    """Host RAM, or None where the platform cannot say.
-
-    `os.sysconf` does not exist on Windows. Only reached when a cgroup file was
-    found, so in practice this is Linux — the guard keeps the module importable
-    and type-checkable everywhere.
-    """
-    sysconf = getattr(os, "sysconf", None)
-    if sysconf is None:
-        return None
-    try:
-        return int(sysconf("SC_PAGE_SIZE")) * int(sysconf("SC_PHYS_PAGES"))
-    except (OSError, ValueError):
-        return None
-
 
 def _detected_memory_limit() -> str | None:
     """A DuckDB size string derived from the container ceiling, or None.
@@ -259,7 +209,9 @@ def _detected_memory_limit() -> str | None:
     this never raises a limit DuckDB would otherwise have chosen — it only
     supplies one where DuckDB would otherwise size itself from host RAM.
     """
-    ceiling = _read_cgroup_limit_bytes()
+    # The reader itself is shared (`stel.memory`, issue #476); the 75%
+    # budget below is what is DuckDB's own.
+    ceiling = container_memory_limit_bytes()
     if ceiling is None:
         return None
     budget = max(int(ceiling * _CGROUP_MEMORY_FRACTION), _MIN_DETECTED_LIMIT_BYTES)

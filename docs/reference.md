@@ -2327,6 +2327,22 @@ Three things follow from how the field is stamped:
   extension has one HNSW); declaring another type against it is refused at
   compile time, naming the LanceDB store.
 
+**stel estimates the build before paying for the rows.** Inside a container,
+a publish reads the cgroup memory ceiling and, from the row count, the
+dimensions, and the ratios above, warns when the build would need more than
+75% of it — the same share the DuckDB adapter reserves for the same reason:
+the ceiling also holds the Python process, and the build lands on top of
+whatever the publish already has resident. On a collection that already
+exists the warning comes before the run spends its time; on a first publish it
+comes the moment the streamed row count crosses the line — which, since that
+check runs after every batch, is always before the build. It names the
+type, the estimate, the ceiling, and the remedy (`index: ivf_pq`, or a larger
+container when that is already the type). It is a warning, not a refusal: the
+ratios are measurements, not a contract. Outside a container there is no
+ceiling to compare against, and nothing is said. The per-batch memory line
+(`publication memory ... rss_bytes=... limit_bytes=...`) carries the same
+ceiling so a sample can be read against it.
+
 `run` and `build` stream projected Arrow batches from the warehouse, validate
 the declared row contract before each mutation, upsert changed rows, delete
 stale rows, and advance warehouse state only after exact durable receipts,

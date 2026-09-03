@@ -48,3 +48,18 @@ def test_memory_diagnostics_do_not_fail_on_unreadable_proc(
 
     monkeypatch.setattr(Path, "read_text", denied)
     assert publication_memory.resident_bytes(status) is None
+
+
+def test_memory_log_carries_the_container_limit_beside_the_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An RSS figure is only legible against the ceiling it is measured under."""
+    status = tmp_path / "status"
+    status.write_text("VmRSS: 10 kB\n", encoding="utf-8")
+    monkeypatch.setattr(publication_memory, "_PROCESS_STATUS", status)
+    monkeypatch.setattr(publication_memory, "container_memory_limit_bytes", lambda: 20 * 1024**3)
+    with caplog.at_level(logging.INFO):
+        publication_memory.log_publication_memory(
+            logging.getLogger("test"), "search_model", phase="index_build", batch=145
+        )
+    assert f"limit_bytes={20 * 1024**3}" in caplog.text

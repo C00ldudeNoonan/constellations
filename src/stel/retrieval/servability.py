@@ -138,3 +138,111 @@ def exact_search_advisory(
             f"{remedy}"
         )
     return f"{measured}. {remedy}"
+
+
+# ─── index build memory (issue #476) ────────────────────────────────────────
+
+# Peak RSS of an ANN index build over the collection's vectors, as a multiple
+# of their raw float32 bytes. Measured on LanceDB 0.34 at 256 dimensions, peak
+# sampled at 20ms during `create_index` (issue #476): `HnswFlat` 3.15x at 100k
+# rows; `HnswSq` 1.74x -> 1.64x -> 1.61x at 100k / 300k / 1M — linear in rows;
+# `IvfPq` 2.07x -> 1.15x -> 0.45x — its cost is training, which barely grows
+# with the corpus. The HNSW figures are rounded up; PQ's is pinned near its
+# small-corpus value rather than its large-corpus one, so the advisory errs
+# toward speaking early for the type that fits, and never stays silent for the
+# ones that do not. These are estimates, stated as such wherever reported.
+_INDEX_BUILD_PEAK_RATIO: Final[dict[str, float]] = {
+    "ivf_hnsw_flat": 3.2,
+    "ivf_hnsw_sq": 1.8,
+    "ivf_pq": 1.2,
+}
+
+# The share of the container ceiling one component may reasonably plan to
+# use. The same 75% the DuckDB adapter hands DuckDB (issue #412), for the same
+# reason: the ceiling also has to hold the Python process, and here the index
+# build lands on top of whatever the publish already has resident. The
+# estimate above is a lower bound, so comparing it against the full ceiling
+# would stay quiet for exactly the marginal cases.
+_INDEX_BUILD_HEADROOM_FRACTION: Final = 0.75
+
+
+def index_build_peak_bytes(*, rows: int, dimensions: int, vector_index: str) -> int:
+    """Estimated peak memory of building `vector_index` over `rows` vectors."""
+    ratio = _INDEX_BUILD_PEAK_RATIO.get(vector_index)
+    if ratio is None or rows <= 0 or dimensions <= 0:
+        return 0
+    return ceil(rows * dimensions * _FLOAT32_BYTES * ratio)
+
+
+def index_build_advisory_row_threshold(
+    *, dimensions: int, vector_index: str, limit_bytes: int
+) -> int:
+    """Rows at which the build estimate first crosses the headroom line.
+
+    The inverse of the estimate, for the same reason `exact_advisory_row_threshold`
+    exists: a first publish has no prior row count, and the useful moment to
+    speak is while the rows are still streaming, not after the last append.
+    """
+    ratio = _INDEX_BUILD_PEAK_RATIO.get(vector_index)
+    if ratio is None or dimensions <= 0 or limit_bytes <= 0:
+        return 0
+    per_row = dimensions * _FLOAT32_BYTES * ratio
+    return ceil(limit_bytes * _INDEX_BUILD_HEADROOM_FRACTION / per_row)
+
+
+def index_build_advisory(
+    *,
+    collection: str,
+    rows: int,
+    dimensions: int,
+    vector_index: str,
+    limit_bytes: int | None,
+    in_progress: bool = False,
+) -> str | None:
+    """The warning an index build of this size deserves, if any.
+
+    Returns None with no container ceiling to compare against — the estimate
+    is only meaningful relative to a limit — or when the build fits under the
+    headroom line. Never a refusal: the ratios are measurements on one store
+    at one scale, and the operator may know the container is larger than the
+    cgroup says or be willing to try. What was missing was any signal at all:
+    the #473 publish would have appended for hours and then died at this step.
+    """
+    if limit_bytes is None or limit_bytes <= 0:
+        return None
+    estimate = index_build_peak_bytes(rows=rows, dimensions=dimensions, vector_index=vector_index)
+    if estimate <= 0 or estimate < limit_bytes * _INDEX_BUILD_HEADROOM_FRACTION:
+        return None
+    ratio = _INDEX_BUILD_PEAK_RATIO[vector_index]
+    vectors_gb = exact_scan_bytes(rows=rows, dimensions=dimensions) / 1_000_000_000
+    counted = (
+        f"the {rows:,} rows published so far -- this run is still streaming"
+        if in_progress
+        else f"{rows:,} rows"
+    )
+    at_least = "at least " if in_progress else ""
+    measured = (
+        f"collection '{collection}' declares `search: approximate` with `index: "
+        f"{vector_index}`; building it over {counted} x {dimensions} dimensions "
+        f"({at_least}about {vectors_gb:.1f} GB of vectors) peaks at roughly {ratio:g}x "
+        f"that -- an estimated {at_least}{estimate / 1_000_000_000:.1f} GB against "
+        f"a {limit_bytes / 1024**3:.1f} GiB container ceiling, of which a build "
+        f"can reasonably plan on {_INDEX_BUILD_HEADROOM_FRACTION:.0%} (a lower bound "
+        "measured on LanceDB 0.34, issue #476; it lands on top of what the "
+        "publish already holds)"
+    )
+    if vector_index != "ivf_pq":
+        remedy = (
+            "Declare `index: ivf_pq`, whose build cost is training rather than rows "
+            "(measured at 0.45x at 1M rows and still falling). With "
+            "`on_index_change: online` the switch is an index build in a private "
+            "generation -- no re-embed, and the live index keeps serving. It is lossy; "
+            "follow with `stel eval`."
+        )
+    else:
+        remedy = (
+            "This is already the smallest build; raise the container's memory "
+            "ceiling for this publish, or accept that the build may be killed -- "
+            "the private generation is abandoned and the live index keeps serving."
+        )
+    return f"{measured}. {remedy}"

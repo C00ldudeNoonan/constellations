@@ -1521,6 +1521,17 @@ def mcp() -> None:
     show_default=True,
 )
 @click.option(
+    "--max-requests-per-minute-per-principal",
+    type=click.IntRange(1, 100_000),
+    default=None,
+    help=(
+        "Each caller's share of --max-requests-per-minute, keyed by subject. "
+        "Unset, the global cap is all there is and one caller can exhaust it "
+        "for everyone. Requests with no resolvable principal share one "
+        "anonymous bucket of this size."
+    ),
+)
+@click.option(
     "--max-response-bytes",
     type=click.IntRange(1024, 10_000_000),
     default=256_000,
@@ -1583,6 +1594,7 @@ def mcp_serve(
     timeout_seconds: float,
     max_concurrency: int,
     max_requests_per_minute: int,
+    max_requests_per_minute_per_principal: int | None,
     max_response_bytes: int,
     max_scan_rows: int,
     grants_relation: str | None,
@@ -1606,6 +1618,7 @@ def mcp_serve(
         timeout_seconds=timeout_seconds,
         max_concurrency=max_concurrency,
         max_requests_per_minute=max_requests_per_minute,
+        max_requests_per_minute_per_principal=max_requests_per_minute_per_principal,
         max_response_bytes=max_response_bytes,
         max_scan_rows=max_scan_rows,
     )

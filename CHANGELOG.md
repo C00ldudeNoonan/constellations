@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Per-principal rate limiting on the MCP server (issue #463)
+
+`--max-requests-per-minute` was sized for one local stdio client. On a network
+transport it is one global cap every caller draws from, so a single principal
+can exhaust it and starve the rest, and nothing distinguishes a noisy tenant
+from an attack.
+
+- New `--max-requests-per-minute-per-principal`: each subject gets its own
+  sliding window under the global cap, which stays as the ceiling above them
+  all. A caller at its own limit is refused as *that caller's* limit while
+  others are still served. Must not exceed the global cap — a larger share is
+  unreachable and would only mislead.
+- Requests with no resolvable principal share one anonymous bucket of the same
+  size, so an unauthenticated flood counts against something rather than
+  nothing. Each such request is still refused as `missing_principal`; the
+  bucket is about what the flood costs everyone else.
+- A request the global ceiling turns away is not also charged to the caller's
+  own share: both windows are decided before either is appended to.
+- Unset, behavior is byte-identical to before: no per-key state is kept and the
+  caller is never resolved ahead of the operation.
+
 ### `search: exact` no longer publishes an index nothing can query (issue #461)
 
 `search: exact` builds no vector index, so every query reads the whole vector

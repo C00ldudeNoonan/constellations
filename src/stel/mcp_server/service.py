@@ -13,7 +13,7 @@ from threading import BoundedSemaphore, Lock
 from time import monotonic
 from typing import Any, Protocol, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..adapters.base import ReadPredicate, ReadPredicateOperator
 from ..agent_context import citation_locator, freshness_status
@@ -94,6 +94,28 @@ class ContextServerSettings(BaseModel):
     )
     max_concurrency: int = Field(default=4, ge=1, le=64)
     max_requests_per_minute: int = Field(default=120, ge=1, le=100_000)
+    # Per-caller share of that budget (issue #463). `max_requests_per_minute`
+    # was sized for one local stdio client; on a network transport it is one
+    # global cap every caller draws from, so a single principal can exhaust it
+    # and starve the rest. Unset keeps the old behavior exactly. Set, each
+    # subject gets this many per minute and the global cap stays as the
+    # ceiling above them all. Requests with no resolvable principal share one
+    # anonymous bucket at the same size, so they count against something.
+    max_requests_per_minute_per_principal: int | None = Field(
+        default=None, ge=1, le=100_000
+    )
+
+    @model_validator(mode="after")
+    def _per_principal_cap_fits_under_the_global_one(self) -> ContextServerSettings:
+        per = self.max_requests_per_minute_per_principal
+        if per is not None and per > self.max_requests_per_minute:
+            raise ValueError(
+                f"max_requests_per_minute_per_principal ({per}) exceeds "
+                f"max_requests_per_minute ({self.max_requests_per_minute}); the "
+                "global cap is the ceiling, so a larger per-principal share can "
+                "never be reached and would only mislead"
+            )
+        return self
 
 
 class ContextSearch(Protocol):
@@ -191,6 +213,21 @@ T = TypeVar("T")
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
 
+# Requests with no resolvable principal share this bucket when per-principal
+# limiting is on. One caller's worth, not zero: an unauthenticated flood must
+# count against something.
+_ANONYMOUS_KEY = "<anonymous>"
+# Distinct principal keys held before idle ones are swept.
+_SWEEP_KEYS = 1024
+
+
+def _trim(times: deque[float], cutoff: float) -> deque[float]:
+    """Drop timestamps at or before `cutoff`; returns the deque for chaining."""
+    while times and times[0] <= cutoff:
+        times.popleft()
+    return times
+
+
 class _OperationLimiter:
     def __init__(
         self,
@@ -198,6 +235,13 @@ class _OperationLimiter:
         max_concurrency: int,
         max_requests_per_minute: int,
         timeout_seconds: float,
+        # Defaulted, against the usual preference for required parameters,
+        # because None is right for essentially every caller: it is the
+        # documented "off" state that keeps the single-window behavior exactly,
+        # and ContextServerSettings defaults it the same way. Requiring it here
+        # would only force every test that does not care about per-principal
+        # limiting to say so.
+        max_requests_per_minute_per_principal: int | None = None,
     ) -> None:
         self._semaphore = BoundedSemaphore(max_concurrency)
         self._executor = ThreadPoolExecutor(
@@ -205,12 +249,18 @@ class _OperationLimiter:
             thread_name_prefix="stel-mcp",
         )
         self._max_requests_per_minute = max_requests_per_minute
+        self._max_requests_per_minute_per_principal = max_requests_per_minute_per_principal
         self._request_times: deque[float] = deque()
+        # One sliding window per principal key (issue #463). Grows with the
+        # number of distinct callers seen in the last minute, and is swept of
+        # idle keys once it passes _SWEEP_KEYS so a churn of one-off subjects
+        # cannot turn it into a leak.
+        self._per_principal_times: dict[str, deque[float]] = {}
         self._request_lock = Lock()
         self._timeout_seconds = timeout_seconds
 
-    def run(self, operation: Callable[[], T]) -> T:
-        self._check_rate_limit()
+    def run(self, operation: Callable[[], T], *, principal_key: str | None = None) -> T:
+        self._check_rate_limit(principal_key)
         if not self._semaphore.acquire(blocking=False):
             raise ContextServiceError(
                 MCPErrorCode.BUSY,
@@ -243,12 +293,25 @@ class _OperationLimiter:
         except TimeoutError:
             raise timeout_error(self._timeout_seconds) from None
 
-    def _check_rate_limit(self) -> None:
+    def _check_rate_limit(self, principal_key: str | None) -> None:
         now = monotonic()
         cutoff = now - 60
+        per_cap = self._max_requests_per_minute_per_principal
         with self._request_lock:
-            while self._request_times and self._request_times[0] <= cutoff:
-                self._request_times.popleft()
+            _trim(self._request_times, cutoff)
+            # Decide both windows before appending to either, so a request the
+            # global ceiling refuses is not charged to the caller's own share.
+            caller_times: deque[float] | None = None
+            if per_cap is not None:
+                key = principal_key if principal_key is not None else _ANONYMOUS_KEY
+                caller_times = self._per_principal_times.setdefault(key, deque())
+                _trim(caller_times, cutoff)
+                if len(caller_times) >= per_cap:
+                    raise ContextServiceError(
+                        MCPErrorCode.BUSY,
+                        "This caller is at its request rate limit",
+                        retryable=True,
+                    )
             if len(self._request_times) >= self._max_requests_per_minute:
                 raise ContextServiceError(
                     MCPErrorCode.BUSY,
@@ -256,6 +319,20 @@ class _OperationLimiter:
                     retryable=True,
                 )
             self._request_times.append(now)
+            if caller_times is not None:
+                caller_times.append(now)
+                if len(self._per_principal_times) > _SWEEP_KEYS:
+                    self._sweep_idle_principals(cutoff)
+
+    def _sweep_idle_principals(self, cutoff: float) -> None:
+        # Called under the lock. A key whose window is empty after trimming has
+        # been idle for the whole minute and holds nothing worth keeping.
+        for key in [
+            key
+            for key, times in self._per_principal_times.items()
+            if not _trim(times, cutoff)
+        ]:
+            del self._per_principal_times[key]
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -288,6 +365,9 @@ class ContextService:
         self._limiter = _OperationLimiter(
             max_concurrency=self._settings.max_concurrency,
             max_requests_per_minute=self._settings.max_requests_per_minute,
+            max_requests_per_minute_per_principal=(
+                self._settings.max_requests_per_minute_per_principal
+            ),
             timeout_seconds=self._settings.timeout_seconds,
         )
 
@@ -401,7 +481,9 @@ class ContextService:
         error_response: Callable[[ToolError], ResponseT],
     ) -> ResponseT:
         try:
-            response = self._limiter.run(operation)
+            response = self._limiter.run(
+                operation, principal_key=self._rate_limit_key()
+            )
             if len(response.model_dump_json().encode()) > self._settings.max_response_bytes:
                 raise ContextServiceError(
                     MCPErrorCode.RESPONSE_LIMIT,
@@ -447,6 +529,25 @@ class ContextService:
                     retryable=True,
                 )
             )
+
+    def _rate_limit_key(self) -> str | None:
+        """The subject to rate-limit on, or None for the anonymous bucket.
+
+        Resolved here, in the request thread, because the limiter runs before
+        the operation and the operation is what normally resolves identity
+        (inside a worker, from the copied context). Deliberately does not raise
+        MISSING_PRINCIPAL: an unauthenticated request still has to count
+        against a bucket, and the operation will refuse it with the same error
+        it always has. Both resolvers this can reach are O(1) reads of a
+        contextvar or a header, so resolving twice per request costs nothing.
+        """
+        if self._settings.max_requests_per_minute_per_principal is None:
+            return None
+        try:
+            principal = self._principal_resolver.resolve()
+        except AuthorizationError:
+            return None
+        return principal.subject_id if principal is not None else None
 
     def _principal(self) -> Principal:
         try:

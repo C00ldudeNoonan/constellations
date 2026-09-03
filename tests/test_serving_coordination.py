@@ -1548,6 +1548,51 @@ def test_a_search_publish_attributes_its_phases(tmp_path: Path) -> None:
         assert search.metrics[phase] >= 0.0
 
 
+def test_a_search_publish_attributes_its_index_reconciliation(tmp_path: Path) -> None:
+    """The ANN build is the largest term in a large publish and was the last
+    one of that size left outside every phase.
+
+    #473 was an index build that exhausted the container; v0.16.0 changed how
+    one is chosen and where it runs. A reader could see `read`, `store_write`
+    and `state` sum to a fraction of `duration_seconds` with nothing saying
+    where the rest went — and the operation the run had just been rebuilt
+    around was the missing term.
+    """
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+
+    results = run_project(project)
+
+    [search] = [r for r in results if r.kind == "search"]
+    assert "seconds_index_reconcile" in search.metrics, search.metrics
+    assert search.metrics["seconds_index_reconcile"] >= 0.0
+
+
+def test_the_index_phase_does_not_claim_a_build_it_did_not_do(tmp_path: Path) -> None:
+    """A rerun that indexes nothing still reports the phase, which is why it
+    is not called `index_build`.
+
+    Every `create_index` in both stores is conditional: an unchanged publish
+    lists the indexes, counts rows, and builds nothing. A phase named for the
+    build would attribute that metadata check to ANN construction — the exact
+    reading the docs promise is impossible, since an absent phase is supposed
+    to mean the work did not happen (PR #486 review). The name describes the
+    block, and the duration separates a check from a build far more finely
+    than a flag would.
+    """
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project)
+
+    results = run_project(project)
+
+    [search] = [r for r in results if r.kind == "search"]
+    assert "seconds_index_build" not in search.metrics, search.metrics
+    assert "seconds_index_reconcile" in search.metrics, search.metrics
+
+
 def test_search_timings_cover_deletion_and_activation(tmp_path: Path) -> None:
     """A run whose work is deletion must not report only `seconds_read`.
 

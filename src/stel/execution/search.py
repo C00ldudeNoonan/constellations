@@ -584,7 +584,20 @@ def _run_search_model(
                     coordinator.verify_publish(publish_lease)
                     store.create_collection(spec)
                 log_publication_memory(log, model.name, phase="index_build", batch=ordinal + 1)
-                metadata = store.ensure_indexes(spec)
+                # The largest term in a large publish, and the last one of that
+                # size still unattributed: a reader could see `read`,
+                # `store_write` and `state` sum to a fraction of
+                # `duration_seconds` with nothing saying where the rest went.
+                #
+                # Named for what the block spans, not for the build inside it.
+                # Every `create_index` in both stores is conditional -- an
+                # unchanged rerun lists indexes, counts rows and builds nothing
+                # -- so `index_build` would claim a build on a publish that only
+                # reconciled (PR #486 review). The duration draws that line by
+                # itself, and more finely than a flag would: milliseconds is a
+                # metadata check, minutes is an ANN build.
+                with timings.phase("index_reconcile"):
+                    metadata = store.ensure_indexes(spec)
                 if not warned_exact:
                     _warn_on_exact_vector_scan(model, spec, metadata.row_count)
                 if metadata.config_fingerprint != spec.config_fingerprint:

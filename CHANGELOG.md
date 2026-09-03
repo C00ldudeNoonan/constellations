@@ -30,6 +30,20 @@ now matches it:
 All of this is `-v` / `STEL_VERBOSE=1` output, same as extraction's existing
 progress lines.
 
+### The grants cache no longer grows without bound (security audit)
+
+`WarehouseGrantStore` (issue #392) caches each verified subject's grants for
+`ttl_seconds`, but past expiry an entry was never reclaimed — only ignored and
+overwritten on that subject's next request. A network deployment serving many
+distinct subjects over its lifetime (every subject a token issuer or a
+trusted proxy ever named) grew this table forever, the same unbounded-growth
+shape the per-principal rate-limit table was fixed for in v0.15.5 (issue
+#466), left unfixed here.
+
+The cache is now swept on the same cadence as its own TTL: an expired entry
+is reclaimed on the next write rather than merely superseded. Revocation
+timing is unchanged — an entry still applies until its TTL lapses either way.
+
 ## v0.15.5 - 2026-09-02
 
 ### The network MCP transport verifies bearer tokens itself (issue #392)

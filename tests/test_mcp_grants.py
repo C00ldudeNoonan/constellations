@@ -208,6 +208,28 @@ def test_grants_are_cached_and_the_ttl_bounds_revocation() -> None:
     assert store.grants_for("alice") == (), "revoked once the TTL lapses"
 
 
+def test_expired_subjects_are_swept_and_do_not_grow_the_cache_forever() -> None:
+    """A churn of one-off subjects (many distinct verified callers over the
+    life of a long-running network deployment) must not grow the cache
+    forever — the same unbounded-growth shape fixed for the per-principal
+    rate-limit table (issue #466), here in the grants cache."""
+    now = {"t": 0.0}
+    repository = _FakeRepository(_rows())
+    store = WarehouseGrantStore(
+        repository, relation="ops.grants", ttl_seconds=60.0, clock=lambda: now["t"]
+    )
+
+    for subject in ("alice", "bob", "carol", "dave"):
+        store.grants_for(subject)
+    assert len(store._cache) == 4
+
+    # A TTL later every entry has expired, so the next call — for a subject
+    # not even in that set — sweeps them on its way in.
+    now["t"] = 61.0
+    store.grants_for("erin")
+    assert set(store._cache) == {"erin"}
+
+
 def test_a_blank_grant_value_is_refused_rather_than_guessed() -> None:
     """Blank is ambiguous between 'no grant' and 'grant everything', and one
     of those readings is a breach."""

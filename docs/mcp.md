@@ -124,8 +124,13 @@ Two limits worth knowing before a shared deployment:
 - **Warehouse credentials are per process, not per caller.** A hosted server
   holds one set for everyone, so row-level governance is the only boundary
   between tenants. Per-tenant credentials are tracked in issue #395.
-- **Rate limits are per process.** `--max-requests-per-minute` was sized for
-  one local client; shared, it is a global cap one caller can exhaust.
+- **Rate limits are per process unless you say otherwise.**
+  `--max-requests-per-minute` was sized for one local client; shared, it is a
+  global cap one caller can exhaust. Set
+  `--max-requests-per-minute-per-principal` to give each subject its own share
+  under that ceiling. Requests with no resolvable principal share one anonymous
+  bucket of the same size, so an unauthenticated flood counts against something
+  rather than nothing. Unset, nothing changes.
 
 Token verification without a proxy in front is tracked in issue #392.
 

@@ -10,6 +10,7 @@ byte-for-byte the same.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import lancedb
 import pytest
@@ -116,7 +117,7 @@ def test_local_data_path_raises_for_cloud() -> None:
 def test_connect_passes_cloud_uri_and_storage_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_connect(target: str, **kwargs: object) -> object:
         captured["target"] = target
@@ -133,13 +134,15 @@ def test_connect_passes_cloud_uri_and_storage_options(
     with _store(config):
         pass
     assert captured["target"] == "gs://bucket/prefix"
-    assert captured["kwargs"] == {"storage_options": {"region": "us-central1"}}
+    # Asserted by key: a session cache budget also rides here now (#479),
+    # and this test is about the storage options.
+    assert captured["kwargs"]["storage_options"] == {"region": "us-central1"}
 
 
 def test_connect_local_path_omits_storage_options(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_connect(target: str, **kwargs: object) -> object:
         captured["target"] = target
@@ -152,7 +155,7 @@ def test_connect_local_path_omits_storage_options(
     with _store(config):
         pass
     assert captured["target"] == str(local)
-    assert captured["kwargs"] == {}
+    assert "storage_options" not in captured["kwargs"]
     # Local stores still create their data directory eagerly.
     assert local.is_dir()
 
@@ -160,7 +163,7 @@ def test_connect_local_path_omits_storage_options(
 def test_storage_options_absent_when_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_connect(target: str, **kwargs: object) -> object:
         captured["kwargs"] = kwargs
@@ -169,13 +172,13 @@ def test_storage_options_absent_when_empty(
     monkeypatch.setattr(lancedb, "connect", fake_connect)
     with _store(_config("gs://bucket/prefix")):
         pass
-    assert captured["kwargs"] == {}
+    assert "storage_options" not in captured["kwargs"]
 
 
 def test_connect_resolves_credential_reference_at_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_connect(target: str, **kwargs: object) -> object:
         captured["kwargs"] = kwargs
@@ -191,11 +194,9 @@ def test_connect_resolves_credential_reference_at_connect(
     with _store(config):
         pass
     # Routing rides verbatim; the reference is resolved from the env only here.
-    assert captured["kwargs"] == {
-        "storage_options": {
-            "region": "us-east-1",
-            "aws_secret_access_key": "resolved-secret-value",
-        }
+    assert captured["kwargs"]["storage_options"] == {
+        "region": "us-east-1",
+        "aws_secret_access_key": "resolved-secret-value",
     }
 
 

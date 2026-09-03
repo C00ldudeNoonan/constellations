@@ -16,6 +16,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    StoreRole,
 )
 from .coordination import (
     PublishLease,
@@ -81,6 +82,7 @@ __all__ = [
     "ServingNotReadyError",
     "StaleServingLeaseError",
     "StateRetrievalTarget",
+    "StoreRole",
     "absolutize_store_config",
     "classify_changes",
     "classify_descriptor_changes",

@@ -6,7 +6,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..hashing import canonical_fingerprint
-from .base import RetrievalConfigError, RetrievalStore, RetrievalStoreConfig
+from .base import (
+    RetrievalConfigError,
+    RetrievalStore,
+    RetrievalStoreConfig,
+    StoreRole,
+)
 from .evolution import semantic_search_config
 
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
@@ -46,6 +51,7 @@ def create_store(
     project_name: str,
     target_name: str,
     alias: str,
+    role: StoreRole = StoreRole.INSPECT,
 ) -> RetrievalStore:
     cls = _REGISTRY.get(config.type)
     if cls is None:
@@ -57,6 +63,7 @@ def create_store(
         project_name=project_name,
         target_name=target_name,
         alias=alias,
+        role=role,
     )
 
 

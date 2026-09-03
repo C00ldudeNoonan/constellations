@@ -33,6 +33,7 @@ from .base import (
     RetrievalStoreConfig,
     SafeRetrievalTarget,
     StateRetrievalTarget,
+    StoreRole,
     reject_generation_shaped_collection_name,
     validate_generation_token,
 )
@@ -40,6 +41,52 @@ from .locks import PublisherLock, default_host_lock_base
 from .registry import register
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+_MB = 1024 * 1024
+
+# Per-role cache budgets in MiB, as (index, metadata), used when the profile
+# names none (issue #479).
+#
+# `SERVE` is absent on purpose rather than set to a large number: leaving the
+# serving path on LanceDB's own defaults keeps ANN query latency exactly as it
+# is today, and this change is not the place to relitigate it. An operator who
+# needs serving bounded — the same 20 GiB container hosting a query process —
+# sets the fields explicitly, which wins in every role.
+#
+# The publisher numbers are bounds, not measurements of need: publish-side
+# session occupancy measured 5 MB on a 600k-row collection (issue #475), so
+# 256 MB is already generous for what the publisher demonstrably uses, while
+# leaving the ceiling to the merge and the index build that actually need it.
+_ROLE_CACHE_BUDGET_MB: dict[StoreRole, tuple[int, int]] = {
+    StoreRole.PUBLISH: (256, 64),
+    StoreRole.INSPECT: (32, 16),
+}
+
+
+def session_cache_budget(
+    config: LanceDBConfig, role: StoreRole
+) -> tuple[int, int] | None:
+    """Cache sizes in bytes as `(index, metadata)`, or None for LanceDB's own.
+
+    An explicit profile setting wins in every role; a role default fills in
+    only what the profile left unset, so bounding one cache does not silently
+    unbound the other.
+    """
+    default = _ROLE_CACHE_BUDGET_MB.get(role)
+    index_mb = config.index_cache_size_mb
+    metadata_mb = config.metadata_cache_size_mb
+    if default is None and index_mb is None and metadata_mb is None:
+        return None
+    fallback = default or (0, 0)
+    resolved_index = index_mb if index_mb is not None else fallback[0]
+    resolved_metadata = metadata_mb if metadata_mb is not None else fallback[1]
+    if not resolved_index or not resolved_metadata:
+        # One side configured under a role with no default (SERVE): fill the
+        # other from LanceDB's documented defaults rather than from zero, which
+        # would disable a cache nobody asked to disable.
+        resolved_index = resolved_index or 6 * 1024
+        resolved_metadata = resolved_metadata or 1024
+    return (resolved_index * _MB, resolved_metadata * _MB)
 
 # Arrow schema metadata written into every collection stel creates. These
 # names live in existing LanceDB collections, so they are data, not code.
@@ -113,6 +160,14 @@ class LanceDBConfig(RetrievalStoreConfig):
     collection_template: str = "{project}__{target}__{collection}"
     timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     minimum_consistency: Literal["strong"] = "strong"
+    # Cache budgets handed to LanceDB's `Session` (issue #479). Unset means
+    # "the role's default" (see `session_cache_budget`), not "LanceDB's":
+    # LanceDB's own are ~6 GB index + 1 GB metadata, which is 7 GB of
+    # unasked-for budget on a memory-limited publisher. These are execution
+    # settings, deliberately absent from `routing_options()` and the safe
+    # descriptor, so changing one cannot reclassify a published collection.
+    index_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
+    metadata_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
 
     @field_validator("path")
     @classmethod
@@ -229,6 +284,7 @@ class LanceDBStore(RetrievalStore):
         project_name: str,
         target_name: str,
         alias: str,
+        role: StoreRole = StoreRole.INSPECT,
     ) -> None:
         if not isinstance(config, LanceDBConfig):
             raise RetrievalError("LanceDB store received incompatible configuration")
@@ -237,6 +293,7 @@ class LanceDBStore(RetrievalStore):
             project_name=project_name,
             target_name=target_name,
             alias=alias,
+            role=role,
         )
         self._config = config
         self._db: Any | None = None
@@ -302,6 +359,16 @@ class LanceDBStore(RetrievalStore):
                 connect_kwargs["storage_options"] = storage_options
         else:
             self._config.local_data_path().mkdir(parents=True, exist_ok=True)
+        budget = session_cache_budget(self._config, self.role)
+        if budget is not None:
+            # Without a Session, LanceDB takes its own defaults (~6 GB index +
+            # 1 GB metadata), which a container ceiling is invisible to
+            # (issue #479, the #412 shape one store over).
+            index_bytes, metadata_bytes = budget
+            connect_kwargs["session"] = lancedb.Session(
+                index_cache_size_bytes=index_bytes,
+                metadata_cache_size_bytes=metadata_bytes,
+            )
         try:
             self._db = lancedb.connect(
                 self._config.connect_target(), **connect_kwargs

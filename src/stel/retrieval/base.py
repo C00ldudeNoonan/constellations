@@ -356,6 +356,29 @@ class CollectionMetadata:
     schema: pa.Schema
 
 
+class StoreRole(StrEnum):
+    """What the process holding a store is doing with it (issue #479).
+
+    A store's cache budget is the one setting where publishing and serving want
+    opposite things, and both reach the store through `create_store`:
+
+    - `PUBLISH` is writing. It competes with the merge and the index build for
+      one container ceiling, and caching an index it is in the middle of
+      replacing buys it nothing.
+    - `SERVE` is querying. ANN latency depends on the index staying resident,
+      so shrinking its cache trades away the thing the index exists to provide.
+    - `INSPECT` reads descriptors and row counts — compile, manifest, ledger
+      admin. It never touches an index.
+
+    The role is what a *default* is chosen from; it is not a permission. An
+    explicit setting in the profile wins in every role.
+    """
+
+    PUBLISH = "publish"
+    SERVE = "serve"
+    INSPECT = "inspect"
+
+
 class RetrievalStore(ABC):
     def __init__(
         self,
@@ -364,11 +387,16 @@ class RetrievalStore(ABC):
         project_name: str,
         target_name: str,
         alias: str,
+        role: StoreRole = StoreRole.INSPECT,
     ) -> None:
         self.config = config
         self.project_name = project_name
         self.target_name = target_name
         self.alias = alias
+        # Defaults to the cheapest role: a caller that has not thought about
+        # this is doing metadata work, and the cost of being wrong that way is
+        # a cache miss rather than a container kill.
+        self.role = role
 
     @classmethod
     @abstractmethod

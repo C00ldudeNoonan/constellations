@@ -52,6 +52,39 @@ zero.
 
 Measured ratios are documented as scaling guidance, not a contract; `ivf_pq` is
 lossy, so pair a switch with `stel eval`.
+### LanceDB's caches are bounded by what the process is doing (issue #479)
+
+`lancedb.connect()` was called with no `Session`, so the index and metadata
+caches took LanceDB's own defaults — documented as equivalent to 6 GB and
+1 GB. A container ceiling is invisible to those numbers, which made this
+#412's shape one store over: ~7 GB of budget a memory-limited publisher never
+asked for and could not bound.
+
+The store now knows its role, because publishing and serving want opposite
+things and both reach it through `create_store`:
+
+- **publishing** takes a bounded 256 MB / 64 MB — it is writing, competing
+  with the merge and the ANN index build for one ceiling, and caching an index
+  it is replacing buys it nothing. (Measured publish-side session occupancy was
+  5 MB on a 600k-row collection in #475, so this is already generous.)
+- **serving** keeps LanceDB's defaults, deliberately: ANN query latency depends
+  on the index staying resident, and this is not the change that trades that
+  away.
+- **inspecting** — compile, manifest, `stel serving` — takes 32 MB / 16 MB and
+  never touches an index. It is also the default for any caller that has not
+  said otherwise, because being wrong that way costs a cache miss rather than a
+  container.
+
+New `index_cache_size_mb` / `metadata_cache_size_mb` on the LanceDB store block
+override the role default, and win in every role — including serving, which is
+how an operator bounds a query process sharing a container. Setting one alone
+leaves the other at its default rather than at zero.
+
+These are execution settings, not identity: they stay out of `routing_options`
+and the safe descriptor, so tuning a cache cannot present as a different
+physical store, reclassify a published collection, or strand its incremental
+state.
+
 ### The search merge key is indexed, so an incremental publish stops scanning the table (issue #475)
 
 `_search_collection_spec` built `scalar_index_fields` from attributes with a

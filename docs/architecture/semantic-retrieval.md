@@ -1333,13 +1333,12 @@ of resolution.
 
 #### Retiring a superseded generation (issue #355)
 
-There is no grace period and no generations table. Both fall out of the
-coordination protocol: `acquire_publish` refuses while any query lease exists,
-and `acquire_query` refuses while a publisher holds the claim, so while the
-publish lease is held there are zero query leases and no other publisher, by
-construction. A sweep running under that lease can race neither a reader
-(whichever generation the reader pinned) nor a concurrent build creating the
-next private generation.
+There is no grace period and no generations table. Private builds allow readers
+of the untouched active generation; admitted readers remain pinned across
+cutover. Retirement therefore defers while any query lease exists. New query
+admissions recheck the active pointer before store I/O, so once pins drain no
+new reader can reach a superseded generation. The sweep excludes the active
+collection and holds the publish claim to exclude concurrent builders.
 
 Holding the publish lease is therefore the sweep's contract, and it is
 verified rather than trusted: the sweeper passes its lease and the fence is
@@ -1350,7 +1349,7 @@ acquire the publish lease and start building while a lease-less sweep is
 listing and dropping. A post-recovery sweeper acquires the lease like any
 other publisher.
 
-The ledger names the active generation, so any other collection named exactly
+With no outstanding pins, any non-active collection named exactly
 `<base>__g<token>` (one 1-16 lowercase-alphanumeric token) is unreachable and
 safe to drop — including a half-built generation left by a publisher that
 died before activating. That suffix shape is reserved: name resolution
@@ -1360,11 +1359,11 @@ for a retired generation and swept. The unsuffixed base collection carries no
 marker and is never a candidate, because that is where an in-place published
 index lives.
 
-Recovery preserves the activation pointer rather than clearing it with the
-generation. It rebuilds the ledger row, and losing the pointer would strand a
-generation-served index: the logical name would fall back to the unsuffixed
-default, which for a generation build holds no data. The scope stays failed
-either way, so this is inert for readers.
+Recovery preserves the activation pointer and its configuration after a private
+build, leaving the scope degraded but servable. An in-place claim clears the
+generation up front, so recovery cannot accidentally serve partially mutated
+data. See [ADR-0003](../adr/0003-reader-safe-online-publication.md) for the
+online-update and reader-pin protocol.
 
 This depends on the serving scope being keyed on the *logical* collection.
 Keying it on the physical collection — as it was before #355 — makes

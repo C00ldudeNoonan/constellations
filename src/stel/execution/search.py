@@ -54,6 +54,7 @@ from ..retrieval import (
     rebuild_required,
 )
 from ..retrieval.base import GENERATION_MARKER
+from ..retrieval.publication_memory import log_publication_memory
 from ..retrieval.retention import retire_superseded_generations
 from ..retrieval.servability import (
     exact_advisory_row_threshold,
@@ -175,13 +176,18 @@ def _run_search_model(
             # A null activation pointer means the unsuffixed default, which is
             # what every index published before generations existed uses.
             serving_entry = coordinator.status(state_scope)
+            if serving_entry.publication_id is not None:
+                raise RunError(
+                    "Another publisher owns this serving scope; retry after it completes, "
+                    "or recover only after terminating the old owners"
+                )
             active_collection = serving_entry.active_collection
             # The generation serving queries before this publish, and the
             # configuration it was published under. A rebuild that fails hands
             # both back so the index keeps answering from it (issue #449); an
             # in-place publish must not, having written into what it names.
-            # The fingerprint travels with the generation because the claim
-            # below overwrites the ledger's with this run's configuration.
+            # The fingerprint travels with the generation; a private claim
+            # retains this pair until activation replaces both together.
             previous_generation = serving_entry.active_generation
             previous_fingerprint = serving_entry.config_fingerprint
             default_collection = store.physical_collection(logical_collection)
@@ -197,10 +203,15 @@ def _run_search_model(
                 resolved=resolved,
             )
             if rebuild:
-                _require_private_generation_build(store, model)
+                _require_private_generation_build(store, model, subset_run=subset_run)
                 generation_token = uuid4().hex[:12]
                 physical = store.physical_collection(
                     logical_collection, generation=generation_token
+                )
+                log.info(
+                    "%s: building a private search generation; activation follows "
+                    "row and index validation",
+                    model.name,
                 )
             else:
                 physical = active_collection or default_collection
@@ -233,6 +244,7 @@ def _run_search_model(
                 state_scope,
                 expected_code_version=code_version,
                 config_fingerprint=spec.config_fingerprint,
+                expected_fencing_token=serving_entry.fencing_token,
                 # A rebuild writes to a private generation, so the live one
                 # stays servable if this publisher dies; an in-place publish
                 # mutates what is live, and the claim clears the pointer so a
@@ -271,13 +283,9 @@ def _run_search_model(
                     warned_exact = _warn_on_exact_vector_scan(
                         model, spec, existing.row_count
                     )
-                    evolved = _verify_collection_config(
+                    _verify_collection_config(
                         store, existing, spec, policy=search.on_index_change
                     )
-                    if evolved:
-                        # The collection just changed shape; compare against
-                        # what it now is, not the snapshot taken before.
-                        existing = store.inspect_collection(physical) or existing
                     _validate_collection_schema(existing.schema, spec)
 
                 batches = iter(snapshot)
@@ -324,6 +332,7 @@ def _run_search_model(
                         ordinal + 1,
                         rows_seen,
                     )
+                    log_publication_memory(log, model.name, phase="batch", batch=ordinal + 1)
                     upstream_records = [
                         UpstreamRecord(row.record_id, row.input_fingerprint)
                         for row in indexed
@@ -398,7 +407,8 @@ def _run_search_model(
                         domain="dbt-ml-search-upsert-batch",
                     )
                     with timings.phase("store_write"):
-                        receipt = store.upsert(
+                        write = store.append if rebuild else store.upsert
+                        receipt = write(
                             physical,
                             pending,
                             id_field=search.id_field,
@@ -481,6 +491,7 @@ def _run_search_model(
                 if not collection_exists:
                     coordinator.verify_publish(publish_lease)
                     store.create_collection(spec)
+                log_publication_memory(log, model.name, phase="index_build", batch=ordinal + 1)
                 metadata = store.ensure_indexes(spec)
                 if not warned_exact:
                     _warn_on_exact_vector_scan(model, spec, metadata.row_count)
@@ -543,15 +554,18 @@ def _run_search_model(
             if rebuild and active_collection and GENERATION_MARKER in active_collection
             else None
         )
-        if rebuild and superseded_collection is not None:
+        if (
+            rebuild and superseded_collection is not None
+            and coordinator.status(state_scope).query_leases == 0
+        ):
             # The collection this activation replaced. Dropped by name rather
             # than by sweeping: `mark_ready` has released the publish claim,
             # and a listing sweep without it can delete a generation another
-            # publisher is building. A superseded name is safe — every build
-            # takes a fresh token, so nothing else is ever writing to it.
+            # publisher is building. Reader pins must also have drained; a
+            # late admission rechecks the active pointer before store I/O.
             with store:
                 store.drop_collection(superseded_collection)
-    except (AdapterError, RetrievalError, RunError) as error:
+    except (AdapterError, RetrievalError, RunError, MemoryError) as error:
         if state_swapped and state_scope is not None:
             # See the activation note above: this state no longer describes
             # the collection the pointer names.
@@ -584,6 +598,11 @@ def _run_search_model(
             )
         if isinstance(error, RunError):
             raise
+        if isinstance(error, MemoryError):
+            raise RunError(
+                "Search publication exhausted process memory; inspect the last "
+                "publication memory sample and reduce batch_size or increase memory"
+            ) from None
         raise RunError(str(error)) from None
 
     assert spec is not None
@@ -679,7 +698,14 @@ def _rebuild_requested(model: ModelConfig, *, full_refresh: bool) -> bool:
     return full_refresh or model.materialization == "full"
 
 
-def _require_private_generation_build(store: Any, model: ModelConfig) -> None:
+def _require_private_generation_build(
+    store: Any, model: ModelConfig, *, subset_run: bool
+) -> None:
+    if subset_run:
+        raise RunError(
+            "Search index replacement requires an unfiltered run; "
+            "a subset cannot replace the complete serving generation"
+        )
     if (
         RetrievalFeature.PRIVATE_GENERATION_BUILD
         not in store.capabilities().features
@@ -715,20 +741,11 @@ def _config_change_forces_rebuild(
     store_type: str,
     resolved: ResolvedProfile,
 ) -> bool:
-    """Whether `on_index_change: rebuild` should replace the live collection.
-
-    Only asked under that policy, and answered before a target collection is
-    chosen — the alternative is discovering it after opening a fence on the
-    collection being replaced.
-    """
+    """Plan configuration changes before claiming or mutating a live target."""
     search = model.search
     assert search is not None
-    if search.on_index_change != "rebuild":
-        return False
-    with store:
-        existing = store.inspect_collection(collection)
-    if existing is None:
-        return False
+    # Validate the warehouse projection before opening the store. Even an
+    # inspect context can create local storage or resolve cloud credentials.
     spec = _search_collection_spec(
         model=model,
         models_by_name=models_by_name,
@@ -737,15 +754,34 @@ def _config_change_forces_rebuild(
         store_type=store_type,
         resolved=resolved,
     )
-    if existing.descriptor is None or existing.descriptor == spec.descriptor:
+    with store:
+        existing = store.inspect_collection(collection)
+    if existing is None:
         return False
-    return bool(
-        rebuild_required(
-            classify_descriptor_changes(
-                json.loads(existing.descriptor), json.loads(spec.descriptor)
+    if existing.descriptor is None:
+        if existing.config_fingerprint != spec.legacy_config_fingerprint:
+            raise RunError(
+                "Search index configuration changed without a stored descriptor; "
+                "publish a private replacement with --full-refresh"
             )
-        )
+        return False
+    if existing.descriptor == spec.descriptor:
+        return False
+    changes = classify_descriptor_changes(
+        json.loads(existing.descriptor), json.loads(spec.descriptor)
     )
+    blocking = rebuild_required(changes)
+    if search.on_index_change == "fail":
+        _verify_collection_config(store, existing, spec)
+    if blocking and search.on_index_change == "online":
+        detail = "; ".join(change.describe() for change in blocking)
+        raise RunError(
+            f"Search index configuration changed and requires a rebuild: {detail}. "
+            "Use on_index_change: rebuild for a private replacement."
+        )
+    # Both policies build away from readers. Online still accepts only
+    # compatible changes; rebuild is an explicit opt-in for any change.
+    return bool(changes)
 
 
 def _warn_on_exact_vector_scan(
@@ -791,7 +827,9 @@ def _mark_search_publication_failed(
     config_fingerprint: str | None = None,
 ) -> None:
     """Record the failure under a safe code; a stale fence has nothing to record."""
-    if isinstance(error, ServingCoordinationError):
+    if isinstance(error, MemoryError):
+        code = "memory_exhausted"
+    elif isinstance(error, ServingCoordinationError):
         code = "coordination_error"
     elif isinstance(error, RetrievalError):
         code = "store_error"
@@ -935,11 +973,9 @@ def _verify_collection_config(
 ) -> bool:
     """Refuse a publish whose configuration no longer describes the collection.
 
-    Returns whether the collection was widened in place. Under the default
-    `fail` policy this only ever returns False or raises, but it says *which*
-    field moved and distinguishes a change the existing collection could serve
-    from one that invalidates the rows already written. Under `online` a
-    compatible change is applied rather than refused (issue #344).
+    Only legacy, semantically unchanged stamps can be rewritten here. Changed
+    configurations must have been routed to a private target by the planner;
+    never evolve a live collection as a fallback (issue #473).
     """
     if existing.descriptor is None:
         # Published before the descriptor existed: it carries only the legacy
@@ -972,22 +1008,15 @@ def _verify_collection_config(
             "over."
         )
     if policy == "online":
-        # Compatible-only, and the store advertised that it can widen a live
-        # collection. Columns arrive null; every row's fingerprint includes the
-        # config digest, so the republish that follows refills the collection
-        # from the warehouse — an index rewrite, but no provider calls.
-        added = [
-            name
-            for name in spec.arrow_schema.names
-            if name not in set(existing.schema.names)
-        ]
-        store.evolve_collection(spec, added)
-        return True
+        raise RunError(
+            "Online configuration changes require a private generation; "
+            "refusing to mutate the live collection"
+        )
 
     raise RunError(
         f"Search index configuration changed: {detail}. The existing collection "
-        "can serve the change — set `on_index_change: online` to apply it in "
-        "place, or publish under a new collection name."
+        "can serve the change — set `on_index_change: online` to build a private "
+        "replacement, or publish under a new collection name."
     )
 
 

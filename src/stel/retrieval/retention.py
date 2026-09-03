@@ -5,15 +5,12 @@ activation moves the pointer, and the half-built one if the publisher dies
 before activating. Neither is reachable through the serving ledger, so nothing
 would ever reclaim them.
 
-**Why there is no grace period.** The issue asks how long a superseded
-generation should linger and what reclaims it if a publisher dies mid-flight.
-Both answers fall out of the coordination protocol rather than needing a timer
-or a generations table: `acquire_publish` refuses while any query lease
-exists, and `acquire_query` refuses while a publisher holds the claim. So
-while the publish lease is held there are *zero* query leases and *no* other
-publisher, by construction — a sweep running under that lease can race
-neither a reader (whichever generation the reader pinned) nor a concurrent
-build creating the next private generation.
+**Why there is no grace period.** Private builds allow concurrent readers.
+An admitted query can still pin a superseded generation, so retirement defers
+while any query lease exists. With zero pins, new admissions can reach only
+the active generation (excluded from the sweep). Admission re-verifies the
+active pointer before store I/O, so a late insertion for a retired generation
+is refused. A publisher claim excludes concurrent builders.
 
 Holding the lease is therefore the contract, verified rather than trusted:
 `retire_superseded_generations` takes the coordinator and the caller's
@@ -104,6 +101,12 @@ def retire_superseded_generations(
             "generations, so it has none to retire"
         )
     coordinator.verify_publish(lease)
+    # Pins can outlive activation. Never retire a collection while a reader
+    # may still be using it. New admissions can pin only the active collection,
+    # which the sweep excludes, so a zero count cannot gain an old-generation
+    # reader after this check (admission re-verifies the active pointer).
+    if coordinator.status(lease.scope).query_leases:
+        return []
     retired = []
     for name in superseded_generations(
         store,

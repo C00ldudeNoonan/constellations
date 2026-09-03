@@ -2392,33 +2392,41 @@ search:
   on_index_change: online
 ```
 
-The new columns are added to the published collection in place, and the rows
-are then republished from the warehouse to fill them. Switching the vector
-search mode adds no columns at all — the vectors are already published, and
-only the index is built or dropped. **No embeddings are recomputed**: vectors come from the upstream table, so the cost is an index
-rewrite, not provider spend. That is the difference between adding a filter
-attribute to a 20k-document index for the price of a republish and paying to
-embed the corpus again.
+Changed configurations are published into a **fresh private generation**, then
+activated only after all rows, indexes, and publication state validate. The
+previous collection is never widened, re-stamped, or merged into during the
+update. Readers keep their generation pinned across cutover; a failed or
+interrupted build leaves the old generation available under its old configuration.
 
-Two limits are deliberate:
+**No embeddings are recomputed by search publication**: rows and vectors stream
+from the upstream warehouse table. LanceDB appends bounded batches into the fresh
+generation, avoiding repeated merge planning against a fully populated live
+collection. This still copies the corpus and builds its indexes; it is not a
+zero-copy, index-only operation. Budget storage for both generations and memory
+for the store's index builder. Select only the search model to avoid rerunning
+upstream models.
+
+The limits are deliberate:
 
 - **It applies only to compatible changes.** A changed vector dimension,
   metric, id mapping, analyzer, or an existing attribute's type or filter role
   is still refused under `online`, because the rows already written really are
   invalid. A capability flag cannot make an incompatible change safe.
-- **The store must advertise `online_schema_evolution`.** The policy is
-  rejected at compile time against a store that cannot widen a live
-  collection, rather than failing mid-publish.
+- **The store must advertise `private_generation_build`.** Unsupported stores
+  are rejected at compile time, before publication.
+- **Replacement needs an unfiltered run.** A subset invocation cannot replace
+  the full collection; it is refused before claiming publication authority.
 - **The store must be configured to build the index it is being asked for.**
   A DuckDB store without `hnsw_experimental_persistence` is refused at compile
-  time when a model declares `search: approximate`, because an in-place switch
-  that discovered the refusal at index time would already have republished the
-  whole collection.
+  time when a model declares `search: approximate`.
+- **An unchanged configuration still uses ordinary incremental publication.**
+  That path mutates in place and excludes queries. Use a search-only
+  `--full-refresh` when you want private replacement without a configuration change.
 
 ### `on_index_change: rebuild`
 
 Set `on_index_change: rebuild` to absorb a change the table above calls
-rebuild-required, instead of stopping the run. stel builds a **new generation**
+rebuild-required (or compatible), instead of stopping the run. stel builds a **new generation**
 — a physical collection nothing is querying — validates it, and only then
 points the logical collection at it. The previous generation keeps serving
 every read until that switch, so there is no window in which the index is
@@ -2440,9 +2448,9 @@ or, permanently, `materialization: full` on the search resource.
 Three things follow from how activation works, and are worth knowing before
 turning any of them on:
 
-- **It re-embeds everything.** A rebuild is a full republication at provider
-  prices. It is never inferred from a change — you ask for it, by policy or by
-  flag. An unannounced full re-embed is the behavior this design rejects.
+- **Search-only replacement does not re-embed.** It republishes stored upstream
+  rows and vectors. Selecting upstream embedding models with `--full-refresh`
+  can incur provider calls; select only the search resource for index maintenance.
 - **The store must advertise `private_generation_build`.** A store that cannot
   build a collection under a private name cannot replace a live one
   atomically, and the run fails before touching anything.
@@ -2529,14 +2537,24 @@ per-index serving ledger plus publish/query leases: a publisher acquires an
 exclusive fenced claim (and an OS-enforced per-collection lock on the LanceDB
 store) before any store mutation, and marks the scope `ready` only after
 receipts, index validation, the snapshot generation check, and state
-advancement all succeed. A failed or interrupted publish leaves the scope
-unavailable to queries until a later publish succeeds. Queries take a shared
-lease that pins the ready physical generation through query embedding, store
-search, and result validation; they are rejected while a publisher is active,
-and publication is rejected while query leases are held.
+advancement all succeed. Queries take a shared lease that pins the physical
+generation and its configuration through query embedding, store search, and
+result validation. Private-generation builds allow both existing and new readers
+of the old generation, including across activation. In-place publication still
+excludes queries and is blocked while any query lease is held.
 
-There is no timeout-based lease stealing. If a publisher crashes, terminate
-it, then explicitly reassign authority:
+Superseded generations are retired only after query leases drain. If readers
+still hold pins at cutover, cleanup is deferred to a later private build; a
+stale lease is not silently expired. The unsuffixed legacy collection is never
+automatically swept.
+
+Upgrade publisher and serving processes together, after draining existing
+leases. Do not mix older cleanup code (which assumes publication excludes all
+readers) with the reader-pinning protocol introduced for #473.
+
+There is no timeout-based lease stealing. Recovery clears every pin: terminate
+the old publisher and stop or drain all previous query processes for this scope
+before confirming `--owner-terminated`, then explicitly reassign authority:
 
 ```bash
 stel serving status chunk_search     # ledger status, fence, counts, leases
@@ -2548,6 +2566,15 @@ check) and clears leases. It grants nobody publication authority — a new
 publisher still claims the scope in the ordinary way. After upgrading to this
 contract, run `stel run` once per search index to establish its ledger before
 querying.
+
+Publication logs include batch and index-build memory samples: Linux process
+RSS (`rss_bytes`, including native allocations) and Arrow allocator usage
+(`arrow_bytes`). RSS is unavailable on platforms without `/proc/self/status`.
+Compare samples across batches when diagnosing memory growth. A caught Python
+`MemoryError` records `memory_exhausted`; a kernel OOM kill cannot be caught or
+write a final log line. Check the container's OOM status externally, terminate
+the old owner before recovery, and use the surviving memory samples. Reducing
+`batch_size` bounds row payloads, not the native index builder's memory.
 
 A failed or recovered publication does not necessarily stop queries. A
 generation build writes to a collection nothing is reading, so its failure

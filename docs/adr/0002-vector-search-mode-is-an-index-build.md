@@ -1,6 +1,6 @@
 # ADR-0002: The vector search mode is an index build, not an index identity
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0003](0003-reader-safe-online-publication.md)
 - **Date:** 2026-09-02
 - **Prompted by:** #461
 

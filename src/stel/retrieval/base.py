@@ -529,6 +529,25 @@ class RetrievalStore(ABC):
         mutation_digest: str,
     ) -> MutationReceipt: ...
 
+    def append(
+        self,
+        collection: str,
+        rows: Sequence[IndexedRow],
+        *,
+        id_field: str,
+        mutation_digest: str,
+    ) -> MutationReceipt:
+        """Publish disjoint, validated batches into a fresh private generation.
+
+        The caller guarantees a unique-key snapshot and never retries a batch
+        into this generation. Failure abandons it. Stores may avoid merge
+        planning against all previously written rows; keyed upsert is the
+        compatible fallback. Receipts retain the same durable-write contract.
+        """
+        return self.upsert(
+            collection, rows, id_field=id_field, mutation_digest=mutation_digest
+        )
+
     @abstractmethod
     def delete(
         self,

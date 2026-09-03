@@ -595,6 +595,33 @@ class LanceDBStore(RetrievalStore):
             tuple(MutationOutcome("applied") for _ in rows),
         )
 
+    def append(
+        self,
+        collection: str,
+        rows: Sequence[IndexedRow],
+        *,
+        id_field: str,
+        mutation_digest: str,
+    ) -> MutationReceipt:
+        if not rows:
+            return MutationReceipt(mutation_digest, True, ())
+        try:
+            table = self._open_owned_table(collection)
+            expected_count = table.count_rows() + len(rows)
+            payload = pa.Table.from_pylist([dict(row.values) for row in rows], schema=table.schema)
+            table.add(payload)
+            if table.count_rows() != expected_count:
+                raise RetrievalError("LanceDB append acknowledgement was incomplete")
+        except RetrievalError:
+            raise
+        except Exception:
+            raise RetrievalError(
+                "LanceDB operation 'append' failed (code=lancedb_append_failed)"
+            ) from None
+        return MutationReceipt(
+            mutation_digest, True, tuple(MutationOutcome("applied") for _ in rows)
+        )
+
     def delete(
         self,
         collection: str,

@@ -275,6 +275,67 @@ def test_query_lease_requires_ready_scope(coordinator: Any) -> None:
     coordinator.release_query(query)
 
 
+@pytest.mark.parametrize("private", [False, True])
+def test_a_stale_publication_plan_cannot_claim_or_clear_a_new_generation(
+    coordinator: Any, private: bool,
+) -> None:
+    scope = _scope()
+    first = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        first, active_generation="gen1", config_fingerprint="cfg1", counts=(1, 0, 0, 0)
+    )
+    planned = coordinator.status(scope)
+    other = coordinator.acquire_publish(
+        scope, expected_code_version="v2", config_fingerprint="cfg2",
+        preserves_active_generation=True,
+    )
+    coordinator.mark_ready(
+        other, active_generation="gen2", config_fingerprint="cfg2", counts=(1, 0, 0, 0)
+    )
+    latest = coordinator.status(scope)
+    with pytest.raises(ServingBusyError, match="changed while planning"):
+        coordinator.acquire_publish(
+            scope, expected_code_version="v3", config_fingerprint="cfg3",
+            preserves_active_generation=private,
+            expected_fencing_token=planned.fencing_token,
+        )
+    assert coordinator.status(scope) == latest
+
+
+def test_admission_that_races_cutover_is_refused(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope()
+    first = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg-old"
+    )
+    coordinator.mark_ready(
+        first, active_generation="gen-old", config_fingerprint="cfg-old",
+        counts=(1, 0, 0, 0),
+    )
+    build = coordinator.acquire_publish(
+        scope, expected_code_version="v2", config_fingerprint="cfg-new",
+        preserves_active_generation=True,
+    )
+    execute = coordinator._adapter.execute
+
+    def cutover_after_insert(sql: str, params: Any = None) -> Any:
+        result = execute(sql, params)
+        if "INSERT INTO" in sql and "pinned_generation" in sql:
+            coordinator.mark_ready(
+                build, active_generation="gen-new", config_fingerprint="cfg-new",
+                counts=(1, 0, 0, 0),
+            )
+        return result
+
+    monkeypatch.setattr(coordinator._adapter, "execute", cutover_after_insert)
+    with pytest.raises(StaleServingLeaseError):
+        coordinator.acquire_query(scope)
+    assert coordinator.status(scope).query_leases == 0
+
+
 def test_shared_query_leases_block_exclusive_publisher(coordinator: Any) -> None:
     scope = _scope()
     lease = coordinator.acquire_publish(
@@ -1411,7 +1472,8 @@ def test_a_retained_generation_keeps_its_own_configuration_fingerprint(
         config_fingerprint="cfg-new",
         preserves_active_generation=True,
     )
-    assert coordinator.status(scope).config_fingerprint == "cfg-new"
+    assert coordinator.status(scope).config_fingerprint == "cfg-old"
+    assert retry.config_fingerprint == "cfg-new"
 
     coordinator.mark_failed(
         retry,

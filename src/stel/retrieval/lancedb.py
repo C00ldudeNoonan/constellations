@@ -198,6 +198,28 @@ class LanceDBConfig(RetrievalStoreConfig):
         return self.model_copy(update={"path": str(resolved.resolve())})
 
 
+# `search.vector.index` -> the `lancedb.index` config class that builds it, and
+# the `index_type` string LanceDB reports for it afterwards. The report name is
+# what `ensure_indexes` compares against, so a type switch rebuilds rather than
+# leaving the previous structure to answer under the new declaration.
+_VECTOR_INDEX_CONFIGS = {
+    "ivf_hnsw_flat": "HnswFlat",
+    "ivf_hnsw_sq": "HnswSq",
+    "ivf_pq": "IvfPq",
+}
+_VECTOR_INDEX_TYPES = {
+    "ivf_hnsw_flat": "IvfHnswFlat",
+    "ivf_hnsw_sq": "IvfHnswSq",
+    "ivf_pq": "IvfPq",
+}
+# Product quantization trains 2**num_bits centroids per sub-vector, and LanceDB
+# (8-bit codes) refuses a corpus with fewer rows than that: "Not enough rows to
+# train PQ. Requires 256 rows" — at any dimension, measured on 0.34. Checked
+# here, before the build, because that native message is sanitized away on the
+# way out and the operator would otherwise see only `lancedb_index_failed`.
+_PQ_MINIMUM_ROWS = 256
+
+
 @register
 class LanceDBStore(RetrievalStore):
     def __init__(
@@ -701,21 +723,51 @@ class LanceDBStore(RetrievalStore):
                     (
                         index
                         for index in indexes
-                        if index.columns == [spec.vector_field] and "Hnsw" in index.index_type
+                        if index.columns == [spec.vector_field]
+                        and index.index_type in _VECTOR_INDEX_TYPES.values()
                     ),
                     None,
                 )
                 if spec.vector_search == "approximate":
-                    if current is None or current.num_unindexed_rows:
+                    chosen = spec.vector_index
+                    if chosen not in _VECTOR_INDEX_TYPES:
+                        # The spec is built from a validated config, which
+                        # always names a type under `approximate`; reaching
+                        # here is a caller bug, not an operator error.
+                        raise RetrievalError(
+                            "LanceDB approximate search needs a declared vector "
+                            f"index type, got {chosen!r} (code=lancedb_index_type_missing)"
+                        )
+                    wanted = _VECTOR_INDEX_TYPES[chosen]
+                    if (
+                        current is None
+                        or current.index_type != wanted
+                        or current.num_unindexed_rows
+                    ):
+                        # Only where a build is about to happen: a collection
+                        # that shrank below the floor after its PQ index was
+                        # trained still has a valid index and nothing to train.
+                        if chosen == "ivf_pq" and table.count_rows() < _PQ_MINIMUM_ROWS:
+                            raise RetrievalError(
+                                "LanceDB cannot train an ivf_pq index on fewer than "
+                                f"{_PQ_MINIMUM_ROWS} rows; declare index: ivf_hnsw_sq "
+                                "or ivf_hnsw_flat until the collection is larger "
+                                "(code=lancedb_pq_corpus_too_small)"
+                            )
                         metric = (
                             "l2"
                             if spec.distance_metric == "euclidean"
                             else spec.distance_metric
                         )
+                        config_class = getattr(index_module, _VECTOR_INDEX_CONFIGS[chosen])
                         table.create_index(
                             spec.vector_field,
-                            config=index_module.HnswFlat(distance_type=metric),
+                            config=config_class(distance_type=metric),
                             replace=current is not None,
+                            # Inert on a native table: the build is synchronous
+                            # and this only bounds LanceDB Cloud's async
+                            # indexing (probed on 0.34, #474 review). Kept so a
+                            # remote store gets a bound rather than none.
                             wait_timeout=timedelta(seconds=self._config.timeout_seconds),
                         )
                 elif current is not None:
@@ -725,6 +777,9 @@ class LanceDBStore(RetrievalStore):
                     # approximate results under a config that promises exact
                     # ones (issue #461).
                     table.drop_index(current.name)
+        except RetrievalError:
+            # A deliberate refusal keeps its own code, as in `upsert`/`delete`.
+            raise
         except Exception:
             raise RetrievalError(
                 "LanceDB operation 'index creation' failed (code=lancedb_index_failed)"

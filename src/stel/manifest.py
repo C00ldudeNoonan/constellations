@@ -579,7 +579,11 @@ def _model_dict_v2(
                 "physical_collection": state_target.physical_collection,
                 "scope_fingerprint": scope.target_identity,
                 "materialization": model.materialization,
-                "schema_version": 1,
+                # 2 (issue #476): `vector` may carry `index`, the declared ANN
+                # structure, when it is not the default. Absent means
+                # `ivf_hnsw_flat` -- the config's serializer omits the default
+                # so every descriptor written under version 1 reads the same.
+                "schema_version": 2,
                 "config_fingerprint": collection_config_fingerprint(
                     effective_search, store_type=config.type
                 ),

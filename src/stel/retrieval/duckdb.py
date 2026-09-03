@@ -631,8 +631,11 @@ class DuckDBStore(RetrievalStore):
             operation="ensure indexes",
         )
 
-    def index_config_refusal(self, *, vector_search: str | None) -> str | None:
-        """Approximate search needs an opt-in this store's config may not carry.
+    def index_config_refusal(
+        self, *, vector_search: str | None, vector_index: str | None
+    ) -> str | None:
+        """Approximate search needs an opt-in this store's config may not carry,
+        and this store builds exactly one kind of ANN index.
 
         Reported here as well as from `ensure_indexes` so the compiler can
         refuse the combination before a publish begins. Since a vector-search
@@ -642,6 +645,12 @@ class DuckDBStore(RetrievalStore):
         """
         if vector_search != "approximate":
             return None
+        if vector_index not in (None, "ivf_hnsw_flat"):
+            return (
+                "DuckDB's vss extension builds only an HNSW index over raw vectors; "
+                f"search.vector.index {vector_index!r} needs the LanceDB store "
+                "(code=duckdb_vector_index_unsupported)"
+            )
         if self._config.hnsw_experimental_persistence:
             return None
         return _HNSW_PERSISTENCE_REFUSAL

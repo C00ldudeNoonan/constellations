@@ -1453,7 +1453,7 @@ def test_a_store_config_refusal_stops_the_compile(
     monkeypatch.setattr(
         LanceDBStore,
         "index_config_refusal",
-        lambda self, *, vector_search: "this store will not build that index",
+        lambda self, *, vector_search, vector_index: "this store will not build that index",
     )
 
     with pytest.raises(Exception, match="will not build that index"):
@@ -1559,6 +1559,7 @@ def test_drop_collection_removes_only_an_owned_existing_collection(
                 vector_dimensions=None,
                 distance_metric=None,
                 vector_search="exact",
+                vector_index=None,
                 config_fingerprint="cfg1",
                 descriptor="{}",
                 legacy_config_fingerprint="legacy1",
@@ -1609,6 +1610,7 @@ def _make_collection(store: Any, name: str) -> None:
             vector_dimensions=None,
             distance_metric=None,
             vector_search="exact",
+            vector_index=None,
             config_fingerprint="cfg1",
             descriptor="{}",
             legacy_config_fingerprint="legacy1",
@@ -1904,7 +1906,11 @@ def test_a_subset_invocation_defers_stale_reconciliation(tmp_path: Path) -> None
 # ─── vector index reconciliation (issue #461) ───────────────────────────────
 
 
-def _vector_spec(name: str, *, vector_search: str) -> CollectionSpec:
+def _vector_spec(
+    name: str, *, vector_search: str, vector_index: str | None = None
+) -> CollectionSpec:
+    if vector_index is None and vector_search == "approximate":
+        vector_index = "ivf_hnsw_flat"
     return CollectionSpec(
         logical_name="ctx",
         physical_name=name,
@@ -1918,8 +1924,9 @@ def _vector_spec(name: str, *, vector_search: str) -> CollectionSpec:
         vector_dimensions=3,
         distance_metric="cosine",
         vector_search=vector_search,
-        config_fingerprint=f"cfg-{vector_search}",
-        descriptor=json.dumps({"vector_search": vector_search}),
+        vector_index=vector_index,
+        config_fingerprint=f"cfg-{vector_search}-{vector_index}",
+        descriptor=json.dumps({"vector_search": vector_search, "vector_index": vector_index}),
         legacy_config_fingerprint="legacy",
         arrow_schema=pa.schema(
             [
@@ -1974,6 +1981,7 @@ def _merge_key_spec(name: str) -> CollectionSpec:
         vector_dimensions=None,
         distance_metric=None,
         vector_search=None,
+        vector_index=None,
         config_fingerprint="cfg",
         descriptor="{}",
         legacy_config_fingerprint="legacy",
@@ -2090,3 +2098,169 @@ def test_lancedb_switching_back_to_exact_takes_the_index_away(
         store.ensure_indexes(_vector_spec(name, vector_search="exact"))
 
         assert _vector_index_types(store, name) == []
+
+
+@pytest.mark.parametrize(
+    "vector_index,reported",
+    [("ivf_hnsw_flat", "IvfHnswFlat"), ("ivf_hnsw_sq", "IvfHnswSq"), ("ivf_pq", "IvfPq")],
+)
+def test_lancedb_builds_the_declared_index_type(
+    tmp_path: Path, vector_index: str, reported: str
+) -> None:
+    """Issue #476: `HnswFlat` was hardcoded, and its build peaks at ~3x the
+    vectors' bytes — more than a 20 GiB publisher has for an 11 GB corpus.
+    The type is now declared, and what LanceDB reports back is what was asked
+    for."""
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, _vector_rows(), id_field="id", mutation_digest="d1")
+
+        store.ensure_indexes(
+            _vector_spec(name, vector_search="approximate", vector_index=vector_index)
+        )
+
+        assert _vector_index_types(store, name) == [reported]
+
+
+def test_lancedb_switching_index_type_replaces_the_structure(tmp_path: Path) -> None:
+    """A type switch must rebuild, not leave the old structure answering under
+    the new declaration: `ensure_indexes` compares the reported type, not just
+    whether *an* index exists."""
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, _vector_rows(), id_field="id", mutation_digest="d1")
+        store.ensure_indexes(
+            _vector_spec(name, vector_search="approximate", vector_index="ivf_hnsw_flat")
+        )
+        assert _vector_index_types(store, name) == ["IvfHnswFlat"]
+
+        store.ensure_indexes(
+            _vector_spec(name, vector_search="approximate", vector_index="ivf_pq")
+        )
+        assert _vector_index_types(store, name) == ["IvfPq"]
+
+        store.ensure_indexes(_vector_spec(name, vector_search="exact"))
+        assert _vector_index_types(store, name) == []
+
+
+def test_lancedb_refuses_approximate_without_a_declared_type(tmp_path: Path) -> None:
+    """A spec built from a validated config always names a type; reaching the
+    store without one is a caller bug and must not silently pick a default."""
+    from stel.retrieval import RetrievalError
+
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, _vector_rows(), id_field="id", mutation_digest="d1")
+        spec = _vector_spec(name, vector_search="approximate")
+        undeclared = replace(spec, vector_index=None)
+
+        with pytest.raises(RetrievalError, match="lancedb_index_type_missing"):
+            store.ensure_indexes(undeclared)
+
+
+def test_compiler_points_a_type_refusal_at_the_index_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that refuses the *type* should name `index`, not `search`: the
+    operator chose the type deliberately, and that is the line to change."""
+    from stel.retrieval.lancedb import LanceDBStore
+
+    _write_project(tmp_path)
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace(
+            "        search: exact\n", "        search: approximate\n        index: ivf_pq\n"
+        ),
+        encoding="utf-8",
+    )
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    monkeypatch.setattr(
+        LanceDBStore,
+        "index_config_refusal",
+        lambda self, *, vector_search, vector_index: f"no {vector_index} here",
+    )
+
+    with pytest.raises(Exception, match=r"no ivf_pq here") as error:
+        validate_retrieval_capabilities(models, project, resolved)
+    assert "index" in str(error.value)
+
+
+def test_lancedb_names_the_pq_training_floor_instead_of_a_generic_failure(
+    tmp_path: Path,
+) -> None:
+    """LanceDB refuses `ivf_pq` below 256 rows with a message stel's error
+    boundary sanitizes away; the operator would see only `lancedb_index_failed`
+    after a full publish. Checked before the build, with the fix in the text."""
+    from stel.retrieval import RetrievalError
+
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, _vector_rows()[:8], id_field="id", mutation_digest="d1")
+
+        with pytest.raises(RetrievalError, match="lancedb_pq_corpus_too_small") as error:
+            store.ensure_indexes(
+                _vector_spec(name, vector_search="approximate", vector_index="ivf_pq")
+            )
+    assert "ivf_hnsw_sq" in str(error.value)
+    with store:
+        assert _vector_index_types(store, name) == []
+
+
+def test_a_pq_collection_that_shrank_below_the_floor_keeps_publishing(tmp_path: Path) -> None:
+    """The floor guards a *build*, not a collection: an index trained on 256
+    rows stays valid after deletions, and a publish that needs no rebuild must
+    not be refused for a training it will not do."""
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        rows = _vector_rows()
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, rows, id_field="id", mutation_digest="d1")
+        pq = _vector_spec(name, vector_search="approximate", vector_index="ivf_pq")
+        store.ensure_indexes(pq)
+        assert _vector_index_types(store, name) == ["IvfPq"]
+
+        store.delete(
+            name, [row.record_id for row in rows[:200]], id_field="id", mutation_digest="d2"
+        )
+        assert store.inspect_collection(name).row_count == 56
+
+        store.ensure_indexes(pq)  # nothing new to index, nothing to train
+
+        assert _vector_index_types(store, name) == ["IvfPq"]
+
+
+def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None:
+    """A new key in a documented artifact is a schema change (AGENTS.md), even
+    an additive one: a consumer pinning version 1 should fail loudly rather
+    than read the wider shape as the narrower. The default is never written,
+    so the only difference between the versions is a declared `index`."""
+    _write_project(tmp_path)
+    resource = next(
+        model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
+    )["output"]["serving_resource"]
+    assert resource["schema_version"] == 2
+    assert "index" not in resource["vector"]
+
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace(
+            "        search: exact\n", "        search: approximate\n        index: ivf_pq\n"
+        ),
+        encoding="utf-8",
+    )
+    resource = next(
+        model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
+    )["output"]["serving_resource"]
+    assert resource["schema_version"] == 2
+    assert resource["vector"]["index"] == "ivf_pq"

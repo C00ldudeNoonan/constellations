@@ -141,3 +141,15 @@ index.
 
 The 4h35m republish figure is the reporter's measured full rebuild of this
 corpus under `on_index_change: fail`.
+
+## Amendments
+
+- **#476 — the index *type* is an index-build field too.** `vector.index`
+  (`ivf_hnsw_flat` | `ivf_hnsw_sq` | `ivf_pq`) joins `vector.search` in the
+  set of fields classified `COMPATIBLE`, for the same reason: it selects a
+  structure over vectors already published. The "exclude from the fingerprint"
+  alternative this ADR rejected on migration cost is what forced the shape of
+  the new field: its default is *omitted* by the model's own serializer rather
+  than written, so no dump — descriptor, fingerprint, manifest, code version —
+  moves, and only a deliberate choice is recorded. The measured build-memory ratios that motivated the field are in
+  `docs/reference.md` under "Choosing the index `approximate` builds".

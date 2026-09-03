@@ -12,8 +12,10 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     PrivateAttr,
+    SerializerFunctionWrapHandler,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
@@ -601,6 +603,14 @@ class SearchEmbeddingIdentityConfig(BaseModel):
     dimensions: int = Field(gt=0)
 
 
+# The ANN structure `search: approximate` builds (issue #476). The default is
+# what every collection published before the field existed was built with, so
+# the model's own serializer omits it when unchanged and nothing derived from a
+# dump — descriptor, fingerprints, manifest, code version — moves on upgrade.
+VectorIndexType = Literal["ivf_hnsw_flat", "ivf_hnsw_sq", "ivf_pq"]
+DEFAULT_VECTOR_INDEX: VectorIndexType = "ivf_hnsw_flat"
+
+
 class SearchVectorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -608,6 +618,12 @@ class SearchVectorConfig(BaseModel):
     dimensions: int = Field(gt=0)
     metric: Literal["cosine", "euclidean", "dot"] = "cosine"
     search: Literal["exact", "approximate"] = "exact"
+    # Which index `approximate` builds. `ivf_hnsw_flat` keeps raw vectors in
+    # the graph (highest recall, ~3x the vectors' bytes to build); `ivf_hnsw_sq`
+    # quantizes them (~1.7x); `ivf_pq` compresses to codes and its build cost
+    # is dominated by training, which barely grows with the corpus — the one
+    # that fits a memory-limited publisher at millions of rows (issue #476).
+    index: VectorIndexType = DEFAULT_VECTOR_INDEX
     embedding: Literal["inherit"] | SearchEmbeddingIdentityConfig
 
     @model_validator(mode="after")
@@ -620,6 +636,37 @@ class SearchVectorConfig(BaseModel):
                 "search.vector embedding identity dimensions must match vector dimensions"
             )
         return self
+
+    @model_validator(mode="after")
+    def _index_type_needs_approximate_search(self) -> SearchVectorConfig:
+        # `exact` builds no index at all, so an `index` written under it would
+        # be accepted and silently do nothing — the shape this codebase refuses
+        # elsewhere (a flag that looks like a decision and is not). Judged on
+        # whether the key was *written*, not on its value: spelling out the
+        # default under `exact` is still an operator asserting a choice that
+        # nothing will honor (Codex review, #477).
+        if "index" in self.model_fields_set and self.search != "approximate":
+            raise ValueError(
+                f"search.vector.index {self.index!r} only applies to "
+                "search: approximate; exact search builds no vector index"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_the_default_index(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # "Absent means default" is enforced here, at the model, rather than in
+        # one consumer: the collection descriptor, every fingerprint, the
+        # manifest, and the code-version hash in `versioning.py` all start from
+        # a dump of this model. A default that surfaced in any one of them
+        # would reclassify every published index as changed on the first run
+        # after upgrade — ADR-0002's "charge everybody once", which it
+        # rejected. Only a deliberate choice is ever written.
+        data = handler(self)
+        if data.get("index") == DEFAULT_VECTOR_INDEX:
+            del data["index"]
+        return data
 
 
 class SearchFullTextConfig(BaseModel):

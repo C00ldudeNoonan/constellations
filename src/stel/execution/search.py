@@ -941,6 +941,7 @@ def _search_collection_spec(
         vector_dimensions=search.vector.dimensions if search.vector else None,
         distance_metric=search.vector.metric if search.vector else None,
         vector_search=search.vector.search if search.vector else None,
+        vector_index=search.vector.index if search.vector else None,
         config_fingerprint=config_fingerprint,
         descriptor=descriptor,
         legacy_config_fingerprint=legacy_fingerprint,

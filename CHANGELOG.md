@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### The ANN index type is declared, and `ivf_pq` fits where `HnswFlat` did not (issue #476)
+
+`search: approximate` always built LanceDB's `HnswFlat`, which keeps raw vectors
+in the graph. Measured locally, that build peaks at ~3.2x the vectors' raw
+bytes — on the 3.6M x 768 corpus from #473 (~11 GB of vectors), roughly 35 GB
+against a 20 GiB container. The publish #474 made safe would have survived its
+appends and then died at the index build, with nothing having said so at minute
+zero.
+
+- New `vector: {index: ivf_hnsw_flat | ivf_hnsw_sq | ivf_pq}`. `ivf_hnsw_sq`
+  builds at ~1.6x; `ivf_pq` — LanceDB's own general-purpose default — at a
+  ratio that *falls* with corpus size (2.1x → 1.2x → 0.45x at 100k / 300k /
+  1M rows, build time flat), because its cost is training rather than rows.
+  That is the type that fits a memory-limited publisher at millions of rows.
+- **Nothing existing changes.** The default stays `ivf_hnsw_flat` and the
+  config's own serializer omits it, so every published collection's
+  descriptor, fingerprint, and code version are byte-identical before and
+  after this release — no dump of the config carries the default.
+  A change of `index` classifies as compatible — the same class as `exact` <->
+  `approximate` — and lands in a private generation under
+  `on_index_change: online`. LanceDB rebuilds when the type on disk differs
+  from the declared one, so a stale structure never answers under a new
+  declaration.
+- `index` under `search: exact` is refused at config time (it would do
+  nothing), and any type but `ivf_hnsw_flat` is refused at compile time against
+  the DuckDB store, whose vss extension builds one HNSW.
+- The manifest's `serving_resource` descriptor moves to `schema_version: 2`:
+  its `vector` block carries `index` when a non-default ANN structure is
+  declared, and nothing else changes — a descriptor written under 1 reads
+  identically, since the default is never written.
+- `ivf_pq` needs 256 rows to train (LanceDB's 8-bit codebook); below that stel
+  refuses with `lancedb_pq_corpus_too_small` and names the alternative, instead
+  of surfacing a sanitized `lancedb_index_failed` after the whole publish.
+
+Measured ratios are documented as scaling guidance, not a contract; `ivf_pq` is
+lossy, so pair a switch with `stel eval`.
 ### The search merge key is indexed, so an incremental publish stops scanning the table (issue #475)
 
 `_search_collection_spec` built `scalar_index_fields` from attributes with a

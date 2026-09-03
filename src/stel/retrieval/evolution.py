@@ -43,12 +43,15 @@ ROUTING_FIELDS = frozenset({"store", "collection"})
 # without being rebuilt.
 _ADDITIVE_FIELDS = ("display_fields", "return_text_fields")
 
-# The one `vector` sub-field that describes how the collection is *indexed*
+# The `vector` sub-fields that describe how the collection is *indexed*
 # rather than what a published row contains. Switching between `exact` and
 # `approximate` builds or drops an ANN structure over vectors that are already
-# there; the field, dimensions, metric, and embedding identity all change what
-# a row means (issue #461).
-_VECTOR_INDEX_ONLY_FIELDS = frozenset({"search"})
+# there (issue #461), and `index` chooses which structure (issue #476); the
+# field, dimensions, metric, and embedding identity all change what a row
+# means. `index` is absent from a descriptor when it is the default, so a
+# stored descriptor without it and a current one with the default compare
+# equal, and only a deliberate choice registers as a change.
+_VECTOR_INDEX_ONLY_FIELDS = frozenset({"search", "index"})
 
 
 class ChangeKind(StrEnum):
@@ -167,12 +170,15 @@ def _classify_vector(before: Any, after: Any) -> ConfigChange:
         key for key in set(old) | set(new) if old.get(key) != new.get(key)
     }
     if moved and moved <= _VECTOR_INDEX_ONLY_FIELDS:
+        described = ", ".join(
+            f"{key} {old.get(key)!r} -> {new.get(key)!r}" for key in sorted(moved)
+        )
         return ConfigChange(
             field="vector",
             kind=ChangeKind.COMPATIBLE,
             detail=(
-                f"search strategy {old.get('search')!r} -> {new.get('search')!r} "
-                "— an index build over vectors already published, not a re-embed"
+                f"{described} — an index build over vectors already published, "
+                "not a re-embed"
             ),
         )
     return ConfigChange(

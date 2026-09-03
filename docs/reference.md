@@ -2275,6 +2275,58 @@ local NVMe store is materially faster, so the warning errs toward arriving
 early. It is a warning, not a refusal: `exact` returns the same rows at any
 size, and paying for it is a decision you are entitled to make.
 
+#### Choosing the index `approximate` builds
+
+`search: approximate` builds one of three structures, declared with
+`vector: {index: ...}`. The choice matters most for the publisher's memory
+during the index build, which is the last step of a publish — and, on a large
+corpus, the step most likely to be the one that does not fit (issue #476):
+
+```yaml
+vector:
+  field: embedding
+  dimensions: 768
+  metric: cosine
+  search: approximate
+  index: ivf_pq          # ivf_hnsw_flat (default) | ivf_hnsw_sq | ivf_pq
+```
+
+| `index` | what it stores | build peak, as a multiple of the vectors' raw bytes | build time trend |
+| --- | --- | --- | --- |
+| `ivf_hnsw_flat` (default) | raw vectors in an HNSW graph — highest recall | ~3.2x | grows with rows |
+| `ivf_hnsw_sq` | scalar-quantized vectors in an HNSW graph | ~1.6x | grows with rows |
+| `ivf_pq` | product-quantized codes; LanceDB's general-purpose default | 2.1x → 1.2x → 0.45x at 100k / 300k / 1M rows, still falling | nearly flat — the cost is training, not rows |
+
+Those are local measurements on LanceDB 0.34 at 256 dimensions, not a contract,
+and they sit on top of whatever the publish itself already holds. Read them as
+scaling guidance: a 3.6M x 768 corpus is ~11 GB of vectors, so `ivf_hnsw_flat`
+needs on the order of 35 GB to build, `ivf_hnsw_sq` ~18 GB, and `ivf_pq` a few
+GB — the one that fits a 20 GiB publisher. `ivf_pq` is lossy; after switching,
+run `stel eval` against your golden set so recall is a number rather than an
+assumption, and prefer dimensions divisible by 16 (LanceDB warns otherwise).
+It also needs a corpus to train on: LanceDB refuses to build it on fewer than
+**256 rows** (one centroid per 8-bit code), and stel reports that as
+`lancedb_pq_corpus_too_small` before the build rather than after — declare
+`ivf_hnsw_sq` for a collection that small.
+
+Three things follow from how the field is stamped:
+
+- **The default is deliberately absent from the collection descriptor.** A
+  collection published before this field existed was built with
+  `ivf_hnsw_flat`, so a config that never mentions `index` — or spells out the
+  default — produces byte-identical descriptors, fingerprints, and code
+  versions: the config's own serializer omits the default, so no dump
+  anywhere carries it. Nothing is reclassified on upgrade; only a deliberate
+  choice is recorded.
+- **Switching it is a compatible change**, the same class as `exact` <->
+  `approximate`: an index build over vectors that are already published, no
+  re-embed, applied under `on_index_change: online` into a private generation.
+- **`index` applies only to `search: approximate`.** `exact` builds no index,
+  so writing `index` under it — even the default — is refused at config time
+  rather than accepted and ignored. The DuckDB store builds only `ivf_hnsw_flat` (its vss
+  extension has one HNSW); declaring another type against it is refused at
+  compile time, naming the LanceDB store.
+
 `run` and `build` stream projected Arrow batches from the warehouse, validate
 the declared row contract before each mutation, upsert changed rows, delete
 stale rows, and advance warehouse state only after exact durable receipts,
@@ -2363,6 +2415,7 @@ Everything that defines a row's shape or meaning is:
 | --- | --- |
 | new attribute, wider `display_fields`/`return_text_fields` | compatible |
 | `vector: {search: ...}` — `exact` <-> `approximate` | compatible |
+| `vector: {index: ...}` — which ANN structure `approximate` builds | compatible |
 | `vector` field, dimensions, metric, or embedding identity | rebuild required |
 | `id_field`, `document_id_field`, `chunk_id_field` | rebuild required |
 | `text_fields`, `full_text`, `access`, `query` modes | rebuild required |

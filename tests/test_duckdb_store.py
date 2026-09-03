@@ -33,7 +33,11 @@ SCHEMA = pa.schema(
 )
 
 
-def _spec(name: str, *, vector_search: str = "exact") -> CollectionSpec:
+def _spec(
+    name: str, *, vector_search: str = "exact", vector_index: str | None = None
+) -> CollectionSpec:
+    if vector_index is None and vector_search == "approximate":
+        vector_index = "ivf_hnsw_flat"
     return CollectionSpec(
         logical_name="ctx",
         physical_name=name,
@@ -47,6 +51,7 @@ def _spec(name: str, *, vector_search: str = "exact") -> CollectionSpec:
         vector_dimensions=3,
         distance_metric="cosine",
         vector_search=vector_search,
+        vector_index=vector_index,
         config_fingerprint="cfg1",
         descriptor='{"distance_metric": "cosine"}',
         legacy_config_fingerprint="legacy1",
@@ -509,6 +514,7 @@ def _multi_field_spec(name: str) -> CollectionSpec:
         vector_dimensions=3,
         distance_metric="cosine",
         vector_search="exact",
+        vector_index=None,
         config_fingerprint="cfg1",
         descriptor='{"distance_metric": "cosine"}',
         legacy_config_fingerprint="legacy1",
@@ -665,7 +671,7 @@ def test_approximate_without_the_opt_in_is_refused_at_preflight(
     would restamp the live collection, republish every row, and only then fail
     — with the serving pointer already cleared (Codex review, #461).
     """
-    refusal = store.index_config_refusal(vector_search="approximate")
+    refusal = store.index_config_refusal(vector_search="approximate", vector_index="ivf_hnsw_flat")
 
     assert refusal is not None
     assert "hnsw_persistence_disabled" in refusal
@@ -676,8 +682,8 @@ def test_preflight_accepts_what_the_store_can_actually_build(
 ) -> None:
     """The complement, in both directions: `exact` needs no index at all, and
     `approximate` is fine once the operator has accepted the WAL risk."""
-    assert store.index_config_refusal(vector_search="exact") is None
-    assert store.index_config_refusal(vector_search=None) is None
+    assert store.index_config_refusal(vector_search="exact", vector_index=None) is None
+    assert store.index_config_refusal(vector_search=None, vector_index=None) is None
 
     opted_in = DuckDBStore(
         DuckDBConfig(
@@ -687,7 +693,10 @@ def test_preflight_accepts_what_the_store_can_actually_build(
         target_name="dev",
         alias="default",
     )
-    assert opted_in.index_config_refusal(vector_search="approximate") is None
+    assert (
+        opted_in.index_config_refusal(vector_search="approximate", vector_index="ivf_hnsw_flat")
+        is None
+    )
 
 
 def test_preflight_and_the_index_build_refuse_with_one_wording(
@@ -705,5 +714,34 @@ def test_preflight_and_the_index_build_refuse_with_one_wording(
             store.ensure_indexes(spec)
 
     assert str(error.value) == store.index_config_refusal(
-        vector_search="approximate"
+        vector_search="approximate", vector_index="ivf_hnsw_flat"
+    )
+
+
+@pytest.mark.parametrize("vector_index", ["ivf_hnsw_sq", "ivf_pq"])
+def test_preflight_refuses_index_types_vss_cannot_build(
+    tmp_path: Path, vector_index: str
+) -> None:
+    """DuckDB's vss extension builds exactly one ANN index. Any other declared
+    type is refused at compile time even with persistence opted in, and the
+    refusal names the LanceDB store as the place that type lives (issue #476)."""
+    opted_in = DuckDBStore(
+        DuckDBConfig(
+            path=str(tmp_path / "hnsw.duckdb"), hnsw_experimental_persistence=True
+        ),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+
+    refusal = opted_in.index_config_refusal(
+        vector_search="approximate", vector_index=vector_index
+    )
+
+    assert refusal is not None
+    assert "duckdb_vector_index_unsupported" in refusal
+    assert vector_index in refusal and "LanceDB" in refusal
+    assert (
+        opted_in.index_config_refusal(vector_search="approximate", vector_index="ivf_hnsw_flat")
+        is None
     )

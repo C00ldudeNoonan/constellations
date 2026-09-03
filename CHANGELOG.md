@@ -80,6 +80,13 @@ override the role default, and win in every role — including serving, which is
 how an operator bounds a query process sharing a container. Setting one alone
 leaves the other at its default rather than at zero.
 
+Under a container memory limit, a *default* is scaled to fit half the detected
+ceiling, reusing the `stel.memory` cgroup reader #476 shared out of the DuckDB
+adapter. This mostly binds serving — LanceDB's ~7 GB is most of a 2 GiB
+container, while a 20 GiB one allows 10 GiB and nothing is clamped. An explicit
+setting is never scaled: the operator may know something the cgroup does not,
+the same way #412's DuckDB detection is advisory.
+
 These are execution settings, not identity: they stay out of `routing_options`
 and the safe descriptor, so tuning a cache cannot present as a different
 physical store, reclassify a published collection, or strand its incremental

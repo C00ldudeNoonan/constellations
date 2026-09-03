@@ -18,9 +18,25 @@ from typing import Any
 import pytest
 
 from stel.retrieval import LanceDBConfig, LanceDBStore, StoreRole
+from stel.retrieval import lancedb as lancedb_store
 from stel.retrieval.lancedb import session_cache_budget
 
 _MB = 1024 * 1024
+_GB = 1024 * _MB
+
+
+def _with_ceiling(monkeypatch: pytest.MonkeyPatch, ceiling: int | None) -> None:
+    monkeypatch.setattr(
+        lancedb_store, "container_memory_limit_bytes", lambda: ceiling
+    )
+
+
+@pytest.fixture(autouse=True)
+def _off_a_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every case to "no container", so a test that is about the role
+    or the profile is not quietly also about the box it runs on. The ceiling
+    cases opt back in with `_with_ceiling`."""
+    _with_ceiling(monkeypatch, None)
 
 
 def _config(**overrides: Any) -> LanceDBConfig:
@@ -211,3 +227,81 @@ def test_serving_connects_without_a_session_by_default(
         pass
 
     assert "session" not in captured
+
+
+# ─── a detected container ceiling clamps defaults (issue #479, ask 3) ───────
+
+
+def test_serving_on_a_small_container_does_not_take_lancedbs_7gb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case this exists for. Serving keeps LanceDB's defaults by choice,
+    but ~7 GB of cache is most of a 2 GiB container before the query process
+    holds anything — and the cgroup is the only thing that knows."""
+    _with_ceiling(monkeypatch, 2 * _GB)
+
+    budget = session_cache_budget(_config(), StoreRole.SERVE)
+
+    assert budget is not None
+    index, metadata = budget
+    # Half the ceiling between them, LanceDB's 6:1 shape preserved.
+    assert index + metadata <= _GB
+    assert index > metadata
+
+
+def test_a_roomy_container_leaves_the_serving_default_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 20 GiB box allows 10 GiB and the default asks for 7, so the clamp
+    must not bind — serving keeps LanceDB's own behavior exactly."""
+    _with_ceiling(monkeypatch, 20 * _GB)
+
+    assert session_cache_budget(_config(), StoreRole.SERVE) is None
+
+
+def test_no_container_leaves_the_serving_default_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_ceiling(monkeypatch, None)
+
+    assert session_cache_budget(_config(), StoreRole.SERVE) is None
+
+
+def test_an_explicit_setting_is_never_clamped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advisory, like #412's DuckDB detection: the operator may know the box
+    is larger than the cgroup says, and an explicit number is a decision."""
+    _with_ceiling(monkeypatch, 2 * _GB)
+
+    budget = session_cache_budget(
+        _config(index_cache_size_mb=4096, metadata_cache_size_mb=512),
+        StoreRole.SERVE,
+    )
+
+    assert budget == (4096 * _MB, 512 * _MB)
+
+
+def test_a_tiny_container_still_leaves_each_cache_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scaling must not drive a cache to zero, which would disable it."""
+    _with_ceiling(monkeypatch, 8 * _MB)
+
+    budget = session_cache_budget(_config(), StoreRole.SERVE)
+
+    assert budget is not None
+    assert all(size >= _MB for size in budget)
+
+
+def test_the_publisher_default_already_fits_a_normal_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """320 MB total against a 20 GiB ceiling: nothing to clamp, so the
+    publisher gets exactly its role default."""
+    _with_ceiling(monkeypatch, 20 * _GB)
+
+    assert session_cache_budget(_config(), StoreRole.PUBLISH) == (
+        256 * _MB,
+        64 * _MB,
+    )

@@ -14,6 +14,7 @@ from pydantic import ConfigDict, Field, field_validator
 
 from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
+from ..memory import container_memory_limit_bytes
 from ..optional_dependencies import (
     import_optional_dependency,
     optional_dependency_version,
@@ -62,6 +63,17 @@ _ROLE_CACHE_BUDGET_MB: dict[StoreRole, tuple[int, int]] = {
     StoreRole.INSPECT: (32, 16),
 }
 
+# LanceDB's own defaults, as its Session docs give them.
+_LANCEDB_DEFAULT_BUDGET_MB = (6 * 1024, 1024)
+
+# Share of a detected container ceiling the caches may take between them. The
+# serving process is the one this binds: its default is LanceDB's ~7 GB, which
+# is most of a small container before the query process holds anything. Half
+# leaves the other half to the process itself, and on a container large enough
+# for LanceDB's defaults it does not bind at all — a 20 GiB box allows 10 GiB
+# and the default asks for 7.
+_CEILING_CACHE_SHARE = 0.5
+
 
 def session_cache_budget(
     config: LanceDBConfig, role: StoreRole
@@ -71,12 +83,20 @@ def session_cache_budget(
     An explicit profile setting wins in every role; a role default fills in
     only what the profile left unset, so bounding one cache does not silently
     unbound the other.
+
+    A detected container ceiling clamps a *default* but never an explicit
+    setting: the operator may know something the cgroup does not, and this is
+    advisory the same way #412's DuckDB detection is.
     """
     default = _ROLE_CACHE_BUDGET_MB.get(role)
     index_mb = config.index_cache_size_mb
     metadata_mb = config.metadata_cache_size_mb
+    configured = index_mb is not None and metadata_mb is not None
     if default is None and index_mb is None and metadata_mb is None:
-        return None
+        # SERVE, unconfigured: LanceDB's defaults, unless a container ceiling
+        # makes them absurd for the box we are actually on.
+        clamped = _clamped_to_ceiling(_LANCEDB_DEFAULT_BUDGET_MB)
+        return None if clamped is None else _to_bytes(clamped)
     fallback = default or (0, 0)
     resolved_index = index_mb if index_mb is not None else fallback[0]
     resolved_metadata = metadata_mb if metadata_mb is not None else fallback[1]
@@ -84,9 +104,38 @@ def session_cache_budget(
         # One side configured under a role with no default (SERVE): fill the
         # other from LanceDB's documented defaults rather than from zero, which
         # would disable a cache nobody asked to disable.
-        resolved_index = resolved_index or 6 * 1024
-        resolved_metadata = resolved_metadata or 1024
-    return (resolved_index * _MB, resolved_metadata * _MB)
+        resolved_index = resolved_index or _LANCEDB_DEFAULT_BUDGET_MB[0]
+        resolved_metadata = resolved_metadata or _LANCEDB_DEFAULT_BUDGET_MB[1]
+    resolved = (resolved_index, resolved_metadata)
+    if not configured:
+        resolved = _clamped_to_ceiling(resolved) or resolved
+    return _to_bytes(resolved)
+
+
+def _to_bytes(budget_mb: tuple[int, int]) -> tuple[int, int]:
+    return (budget_mb[0] * _MB, budget_mb[1] * _MB)
+
+
+def _clamped_to_ceiling(budget_mb: tuple[int, int]) -> tuple[int, int] | None:
+    """`budget_mb` reduced to fit a detected container ceiling, or None.
+
+    None means "nothing to say": no ceiling detected, or one roomy enough that
+    the budget already fits. The two caches are scaled together so their
+    relative sizing — which is LanceDB's shape, not ours to reinterpret —
+    survives the clamp, and neither is driven below 1 MB.
+    """
+    ceiling = container_memory_limit_bytes()
+    if ceiling is None:
+        return None
+    allowance_mb = int(ceiling * _CEILING_CACHE_SHARE) // _MB
+    total_mb = budget_mb[0] + budget_mb[1]
+    if total_mb <= allowance_mb:
+        return None
+    scale = allowance_mb / total_mb
+    return (
+        max(int(budget_mb[0] * scale), 1),
+        max(int(budget_mb[1] * scale), 1),
+    )
 
 # Arrow schema metadata written into every collection stel creates. These
 # names live in existing LanceDB collections, so they are data, not code.

@@ -2159,6 +2159,13 @@ container:
             metadata_cache_size_mb: 256
 ```
 
+Under a container memory limit, a *default* is scaled down to fit half that
+ceiling, using the same cgroup detection `memory_limit` uses for DuckDB. This
+mostly binds serving: LanceDB's ~7 GB of defaults is most of a 2 GiB container
+before the query process holds anything, while a 20 GiB one allows 10 GiB and
+nothing is clamped. An explicit setting is never scaled — the operator may
+know something the cgroup does not.
+
 These are execution settings, not identity: changing one does not alter the
 store's descriptor, so it cannot reclassify a published collection or strand
 its incremental state.

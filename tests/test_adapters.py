@@ -1054,20 +1054,14 @@ def _fake_cgroup(
     physical: int | None = 64 * 1024**3,
 ) -> None:
     """Stand in for the cgroup mount, which no test can create for real."""
-    from stel.adapters import duckdb as duckdb_adapter
+    from stel import memory as memory_module
 
     present = tmp_path / ("memory.max" if v2 else "memory.limit_in_bytes")
     present.write_text(contents, encoding="utf-8")
     absent = tmp_path / "absent"
-    monkeypatch.setattr(
-        duckdb_adapter, "_CGROUP_V2_MAX", present if v2 else absent
-    )
-    monkeypatch.setattr(
-        duckdb_adapter, "_CGROUP_V1_MAX", absent if v2 else present
-    )
-    monkeypatch.setattr(
-        duckdb_adapter, "_physical_memory_bytes", lambda: physical
-    )
+    monkeypatch.setattr(memory_module, "_CGROUP_V2_MAX", present if v2 else absent)
+    monkeypatch.setattr(memory_module, "_CGROUP_V1_MAX", absent if v2 else present)
+    monkeypatch.setattr(memory_module, "physical_memory_bytes", lambda: physical)
 
 
 def test_a_container_ceiling_bounds_duckdb_without_configuration(
@@ -1186,11 +1180,11 @@ def test_no_container_means_no_change_in_behavior(
 ) -> None:
     """Outside a container nothing is detected, so an ordinary workstation run
     keeps exactly the DuckDB sizing it had before this change."""
-    from stel.adapters import duckdb as duckdb_adapter
+    from stel import memory as memory_module
 
     absent = tmp_path / "absent"
-    monkeypatch.setattr(duckdb_adapter, "_CGROUP_V2_MAX", absent)
-    monkeypatch.setattr(duckdb_adapter, "_CGROUP_V1_MAX", absent)
+    monkeypatch.setattr(memory_module, "_CGROUP_V2_MAX", absent)
+    monkeypatch.setattr(memory_module, "_CGROUP_V1_MAX", absent)
     config = parse_warehouse_config(
         {"type": "duckdb", "path": str(tmp_path / "w.duckdb")}
     )

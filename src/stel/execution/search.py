@@ -34,6 +34,7 @@ from ..config.project import ProjectConfig
 from ..dag import parse_ref
 from ..embedding import effective_search_config, resolve_search_embedding_options
 from ..hashing import canonical_fingerprint
+from ..memory import container_memory_limit_bytes
 from ..profile import ResolvedProfile
 from ..retrieval import (
     ChangeKind,
@@ -59,6 +60,9 @@ from ..retrieval.retention import retire_superseded_generations
 from ..retrieval.servability import (
     exact_advisory_row_threshold,
     exact_search_advisory,
+    index_build_advisory,
+    index_build_advisory_row_threshold,
+    index_build_is_estimated,
 )
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..timing import PhaseTimings
@@ -273,16 +277,70 @@ def _run_search_model(
                     and spec.vector_dimensions is not None
                     else None
                 )
+                # The other scale-dependent cost, and the one that killed the
+                # #473 retest's predecessor at its last step: the ANN build's
+                # peak against the container ceiling (issue #476). Read once;
+                # None outside a container, where there is nothing to compare.
+                build_limit = container_memory_limit_bytes()
+                warned_build = False
+                build_warn_after = (
+                    index_build_advisory_row_threshold(
+                        dimensions=spec.vector_dimensions,
+                        vector_index=spec.vector_index,
+                        limit_bytes=build_limit,
+                    )
+                    if spec.vector_search == "approximate"
+                    and spec.vector_dimensions is not None
+                    and spec.vector_index is not None
+                    and build_limit is not None
+                    and index_build_is_estimated(store_config.type)
+                    else None
+                )
                 existing = store.inspect_collection(physical)
                 force_publish = existing is None
                 collection_exists = existing is not None
-                if existing is not None:
+                # A private build inspects its own, still-empty target, so
+                # `existing` is None on exactly the runs the advisories matter
+                # most for: a configuration change over a large live
+                # collection. #474 moved those off the in-place path and, with
+                # them, the pre-run advisories' view of the row count -- the
+                # exact-scan warning lost its minute-zero shot without anyone
+                # noticing. The live collection is what the rows will be
+                # republished from, so its count is the one to warn against
+                # before any of them are read (issue #476).
+                live = (
+                    store.inspect_collection(active_collection or default_collection)
+                    if rebuild and existing is None
+                    else None
+                )
+                known_rows = (
+                    existing.row_count
+                    if existing is not None
+                    else live.row_count
+                    if live is not None
+                    else None
+                )
+                if known_rows is not None:
                     # Before the run spends its time, not after: on every run
-                    # but the first, the collection already knows how many rows
+                    # but the first, a collection already knows how many rows
                     # an exact query has to scan (issue #461).
-                    warned_exact = _warn_on_exact_vector_scan(
-                        model, spec, existing.row_count
+                    warned_exact = _warn_on_exact_vector_scan(model, spec, known_rows)
+                if known_rows is not None and rebuild:
+                    # The build advisory only where a build is certain. A
+                    # private generation always builds its index; an in-place
+                    # run builds only if it writes -- `ensure_indexes` skips a
+                    # collection with nothing unindexed -- so warning here on
+                    # every rerun of a large indexed collection would report a
+                    # false failure risk daily (Codex review, #480). In-place
+                    # runs warn at their first write instead, below.
+                    warned_build = _warn_on_index_build_memory(
+                        model,
+                        spec,
+                        known_rows,
+                        limit_bytes=build_limit,
+                        store_type=store_config.type,
                     )
+                if existing is not None:
                     _verify_collection_config(
                         store, existing, spec, policy=search.on_index_change
                     )
@@ -322,6 +380,24 @@ def _run_search_model(
                         # the index build fails (Codex review, #461).
                         warned_exact = _warn_on_exact_vector_scan(
                             model, spec, rows_seen, in_progress=True
+                        )
+                    if (
+                        not warned_build
+                        and build_warn_after is not None
+                        and rows_seen >= build_warn_after
+                        # Certain to build: a private generation, or a first
+                        # publish into a collection that does not exist yet.
+                        # An in-place run's streamed count says nothing about
+                        # whether it will write (Codex review, #480).
+                        and (rebuild or existing is None)
+                    ):
+                        warned_build = _warn_on_index_build_memory(
+                            model,
+                            spec,
+                            rows_seen,
+                            limit_bytes=build_limit,
+                            store_type=store_config.type,
+                            in_progress=True,
                         )
                     # A line rather than a bar: the snapshot is a one-shot
                     # bounded stream with no row count, so there is no total to
@@ -436,6 +512,19 @@ def _run_search_model(
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
+                    if not warned_build and existing is not None:
+                        # The first in-place write settles it: rows are now
+                        # unindexed, so `ensure_indexes` will rebuild the index
+                        # over the whole collection (LanceDB rebuilds with
+                        # replace=True, not incrementally). The collection's
+                        # count is the floor of what that build spans.
+                        warned_build = _warn_on_index_build_memory(
+                            model,
+                            spec,
+                            max(existing.row_count, rows_seen),
+                            limit_bytes=build_limit,
+                            store_type=store_config.type,
+                        )
 
                 # Stale discovery streams state pages whose keys no longer
                 # exist upstream, in ascending key order — complete even for
@@ -808,6 +897,44 @@ def _warn_on_exact_vector_scan(
         rows=row_count,
         dimensions=spec.vector_dimensions,
         access=search.access,
+        in_progress=in_progress,
+    )
+    if advisory is None:
+        return False
+    log.warning("Search resource '%s': %s", model.name, advisory)
+    return True
+
+
+def _warn_on_index_build_memory(
+    model: ModelConfig,
+    spec: CollectionSpec,
+    row_count: int,
+    *,
+    limit_bytes: int | None,
+    store_type: str,
+    in_progress: bool = False,
+) -> bool:
+    """Report an ANN build that will not fit the container it runs in.
+
+    Returns whether anything was said, so the same run does not say it twice.
+    A warning, not a refusal, for the same reasons as the exact-scan advisory:
+    the ratios are measurements, not a contract, and the operator may know
+    better. The #473 predecessor to this appended for hours and died at the
+    build with nothing having mentioned the cost (issue #476).
+    """
+    if (
+        spec.vector_search != "approximate"
+        or spec.vector_dimensions is None
+        or spec.vector_index is None
+    ):
+        return False
+    advisory = index_build_advisory(
+        collection=spec.logical_name,
+        rows=row_count,
+        dimensions=spec.vector_dimensions,
+        vector_index=spec.vector_index,
+        limit_bytes=limit_bytes,
+        store_type=store_type,
         in_progress=in_progress,
     )
     if advisory is None:

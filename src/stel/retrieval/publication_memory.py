@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from ..memory import container_memory_limit_bytes
+
 _PROCESS_STATUS = Path("/proc/self/status")
 
 
@@ -34,8 +36,10 @@ def log_publication_memory(
 ) -> None:
     if not logger.isEnabledFor(logging.INFO):
         return
+    # The limit beside the sample: "rss 8.5 GB" reads very differently next
+    # to a 20 GiB ceiling than a 64 GiB one (issue #476).
     logger.info(
-        "%s: publication memory phase=%s batch=%d rss_bytes=%s arrow_bytes=%d",
+        "%s: publication memory phase=%s batch=%d rss_bytes=%s arrow_bytes=%d limit_bytes=%s",
         model_name, phase, batch, resident_bytes(_PROCESS_STATUS),
-        pa.total_allocated_bytes(),
+        pa.total_allocated_bytes(), container_memory_limit_bytes(),
     )

@@ -2620,6 +2620,7 @@ lancedb = [
     { name = "lancedb" },
 ]
 mcp = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
@@ -2682,6 +2683,7 @@ requires-dist = [
     { name = "google-cloud-storage", marker = "extra == 'gcs'", specifier = ">=2.16" },
     { name = "google-genai", marker = "extra == 'all'", specifier = ">=1.28" },
     { name = "google-genai", marker = "extra == 'vertex'", specifier = ">=1.28" },
+    { name = "httpx", marker = "extra == 'mcp'", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "lancedb", marker = "extra == 'all'", specifier = ">=0.34,<0.35" },
     { name = "lancedb", marker = "extra == 'lancedb'", specifier = ">=0.34,<0.35" },

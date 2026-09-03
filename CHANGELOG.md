@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Opaque bearer tokens verify by introspection (issue #464)
+
+`JwksTokenVerifier` needs a JWT it can read, which ruled out every
+authorization server that issues opaque tokens. `stel mcp serve` now takes
+`--introspection-endpoint`, `--introspection-issuer`,
+`--introspection-audience`, `--introspection-client-id` and
+`--introspection-client-secret-env` instead, and asks the issuer about each
+token (RFC 7662). Same seam, same invariant: a token establishes identity only,
+and authorization stays with operator-owned grants.
+
+- **The audience check is the one this scheme cannot skip.** RFC 7662's
+  `active: true` means the token is live at that server, not that it was minted
+  for this deployment — so a server that omits `aud` from its response cannot
+  be used, because a token a caller legitimately holds for another service
+  would otherwise be valid here. `iss` is checked when present but not
+  demanded: unlike a self-contained JWT, the answer came over TLS from the one
+  endpoint the operator named, authenticated as a registered client.
+- **The secret is passed by environment-variable name**, never as a flag value
+  that the process list and shell history would carry — and only the name is
+  held. The value is read where each request is built, so no long-lived object
+  carries it into an `asdict()`, a `__dict__`, a debugger, or a crash dump.
+  The server refuses to start if the variable is unset.
+- **The call is bounded, because it sits on the unauthenticated path.** Tokens
+  are verified before any tool runs, so the server's rate limits are downstream
+  of it: introspections share one pooled client with a connection ceiling, at
+  most sixteen run at once, and a caller that cannot get a slot is refused
+  rather than queued.
+- **A cache hit is a revocation delay.** A verified token is reused for up to a
+  minute, capped by its own `exp`, which is also how long a revoked token keeps
+  working. Failures are never cached, and entries are keyed by digest rather
+  than by the token.
+- Mutually exclusive with the `--jwt-*` flags and with
+  `--trust-proxy-principal-headers`; refused on `--transport stdio`, where they
+  would verify nothing. `httpx` joins the `mcp` extra, declared rather than
+  relied on transitively.
+
 ### The index build and the resume reads report their wall clock (issue #432)
 
 Two phases of a run were doing real work outside every timing phase, so

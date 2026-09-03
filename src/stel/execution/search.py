@@ -62,6 +62,7 @@ from ..retrieval.servability import (
     exact_search_advisory,
     index_build_advisory,
     index_build_advisory_row_threshold,
+    index_build_is_estimated,
 )
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..timing import PhaseTimings
@@ -292,6 +293,7 @@ def _run_search_model(
                     and spec.vector_dimensions is not None
                     and spec.vector_index is not None
                     and build_limit is not None
+                    and index_build_is_estimated(store_config.type)
                     else None
                 )
                 existing = store.inspect_collection(physical)
@@ -321,11 +323,22 @@ def _run_search_model(
                 if known_rows is not None:
                     # Before the run spends its time, not after: on every run
                     # but the first, a collection already knows how many rows
-                    # an exact query has to scan (issue #461) and an index
-                    # build has to hold (issue #476).
+                    # an exact query has to scan (issue #461).
                     warned_exact = _warn_on_exact_vector_scan(model, spec, known_rows)
+                if known_rows is not None and rebuild:
+                    # The build advisory only where a build is certain. A
+                    # private generation always builds its index; an in-place
+                    # run builds only if it writes -- `ensure_indexes` skips a
+                    # collection with nothing unindexed -- so warning here on
+                    # every rerun of a large indexed collection would report a
+                    # false failure risk daily (Codex review, #480). In-place
+                    # runs warn at their first write instead, below.
                     warned_build = _warn_on_index_build_memory(
-                        model, spec, known_rows, limit_bytes=build_limit
+                        model,
+                        spec,
+                        known_rows,
+                        limit_bytes=build_limit,
+                        store_type=store_config.type,
                     )
                 if existing is not None:
                     _verify_collection_config(
@@ -372,9 +385,19 @@ def _run_search_model(
                         not warned_build
                         and build_warn_after is not None
                         and rows_seen >= build_warn_after
+                        # Certain to build: a private generation, or a first
+                        # publish into a collection that does not exist yet.
+                        # An in-place run's streamed count says nothing about
+                        # whether it will write (Codex review, #480).
+                        and (rebuild or existing is None)
                     ):
                         warned_build = _warn_on_index_build_memory(
-                            model, spec, rows_seen, limit_bytes=build_limit, in_progress=True
+                            model,
+                            spec,
+                            rows_seen,
+                            limit_bytes=build_limit,
+                            store_type=store_config.type,
+                            in_progress=True,
                         )
                     # A line rather than a bar: the snapshot is a one-shot
                     # bounded stream with no row count, so there is no total to
@@ -489,6 +512,19 @@ def _run_search_model(
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
+                    if not warned_build and existing is not None:
+                        # The first in-place write settles it: rows are now
+                        # unindexed, so `ensure_indexes` will rebuild the index
+                        # over the whole collection (LanceDB rebuilds with
+                        # replace=True, not incrementally). The collection's
+                        # count is the floor of what that build spans.
+                        warned_build = _warn_on_index_build_memory(
+                            model,
+                            spec,
+                            max(existing.row_count, rows_seen),
+                            limit_bytes=build_limit,
+                            store_type=store_config.type,
+                        )
 
                 # Stale discovery streams state pages whose keys no longer
                 # exist upstream, in ascending key order — complete even for
@@ -875,6 +911,7 @@ def _warn_on_index_build_memory(
     row_count: int,
     *,
     limit_bytes: int | None,
+    store_type: str,
     in_progress: bool = False,
 ) -> bool:
     """Report an ANN build that will not fit the container it runs in.
@@ -897,6 +934,7 @@ def _warn_on_index_build_memory(
         dimensions=spec.vector_dimensions,
         vector_index=spec.vector_index,
         limit_bytes=limit_bytes,
+        store_type=store_type,
         in_progress=in_progress,
     )
     if advisory is None:

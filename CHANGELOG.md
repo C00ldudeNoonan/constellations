@@ -36,12 +36,14 @@ zero.
   refuses with `lancedb_pq_corpus_too_small` and names the alternative, instead
   of surfacing a sanitized `lancedb_index_failed` after the whole publish.
 - **The build is estimated before the rows are paid for.** Inside a container,
-  a publish compares `rows x dims x 4 x ratio(index)` against 75% of the cgroup
-  ceiling and warns — on an existing collection before the run starts (using
-  the live collection's count when the change lands in a private generation,
-  which also restores the exact-scan advisory's minute-zero warning that #474
-  had quietly lost for configuration changes), on a first publish as the
-  streamed count crosses the line — naming the type, the estimate, the
+  a LanceDB publish compares `rows x dims x 4 x ratio(index)` against 75% of
+  the cgroup ceiling and warns only where a build is certain — on a change
+  landing in a private generation before the run starts (from the live
+  collection's count, which also restores the exact-scan advisory's
+  minute-zero warning that #474 had quietly lost for configuration changes),
+  on a first publish as the streamed count crosses the line, and on an
+  in-place incremental at its first write; a no-op rerun says nothing —
+  naming the type, the estimate, the
   ceiling, and the remedy. The #473 predecessor to this appended for hours and
   would have died at exactly that step with nothing having mentioned the cost.
   The container reader moved from the DuckDB adapter to `stel.memory` (it now

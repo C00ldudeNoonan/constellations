@@ -165,6 +165,18 @@ _INDEX_BUILD_PEAK_RATIO: Final[dict[str, float]] = {
 # would stay quiet for exactly the marginal cases.
 _INDEX_BUILD_HEADROOM_FRACTION: Final = 0.75
 
+# The stores the ratios above were measured on. The advisory says nothing for
+# any other: DuckDB's HNSW is a different implementation whose build runs
+# inside DuckDB's own `memory_limit` (issue #412) rather than against the
+# container directly, and it builds exactly one index type -- so the
+# `ivf_pq` remedy would be advice its compiler refuses (Codex review, #480).
+_INDEX_BUILD_MEASURED_STORES: Final = frozenset({"lancedb"})
+
+
+def index_build_is_estimated(store_type: str) -> bool:
+    """Whether the build-memory estimate applies to this store at all."""
+    return store_type in _INDEX_BUILD_MEASURED_STORES
+
 
 def index_build_peak_bytes(*, rows: int, dimensions: int, vector_index: str) -> int:
     """Estimated peak memory of building `vector_index` over `rows` vectors."""
@@ -197,17 +209,21 @@ def index_build_advisory(
     dimensions: int,
     vector_index: str,
     limit_bytes: int | None,
+    store_type: str,
     in_progress: bool = False,
 ) -> str | None:
     """The warning an index build of this size deserves, if any.
 
-    Returns None with no container ceiling to compare against — the estimate
-    is only meaningful relative to a limit — or when the build fits under the
-    headroom line. Never a refusal: the ratios are measurements on one store
-    at one scale, and the operator may know the container is larger than the
-    cgroup says or be willing to try. What was missing was any signal at all:
+    Returns None for a store the ratios were not measured on, with no
+    container ceiling to compare against — the estimate is only meaningful
+    relative to a limit — or when the build fits under the headroom line.
+    Never a refusal: the ratios are measurements on one store at one scale, and
+    the operator may know the container is larger than the cgroup says or be
+    willing to try. What was missing was any signal at all:
     the #473 publish would have appended for hours and then died at this step.
     """
+    if not index_build_is_estimated(store_type):
+        return None
     if limit_bytes is None or limit_bytes <= 0:
         return None
     estimate = index_build_peak_bytes(rows=rows, dimensions=dimensions, vector_index=vector_index)

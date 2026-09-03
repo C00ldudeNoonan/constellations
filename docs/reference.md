@@ -2328,18 +2328,24 @@ Three things follow from how the field is stamped:
   compile time, naming the LanceDB store.
 
 **stel estimates the build before paying for the rows.** Inside a container,
-a publish reads the cgroup memory ceiling and, from the row count, the
-dimensions, and the ratios above, warns when the build would need more than
-75% of it — the same share the DuckDB adapter reserves for the same reason:
-the ceiling also holds the Python process, and the build lands on top of
-whatever the publish already has resident. On a collection that already
-exists the warning comes before the run spends its time; on a first publish it
-comes the moment the streamed row count crosses the line — which, since that
-check runs after every batch, is always before the build. It names the
+a publish to a LanceDB store reads the cgroup memory ceiling and, from the row
+count, the dimensions, and the ratios above, warns when the build would need
+more than 75% of it — the same share the DuckDB adapter reserves for the same
+reason: the ceiling also holds the Python process, and the build lands on top
+of whatever the publish already has resident. It speaks only where a build is
+certain: on a change that lands in a private generation, before the run spends
+its time; on a first publish, the moment the streamed row count crosses the
+line; on an in-place incremental, at its first write — a write leaves rows
+unindexed, and LanceDB then rebuilds the whole index. An unchanged rerun of an
+indexed collection writes nothing, builds nothing, and is told nothing. It
+names the
 type, the estimate, the ceiling, and the remedy (`index: ivf_pq`, or a larger
 container when that is already the type). It is a warning, not a refusal: the
 ratios are measurements, not a contract. Outside a container there is no
-ceiling to compare against, and nothing is said. The per-batch memory line
+ceiling to compare against, and nothing is said; nor is anything said for the
+DuckDB store, whose HNSW is a different implementation that builds inside
+DuckDB's own `memory_limit` and offers no lower-memory type to recommend. The
+per-batch memory line
 (`publication memory ... rss_bytes=... limit_bytes=...`) carries the same
 ceiling so a sample can be read against it.
 

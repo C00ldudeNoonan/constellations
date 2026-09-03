@@ -885,12 +885,6 @@ class RetrievalStore(ABC):
     def create_collection(
         self, spec: CollectionSpec, context: PublicationContext
     ) -> CollectionMetadata: ...
-    def evolve_collection(
-        self,
-        collection: str,
-        desired: CollectionSpec,
-        context: PublicationContext,
-    ) -> CollectionMetadata: ...
     def drop_collection(self, name: str, *, confirmation: DropConfirmation) -> None: ...
 
     def replace_all(
@@ -1007,7 +1001,6 @@ class RetrievalFeature(StrEnum):
     ATOMIC_FULL_REPLACE = "atomic_full_replace"
     KEYED_UPSERT = "keyed_upsert"
     KEYED_DELETE = "keyed_delete"
-    ONLINE_SCHEMA_EVOLUTION = "online_schema_evolution"
     INDEX_READINESS = "index_readiness"
     OBSERVABLE_READ_GENERATION = "observable_read_generation"
     PINNED_GENERATION_READS = "pinned_generation_reads"
@@ -1265,9 +1258,10 @@ untouched. If atomic activation is unavailable, the recovery guidance is to
 publish under a new collection name/target, validate it, and deliberately cut
 consumers over; it must not recommend an impossible `--full-refresh`. `rebuild`
 performs an atomic full replacement only when advertised. `online` is allowed
-only for an adapter-classified compatible change; a broad
-`ONLINE_SCHEMA_EVOLUTION` flag cannot make an incompatible dimension or type
-change safe.
+only for an adapter-classified compatible change, and since #474 it builds
+that change into a private generation rather than widening the live
+collection (ADR-0003); no capability flag can make an incompatible dimension
+or type change safe.
 
 The vector *search mode* is the one `vector` sub-field that classifies as
 compatible. `exact` and `approximate` differ in whether an ANN structure is

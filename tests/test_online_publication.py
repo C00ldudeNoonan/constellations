@@ -74,11 +74,10 @@ def test_online_switch_appends_privately_and_preserves_readers(
             return real_append(self, collection, rows, **kwargs)
 
         def no_live_mutation(*args: Any, **kwargs: Any) -> Any:
-            pytest.fail("An online configuration change must not merge or evolve the live index")
+            pytest.fail("An online configuration change must not merge into the live index")
 
         monkeypatch.setattr(LanceDBStore, "append", append)
         monkeypatch.setattr(LanceDBStore, "upsert", no_live_mutation)
-        monkeypatch.setattr(LanceDBStore, "evolve_collection", no_live_mutation)
         [result] = run_project(tmp_path, select="context_search")
         assert result.rows_written == 2
         assert len(written) == 2 and len(set(written)) == 1

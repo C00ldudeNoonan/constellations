@@ -1,6 +1,9 @@
 # ADR-0002: The vector search mode is an index build, not an index identity
 
-- **Status:** superseded by [ADR-0003](0003-reader-safe-online-publication.md)
+- **Status:** accepted
+- **Amended by:** [ADR-0003](0003-reader-safe-online-publication.md) — the choice to
+  apply the switch in place; it now builds into a private generation. The
+  classification (search mode is an index build, not an identity) stands.
 - **Date:** 2026-09-02
 - **Prompted by:** #461
 

@@ -123,6 +123,53 @@ exact sequence (index the id, merge-update, append, rebuild, merge-update,
 verify), and that sequence is now a regression test so a LanceDB bump cannot
 reintroduce it silently.
 
+### Online index updates no longer take the live index down (issue #473, PR #474)
+
+An `on_index_change: online` publish used to widen and merge into the *live*
+collection, with the serving pointer cleared for the duration. A 3.6M-row
+`exact -> approximate` switch ran for 2h47m, was OOM-killed at 58%, and left
+the collection unreachable — and, it turned out, with its pre-existing scalar
+and full-text indexes stale for every row the run had touched, since the
+reconciliation that would have swept them back in never ran.
+
+- **Compatible changes build into a fresh private generation**, the same
+  machinery `rebuild` uses. The live collection is never written to, so a
+  publish killed mid-run leaves it — and its indexes — exactly as they were;
+  the scope is `degraded` (still serving the old generation), not `failed`.
+  Rows are appended into the new generation rather than merged against a
+  populated one. No provider calls: vectors come from the warehouse.
+- **Readers keep their pinned generation across a cutover.** Query admission
+  is conditioned on the observed active generation, so once the pointer has
+  moved no new pin can land on the superseded one; retirement of a
+  superseded generation defers while any pin remains. `publishing` is now a
+  reader-servable status for a private build (an in-place claim still clears
+  the pointer and excludes readers).
+- A stale publication plan is refused at claim time (`fencing_token`
+  guard); a subset (`--source-filter`/`--read-filter`) run cannot replace the
+  complete generation; `on_index_change: rebuild` also accepts compatible
+  changes. `online` now requires the store to advertise
+  `private_generation_build` (both bundled stores do).
+- Per-batch memory samples (`publication memory ... rss_bytes=...
+  arrow_bytes=...`) and a `memory_exhausted` safe error code when a Python
+  `MemoryError` is caught. A kernel OOM kill still cannot be caught; the
+  samples are what survive it.
+- The dead in-place path is gone: `evolve_collection` and the
+  `online_schema_evolution` capability had no caller and no requirer after
+  this change and are removed.
+
+**Upgrading.** Publishers and serving processes (`stel search`, the MCP
+server) read one ledger and must move to this release **together**, after
+draining query leases. Older serving code assumes a publisher excludes all
+readers; older publishers do not honor the reader-pin protocol. Do not run the
+two mixed. A collection left `failed` with no active generation by a killed
+in-place publish recovers with a plain `stel run` under `online` on this
+release; the stranded unsuffixed collection is never auto-swept and is dropped
+by hand.
+
+The reasoning and the alternatives that lost are in
+[ADR-0003](docs/adr/0003-reader-safe-online-publication.md), which amends
+ADR-0001 and ADR-0002 rather than replacing them.
+
 ### Long-running transform models report progress, not silence (issue #469)
 
 A transform over a large corpus used to log `starting <model> (transform)`

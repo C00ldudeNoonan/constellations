@@ -177,20 +177,6 @@ def test_an_unowned_table_is_never_adopted(store: DuckDBStore) -> None:
             store.inspect_collection("someone_elses")
 
 
-def test_schema_evolution_adds_a_column_in_place(store: DuckDBStore) -> None:
-    with store:
-        name = _populate(store)
-        widened = pa.schema([*list(SCHEMA), pa.field("classification", pa.string())])
-        spec = _spec(name).__class__(
-            **{**_spec(name).__dict__, "arrow_schema": widened}
-        )
-
-        store.evolve_collection(spec, ["classification"])
-
-        metadata = store.inspect_collection(name)
-        assert metadata is not None
-        assert "classification" in metadata.schema.names
-        assert metadata.row_count == 3
 
 
 # ─── queries ────────────────────────────────────────────────────────────────

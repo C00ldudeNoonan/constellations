@@ -1,6 +1,9 @@
 # ADR-0001: A failed publish keeps serving its live generation; recovery fails closed
 
-- **Status:** superseded by [ADR-0003](0003-reader-safe-online-publication.md)
+- **Status:** accepted
+- **Amended by:** [ADR-0003](0003-reader-safe-online-publication.md) — the assumption
+  that every publisher excludes readers. The decision here (a failed publish
+  keeps serving its live generation; recovery fails closed) stands.
 - **Date:** 2026-09-02
 - **Prompted by:** #449 (the outage), #450 (the change)
 

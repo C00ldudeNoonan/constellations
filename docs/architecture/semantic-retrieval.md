@@ -1249,7 +1249,7 @@ Changes are classified before mutation:
 | vector search mode (`exact` <-> `approximate`) | compatible: an index build over vectors already published |
 | text fields/analyzer, attribute type/role, display projection | whole-index invalidation |
 | store contract or semantic implementation version | whole-index invalidation |
-| adapter-declared compatible additive index change | allowed only with `on_index_change: online` and the exact capability |
+| adapter-declared compatible additive index change | allowed only with `on_index_change: online`; built into a private generation, so the store must advertise `private_generation_build` (#474) |
 | timeout, retry, batch size, logging | no semantic invalidation |
 | physical target or collection | new state scope and independent publication |
 
@@ -1267,8 +1267,10 @@ The vector *search mode* is the one `vector` sub-field that classifies as
 compatible. `exact` and `approximate` differ in whether an ANN structure is
 built over the vector column; neither changes what a stored row contains, so
 switching between them under `on_index_change: online` republishes the rows
-from the warehouse and rebuilds the index without re-embedding and without a
-new collection name. `exact` is implemented by the *absence* of the index, so
+from the warehouse into a private generation and builds the index there,
+without re-embedding; the logical collection name is unchanged and the
+generation is activated in place of the old one once validated (#474).
+`exact` is implemented by the *absence* of the index, so
 switching back must drop it — a store that left a stale ANN index behind would
 keep answering approximately under a configuration promising exact results
 (issue #461).

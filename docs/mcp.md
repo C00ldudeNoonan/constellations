@@ -132,7 +132,49 @@ Two limits worth knowing before a shared deployment:
   bucket of the same size, so an unauthenticated flood counts against something
   rather than nothing. Unset, nothing changes.
 
-Token verification without a proxy in front is tracked in issue #392.
+### Verifying tokens instead of trusting a proxy
+
+When nothing authenticating sits in front of the server, have it verify each
+caller's bearer token itself:
+
+```bash
+stel mcp serve --transport streamable-http --host 0.0.0.0 --port 8000   --jwt-issuer https://issuer.example   --jwt-audience https://stel.example/mcp   --jwt-jwks-uri https://issuer.example/.well-known/jwks.json
+```
+
+All three flags are required and none has a default — each is a security
+boundary, and a default would be stel quietly choosing one. The JWKS URL must
+be `https`: keys fetched in plaintext can be replaced in transit, which makes
+verifying against them meaningless.
+
+Every accepted token has passed all of these, and a token failing any of them
+is refused with the same unauthenticated response — distinguishing "bad
+signature" from "wrong audience" would be a probing oracle:
+
+| check | why it is not optional |
+|---|---|
+| signature against the issuer's JWKS | the token is what it says it is |
+| asymmetric algorithm (`RS*`, `ES*`, `PS*`) | accepting HMAC alongside RSA is the classic JWKS forgery: sign with the public key as the shared secret |
+| `iss` matches `--jwt-issuer` exactly | a token from another issuer is another system's |
+| `aud` matches `--jwt-audience` exactly | the confused-deputy case the MCP authorization spec calls out: without it, a token a caller legitimately holds for *another* service is valid here |
+| `exp` and `nbf`, with 30s leeway | expiry is the only revocation this scheme has |
+| a non-empty `sub` | grants are keyed by subject; a subjectless token could never be authorized |
+
+**A token establishes identity, never authorization.** Only the subject is
+taken from it. With [operator-owned grants](#operator-owned-grants), groups and
+tenants are looked up by that subject — so a token that *claims* a tenant or a
+group gains nothing by claiming it, and a legitimately issued token cannot be
+turned into a privilege escalation by whoever minted it. Use `--grants-relation`
+with token verification; without it, a verified caller has an identity and no
+policy, and every governed read is refused.
+
+`--trust-proxy-principal-headers` and the JWT flags are mutually exclusive.
+Enabled together, the headers would decide and the token checking would be
+decoration, so the server refuses to start rather than pick.
+
+What this does not yet do: OAuth token introspection (RFC 7662) for opaque
+tokens, and the MCP authorization spec's metadata endpoints for clients that
+discover the issuer themselves. Both compose with this verifier rather than
+replacing it.
 
 ## Operator-owned grants
 

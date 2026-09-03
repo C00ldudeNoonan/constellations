@@ -966,7 +966,9 @@ def test_serve_stdio_warms_up_before_the_transport_starts(
         classmethod(lambda cls, project_dir, **kwargs: StubService()),
     )
     monkeypatch.setattr(
-        server_module, "create_mcp_server", lambda service: StubApp()
+        server_module,
+        "create_mcp_server",
+        lambda service, token_verifier=None: StubApp(),
     )
 
     server_module.serve_stdio(Path("unused-project-dir"))

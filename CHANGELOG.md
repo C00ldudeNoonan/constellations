@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### The network MCP transport verifies bearer tokens itself (issue #392)
+
+#394 gave `stel mcp serve --transport streamable-http|sse` a per-request
+principal, but only through headers an authenticating proxy in front was
+trusted to set — sound behind such a proxy, and nothing at all without one.
+This is the other option, and the last item on #392: verify the caller's own
+JWT against the issuer's published keys, so a deployment with no proxy in front
+is not reduced to auth theater.
+
+```bash
+stel mcp serve --transport streamable-http   --jwt-issuer https://issuer.example   --jwt-audience https://stel.example/mcp   --jwt-jwks-uri https://issuer.example/.well-known/jwks.json
+```
+
+- **Identity only.** #396 made operator-owned grants the authorization source
+  — groups and tenants are looked up by subject, never carried — so a verified
+  token establishes exactly one thing: who is calling. A token that claims a
+  tenant or a group gains nothing by claiming it.
+- **Every check is a refusal.** Signature against the JWKS; asymmetric
+  algorithms only (an HMAC family alongside RSA is the classic JWKS forgery);
+  issuer and audience, exactly — audience is the confused-deputy defense the
+  MCP authorization spec calls out, and it is required; expiry and not-before;
+  a subject. All three flags are required with no defaults, because each is a
+  security boundary. The JWKS URL must be `https`.
+- **One identity source at a time.** `--trust-proxy-principal-headers` and the
+  JWT flags together are refused: the headers would decide, and the token
+  checking would be decoration. A token resolver with no verifier, or a
+  verifier with a header resolver, is refused at startup for the same reason.
+- `pyjwt[crypto]` joins the `mcp` extra. It was already present transitively;
+  a feature that authenticates callers must not depend on someone else's
+  dependency graph.
+
+Still open from #392: per-tenant warehouse credentials (#395) and per-principal
+rate limiting — `--max-requests-per-minute` remains one global cap, so on a
+shared deployment one caller can still starve the rest.
+
 ### Per-principal rate limiting on the MCP server (issue #463)
 
 `--max-requests-per-minute` was sized for one local stdio client. On a network
@@ -22,6 +57,7 @@ from an attack.
   own share: both windows are decided before either is appended to.
 - Unset, behavior is byte-identical to before: no per-key state is kept and the
   caller is never resolved ahead of the operation.
+
 
 ### `search: exact` no longer publishes an index nothing can query (issue #461)
 
@@ -70,6 +106,7 @@ arrive after every row had been republished and the serving pointer cleared.
 
 The reasoning, and the two alternatives that lost, are in
 [ADR-0002](docs/adr/0002-vector-search-mode-is-an-index-build.md).
+
 
 ### Runs report where their wall clock went (issue #432)
 

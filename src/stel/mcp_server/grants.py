@@ -23,6 +23,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Protocol
 
 from ..adapters.base import ReadPredicate, ReadPredicateOperator
@@ -119,6 +120,14 @@ class WarehouseGrantStore:
     Cached per subject with a TTL. The cache is the revocation delay: a grant
     removed from the relation stops applying within `ttl_seconds`, and an
     operator who needs it immediate restarts the server.
+
+    The cache is swept on the same cadence, so a network deployment serving
+    many distinct subjects over time does not grow this table forever: an
+    entry past its TTL is reclaimed rather than merely ignored. Without this,
+    every subject a token issuer or a proxy ever named would hold memory for
+    the life of the process — the same unbounded-growth shape the
+    per-principal rate-limit table was fixed for (issue #466), here in the
+    grants cache instead.
     """
 
     def __init__(
@@ -138,15 +147,38 @@ class WarehouseGrantStore:
         self._ttl = ttl_seconds
         self._clock = clock
         self._cache: dict[str, tuple[float, tuple[Grant, ...]]] = {}
+        self._lock = Lock()
+        self._last_sweep = clock()
 
     def grants_for(self, subject_id: str) -> tuple[Grant, ...]:
         now = self._clock()
-        cached = self._cache.get(subject_id)
-        if cached is not None and now < cached[0]:
-            return cached[1]
+        with self._lock:
+            cached = self._cache.get(subject_id)
+            if cached is not None and now < cached[0]:
+                return cached[1]
+        # The warehouse read happens outside the lock: concurrent requests for
+        # different subjects (the common case under real load) must not
+        # serialize on each other's I/O. A cache miss two callers hit at once
+        # simply reads twice, same as before this lock existed.
         grants = self._read(subject_id)
-        self._cache[subject_id] = (now + self._ttl, grants)
+        with self._lock:
+            self._cache[subject_id] = (now + self._ttl, grants)
+            self._sweep_expired(now)
         return grants
+
+    def _sweep_expired(self, now: float) -> None:
+        # Called under the lock. One TTL between sweeps, matching the cache's
+        # own revocation cadence rather than adding an unrelated interval.
+        if now - self._last_sweep < self._ttl:
+            return
+        self._last_sweep = now
+        expired = [
+            subject_id
+            for subject_id, (expires_at, _grants) in self._cache.items()
+            if expires_at <= now
+        ]
+        for subject_id in expired:
+            del self._cache[subject_id]
 
     def _read(self, subject_id: str) -> tuple[Grant, ...]:
         rows = self._repository.read_rows(

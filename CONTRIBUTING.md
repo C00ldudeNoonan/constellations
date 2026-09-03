@@ -199,6 +199,15 @@ Model kinds are `ModelConfig` sub-blocks; exactly one per model. To add one
    existing commands do.
 3. Raise `click.ClickException` from any `*Error` exception you catch.
 4. Update README's CLI section.
+5. **Test at least one complete, valid invocation end to end**, not only the
+   refusals. Refusal tests are easy to write and easy to make exhaustive, so a
+   command can end up with thorough coverage of every way it says no and none
+   of the one path an operator actually takes. `stel mcp serve` had exactly
+   that: every flag combination's rejection was tested, the verifier classes
+   were tested alone, and the assembled server raised `ValueError` at startup
+   in every release that shipped token verification (#488). See
+   `tests/test_mcp_serve_wiring.py` for the shape — stub the outermost edges
+   only, and assert the command reached the thing it exists to do.
 
 ## Changing a persisted name or a fingerprint domain
 

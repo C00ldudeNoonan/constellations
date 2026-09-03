@@ -37,6 +37,7 @@ from stel.manifest import build_manifest
 from stel.profile import resolve_profile
 from stel.retrieval import (
     CollectionSpec,
+    IndexedRow,
     LanceDBConfig,
     LanceDBStore,
     RetrievalError,
@@ -1818,3 +1819,92 @@ def test_a_subset_invocation_defers_stale_reconciliation(tmp_path: Path) -> None
 
     [unfiltered] = run_project(tmp_path, select="context_search")
     assert unfiltered.documents_deleted == 1
+
+
+# ─── vector index reconciliation (issue #461) ───────────────────────────────
+
+
+def _vector_spec(name: str, *, vector_search: str) -> CollectionSpec:
+    return CollectionSpec(
+        logical_name="ctx",
+        physical_name=name,
+        id_field="id",
+        text_fields=("body",),
+        full_text_fields=(),
+        attribute_fields=(),
+        scalar_index_fields=(),
+        display_fields=("body",),
+        vector_field="embedding",
+        vector_dimensions=3,
+        distance_metric="cosine",
+        vector_search=vector_search,
+        config_fingerprint=f"cfg-{vector_search}",
+        descriptor=json.dumps({"vector_search": vector_search}),
+        legacy_config_fingerprint="legacy",
+        arrow_schema=pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("body", pa.string()),
+                pa.field("embedding", pa.list_(pa.float32(), 3)),
+            ]
+        ),
+    )
+
+
+def _vector_rows() -> list[IndexedRow]:
+    return [
+        IndexedRow(
+            str(index),
+            {
+                "id": str(index),
+                "body": f"row {index}",
+                "embedding": [float(index), 1.0, 0.0],
+            },
+            f"fp-{index}",
+        )
+        # HNSW needs more than a handful of rows before LanceDB will build it.
+        for index in range(256)
+    ]
+
+
+def _vector_index_types(store: Any, name: str) -> list[str]:
+    table = store._open_owned_table(name)
+    return [
+        index.index_type
+        for index in table.list_indices()
+        if index.columns == ["embedding"]
+    ]
+
+
+def test_lancedb_builds_the_ann_index_only_when_approximate(tmp_path: Path) -> None:
+    """`exact` is implemented by the absence of an index, which is exactly why
+    a 3.6M-row exact collection scanned ~11GB per query (issue #461)."""
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, _vector_rows(), id_field="id", mutation_digest="d1")
+
+        store.ensure_indexes(_vector_spec(name, vector_search="exact"))
+        assert _vector_index_types(store, name) == []
+
+        store.ensure_indexes(_vector_spec(name, vector_search="approximate"))
+        assert any("Hnsw" in kind for kind in _vector_index_types(store, name))
+
+
+def test_lancedb_switching_back_to_exact_takes_the_index_away(
+    tmp_path: Path,
+) -> None:
+    """LanceDB uses an ANN index whenever one exists, so a stale index would
+    keep serving approximate results under a config promising exact ones."""
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_vector_spec(name, vector_search="exact"))
+        store.upsert(name, _vector_rows(), id_field="id", mutation_digest="d1")
+        store.ensure_indexes(_vector_spec(name, vector_search="approximate"))
+        assert any("Hnsw" in kind for kind in _vector_index_types(store, name))
+
+        store.ensure_indexes(_vector_spec(name, vector_search="exact"))
+
+        assert _vector_index_types(store, name) == []

@@ -18,6 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..adapters.base import ReadPredicate, ReadPredicateOperator
 from ..agent_context import citation_locator, freshness_status
 from ..append_log import query_fingerprint
+from ..retrieval.servability import (
+    DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+    MAX_CONTEXT_TIMEOUT_SECONDS,
+)
 from ..search import (
     SearchError,
     SearchFilter,
@@ -83,7 +87,11 @@ class ContextServerSettings(BaseModel):
     max_chunk_bytes: int = Field(default=16_000, ge=64, le=1_000_000)
     max_response_bytes: int = Field(default=256_000, ge=1024, le=10_000_000)
     max_scan_rows: int = Field(default=10_000, ge=1, le=1_000_000)
-    timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    timeout_seconds: float = Field(
+        default=DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_CONTEXT_TIMEOUT_SECONDS,
+    )
     max_concurrency: int = Field(default=4, ge=1, le=64)
     max_requests_per_minute: int = Field(default=120, ge=1, le=100_000)
 
@@ -136,6 +144,33 @@ class ContextServiceError(Exception):
         self.code = code
         self.message = message
         self.retryable = retryable
+
+
+def timeout_error(timeout_seconds: float) -> ContextServiceError:
+    """The TIMEOUT this server should report at a given deadline (issue #461).
+
+    `retryable` was unconditionally true, which is misleading for the case that
+    prompted this: an `exact` vector index whose full scan simply costs more
+    than the deadline fails identically on every attempt, and at the ceiling
+    there is no larger `timeout_seconds` left to configure. A caller told to
+    retry will retry forever. Below the ceiling the same timeout can be
+    contention and the operator still has a lever, so retrying is reasonable
+    there and the flag stays true.
+    """
+    if timeout_seconds < MAX_CONTEXT_TIMEOUT_SECONDS:
+        return ContextServiceError(
+            MCPErrorCode.TIMEOUT,
+            "The context operation exceeded its time limit",
+            retryable=True,
+        )
+    return ContextServiceError(
+        MCPErrorCode.TIMEOUT,
+        "The context operation exceeded its time limit, and the server is "
+        f"already at the maximum timeout_seconds ({MAX_CONTEXT_TIMEOUT_SECONDS:.0f}s), "
+        "so retrying will not help: the operation costs more than any permitted "
+        "deadline allows",
+        retryable=False,
+    )
 
 
 T = TypeVar("T")
@@ -192,11 +227,7 @@ class _OperationLimiter:
         try:
             return future.result(timeout=self._timeout_seconds)
         except TimeoutError:
-            raise ContextServiceError(
-                MCPErrorCode.TIMEOUT,
-                "The context operation exceeded its time limit",
-                retryable=True,
-            ) from None
+            raise timeout_error(self._timeout_seconds) from None
 
     def _check_rate_limit(self) -> None:
         now = monotonic()

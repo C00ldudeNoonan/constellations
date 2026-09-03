@@ -173,9 +173,14 @@ class _RecordingStore:
 
     def __init__(self) -> None:
         self.restamped: list[str] = []
+        self.evolved: list[tuple[str, list[str]]] = []
 
     def restamp_collection(self, spec: CollectionSpec) -> None:
         self.restamped.append(spec.descriptor)
+
+    def evolve_collection(self, spec: CollectionSpec, added: Any) -> None:
+        self.evolved.append((spec.descriptor, list(added)))
+        self.restamp_collection(spec)
 
 
 def _spec(**overrides: Any) -> CollectionSpec:
@@ -283,8 +288,9 @@ def test_an_additive_change_says_so_rather_than_demanding_a_rebuild() -> None:
         descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
     )
 
-    with pytest.raises(RunError, match="additive") as error:
+    with pytest.raises(RunError, match="can serve the change") as error:
         _verify_collection_config(_RecordingStore(), existing, spec)
+    assert "added ['symbol']" in str(error.value)
     assert "rebuild" not in str(error.value).split("on_index_change")[0]
 
 
@@ -587,3 +593,101 @@ def test_a_second_run_after_an_evolution_still_validates(tmp_path: Path) -> None
     assert not after.schema.equals(declared, check_metadata=False), (
         "fixture must reproduce the ordering difference the bug turns on"
     )
+
+
+# ─── Vector search strategy is an index build, not a rebuild (issue #461) ─────
+
+_EXACT_VECTOR = {"field": "embedding", "dimensions": 2, "metric": "cosine", "search": "exact"}
+_APPROX_VECTOR = {**_EXACT_VECTOR, "search": "approximate"}
+
+
+def test_switching_vector_search_strategy_is_compatible() -> None:
+    """The change this issue is about. `exact` -> `approximate` builds an ANN
+    index over vectors that are already published; nothing about a stored row
+    changes, so demanding a new collection name and a re-embed charged hours of
+    provider time for an index flag."""
+    changes = classify_changes(
+        _search(vector=_EXACT_VECTOR), _search(vector=_APPROX_VECTOR)
+    )
+
+    assert [change.kind for change in changes] == [ChangeKind.COMPATIBLE]
+    assert "index build" in changes[0].detail
+
+
+def test_switching_back_to_exact_is_also_compatible() -> None:
+    """Symmetry matters: dropping the index is no more invalidating than
+    building it, and an asymmetric rule would be a trap in one direction."""
+    changes = classify_changes(
+        _search(vector=_APPROX_VECTOR), _search(vector=_EXACT_VECTOR)
+    )
+
+    assert [change.kind for change in changes] == [ChangeKind.COMPATIBLE]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("dimensions", 4), ("metric", "euclidean"), ("field", "vec")],
+)
+def test_other_vector_changes_still_require_a_rebuild(field: str, value: Any) -> None:
+    """The complement, and the reason this is a classifier rather than a blanket
+    exemption: every other vector sub-field changes what a stored row contains
+    or what its distances mean."""
+    changes = classify_changes(
+        _search(vector=_EXACT_VECTOR),
+        _search(vector={**_EXACT_VECTOR, field: value}),
+    )
+
+    assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
+
+
+def test_adding_a_vector_to_a_collection_without_one_requires_a_rebuild() -> None:
+    """`None` -> a vector config is not a strategy change; the rows carry no
+    vector column at all."""
+    changes = classify_changes(
+        _search(vector=None), _search(vector=_EXACT_VECTOR)
+    )
+
+    assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
+
+
+def test_online_applies_a_strategy_switch_in_place() -> None:
+    """End to end through the executor's gate: under `online` the collection is
+    evolved with no added columns — there is nothing to widen — and re-stamped,
+    so the publish proceeds against the same collection and `ensure_indexes`
+    builds the ANN index."""
+    import pyarrow as pa
+
+    schema = pa.schema([pa.field("chunk_id", pa.string())])
+    stored = _spec(vector=_EXACT_VECTOR)
+    spec = replace(_spec(vector=_APPROX_VECTOR), arrow_schema=schema)
+    store = _RecordingStore()
+    existing = replace(
+        _metadata(
+            descriptor=stored.descriptor,
+            config_fingerprint=stored.config_fingerprint,
+        ),
+        schema=schema,
+    )
+
+    evolved = _verify_collection_config(store, existing, spec, policy="online")
+
+    assert evolved is True
+    assert store.evolved == [(spec.descriptor, [])]
+
+
+def test_fail_names_the_strategy_switch_and_points_at_online() -> None:
+    """Under the default policy it still raises, but what it says is the whole
+    point: the operator learns the change is servable in place rather than
+    being sent to rebuild 3.6M rows under a new collection name."""
+    stored = _spec(vector=_EXACT_VECTOR)
+    spec = _spec(vector=_APPROX_VECTOR)
+    existing = _metadata(
+        descriptor=stored.descriptor, config_fingerprint=stored.config_fingerprint
+    )
+
+    with pytest.raises(RunError) as error:
+        _verify_collection_config(_RecordingStore(), existing, spec)
+
+    message = str(error.value)
+    assert "on_index_change: online" in message
+    assert "requires a rebuild" not in message

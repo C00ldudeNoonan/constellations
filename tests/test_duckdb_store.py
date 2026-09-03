@@ -333,6 +333,29 @@ def test_approximate_index_builds_when_the_opt_in_is_given(tmp_path: Path) -> No
         assert any("hnsw" in str(row[0]) for row in indexes)
 
 
+def test_switching_back_to_exact_takes_the_index_away(tmp_path: Path) -> None:
+    """`exact` is implemented by the *absence* of the index — the planner uses
+    one whenever it exists. Leaving a stale HNSW index behind after a switch
+    back would keep answering approximately under a config that promises exact
+    results, and nothing in the query path would say so (issue #461)."""
+    config = DuckDBConfig(
+        path=str(tmp_path / "hnsw.duckdb"), hnsw_experimental_persistence=True
+    )
+    opted_in = DuckDBStore(
+        config, project_name="proj", target_name="dev", alias="default"
+    )
+    with opted_in:
+        name = _populate(opted_in, vector_search="approximate")
+
+        opted_in.ensure_indexes(_spec(name, vector_search="exact"))
+
+        indexes = opted_in._connection().execute(
+            "SELECT index_name FROM duckdb_indexes()"
+        ).fetchall()
+
+        assert not any("hnsw" in str(row[0]) for row in indexes)
+
+
 # ─── configuration ──────────────────────────────────────────────────────────
 
 

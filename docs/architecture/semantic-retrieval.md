@@ -1253,6 +1253,7 @@ Changes are classified before mutation:
 | --- | --- |
 | row vector/text/display/provenance/attribute/policy value | keyed republish for that ID |
 | ID mapping, vector field/dimensions/metric/embedding identity | whole-index invalidation |
+| vector search mode (`exact` <-> `approximate`) | compatible: an index build over vectors already published |
 | text fields/analyzer, attribute type/role, display projection | whole-index invalidation |
 | store contract or semantic implementation version | whole-index invalidation |
 | adapter-declared compatible additive index change | allowed only with `on_index_change: online` and the exact capability |
@@ -1267,6 +1268,16 @@ performs an atomic full replacement only when advertised. `online` is allowed
 only for an adapter-classified compatible change; a broad
 `ONLINE_SCHEMA_EVOLUTION` flag cannot make an incompatible dimension or type
 change safe.
+
+The vector *search mode* is the one `vector` sub-field that classifies as
+compatible. `exact` and `approximate` differ in whether an ANN structure is
+built over the vector column; neither changes what a stored row contains, so
+switching between them under `on_index_change: online` republishes the rows
+from the warehouse and rebuilds the index without re-embedding and without a
+new collection name. `exact` is implemented by the *absence* of the index, so
+switching back must drop it — a store that left a stale ANN index behind would
+keep answering approximately under a configuration promising exact results
+(issue #461).
 
 ### Full replacement
 

@@ -590,14 +590,32 @@ class DuckDBStore(RetrievalStore):
 
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
         conn = self._connection()
-        if spec.vector_field is not None and spec.vector_search == "approximate":
-            self._ensure_hnsw_index(conn, spec)
+        if spec.vector_field is not None:
+            if spec.vector_search == "approximate":
+                self._ensure_hnsw_index(conn, spec)
+            else:
+                self._drop_hnsw_index(conn, spec)
         if spec.full_text_fields:
             self._ensure_fts_index(conn, spec)
         metadata = self.inspect_collection(spec.physical_name)
         if metadata is None:
             raise RetrievalError("DuckDB collection disappeared while indexing")
         return metadata
+
+    def _drop_hnsw_index(self, conn: Any, spec: CollectionSpec) -> None:
+        """Remove an ANN index left by a previous `approximate` publish.
+
+        `exact` is implemented by the absence of the index -- the planner uses
+        one whenever it exists -- so a switch back has to take it away, or the
+        collection keeps answering approximately under a config that promises
+        otherwise (issue #461).
+        """
+        self._execute(
+            conn,
+            "DROP INDEX IF EXISTS "
+            f"{_quote_identifier(_index_name(spec.physical_name, 'hnsw'))}",
+            operation="ensure indexes",
+        )
 
     def _ensure_hnsw_index(self, conn: Any, spec: CollectionSpec) -> None:
         if not self._config.hnsw_experimental_persistence:

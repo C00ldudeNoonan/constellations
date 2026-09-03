@@ -43,6 +43,13 @@ ROUTING_FIELDS = frozenset({"store", "collection"})
 # without being rebuilt.
 _ADDITIVE_FIELDS = ("display_fields", "return_text_fields")
 
+# The one `vector` sub-field that describes how the collection is *indexed*
+# rather than what a published row contains. Switching between `exact` and
+# `approximate` builds or drops an ANN structure over vectors that are already
+# there; the field, dimensions, metric, and embedding identity all change what
+# a row means (issue #461).
+_VECTOR_INDEX_ONLY_FIELDS = frozenset({"search"})
+
 
 class ChangeKind(StrEnum):
     """Whether a classified change can be served by the existing collection."""
@@ -113,6 +120,8 @@ def classify_changes(
             continue
         if field == "attributes":
             changes.append(_classify_attributes(before, after))
+        elif field == "vector":
+            changes.append(_classify_vector(before, after))
         elif field in _ADDITIVE_FIELDS:
             changes.append(_classify_projection(field, before, after))
         else:
@@ -139,6 +148,37 @@ def _classify_projection(field: str, before: Any, after: Any) -> ConfigChange:
         field=field,
         kind=ChangeKind.REBUILD_REQUIRED,
         detail=f"dropped {sorted(set(old) - set(new))}",
+    )
+
+
+def _classify_vector(before: Any, after: Any) -> ConfigChange:
+    """A vector-search strategy change is an index build, not a rebuild.
+
+    Treating the whole `vector` mapping as opaque made switching `exact` ->
+    `approximate` demand a new collection name and a full republish, when the
+    vectors themselves are untouched and only an ANN index needs building. For
+    a corpus large enough to need the switch, that is hours of re-embedding to
+    change an index flag -- and it is precisely the corpora large enough to
+    need it that make the mistake expensive to correct (issue #461).
+    """
+    old = dict(before or {})
+    new = dict(after or {})
+    moved = {
+        key for key in set(old) | set(new) if old.get(key) != new.get(key)
+    }
+    if moved and moved <= _VECTOR_INDEX_ONLY_FIELDS:
+        return ConfigChange(
+            field="vector",
+            kind=ChangeKind.COMPATIBLE,
+            detail=(
+                f"search strategy {old.get('search')!r} -> {new.get('search')!r} "
+                "— an index build over vectors already published, not a re-embed"
+            ),
+        )
+    return ConfigChange(
+        field="vector",
+        kind=ChangeKind.REBUILD_REQUIRED,
+        detail=f"changed from {before!r} to {after!r}",
     )
 
 

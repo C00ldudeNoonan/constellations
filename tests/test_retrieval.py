@@ -1956,6 +1956,108 @@ def _vector_index_types(store: Any, name: str) -> list[str]:
     ]
 
 
+# ─── the merge key is indexed (issue #475) ─────────────────────────────────
+
+
+def _merge_key_spec(name: str) -> CollectionSpec:
+    """A spec whose scalar indexes name the merge key, as #475 makes them."""
+    return CollectionSpec(
+        logical_name="ctx",
+        physical_name=name,
+        id_field="id",
+        text_fields=("body",),
+        full_text_fields=(),
+        attribute_fields=(),
+        scalar_index_fields=("id",),
+        display_fields=("body",),
+        vector_field=None,
+        vector_dimensions=None,
+        distance_metric=None,
+        vector_search=None,
+        config_fingerprint="cfg",
+        descriptor="{}",
+        legacy_config_fingerprint="legacy",
+        arrow_schema=pa.schema(
+            [pa.field("id", pa.string()), pa.field("body", pa.string())]
+        ),
+    )
+
+
+def _rows_for(ids: range | list[int], *, body: str) -> list[IndexedRow]:
+    return [
+        IndexedRow(str(i), {"id": str(i), "body": f"{body} {i}"}, f"fp-{i}")
+        for i in ids
+    ]
+
+
+def _body_of(store: Any, name: str, record_id: str) -> str | None:
+    table = store._open_owned_table(name)
+    rows = table.search().where(f"id = '{record_id}'").limit(1).to_list()
+    return rows[0]["body"] if rows else None
+
+
+def test_the_merge_key_gets_a_scalar_index(tmp_path: Path) -> None:
+    """Unindexed, `merge_insert`'s join-key predicate is a full column scan and
+    the ack `count_rows` scans it again — two O(table) passes per page on a
+    daily incremental, not just a reindex (issue #475)."""
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_merge_key_spec(name))
+        store.upsert(name, _rows_for(range(64), body="v1"), id_field="id", mutation_digest="d1")
+
+        store.ensure_indexes(_merge_key_spec(name))
+
+        table = store._open_owned_table(name)
+        assert [
+            index.index_type
+            for index in table.list_indices()
+            if index.columns == ["id"]
+        ] == ["BTree"]
+
+
+def test_merge_updates_still_apply_after_the_id_index_is_rebuilt(
+    tmp_path: Path,
+) -> None:
+    """Pins lancedb#3177 on the pinned LanceDB version.
+
+    On lancedb 0.30 / lance 3.0, a BTree on the merge key plus an index
+    rebuild made later `when_matched_update_all` calls silently stop updating
+    rows — no error, just stale data. `ensure_indexes` rebuilds with
+    `create_index(replace=True)` on every publish that added rows, which is
+    every incremental publish, so #475 walks straight into that sequence.
+
+    It is correct on the pinned version. This test is what keeps a LanceDB
+    bump from reintroducing it silently, so it drives the exact order:
+    index the id, merge-update, append, rebuild, merge-update, verify.
+    """
+    store = _gen_store(tmp_path)
+    with store:
+        name = store.physical_collection("ctx")
+        store.create_collection(_merge_key_spec(name))
+        store.upsert(name, _rows_for(range(64), body="v1"), id_field="id", mutation_digest="d1")
+        store.ensure_indexes(_merge_key_spec(name))
+
+        # Update through the index, before any rebuild.
+        store.upsert(name, _rows_for([7], body="v2"), id_field="id", mutation_digest="d2")
+        assert _body_of(store, name, "7") == "v2 7"
+
+        # Append leaves unindexed rows behind, which is what makes the next
+        # ensure_indexes rebuild rather than skip.
+        store.upsert(
+            name, _rows_for(range(64, 128), body="v1"), id_field="id", mutation_digest="d3"
+        )
+        store.ensure_indexes(_merge_key_spec(name))
+
+        # The call that silently no-opped under the bug.
+        store.upsert(name, _rows_for([7, 70], body="v3"), id_field="id", mutation_digest="d4")
+
+        assert _body_of(store, name, "7") == "v3 7"
+        assert _body_of(store, name, "70") == "v3 70"
+        # Updates, not duplicate inserts: the merge key must still match.
+        assert store._open_owned_table(name).count_rows() == 128
+
+
 def test_lancedb_builds_the_ann_index_only_when_approximate(tmp_path: Path) -> None:
     """`exact` is implemented by the absence of an index, which is exactly why
     a 3.6M-row exact collection scanned ~11GB per query (issue #461)."""

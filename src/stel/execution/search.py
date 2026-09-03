@@ -29,7 +29,7 @@ from ..adapters import (
     WarehouseAdapter,
     WarehouseCapability,
 )
-from ..config.model import ModelConfig
+from ..config.model import ModelConfig, SearchConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
 from ..embedding import effective_search_config, resolve_search_embedding_options
@@ -848,6 +848,29 @@ def _mark_search_publication_failed(
         )
 
 
+def _scalar_index_fields(search: SearchConfig) -> tuple[str, ...]:
+    """Scalar columns worth a BTree, the merge key first (issue #475).
+
+    `id_field` is the join key `upsert` hands to `merge_insert` on every
+    incremental publish, and the column its acknowledging `count_rows` filters
+    on. Unindexed, LanceDB evaluates that predicate with a full column scan and
+    the ack scans the same column again — two O(table) passes per page, on a
+    *daily* incremental rather than only on a reindex. It is indexed here
+    rather than at the store because the store is handed a spec, and which
+    columns deserve an index is a property of the search model.
+
+    Ordered with the merge key first and de-duplicated: an id field that is
+    also a filterable attribute must not ask for the same index twice.
+    """
+    fields = [search.id_field]
+    fields.extend(
+        attribute.name
+        for attribute in search.attributes
+        if attribute.filter_role != "none" or attribute.sortable
+    )
+    return tuple(dict.fromkeys(fields))
+
+
 def _search_collection_spec(
     *,
     model: ModelConfig,
@@ -912,11 +935,7 @@ def _search_collection_spec(
         text_fields=search.text_fields,
         full_text_fields=search.full_text.fields if search.full_text else (),
         attribute_fields=tuple(attribute.name for attribute in search.attributes),
-        scalar_index_fields=tuple(
-            attribute.name
-            for attribute in search.attributes
-            if attribute.filter_role != "none" or attribute.sortable
-        ),
+        scalar_index_fields=_scalar_index_fields(search),
         display_fields=search.display_fields,
         vector_field=search.vector.field if search.vector else None,
         vector_dimensions=search.vector.dimensions if search.vector else None,

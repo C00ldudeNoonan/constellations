@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Token verification could not start a server, and now publishes its discovery metadata (issue #464)
+
+**Fixes a startup crash.** The MCP SDK refuses a `token_verifier` that arrives
+without `AuthSettings` — `Cannot specify auth_server_provider or
+token_verifier without auth settings`. stel passed one without, so every
+release carrying token verification failed at boot the moment `--jwt-*` was
+used, and v0.16.0's `--introspection-*` flags inherited it. Nothing caught it
+because the only test that built a server built the unauthenticated one, and
+the verifier tests exercised the verifier classes alone.
+
+Those same settings are what a resource server declares, so the fix delivers
+item 2 of the issue with it:
+
+- **`--public-url`** — this deployment's externally reachable URL. Required
+  with either verifier, and not derivable from `--host`/`--port`, which are
+  what the process binds behind a proxy rather than what a caller reaches.
+  Refused without a verifier, where there is no challenge to issue.
+- **OAuth 2.0 protected resource metadata (RFC 9728)** at
+  `/.well-known/oauth-protected-resource/mcp`, naming the resource and its
+  authorization server, plus the `resource_metadata` parameter on the
+  `WWW-Authenticate` challenge. A spec-compliant client handed only this
+  server's URL can now discover who issues tokens for it, instead of being
+  configured with the issuer out of band.
+- stel remains a **resource server**: it validates tokens somebody else issued
+  and does not issue, refresh, or revoke any. `auth_server_provider` — the
+  seam the issue named — would have made it an authorization server, and the
+  SDK refuses it alongside a verifier regardless.
+
 ### Opaque bearer tokens verify by introspection (issue #464)
 
 `JwksTokenVerifier` needs a JWT it can read, which ruled out every

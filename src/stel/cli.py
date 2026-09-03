@@ -1617,6 +1617,18 @@ def mcp() -> None:
     ),
 )
 @click.option(
+    "--public-url",
+    default=None,
+    help=(
+        "This deployment's externally reachable URL, e.g. "
+        "https://stel.example/mcp. Required with either verifier: it is what "
+        "the OAuth protected-resource metadata publishes and what a client is "
+        "pointed at when it is challenged. Not derivable from --host/--port, "
+        "which are what the process binds behind a proxy, not what a caller "
+        "reaches."
+    ),
+)
+@click.option(
     "--trust-proxy-principal-headers",
     is_flag=True,
     help=(
@@ -1662,6 +1674,7 @@ def mcp_serve(
     introspection_audience: str | None,
     introspection_client_id: str | None,
     introspection_client_secret_env: str | None,
+    public_url: str | None,
     trust_proxy_principal_headers: bool,
     timeout_seconds: float,
     max_concurrency: int,
@@ -1801,7 +1814,24 @@ def mcp_serve(
                 "--trust-proxy-principal-headers if an authenticating proxy "
                 "sets them."
             )
+        if verifying_tokens and not public_url:
+            raise ConfigClickError(
+                "Token verification needs --public-url: this deployment's own "
+                "externally reachable URL. It is published as the OAuth "
+                "protected-resource metadata and named in the "
+                "WWW-Authenticate challenge a client follows to discover the "
+                "authorization server, and --host/--port cannot stand in for "
+                "it — those are what the process binds behind a proxy, not "
+                "what a caller reaches."
+            )
+        if public_url and not verifying_tokens:
+            raise ConfigClickError(
+                "--public-url describes a deployment that verifies tokens; "
+                "with proxy-set headers there is no challenge to issue and no "
+                "protected-resource metadata to publish."
+            )
         token_verifier = None
+        issuer_url = None
         if verifying_jwt:
             from .mcp_server.authorization import AccessTokenPrincipalResolver
             from .mcp_server.tokens import JwksTokenVerifier, JwtVerifierConfig
@@ -1813,6 +1843,7 @@ def mcp_serve(
                     jwks_uri=str(jwt_jwks_uri),
                 )
             )
+            issuer_url = str(jwt_issuer)
             resolver: Any = AccessTokenPrincipalResolver()
             click.echo(
                 f"Serving on {host}:{port} over {transport}. Caller identity "
@@ -1838,6 +1869,7 @@ def mcp_serve(
                     client_secret_env=str(introspection_client_secret_env),
                 )
             )
+            issuer_url = str(introspection_issuer)
             resolver = AccessTokenPrincipalResolver()
             click.echo(
                 f"Serving on {host}:{port} over {transport}. Caller identity "
@@ -1861,6 +1893,8 @@ def mcp_serve(
             port=port,
             principal_resolver=resolver,
             token_verifier=token_verifier,
+            issuer_url=issuer_url,
+            public_url=public_url,
             target=ctx.obj["target"],
             profiles_dir=ctx.obj["profiles_dir"],
             grants_relation=grants_relation,

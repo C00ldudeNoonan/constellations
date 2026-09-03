@@ -22,12 +22,19 @@ from .service import ContextServerSettings, ContextService
 
 
 def create_mcp_server(
-    service: ContextService, token_verifier: Any = None
+    service: ContextService,
+    token_verifier: Any = None,
+    *,
+    issuer_url: str | None = None,
+    public_url: str | None = None,
 ) -> Any:
     fastmcp = import_optional_dependency(
         "mcp.server.fastmcp",
         extra="mcp",
         feature="stel MCP serving",
+    )
+    auth = _auth_settings(
+        token_verifier, issuer_url=issuer_url, public_url=public_url
     )
     app = fastmcp.FastMCP(
         "stel",
@@ -41,6 +48,9 @@ def create_mcp_server(
         # #392). Absent, the server is unauthenticated and only a trusted
         # proxy in front can supply identity.
         token_verifier=token_verifier,
+        # Required by the SDK whenever a verifier is present, and the source of
+        # the discovery metadata (issue #464). See `_auth_settings`.
+        auth=auth,
     )
 
     @app.tool()  # type: ignore[untyped-decorator]
@@ -151,6 +161,8 @@ def serve_network(
     port: int,
     principal_resolver: Any,
     token_verifier: Any = None,
+    issuer_url: str | None = None,
+    public_url: str | None = None,
     target: str | None = None,
     profiles_dir: Path | None = None,
     grants_relation: str | None = None,
@@ -188,6 +200,8 @@ def serve_network(
         service,
         transport=transport,
         token_verifier=token_verifier,
+        issuer_url=issuer_url,
+        public_url=public_url,
         host=host,
         port=port,
     )
@@ -246,11 +260,55 @@ def _reject_unverified_token_identity(
         )
 
 
+def _auth_settings(
+    token_verifier: Any, *, issuer_url: str | None, public_url: str | None
+) -> Any:
+    """The SDK's `AuthSettings`, or None when nothing is being verified.
+
+    stel is a **resource server**: it validates tokens somebody else issued.
+    It is not an authorization server, so `auth_server_provider` — the other
+    parameter, and the one #464 named — is the wrong seam twice over. It would
+    make stel issue tokens, and the SDK refuses it alongside a `token_verifier`
+    anyway. What a resource server declares instead is `resource_server_url`,
+    which the SDK turns into the RFC 9728 protected-resource metadata document
+    and the `resource_metadata` parameter of its `WWW-Authenticate` challenges.
+
+    These settings are also **not optional**: the SDK raises
+    `Cannot specify auth_server_provider or token_verifier without auth
+    settings` when a verifier arrives without them. Every stel release with
+    token verification passed one without, so `--jwt-*` never got past startup
+    on the SDK versions the `mcp` extra allows. Nothing caught it because the
+    only test that built a server built the unauthenticated one.
+    """
+    if token_verifier is None:
+        # Unauthenticated, or identity from a trusted proxy. Passing settings
+        # here would make the SDK demand a verifier to go with them.
+        return None
+    if not issuer_url or not public_url:
+        raise ValueError(
+            "A token verifier needs both an issuer URL and this deployment's "
+            "own public URL: the first names who may issue tokens, the second "
+            "is what the discovery metadata publishes and what a client is "
+            "told to ask about in a WWW-Authenticate challenge."
+        )
+    settings_module = import_optional_dependency(
+        "mcp.server.auth.settings",
+        extra="mcp",
+        feature="stel MCP serving",
+    )
+    return settings_module.AuthSettings(
+        issuer_url=issuer_url,
+        resource_server_url=public_url,
+    )
+
+
 def _run(
     service: ContextService,
     *,
     transport: str,
     token_verifier: Any = None,
+    issuer_url: str | None = None,
+    public_url: str | None = None,
     **settings: Any,
 ) -> None:
     try:
@@ -258,7 +316,12 @@ def _run(
         # starts, so auth problems fail loudly at boot rather than as per-call
         # "timeout" errors mid-session (issue #365).
         service.warm_up()
-        app = create_mcp_server(service, token_verifier=token_verifier)
+        app = create_mcp_server(
+            service,
+            token_verifier=token_verifier,
+            issuer_url=issuer_url,
+            public_url=public_url,
+        )
         for name, value in settings.items():
             setattr(app.settings, name, value)
         app.run(transport=transport)

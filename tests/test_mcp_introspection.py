@@ -498,6 +498,7 @@ def _serve(args: list[str], tmp_path: Any) -> Any:
 
 
 _FULL_INTROSPECTION = [
+    "--public-url", "https://stel.example/mcp",
     "--introspection-endpoint", ENDPOINT,
     "--introspection-issuer", ISSUER,
     "--introspection-audience", AUDIENCE,
@@ -569,6 +570,7 @@ def test_cli_refuses_a_plaintext_introspection_endpoint(
     result = _serve(
         [
             "--transport", "streamable-http",
+            "--public-url", "https://stel.example/mcp",
             "--introspection-endpoint", "http://issuer.example/introspect",
             "--introspection-issuer", ISSUER,
             "--introspection-audience", AUDIENCE,

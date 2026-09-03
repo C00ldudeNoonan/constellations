@@ -434,6 +434,7 @@ def test_cli_refuses_a_plaintext_jwks_uri(tmp_path: Any) -> None:
     result = _serve(
         [
             "--transport", "streamable-http",
+            "--public-url", "https://stel.example/mcp",
             "--jwt-issuer", ISSUER,
             "--jwt-audience", AUDIENCE,
             "--jwt-jwks-uri", "http://issuer.example/jwks.json",

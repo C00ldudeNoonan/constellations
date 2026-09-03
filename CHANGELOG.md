@@ -35,6 +35,34 @@ zero.
 
 Measured ratios are documented as scaling guidance, not a contract; `ivf_pq` is
 lossy, so pair a switch with `stel eval`.
+### The search merge key is indexed, so an incremental publish stops scanning the table (issue #475)
+
+`_search_collection_spec` built `scalar_index_fields` from attributes with a
+filter role or `sortable`, and the search model's `id_field` was not among
+them — so the column `upsert` merges on had no index. Per LanceDB's own
+guidance, `merge_insert` without a scalar index on the join key "evaluates the
+join key predicate on every row through a full column scan", and the
+acknowledging `count_rows` scanned the same column again: two O(table) passes
+per page, 145 pages per publish on the 3,613,979-row collection from
+#461/#473 — on a *daily* incremental, not just a reindex.
+
+`id_field` now leads `scalar_index_fields`, so `ensure_indexes` builds a BTree
+on it and both the merge planning and the ack use the index. An id field that
+is also a filterable attribute is indexed once, not twice.
+
+This does not invalidate anything already published: the collection
+fingerprint is computed from the search descriptor, not from which columns
+carry an index, so an existing collection picks the BTree up on its next
+publish rather than rebuilding.
+
+The hazard this had to clear first is [lancedb#3177](https://github.com/lancedb/lancedb/issues/3177):
+on lancedb 0.30 / lance 3.0, a BTree on the merge key plus an index rebuild
+made later `when_matched_update_all` calls silently stop updating rows — and
+`ensure_indexes` rebuilds on every publish that added rows, which is every
+incremental publish. It is correct on the pinned 0.34, verified by driving the
+exact sequence (index the id, merge-update, append, rebuild, merge-update,
+verify), and that sequence is now a regression test so a LanceDB bump cannot
+reintroduce it silently.
 
 ### Long-running transform models report progress, not silence (issue #469)
 

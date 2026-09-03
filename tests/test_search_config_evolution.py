@@ -15,8 +15,10 @@ from typing import Any
 
 import pytest
 
+from stel.config import SearchConfig
 from stel.execution.contracts import RunError
 from stel.execution.search import (
+    _scalar_index_fields,
     _validate_collection_schema,
     _verify_collection_config,
 )
@@ -687,3 +689,60 @@ def test_fail_names_the_strategy_switch_and_points_at_online() -> None:
     message = str(error.value)
     assert "on_index_change: online" in message
     assert "requires a rebuild" not in message
+
+
+# ─── the merge key is indexed (issue #475) ─────────────────────────────────
+
+
+def _search_config(**overrides: Any) -> SearchConfig:
+    payload: dict[str, Any] = {
+        "id_field": "chunk_id",
+        "text_fields": ("text",),
+        "query": {"modes": ("vector",)},
+        "vector": {
+            "field": "embedding",
+            "dimensions": 2,
+            "metric": "cosine",
+            "search": "exact",
+            "embedding": "inherit",
+        },
+    }
+    payload.update(overrides)
+    return SearchConfig.model_validate(payload)
+
+
+def test_the_merge_key_is_among_the_indexed_scalar_fields() -> None:
+    """`upsert` merges on `id_field` every incremental publish. Unindexed, that
+    join-key predicate is a full column scan and the ack scans the column
+    again — two O(table) passes per page (issue #475)."""
+    fields = _scalar_index_fields(_search_config())
+
+    assert fields == ("chunk_id",)
+
+
+def test_the_merge_key_comes_first_and_filterable_attributes_follow() -> None:
+    fields = _scalar_index_fields(
+        _search_config(
+            attributes=(
+                {"name": "category", "data_type": "string", "filter_role": "user"},
+                {"name": "ignored", "data_type": "string"},
+                {"name": "published_at", "data_type": "timestamp", "sortable": True},
+            )
+        )
+    )
+
+    # `ignored` has no filter role and is not sortable, so it earns no index.
+    assert fields == ("chunk_id", "category", "published_at")
+
+
+def test_an_id_field_that_is_also_an_attribute_is_indexed_once() -> None:
+    """Asking for the same BTree twice would rebuild it twice per publish."""
+    fields = _scalar_index_fields(
+        _search_config(
+            attributes=(
+                {"name": "chunk_id", "data_type": "string", "filter_role": "user"},
+            )
+        )
+    )
+
+    assert fields == ("chunk_id",)

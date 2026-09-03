@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1389,6 +1390,87 @@ def test_online_policy_is_refused_when_the_store_cannot_evolve(
 
     with pytest.raises(Exception, match="online_schema_evolution"):
         validate_retrieval_capabilities(models, project, resolved)
+
+
+def test_a_first_publish_warns_while_it_is_still_streaming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """On a first publish there is no prior row count, so the advisory has to
+    come from the batch loop.
+
+    Taking it only from the post-publish metadata meant a newly created large
+    exact collection paid the whole publication first — and got no warning at
+    all if the index build failed (Codex review, #461). Rather than publishing
+    390k rows, the modelled scan throughput is dropped so that two rows cost
+    what millions would on a real store; every threshold in the advisory then
+    derives from it exactly as it does in production.
+    """
+    from stel.retrieval import servability
+
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+    monkeypatch.setattr(servability, "_SCAN_BYTES_PER_SECOND", 0.1)
+
+    with caplog.at_level(logging.WARNING, logger="stel.execution.search"):
+        run_project(tmp_path, select="context_search")
+
+    assert "still streaming" in caplog.text
+    # Latched, not repeated: one line per run, not one per batch.
+    assert caplog.text.count("declares `search: exact`") == 1
+
+
+def test_a_small_first_publish_says_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same path at the real threshold. Two rows is not a design problem,
+    and a warning on every publish would be the noise that hides the one that
+    matters."""
+    _write_project(tmp_path)
+    _materialize_upstream(tmp_path, _rows())
+
+    with caplog.at_level(logging.WARNING, logger="stel.execution.search"):
+        run_project(tmp_path, select="context_search")
+
+    assert "search: exact" not in caplog.text
+
+
+def test_a_store_config_refusal_stops_the_compile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Some refusals depend on the resolved store *config*, not the store type,
+    so `capabilities()` cannot express them — DuckDB will not build a
+    persistent HNSW index without `hnsw_experimental_persistence`. They must
+    still stop the compile, because a compatible vector-search change is
+    applied to the live collection: discovering the refusal at index time means
+    every row has already been republished and the serving pointer cleared
+    (Codex review, #461).
+    """
+    from stel.retrieval.lancedb import LanceDBStore
+
+    _write_project(tmp_path)
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    monkeypatch.setattr(
+        LanceDBStore,
+        "index_config_refusal",
+        lambda self, *, vector_search: "this store will not build that index",
+    )
+
+    with pytest.raises(Exception, match="will not build that index"):
+        validate_retrieval_capabilities(models, project, resolved)
+
+
+def test_a_store_with_nothing_to_refuse_compiles(tmp_path: Path) -> None:
+    """The default is permissive: the base implementation returns None, so a
+    store with no config-dependent refusals is unaffected by the seam."""
+    _write_project(tmp_path)
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    validate_retrieval_capabilities(models, project, resolved)
 
 
 # ─── private generation build (issue #355) ──────────────────────────────────

@@ -466,6 +466,28 @@ class RetrievalStore(ABC):
             f"Retrieval store '{self.store_type()}' cannot drop collections"
         )
 
+    def index_config_refusal(self, *, vector_search: str | None) -> str | None:
+        """Why this store instance cannot build the declared index, if it cannot.
+
+        Returns None when it can. `capabilities()` is a classmethod and answers
+        for the store *type*; some refusals depend on the resolved store
+        *config*, and those still have to be findable before any mutation.
+        DuckDB is the live case: it will not build a persistent HNSW index
+        without `hnsw_experimental_persistence`, which its capability set
+        cannot express.
+
+        This exists because the refusal used to surface only from
+        `ensure_indexes`, at the very end of a publish. That was survivable
+        while a vector-search change forced a rebuild into a private
+        generation. Once such a change became compatible (issue #461), an
+        in-place evolution could restamp the live collection, republish every
+        row, and only then discover the store would not build the index — with
+        the serving pointer already cleared by the in-place claim (Codex
+        review, #461).
+        """
+        del vector_search
+        return None
+
     @abstractmethod
     def inspect_collection(self, name: str) -> CollectionMetadata | None: ...
 

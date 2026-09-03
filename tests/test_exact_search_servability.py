@@ -199,31 +199,43 @@ def test_the_publish_path_stays_quiet_when_there_is_nothing_to_warn_about(
 # ─── a timeout no retry can satisfy (issue #461) ────────────────────────────
 
 
-def test_a_timeout_at_the_ceiling_is_not_reported_as_retryable() -> None:
-    """`retryable: true` told the caller to try again on a call this server is
-    configured never to finish. A deterministic full scan fails identically on
-    every attempt, and at the ceiling there is no larger `timeout_seconds` left
-    to set, so `true` was an instruction to retry forever."""
+def test_a_timeout_at_the_ceiling_says_no_larger_deadline_exists() -> None:
+    """The message carries what the server actually knows: that raising
+    `timeout_seconds` is no longer a lever. It does not claim the operation is
+    permanently unanswerable — the limiter sees a deadline elapse and nothing
+    else, and the same expiry covers congestion that a retry would clear."""
     from stel.mcp_server.contracts import MCPErrorCode
     from stel.mcp_server.service import timeout_error
 
     error = timeout_error(MAX_CONTEXT_TIMEOUT_SECONDS)
 
     assert error.code is MCPErrorCode.TIMEOUT
-    assert error.retryable is False
-    assert "retrying will not help" in error.message
+    assert "no larger deadline can be configured" in error.message
 
 
-def test_a_timeout_below_the_ceiling_is_still_retryable() -> None:
-    """The complement. Under the ceiling a timeout can be contention, and the
-    operator still has a lever — raising `timeout_seconds` — so telling the
-    caller to give up would be as wrong as telling it to keep trying."""
+def test_every_timeout_stays_retryable_because_the_server_cannot_tell(
+) -> None:
+    """The correction to this PR's first attempt (Codex review). Marking
+    ceiling timeouts permanent would have covered approximate search, document
+    retrieval and transient store congestion as well as the oversized exact
+    scan — and the serving layer knows neither the collection's row count nor
+    its search mode, so it has no evidence to tell them apart. The structural
+    claim is made at publish time instead, where that evidence exists."""
+    from stel.mcp_server.service import timeout_error
+
+    for deadline in (DEFAULT_CONTEXT_TIMEOUT_SECONDS, MAX_CONTEXT_TIMEOUT_SECONDS):
+        assert timeout_error(deadline).retryable is True
+
+
+def test_a_timeout_below_the_ceiling_does_not_mention_the_ceiling() -> None:
+    """Under it, raising `timeout_seconds` is still available and is the first
+    thing to try, so the message must not imply otherwise."""
     from stel.mcp_server.service import timeout_error
 
     error = timeout_error(DEFAULT_CONTEXT_TIMEOUT_SECONDS)
 
     assert error.retryable is True
-    assert "retrying will not help" not in error.message
+    assert "no larger deadline" not in error.message
 
 
 def test_the_limiter_reports_the_timeout_through_that_rule() -> None:
@@ -242,3 +254,57 @@ def test_the_limiter_reports_the_timeout_through_that_rule() -> None:
         limiter.close()
 
     assert error.value.retryable is True
+
+
+# ─── warning while the first collection is still streaming ──────────────────
+
+
+def test_the_row_threshold_is_the_inverse_of_the_estimate() -> None:
+    """A first publish has no prior row count, so it needs to know the row at
+    which the advisory starts applying rather than waiting for a total."""
+    from stel.retrieval.servability import exact_advisory_row_threshold
+
+    threshold = exact_advisory_row_threshold(dimensions=_REPORTED_DIMENSIONS)
+
+    assert (
+        exact_search_advisory(
+            collection="ctx",
+            rows=threshold,
+            dimensions=_REPORTED_DIMENSIONS,
+            access="public",
+        )
+        is not None
+    )
+    assert (
+        exact_search_advisory(
+            collection="ctx",
+            rows=threshold - 1,
+            dimensions=_REPORTED_DIMENSIONS,
+            access="public",
+        )
+        is None
+    )
+
+
+def test_a_threshold_for_a_dimensionless_collection_is_never_crossed() -> None:
+    from stel.retrieval.servability import exact_advisory_row_threshold
+
+    assert exact_advisory_row_threshold(dimensions=0) == 0
+
+
+def test_an_in_progress_advisory_claims_a_floor_not_a_total() -> None:
+    """Mid-stream the row count is still growing, so saying "scans all N rows"
+    would be false. The estimate is a lower bound too, which only strengthens
+    the warning."""
+    advisory = exact_search_advisory(
+        collection="ctx",
+        rows=_REPORTED_ROWS,
+        dimensions=_REPORTED_DIMENSIONS,
+        access="public",
+        in_progress=True,
+    )
+
+    assert advisory is not None
+    assert "still streaming" in advisory
+    assert "at least" in advisory
+    assert "scans all" not in advisory

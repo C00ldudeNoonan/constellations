@@ -17,6 +17,7 @@ stated as such wherever it is reported.
 
 from __future__ import annotations
 
+from math import ceil
 from typing import Final
 
 # The largest `timeout_seconds` a context server will accept. Defined here
@@ -57,12 +58,26 @@ def estimated_exact_scan_seconds(*, rows: int, dimensions: int) -> float:
     return exact_scan_bytes(rows=rows, dimensions=dimensions) / _SCAN_BYTES_PER_SECOND
 
 
+def exact_advisory_row_threshold(*, dimensions: int) -> int:
+    """Rows at which an exact scan first becomes worth warning about.
+
+    The inverse of the estimate, so a publish still streaming its first
+    collection can warn the moment it crosses the line instead of waiting for
+    a final row count it does not have yet (Codex review, #461).
+    """
+    if dimensions <= 0:
+        return 0
+    per_row = dimensions * _FLOAT32_BYTES
+    return ceil(_ADVISORY_SECONDS * _SCAN_BYTES_PER_SECOND / per_row)
+
+
 def exact_search_advisory(
     *,
     collection: str,
     rows: int,
     dimensions: int,
     access: str,
+    in_progress: bool = False,
 ) -> str | None:
     """The warning an `exact` collection of this size deserves, if any.
 
@@ -75,6 +90,10 @@ def exact_search_advisory(
     the scan — the measured incident sat here, at an estimated 278s. Below it
     and public, the query is merely expensive, which is a choice an operator is
     entitled to make.
+
+    `in_progress` says `rows` is a running count from a publish that is still
+    streaming, so the wording claims a floor rather than a total. The estimate
+    is then a lower bound too, which only strengthens the warning.
     """
     if rows <= 0 or dimensions <= 0:
         return None
@@ -82,11 +101,18 @@ def exact_search_advisory(
     if seconds < _ADVISORY_SECONDS:
         return None
     gigabytes = exact_scan_bytes(rows=rows, dimensions=dimensions) / 1_000_000_000
+    scanned = (
+        f"the {rows:,} rows published so far -- this run is still streaming"
+        if in_progress
+        else f"all {rows:,} rows"
+    )
+    at_least = "at least " if in_progress else ""
     measured = (
         f"collection '{collection}' declares `search: exact`, which builds no "
-        f"vector index, so every query scans all {rows:,} rows x {dimensions} "
-        f"dimensions -- about {gigabytes:.1f} GB, an estimated {seconds:.0f}s "
-        "per query on object storage (issue #461; a local store will be faster)"
+        f"vector index, so every query scans {scanned} x {dimensions} "
+        f"dimensions -- {at_least}about {gigabytes:.1f} GB, an estimated "
+        f"{at_least}{seconds:.0f}s per query on object storage (issue #461; a "
+        "local store will be faster)"
     )
     remedy = (
         "Declare `search: approximate` to build an ANN index. With "

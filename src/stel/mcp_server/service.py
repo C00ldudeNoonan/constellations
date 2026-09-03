@@ -149,13 +149,26 @@ class ContextServiceError(Exception):
 def timeout_error(timeout_seconds: float) -> ContextServiceError:
     """The TIMEOUT this server should report at a given deadline (issue #461).
 
-    `retryable` was unconditionally true, which is misleading for the case that
-    prompted this: an `exact` vector index whose full scan simply costs more
-    than the deadline fails identically on every attempt, and at the ceiling
-    there is no larger `timeout_seconds` left to configure. A caller told to
-    retry will retry forever. Below the ceiling the same timeout can be
-    contention and the operator still has a lever, so retrying is reasonable
-    there and the flag stays true.
+    Issue #461 asked whether `retryable: true` is right for a timeout no retry
+    can satisfy — a full `exact` vector scan costs the same on every attempt,
+    and at the ceiling there is no larger `timeout_seconds` left to set.
+
+    It is right, because this is the wrong layer to answer it from. The limiter
+    sees a deadline elapse and nothing else: the same expiry at 600s covers an
+    oversized deterministic scan, an approximate search behind a congested
+    store, and a warehouse read that was merely unlucky. Two of those succeed
+    on a retry. Marking them all permanent to catch the first would trade a
+    misleading flag for a wrong one, and the flag would still carry no
+    evidence — the serving layer knows neither the collection's row count nor
+    its search mode.
+
+    So `retryable` stays true and the *message* carries what the server does
+    know: whether a larger deadline is still available. A caller at the ceiling
+    learns that retrying is the only lever left, rather than being sent to
+    raise a setting that is already at its maximum. The structural claim — this
+    index cannot be served at any permitted deadline — is made at publish time
+    instead, in `retrieval/servability.py`, which has the row count and the
+    search mode in hand (Codex review, #461).
     """
     if timeout_seconds < MAX_CONTEXT_TIMEOUT_SECONDS:
         return ContextServiceError(
@@ -167,9 +180,10 @@ def timeout_error(timeout_seconds: float) -> ContextServiceError:
         MCPErrorCode.TIMEOUT,
         "The context operation exceeded its time limit, and the server is "
         f"already at the maximum timeout_seconds ({MAX_CONTEXT_TIMEOUT_SECONDS:.0f}s), "
-        "so retrying will not help: the operation costs more than any permitted "
-        "deadline allows",
-        retryable=False,
+        "so no larger deadline can be configured. If this is not transient "
+        "congestion, the index is too expensive to query — an `exact` vector "
+        "index scans its whole vector column on every query",
+        retryable=True,
     )
 
 

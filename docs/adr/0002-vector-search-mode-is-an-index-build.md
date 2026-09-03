@@ -38,7 +38,22 @@ per-query scan from row count and dimensions and reports it when it exceeds the
 default serving timeout — escalating for a governed index, which is reachable
 only through a context server, and again past the server's absolute ceiling,
 where no permitted setting can answer the query. A TIMEOUT raised at that
-ceiling now reports `retryable: false`.
+ceiling says so in its message, but stays retryable: see below.
+
+### Reporting a ceiling timeout as `retryable: false`
+
+#461 asked whether `retryable: true` is right for a timeout no retry can
+satisfy. It is, from the serving layer. The limiter observes a deadline elapse
+and nothing else, and the same expiry at 600s covers an oversized deterministic
+scan, an approximate search behind a congested store, and a warehouse read that
+was merely unlucky — two of which succeed on a retry. The serving layer knows
+neither the collection's row count nor its search mode, so it cannot tell them
+apart. Marking them all permanent to catch the first would trade a misleading
+flag for a wrong one.
+
+So the message carries what the server does know — whether a larger deadline is
+still configurable — and the structural claim is made at publish time, where
+the row count and the search mode are in hand.
 
 ## Alternatives considered
 
@@ -90,6 +105,16 @@ a query that costs eleven gigabytes of reads, not a limit set too low.
 - `ensure_indexes` is now destructive in one narrow case: it drops a vector
   index when the mode is `exact`. That is required for `exact` to mean what it
   says, but it means a mode typo now costs an index rebuild on the next run.
+- **A store that refuses an index must say so at compile time.** This was
+  survivable while a vector-search change forced a rebuild into a private
+  generation: the live collection was untouched. Now the change is applied in
+  place, so a refusal discovered at `ensure_indexes` arrives after every row
+  has been republished and the in-place claim has cleared the serving pointer.
+  `RetrievalStore.index_config_refusal` is the seam — asked of the constructed
+  store rather than its capability set, because DuckDB's
+  `hnsw_experimental_persistence` is a property of the resolved config, not of
+  the store type. A store adding a config-dependent refusal must implement it
+  there, not only at index time.
 - The throughput constant in `servability.py` is a single measurement, not a
   model. It will drift as stores and hardware move; it is stated as an estimate
   everywhere it surfaces, and the advisory names its source.

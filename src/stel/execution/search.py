@@ -55,7 +55,10 @@ from ..retrieval import (
 )
 from ..retrieval.base import GENERATION_MARKER
 from ..retrieval.retention import retire_superseded_generations
-from ..retrieval.servability import exact_search_advisory
+from ..retrieval.servability import (
+    exact_advisory_row_threshold,
+    exact_search_advisory,
+)
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
@@ -252,6 +255,12 @@ def _run_search_model(
                         lease=publish_lease,
                     )
                 warned_exact = False
+                exact_scan_warn_after = (
+                    exact_advisory_row_threshold(dimensions=spec.vector_dimensions)
+                    if spec.vector_search == "exact"
+                    and spec.vector_dimensions is not None
+                    else None
+                )
                 existing = store.inspect_collection(physical)
                 force_publish = existing is None
                 collection_exists = existing is not None
@@ -294,6 +303,18 @@ def _run_search_model(
                         max_id_bytes=store.capabilities().max_id_bytes,
                     )
                     rows_seen += len(indexed)
+                    if (
+                        not warned_exact
+                        and exact_scan_warn_after is not None
+                        and rows_seen >= exact_scan_warn_after
+                    ):
+                        # A first publish has no prior row count, so without
+                        # this the only advisory arrives after every batch has
+                        # been read, upserted and indexed — and not at all if
+                        # the index build fails (Codex review, #461).
+                        warned_exact = _warn_on_exact_vector_scan(
+                            model, spec, rows_seen, in_progress=True
+                        )
                     # A line rather than a bar: the snapshot is a one-shot
                     # bounded stream with no row count, so there is no total to
                     # render a determinate bar against.
@@ -728,7 +749,11 @@ def _config_change_forces_rebuild(
 
 
 def _warn_on_exact_vector_scan(
-    model: ModelConfig, spec: CollectionSpec, row_count: int
+    model: ModelConfig,
+    spec: CollectionSpec,
+    row_count: int,
+    *,
+    in_progress: bool = False,
 ) -> bool:
     """Report an `exact` collection that has grown past what a scan can serve.
 
@@ -747,6 +772,7 @@ def _warn_on_exact_vector_scan(
         rows=row_count,
         dimensions=spec.vector_dimensions,
         access=search.access,
+        in_progress=in_progress,
     )
     if advisory is None:
         return False

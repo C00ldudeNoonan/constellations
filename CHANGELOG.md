@@ -32,11 +32,20 @@ calls. `exact` is implemented by the *absence* of an index, so switching back
 now drops it; a store that left a stale one behind would keep answering
 approximately under a config promising exact results.
 
-**A timeout no retry can satisfy no longer claims to be retryable.** At the
-600s ceiling there is no larger `timeout_seconds` to configure, so `retryable:
-true` was an instruction to retry forever. `stel mcp serve --timeout-seconds`
-is also bounded at the ceiling now, so an operator raising it learns the limit
-from the CLI rather than from a validation error.
+**A timeout at the ceiling says a larger deadline is not available.** It stays
+`retryable: true` — the serving layer sees a deadline elapse and nothing else,
+and the same expiry covers congestion a retry would clear — but the message no
+longer sends the caller to raise a setting that is already at its maximum. The
+structural claim is made at publish time, where the row count and search mode
+are known. `stel mcp serve --timeout-seconds` is bounded at the ceiling now
+too, so the limit is visible where an operator would try to raise it.
+
+**A store that will not build the declared index refuses at compile time.**
+DuckDB will not build a persistent HNSW index without
+`hnsw_experimental_persistence`, and that used to surface only from
+`ensure_indexes`. Harmless while the change forced a rebuild into a private
+generation; not harmless once it is applied in place, where the refusal would
+arrive after every row had been republished and the serving pointer cleared.
 
 The reasoning, and the two alternatives that lost, are in
 [ADR-0002](docs/adr/0002-vector-search-mode-is-an-index-build.md).

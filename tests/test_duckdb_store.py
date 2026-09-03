@@ -649,3 +649,61 @@ def test_configured_hnsw_search_effort_reaches_the_connection(
         ).fetchone()
 
     assert row is not None and int(row[0]) == 99
+
+
+# ─── the opt-in is refused before mutation, not after (issue #461) ──────────
+
+
+def test_approximate_without_the_opt_in_is_refused_at_preflight(
+    store: DuckDBStore,
+) -> None:
+    """The refusal has to be findable before a publish starts.
+
+    Discovering it from `ensure_indexes` was survivable while a vector-search
+    change forced a rebuild into a private generation. Once such a change
+    became compatible, an in-place evolution under `on_index_change: online`
+    would restamp the live collection, republish every row, and only then fail
+    — with the serving pointer already cleared (Codex review, #461).
+    """
+    refusal = store.index_config_refusal(vector_search="approximate")
+
+    assert refusal is not None
+    assert "hnsw_persistence_disabled" in refusal
+
+
+def test_preflight_accepts_what_the_store_can_actually_build(
+    tmp_path: Path, store: DuckDBStore
+) -> None:
+    """The complement, in both directions: `exact` needs no index at all, and
+    `approximate` is fine once the operator has accepted the WAL risk."""
+    assert store.index_config_refusal(vector_search="exact") is None
+    assert store.index_config_refusal(vector_search=None) is None
+
+    opted_in = DuckDBStore(
+        DuckDBConfig(
+            path=str(tmp_path / "hnsw.duckdb"), hnsw_experimental_persistence=True
+        ),
+        project_name="proj",
+        target_name="dev",
+        alias="default",
+    )
+    assert opted_in.index_config_refusal(vector_search="approximate") is None
+
+
+def test_preflight_and_the_index_build_refuse_with_one_wording(
+    store: DuckDBStore,
+) -> None:
+    """An operator who saw two different messages for one cause would
+    reasonably think they were two different problems."""
+    with store:
+        name = store.physical_collection("ctx")
+        spec = _spec(name, vector_search="approximate")
+        store.create_collection(spec)
+        store.upsert(name, _rows(), id_field="id", mutation_digest="d1")
+
+        with pytest.raises(RetrievalError) as error:
+            store.ensure_indexes(spec)
+
+    assert str(error.value) == store.index_config_refusal(
+        vector_search="approximate"
+    )

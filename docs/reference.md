@@ -2244,11 +2244,14 @@ defaults to 30s and cannot be set above 600s — so at that size the index
 publishes, validates, reports `ready`, and answers nothing.
 
 stel warns during publish once the estimated scan exceeds the default serving
-timeout, naming the row count, the bytes, and the estimate. Treat it as a
-prompt to declare `search: approximate`, which builds an ANN index. Switching
-is [a compatible change](#changing-a-published-indexs-configuration): under
-`on_index_change: online` it is an index build over vectors that are already
-published — no re-embed, and no new collection name.
+timeout, naming the row count, the bytes, and the estimate. On a collection
+that already exists the warning comes before the run spends its time; on a
+first publish it comes as soon as the streamed row count crosses the
+threshold, not at the end. Treat it as a prompt to declare `search:
+approximate`, which builds an ANN index. Switching is [a compatible
+change](#changing-a-published-indexs-configuration): under `on_index_change:
+online` it is an index build over vectors that are already published — no
+re-embed, and no new collection name.
 
 The threshold is an estimate anchored to one measurement on object storage. A
 local NVMe store is materially faster, so the warning errs toward arriving
@@ -2389,6 +2392,11 @@ Two limits are deliberate:
 - **The store must advertise `online_schema_evolution`.** The policy is
   rejected at compile time against a store that cannot widen a live
   collection, rather than failing mid-publish.
+- **The store must be configured to build the index it is being asked for.**
+  A DuckDB store without `hnsw_experimental_persistence` is refused at compile
+  time when a model declares `search: approximate`, because an in-place switch
+  that discovered the refusal at index time would already have republished the
+  whole collection.
 
 ### `on_index_change: rebuild`
 

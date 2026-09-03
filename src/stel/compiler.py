@@ -473,6 +473,17 @@ def validate_retrieval_capabilities(
             target_name=resolved.target_name,
             alias=alias,
         )
+        # Asked of the constructed store, not of its capability set: some
+        # refusals depend on the resolved store config rather than the store
+        # type. This has to happen before any publish, because a compatible
+        # vector-search change is applied to the *live* collection — an index
+        # the store turns out to refuse would be discovered after every row had
+        # been republished and the serving pointer cleared (Codex review, #461).
+        refusal = store.index_config_refusal(
+            vector_search=search.vector.search if search.vector else None
+        )
+        if refusal is not None:
+            raise _model_error(model, refusal, ("search", "vector", "search"))
         logical = search.collection or model.name
         physical = store.physical_collection(logical)
         key = (store.safe_descriptor().safe_target_identity, physical)

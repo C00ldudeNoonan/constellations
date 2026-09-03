@@ -55,6 +55,10 @@ from ..retrieval import (
 )
 from ..retrieval.base import GENERATION_MARKER
 from ..retrieval.retention import retire_superseded_generations
+from ..retrieval.servability import (
+    exact_advisory_row_threshold,
+    exact_search_advisory,
+)
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
@@ -250,10 +254,23 @@ def _run_search_model(
                         coordinator=coordinator,
                         lease=publish_lease,
                     )
+                warned_exact = False
+                exact_scan_warn_after = (
+                    exact_advisory_row_threshold(dimensions=spec.vector_dimensions)
+                    if spec.vector_search == "exact"
+                    and spec.vector_dimensions is not None
+                    else None
+                )
                 existing = store.inspect_collection(physical)
                 force_publish = existing is None
                 collection_exists = existing is not None
                 if existing is not None:
+                    # Before the run spends its time, not after: on every run
+                    # but the first, the collection already knows how many rows
+                    # an exact query has to scan (issue #461).
+                    warned_exact = _warn_on_exact_vector_scan(
+                        model, spec, existing.row_count
+                    )
                     evolved = _verify_collection_config(
                         store, existing, spec, policy=search.on_index_change
                     )
@@ -286,6 +303,18 @@ def _run_search_model(
                         max_id_bytes=store.capabilities().max_id_bytes,
                     )
                     rows_seen += len(indexed)
+                    if (
+                        not warned_exact
+                        and exact_scan_warn_after is not None
+                        and rows_seen >= exact_scan_warn_after
+                    ):
+                        # A first publish has no prior row count, so without
+                        # this the only advisory arrives after every batch has
+                        # been read, upserted and indexed — and not at all if
+                        # the index build fails (Codex review, #461).
+                        warned_exact = _warn_on_exact_vector_scan(
+                            model, spec, rows_seen, in_progress=True
+                        )
                     # A line rather than a bar: the snapshot is a one-shot
                     # bounded stream with no row count, so there is no total to
                     # render a determinate bar against.
@@ -453,6 +482,8 @@ def _run_search_model(
                     coordinator.verify_publish(publish_lease)
                     store.create_collection(spec)
                 metadata = store.ensure_indexes(spec)
+                if not warned_exact:
+                    _warn_on_exact_vector_scan(model, spec, metadata.row_count)
                 if metadata.config_fingerprint != spec.config_fingerprint:
                     raise RunError(
                         "Retrieval collection failed post-publication configuration validation"
@@ -717,6 +748,38 @@ def _config_change_forces_rebuild(
     )
 
 
+def _warn_on_exact_vector_scan(
+    model: ModelConfig,
+    spec: CollectionSpec,
+    row_count: int,
+    *,
+    in_progress: bool = False,
+) -> bool:
+    """Report an `exact` collection that has grown past what a scan can serve.
+
+    Returns whether anything was said, so the same run does not say it twice.
+    A warning rather than a refusal: `exact` stays a legitimate choice, and the
+    threshold is an estimate anchored to one measurement, not a contract. What
+    was missing was any signal at all — the collection in issue #461 published,
+    validated, and reported ready while being structurally unqueryable.
+    """
+    search = model.search
+    assert search is not None
+    if spec.vector_search != "exact" or spec.vector_dimensions is None:
+        return False
+    advisory = exact_search_advisory(
+        collection=spec.logical_name,
+        rows=row_count,
+        dimensions=spec.vector_dimensions,
+        access=search.access,
+        in_progress=in_progress,
+    )
+    if advisory is None:
+        return False
+    log.warning("Search resource '%s': %s", model.name, advisory)
+    return True
+
+
 def _mark_search_publication_failed(
     coordinator: ServingCoordinator,
     lease: PublishLease,
@@ -922,9 +985,9 @@ def _verify_collection_config(
         return True
 
     raise RunError(
-        f"Search index configuration changed: {detail}. The change is additive "
-        "and the existing collection could serve it — set `on_index_change: "
-        "online` to widen it in place, or publish under a new collection name."
+        f"Search index configuration changed: {detail}. The existing collection "
+        "can serve the change — set `on_index_change: online` to apply it in "
+        "place, or publish under a new collection name."
     )
 
 

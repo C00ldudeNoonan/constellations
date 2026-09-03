@@ -62,6 +62,10 @@ from .prompts import (
 from .providers import (
     get_inference_provider,
 )
+from .retrieval.servability import (
+    DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+    MAX_CONTEXT_TIMEOUT_SECONDS,
+)
 from .retrieval_eval import (
     RetrievalEvalError,
     run_retrieval_evaluation,
@@ -1497,8 +1501,11 @@ def mcp() -> None:
 @mcp.command("serve")
 @click.option(
     "--timeout-seconds",
-    type=click.FloatRange(min=0.1),
-    default=30.0,
+    # Bounded here as well as in the settings model so an operator raising the
+    # deadline learns the ceiling from the CLI, instead of from a validation
+    # error after the server has been told to start (issue #461).
+    type=click.FloatRange(min=0.1, max=MAX_CONTEXT_TIMEOUT_SECONDS),
+    default=DEFAULT_CONTEXT_TIMEOUT_SECONDS,
     show_default=True,
 )
 @click.option(

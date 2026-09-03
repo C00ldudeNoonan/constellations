@@ -669,7 +669,7 @@ class LanceDBStore(RetrievalStore):
                         replace=current is not None,
                         wait_timeout=timedelta(seconds=self._config.timeout_seconds),
                     )
-            if spec.vector_field is not None and spec.vector_search == "approximate":
+            if spec.vector_field is not None:
                 current = next(
                     (
                         index
@@ -678,14 +678,26 @@ class LanceDBStore(RetrievalStore):
                     ),
                     None,
                 )
-                if current is None or current.num_unindexed_rows:
-                    metric = "l2" if spec.distance_metric == "euclidean" else spec.distance_metric
-                    table.create_index(
-                        spec.vector_field,
-                        config=index_module.HnswFlat(distance_type=metric),
-                        replace=current is not None,
-                        wait_timeout=timedelta(seconds=self._config.timeout_seconds),
-                    )
+                if spec.vector_search == "approximate":
+                    if current is None or current.num_unindexed_rows:
+                        metric = (
+                            "l2"
+                            if spec.distance_metric == "euclidean"
+                            else spec.distance_metric
+                        )
+                        table.create_index(
+                            spec.vector_field,
+                            config=index_module.HnswFlat(distance_type=metric),
+                            replace=current is not None,
+                            wait_timeout=timedelta(seconds=self._config.timeout_seconds),
+                        )
+                elif current is not None:
+                    # `exact` is implemented by the *absence* of an ANN index --
+                    # LanceDB uses one whenever it exists. Leaving a stale index
+                    # behind after a switch back would silently keep serving
+                    # approximate results under a config that promises exact
+                    # ones (issue #461).
+                    table.drop_index(current.name)
         except Exception:
             raise RetrievalError(
                 "LanceDB operation 'index creation' failed (code=lancedb_index_failed)"

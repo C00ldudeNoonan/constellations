@@ -10,6 +10,7 @@ history (issue #311).
 | ADR | Decision | Status |
 |---|---|---|
 | [0001](0001-degraded-serving-and-fail-closed-recovery.md) | A failed publish keeps serving its live generation; recovery fails closed | accepted |
+| [0002](0002-vector-search-mode-is-an-index-build.md) | Switching `exact` <-> `approximate` is an index build, not a whole-index invalidation | accepted |
 
 ## When to write one
 

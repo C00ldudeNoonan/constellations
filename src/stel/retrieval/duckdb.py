@@ -87,6 +87,20 @@ _DISTANCE_FUNCTIONS = {
     "dot": "array_negative_inner_product",
 }
 
+# One wording for the two places that refuse this: compile-time preflight and
+# the index build itself. They must agree, because an operator who saw one and
+# then hit the other would reasonably think they were different problems.
+_HNSW_PERSISTENCE_REFUSAL = (
+    "DuckDB cannot build an approximate (HNSW) vector index on a "
+    "file-backed database unless hnsw_experimental_persistence is "
+    "enabled (code=duckdb_hnsw_persistence_disabled). That index "
+    "is not covered by the WAL, so a crash can leave it "
+    "inconsistent with the table. Either set "
+    "hnsw_experimental_persistence: true on the store, accepting "
+    "that risk, or declare vector search as 'exact' -- exact "
+    "search needs no index and returns the same rows, only slower."
+)
+
 
 class DuckDBConfig(RetrievalStoreConfig):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -590,8 +604,11 @@ class DuckDBStore(RetrievalStore):
 
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
         conn = self._connection()
-        if spec.vector_field is not None and spec.vector_search == "approximate":
-            self._ensure_hnsw_index(conn, spec)
+        if spec.vector_field is not None:
+            if spec.vector_search == "approximate":
+                self._ensure_hnsw_index(conn, spec)
+            else:
+                self._drop_hnsw_index(conn, spec)
         if spec.full_text_fields:
             self._ensure_fts_index(conn, spec)
         metadata = self.inspect_collection(spec.physical_name)
@@ -599,18 +616,39 @@ class DuckDBStore(RetrievalStore):
             raise RetrievalError("DuckDB collection disappeared while indexing")
         return metadata
 
+    def _drop_hnsw_index(self, conn: Any, spec: CollectionSpec) -> None:
+        """Remove an ANN index left by a previous `approximate` publish.
+
+        `exact` is implemented by the absence of the index -- the planner uses
+        one whenever it exists -- so a switch back has to take it away, or the
+        collection keeps answering approximately under a config that promises
+        otherwise (issue #461).
+        """
+        self._execute(
+            conn,
+            "DROP INDEX IF EXISTS "
+            f"{_quote_identifier(_index_name(spec.physical_name, 'hnsw'))}",
+            operation="ensure indexes",
+        )
+
+    def index_config_refusal(self, *, vector_search: str | None) -> str | None:
+        """Approximate search needs an opt-in this store's config may not carry.
+
+        Reported here as well as from `ensure_indexes` so the compiler can
+        refuse the combination before a publish begins. Since a vector-search
+        change became compatible (issue #461), discovering it at index time
+        would mean an in-place evolution had already republished the whole
+        collection and cleared the serving pointer.
+        """
+        if vector_search != "approximate":
+            return None
+        if self._config.hnsw_experimental_persistence:
+            return None
+        return _HNSW_PERSISTENCE_REFUSAL
+
     def _ensure_hnsw_index(self, conn: Any, spec: CollectionSpec) -> None:
         if not self._config.hnsw_experimental_persistence:
-            raise RetrievalError(
-                "DuckDB cannot build an approximate (HNSW) vector index on a "
-                "file-backed database unless hnsw_experimental_persistence is "
-                "enabled (code=duckdb_hnsw_persistence_disabled). That index "
-                "is not covered by the WAL, so a crash can leave it "
-                "inconsistent with the table. Either set "
-                "hnsw_experimental_persistence: true on the store, accepting "
-                "that risk, or declare vector search as 'exact' -- exact "
-                "search needs no index and returns the same rows, only slower."
-            )
+            raise RetrievalError(_HNSW_PERSISTENCE_REFUSAL)
         metric = spec.distance_metric or "cosine"
         if metric not in _DISTANCE_FUNCTIONS:
             raise RetrievalError(f"DuckDB does not support distance metric '{metric}'")

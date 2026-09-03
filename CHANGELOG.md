@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### `search: exact` no longer publishes an index nothing can query (issue #461)
+
+`search: exact` builds no vector index, so every query reads the whole vector
+column. A production collection — 3,613,979 rows at 768 dimensions — published
+cleanly, passed post-publication validation, reported `ready`, and then
+answered no governed query at all: one scan is ~11 GB and took ~275s, warm and
+cold alike, against a context server whose `timeout_seconds` defaults to 30s
+and caps at 600s. Nothing in the build path had mentioned the cost at any
+scale, and the index was fine at 1.04M rows, so there was no signal in between.
+
+Three changes, because the warning is only worth having if the fix is cheap.
+
+**The publish now says what a query will cost.** Once the estimated scan
+exceeds the default serving timeout, the run warns with the row count, the
+bytes, and the estimate — escalating for a governed index, which is reachable
+only through a context server, and again past that server's ceiling, where no
+permitted setting can answer the query at all. It warns rather than refuses:
+`exact` returns the same rows at any size, and the estimate is anchored to one
+measurement on object storage, not a contract.
+
+**Switching `exact` <-> `approximate` is now a compatible change.** It was
+classified as whole-index invalidation, which meant a new collection name, a
+full re-embed, and a consumer cutover — 4h35m for that corpus — to change what
+is physically an index-build flag over vectors that were already published and
+unchanged. Under `on_index_change: online` it is now applied in place: the rows
+are republished from the warehouse and the ANN index is built, with no provider
+calls. `exact` is implemented by the *absence* of an index, so switching back
+now drops it; a store that left a stale one behind would keep answering
+approximately under a config promising exact results.
+
+**A timeout at the ceiling says a larger deadline is not available.** It stays
+`retryable: true` — the serving layer sees a deadline elapse and nothing else,
+and the same expiry covers congestion a retry would clear — but the message no
+longer sends the caller to raise a setting that is already at its maximum. The
+structural claim is made at publish time, where the row count and search mode
+are known. `stel mcp serve --timeout-seconds` is bounded at the ceiling now
+too, so the limit is visible where an operator would try to raise it.
+
+**A store that will not build the declared index refuses at compile time.**
+DuckDB will not build a persistent HNSW index without
+`hnsw_experimental_persistence`, and that used to surface only from
+`ensure_indexes`. Harmless while the change forced a rebuild into a private
+generation; not harmless once it is applied in place, where the refusal would
+arrive after every row had been republished and the serving pointer cleared.
+
+The reasoning, and the two alternatives that lost, are in
+[ADR-0002](docs/adr/0002-vector-search-mode-is-an-index-build.md).
+
 ### Runs report where their wall clock went (issue #432)
 
 Both open performance issues on the streaming stages begin by asking for the

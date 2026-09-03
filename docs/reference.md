@@ -2230,6 +2230,34 @@ The project model declares the portable serving contract:
       consistency: strong
 ```
 
+#### `search: exact` does not scale, and stel now says so
+
+`search: exact` is the default and builds **no vector index**, so every query
+reads the entire vector column. That is the right choice for most collections
+and quietly disqualifying for large ones: the cost is `rows x dimensions x 4`
+bytes per query, and it does not improve with warming.
+
+A measured example (issue #461): 3,613,979 rows at 768 dimensions is ~11 GB per
+query, about **275 seconds** against an object-store-backed index. A governed
+index is queryable only through a context server, whose `timeout_seconds`
+defaults to 30s and cannot be set above 600s — so at that size the index
+publishes, validates, reports `ready`, and answers nothing.
+
+stel warns during publish once the estimated scan exceeds the default serving
+timeout, naming the row count, the bytes, and the estimate. On a collection
+that already exists the warning comes before the run spends its time; on a
+first publish it comes as soon as the streamed row count crosses the
+threshold, not at the end. Treat it as a prompt to declare `search:
+approximate`, which builds an ANN index. Switching is [a compatible
+change](#changing-a-published-indexs-configuration): under `on_index_change:
+online` it is an index build over vectors that are already published — no
+re-embed, and no new collection name.
+
+The threshold is an estimate anchored to one measurement on object storage. A
+local NVMe store is materially faster, so the warning errs toward arriving
+early. It is a warning, not a refusal: `exact` returns the same rows at any
+size, and paying for it is a decision you are entitled to make.
+
 `run` and `build` stream projected Arrow batches from the warehouse, validate
 the declared row contract before each mutation, upsert changed rows, delete
 stale rows, and advance warehouse state only after exact durable receipts,
@@ -2317,6 +2345,7 @@ Everything that defines a row's shape or meaning is:
 | Change | Classification |
 | --- | --- |
 | new attribute, wider `display_fields`/`return_text_fields` | compatible |
+| `vector: {search: ...}` — `exact` <-> `approximate` | compatible |
 | `vector` field, dimensions, metric, or embedding identity | rebuild required |
 | `id_field`, `document_id_field`, `chunk_id_field` | rebuild required |
 | `text_fields`, `full_text`, `access`, `query` modes | rebuild required |
@@ -2337,8 +2366,9 @@ consumers over.
 ### `on_index_change: online`
 
 Set `on_index_change: online` to apply a change the table above calls
-*compatible* — a new attribute, or a wider `display_fields` /
-`return_text_fields` — to the live collection instead of refusing it:
+*compatible* — a new attribute, a wider `display_fields` /
+`return_text_fields`, or a switch of `vector: {search: ...}` — to the live
+collection instead of refusing it:
 
 ```yaml
 search:
@@ -2346,8 +2376,9 @@ search:
 ```
 
 The new columns are added to the published collection in place, and the rows
-are then republished from the warehouse to fill them. **No embeddings are
-recomputed**: vectors come from the upstream table, so the cost is an index
+are then republished from the warehouse to fill them. Switching the vector
+search mode adds no columns at all — the vectors are already published, and
+only the index is built or dropped. **No embeddings are recomputed**: vectors come from the upstream table, so the cost is an index
 rewrite, not provider spend. That is the difference between adding a filter
 attribute to a 20k-document index for the price of a republish and paying to
 embed the corpus again.
@@ -2361,6 +2392,11 @@ Two limits are deliberate:
 - **The store must advertise `online_schema_evolution`.** The policy is
   rejected at compile time against a store that cannot widen a live
   collection, rather than failing mid-publish.
+- **The store must be configured to build the index it is being asked for.**
+  A DuckDB store without `hnsw_experimental_persistence` is refused at compile
+  time when a model declares `search: approximate`, because an in-place switch
+  that discovered the refusal at index time would already have republished the
+  whole collection.
 
 ### `on_index_change: rebuild`
 

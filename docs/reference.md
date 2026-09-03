@@ -4009,12 +4009,14 @@ run results under `target-path`:
   the upstream snapshot), and `reuse` (reading the existing target to reclaim
   vectors, so it appears only on a resume); for search, `read`, `store_write`
   (the retrieval store upsert), `state` (the ledger reads and state MERGE each
-  page costs), and `index_build` (building the vector index — the same phase
-  name the memory log uses, so peak RSS and wall clock line up). Use them to
-  attribute a slow run rather than guess at it: a publish dominated by `state`
-  is a per-page round-trip problem, one dominated by `read` is a warehouse or
-  transfer problem, one dominated by `index_build` is an ANN-build problem the
-  `index:` choice can move, and one dominated by `provider` is none of those.
+  page costs), and `index_reconcile` (bringing the collection's indexes in line
+  with the config — the ANN build when one is needed, a metadata check when
+  not; the duration tells you which, and the memory log samples peak RSS at
+  this same point). Use them to attribute a slow run rather than guess at it: a
+  publish dominated by `state` is a per-page round-trip problem, one dominated
+  by `read` is a warehouse or transfer problem, one dominated by
+  `index_reconcile` is an ANN build the `index:` choice can move, and one
+  dominated by `provider` is none of those.
 
   A phase absent from `metrics` did not happen — a first embed run has no
   `seconds_reuse` because it has nothing to reuse, which is different from

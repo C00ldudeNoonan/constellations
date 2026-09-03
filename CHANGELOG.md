@@ -8,10 +8,12 @@ Two phases of a run were doing real work outside every timing phase, so
 `seconds_*` could sum to a fraction of `duration_seconds` with nothing saying
 where the rest went. Both are on the path a retried production run takes.
 
-- **`seconds_index_build`** on `search:` models — the ANN build, the largest
-  term in a large publish and the operation v0.16.0 just changed the shape of.
-  It shares the name `log_publication_memory` already uses for the same
-  operation, so peak RSS and wall clock now answer under one `index_build`.
+- **`seconds_index_reconcile`** on `search:` models — bringing the collection's
+  indexes in line with the config. That is the ANN build when one is needed,
+  the largest term in a large publish and the operation v0.16.0 just changed
+  the shape of; it is a metadata check when not, since every `create_index` in
+  both stores is conditional. The duration says which, and the memory log
+  samples peak RSS at the same point.
 - **`seconds_reuse`** on `embed:` models — reading the existing target to
   reclaim vectors on a resume: one pass over the id column, then a keyed
   lookup per window, each a query job and a read session on BigQuery. Reported

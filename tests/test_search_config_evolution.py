@@ -208,6 +208,7 @@ def _spec(**overrides: Any) -> CollectionSpec:
         legacy_config_fingerprint=legacy_collection_config_fingerprint(
             config, store_type="lancedb"
         ),
+        row_fingerprint=collection_config_fingerprint(config, store_type="lancedb"),
         arrow_schema=None,
     )
 

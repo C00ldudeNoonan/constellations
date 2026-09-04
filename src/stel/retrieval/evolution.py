@@ -66,6 +66,12 @@ class ConfigChange:
     field: str
     kind: ChangeKind
     detail: str
+    # Whether the rows already written are byte-identical under the new
+    # configuration. A strict subset of COMPATIBLE: adding an attribute is
+    # compatible but still needs column values from the warehouse, while
+    # changing which ANN structure indexes an unchanged vector needs nothing
+    # at all (issue #495).
+    index_only: bool = False
 
     def describe(self) -> str:
         return f"{self.field}: {self.detail}"
@@ -180,6 +186,7 @@ def _classify_vector(before: Any, after: Any) -> ConfigChange:
                 f"{described} — an index build over vectors already published, "
                 "not a re-embed"
             ),
+            index_only=True,
         )
     return ConfigChange(
         field="vector",
@@ -224,6 +231,22 @@ def _classify_attributes(before: Any, after: Any) -> ConfigChange:
 
 def rebuild_required(changes: list[ConfigChange]) -> list[ConfigChange]:
     return [change for change in changes if change.kind is ChangeKind.REBUILD_REQUIRED]
+
+
+def advances_row_fingerprint(changes: list[ConfigChange]) -> bool:
+    """Whether these changes alter what a published row contains (issue #495).
+
+    False for an empty diff and for one confined to index-only fields, which is
+    what lets the rows keep the digest they were written under: a row's
+    `input_fingerprint` mixes in the config digest, so advancing it declares
+    every row changed and forces a full corpus rewrite to build an index over
+    vectors that were never touched.
+
+    Deliberately not `all(...)` over an empty list read as "index only" — the
+    question asked is whether anything *needs* the digest to move, and nothing
+    does when nothing changed.
+    """
+    return any(not change.index_only for change in changes)
 
 
 # Descriptor fields outside `search` that invalidate a collection on their own:

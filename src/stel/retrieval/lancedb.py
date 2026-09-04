@@ -163,6 +163,14 @@ _DESCRIPTOR_KEY = b"stel.collection_descriptor"
 # `_CONFIG_KEY` cannot be rewritten — leaving post-publication validation
 # comparing a v1 stamp against a v2 fingerprint forever (Codex review, #344).
 _FINGERPRINT_KEY = b"stel.config_fingerprint"
+# The digest the stored rows were fingerprinted under (issue #495). Absent on
+# a collection stamped before it existed, where that digest was necessarily
+# the config fingerprint.
+_ROW_FINGERPRINT_KEY = b"stel.row_fingerprint"
+# Rows per batch when seeding a generation from another collection. Chosen so
+# one batch of 768-dim float32 vectors is tens of MB rather than gigabytes;
+# the point is bounded residency, not throughput (issue #495).
+_SEED_BATCH_ROWS = 10_000
 # Recorded on published search indexes and compared on read to invalidate
 # state when the store implementation changes.
 _IMPLEMENTATION_IDENTITY_PREFIX = "dbt_ml.retrieval.lancedb:v1"
@@ -409,6 +417,7 @@ class LanceDBStore(RetrievalStore):
                     # is a warehouse row update, not a LanceDB operation
                     # (issue #355).
                     RetrievalFeature.PRIVATE_GENERATION_BUILD,
+                    RetrievalFeature.COLLECTION_SEEDING,
                 }
             ),
             distance_metrics=frozenset({"cosine", "euclidean", "dot"}),
@@ -641,12 +650,42 @@ class LanceDBStore(RetrievalStore):
                 physical_generation=generation,
                 row_count=int(table.count_rows()),
                 schema=schema,
+                row_fingerprint=_read_field_value(schema, _ROW_FINGERPRINT_KEY),
             )
         except RetrievalError:
             raise
         except Exception as error:
             failure = _operation_failed("inspect", "lancedb_inspect_failed", error)
         raise failure
+
+    def seed_collection(self, spec: CollectionSpec, *, source: str) -> int:
+        """Copy `source`'s rows into this generation, one batch at a time.
+
+        Streamed rather than materialized: the corpus this exists for is ~11GB
+        of float32 vectors, and pulling it into one Arrow table to move it
+        would trade the 4.2h warehouse round trip (issue #495) for the OOM of
+        issue #473. `_SEED_BATCH_ROWS` bounds the residency instead.
+
+        Columns are projected onto the target schema by name. The two
+        collections share a contract, but a positional copy that transposed two
+        same-typed columns would corrupt the index silently, and by the time it
+        surfaced the generation would already be live.
+        """
+        failure: RetrievalError | None = None
+        seeded = 0
+        try:
+            origin = self._open_owned_table(source)
+            target = self._open_owned_table(spec.physical_name)
+            names = [field.name for field in spec.arrow_schema]
+            for batch in origin.search(None).to_batches(_SEED_BATCH_ROWS):
+                projected = pa.Table.from_batches([batch], schema=batch.schema)
+                target.add(projected.select(names))
+                seeded += batch.num_rows
+        except Exception as error:
+            failure = _operation_failed("seed collection", "lancedb_seed_failed", error)
+        if failure is not None:
+            raise failure
+        return seeded
 
     def create_collection(self, spec: CollectionSpec) -> CollectionMetadata:
         db = self._connection()
@@ -683,6 +722,7 @@ class LanceDBStore(RetrievalStore):
                     "metadata": {
                         _DESCRIPTOR_KEY.decode(): spec.descriptor,
                         _FINGERPRINT_KEY.decode(): spec.config_fingerprint,
+                        _ROW_FINGERPRINT_KEY.decode(): spec.row_fingerprint,
                     },
                 }
             )
@@ -1097,6 +1137,7 @@ def _with_descriptor(schema: pa.Schema, spec: CollectionSpec) -> pa.Schema:
     metadata = dict(field.metadata or {})
     metadata[_DESCRIPTOR_KEY] = spec.descriptor.encode()
     metadata[_FINGERPRINT_KEY] = spec.config_fingerprint.encode()
+    metadata[_ROW_FINGERPRINT_KEY] = spec.row_fingerprint.encode()
     return schema.set(index, field.with_metadata(metadata))
 
 

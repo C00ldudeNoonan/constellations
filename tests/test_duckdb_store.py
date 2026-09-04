@@ -56,6 +56,7 @@ def _spec(
         config_fingerprint="cfg1",
         descriptor='{"distance_metric": "cosine"}',
         legacy_config_fingerprint="legacy1",
+        row_fingerprint="row-fp",
         arrow_schema=SCHEMA,
     )
 
@@ -511,6 +512,7 @@ def _multi_field_spec(name: str) -> CollectionSpec:
         config_fingerprint="cfg1",
         descriptor='{"distance_metric": "cosine"}',
         legacy_config_fingerprint="legacy1",
+        row_fingerprint="row-fp",
         arrow_schema=MULTI_FIELD_SCHEMA,
     )
 

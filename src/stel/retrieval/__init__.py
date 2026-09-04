@@ -33,6 +33,7 @@ from .duckdb import DuckDBConfig, DuckDBStore
 from .evolution import (
     ChangeKind,
     ConfigChange,
+    advances_row_fingerprint,
     classify_changes,
     classify_descriptor_changes,
     descriptor_json,
@@ -85,6 +86,7 @@ __all__ = [
     "StateRetrievalTarget",
     "StoreRole",
     "absolutize_store_config",
+    "advances_row_fingerprint",
     "classify_changes",
     "classify_descriptor_changes",
     "collection_config_fingerprint",

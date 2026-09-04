@@ -67,6 +67,7 @@ def _spec(
         config_fingerprint="fingerprint",
         descriptor="{}",
         legacy_config_fingerprint="legacy",
+        row_fingerprint="row-fp",
         arrow_schema=pa.schema(
             [
                 pa.field("chunk_id", pa.string(), nullable=False),

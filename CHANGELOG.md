@@ -21,6 +21,27 @@
   full exception goes to the `stel.retrieval.lancedb` DEBUG log, which
   `--verbose` never enables; attach a DEBUG handler to capture it.
 
+### Index builds retry transient failures instead of discarding the publish (issue #491)
+
+- **The index step was single-shot at the end of a resilient pipeline.** The
+  same publish that wrote 3.6 million rows over 4.2 hours with no failures
+  then spent its last six seconds with no protection: one transient
+  object-store error in `create_index` discarded the run, and the retry cost
+  a full corpus re-read. Each index build (BTree, FTS, vector) now retries
+  native failures with doubling backoff, three attempts five seconds apart by
+  default, and reports `... failed on BTree index for 'category' after 3
+  attempts [...]` when every attempt fails.
+- Retrying is safe: `create_index(replace=True)` is idempotent and a partial
+  build is re-entered by the existing `num_unindexed_rows` check. Every retry
+  passes `replace=True`, because a first attempt that failed after LanceDB had
+  committed the index would otherwise be refused as a duplicate. A
+  `RetrievalError` raised inside the build is a deliberate refusal and is
+  never retried; neither is anything outside the build itself.
+- New `index_build_attempts` (1–10) and `index_build_retry_seconds` (0–600)
+  on the LanceDB store block tune the policy. They are execution settings,
+  not identity: neither reaches the store descriptor, so changing one cannot
+  reclassify a published collection or strand its state.
+
 ### `kind:` selects a class of steps without naming or pre-tagging each (issue #494)
 
 Selection was by name, ancestry, tag, or state — never by what kind of step a

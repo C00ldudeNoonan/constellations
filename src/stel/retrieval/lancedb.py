@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
+from functools import partial
 from math import isfinite
 from pathlib import Path
 from types import TracebackType
@@ -221,6 +223,15 @@ class LanceDBConfig(RetrievalStoreConfig):
     # descriptor, so changing one cannot reclassify a published collection.
     index_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
     metadata_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
+    # Bounded retry for each index build (issue #491). The build is the last
+    # step of a publish that may have written rows for hours, and one
+    # transient object-store error there used to discard the whole run.
+    # Retrying is safe: `create_index(replace=True)` is idempotent, and a
+    # partial build is re-entered by the `num_unindexed_rows` check. The
+    # delay doubles after each failed attempt. Execution settings, not
+    # identity: neither reaches the store descriptor.
+    index_build_attempts: int = Field(default=3, ge=1, le=10)
+    index_build_retry_seconds: float = Field(default=5.0, ge=0, le=600)
 
     @field_validator("path")
     @classmethod
@@ -326,6 +337,18 @@ _VECTOR_INDEX_TYPES = {
 # here, before the build, because that native message is sanitized away on the
 # way out and the operator would otherwise see only `lancedb_index_failed`.
 _PQ_MINIMUM_ROWS = 256
+
+# Indirection so tests can observe the backoff without waiting it out.
+_sleep = time.sleep
+
+
+class _IndexBuildExhausted(Exception):
+    """Every attempt at one index build failed; carries the last native error."""
+
+    def __init__(self, attempts: int, error: Exception) -> None:
+        super().__init__(f"index build failed after {attempts} attempts")
+        self.attempts = attempts
+        self.error = error
 
 
 @register
@@ -770,6 +793,43 @@ class LanceDBStore(RetrievalStore):
             tuple(MutationOutcome("deleted") for _ in record_ids),
         )
 
+    def _build_index(
+        self, step: str, build: Callable[..., Any], *, existing: bool
+    ) -> None:
+        """Run one index build, retrying native failures with backoff (#491).
+
+        Only native errors are retried; a `RetrievalError` is a deliberate
+        refusal. Every retry passes `replace=True`: a first attempt that failed
+        after LanceDB had already committed the index would otherwise be
+        refused as a duplicate. The retry warning carries only the step and the
+        native exception's type (issue #490); the native text goes to DEBUG.
+        """
+        attempts = self._config.index_build_attempts
+        delay = self._config.index_build_retry_seconds
+        for attempt in range(1, attempts + 1):
+            try:
+                build(replace=existing or attempt > 1)
+                return
+            except RetrievalError:
+                raise
+            except Exception as error:
+                if attempt == attempts:
+                    if attempts == 1:
+                        raise
+                    raise _IndexBuildExhausted(attempts, error) from None
+                log.warning(
+                    "LanceDB index build on %s failed [%s]; retrying in %.1fs "
+                    "(attempt %d of %d)",
+                    step,
+                    type(error).__name__,
+                    delay,
+                    attempt,
+                    attempts,
+                )
+                log.debug("LanceDB index build retry cause", exc_info=error)
+            _sleep(delay)
+            delay *= 2
+
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
         failure: RetrievalError | None = None
         # Tracks which index was being built when a native error surfaced.
@@ -800,11 +860,15 @@ class LanceDBStore(RetrievalStore):
                 )
                 if current is None or current.num_unindexed_rows:
                     step = f"BTree index for '{field}'"
-                    table.create_index(
-                        field,
-                        config=index_module.BTree(),
-                        replace=current is not None,
-                        wait_timeout=timedelta(seconds=self._config.timeout_seconds),
+                    self._build_index(
+                        step,
+                        partial(
+                            table.create_index,
+                            field,
+                            config=index_module.BTree(),
+                            wait_timeout=timedelta(seconds=self._config.timeout_seconds),
+                        ),
+                        existing=current is not None,
                     )
             for field in spec.full_text_fields:
                 current = next(
@@ -817,11 +881,15 @@ class LanceDBStore(RetrievalStore):
                 )
                 if current is None or current.num_unindexed_rows:
                     step = f"FTS index for '{field}'"
-                    table.create_index(
-                        field,
-                        config=index_module.FTS(),
-                        replace=current is not None,
-                        wait_timeout=timedelta(seconds=self._config.timeout_seconds),
+                    self._build_index(
+                        step,
+                        partial(
+                            table.create_index,
+                            field,
+                            config=index_module.FTS(),
+                            wait_timeout=timedelta(seconds=self._config.timeout_seconds),
+                        ),
+                        existing=current is not None,
                     )
             if spec.vector_field is not None:
                 current = next(
@@ -866,15 +934,22 @@ class LanceDBStore(RetrievalStore):
                         )
                         config_class = getattr(index_module, _VECTOR_INDEX_CONFIGS[chosen])
                         step = f"{wanted} vector index for '{spec.vector_field}'"
-                        table.create_index(
-                            spec.vector_field,
-                            config=config_class(distance_type=metric),
-                            replace=current is not None,
-                            # Inert on a native table: the build is synchronous
-                            # and this only bounds LanceDB Cloud's async
-                            # indexing (probed on 0.34, #474 review). Kept so a
-                            # remote store gets a bound rather than none.
-                            wait_timeout=timedelta(seconds=self._config.timeout_seconds),
+                        self._build_index(
+                            step,
+                            partial(
+                                table.create_index,
+                                spec.vector_field,
+                                config=config_class(distance_type=metric),
+                                # Inert on a native table: the build is
+                                # synchronous and this only bounds LanceDB
+                                # Cloud's async indexing (probed on 0.34, #474
+                                # review). Kept so a remote store gets a bound
+                                # rather than none.
+                                wait_timeout=timedelta(
+                                    seconds=self._config.timeout_seconds
+                                ),
+                            ),
+                            existing=current is not None,
                         )
                 elif current is not None:
                     # `exact` is implemented by the *absence* of an ANN index --
@@ -887,6 +962,13 @@ class LanceDBStore(RetrievalStore):
         except RetrievalError:
             # A deliberate refusal keeps its own code, as in `upsert`/`delete`.
             raise
+        except _IndexBuildExhausted as exhausted:
+            failure = _operation_failed(
+                "index creation",
+                "lancedb_index_failed",
+                exhausted.error,
+                step=f"{step} after {exhausted.attempts} attempts",
+            )
         except Exception as error:
             failure = _operation_failed(
                 "index creation", "lancedb_index_failed", error, step=step

@@ -1266,10 +1266,12 @@ or type change safe.
 The vector *search mode* is the one `vector` sub-field that classifies as
 compatible. `exact` and `approximate` differ in whether an ANN structure is
 built over the vector column; neither changes what a stored row contains, so
-switching between them under `on_index_change: online` republishes the rows
-from the warehouse into a private generation and builds the index there,
-without re-embedding; the logical collection name is unchanged and the
-generation is activated in place of the old one once validated (#474).
+switching between them under `on_index_change: online` builds a private
+generation **seeded from the collection it replaces** — the rows are copied,
+not re-read; the warehouse is scanned once only to reconcile rows that changed
+or disappeared meanwhile — and builds the index there (#495, ADR-0004); the
+logical collection name is unchanged and the generation is activated in place
+of the old one once validated (#474).
 `exact` is implemented by the *absence* of the index, so
 switching back must drop it — a store that left a stale ANN index behind would
 keep answering approximately under a configuration promising exact results

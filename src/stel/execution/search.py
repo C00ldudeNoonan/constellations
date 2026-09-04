@@ -225,9 +225,24 @@ def _run_search_model(
                 # an in-place publish the ledger names no generation, but the
                 # rows are in the default collection all the same, and that is
                 # exactly the first switch a project makes.
+                #
+                # Only from a collection the ledger vouches for, and the
+                # voucher is `active_generation`: it names a generation that
+                # was validated whole at its own activation, whether the
+                # collection is a private one (`ready`, or `degraded` after a
+                # later private build failed and this one was retained) or the
+                # default in-place one (which sets a generation but no
+                # `active_collection`). A scope left `failed` by a stranded
+                # in-place publisher has no active generation and may sit on a
+                # half-rewritten collection; copying that forward would launder
+                # the damage into a generation that then activates as sound.
+                # That state rebuilds from the warehouse, retaining nothing
+                # (#473).
                 (active_collection or default_collection)
                 if plan.rows_unchanged
                 and not requested
+                and serving_entry.status in {"ready", "degraded"}
+                and serving_entry.active_generation is not None
                 and RetrievalFeature.COLLECTION_SEEDING
                 in store.capabilities().features
                 else None
@@ -590,14 +605,18 @@ def _run_search_model(
                     )
                     with timings.phase("store_write"):
                         # Append is the fast path for a generation this run
-                        # created, which is empty by construction. A resumed
-                        # one is not: state advances only after a write lands,
-                        # so a row can be present in the store with its state
-                        # unrecorded, and appending it again would duplicate
-                        # it. Upsert is idempotent on the id, which is what
-                        # re-entering a partial build requires (issue #492).
+                        # created, which is empty by construction. Two kinds of
+                        # generation are not. A *resumed* one may hold rows whose
+                        # state never landed, so appending them again would
+                        # duplicate them (issue #492). A *seeded* one already
+                        # holds every id it was copied with, so a row that
+                        # changed upstream during the switch has to merge or it
+                        # lands twice (issue #495). Upsert is idempotent on the
+                        # id, which is what both need.
                         write = (
-                            store.append if rebuild and not resumed else store.upsert
+                            store.append
+                            if rebuild and not resumed and seed_from is None
+                            else store.upsert
                         )
                         receipt = write(
                             physical,

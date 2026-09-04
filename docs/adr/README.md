@@ -11,7 +11,8 @@ history (issue #311).
 |---|---|---|
 | [0001](0001-degraded-serving-and-fail-closed-recovery.md) | A failed publish keeps serving its live generation; recovery fails closed | accepted; amended by 0003 |
 | [0002](0002-vector-search-mode-is-an-index-build.md) | Switching `exact` <-> `approximate` is an index build, not a whole-index invalidation | accepted; amended by 0003 |
-| [0003](0003-reader-safe-online-publication.md) | Online changes use private generations, append writes, and reader-aware retirement | accepted |
+| [0003](0003-reader-safe-online-publication.md) | Online changes use private generations, append writes, and reader-aware retirement | accepted; amended by 0004 |
+| [0004](0004-seed-private-generation-from-store.md) | An index-only change fills its private generation from the store, not the warehouse | accepted |
 
 ## When to write one
 

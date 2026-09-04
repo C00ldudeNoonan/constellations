@@ -2579,13 +2579,25 @@ previous collection is never widened, re-stamped, or merged into during the
 update. Readers keep their generation pinned across cutover; a failed or
 interrupted build leaves the old generation available under its old configuration.
 
-**No embeddings are recomputed by search publication**: rows and vectors stream
-from the upstream warehouse table. LanceDB appends bounded batches into the fresh
-generation, avoiding repeated merge planning against a fully populated live
-collection. This still copies the corpus and builds its indexes; it is not a
-zero-copy, index-only operation. Budget storage for both generations and memory
-for the store's index builder. Select only the search model to avoid rerunning
-upstream models.
+**No embeddings are recomputed by search publication.** Where the rows come
+from depends on what changed:
+
+- **An index-only change** — `vector: {search: ...}` or `vector: {index: ...}`
+  — reaches no row, so the fresh generation is **seeded from the collection it
+  replaces** rather than re-read from the warehouse. The warehouse is still
+  scanned once to reconcile rows that changed or disappeared meanwhile, but
+  nothing is rewritten: `rows_written` is 0, and the cost is the copy plus the
+  index build. This needs the store to advertise `collection_seeding` (LanceDB
+  and DuckDB do) and a ledger that vouches for the source: an active, validated
+  generation. A scope left `failed` by a stranded publisher rebuilds from the
+  warehouse instead, retaining nothing.
+- **Any other compatible change** — a new attribute, a wider projection — needs
+  values the store does not have, so rows and vectors stream from the upstream
+  warehouse table into the fresh generation.
+
+Either way it is two generations on disk until activation, and the store's
+index builder still needs its memory. Budget for both. Select only the search
+model to avoid rerunning upstream models.
 
 The limits are deliberate:
 

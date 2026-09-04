@@ -82,6 +82,11 @@ rewrite this change exists to avoid, once, on upgrade. The cost is the same;
 the alternative just charges it to everybody. Worth revisiting only alongside
 another change that already invalidates the stamp.
 
+*Revisited in [ADR-0004](0004-seed-private-generation-from-store.md): the
+migration-free form — a stamped row digest that advances only when a change
+reaches a row, falling back to `config_fingerprint` where absent — was adopted
+for #495 without invalidating any existing stamp.*
+
 ### Refuse `search: exact` above a row threshold
 
 Rejected as overreach. `exact` is correct at any size, the threshold is an
@@ -104,7 +109,10 @@ a query that costs eleven gigabytes of reads, not a limit set too low.
 - The switch still streams every row from the warehouse to recompute
   fingerprints, so it is not free — minutes to tens of minutes at millions of
   rows, against hours for a re-embed. The advisory says so rather than implying
-  the switch is instant.
+  the switch is instant. *Superseded by
+  [ADR-0004](0004-seed-private-generation-from-store.md): the rows are now
+  copied from the store, the warehouse is read once to reconcile, and nothing
+  is rewritten.*
 - `ensure_indexes` is now destructive in one narrow case: it drops a vector
   index when the mode is `exact`. That is required for `exact` to mean what it
   says, but it means a mode typo now costs an index rebuild on the next run.

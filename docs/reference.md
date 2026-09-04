@@ -1309,22 +1309,6 @@ rows, resolved by the active adapter in standalone mode. Source freshness
 reports row counts but no modification time — rows carry none a listing could
 read; a declared watermark column is future work.
 
-### SaaS context: land, then render
-
-Notion, Confluence, Linear, Slack, and Drive are not sources stel fetches.
-They arrive through your EL tool as landed tables, and stel reads those with
-`warehouse://`. What a connector lands is block rows — one row per block with
-a parent pointer and a position — which is the raw material for a document,
-not a document. `stel.text.transforms.render_blocks` is the missing half: it
-consumes a vendor-neutral block contract (`page_id`, `parent_block_id`,
-`position`, `type`, `text`) and emits one ordered markdown document per page,
-with real heading levels and nesting, so `chunk:` with `headings:` attributes
-every chunk to its section. Pages are the incremental parents and blocks a
-reference keyed to their page, so an edited block re-renders only its page.
-The position, the recipe, and why there is no `notion://` scheme are in
-[SaaS context: land, then render](saas-context.md); the worked proof is
-[`examples/notion_landed_pages`](../examples/notion_landed_pages/).
-
 ## GCS sources
 
 Sources can point at Google Cloud Storage instead of local directories —
@@ -2966,7 +2950,6 @@ needed. Users can override by writing their own `transforms/<name>.py`
 | `stel.text.transforms.nlp_document_features` | Rolls the NLP child tables up to one aggregate feature row per document     |
 | `stel.text.transforms.document_tone`      | Scores per-document tone from the token table + an operator-owned lexicon      |
 | `stel.text.transforms.extract_keyphrases` | Ranks keyphrases per document by n-gram frequency; child table with stable IDs |
-| `stel.text.transforms.render_blocks`      | Renders landed block rows (Notion, Confluence, Linear via an EL tool) into one ordered markdown document per page |
 
 All are pure functions importable via `from stel.text import …` if you'd
 rather wire them into your own transforms.

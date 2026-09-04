@@ -14,7 +14,6 @@ history (issue #311).
 | [0003](0003-reader-safe-online-publication.md) | Online changes use private generations, append writes, and reader-aware retirement | accepted; amended by 0004 |
 | [0004](0004-seed-private-generation-from-store.md) | An index-only change fills its private generation from the store, not the warehouse | accepted |
 | [0005](0005-re-entry-unit-is-the-existing-checkpoint.md) | Re-entry resumes from each step's existing checkpoint; no phase ledger, no activate command | accepted |
-| [0006](0006-saas-context-is-landed-then-rendered.md) | SaaS context is landed by an EL tool and rendered by stel; no first-party connectors | accepted |
 
 ## When to write one
 

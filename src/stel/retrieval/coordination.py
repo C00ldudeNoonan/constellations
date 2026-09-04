@@ -367,6 +367,17 @@ class ServingCoordinator:
         )
         return int(rows[0][0]) if rows else 0
 
+    def scope_exists(self, scope: StateScope) -> bool:
+        """Whether this warehouse holds a ledger row for the scope at all.
+
+        `status()` synthesizes an `unpublished` entry for a scope it has never
+        seen, which reads as a settled fact about the index rather than as
+        "this warehouse has no record of it". Those are different answers, and
+        confusing them is what let a recovery run against the wrong target and
+        report success (issue #511).
+        """
+        return self._read_row(scope) is not None
+
     def status(self, scope: StateScope) -> ServingLedgerEntry:
         row = self._read_row(scope)
         if row is None:

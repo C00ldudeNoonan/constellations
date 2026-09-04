@@ -702,9 +702,36 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
         run_project(project)
 
     runner = CliRunner()
+    # Recovery is refused twice over, and the target check comes first: it is
+    # the one that decides *which* store the rest of the command is about
+    # (issue #511).
+    untargeted = runner.invoke(
+        cli,
+        [
+            "serving",
+            "recover",
+            "release_search",
+            "--owner-terminated",
+            "--project-dir",
+            str(project),
+        ],
+    )
+    assert untargeted.exit_code != 0
+    assert "requires an explicit --target" in untargeted.output
+    # It names the target it would have used, so confirming is one edit.
+    assert "'dev'" in untargeted.output
+
     refused = runner.invoke(
         cli,
-        ["serving", "recover", "release_search", "--project-dir", str(project)],
+        [
+            "serving",
+            "recover",
+            "release_search",
+            "--target",
+            "dev",
+            "--project-dir",
+            str(project),
+        ],
     )
     assert refused.exit_code != 0
     assert "terminating the previous owner" in refused.output
@@ -716,6 +743,8 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
             "recover",
             "release_search",
             "--owner-terminated",
+            "--target",
+            "dev",
             "--project-dir",
             str(project),
         ],
@@ -747,6 +776,142 @@ def test_serving_status_command_reports_ledger(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "status:            ready" in result.output
     assert "fencing_token:     1" in result.output
+
+
+# ─── naming what a serving command acted on (issue #511) ───────────────────
+
+
+def test_serving_status_names_the_target_warehouse_and_store(
+    tmp_path: Path,
+) -> None:
+    """The ledger alone is ambiguous. A production `status` reported a clean
+    `unpublished` for an index that was actively publishing, because it had
+    silently resolved a dev target whose store is a local directory rather
+    than the GCS store the index lives in. Nothing in the output said so."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    result = CliRunner().invoke(
+        cli, ["serving", "status", "release_search", "--project-dir", str(project)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "target:            dev" in result.output
+    assert "warehouse:         duckdb" in result.output
+    # The store line carries the location, which is the discriminator that
+    # makes a wrong target obvious: dev is a directory, prod is a bucket.
+    assert "store:             " in result.output
+    assert "(lancedb)" in result.output
+    assert "lancedb" in result.output
+
+
+def test_serving_status_says_when_the_target_has_no_row_for_the_index(
+    tmp_path: Path,
+) -> None:
+    """`unpublished` reads as a settled fact about the index. For a target
+    that has never heard of it, it is really an empty result -- the reading
+    that turned a wrong-target lookup into a confident wrong answer."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    # Never run, so the ledger has no row for this scope at all.
+    project = _write_project(tmp_path)
+    result = CliRunner().invoke(
+        cli, ["serving", "status", "release_search", "--project-dir", str(project)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "no ledger row for 'release_search'" in result.output
+    assert "check --target" in result.output
+    assert "status:            unpublished" in result.output
+
+
+def test_serving_recover_refuses_a_defaulted_target_without_touching_anything(
+    tmp_path: Path,
+) -> None:
+    """Recovery advances the fencing token and marks the scope failed. It
+    already demands `--owner-terminated`; inferring which store to apply that
+    to undoes the care, and did -- a recovery reported success against a dev
+    scope nobody had asked about while prod stayed stranded."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.config import load_project
+    from stel.profile import resolve_profile
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    scope = _serving_scope(project)
+    project_config, _sources, _models = load_project(project)
+    resolved = resolve_profile(project_config, project)
+    with create_adapter(resolved.warehouse, project_dir=project) as adapter:
+        before = ServingCoordinator(adapter).status(scope)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "serving",
+            "recover",
+            "release_search",
+            "--owner-terminated",
+            "--project-dir",
+            str(project),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "requires an explicit --target" in result.output
+    # It names the target it would have used and the store behind it, so the
+    # operator can confirm rather than guess.
+    assert "'dev'" in result.output
+    assert "lancedb" in result.output
+
+    with create_adapter(resolved.warehouse, project_dir=project) as adapter:
+        after = ServingCoordinator(adapter).status(scope)
+    # Refused before anything moved: the resolution it needed to name the
+    # default is a read.
+    assert after.fencing_token == before.fencing_token
+    assert after.status == before.status
+
+
+def test_serving_recover_output_names_the_target_it_acted_on(
+    tmp_path: Path,
+) -> None:
+    """`Recovered serving scope for 'x'` was equally true of dev and prod, so
+    the output carried no signal that the wrong scope had been touched."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "serving",
+            "recover",
+            "release_search",
+            "--owner-terminated",
+            "--target",
+            "dev",
+            "--project-dir",
+            str(project),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "target:            dev" in result.output
+    assert "on target 'dev'" in result.output
+    # `degraded`, not `failed`: this index published cleanly, so the
+    # generation it activated survives recovery and keeps serving (#449).
+    assert "status=degraded" in result.output
 
 
 # ─── governed publication and queries ───────────────────────────────────────

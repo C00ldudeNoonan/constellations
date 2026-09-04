@@ -47,6 +47,23 @@ class RetrievalStoreConfig(BaseModel):
     def absolutize(self, project_dir: Path) -> RetrievalStoreConfig:
         return self
 
+    def storage_location(self) -> str:
+        """Where this store physically is, for output that has to name it.
+
+        Diagnostics only, never identity -- `safe_descriptor()` owns that and
+        reports a fingerprint, which is the right answer for an artifact and
+        useless to an operator asking which store a command just recovered
+        (issue #511).
+
+        Safe to print by construction: credential-bearing settings are held as
+        environment references and resolved only at the native SDK boundary,
+        so nothing secret is reachable from a config field.
+
+        Named to match `WarehouseConfig.storage_location()`, which is the
+        same question asked of the other config family.
+        """
+        return "-"
+
 
 class RetrievalFeature(StrEnum):
     EXACT_VECTOR_SEARCH = "exact_vector_search"

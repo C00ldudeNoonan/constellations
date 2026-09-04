@@ -139,6 +139,9 @@ class DuckDBConfig(RetrievalStoreConfig):
     fts_lower: bool = True
     publisher_lock_dir: str | None = None
 
+    def storage_location(self) -> str:
+        return self.path
+
     @field_validator("path")
     @classmethod
     def _validate_path(cls, value: str) -> str:

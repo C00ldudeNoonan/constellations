@@ -617,6 +617,65 @@ def test_env_var_interpolation(
     assert resolved.warehouse.schema_name == "fallback_schema"
 
 
+def test_env_var_default_applies_to_a_present_but_empty_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`docker compose` forwards an unset variable as `${VAR:-}`, so the
+    container sees an empty string and the default never applied -- rendering
+    `gs:///lancedb`, which fails store validation with nothing pointing at the
+    empty variable (issue #511)."""
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: ./target/demo.duckdb",
+                "        schema: \"{{ env_var('STEL_SCHEMA', 'fallback_schema') }}\"",
+            ]
+        )
+        + "\n",
+    )
+    monkeypatch.setenv("STEL_SCHEMA", "")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.warehouse.schema_name == "fallback_schema"
+
+
+def test_env_var_without_a_default_still_returns_an_empty_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the defaulted case treats empty as absent. With no default there
+    is nothing to fall back to, so a deliberately-empty variable keeps its
+    meaning and only a genuinely unset one is an error."""
+    _write_project(tmp_path, profile="test_proj")
+    _write_profiles_raw(
+        tmp_path,
+        "\n".join(
+            [
+                "test_proj:",
+                "  target: dev",
+                "  outputs:",
+                "    dev:",
+                "      warehouse:",
+                "        type: duckdb",
+                "        path: \"./target/demo{{ env_var('STEL_SUFFIX') }}.duckdb\"",
+            ]
+        )
+        + "\n",
+    )
+    monkeypatch.setenv("STEL_SUFFIX", "")
+
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.warehouse.storage_location().endswith("demo.duckdb")
+
 def test_bigquery_warehouse_defaults_interpolate_and_bind_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

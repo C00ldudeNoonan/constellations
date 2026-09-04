@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### `serving status` and `recover` name the target they acted on (issue #511)
+
+- **Neither command said which target, warehouse or store it resolved.** In a
+  production incident that produced two confidently wrong answers and a
+  recovery that did nothing: `status` reported a clean `unpublished` for an
+  index that was actively publishing, and `recover` reported success, both
+  having silently defaulted to a dev target whose retrieval store is a local
+  directory rather than the GCS store the index lives in. The prod scope stayed
+  stranded. `Recovered serving scope for 'x'` is equally true of dev and prod,
+  so nothing in the output could have caught it. Both commands now print the
+  resolved `target`, `warehouse` and `store` (alias, type and location) before
+  the ledger.
+- **`stel serving recover` now requires an explicit `--target`.** It advances
+  the fencing token and marks the scope failed; it already demands
+  `--owner-terminated` as a confirmation, and inferring *which store* to apply
+  that to undid the care. Without it the command refuses and names the target
+  it would have used, so confirming is one edit. The refusal happens before
+  anything moves, since the resolution it needs is a read.
+- **`status` distinguishes "unpublished" from "no row here".** A scope the
+  warehouse has never seen used to render as a settled `unpublished`, which
+  reads as a fact about the index rather than as an empty result for the wrong
+  target. It now says so on a `note:` line.
+- `RetrievalStoreConfig.storage_location()` is new, mirroring
+  `WarehouseConfig.storage_location()`. Diagnostics only, never identity:
+  `safe_descriptor()` still owns identity and reports a fingerprint, which is
+  right for an artifact and useless to an operator asking which store a command
+  just recovered.
+
+### `env_var` defaults apply to an empty variable, not only a missing one (issue #511)
+
+`env_var('NAME', 'default')` applied its default only when the variable was
+absent. `docker compose` forwards an unset variable as `${NAME:-}`, so a
+container sees `""`, the default never applied, and a prod profile rendered
+`gs:///lancedb` — failing store validation with nothing pointing at the empty
+variable. Present-but-empty now counts as absent when a default was written.
+
+This diverges from dbt, which returns the empty string, and the divergence is
+deliberate: a default exists precisely to say what to use when the variable
+gives nothing. `env_var('NAME')` with no default still returns an empty value
+verbatim, so a deliberately-empty variable keeps working and only a genuinely
+unset one is an error.
+
 ### A complete resume no longer re-reads the corpus to publish nothing (issue #508)
 
 #492's resume did what it said — a retry republished nothing — but it still

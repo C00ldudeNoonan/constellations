@@ -329,6 +329,16 @@ class CollectionSpec:
     # been inspected; equal to `config_fingerprint` for a new collection.
     row_fingerprint: str
     arrow_schema: pa.Schema
+    # The upstream generation this collection's rows were last complete for,
+    # and how many rows that was (issue #508). Set by the publish once every
+    # page has been reconciled and before the index build, which is where
+    # #492's incident died; a resume that finds the upstream generation
+    # unchanged and the row count intact skips the read entirely. None is the
+    # correct value for every construction but that one — it means "not known
+    # complete for any generation" — so these default, against the usual rule,
+    # and sit last so the dataclass stays valid.
+    source_generation: str | None = None
+    source_rows: int | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -380,6 +390,11 @@ class CollectionMetadata:
     # necessarily `config_fingerprint` — so the fallback is not a guess, it is
     # what those rows were actually written with.
     row_fingerprint: str | None = None
+    # The upstream generation the rows were last complete for, and the count
+    # then (issue #508). Absent on a generation that never finished its row
+    # loop, or was stamped before this existed.
+    source_generation: str | None = None
+    source_rows: int | None = None
 
 
 class StoreRole(StrEnum):

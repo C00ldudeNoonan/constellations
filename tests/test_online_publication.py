@@ -624,3 +624,164 @@ def test_an_interrupted_in_place_publish_resumes_from_state(
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         assert ServingCoordinator(adapter).status(scope).status == "ready"
+
+
+# ─── a complete resume does not read the corpus again (issue #508) ──────────
+#
+# #498 made a failed private build resumable, and it did what it said: the
+# retry republished nothing. It still paged the entire corpus out of the
+# warehouse to discover that — ~3.8h of BigQuery reads on 3.6M rows, against
+# ~4.25h for the publish it was retrying. The rows were complete and every
+# index built; what was missing was any record that they were complete *for
+# this upstream*, so completeness was re-established by re-reading.
+#
+# The default suite runs on DuckDB, whose upstream generation is a content
+# digest known only after a read, so the skip path can never fire there
+# unpatched. These tests pin a generation through the adapter's own hook —
+# the same value the publish would see on a warehouse that exposes one
+# (BigQuery: etag, modified time, row count) — and neutralise the
+# end-of-stream overwrite so the value survives to the stamp. The deletion
+# test below runs unpatched and exercises the read path.
+
+
+def _pin_upstream_generation(monkeypatch: pytest.MonkeyPatch, label: str) -> str:
+    """Make every DuckDB snapshot report `label`'s generation before the read.
+
+    Re-pinning within a test updates the value rather than wrapping the hook
+    again: a second wrapper would call a setter the first one had already
+    neutralised, and the old value would silently win.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+    from stel.hashing import canonical_fingerprint
+
+    value = canonical_fingerprint({"upstream": label}, domain="test-upstream-generation")
+    current = DuckDBAdapter._open_table_snapshot
+    box = getattr(current, "_pin_box", None)
+    if box is not None:
+        box["value"] = value
+        return value
+
+    box = {"value": value}
+    real_open = current
+
+    def opened(self: Any, request: Any) -> Any:
+        snapshot = real_open(self, request)
+        snapshot._set_generation_fingerprint(box["value"])
+        # DuckDB sets its content digest once the stream drains; keep the
+        # pinned value so the completeness stamp and the retry agree.
+        monkeypatch.setattr(snapshot, "_set_generation_fingerprint", lambda fingerprint: None)
+        return snapshot
+
+    setattr(opened, "_pin_box", box)  # noqa: B010 - read back through getattr above
+    monkeypatch.setattr(DuckDBAdapter, "_open_table_snapshot", opened)
+    return value
+
+
+def _fail_the_index_build_once(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave behind a generation whose rows and state are complete."""
+
+    def indexes(*args: Any, **kwargs: Any) -> Any:
+        raise RetrievalError("simulated index build failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LanceDBStore, "ensure_indexes", indexes)
+        with pytest.raises(RunError):
+            run_project(project, select="context_search")
+
+
+def test_a_complete_resume_skips_the_warehouse_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case #508 measured: rows complete, indices to build, upstream
+    untouched. The retry must go straight to the index build without reading
+    a single upstream page — asserted by making any read fail the test."""
+    from stel.adapters.base import TableReadSnapshot
+
+    scope, resolved = _prepare(tmp_path)
+    _pin_upstream_generation(monkeypatch, "A")
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+
+    def no_read(self: Any) -> Any:
+        raise AssertionError("the resume read the upstream corpus it already had")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(TableReadSnapshot, "__iter__", no_read)
+        [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.rows_written == 0
+    assert retry.documents_skipped == 2
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        entry = ServingCoordinator(adapter).status(scope)
+    assert entry.status == "ready"
+    assert entry.active_collection is not None and "__g" in entry.active_collection
+    assert resolved.retrieval is not None
+    with LanceDBStore(
+        resolved.retrieval.stores["primary"],
+        project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
+    ) as store:
+        served = store.inspect_collection(entry.active_collection)
+        assert served is not None and served.row_count == 2
+        # The data is actually there and indexed, not merely pointed at.
+        assert store.text_search(
+            entry.active_collection, "inflation", text_field="text", limit=2
+        ).num_rows
+
+
+def test_a_moved_upstream_is_read_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The complement: the skip is earned by an unchanged upstream, never
+    assumed. A different generation on retry means the corpus may differ, and
+    the resume reads it — here picking up a row edited in between."""
+    scope, resolved = _prepare(tmp_path)
+    _pin_upstream_generation(monkeypatch, "A")
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+
+    _materialize_upstream(
+        tmp_path, _rows().with_columns(pl.lit("edited").alias("title"))
+    )
+    _pin_upstream_generation(monkeypatch, "B")
+    [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.rows_written == 2, "a moved upstream must be re-read and reconciled"
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        entry = ServingCoordinator(adapter).status(scope)
+    assert entry.status == "ready" and entry.active_collection is not None
+    assert resolved.retrieval is not None
+    with LanceDBStore(
+        resolved.retrieval.stores["primary"],
+        project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
+    ) as store:
+        hits = store.text_search(entry.active_collection, "inflation", text_field="text", limit=2)
+    assert hits.column("title").to_pylist() == ["edited"]
+
+
+def test_a_resumed_generation_reconciles_deletions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Found while making the resume cheap. A plain rebuild skips stale
+    discovery because it writes every row from upstream; a resumed one does
+    not — the failed build wrote rows the retry's stream never mentions, so a
+    document removed in between survived in the adopted generation. Runs
+    unpatched, on the read path."""
+    scope, resolved = _prepare(tmp_path)
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+
+    # One of the two upstream rows disappears before the retry.
+    _materialize_upstream(tmp_path, _rows().head(1))
+    [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.documents_deleted == 1
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        entry = ServingCoordinator(adapter).status(scope)
+    assert entry.status == "ready" and entry.active_collection is not None
+    assert resolved.retrieval is not None
+    with LanceDBStore(
+        resolved.retrieval.stores["primary"],
+        project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
+    ) as store:
+        served = store.inspect_collection(entry.active_collection)
+    assert served is not None and served.row_count == 1

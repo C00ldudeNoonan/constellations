@@ -167,6 +167,11 @@ _FINGERPRINT_KEY = b"stel.config_fingerprint"
 # a collection stamped before it existed, where that digest was necessarily
 # the config fingerprint.
 _ROW_FINGERPRINT_KEY = b"stel.row_fingerprint"
+# The upstream generation the rows were last complete for, and the row count
+# then (issue #508). Written as an empty value to clear, which `_read_field_value`
+# reads back as absent.
+_SOURCE_GENERATION_KEY = b"stel.source_generation"
+_SOURCE_ROWS_KEY = b"stel.source_rows"
 # Rows per batch when seeding a generation from another collection. Chosen so
 # one batch of 768-dim float32 vectors is tens of MB rather than gigabytes;
 # the point is bounded residency, not throughput (issue #495).
@@ -651,6 +656,8 @@ class LanceDBStore(RetrievalStore):
                 row_count=int(table.count_rows()),
                 schema=schema,
                 row_fingerprint=_read_field_value(schema, _ROW_FINGERPRINT_KEY),
+                source_generation=_read_field_value(schema, _SOURCE_GENERATION_KEY),
+                source_rows=_read_int_field_value(schema, _SOURCE_ROWS_KEY),
             )
         except RetrievalError:
             raise
@@ -723,6 +730,10 @@ class LanceDBStore(RetrievalStore):
                         _DESCRIPTOR_KEY.decode(): spec.descriptor,
                         _FINGERPRINT_KEY.decode(): spec.config_fingerprint,
                         _ROW_FINGERPRINT_KEY.decode(): spec.row_fingerprint,
+                        _SOURCE_GENERATION_KEY.decode(): spec.source_generation or "",
+                        _SOURCE_ROWS_KEY.decode(): (
+                            "" if spec.source_rows is None else str(spec.source_rows)
+                        ),
                     },
                 }
             )
@@ -1138,7 +1149,24 @@ def _with_descriptor(schema: pa.Schema, spec: CollectionSpec) -> pa.Schema:
     metadata[_DESCRIPTOR_KEY] = spec.descriptor.encode()
     metadata[_FINGERPRINT_KEY] = spec.config_fingerprint.encode()
     metadata[_ROW_FINGERPRINT_KEY] = spec.row_fingerprint.encode()
+    metadata[_SOURCE_GENERATION_KEY] = (spec.source_generation or "").encode()
+    metadata[_SOURCE_ROWS_KEY] = (
+        b"" if spec.source_rows is None else str(spec.source_rows).encode()
+    )
     return schema.set(index, field.with_metadata(metadata))
+
+
+def _read_int_field_value(schema: pa.Schema, key: bytes) -> int | None:
+    """An integer stamp, or None if absent or not an integer.
+
+    A stamp this store did not write — a hand-edited one, a value from a
+    build that failed mid-write — must read as absent rather than raise: the
+    only consumer treats absence as "read the upstream", which is always safe.
+    """
+    value = _read_field_value(schema, key)
+    if value is None or not value.isdigit():
+        return None
+    return int(value)
 
 
 def _read_field_value(schema: pa.Schema, key: bytes) -> str | None:

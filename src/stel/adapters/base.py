@@ -655,6 +655,19 @@ class TableReadSnapshot:
 
     @property
     def generation_fingerprint(self) -> str | None:
+        """A digest that changes whenever the relation's content may have.
+
+        None when the adapter cannot know it before the read. BigQuery derives
+        it from table metadata — etag, modification time, row count — so it is
+        available at open and stable across runs while the table is untouched.
+        DuckDB has no such metadata and sets it only once the stream is drained,
+        from the content itself, so before a read it is None.
+
+        A search publish resuming a private generation compares this against
+        the generation it recorded when its rows were last complete: equal
+        means the upstream has not changed since, so there is nothing to read
+        (issue #508). Unavailable means read, which is always correct.
+        """
         return self._generation_fingerprint
 
     def __iter__(self) -> Iterator[pa.RecordBatch]:

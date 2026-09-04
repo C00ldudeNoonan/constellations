@@ -2631,6 +2631,17 @@ Either way it is two generations on disk until activation, and the store's
 index builder still needs its memory. Budget for both. Select only the search
 model to avoid rerunning upstream models.
 
+**A retry after a failed index build does not read the corpus again** when
+nothing upstream has changed. A private build records, once every page is
+reconciled, which upstream generation its rows are complete for; a later run
+that adopts that generation and sees the same upstream generation skips the
+read and goes straight to the index build, so the retry costs the build, not
+the hours before it. This needs a warehouse that can state its table's
+generation before a read — BigQuery does, from table metadata. DuckDB cannot,
+and a DuckDB resume reads as before. Any upstream change, a subset run, or a
+generation whose row loop never finished takes the full read, which is always
+correct.
+
 The limits are deliberate:
 
 - **It applies only to compatible changes.** A changed vector dimension,

@@ -237,12 +237,16 @@ _ENTRY_POINTS: tuple[Step, ...] = (
         "the same configuration fingerprint (#492) and its index step is "
         "retried with backoff (#491); an index-only change seeds its generation "
         "from the store instead of the warehouse (#495); a generation nothing "
-        "will resume takes its state scope with it when swept (#502). "
+        "will resume takes its state scope with it when swept (#502); a resume "
+        "whose upstream generation is unchanged skips the read entirely and "
+        "goes to the index build (#508). "
         "Activation is fenced, and a failure after the state swap leaves the "
         "previous generation serving (ADR-0001).",
         (
             "test_an_interrupted_in_place_publish_resumes_from_state",
             "test_online_failure_keeps_the_old_index_and_retry_succeeds",
+            "test_a_complete_resume_skips_the_warehouse_read",
+            "test_a_resumed_generation_reconciles_deletions",
             "test_republishing_converges_rather_than_duplicating",
             "test_a_generation_built_under_this_configuration_is_resumable",
             "test_activation_clears_the_generation_scope",

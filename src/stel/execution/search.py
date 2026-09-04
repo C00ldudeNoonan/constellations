@@ -430,6 +430,43 @@ def _run_search_model(
                     )
                 else:
                     spec = _resolve_row_fingerprint(spec, existing)
+                # A resumed generation whose rows were complete for the very
+                # upstream generation this run sees has nothing to read: no
+                # row can have changed or gone, so the page loop and stale
+                # discovery are both skipped and the run goes straight to the
+                # index build — the step #492's incident died in, and the one a
+                # retry was supposed to make cheap (issue #508). Every other
+                # case reads, which is always correct: the stamp is absent
+                # because the row loop never finished, the upstream moved, the
+                # adapter cannot know its generation before a read (DuckDB), or
+                # a subset run never saw the whole corpus.
+                complete_resume = (
+                    resumed
+                    and existing is not None
+                    and not subset_run
+                    and existing.source_generation is not None
+                    and existing.source_generation == snapshot.generation_fingerprint
+                    and existing.source_rows == existing.row_count
+                )
+                if complete_resume:
+                    assert existing is not None
+                    log.info(
+                        "%s: the resumed generation is complete for the current "
+                        "upstream (%d rows); skipping the read and going to the "
+                        "index build",
+                        model.name,
+                        existing.row_count,
+                    )
+                    rows_seen = existing.row_count
+                    skipped = existing.row_count
+                elif resumed and existing is not None and existing.source_generation:
+                    # About to rewrite parts of a generation stamped complete
+                    # for an older upstream. Cleared first: if this run dies
+                    # mid-loop the rows are a mix of two generations, and a
+                    # stamp naming either would be a lie a later resume could
+                    # act on.
+                    spec = replace(spec, source_generation=None, source_rows=None)
+                    store.restamp_collection(spec)
                 force_publish = existing is None
                 collection_exists = existing is not None
                 # A private build inspects its own, still-empty target, so
@@ -479,7 +516,9 @@ def _run_search_model(
                     )
                     _validate_collection_schema(existing.schema, spec)
 
-                batches = iter(snapshot)
+                batches: Iterator[pa.RecordBatch] = (
+                    iter([]) if complete_resume else iter(snapshot)
+                )
                 ordinal = -1
                 while True:
                     # Only the pull is credited to `read`: the row shaping
@@ -685,12 +724,20 @@ def _run_search_model(
                 # rebuild does not: it copies the rows it is replacing, deleted
                 # ones included, and without this a document removed upstream
                 # would come back to life on the next index change (issue #495).
+                # Neither does a *resumed* one, for the same reason: the failed
+                # build wrote rows the retry's stream never mentions, so a
+                # document removed in between survived — found while making the
+                # resume cheap (issue #508). A resume that skipped the read is
+                # the one exception: the upstream is provably unchanged, so
+                # there is nothing to be stale.
                 stale_pages = (
                     reconciler.iter_stale_pages(
                         upstream_table=upstream,
                         key_column=search.id_field,
                     )
-                    if (not rebuild or seed_from is not None) and not subset_run
+                    if (not rebuild or seed_from is not None or resumed)
+                    and not subset_run
+                    and not complete_resume
                     else _no_stale_pages()
                 )
                 try:
@@ -732,6 +779,27 @@ def _run_search_model(
                 if not collection_exists:
                     coordinator.verify_publish(publish_lease)
                     store.create_collection(spec)
+                if (
+                    rebuild
+                    and not subset_run
+                    and not complete_resume
+                    and snapshot.generation_fingerprint is not None
+                ):
+                    # Every page reconciled, every deletion applied: the rows
+                    # are complete for this upstream generation. Recorded now,
+                    # before the index build, so a failure there — or in
+                    # activation — leaves a generation the next run can finish
+                    # without reading the corpus again (issue #508). On an
+                    # adapter whose generation is a content digest known only
+                    # after the read, this is written but never matched before
+                    # one; harmless, and honest about what is known.
+                    spec = replace(
+                        spec,
+                        source_generation=snapshot.generation_fingerprint,
+                        source_rows=rows_seen,
+                    )
+                    coordinator.verify_publish(publish_lease)
+                    store.restamp_collection(spec)
                 log_publication_memory(log, model.name, phase="index_build", batch=ordinal + 1)
                 # The largest term in a large publish, and the last one of that
                 # size still unattributed: a reader could see `read`,

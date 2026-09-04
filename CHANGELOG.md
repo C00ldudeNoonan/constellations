@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### `kind:` selects a class of steps without naming or pre-tagging each (issue #494)
+
+Selection was by name, ancestry, tag, or state — never by what kind of step a
+model is. "Re-run only the search publishes" or "re-run every embed after a
+provider change" meant naming each model, or having tagged them back when they
+were written, which is the tag's weakness: it has to be applied before anyone
+knows it will be wanted. On a project with one search model that is nothing; at
+fifteen it is the difference between a command and a list.
+
+`kind:` matches on the config block a model declares — `extraction`,
+`transform`, `ml`, `chunk`, `embed`, `llm`, `search`, `eval` — and composes
+with the graph operators the way `tag:` does:
+
+```bash
+stel run --select kind:search --full-refresh
+stel run --select '+kind:embed'
+stel ls --select kind:embed
+```
+
+An unrecognized kind is refused, naming the valid set. A selector that silently
+matched nothing would look exactly like a project with no models of that kind,
+which is the case a typo has to be distinguishable from; a *recognized* kind
+matching nothing stays a valid empty selection.
+
+The labels come from one place now. `ModelKind` in `config/model.py` is the
+single definition, and the exclusivity validator, `kind_block_count`, `stel
+ls`'s kind column, the run-result label and the new selector all derive from
+it — the label function in `cli.py` had been a verbatim copy of the one in
+`runner.py`, so the selector would have been a third thing able to disagree
+about what a model is.
+
 ### Token verification could not start a server, and now publishes its discovery metadata (issue #464)
 
 **Fixes a startup crash.** The MCP SDK refuses a `token_verifier` that arrives

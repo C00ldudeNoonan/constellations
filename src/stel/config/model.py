@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -993,6 +994,33 @@ class FieldConfig(BaseModel):
         return aliases.get(normalized, normalized)
 
 
+class ModelKind(StrEnum):
+    """What kind of step a model is, named by the config block it declares.
+
+    One spelling for a fact that had three: the exclusivity validator's label
+    list, `kind_block_count`, and the runner's `_model_kind_label`. Exposing it
+    to selection as `kind:` (issue #494) would have made a fourth place able to
+    disagree about what a model is, so they all derive from this instead.
+
+    **Each member's value is exactly the name of its `ModelConfig` field.**
+    That is what lets the blocks be found by name rather than by a hand-kept
+    list, and it is pinned by a test rather than left as a convention.
+
+    Distinct from `dag.NodeKind` (`source`/`model`/`search_index`), which is the
+    DAG's structural axis, and from `--resource-type`, which chooses what
+    `stel ls` lists rather than what runs.
+    """
+
+    EXTRACTION = "extraction"
+    TRANSFORM = "transform"
+    ML = "ml"
+    CHUNK = "chunk"
+    EMBED = "embed"
+    LLM = "llm"
+    SEARCH = "search"
+    EVAL = "eval"
+
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
@@ -1091,25 +1119,12 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_single_kind(self) -> ModelConfig:
-        kinds = [
-            label
-            for label, block in (
-                ("extraction", self.extraction),
-                ("transform", self.transform),
-                ("ml", self.ml),
-                ("chunk", self.chunk),
-                ("embed", self.embed),
-                ("llm", self.llm),
-                ("search", self.search),
-                ("eval", self.eval),
-            )
-            if block is not None
-        ]
+        kinds = self.declared_kinds()
         if len(kinds) > 1:
             raise ValueError(
                 f"Model '{self.name}' declares multiple kind blocks "
-                f"({', '.join(kinds)}); exactly one of "
-                "extraction/transform/ml/chunk/embed/llm/search/eval is allowed"
+                f"({', '.join(kind.value for kind in kinds)}); exactly one of "
+                f"{'/'.join(ModelKind)} is allowed"
             )
         if self.search is not None and "materialization" not in self.model_fields_set:
             raise ValueError(
@@ -1236,21 +1251,42 @@ class ModelConfig(BaseModel):
         self.depends_on = [f"ref('{name}')" for name in dict.fromkeys(refs)]
         return self
 
+    def declared_kinds(self) -> tuple[ModelKind, ...]:
+        """Every kind block this model sets — exactly one, once validated.
+
+        Found by field name rather than from a hand-kept list, because every
+        such list is a place the answer can drift from the others. The naming
+        invariant that makes this work is stated on `ModelKind` and pinned by
+        a test.
+        """
+        return tuple(
+            kind for kind in ModelKind if getattr(self, kind.value) is not None
+        )
+
+    def kind(self) -> ModelKind | None:
+        """The one kind block this model declares, or None if it declares none.
+
+        None is reachable: `_validate_single_kind` refuses more than one block
+        but not zero, and the "model declares no kind block" error belongs to
+        the compiler and the loader, which say so far better than a model-level
+        validator could.
+        """
+        declared = self.declared_kinds()
+        return declared[0] if len(declared) == 1 else None
+
+    def kind_label(self) -> str:
+        """`kind()` as the string run results and `stel ls` report.
+
+        "unknown" for a model declaring no kind block: the compiler and the
+        loader reject that, but a run result and a listing must still be able
+        to name it rather than crash on it.
+        """
+        kind = self.kind()
+        return kind.value if kind is not None else "unknown"
+
     @property
     def kind_block_count(self) -> int:
-        return sum(
-            b is not None
-            for b in (
-                self.extraction,
-                self.transform,
-                self.ml,
-                self.chunk,
-                self.embed,
-                self.llm,
-                self.search,
-                self.eval,
-            )
-        )
+        return len(self.declared_kinds())
 
     @property
     def yaml_provenance(self) -> YamlProvenance | None:

@@ -139,6 +139,11 @@ class _FakeStorageReadClient:
         self.read_streams: list[str] = []
         self.session_parents: list[str] = []
         self.timeouts: list[Any] = []
+        # The session request itself, so a test can assert what was asked
+        # for rather than only what came back (issue #454). The whole message
+        # rather than its `read_options`, because "no options" and "empty
+        # options" are different requests and only the message shows which.
+        self.read_sessions: list[Any] = []
 
     def close(self) -> None:
         pass
@@ -164,6 +169,7 @@ class _FakeStorageReadClient:
         self.session_parents.append(parent)
         self.timeouts.append(timeout)
         self.sessions.append((read_session.table, max_stream_count))
+        self.read_sessions.append(read_session)
         table = self._served()
         return SimpleNamespace(
             arrow_schema=SimpleNamespace(
@@ -4001,6 +4007,73 @@ def test_integration_keyed_table_snapshot_streams_and_validates() -> None:
         adapter._reset_storage_for_test()
 
 
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+@pytest.mark.parametrize("codec", ["lz4", "zstd"])
+def test_integration_compressed_reads_round_trip(codec: str) -> None:
+    """Live cover for `storage_read_compression` (issue #454).
+
+    A fake client can prove the option reaches the request and nothing more.
+    Two things only a real read can settle, and both are silent failures if
+    wrong: that the service accepts an Arrow session carrying
+    `buffer_compression` at all, and that pyarrow decodes the compressed
+    buffers back to the exact rows that went in. A codec the client cannot
+    decompress does not raise a configuration error -- it fails mid-stream,
+    hours into a publish.
+
+    Rows are compared by value rather than counted, because the failure this
+    guards against is corrupted decode, not a short read.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": dataset,
+            "storage_read_compression": codec,
+        }
+    )
+    adapter = create_adapter(cfg)
+    # Text that actually compresses, so the codec is doing something rather
+    # than passing a handful of incompressible bytes through.
+    frame = pl.DataFrame(
+        {
+            "chunk_id": [f"c{index}" for index in range(200)],
+            "body": [f"repeated body text {index % 7} " * 40 for index in range(200)],
+        }
+    )
+    try:
+        with adapter:
+            adapter.materialize_full("chunks", frame)
+
+            with adapter.table_snapshot("chunks", batch_size=50) as snapshot:
+                read = pa.concat_tables(
+                    [pa.Table.from_batches([batch]) for batch in snapshot]
+                )
+
+            assert read.num_rows == 200
+            got = read.sort_by("chunk_id").to_pydict()
+            want = frame.sort("chunk_id").to_dict(as_series=False)
+            assert got["chunk_id"] == want["chunk_id"]
+            assert got["body"] == want["body"]
+
+            # The projected path too: it sets `selected_fields` on the same
+            # message the codec rides on, so one overwriting the other would
+            # show up here and nowhere else.
+            with adapter.table_snapshot(
+                "chunks", columns=("chunk_id",), batch_size=50
+            ) as snapshot:
+                projected = pa.concat_tables(
+                    [pa.Table.from_batches([batch]) for batch in snapshot]
+                )
+            assert projected.schema.names == ["chunk_id"]
+            assert projected.num_rows == 200
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
 _UNCOVERED_BY_LIVE_TESTS = frozenset(
     {
         "clear_state",
@@ -4328,6 +4401,109 @@ def test_the_configured_timeout_reaches_the_storage_read_calls() -> None:
 
     # Both the session creation and the row read, not just one of them.
     assert adapter._bqstorage_client.timeouts == [42, 42]
+
+
+# ─── Storage Read transfer compression (issue #454) ────────────────────────
+
+
+def _snapshot_with(adapter: Any, payload: pa.Table, **kwargs: Any) -> None:
+    """Run one snapshot to completion so its read session is issued."""
+    adapter._bqstorage_client.payload = payload
+    with adapter.table_snapshot("chunks", **kwargs) as snapshot:
+        list(snapshot)
+
+
+def _storage_client(**cfg_extra: Any) -> Any:
+    payload = pa.table({"chunk_id": ["a"], "body": ["x"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "body"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client, **cfg_extra)
+    return adapter, payload
+
+
+def test_an_unconfigured_read_session_sends_no_options_at_all() -> None:
+    """The default has to leave the request exactly as it was before #454.
+    An empty `TableReadOptions` is not the same message as no options, and
+    sending one would change every read for operators who asked for nothing."""
+    adapter, payload = _storage_client()
+
+    _snapshot_with(adapter, payload)
+
+    (session,) = adapter._bqstorage_client.read_sessions
+    # Field presence, not truthiness: an empty `TableReadOptions` is falsy but
+    # still serializes as a set field, so `assert not options` would pass on
+    # exactly the regression this guards.
+    assert "read_options" not in session
+
+
+@pytest.mark.parametrize(
+    ("setting", "codec"), [("lz4", "LZ4_FRAME"), ("zstd", "ZSTD")]
+)
+def test_storage_read_compression_sets_the_arrow_buffer_codec(
+    setting: str, codec: str
+) -> None:
+    adapter, payload = _storage_client(storage_read_compression=setting)
+
+    _snapshot_with(adapter, payload)
+
+    (session,) = adapter._bqstorage_client.read_sessions
+    options = session.read_options
+    assert options.arrow_serialization_options.buffer_compression.name == codec
+    # The Arrow-native mechanism, never the response-level one: only this
+    # mechanism offers ZSTD, and asking for both is rejected by the service.
+    assert not options.response_compression_codec
+
+
+def test_compression_composes_with_a_projected_read() -> None:
+    """The two settings land on the same message, so a projected read that
+    also compresses must carry both rather than one overwriting the other."""
+    adapter, payload = _storage_client(storage_read_compression="zstd")
+
+    _snapshot_with(adapter, payload, columns=["chunk_id"])
+
+    (session,) = adapter._bqstorage_client.read_sessions
+    options = session.read_options
+    assert list(options.selected_fields) == ["chunk_id"]
+    assert options.arrow_serialization_options.buffer_compression.name == "ZSTD"
+
+
+def test_an_unknown_compression_codec_is_refused_at_configuration_time() -> None:
+    """Before source discovery or any credential use, per the compiler's
+    validate-early boundary -- not at the first read of a long run."""
+    with pytest.raises(AdapterError):
+        parse_warehouse_config(
+            {
+                "type": "bigquery",
+                "project": "proj",
+                "dataset": "ds",
+                "storage_read_compression": "snappy",
+            }
+        )
+
+
+def test_compression_reaches_the_query_destination_read_too() -> None:
+    """Two paths open read sessions: the projected table read above, and the
+    one that reads a query job's destination, which passes no projection at
+    all. The second used to send no options by construction, so it is the one
+    that regresses silently if compression is wired only into the first."""
+    payload = pa.table({"chunk_id": ["a"], "body": ["x"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "body"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client, storage_read_compression="zstd")
+    adapter._bqstorage_client.payload = payload
+
+    with adapter.table_snapshot(
+        "chunks", predicate=ReadPredicate("body", ReadPredicateOperator.EQUAL, "x")
+    ) as snapshot:
+        list(snapshot)
+
+    (session,) = adapter._bqstorage_client.read_sessions
+    options = session.read_options
+    assert options.arrow_serialization_options.buffer_compression.name == "ZSTD"
 
 
 # ─── skip the query job for an unfiltered projection (issue #441 round 2) ──

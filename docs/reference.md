@@ -965,6 +965,38 @@ bigquery.readsessions permissions) on the query execution project
 access on the data project. Bounded snapshot payloads use that API so wide
 vectors and document text do not pass through the REST result endpoint.
 
+#### Compressing the read (issue #454)
+
+Read sessions transfer uncompressed by default. On a wide corpus that is real
+volume: a 768-float vector plus full chunk text is roughly 6KB a row, so a
+3.6M-row read moves about 21GB. `storage_read_compression` compresses the
+Arrow buffers on the wire:
+
+```yaml
+      warehouse:
+        type: bigquery
+        project: my-gcp-project
+        storage_read_compression: zstd   # none (default), lz4, or zstd
+```
+
+**Measure before setting it.** Compression trades wire bytes for client CPU,
+so a read already dominated by decode gets *slower* under it. The run metrics
+answer this directly: compare `seconds_read_transfer` against
+`seconds_read_decode` on a real read (see Artifacts below). Transfer-dominated
+reads have headroom to trade; decode-dominated reads do not. Which one you are
+depends on the network between the client and BigQuery and on the client's CPU
+headroom, neither of which stel can know, which is why there is no inferred
+default.
+
+`zstd` is Google's own recommendation and compresses harder; `lz4` trades
+ratio for throughput and is the better pick when the client is closer to
+CPU-bound. Both are decoded by pyarrow transparently.
+
+This is Arrow-native buffer compression rather than the API's separate
+`response_compression_codec`, which compresses the whole response envelope and
+offers LZ4 only. stel exposes one mechanism deliberately: the service rejects a
+session that asks for both.
+
 ```yaml
 my_project:
   target: prod

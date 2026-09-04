@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### BigQuery read sessions can compress the wire (issue #454)
+
+- **Storage Read sessions transferred uncompressed, always.** On the corpus
+  that motivated #441 and #452 — a 768-float vector plus full chunk text at
+  roughly 6KB a row — that is about 21GB over the wire per full read of
+  3.6M rows, with two compression mechanisms available and neither used.
+- New **`storage_read_compression`** on the BigQuery warehouse block: `none`
+  (the default), `lz4`, or `zstd`. It sets Arrow buffer compression on the
+  read session.
+- **The default is unchanged behavior, deliberately.** Compression trades wire
+  bytes for client CPU, so a read already dominated by decode gets slower
+  under it, and the right answer depends on the network and the client's CPU
+  headroom — neither of which stel can know. #486's `seconds_read_transfer`
+  against `seconds_read_decode` is the measurement that decides it, and this
+  is the knob that makes acting on it possible. An unconfigured session sends
+  no read options at all, so its request is byte-identical to the pre-#454
+  one rather than carrying an empty options message.
+- Arrow buffer compression rather than the API's `response_compression_codec`:
+  only the Arrow mechanism offers ZSTD (Google's own recommendation), and
+  exposing both would let a profile ask for the combination the service
+  rejects. Worth correcting the issue's premise on the way past — the
+  response-level codec is **LZ4-only**, so ZSTD was never available there.
+
 ## v0.17.0 - 2026-09-04
 
 ### A failed private-generation build no longer leaks its state scope (issue #502)

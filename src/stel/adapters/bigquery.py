@@ -219,6 +219,12 @@ def _bigquery() -> Any:
     return bigquery
 
 
+# Profile spelling -> `ArrowSerializationOptions.CompressionCodec` member.
+# Resolved by name at call time because the enum lives on the lazily imported
+# storage module, which a core-only install does not have (issue #454).
+_ARROW_BUFFER_COMPRESSION = {"lz4": "LZ4_FRAME", "zstd": "ZSTD"}
+
+
 def _bigquery_storage() -> Any:
     try:
         from google.cloud import bigquery_storage
@@ -339,6 +345,20 @@ class BigQueryWarehouseConfig(WarehouseConfig):
     # Target-scoped physical-layout policy. The adapter validates and merges
     # this mapping before source discovery; model-level warehouse_options win.
     warehouse_defaults: dict[str, Any] = Field(default_factory=dict)
+
+    # ─── Storage Read transfer (issue #454) ───────────────────────────────
+    # Compresses the Arrow buffers a read session streams. Off by default and
+    # deliberately not inferred: compression trades wire bytes for client CPU,
+    # so a read already dominated by decode gets *slower* under it, and stel
+    # knows neither the client's CPU headroom nor the network to BigQuery.
+    # `seconds_read_transfer` against `seconds_read_decode` is the measurement
+    # that decides it -- see docs/reference.md.
+    #
+    # This is the Arrow-native mechanism, not `response_compression_codec`:
+    # only this one offers ZSTD (what Google's guidance recommends), and
+    # exposing both would let a profile request the combination the service
+    # rejects.
+    storage_read_compression: Literal["none", "lz4", "zstd"] = "none"
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -974,6 +994,31 @@ def _storage_read_batches(
             cancel()
 
 
+def _table_read_options(
+    storage: Any, *, selected_fields: list[str] | None, compression: str
+) -> Any:
+    """Read options for one session, or None when neither setting is in play.
+
+    One place because the two settings compose onto the same message: a
+    projected read that also compresses needs both set, and a session with
+    neither must send no options at all, so an unconfigured read stays exactly
+    the request it was before issue #454.
+    """
+    if selected_fields is None and compression == "none":
+        return None
+    options = storage.types.ReadSession.TableReadOptions()
+    if selected_fields is not None:
+        options.selected_fields = selected_fields
+    if compression != "none":
+        options.arrow_serialization_options = storage.types.ArrowSerializationOptions(
+            buffer_compression=getattr(
+                storage.types.ArrowSerializationOptions.CompressionCodec,
+                _ARROW_BUFFER_COMPRESSION[compression],
+            )
+        )
+    return options
+
+
 def _coalesced_batches(
     arrow_batches: Iterator[pa.RecordBatch],
     output_indices: list[int],
@@ -1348,12 +1393,10 @@ class BigQueryAdapter(WarehouseAdapter):
     ) -> Any:
         storage = _bigquery_storage()
         cfg = self._cfg
-        read_options = (
-            None
-            if selected_fields is None
-            else storage.types.ReadSession.TableReadOptions(
-                selected_fields=selected_fields
-            )
+        read_options = _table_read_options(
+            storage,
+            selected_fields=selected_fields,
+            compression=cfg.storage_read_compression,
         )
         return self._ensure_bqstorage_client().create_read_session(
             # The session is billed to, and authorized against, the project

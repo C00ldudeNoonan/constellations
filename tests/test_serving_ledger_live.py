@@ -12,7 +12,9 @@ SQL survives a second dialect and a second parameter binder.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -198,18 +200,17 @@ def exercise_state_seeding(adapter: WarehouseAdapter, coordinator: ServingCoordi
     generation = _generation_state_scope("seed_live", "seed_live__gseed")
 
     # Observe every page the seed writes, through the adapter it actually
-    # writes with. An instance attribute shadows the bound method and is
-    # removed afterwards, so the adapter is unchanged for the assertions.
+    # writes with; the patch is scoped so the adapter is itself again for the
+    # assertions that follow.
     pages: list[int] = []
     real_upsert = adapter.upsert_state
 
-    def observed(scope: StateScope, records: list[StateRecord]) -> None:
+    def observed(scope: StateScope, records: Sequence[StateRecord]) -> None:
         if scope == generation:
             pages.append(len(records))
         real_upsert(scope, records)
 
-    adapter.upsert_state = observed  # type: ignore[method-assign]
-    try:
+    with patch.object(adapter, "upsert_state", side_effect=observed):
         copied = _seed_publication_state(
             adapter,
             coordinator,
@@ -219,8 +220,6 @@ def exercise_state_seeding(adapter: WarehouseAdapter, coordinator: ServingCoordi
             page_size=_SEED_PAGE,
             code_version="v2",
         )
-    finally:
-        del adapter.upsert_state
 
     assert copied == _SEED_ROWS
     # Residency is bounded by the page, not the scope: a regression to loading

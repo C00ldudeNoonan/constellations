@@ -1,8 +1,0 @@
-notion_landed_pages:
-  target: dev
-  outputs:
-    dev:
-      warehouse:
-        type: duckdb
-        path: ./target/stel.duckdb
-        schema: notion

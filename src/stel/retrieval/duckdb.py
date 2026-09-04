@@ -85,6 +85,10 @@ _DESCRIPTOR_KEY = "descriptor"
 # a collection stamped before it existed, where that digest was necessarily
 # the config fingerprint.
 _ROW_FINGERPRINT_KEY = "row_fingerprint"
+# The upstream generation the rows were last complete for, and the row count
+# then (issue #508); null when not known complete for any generation.
+_SOURCE_GENERATION_KEY = "source_generation"
+_SOURCE_ROWS_KEY = "source_rows"
 
 _DISTANCE_FUNCTIONS = {
     "cosine": "array_cosine_distance",
@@ -453,6 +457,12 @@ class DuckDBStore(RetrievalStore):
             config_fingerprint=stamp.get(_CONFIG_KEY),
             descriptor=stamp.get(_DESCRIPTOR_KEY),
             row_fingerprint=stamp.get(_ROW_FINGERPRINT_KEY),
+            source_generation=stamp.get(_SOURCE_GENERATION_KEY) or None,
+            source_rows=(
+                int(stamp[_SOURCE_ROWS_KEY])
+                if isinstance(stamp.get(_SOURCE_ROWS_KEY), int)
+                else None
+            ),
             physical_generation=generation,
             row_count=row_count,
             schema=schema,
@@ -531,6 +541,8 @@ class DuckDBStore(RetrievalStore):
             _LEGACY_CONFIG_KEY: spec.legacy_config_fingerprint,
             _DESCRIPTOR_KEY: spec.descriptor,
             _ROW_FINGERPRINT_KEY: spec.row_fingerprint,
+            _SOURCE_GENERATION_KEY: spec.source_generation,
+            _SOURCE_ROWS_KEY: spec.source_rows,
         }
         payload = json.dumps(stamp, sort_keys=True, separators=(",", ":"))
         self._execute(

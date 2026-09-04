@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### A complete resume no longer re-reads the corpus to publish nothing (issue #508)
+
+#492's resume did what it said — a retry republished nothing — but it still
+paged the entire corpus out of the warehouse to discover that: ~3.8h of
+BigQuery reads on 3.6M rows, against ~4.25h for the publish it was retrying, an
+11% saving because the read sets the pace, not the write. The generation was
+complete with every index built; what was missing was any record that its
+rows were complete *for this upstream*, so completeness was re-established by
+re-reading.
+
+A private build now stamps its generation, once every page is reconciled and
+before the index build, with the upstream generation it was built from and the
+rows it saw. A resume that finds the upstream generation unchanged and the row
+count intact skips the page loop and stale discovery and goes straight to the
+index build — the step #492's incident died in. On BigQuery the upstream
+generation comes from table metadata (etag, modification time, row count), one
+API call, available before any read; the publish's snapshot is a direct
+Storage Read session, so nothing is billed for streams never opened. DuckDB has
+no such metadata and knows its generation only after a read, so it always
+reads — correct, only slow, and stated.
+
+Two things came with it. A resumed generation now reconciles upstream
+deletions: a plain rebuild skips that because it writes every row from
+upstream, but a resumed one keeps rows the retry's stream never mentions, so a
+document removed between the failed build and the retry survived. And a stamp
+naming an older upstream is cleared before a resume rewrites the generation,
+so a run that dies mid-loop cannot leave a stamp a later resume would act on.
+
 ### BigQuery read sessions can compress the wire (issue #454)
 
 - **Storage Read sessions transferred uncompressed, always.** On the corpus

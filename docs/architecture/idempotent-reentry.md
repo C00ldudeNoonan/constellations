@@ -80,7 +80,7 @@ its step. The `GAP` list is pinned empty.
 | transform (Python) | holds | holds | parent batch under the incremental contract | changed parents publish in batches, each batch's state advancing after its publish; without a contract, one atomic replace |
 | ml | holds | **exception** | the whole step | full-only (#53); retrains each run, replaces relations atomically, publishes the artifact from a staged copy or discards it; no per-row checkpoint to resume, no provider spend to lose |
 | eval | holds | **exception** | the whole step | pure warehouse arithmetic; full replaces, incremental deletes stale metric rows then merges; cheap enough that the step is the unit |
-| search | holds | holds | the page (in place); the generation (private build) | keyed upsert with a durable receipt, state after the receipt; a private build that fails after its rows land is adopted by the next run (#492), its index step retried (#491), its rows seeded rather than re-read for an index-only change (#495), and its state scope swept with it when abandoned (#502) |
+| search | holds | holds | the page (in place); the generation (private build) | keyed upsert with a durable receipt, state after the receipt; a private build that fails after its rows land is adopted by the next run (#492), its index step retried (#491), its rows seeded rather than re-read for an index-only change (#495), and its state scope swept with it when abandoned (#502); a resume whose upstream generation is unchanged skips the read and goes to the index build (#508) |
 
 ### Phases inside a publish
 

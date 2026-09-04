@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### A failed private-generation build no longer leaks its state scope (issue #502)
+
+A private search generation accumulates its publication state in a scope
+keyed on the generation. That scope was cleared when the build activated and
+never otherwise, so every failed rebuild left one dead scope behind for good:
+#492's incident left roughly 2.1M rows of it in `stel_state`, scanned past by
+every later MERGE (#431).
+
+Since #492 a failed generation's scope is kept *on purpose*, so a retry can
+resume the build instead of redoing it. What leaked was the state of
+generations nothing would ever resume: a losing candidate when several
+matched, or one built under a configuration a later run had moved past. The
+sweep that retires such a generation now clears its scope with it. Both halves
+are tested for the first time: activation leaves no generation scope behind,
+and neither does a sweep.
+
 ### Building an ANN index no longer rewrites the corpus (issue #495)
 
 Adding an ANN index over vectors that were already published and unchanged

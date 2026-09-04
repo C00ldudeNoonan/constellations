@@ -932,23 +932,14 @@ def _run_model(
 
 
 def _model_kind_label(model: ModelConfig) -> str:
-    if model.extraction is not None:
-        return "extraction"
-    if model.ml is not None:
-        return "ml"
-    if model.transform is not None:
-        return "transform"
-    if model.chunk is not None:
-        return "chunk"
-    if model.embed is not None:
-        return "embed"
-    if model.llm is not None:
-        return "llm"
-    if model.search is not None:
-        return "search"
-    if model.eval is not None:
-        return "eval"
-    return "unknown"
+    """The run-result label for a model's kind.
+
+    Delegates rather than re-deriving. This label, `stel ls`'s kind column and
+    the `kind:` selector all have to agree about what a model is, and the only
+    way to guarantee that is for there to be one answer (issue #494). Kept as a
+    named function because the runner calls it in two places and tests pin it.
+    """
+    return model.kind_label()
 
 
 def clean_project(

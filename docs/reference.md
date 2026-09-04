@@ -532,19 +532,54 @@ stays reserved even though no internal table uses it any more.
 
 ## Selectors
 
-dbt-shaped. Whitespace-separated tokens, optional `+` modifiers, `tag:` prefix.
+dbt-shaped. Whitespace-separated tokens, optional `+` modifiers, and the
+`tag:`, `kind:` and `state:` prefixes.
 
 ```bash
 stel run --select raw_pdf_text       # one model
 stel run --select 'raw_pdf_text+'    # plus all downstream
 stel run --select '+invoice_summary' # plus all upstream
 stel run --select 'tag:raw+'         # all models tagged "raw" + their downstream
+stel run --select kind:search        # every search publish
+stel run --select '+kind:embed'      # every embed, plus everything it needs
 stel run --exclude tag:expensive
 stel run --select 'state:modified+' --state ./main-manifest/
                                        # only models whose config or transform
                                        # code changed vs a previous manifest,
                                        # plus their downstream
 ```
+
+### `kind:` — select by what a step *is*
+
+`kind:` matches models by the config block they declare, so a class of steps
+can be run without naming each one or having tagged them in advance:
+
+| | |
+|---|---|
+| `kind:extraction` | `kind:ml` |
+| `kind:transform` | `kind:chunk` |
+| `kind:embed` | `kind:llm` |
+| `kind:search` | `kind:eval` |
+
+These are the same labels a run result reports for each model, from the same
+source, so the two cannot disagree about what a model is.
+
+It exists for the operations tags handle badly, because a tag has to be applied
+before anyone knows it will be wanted: re-running only the search publishes
+after a failed index build, or only the embeds after a provider change.
+
+```bash
+stel run --select kind:search --full-refresh
+stel ls --select kind:embed
+```
+
+An unrecognized kind is refused and the message names the valid set. A
+selector that silently matched nothing would be indistinguishable from a
+project that has no models of that kind — which is exactly the case a typo has
+to be told apart from. A *recognized* kind matching nothing is not an error.
+
+`kind:` is a different axis from `--resource-type`, which chooses what `stel
+ls` lists rather than what runs.
 
 `state:modified` compares each model's `code_version` (a hash of its
 extraction/transform/ml config and transform module source) against a

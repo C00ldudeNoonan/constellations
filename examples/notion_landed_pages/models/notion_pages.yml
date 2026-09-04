@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: notion_pages
+    description: "Landed Notion pages, one row each, as a stel model"
+    source: ref('notion_page_rows')
+    extraction:
+      backend: json
+      options:
+        fields:
+          - page_id
+          - title
+          - parent_page_id
+          - database_id
+          - properties_json
+          - last_edited_time
+    materialization: incremental
+    fields:
+      - name: page_id
+        data_type: string
+      - name: title
+        data_type: string
+      - name: parent_page_id
+        data_type: string
+      - name: database_id
+        data_type: string
+      - name: properties_json
+        data_type: string
+      - name: last_edited_time
+        data_type: string
+    tests:
+      - not_null: [page_id, title]
+      - unique: page_id

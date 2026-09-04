@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### SaaS context: land, then render (issue #352)
+
+"Can stel read my Notion?" now has one answer, written down. stel ships no
+first-party SaaS connectors: your EL tool lands Notion, Confluence, Linear as
+tables, and stel reads them with `warehouse://`. What those tools land is one
+row per block with a parent pointer, which is the raw material for a document
+and not a document, so the new `stel.text.transforms.render_blocks`
+transform turns block rows back into one ordered markdown document per page,
+with real heading levels, nested lists, code fences, and links to child pages.
+It reads a vendor-neutral block contract; the connector's own tables map onto
+it with one SQL staging model in the project, so nothing vendor-shaped enters
+the core.
+
+The renderer accounts for what a real landing has instead of guessing: a
+block whose parent was never landed renders at the end of its page and is
+counted in `orphan_block_count`, and a block type outside the vocabulary
+renders as text and is counted in `unknown_block_count`. Pages are the
+incremental parents and blocks a reference keyed to their page, so editing
+one block re-renders one page and re-chunks one page. `chunk:` with
+`headings:` then attributes every chunk to its section.
+
+`examples/notion_landed_pages` is the worked proof; its tests run the same
+models over local files and over `warehouse://` tables and assert identical
+documents. `docs/saas-context.md` states the position, and ADR-0006 records
+the alternatives ruled out: in-tree connectors, stel as an MCP client, and a
+generic `http://` source.
+
 ### `serving status` and `recover` name the target they acted on (issue #511)
 
 - **Neither command said which target, warehouse or store it resolved.** In a

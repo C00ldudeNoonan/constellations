@@ -1,0 +1,10 @@
+{
+  "block_id": "blk_b8",
+  "page_id": "pg_7b2e04",
+  "parent_block_id": null,
+  "position": 7,
+  "type": "paragraph",
+  "text": "Disk encryption is mandatory. On Linux images the installer prompts for a passphrase; store it in the password manager.",
+  "checked": null,
+  "language": null
+}

@@ -1,0 +1,23 @@
+version: 2
+
+# The renderer: block rows back into one ordered markdown document per page,
+# with real heading levels and nesting. Pages are the incremental parents and
+# blocks a reference keyed to their page, so an edited block re-renders its
+# page and nothing else.
+models:
+  - name: page_documents
+    description: "One markdown document per Notion page, rendered from its blocks"
+    depends_on: [ref('notion_pages'), ref('notion_blocks')]
+    transform:
+      type: python
+      module: stel.text.transforms.render_blocks
+      options:
+        pages: notion_pages
+        blocks: notion_blocks
+        include_fields: [parent_page_id, database_id, properties_json, last_edited_time]
+    materialization: incremental
+    tags: [notion]
+    tests:
+      - not_null: [document_id, page_id, title, text]
+      - unique: document_id
+      - unique: page_id

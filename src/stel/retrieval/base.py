@@ -83,6 +83,15 @@ class RetrievalFeature(StrEnum):
     # drops. A store with a fixed collection namespace cannot do even this,
     # which is what the flag exists to catch.
     PRIVATE_GENERATION_BUILD = "private_generation_build"
+    # Seed a private generation from a collection the store already holds
+    # (issue #495). Building an ANN index over unchanged vectors still needs a
+    # generation to build away from readers, but it does not need the rows to
+    # come from the warehouse again: re-reading and rewriting 3.6M rows to
+    # index vectors already sitting in the store cost 4.2h. A store that can
+    # copy a collection internally skips the warehouse round trip entirely; one
+    # that cannot keeps the warehouse path, which is always correct, only
+    # slower.
+    COLLECTION_SEEDING = "collection_seeding"
 
 
 PUBLISHER_FENCING_FEATURES = frozenset(
@@ -312,6 +321,13 @@ class CollectionSpec:
     # collection stamped before the descriptor existed and prove it unchanged.
     # Removable with the rest of the legacy path (#321 category 1).
     legacy_config_fingerprint: str
+    # The digest to fingerprint this publish's rows under, which is *not*
+    # always `config_fingerprint`. An index-only change leaves every stored row
+    # byte-identical, so advancing it would declare all of them changed and
+    # rewrite a corpus to build an index over vectors nothing touched
+    # (issue #495). Resolved against the stored stamp once the collection has
+    # been inspected; equal to `config_fingerprint` for a new collection.
+    row_fingerprint: str
     arrow_schema: pa.Schema
 
 
@@ -359,6 +375,11 @@ class CollectionMetadata:
     physical_generation: str
     row_count: int
     schema: pa.Schema
+    # The config digest the stored rows were fingerprinted under (issue #495).
+    # None on a collection stamped before this existed, where that digest was
+    # necessarily `config_fingerprint` — so the fallback is not a guess, it is
+    # what those rows were actually written with.
+    row_fingerprint: str | None = None
 
 
 class StoreRole(StrEnum):
@@ -534,6 +555,29 @@ class RetrievalStore(ABC):
 
     @abstractmethod
     def create_collection(self, spec: CollectionSpec) -> CollectionMetadata: ...
+
+    def seed_collection(self, spec: CollectionSpec, *, source: str) -> int:
+        """Fill `spec`'s collection with `source`'s rows, returning the count.
+
+        Called only for a change that leaves every stored row byte-identical,
+        so this is a copy and never a transformation — the caller has already
+        established that the source rows satisfy the target's contract. The
+        target must exist and be empty.
+
+        Implementations must copy in bounded memory. The corpus that motivated
+        this is ~11GB of vectors, and materializing it to move it would trade
+        one resource failure for another (issues #473, #495).
+        """
+        del spec, source
+        capabilities = self.capabilities()
+        if RetrievalFeature.COLLECTION_SEEDING in capabilities.features:
+            raise RetrievalError(
+                "Retrieval store advertises collection_seeding but does not "
+                "implement seed_collection()"
+            )
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot seed a collection"
+        )
 
     @abstractmethod
     def restamp_collection(self, spec: CollectionSpec) -> None:

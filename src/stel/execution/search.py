@@ -13,6 +13,7 @@ import json
 import logging
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -47,6 +48,7 @@ from ..retrieval import (
     ServingCoordinationError,
     ServingCoordinator,
     StoreRole,
+    advances_row_fingerprint,
     classify_descriptor_changes,
     collection_config_fingerprint,
     collection_descriptor,
@@ -201,9 +203,8 @@ def _run_search_model(
             previous_generation = serving_entry.active_generation
             previous_fingerprint = serving_entry.config_fingerprint
             default_collection = store.physical_collection(logical_collection)
-            rebuild = _rebuild_requested(
-                model, full_refresh=full_refresh
-            ) or _config_change_forces_rebuild(
+            requested = _rebuild_requested(model, full_refresh=full_refresh)
+            plan = _config_change_forces_rebuild(
                 store,
                 model=model,
                 models_by_name=models_by_name,
@@ -212,7 +213,40 @@ def _run_search_model(
                 store_type=store_config.type,
                 resolved=resolved,
             )
+            rebuild = requested or plan.rebuild
             resumed = False
+            # A generation whose rows are already correct can be filled from
+            # the store instead of the warehouse (issue #495). Never when the
+            # operator asked for the rebuild outright — `--full-refresh` and
+            # `materialization: full` mean "read it all again", and quietly
+            # copying instead would make them unable to say so.
+            seed_from = (
+                # The same collection the change was classified against. After
+                # an in-place publish the ledger names no generation, but the
+                # rows are in the default collection all the same, and that is
+                # exactly the first switch a project makes.
+                #
+                # Only from a collection the ledger vouches for, and the
+                # voucher is `active_generation`: it names a generation that
+                # was validated whole at its own activation, whether the
+                # collection is a private one (`ready`, or `degraded` after a
+                # later private build failed and this one was retained) or the
+                # default in-place one (which sets a generation but no
+                # `active_collection`). A scope left `failed` by a stranded
+                # in-place publisher has no active generation and may sit on a
+                # half-rewritten collection; copying that forward would launder
+                # the damage into a generation that then activates as sound.
+                # That state rebuilds from the warehouse, retaining nothing
+                # (#473).
+                (active_collection or default_collection)
+                if plan.rows_unchanged
+                and not requested
+                and serving_entry.status in {"ready", "degraded"}
+                and serving_entry.active_generation is not None
+                and RetrievalFeature.COLLECTION_SEEDING
+                in store.capabilities().features
+                else None
+            )
             if rebuild:
                 _require_private_generation_build(store, model, subset_run=subset_run)
                 # The fingerprint identifies the configuration, not the
@@ -353,6 +387,37 @@ def _run_search_model(
                     )
                     adapter.clear_state(publish_scope)
                     resumed = False
+                if seed_from is not None and not resumed:
+                    # The digest has to be resolved against the collection the
+                    # rows are coming *from*. `existing` is this build's own
+                    # empty target, which knows nothing about what those rows
+                    # were fingerprinted under.
+                    spec = _resolve_row_fingerprint(
+                        spec, store.inspect_collection(seed_from)
+                    )
+                    seeded = _seed_generation(
+                        store,
+                        adapter,
+                        coordinator,
+                        spec=spec,
+                        source=seed_from,
+                        serving_scope=state_scope,
+                        publish_scope=publish_scope,
+                        lease=publish_lease,
+                        page_size=search.batch_size,
+                        code_version=code_version,
+                        model_name=model.name,
+                    )
+                    existing = store.inspect_collection(physical)
+                    log.info(
+                        "%s: seeded %d row(s) from %s; the index build follows "
+                        "without re-reading the warehouse",
+                        model.name,
+                        seeded,
+                        seed_from,
+                    )
+                else:
+                    spec = _resolve_row_fingerprint(spec, existing)
                 force_publish = existing is None
                 collection_exists = existing is not None
                 # A private build inspects its own, still-empty target, so
@@ -421,7 +486,7 @@ def _run_search_model(
                     indexed = _indexed_rows(
                         batch,
                         model,
-                        spec.config_fingerprint,
+                        spec.row_fingerprint,
                         max_id_bytes=store.capabilities().max_id_bytes,
                     )
                     rows_seen += len(indexed)
@@ -540,14 +605,18 @@ def _run_search_model(
                     )
                     with timings.phase("store_write"):
                         # Append is the fast path for a generation this run
-                        # created, which is empty by construction. A resumed
-                        # one is not: state advances only after a write lands,
-                        # so a row can be present in the store with its state
-                        # unrecorded, and appending it again would duplicate
-                        # it. Upsert is idempotent on the id, which is what
-                        # re-entering a partial build requires (issue #492).
+                        # created, which is empty by construction. Two kinds of
+                        # generation are not. A *resumed* one may hold rows whose
+                        # state never landed, so appending them again would
+                        # duplicate them (issue #492). A *seeded* one already
+                        # holds every id it was copied with, so a row that
+                        # changed upstream during the switch has to merge or it
+                        # lands twice (issue #495). Upsert is idempotent on the
+                        # id, which is what both need.
                         write = (
-                            store.append if rebuild and not resumed else store.upsert
+                            store.append
+                            if rebuild and not resumed and seed_from is None
+                            else store.upsert
                         )
                         receipt = write(
                             physical,
@@ -598,12 +667,18 @@ def _run_search_model(
                 # run's view is not stale; reconciliation belongs to the next
                 # unfiltered run, exactly as rebuild already skips it
                 # (issue #417).
+                #
+                # A rebuild skips it because it writes every row from upstream,
+                # so a deleted one is absent by never being written. A *seeded*
+                # rebuild does not: it copies the rows it is replacing, deleted
+                # ones included, and without this a document removed upstream
+                # would come back to life on the next index change (issue #495).
                 stale_pages = (
                     reconciler.iter_stale_pages(
                         upstream_table=upstream,
                         key_column=search.id_field,
                     )
-                    if not rebuild and not subset_run
+                    if (not rebuild or seed_from is not None) and not subset_run
                     else _no_stale_pages()
                 )
                 try:
@@ -812,6 +887,58 @@ def _no_stale_pages() -> Generator[Sequence[Any], None, None]:
     yield  # pragma: no cover - unreachable, makes this a generator
 
 
+def _seed_generation(
+    store: Any,
+    adapter: WarehouseAdapter,
+    coordinator: ServingCoordinator,
+    *,
+    spec: CollectionSpec,
+    source: str,
+    serving_scope: StateScope,
+    publish_scope: StateScope,
+    lease: PublishLease,
+    page_size: int,
+    code_version: str,
+    model_name: str,
+) -> int:
+    """Fill a fresh generation from the collection it is replacing (issue #495).
+
+    Both halves have to move, or the seeding buys nothing. The rows come from
+    the store, which is what removes the warehouse round trip. The publication
+    *state* comes from the serving scope, because reconciliation is what
+    decides a row can be skipped — against an empty scope every row is new, and
+    the build would rewrite the corpus it had just copied.
+
+    Streamed on both sides: `seed_collection` copies in bounded batches, and
+    the state moves page by page, the same way activation moves it back.
+    """
+    log.info("%s: seeding a private generation from %s", model_name, source)
+    store.create_collection(spec)
+    seeded = store.seed_collection(spec, source=source)
+    # Copied page by page rather than through `replace_state_scope`, whose
+    # fence is checked against the serving ledger: a generation scope has no
+    # ledger entry of its own, so that check reports the publisher's authority
+    # as reassigned. The claim is still verified per page, which is the same
+    # protection the publish loop applies to its own state writes.
+    with adapter.state_page_reader(serving_scope, page_size=page_size) as reader:
+        for batch in _state_batches(reader):
+            coordinator.verify_publish(lease)
+            # Restamped to this run's code version, which is the whole claim
+            # being made: the change was classified as reaching no row, so a
+            # row carried over is current under the new configuration. Leaving
+            # the old version would mark every row changed — reconciliation
+            # compares it alongside the fingerprint — and the build would
+            # rewrite the corpus it had just copied.
+            adapter.upsert_state(
+                publish_scope,
+                [
+                    StateRecord(record.record_key, record.input_fingerprint, code_version)
+                    for record in batch
+                ],
+            )
+    return seeded
+
+
 def _activate_generation(
     adapter: WarehouseAdapter,
     *,
@@ -898,6 +1025,19 @@ def _generation_state_scope(model_name: str, physical_collection: str) -> StateS
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ConfigChangePlan:
+    """What a descriptor change requires, and whether it reaches any row."""
+
+    rebuild: bool
+    # True when every classified change is index-only, so the rows already
+    # published satisfy the new configuration byte for byte. The rebuild still
+    # happens — it is what keeps readers on a complete index until activation
+    # (#473) — but its rows can come from the store instead of the warehouse
+    # (issue #495).
+    rows_unchanged: bool
+
+
 def _config_change_forces_rebuild(
     store: Any,
     *,
@@ -907,7 +1047,7 @@ def _config_change_forces_rebuild(
     upstream_schema: pa.Schema,
     store_type: str,
     resolved: ResolvedProfile,
-) -> bool:
+) -> _ConfigChangePlan:
     """Plan configuration changes before claiming or mutating a live target."""
     search = model.search
     assert search is not None
@@ -921,19 +1061,20 @@ def _config_change_forces_rebuild(
         store_type=store_type,
         resolved=resolved,
     )
+    settled = _ConfigChangePlan(rebuild=False, rows_unchanged=False)
     with store:
         existing = store.inspect_collection(collection)
     if existing is None:
-        return False
+        return settled
     if existing.descriptor is None:
         if existing.config_fingerprint != spec.legacy_config_fingerprint:
             raise RunError(
                 "Search index configuration changed without a stored descriptor; "
                 "publish a private replacement with --full-refresh"
             )
-        return False
+        return settled
     if existing.descriptor == spec.descriptor:
-        return False
+        return settled
     changes = classify_descriptor_changes(
         json.loads(existing.descriptor), json.loads(spec.descriptor)
     )
@@ -948,7 +1089,41 @@ def _config_change_forces_rebuild(
         )
     # Both policies build away from readers. Online still accepts only
     # compatible changes; rebuild is an explicit opt-in for any change.
-    return bool(changes)
+    return _ConfigChangePlan(
+        rebuild=bool(changes),
+        rows_unchanged=bool(changes) and not advances_row_fingerprint(changes),
+    )
+
+
+def _resolve_row_fingerprint(
+    spec: CollectionSpec, existing: CollectionMetadata | None
+) -> CollectionSpec:
+    """Keep the rows on the digest they were written under, where they can be.
+
+    A row's `input_fingerprint` mixes in the config digest, so advancing that
+    digest declares every row changed. For a change confined to index-only
+    fields nothing about a stored row differs, and advancing it would spend a
+    full corpus rewrite building an index over vectors nothing touched — 4.2h
+    for the corpus in issue #495, to change one descriptor field.
+
+    A collection stamped before `row_fingerprint` existed reports None, and its
+    rows were necessarily written under `config_fingerprint`; carrying that
+    forward is what makes this change cost no existing collection a republish.
+    """
+    if existing is None or existing.descriptor is None:
+        return spec
+    stored = existing.row_fingerprint or existing.config_fingerprint
+    if stored is None:
+        return spec
+    changes = classify_descriptor_changes(
+        json.loads(existing.descriptor), json.loads(spec.descriptor)
+    )
+    if advances_row_fingerprint(changes):
+        return spec
+    # Nothing changed, or nothing that reaches a row. Either way the stored
+    # digest is still the one those rows carry, and pinning it is what lets
+    # the next run skip them rather than rewrite them.
+    return replace(spec, row_fingerprint=stored)
 
 
 def _warn_on_exact_vector_scan(
@@ -1150,6 +1325,10 @@ def _search_collection_spec(
         config_fingerprint=config_fingerprint,
         descriptor=descriptor,
         legacy_config_fingerprint=legacy_fingerprint,
+        # The starting point, and correct for a collection that does not exist
+        # yet. `_resolve_row_fingerprint` swaps in the stored digest once the
+        # change is known to leave every published row untouched (issue #495).
+        row_fingerprint=config_fingerprint,
         arrow_schema=schema,
     )
 

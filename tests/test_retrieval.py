@@ -1580,6 +1580,7 @@ def test_drop_collection_removes_only_an_owned_existing_collection(
                 config_fingerprint="cfg1",
                 descriptor="{}",
                 legacy_config_fingerprint="legacy1",
+                row_fingerprint="row-fp",
                 arrow_schema=pa.schema(
                     [pa.field("id", pa.string()), pa.field("body", pa.string())]
                 ),
@@ -1631,6 +1632,7 @@ def _make_collection(store: Any, name: str, *, fingerprint: str = "cfg1") -> Non
             config_fingerprint=fingerprint,
             descriptor="{}",
             legacy_config_fingerprint="legacy1",
+            row_fingerprint="row-fp",
             arrow_schema=pa.schema(
                 [pa.field("id", pa.string()), pa.field("body", pa.string())]
             ),
@@ -1950,6 +1952,7 @@ def _vector_spec(
         config_fingerprint=f"cfg-{vector_search}-{vector_index}",
         descriptor=json.dumps({"vector_search": vector_search, "vector_index": vector_index}),
         legacy_config_fingerprint="legacy",
+        row_fingerprint="row-fp",
         arrow_schema=pa.schema(
             [
                 pa.field("id", pa.string()),
@@ -2007,6 +2010,7 @@ def _merge_key_spec(name: str) -> CollectionSpec:
         config_fingerprint="cfg",
         descriptor="{}",
         legacy_config_fingerprint="legacy",
+        row_fingerprint="row-fp",
         arrow_schema=pa.schema(
             [pa.field("id", pa.string()), pa.field("body", pa.string())]
         ),

@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### Building an ANN index no longer rewrites the corpus (issue #495)
+
+Adding an ANN index over vectors that were already published and unchanged
+re-read the whole corpus from the warehouse into a fresh generation:
+3,613,979 rows, ~4.2 hours and a full BigQuery read, to change one descriptor
+field. The embed model alongside it reported every row skipped while the
+search index rewrote all of them.
+
+The private generation stays. It is what keeps readers on a complete index
+until activation (#473), and that is worth keeping. What changes is where its
+rows come from. A change confined to `vector.search` or `vector.index` is
+classified as reaching no row, and a store advertising `collection_seeding`
+fills the new generation by copying the collection it replaces: DuckDB with
+one streamed `INSERT ... SELECT`, LanceDB in bounded batches so the ~11GB
+corpus never lands in the process. The warehouse is still read once, to
+reconcile rows that changed or disappeared while the switch was made, but
+nothing is rewritten. `rows_written` for that publish is 0.
+
+Three things had to move with the rows, or the copy bought nothing:
+
+- **Rows keep the digest they were written under.** A row's fingerprint mixes
+  in the config digest, so advancing it declares every row changed. The
+  collection now stamps a `row_fingerprint` that advances only when a change
+  reaches a row. A stamp without one falls back to `config_fingerprint`, which
+  is what those rows were written with, so no existing collection is forced
+  to republish.
+- **Seeded state is restamped to the current code version.** Reconciliation
+  compares it alongside the fingerprint, and the index config feeds it. The
+  restamp is the claim being made: the change reaches no row, so a carried
+  row is current.
+- **A seeded rebuild reconciles deletions.** A plain rebuild skips that
+  because it rewrites every row from upstream. A seeded one copies the rows it
+  replaces, deleted ones included; without this a document removed upstream
+  came back on the next index change.
+
+Seeding happens only from a collection the ledger vouches for, one with an
+active, validated generation. A scope left `failed` by a stranded in-place
+publisher rebuilds from the warehouse as before, retaining nothing.
+`--full-refresh` and `materialization: full` also still read everything: they
+mean it.
+
 ### LanceDB failures name the operation, the step, and the native error type (issue #490)
 
 - **A native LanceDB error was discarded at every store boundary.** A

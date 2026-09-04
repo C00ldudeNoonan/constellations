@@ -81,6 +81,10 @@ _CONTRACT_VALUE = "1"
 _CONFIG_KEY = "config_fingerprint"
 _LEGACY_CONFIG_KEY = "legacy_config_fingerprint"
 _DESCRIPTOR_KEY = "descriptor"
+# The digest the stored rows were fingerprinted under (issue #495). Absent on
+# a collection stamped before it existed, where that digest was necessarily
+# the config fingerprint.
+_ROW_FINGERPRINT_KEY = "row_fingerprint"
 
 _DISTANCE_FUNCTIONS = {
     "cosine": "array_cosine_distance",
@@ -244,6 +248,7 @@ class DuckDBStore(RetrievalStore):
                     RetrievalFeature.ATOMIC_BATCH_MUTATION,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                     RetrievalFeature.PRIVATE_GENERATION_BUILD,
+                    RetrievalFeature.COLLECTION_SEEDING,
                 }
             ),
             distance_metrics=frozenset({"cosine", "euclidean", "dot"}),
@@ -447,6 +452,7 @@ class DuckDBStore(RetrievalStore):
             physical_name=name,
             config_fingerprint=stamp.get(_CONFIG_KEY),
             descriptor=stamp.get(_DESCRIPTOR_KEY),
+            row_fingerprint=stamp.get(_ROW_FINGERPRINT_KEY),
             physical_generation=generation,
             row_count=row_count,
             schema=schema,
@@ -482,6 +488,36 @@ class DuckDBStore(RetrievalStore):
             raise RetrievalError("DuckDB collection creation was not observable")
         return created
 
+    def seed_collection(self, spec: CollectionSpec, *, source: str) -> int:
+        """Copy `source`'s rows into this generation with one INSERT SELECT.
+
+        The engine streams it, so the 11GB corpus of issue #495 never lands in
+        this process. Columns are named explicitly rather than `SELECT *`: the
+        two collections share a contract but not necessarily a column *order*,
+        and a positional copy that silently transposed two same-typed columns
+        would be undetectable.
+        """
+        # Ownership is the gate, and `inspect_collection` is where it lives:
+        # it refuses a table this store does not own rather than returning it.
+        if self.inspect_collection(source) is None:
+            raise RetrievalError(
+                f"DuckDB cannot seed from '{source}': it does not exist"
+            )
+        conn = self._connection()
+        columns = ", ".join(
+            _quote_identifier(field.name) for field in spec.arrow_schema
+        )
+        self._execute(
+            conn,
+            f"INSERT INTO {_quote_identifier(spec.physical_name)} ({columns}) "
+            f"SELECT {columns} FROM {_quote_identifier(source)}",
+            operation="seed collection",
+        )
+        seeded = self.inspect_collection(spec.physical_name)
+        if seeded is None:
+            raise RetrievalError("DuckDB collection seeding was not observable")
+        return seeded.row_count
+
     def restamp_collection(self, spec: CollectionSpec) -> None:
         self._stamp_collection(self._connection(), spec.physical_name, spec)
 
@@ -494,6 +530,7 @@ class DuckDBStore(RetrievalStore):
             _CONFIG_KEY: spec.config_fingerprint,
             _LEGACY_CONFIG_KEY: spec.legacy_config_fingerprint,
             _DESCRIPTOR_KEY: spec.descriptor,
+            _ROW_FINGERPRINT_KEY: spec.row_fingerprint,
         }
         payload = json.dumps(stamp, sort_keys=True, separators=(",", ":"))
         self._execute(

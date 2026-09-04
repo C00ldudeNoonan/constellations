@@ -48,7 +48,7 @@ def test_online_switch_appends_privately_and_preserves_readers(
 ) -> None:
     scope, resolved = _prepare(tmp_path)
     written: list[str] = []
-    real_append = LanceDBStore.append
+    real_seed = LanceDBStore.seed_collection
 
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter)
@@ -56,8 +56,12 @@ def test_online_switch_appends_privately_and_preserves_readers(
         first_reader = coordinator.acquire_query(scope)
         readers = [first_reader]
 
-        def append(self: Any, collection: str, rows: Any, **kwargs: Any) -> Any:
+        def seed(self: Any, spec: Any, *, source: str) -> int:
+            # The write the seeded path performs (issue #495): the private
+            # generation is filled from the live collection, not the warehouse.
+            collection = spec.physical_name
             assert "__g" in collection
+            assert source == self.physical_collection("context")
             entry = coordinator.status(scope)
             assert entry.status == "publishing"
             assert entry.active_generation == before.active_generation
@@ -71,16 +75,20 @@ def test_online_switch_appends_privately_and_preserves_readers(
                 original, "inflation", text_field="text", limit=2
             ).num_rows
             written.append(collection)
-            return real_append(self, collection, rows, **kwargs)
+            return real_seed(self, spec, source=source)
 
         def no_live_mutation(*args: Any, **kwargs: Any) -> Any:
+            # Nothing changed upstream, so reconciliation must skip every
+            # seeded row; a merge here would mean the copy was not recognised
+            # as current, and the corpus was about to be rewritten after all.
             pytest.fail("An online configuration change must not merge into the live index")
 
-        monkeypatch.setattr(LanceDBStore, "append", append)
+        monkeypatch.setattr(LanceDBStore, "seed_collection", seed)
         monkeypatch.setattr(LanceDBStore, "upsert", no_live_mutation)
         [result] = run_project(tmp_path, select="context_search")
-        assert result.rows_written == 2
-        assert len(written) == 2 and len(set(written)) == 1
+        # Zero: the rows were copied into the generation, not written to it.
+        assert result.rows_written == 0
+        assert len(written) == 1 and "__g" in written[0]
         after = coordinator.status(scope)
         assert after.status == "ready"
         assert after.active_collection == written[0]
@@ -102,7 +110,7 @@ def test_online_switch_appends_privately_and_preserves_readers(
     assert rerun.documents_skipped == 2
 
 
-@pytest.mark.parametrize("failure", ["append", "indexes", "memory", "killed"])
+@pytest.mark.parametrize("failure", ["seed", "indexes", "memory", "killed"])
 def test_online_failure_keeps_the_old_index_and_retry_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
@@ -111,26 +119,25 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
         coordinator = ServingCoordinator(adapter)
         before = coordinator.status(scope)
         original_state = adapter.fetch_state(scope)
-        real_append = LanceDBStore.append
-        writes = 0
+        real_seed = LanceDBStore.seed_collection
 
-        def append(self: Any, *args: Any, **kwargs: Any) -> Any:
-            nonlocal writes
-            receipt = real_append(self, *args, **kwargs)
-            writes += 1
-            if writes == 2 and failure != "indexes":
+        def seed(self: Any, spec: Any, *, source: str) -> int:
+            # The rows land in the private generation first, so the failure
+            # leaves a complete generation behind with nothing pointing at it.
+            seeded = real_seed(self, spec, source=source)
+            if failure != "indexes":
                 if failure == "memory":
                     raise MemoryError("private sentinel input must not escape")
                 if failure == "killed":
                     raise SystemExit("simulated termination without exception cleanup")
                 raise RetrievalError("simulated store failure")
-            return receipt
+            return seeded
 
         def indexes(*args: Any, **kwargs: Any) -> Any:
             raise RetrievalError("simulated index build failure")
 
         with monkeypatch.context() as patch:
-            patch.setattr(LanceDBStore, "append", append)
+            patch.setattr(LanceDBStore, "seed_collection", seed)
             if failure == "indexes":
                 patch.setattr(LanceDBStore, "ensure_indexes", indexes)
             with pytest.raises(SystemExit if failure == "killed" else RunError) as caught:
@@ -165,11 +172,29 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
     # refuses to activate a generation whose row count disagrees with the rows
     # it read, so a resume that duplicated or dropped a row would raise rather
     # than reach `ready`.
-    expected_written = 0 if failure == "indexes" else 1
+    #
+    # On the seeded path (issue #495) what a failure costs is decided by
+    # ordering: rows are copied first and their state second, so state never
+    # vouches for a row that is not there. A failure injected at the store
+    # write therefore leaves a generation with every row and no state, and the
+    # resume re-upserts both rows — idempotent on the id, so the count below
+    # still holds. Only the index-build failure leaves rows and state both
+    # landed, and writes nothing.
+    expected_written = 0 if failure == "indexes" else 2
     [retry] = run_project(tmp_path, select="context_search")
     assert retry.rows_written == expected_written
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        assert ServingCoordinator(adapter).status(scope).status == "ready"
+        recovered = ServingCoordinator(adapter).status(scope)
+        assert recovered.status == "ready"
+        assert recovered.active_collection is not None
+    assert resolved.retrieval is not None
+    with LanceDBStore(
+        resolved.retrieval.stores["primary"],
+        project_name="retrieval_demo", target_name="dev", alias="primary",
+        role=StoreRole.PUBLISH,
+    ) as store:
+        served = store.inspect_collection(recovered.active_collection)
+        assert served is not None and served.row_count == 2
 
 
 def test_online_incompatible_change_is_refused_before_claim(tmp_path: Path) -> None:
@@ -435,7 +460,11 @@ def test_online_index_type_switch_builds_the_declared_type_privately(tmp_path: P
             encoding="utf-8",
         )
         [result] = run_project(tmp_path, select="context_search")
-        assert result.rows_written == 2
+        # Zero, not two: an index-type switch reaches no row, so the new
+        # generation is seeded from the one it replaces instead of re-read
+        # from the warehouse (issue #495). The rows are all still there: the
+        # post-publication row-count validation refuses the run otherwise.
+        assert result.rows_written == 0
         current = coordinator.status(scope)
         assert current.active_collection != old.active_collection
         coordinator.validate_query(reader)

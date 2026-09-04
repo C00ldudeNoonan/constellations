@@ -55,7 +55,7 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
             text=str(chunk["text"]),
             upstream_unique_id="model.google_drive_context.drive_chunks",
             invocation_id="google-drive-context-v1",
-            chunker_identity=f"{chunk['chunk_strategy']}:600:60:v1",
+            chunker_identity=f"{chunk['chunk_strategy']}:400:0:v1",
             citation_section_path=section_path,
             parser_identity="markdown:v1",
             transform_identity="google-drive-context-chunks:v1",

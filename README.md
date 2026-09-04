@@ -10,7 +10,7 @@ build a DAG, materialize incrementally, test the results, and emit artifacts.
 `stel` is a standalone CLI rather than a dbt package or dbt adapter.
 
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
-> and BigQuery warehouses, local and GCS sources, metadata-aware deterministic
+> and BigQuery warehouses, local, GCS, and Google Drive sources, metadata-aware deterministic
 > chunk models, record-scoped incremental state, bounded projected warehouse
 > snapshots, an incremental local LanceDB search sink, classic text ML, and six
 > extraction backends. See
@@ -135,7 +135,8 @@ fitting the workflow analytics engineers already use.**
   language detection, text statistics, near-duplicate detection (MinHash), and
   PII redaction (Microsoft Presidio).
 - **Warehouse and source adapters** — DuckDB or BigQuery materialization, with
-  local files or generation-pinned GCS objects as source documents.
+  local files, generation-pinned GCS objects, or a Google Drive folder of Docs
+  and Slides as source documents.
 - **RAG and classic ML primitives** — deterministic recursive/token chunking;
   count, TF-IDF, and hashing features; and naive Bayes text classification.
 - **dbt-shaped everything** — `ref()`, `--select` / `--exclude` selectors with
@@ -155,7 +156,7 @@ fitting the workflow analytics engineers already use.**
 ```bash
 uv add stel
 # Optional cloud integrations:
-uv add 'stel[bigquery,gcs]'
+uv add 'stel[bigquery,gcs,gdrive]'
 ```
 
 ## Quickstart
@@ -169,11 +170,12 @@ uv run stel --project-dir examples/invoice_pipeline run
 uv run stel --project-dir examples/invoice_pipeline test
 ```
 
-Sixteen examples live in [`examples/`](examples/), covering
+Seventeen examples live in [`examples/`](examples/), covering
 invoices, blog posts, support tickets, arXiv quality checks, PDF and direct LLM
 extraction, classic text ML, document clustering, RAG chunks, governed SQL
-chunks, dbt handoff and embedded execution, a metric-plus-evidence agent, and
-Notion pages landed by an EL tool and rendered back into documents.
+chunks, dbt handoff and embedded execution, a metric-plus-evidence agent,
+Notion pages landed by an EL tool and rendered back into documents, and a
+Google Drive folder served as governed context over MCP.
 
 ## Security model
 

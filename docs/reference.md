@@ -200,7 +200,7 @@ rejects project-root or source/model/transform overlap, and refuses symlinked
 paths. There is no `--force` option.
 
 Running a third-party project still executes its Python transforms, custom
-tests, and post-extract hooks, and remote sources (`gs://…`) reach whatever
+tests, and post-extract hooks, and remote sources (`gs://…`, `gdrive://…`) reach whatever
 your ambient credentials allow — review projects you didn't write before
 running them.
 
@@ -1379,11 +1379,82 @@ service-account JSON in CI. User ADC may not carry a default Google Cloud
 project; set `GOOGLE_CLOUD_PROJECT` or add `project:` to the GCS source when
 project inference is unavailable.
 
+## Google Drive sources
+
+A source can point at a Google Drive folder. Drive is the one SaaS system
+with a first-party source, because it is file-grained and fits the object
+shape; everything else lands through an EL tool first (see the position on
+SaaS context above).
+
+```
+pip install 'stel[gdrive]'
+```
+
+```yaml
+sources:
+  - name: handbook
+    path: gdrive://1AbCdEfGhIjKlMnOpQrStUvWxYz   # a folder id, or a shared drive's id
+    file_pattern: "*.md"                          # Docs and Slides
+    max_objects: 2000
+  - name: handbook_pdfs
+    path: gdrive://1AbCdEfGhIjKlMnOpQrStUvWxYz
+    file_pattern: "*.pdf"                         # uploaded binaries
+```
+
+**Auth** is Application Default Credentials with the Drive read-only scope,
+the same posture as `gs://`. Locally:
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/cloud-platform
+```
+
+In CI, `GOOGLE_APPLICATION_CREDENTIALS` names a service-account key and the
+folder is shared with that account. `project:` on the source sets the quota
+project when ADC cannot. Missing credentials, or a login without the scope,
+fail at discovery with the command to run.
+
+**What is a document.** The folder is walked recursively (`recursive: false`
+lists the top level); shortcuts and trashed files are skipped. Native files
+are fetched in the format they render to and their source-relative path
+carries that extension: a Doc exports as markdown (`Name.md`) and a Slides
+deck renders to markdown with `#` for the deck and `##` per slide
+(`Name.md`), so `file_pattern: "*.md"` selects both and `headings:` on a
+`chunk:` model attributes every chunk to its section or slide. Uploaded
+files keep their names. Sheets, Forms, Drawings and other native types are
+skipped and counted in the run log. Two files with the same name in one
+folder are refused with both ids, since the path is the identity.
+`--source-filter 'Runbooks/*'` scopes by folder path and prunes the walk.
+
+**Identity: an md5, or a change token named as such.** Uploaded binaries
+list an md5, so `content_hash` is `md5:<checksum>` and the downloaded bytes
+are verified against it. Native Docs and Slides have no content hash in any
+listing; their `content_hash` is `mtime:<modifiedTime>`, a **change token**:
+every content edit moves it, so it never under-triggers on content, and a
+no-op save also moves it, so it can over-trigger and re-extract an unchanged
+document. `source_metadata.identity` says which kind a row has, and Drive's
+monotonic `version` rides beside it. `source_uri` is
+`gdrive://<fileId>#v<version>`.
+
+**Fetch pins what discovery saw.** Before exporting or downloading, the
+source re-reads the file's listing fields and refuses with "changed after
+discovery" if they moved, so a run extracts the documents it discovered or
+fails loudly. Docs use the `text/markdown` export; Slides use the Slides API
+and are rendered slide by slide (title, body with nested bullets, tables,
+speaker notes as a quoted block); binaries download and are md5-checked.
+Retryable statuses get a bounded backoff; errors carry the status and the
+operation, never a response body.
+
+See [`examples/google_drive_context/`](../examples/google_drive_context/) for
+the full path from `gcloud` sign-in to a question answered through the stel
+MCP server.
+
 ## Document extraction contract
 
 Every extraction row carries identity, lineage, and parser provenance:
 `document_id`, `source_path`, `source_uri` (local `file://` URI, or
-`gs://bucket/name#generation` for GCS), `content_hash`, `code_version`,
+`gs://bucket/name#generation` for GCS, `gdrive://<fileId>#v<version>` for
+Drive), `content_hash`, `code_version`,
 `backend_name`, `backend_version` (the parsing library's version, e.g.
 `pypdf/6.1`), and `extracted_at` (one UTC timestamp per run). Remote
 sources populate the nullable `source_metadata` JSON column.

@@ -9,8 +9,13 @@ models:
     chunk:
       strategy: recursive
       text_field: body
-      chunk_size: 600
-      chunk_overlap: 60
+      # Below a typical section's length, so a section starts its own chunk
+      # and heading attribution names it. No overlap: a chunk is attributed
+      # to the section where it *starts* (#343), and overlap would start every
+      # chunk inside the previous section's tail, so headings never name the
+      # chunk that actually holds their text.
+      chunk_size: 400
+      chunk_overlap: 0
       headings:
         pattern: '^#{1,6} (.+)$'
         column: section

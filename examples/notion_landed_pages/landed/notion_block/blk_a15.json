@@ -1,0 +1,10 @@
+{
+  "block_id": "blk_a15",
+  "page_id": "pg_3f1c9a",
+  "parent_block_id": null,
+  "position": 14,
+  "type": "code",
+  "text": "git clone git@github.com:example/monorepo.git\nmake bootstrap",
+  "checked": null,
+  "language": "bash"
+}

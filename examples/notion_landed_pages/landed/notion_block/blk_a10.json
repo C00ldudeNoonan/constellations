@@ -1,0 +1,10 @@
+{
+  "block_id": "blk_a10",
+  "page_id": "pg_3f1c9a",
+  "parent_block_id": null,
+  "position": 9,
+  "type": "to_do",
+  "text": "Add your public key to the bastion",
+  "checked": false,
+  "language": null
+}

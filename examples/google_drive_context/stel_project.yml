@@ -1,0 +1,10 @@
+name: google_drive_context
+version: "0.1.0"
+profile: google_drive_context
+
+extraction:
+  default_backend: markdown
+
+source-paths: ["sources"]
+model-paths: ["models"]
+target-path: "target"

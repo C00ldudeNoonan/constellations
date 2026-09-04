@@ -4,6 +4,7 @@ from ..config.profile import WarehouseConfig
 from ..config.source import WAREHOUSE_SOURCE_SCHEME
 from .base import DocumentRef, DocumentSource, SourceError, SourceScan
 from .gcs import GCSDocumentSource
+from .gdrive import GDRIVE_SCHEME, GoogleDriveDocumentSource
 from .local import LocalDocumentSource
 from .warehouse import WarehouseDocumentSource
 
@@ -11,6 +12,7 @@ __all__ = [
     "DocumentRef",
     "DocumentSource",
     "GCSDocumentSource",
+    "GoogleDriveDocumentSource",
     "LocalDocumentSource",
     "SourceError",
     "SourceScan",
@@ -42,4 +44,6 @@ def get_document_source(
         return WarehouseDocumentSource(warehouse, project_dir)
     if path.startswith("gs://"):
         return GCSDocumentSource()
+    if path.startswith(GDRIVE_SCHEME):
+        return GoogleDriveDocumentSource()
     return LocalDocumentSource()

@@ -1,0 +1,20 @@
+version: 2
+
+# The exported markdown carries real headings — a Doc's own, or one per slide
+# for a deck — so heading attribution gives every chunk its section.
+models:
+  - name: drive_chunks
+    description: "Heading-attributed chunks of each Drive document"
+    depends_on: [ref('drive_documents')]
+    chunk:
+      strategy: recursive
+      text_field: body
+      chunk_size: 600
+      chunk_overlap: 60
+      headings:
+        pattern: '^#{1,6} (.+)$'
+        column: section
+    materialization: incremental
+    tests:
+      - not_null: [chunk_id, document_id, text, source_path]
+      - unique: chunk_id

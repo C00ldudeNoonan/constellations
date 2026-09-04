@@ -20,6 +20,17 @@ class RetrievalError(Exception):
     """Artifact-safe retrieval failure."""
 
 
+def sanitized_retrieval_cause(error: Exception) -> RetrievalError:
+    """Retain only a native exception's type in a diagnostic-safe cause chain.
+
+    Mirrors `adapters.base.sanitized_adapter_cause`: the type name is enough
+    to tell a transient object-store error from a configuration problem, and
+    the native message — which may quote URIs, SQL, or response bodies — is
+    left behind with the traceback.
+    """
+    return RetrievalError(f"Native retrieval error type: {type(error).__name__}")
+
+
 class RetrievalConfigError(RetrievalError):
     pass
 

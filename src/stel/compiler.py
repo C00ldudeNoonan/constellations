@@ -16,6 +16,7 @@ from .config.loader import ConfigError
 from .config.model import (
     DEFAULT_VECTOR_INDEX,
     ModelConfig,
+    ModelKind,
     protect_model_llm_credential_option,
 )
 from .config.project import ProjectConfig
@@ -653,7 +654,7 @@ def _validate_model_edges(
         raise _model_error(
             model,
             f"Model '{model.name}' must declare exactly one of "
-            "extraction/transform/ml/chunk/embed/llm/search/eval",
+            f"{'/'.join(ModelKind)}",
         )
 
     has_dbt_ref = model.source is not None and is_dbt_ref(model.source)

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### LanceDB failures name the operation, the step, and the native error type (issue #490)
+
+- **A native LanceDB error was discarded at every store boundary.** A
+  `sec_chunk_search` publish wrote 3.6 million rows over four hours and then
+  died at the index step with `LanceDB operation 'index creation' failed`
+  and nothing else: no exception type, no reason, and no record of which of
+  the seven indexes it was building. The cause was unrecoverable after the
+  fact. Every wrapper now reports the native exception's type, and index
+  creation names the index it was on:
+  `LanceDB operation 'index creation' failed on BTree index for 'category'
+  [ObjectStoreError] (code=lancedb_index_failed)`. That is the difference
+  between "retry" and "stop and fix the configuration".
+- **The native message still never reaches the CLI or `run_results.json`.**
+  LanceDB quotes object-store URIs and response bodies verbatim, so the
+  message carries the type alone and the cause chain holds a traceback-free
+  `Native retrieval error type: …`, mirroring the warehouse adapters. The
+  full exception goes to the `stel.retrieval.lancedb` DEBUG log, which
+  `--verbose` never enables; attach a DEBUG handler to capture it.
+
 ### `kind:` selects a class of steps without naming or pre-tagging each (issue #494)
 
 Selection was by name, ancestry, tag, or state — never by what kind of step a
@@ -32,6 +51,12 @@ ls`'s kind column, the run-result label and the new selector all derive from
 it — the label function in `cli.py` had been a verbatim copy of the one in
 `runner.py`, so the selector would have been a third thing able to disagree
 about what a model is.
+
+So had the messages that tell you which blocks exist, and two of them were
+already wrong: `Model 'x' is missing a ...` listed seven of the eight kinds
+and `Models missing a ... block` listed six, both omitting `eval`, so a user
+who forgot a kind block was told about kinds that had been shipped for
+releases and not about one that had. They derive from `ModelKind` too now.
 
 ### A failed publish no longer discards the rows it already wrote (issue #492)
 

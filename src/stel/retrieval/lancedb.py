@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
@@ -36,10 +37,13 @@ from .base import (
     StateRetrievalTarget,
     StoreRole,
     reject_generation_shaped_collection_name,
+    sanitized_retrieval_cause,
     validate_generation_token,
 )
 from .locks import PublisherLock, default_host_lock_base
 from .registry import register
+
+log = logging.getLogger(__name__)
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
@@ -415,14 +419,15 @@ class LanceDBStore(RetrievalStore):
                 index_cache_size_bytes=index_bytes,
                 metadata_cache_size_bytes=metadata_bytes,
             )
+        failure: RetrievalError | None = None
         try:
             self._db = lancedb.connect(
                 self._config.connect_target(), **connect_kwargs
             )
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'connect' failed (code=lancedb_connect_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("connect", "lancedb_connect_failed", error)
+        if failure is not None:
+            raise failure
         return self
 
     def __exit__(
@@ -562,17 +567,18 @@ class LanceDBStore(RetrievalStore):
 
     def list_collections(self) -> tuple[str, ...]:
         db = self._connection()
+        failure: RetrievalError | None = None
         try:
             return tuple(sorted(db.list_tables().tables))
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'list' failed (code=lancedb_list_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("list", "lancedb_list_failed", error)
+        raise failure
 
     def drop_collection(self, name: str) -> bool:
         if not _COLLECTION_RE.fullmatch(name):
             raise RetrievalError("LanceDB collection name is invalid")
         db = self._connection()
+        failure: RetrievalError | None = None
         try:
             if name not in db.list_tables().tables:
                 return False
@@ -584,13 +590,13 @@ class LanceDBStore(RetrievalStore):
             return True
         except RetrievalError:
             raise
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'drop' failed (code=lancedb_drop_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("drop", "lancedb_drop_failed", error)
+        raise failure
 
     def inspect_collection(self, name: str) -> CollectionMetadata | None:
         db = self._connection()
+        failure: RetrievalError | None = None
         try:
             if name not in db.list_tables().tables:
                 return None
@@ -615,10 +621,9 @@ class LanceDBStore(RetrievalStore):
             )
         except RetrievalError:
             raise
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'inspect' failed (code=lancedb_inspect_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("inspect", "lancedb_inspect_failed", error)
+        raise failure
 
     def create_collection(self, spec: CollectionSpec) -> CollectionMetadata:
         db = self._connection()
@@ -633,12 +638,13 @@ class LanceDBStore(RetrievalStore):
         schema = _with_descriptor(
             spec.arrow_schema.with_metadata(metadata), spec
         )
+        failure: RetrievalError | None = None
         try:
             db.create_table(spec.physical_name, schema=schema)
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'create collection' failed (code=lancedb_create_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("create collection", "lancedb_create_failed", error)
+        if failure is not None:
+            raise failure
         created = self.inspect_collection(spec.physical_name)
         if created is None:
             raise RetrievalError("LanceDB collection creation was not observable")
@@ -646,6 +652,7 @@ class LanceDBStore(RetrievalStore):
 
     def restamp_collection(self, spec: CollectionSpec) -> None:
         table = self._open_owned_table(spec.physical_name)
+        failure: RetrievalError | None = None
         try:
             table.update_field_metadata(
                 {
@@ -656,10 +663,10 @@ class LanceDBStore(RetrievalStore):
                     },
                 }
             )
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'restamp' failed (code=lancedb_restamp_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("restamp", "lancedb_restamp_failed", error)
+        if failure is not None:
+            raise failure
         written = self.inspect_collection(spec.physical_name)
         if (
             written is None
@@ -678,6 +685,7 @@ class LanceDBStore(RetrievalStore):
     ) -> MutationReceipt:
         if not rows:
             return MutationReceipt(mutation_digest, True, ())
+        failure: RetrievalError | None = None
         try:
             table = self._open_owned_table(collection)
             payload = pa.Table.from_pylist([dict(row.values) for row in rows], schema=table.schema)
@@ -693,10 +701,10 @@ class LanceDBStore(RetrievalStore):
                 raise RetrievalError("LanceDB upsert acknowledgement was incomplete")
         except RetrievalError:
             raise
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'upsert' failed (code=lancedb_upsert_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("upsert", "lancedb_upsert_failed", error)
+        if failure is not None:
+            raise failure
         return MutationReceipt(
             mutation_digest,
             True,
@@ -713,6 +721,7 @@ class LanceDBStore(RetrievalStore):
     ) -> MutationReceipt:
         if not rows:
             return MutationReceipt(mutation_digest, True, ())
+        failure: RetrievalError | None = None
         try:
             table = self._open_owned_table(collection)
             expected_count = table.count_rows() + len(rows)
@@ -722,10 +731,10 @@ class LanceDBStore(RetrievalStore):
                 raise RetrievalError("LanceDB append acknowledgement was incomplete")
         except RetrievalError:
             raise
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'append' failed (code=lancedb_append_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("append", "lancedb_append_failed", error)
+        if failure is not None:
+            raise failure
         return MutationReceipt(
             mutation_digest, True, tuple(MutationOutcome("applied") for _ in rows)
         )
@@ -741,6 +750,7 @@ class LanceDBStore(RetrievalStore):
         if not record_ids:
             return MutationReceipt(mutation_digest, True, ())
         quoted = ", ".join(_sql_string(value) for value in record_ids)
+        failure: RetrievalError | None = None
         try:
             table = self._open_owned_table(collection)
             if not _COLLECTION_RE.fullmatch(id_field):
@@ -750,10 +760,10 @@ class LanceDBStore(RetrievalStore):
                 raise RetrievalError("LanceDB delete acknowledgement was incomplete")
         except RetrievalError:
             raise
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'delete' failed (code=lancedb_delete_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed("delete", "lancedb_delete_failed", error)
+        if failure is not None:
+            raise failure
         return MutationReceipt(
             mutation_digest,
             True,
@@ -761,6 +771,12 @@ class LanceDBStore(RetrievalStore):
         )
 
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
+        failure: RetrievalError | None = None
+        # Tracks which index was being built when a native error surfaced.
+        # This is the last step of a multi-hour publish and covers three index
+        # kinds; a failure that cannot say which one it was on is undiagnosable
+        # after the fact (issue #490).
+        step = "collection open"
         try:
             table = self._open_owned_table(spec.physical_name)
             if table.count_rows() == 0:
@@ -771,6 +787,7 @@ class LanceDBStore(RetrievalStore):
             index_module = import_optional_dependency(
                 "lancedb.index", extra="lancedb", feature="LanceDB retrieval"
             )
+            step = "index listing"
             indexes = list(table.list_indices())
             for field in spec.scalar_index_fields:
                 current = next(
@@ -782,6 +799,7 @@ class LanceDBStore(RetrievalStore):
                     None,
                 )
                 if current is None or current.num_unindexed_rows:
+                    step = f"BTree index for '{field}'"
                     table.create_index(
                         field,
                         config=index_module.BTree(),
@@ -798,6 +816,7 @@ class LanceDBStore(RetrievalStore):
                     None,
                 )
                 if current is None or current.num_unindexed_rows:
+                    step = f"FTS index for '{field}'"
                     table.create_index(
                         field,
                         config=index_module.FTS(),
@@ -846,6 +865,7 @@ class LanceDBStore(RetrievalStore):
                             else spec.distance_metric
                         )
                         config_class = getattr(index_module, _VECTOR_INDEX_CONFIGS[chosen])
+                        step = f"{wanted} vector index for '{spec.vector_field}'"
                         table.create_index(
                             spec.vector_field,
                             config=config_class(distance_type=metric),
@@ -862,14 +882,17 @@ class LanceDBStore(RetrievalStore):
                     # behind after a switch back would silently keep serving
                     # approximate results under a config that promises exact
                     # ones (issue #461).
+                    step = f"stale {current.index_type} vector index drop for '{spec.vector_field}'"
                     table.drop_index(current.name)
         except RetrievalError:
             # A deliberate refusal keeps its own code, as in `upsert`/`delete`.
             raise
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'index creation' failed (code=lancedb_index_failed)"
-            ) from None
+        except Exception as error:
+            failure = _operation_failed(
+                "index creation", "lancedb_index_failed", error, step=step
+            )
+        if failure is not None:
+            raise failure
         metadata = self.inspect_collection(spec.physical_name)
         if metadata is None:
             raise RetrievalError("LanceDB collection disappeared during index creation")
@@ -885,6 +908,7 @@ class LanceDBStore(RetrievalStore):
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
     ) -> pa.Table:
+        failure: RetrievalError | None = None
         try:
             table = self._open_owned_table(collection)
             _validate_query_projection(columns)
@@ -908,10 +932,13 @@ class LanceDBStore(RetrievalStore):
             if not isinstance(result, pa.Table):
                 raise RetrievalError("LanceDB vector search result is invalid")
             return result
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'vector search' failed (code=lancedb_vector_search_failed)"
-            ) from None
+        except RetrievalError:
+            raise
+        except Exception as error:
+            failure = _operation_failed(
+                "vector search", "lancedb_vector_search_failed", error
+            )
+        raise failure
 
     def text_search(
         self,
@@ -923,6 +950,7 @@ class LanceDBStore(RetrievalStore):
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
     ) -> pa.Table:
+        failure: RetrievalError | None = None
         try:
             table = self._open_owned_table(collection)
             _validate_query_projection(columns)
@@ -941,10 +969,41 @@ class LanceDBStore(RetrievalStore):
             if not isinstance(result, pa.Table):
                 raise RetrievalError("LanceDB text search result is invalid")
             return result
-        except Exception:
-            raise RetrievalError(
-                "LanceDB operation 'text search' failed (code=lancedb_text_search_failed)"
-            ) from None
+        except RetrievalError:
+            raise
+        except Exception as error:
+            failure = _operation_failed("text search", "lancedb_text_search_failed", error)
+        raise failure
+
+
+def _operation_failed(
+    operation: str,
+    code: str,
+    error: Exception,
+    *,
+    step: str | None = None,
+) -> RetrievalError:
+    """Build the artifact-safe failure for a native LanceDB error.
+
+    The message names the operation, the step it was on, and the native
+    exception's type: enough to tell a transient object-store error from a
+    resource limit or a configuration problem (issue #490). The native text is
+    never copied. LanceDB quotes object-store URIs and response bodies
+    verbatim, and this message reaches run_results.json and the CLI. The cause
+    chain carries the type alone, with no traceback, and the full exception
+    goes only to the DEBUG log, which `--verbose` never enables.
+
+    Callers raise the result *outside* their except block so the native
+    exception is not retained as `__context__` either.
+    """
+    on = f" on {step}" if step else ""
+    log.debug("LanceDB operation %r failed%s", operation, on, exc_info=error)
+    failure = RetrievalError(
+        f"LanceDB operation '{operation}' failed{on} "
+        f"[{type(error).__name__}] (code={code})"
+    )
+    failure.__cause__ = sanitized_retrieval_cause(error)
+    return failure
 
 
 def _with_descriptor(schema: pa.Schema, spec: CollectionSpec) -> pa.Schema:

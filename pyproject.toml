@@ -27,6 +27,9 @@ dependencies = [
 # inside google-cloud.
 bigquery = ["google-cloud-bigquery>=3.25", "google-cloud-bigquery-storage>=2.25"]
 gcs = ["google-cloud-storage>=2.16"]
+# Drive and Slides are four REST endpoints over an authorized session, so no
+# discovery client: google-auth for ADC and the session, requests underneath.
+gdrive = ["google-auth>=2.23", "requests>=2.31"]
 vertex = ["google-genai>=1.28"]
 lancedb = ["lancedb>=0.34,<0.35"]
 # pyjwt[crypto] is for the network transport's JWT/JWKS token verifier
@@ -47,6 +50,8 @@ all = [
     "google-cloud-bigquery>=3.25",
     "google-cloud-bigquery-storage>=2.25",
     "google-cloud-storage>=2.16",
+    "google-auth>=2.23",
+    "requests>=2.31",
     "google-genai>=1.28",
     "lancedb>=0.34,<0.35",
     "mcp>=1.27,<2",

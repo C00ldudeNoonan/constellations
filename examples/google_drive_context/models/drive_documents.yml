@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: drive_documents
+    description: "One row per Doc or Slides deck: exported markdown plus Drive lineage"
+    source: ref('drive_folder')
+    extraction:
+      backend: markdown
+      options:
+        include_body: true
+        compute_word_count: true
+    materialization: incremental
+    fields:
+      - name: body
+        data_type: string
+      - name: word_count
+        data_type: integer
+    tests:
+      - not_null: [document_id, source_path, source_uri, content_hash, body]
+      - unique: source_path

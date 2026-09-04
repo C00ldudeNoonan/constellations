@@ -1,0 +1,14 @@
+version: 2
+
+# One Drive folder, walked recursively. Docs export as markdown and Slides
+# render to markdown one heading per slide, so `*.md` selects both; uploaded
+# PDFs would be a second source with `file_pattern: "*.pdf"` and the pdf
+# backend. The folder id itself is supplied per target through `source_paths`
+# in profiles.yml.
+sources:
+  - name: drive_folder
+    description: "A Google Drive folder of Docs and Slides, read with ADC"
+    path: gdrive://replace-with-your-folder-id
+    file_pattern: "*.md"
+    max_objects: 2000
+    tags: [drive]

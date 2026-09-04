@@ -77,7 +77,7 @@ class SourceConfig(BaseModel):
 
     name: str
     description: str | None = None
-    path: str  # project-relative directory, or gs://bucket/prefix
+    path: str  # project-relative directory, gs://bucket/prefix, or gdrive://<folderId>
     project: str | None = None
     file_pattern: str = "*.json"
     recursive: bool = True

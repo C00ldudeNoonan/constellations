@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: chunk_embeddings
+    description: "Embeddings for the governed Drive chunks (offline deterministic provider)"
+    depends_on: [ref('document_chunks')]
+    embed:
+      # Offline so the example runs with no inference credentials. For real
+      # semantic search swap `provider: vertex` and add an `embedding:` block
+      # to profiles.yml; text search works either way.
+      provider: deterministic
+      model: deterministic-v1
+      text_field: text
+      id_field: context_id
+      vector_field: embedding
+      dimensions: 8
+      batch_size: 128
+    materialization: incremental
+    tests:
+      - not_null: [context_id, embedding]
+      - unique: context_id

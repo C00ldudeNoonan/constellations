@@ -1,0 +1,19 @@
+google_drive_context:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: ./target/context.duckdb
+        schema: drive
+      # The folder to read comes from the environment, so the checked-in
+      # source file never carries anyone's folder id:
+      #   export STEL_DRIVE_FOLDER=gdrive://<folderId>
+      source_paths:
+        drive_folder: "{{ env_var('STEL_DRIVE_FOLDER', 'gdrive://replace-with-your-folder-id') }}"
+      retrieval:
+        default: local
+        stores:
+          local:
+            type: lancedb
+            path: ./target/lancedb

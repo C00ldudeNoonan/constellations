@@ -2819,7 +2819,7 @@ def _backend_for_source(source: SourceConfig, models: list[ModelConfig]) -> str:
 
 
 def _is_remote_source_path(path: str) -> bool:
-    return path.startswith("gs://")
+    return path.startswith(("gs://", "gdrive://"))
 
 
 def _pick_source(sources: list[SourceConfig], name: str | None) -> SourceConfig:

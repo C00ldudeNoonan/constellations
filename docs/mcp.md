@@ -55,7 +55,8 @@ drifts the schema, on a later mixed batch. See
 `examples/agent_context_from_builtin_pipeline/` for a complete project
 (`extraction:` → `chunk:` → two thin `transform:` wrappers → `embed:` →
 `search:`) that compiles, runs, and is discoverable through
-`list_context_models`. See [Agent context contract
+`list_context_models`, and `examples/google_drive_context/` for the same
+shape over a Google Drive folder, from `gcloud` sign-in to a served answer. See [Agent context contract
 v1](architecture/agent-context-v1.md#runtime-and-artifact-integration) for why
 and how to wrap an existing extraction/chunk pipeline in a contract-emitting
 transform.

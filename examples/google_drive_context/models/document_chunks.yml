@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: document_chunks
+    description: "agent_context/v1 document_chunks, projected from drive_chunks"
+    depends_on: [ref('document_registry'), ref('drive_chunks')]
+    transform:
+      type: python
+      module: transforms.document_chunks
+    agent_context:
+      contract: agent_context/v1
+      grain: document_chunks
+    fields:
+      - name: title
+        data_type: string
+      - name: section
+        data_type: string
+      - name: source_key
+        data_type: string
+    materialization: incremental
+    tests:
+      - not_null: [context_id, chunk_id, document_version_id, text, title]
+      - unique: context_id

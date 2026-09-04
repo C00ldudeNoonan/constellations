@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: document_registry
+    description: "agent_context/v1 document_registry, projected from drive_documents"
+    depends_on: [ref('drive_documents')]
+    transform:
+      type: python
+      module: transforms.document_registry
+    agent_context:
+      contract: agent_context/v1
+      grain: document_registry
+    fields:
+      - name: title
+        data_type: string
+    materialization: full
+    tests:
+      - not_null: [document_id, document_version_id, title]
+      - unique: document_version_id

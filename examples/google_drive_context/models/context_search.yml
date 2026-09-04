@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: context_search
+    description: "Governed search over a Google Drive folder, served through stel MCP"
+    depends_on: [ref('chunk_embeddings')]
+    materialization: incremental
+    tags: [retrieval, agent-context, drive]
+    search:
+      access: governed
+      store: local
+      collection: google_drive_context
+      id_field: context_id
+      document_id_field: document_id
+      chunk_id_field: chunk_id
+      text_fields: [text]
+      return_text_fields: [text]
+      vector:
+        field: embedding
+        dimensions: 8
+        metric: cosine
+        search: exact
+        embedding: inherit
+      full_text:
+        fields: [text]
+      attributes:
+        - name: tenant_id
+          data_type: string
+          filter_role: policy
+        - name: classification
+          data_type: string
+          returned: true
+        - name: title
+          data_type: string
+          filter_role: user
+          returned: true
+        - name: section
+          data_type: string
+          filter_role: user
+          returned: true
+      display_fields: [title, section]
+      query:
+        modes: [vector, text, hybrid]
+        consistency: strong
+      on_index_change: fail
+      batch_size: 100

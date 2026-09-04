@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Google Drive as a document source, Docs and Slides included (issue #514)
+
+`path: gdrive://<folderId>` reads a Drive folder the way `gs://` reads a
+bucket: the walk lists, identity comes from the listing, and a fetch happens
+only for a document the run decided to process. Docs export as markdown and
+Slides render to markdown one heading per slide (title, nested bullets,
+tables, speaker notes), so `headings:` on the chunk model attributes every
+chunk to its section or its slide. Uploaded PDFs and other binaries keep
+their names and their listed md5, verified on download. Sheets and other
+native types are skipped and counted.
+
+Native files have no content hash in any listing, so theirs is a change token
+and is called one: `mtime:<modifiedTime>`, which every content edit moves and
+a no-op save also moves. A fetch re-reads the listing fields first and refuses
+a file that moved after discovery. Auth is Application Default Credentials
+with the Drive read scope, the same posture as GCS; `google-auth` and
+`requests` ship as the `gdrive` extra, and the four REST endpoints need no
+discovery client. Errors carry a status and an operation, never a body.
+
+`examples/google_drive_context` walks from `gcloud auth application-default
+login` through `stel run` into DuckDB to a question answered by `stel mcp
+serve`, with citations naming the document, the section or slide, and the
+`gdrive://<fileId>#v<version>` it came from. Its tests run the whole path
+against an in-memory Drive, so the default suite needs no credentials; a
+credential-gated test covers the live API. This is the one first-party SaaS
+source ADR-0006 allows, because Drive is file-grained.
 ### SaaS context: land, then render (issue #352)
 
 "Can stel read my Notion?" now has one answer, written down. stel ships no

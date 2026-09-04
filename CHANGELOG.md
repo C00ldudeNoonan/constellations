@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.17.0 - 2026-09-04
+
 ### A failed private-generation build no longer leaks its state scope (issue #502)
 
 A private search generation accumulates its publication state in a scope

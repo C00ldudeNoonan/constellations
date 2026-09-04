@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from graphlib import CycleError, TopologicalSorter
 
-from .config.model import ModelConfig
+from .config.model import ModelConfig, ModelKind
 from .config.source import SourceConfig
 from .test_specs import TestSpecError, relationship_test_targets
 
@@ -40,6 +40,12 @@ class Node:
     name: str
     kind: NodeKind
     tags: frozenset[str] = frozenset()
+    # What kind of step this is, for `kind:` selection (issue #494). None on a
+    # source, which runs nothing, and on a model declaring no kind block — a
+    # state the compiler and loader reject but the DAG can still be built in.
+    # Carried on the node rather than recomputed at selection time so the DAG
+    # answers from the same place run results do.
+    model_kind: ModelKind | None = None
 
 
 class DAGError(Exception):
@@ -81,7 +87,9 @@ class ProjectDAG:
 
         for model in models:
             kind = NodeKind.SEARCH_INDEX if model.search is not None else NodeKind.MODEL
-            self._add_node(Node(model.name, kind, frozenset(model.tags)))
+            self._add_node(
+                Node(model.name, kind, frozenset(model.tags), model.kind())
+            )
             preds: set[str] = set()
             if model.source and not is_dbt_ref(model.source):
                 # A dbt_ref('...') source is a dbt-built table resolved by dbt in
@@ -184,6 +192,7 @@ class ProjectDAG:
           - `name+`          — name plus all transitive descendants
           - `+name+`         — name plus ancestors and descendants
           - `tag:x`          — nodes tagged x
+          - `kind:embed`     — models of that kind (issue #494)
           - `state:modified` — models in `modified` (requires --state)
         Source nodes can match but are never returned (sources don't run).
 
@@ -236,6 +245,8 @@ class ProjectDAG:
             if not tag:
                 raise SelectionError(f"Empty tag in selector '{token}'")
             seeds = {n for n, node in self.nodes.items() if tag in node.tags}
+        elif body.startswith("kind:"):
+            seeds = self._kind_seeds(body[5:], token)
         else:
             if body not in self.nodes:
                 raise SelectionError(
@@ -250,6 +261,25 @@ class ProjectDAG:
             if down:
                 result |= _bfs(seed, self.successors)
         return result
+
+    def _kind_seeds(self, kind: str, token: str) -> set[str]:
+        """Nodes whose model kind is `kind`, refusing an unrecognized one.
+
+        A `kind:` that silently matched nothing would be indistinguishable from
+        a project with no models of that kind, which is the failure mode that
+        makes a typo expensive rather than obvious — `state:` already refuses
+        its unknown methods for the same reason (issue #494).
+        """
+        if not kind:
+            raise SelectionError(f"Empty kind in selector '{token}'")
+        if kind not in set(ModelKind):
+            raise SelectionError(
+                f"Unknown kind selector 'kind:{kind}'. Supported: "
+                f"{', '.join(sorted(ModelKind))}"
+            )
+        return {
+            name for name, node in self.nodes.items() if node.model_kind == kind
+        }
 
     def all_nodes_in_order(self) -> list[Node]:
         return [self.nodes[name] for name in self._sorted]

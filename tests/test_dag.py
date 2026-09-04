@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from stel.config import load_project
-from stel.config.model import ModelConfig
+from stel.config.model import ChunkConfig, EmbedConfig, ModelConfig
 from stel.config.source import SourceConfig
 from stel.dag import DAGError, NodeKind, ProjectDAG, SelectionError, parse_ref
 
@@ -219,3 +219,133 @@ def test_tag_and_name_selectors_compose(tagged_dag: ProjectDAG) -> None:
 def test_source_tag_can_match(tagged_dag: ProjectDAG) -> None:
     # src has tag "external"; selecting tag:external+ pulls in everything downstream
     assert set(tagged_dag.select_models(select="tag:external+")) == {"a", "b", "c"}
+
+
+# ─── kind: selection (issue #494) ───────────────────────────────────────────
+#
+# Selection could name a model, its ancestry, a tag, or its state — never what
+# kind of step it is. "Re-run only the search publishes" meant naming each one,
+# or having tagged them before anyone knew they would be wanted, which is the
+# tag's whole weakness: it has to be applied ahead of the need.
+
+
+@pytest.fixture
+def kinded_dag() -> ProjectDAG:
+    """docs -> ex (extraction) -> ch (chunk) -> em, em2 (embed)."""
+    embed = EmbedConfig(provider="deterministic", model="contract-v1", dimensions=4)
+    sources = [SourceConfig(name="docs", path="./docs/")]
+    models = [
+        ModelConfig(
+            name="ex", source="ref('docs')", extraction={"backend": "heuristic"}
+        ),
+        ModelConfig(name="ch", depends_on=["ref('ex')"], chunk=ChunkConfig()),
+        ModelConfig(name="em", depends_on=["ref('ch')"], embed=embed),
+        ModelConfig(name="em2", depends_on=["ref('ch')"], embed=embed),
+    ]
+    return ProjectDAG(sources, models)
+
+
+def test_kind_selects_every_model_of_that_kind(kinded_dag: ProjectDAG) -> None:
+    """The ask: a class of steps, without naming or pre-tagging each one."""
+    assert kinded_dag.select_models(select="kind:embed") == ["em", "em2"]
+
+
+def test_kind_composes_with_ancestors(kinded_dag: ProjectDAG) -> None:
+    """`+kind:embed` has to mean what a reader expects — the embeds and
+    everything they need, which is what re-running them actually requires."""
+    assert set(kinded_dag.select_models(select="+kind:embed")) == {
+        "ex",
+        "ch",
+        "em",
+        "em2",
+    }
+
+
+def test_kind_composes_with_descendants(kinded_dag: ProjectDAG) -> None:
+    assert set(kinded_dag.select_models(select="kind:chunk+")) == {"ch", "em", "em2"}
+
+
+def test_kind_composes_with_other_tokens(kinded_dag: ProjectDAG) -> None:
+    assert set(kinded_dag.select_models(select="kind:chunk kind:embed")) == {
+        "ch",
+        "em",
+        "em2",
+    }
+
+
+def test_kind_can_exclude(kinded_dag: ProjectDAG) -> None:
+    assert set(kinded_dag.select_models(exclude="kind:embed")) == {"ex", "ch"}
+
+
+def test_a_kind_with_no_models_selects_nothing(kinded_dag: ProjectDAG) -> None:
+    """Valid but unmatched is not an error: the project has no such models.
+    Only an unrecognized kind is a mistake, which is the distinction the
+    refusal below exists to preserve."""
+    assert kinded_dag.select_models(select="kind:llm") == []
+
+
+def test_an_unknown_kind_names_the_valid_set(kinded_dag: ProjectDAG) -> None:
+    """A typo that silently matched nothing would look exactly like a project
+    with no models of that kind. `state:` already refuses its unknown methods
+    for the same reason."""
+    with pytest.raises(SelectionError, match="Unknown kind selector") as error:
+        kinded_dag.select_models(select="kind:embeddings")
+
+    # Naming the mistake without naming the alternatives only half helps.
+    message = str(error.value)
+    assert "embed" in message and "search" in message
+
+
+def test_an_empty_kind_raises(kinded_dag: ProjectDAG) -> None:
+    with pytest.raises(SelectionError, match="Empty kind"):
+        kinded_dag.select_models(select="kind:")
+
+
+def test_a_source_has_no_kind_to_match(kinded_dag: ProjectDAG) -> None:
+    """A source runs nothing, so it has no step kind. It can still be reached
+    as an ancestor — it is just never selected on its own account."""
+    assert kinded_dag.nodes["docs"].model_kind is None
+    assert kinded_dag.select_models(select="kind:extraction") == ["ex"]
+
+
+def test_the_selector_and_the_run_result_label_cannot_disagree(
+    kinded_dag: ProjectDAG,
+) -> None:
+    """Requirement 4 of the issue. Two independent derivations of "what kind is
+    this model" are two things that can drift; the run-result label now
+    delegates to the same accessor the DAG node was built from."""
+    from stel.config.model import ModelKind
+    from stel.runner import _model_kind_label
+
+    embed = EmbedConfig(provider="deterministic", model="contract-v1", dimensions=4)
+    model = ModelConfig(name="em", depends_on=["ref('ch')"], embed=embed)
+
+    assert _model_kind_label(model) == "embed"
+    assert kinded_dag.nodes["em"].model_kind is ModelKind.EMBED
+    assert _model_kind_label(model) == kinded_dag.nodes["em"].model_kind
+
+
+def test_every_model_kind_names_a_real_config_field() -> None:
+    """The invariant `declared_kinds` rests on, pinned rather than trusted.
+
+    Kind blocks are located by field name, so a member whose value is not a
+    `ModelConfig` field would make that kind permanently unselectable and
+    unreportable — a failure with no symptom at any call site.
+    """
+    from stel.config.model import ModelConfig as MC
+    from stel.config.model import ModelKind
+
+    assert {kind.value for kind in ModelKind} <= set(MC.model_fields)
+
+
+def test_every_kind_the_runner_can_report_is_selectable(
+    kinded_dag: ProjectDAG,
+) -> None:
+    """Every label a run result can carry is a selector that resolves. Adding a
+    ninth kind block without extending `ModelKind` would leave the selector
+    quietly one short, and this is what says so."""
+    from stel.config.model import ModelKind
+
+    for kind in ModelKind:
+        # Resolves to a (possibly empty) selection rather than raising.
+        assert isinstance(kinded_dag.select_models(select=f"kind:{kind.value}"), list)

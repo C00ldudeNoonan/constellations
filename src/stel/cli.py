@@ -760,7 +760,16 @@ class _ResourceListRow(TypedDict):
 
 
 @cli.command(name="ls")
-@click.option("--select", "select", default=None, help="Selector expression for models.")
+@click.option(
+    "--select",
+    "select",
+    default=None,
+    help=(
+        "Selector expression for models: a name, 'name+' / '+name' for "
+        "descendants / ancestors, 'tag:x', or 'kind:x' where x is one of "
+        "extraction, transform, ml, chunk, embed, llm, search, eval."
+    ),
+)
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
 @click.option(
     "--resource-type",
@@ -838,23 +847,13 @@ def ls(
 
 
 def _model_kind(model: ModelConfig) -> str:
-    if model.extraction is not None:
-        return "extraction"
-    if model.ml is not None:
-        return "ml"
-    if model.transform is not None:
-        return "transform"
-    if model.chunk is not None:
-        return "chunk"
-    if model.embed is not None:
-        return "embed"
-    if model.llm is not None:
-        return "llm"
-    if model.search is not None:
-        return "search"
-    if model.eval is not None:
-        return "eval"
-    return "unknown"
+    """The kind column in `stel ls`.
+
+    Was a verbatim copy of the runner's label function, which is two places
+    able to disagree about what a model is — and a `kind:` selector would have
+    made a third (issue #494). Both delegate now.
+    """
+    return model.kind_label()
 
 
 @cli.command()
@@ -865,7 +864,10 @@ def _model_kind(model: ModelConfig) -> str:
     "--select",
     "select",
     default=None,
-    help="Selector expression (e.g. 'raw_invoices+', '+invoice_summary', '+name+').",
+    help=(
+        "Selector expression (e.g. 'raw_invoices+', '+invoice_summary', "
+        "'+name+', 'tag:raw', 'kind:embed')."
+    ),
 )
 @click.option(
     "--exclude", default=None, help="Selector expression for nodes to exclude."

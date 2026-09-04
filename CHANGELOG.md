@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### LanceDB failures name the operation, the step, and the native error type (issue #490)
+
+- **A native LanceDB error was discarded at every store boundary.** A
+  `sec_chunk_search` publish wrote 3.6 million rows over four hours and then
+  died at the index step with `LanceDB operation 'index creation' failed`
+  and nothing else: no exception type, no reason, and no record of which of
+  the seven indexes it was building. The cause was unrecoverable after the
+  fact. Every wrapper now reports the native exception's type, and index
+  creation names the index it was on:
+  `LanceDB operation 'index creation' failed on BTree index for 'category'
+  [ObjectStoreError] (code=lancedb_index_failed)`. That is the difference
+  between "retry" and "stop and fix the configuration".
+- **The native message still never reaches the CLI or `run_results.json`.**
+  LanceDB quotes object-store URIs and response bodies verbatim, so the
+  message carries the type alone and the cause chain holds a traceback-free
+  `Native retrieval error type: …`, mirroring the warehouse adapters. The
+  full exception goes to the `stel.retrieval.lancedb` DEBUG log, which
+  `--verbose` never enables; attach a DEBUG handler to capture it.
+
 ### `kind:` selects a class of steps without naming or pre-tagging each (issue #494)
 
 Selection was by name, ancestry, tag, or state — never by what kind of step a

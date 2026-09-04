@@ -93,6 +93,14 @@ the price of not resurrecting deletions.
   generation that activates as sound.
 - The store contract grows `COLLECTION_SEEDING` and `seed_collection()`. A
   store without it keeps the warehouse path silently — correct, only slow.
+- Seeding composes with generation resumption (#492, ADR-0003) through
+  ordering. Rows are copied first and their state second, so state never
+  vouches for a row that is not there. A failure between the two leaves a
+  complete generation with no state; a retry resumes it and re-upserts every
+  row, which is idempotent on the id and costs exactly what the failure lost.
+  A retry never seeds a generation it is resuming — an adopted one is not
+  empty — and if the adopted generation was swept meanwhile, #492's reset
+  leaves the empty target seeding wants.
 - Tests that hooked `append` to observe or fail a private build now hook
   `seed_collection`, because on this path `append` is never reached.
 

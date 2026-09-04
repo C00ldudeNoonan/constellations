@@ -172,14 +172,17 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
     # refuses to activate a generation whose row count disagrees with the rows
     # it read, so a resume that duplicated or dropped a row would raise rather
     # than reach `ready`.
+    #
+    # On the seeded path (issue #495) what a failure costs is decided by
+    # ordering: rows are copied first and their state second, so state never
+    # vouches for a row that is not there. A failure injected at the store
+    # write therefore leaves a generation with every row and no state, and the
+    # resume re-upserts both rows — idempotent on the id, so the count below
+    # still holds. Only the index-build failure leaves rows and state both
+    # landed, and writes nothing.
+    expected_written = 0 if failure == "indexes" else 2
     [retry] = run_project(tmp_path, select="context_search")
-    # Zero written on the retry, whichever way it goes. The injected failure
-    # fires after the seed has fully landed, so the orphaned generation is
-    # complete: a retry that resumes it (#492) finds every row and its state
-    # already there, and one that seeds afresh copies them again. Neither
-    # writes a row. The rows-present check below is what makes that zero a
-    # claim rather than an absence.
-    assert retry.rows_written == 0
+    assert retry.rows_written == expected_written
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         recovered = ServingCoordinator(adapter).status(scope)
         assert recovered.status == "ready"

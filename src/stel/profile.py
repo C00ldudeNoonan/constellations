@@ -457,11 +457,24 @@ def _interpolate_env_vars(value: Any, path: Path) -> Any:
         def _sub(match: re.Match[str]) -> str:
             name = match.group("name")
             env_value = os.environ.get(name)
-            if env_value is not None:
-                return env_value
             default = match.group("default")
+            if env_value:
+                return env_value
+            # Present-but-empty counts as absent *when a default was written*
+            # (issue #511). `docker compose` forwards an unset variable as
+            # `${VAR:-}`, so the container sees "" and the default never
+            # applied -- which rendered `gs:///lancedb` and failed store
+            # validation with nothing pointing at the empty variable. dbt
+            # returns the empty string here; the divergence is deliberate,
+            # because a default exists precisely to say what to use when the
+            # variable gives nothing.
             if default is not None:
                 return default
+            # Without a default an empty value is still returned verbatim, so
+            # a deliberately-empty variable keeps working and only the
+            # genuinely-unset case is an error.
+            if env_value is not None:
+                return env_value
             raise ProfileError(
                 f"{path}: env_var('{name}') is not set and has no default"
             )

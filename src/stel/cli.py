@@ -2170,6 +2170,25 @@ def serving() -> None:
     """Inspect and recover serving-readiness state for search indexes."""
 
 
+def _echo_serving_context(report: Any) -> None:
+    """Name what the command resolved, before the ledger it produced.
+
+    All three were already resolved and none of them were printed, so a
+    command that defaulted onto the wrong target rendered a clean, confident
+    answer about a store nobody had asked about (issue #511). The store
+    location is the discriminator that makes it obvious: dev is a directory,
+    prod is a bucket.
+
+    ASCII only, like the rest of the ledger output.
+    """
+    click.echo(f"target:            {report.target}")
+    click.echo(f"warehouse:         {report.warehouse}")
+    click.echo(
+        f"store:             {report.store_alias} ({report.store_type}) "
+        f"{report.store_location}"
+    )
+
+
 @serving.command("status")
 @click.argument("model_name")
 @_project_context_options
@@ -2180,7 +2199,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     from .retrieval import ServingCoordinationError
 
     try:
-        entry = _serving_status(
+        report = _serving_status(
             ctx.obj["project_dir"],
             profiles_dir=ctx.obj["profiles_dir"],
             target=ctx.obj["target"],
@@ -2190,6 +2209,15 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
         raise ConfigClickError(str(e)) from e
     except (AdapterError, ServingCoordinationError) as e:
         raise click.ClickException(str(e)) from e
+    _echo_serving_context(report)
+    if not report.had_ledger_row:
+        click.echo(
+            f"note:              no ledger row for '{model_name}' in this "
+            "warehouse. What follows is the default for an index it has "
+            "never seen, not a record of one; check --target if you expected "
+            "a published index."
+        )
+    entry = report.entry
     click.echo(f"status:            {entry.status}")
     click.echo(f"fencing_token:     {entry.fencing_token}")
     click.echo(f"active_generation: {entry.active_generation or '-'}")
@@ -2229,7 +2257,7 @@ def serving_recover(
     from .retrieval import ServingCoordinationError
 
     try:
-        entry = _serving_recover(
+        report = _serving_recover(
             ctx.obj["project_dir"],
             profiles_dir=ctx.obj["profiles_dir"],
             target=ctx.obj["target"],
@@ -2240,9 +2268,19 @@ def serving_recover(
         raise ConfigClickError(str(e)) from e
     except (AdapterError, ServingCoordinationError) as e:
         raise click.ClickException(str(e)) from e
+    _echo_serving_context(report)
+    if not report.had_ledger_row:
+        click.echo(
+            f"note:              '{model_name}' had no ledger row in this "
+            "warehouse before recovery, so this reassigned authority over a "
+            "scope that had never published. Check --target if you meant a "
+            "different store."
+        )
     click.echo(
-        f"Recovered serving scope for '{model_name}': status={entry.status}, "
-        f"fencing_token={entry.fencing_token}. Re-run `stel run` to publish."
+        f"Recovered serving scope for '{model_name}' on target "
+        f"'{report.target}': status={report.entry.status}, "
+        f"fencing_token={report.entry.fencing_token}. "
+        "Re-run `stel run` to publish."
     )
 
 

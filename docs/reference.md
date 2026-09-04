@@ -390,7 +390,7 @@ stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--out
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
-stel serving recover <search-index> --owner-terminated   # explicit authority reassignment after a crash
+stel serving recover <search-index> --target T --owner-terminated  # explicit authority reassignment after a crash
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
 stel suggest dbt --from RELATION --dbt-project DIR       # propose `description:` for under-documented dbt models
 stel providers list [--output {table,json}]              # built-in + entry-point providers, incompatible plugins flagged
@@ -776,6 +776,15 @@ my_project:
 
 Lookup order: `--profiles-dir` flag → `$STEL_PROFILES_DIR` →
 `<project>/profiles.yml` → `~/.stel/profiles.yml`.
+
+An `env_var('NAME', 'default')` applies its default when the variable is unset
+**or set to an empty string**. This diverges from dbt, which returns the empty
+string, and it is deliberate: `docker compose` forwards an unset variable as
+`${NAME:-}`, so a container sees `""` and the default never applies. That
+rendered a store path of `gs:///lancedb` and failed validation with nothing
+pointing at the empty variable (issue #511). `env_var('NAME')` with no default
+still returns an empty value verbatim, so a deliberately-empty variable keeps
+working and only a genuinely unset one is an error.
 
 Set `api_key_env` to the name of the credential variable itself, as above; do
 not wrap it in `env_var()`. stel deliberately rejects secret-value
@@ -2794,8 +2803,31 @@ before confirming `--owner-terminated`, then explicitly reassign authority:
 
 ```bash
 stel serving status chunk_search     # ledger status, fence, counts, leases
-stel serving recover chunk_search --owner-terminated
+stel serving recover chunk_search --target prod --owner-terminated
 ```
+
+**Both commands name what they resolved**, because the ledger alone does not
+identify it:
+
+```
+target:            prod
+warehouse:         bigquery my-proj.stel
+store:             primary (lancedb) gs://my-bucket/lancedb
+status:            ready
+```
+
+`--target` is **required** for `recover`. It advances the fencing token and
+marks the scope failed, and a defaulted target is how that lands on the wrong
+store: a production incident saw `status` report a clean `unpublished` and
+`recover` report success, both against a dev target whose store is a local
+directory, while the prod scope stayed stranded (issue #511). Without
+`--target` the command refuses and names the target it would have used, so
+confirming is one edit.
+
+`status` also distinguishes "this index is unpublished" from "this warehouse
+has no row for it". The second prints a `note:` line, because an empty result
+rendered as `unpublished` reads as a settled fact about the index rather than
+as a lookup against a store that has never heard of it.
 
 Recovery advances the fencing token (so a surviving zombie fails its next
 check) and clears leases. It grants nobody publication authority — a new

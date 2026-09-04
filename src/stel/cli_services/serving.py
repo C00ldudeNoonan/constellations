@@ -9,6 +9,7 @@ vector-store backend.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,13 +24,36 @@ if TYPE_CHECKING:
     from ..retrieval import ServingLedgerEntry
 
 
+@dataclass(frozen=True)
+class ServingReport:
+    """A ledger entry plus which target and store it was read from.
+
+    The entry alone is ambiguous: `status=unpublished` is equally true of the
+    index you meant and of a target that has never heard of it, and
+    "Recovered serving scope for 'x'" is equally true of dev and prod. Naming
+    the resolution is what makes acting on the wrong one self-evident
+    (issue #511).
+    """
+
+    entry: ServingLedgerEntry
+    target: str
+    warehouse: str
+    store_alias: str
+    store_type: str
+    store_location: str
+    # Whether a ledger row existed *before* this command ran. False alongside a
+    # `status=unpublished` entry means this warehouse has no record of the
+    # index at all, which is the shape a wrong-target lookup takes.
+    had_ledger_row: bool
+
+
 def _resolve_serving_scopes(
     project_dir: Path,
     *,
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> tuple[Any, Any, ResolvedProfile]:
+) -> tuple[Any, Any, ResolvedProfile, tuple[str, str, str]]:
     """Resolve the current and pre-#355 retrieval-publish scopes for an index.
 
     Domain failures (unknown index, no retrieval config, unavailable store)
@@ -64,6 +88,7 @@ def _resolve_serving_scopes(
     )
     logical = model.search.collection or model.name
     state_target = store.state_descriptor(logical)
+    context = (alias, store_config.type, store_config.storage_location())
     scope = StateScope.for_target_descriptor(
         model.name,
         stage="retrieval_publish",
@@ -74,7 +99,7 @@ def _resolve_serving_scopes(
         stage="retrieval_publish",
         descriptor=state_target.legacy_descriptor(),
     )
-    return scope, legacy_scope, resolved
+    return scope, legacy_scope, resolved, context
 
 
 def resolve_serving_scope(
@@ -85,7 +110,7 @@ def resolve_serving_scope(
     model_name: str,
 ) -> tuple[Any, ResolvedProfile]:
     """The current (logical-keyed) serving scope for one search index."""
-    scope, _legacy, resolved = _resolve_serving_scopes(
+    scope, _legacy, resolved, _context = _resolve_serving_scopes(
         project_dir,
         profiles_dir=profiles_dir,
         target=target,
@@ -100,15 +125,21 @@ def serving_status(
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> ServingLedgerEntry:
+) -> ServingReport:
     """Read the publication ledger for one search index."""
     from ..retrieval import ServingCoordinator
 
-    scope, resolved = resolve_serving_scope(
+    scope, _legacy, resolved, context = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-        return ServingCoordinator(adapter).status(scope)
+        coordinator = ServingCoordinator(adapter)
+        return _report(
+            coordinator.status(scope),
+            resolved=resolved,
+            context=context,
+            had_ledger_row=coordinator.scope_exists(scope),
+        )
 
 
 def serving_recover(
@@ -118,18 +149,58 @@ def serving_recover(
     target: str | None,
     model_name: str,
     owner_terminated: bool,
-) -> ServingLedgerEntry:
+) -> ServingReport:
     """Reassign serving authority, advancing the fencing token and clearing
-    leases. Refused unless the caller confirms the old owner was terminated."""
+    leases. Refused unless the caller confirms the old owner was terminated,
+    and unless they named the target explicitly."""
     from ..retrieval import ServingCoordinator
 
-    scope, resolved = resolve_serving_scope(
+    scope, _legacy, resolved, context = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
-    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-        return ServingCoordinator(adapter).recover(
-            scope, owner_terminated=owner_terminated
+    if target is None:
+        # Resolution above is a read, so this refuses before anything moves
+        # -- and it can name the default the caller would otherwise have
+        # got. `--owner-terminated` already treats this as an operation
+        # worth confirming; inferring *which store* to confirm it against
+        # undoes that care, and did (issue #511).
+        raise ConfigClickError(
+            "'stel serving recover' requires an explicit --target: it "
+            "advances the fencing token and marks the scope failed, so it "
+            "must not act on a target nobody named. This profile would "
+            f"have used '{resolved.target_name}' (store {context[0]}: "
+            f"{context[1]} {context[2]}). Re-run with --target "
+            f"{resolved.target_name} to confirm that is the one you mean."
         )
+    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+        coordinator = ServingCoordinator(adapter)
+        had_row = coordinator.scope_exists(scope)
+        entry = coordinator.recover(scope, owner_terminated=owner_terminated)
+        return _report(
+            entry, resolved=resolved, context=context, had_ledger_row=had_row
+        )
+
+
+def _report(
+    entry: ServingLedgerEntry,
+    *,
+    resolved: ResolvedProfile,
+    context: tuple[str, str, str],
+    had_ledger_row: bool,
+) -> ServingReport:
+    alias, store_type, location = context
+    return ServingReport(
+        entry=entry,
+        target=resolved.target_name,
+        warehouse=(
+            f"{resolved.warehouse.type} "
+            f"{resolved.warehouse.storage_location()}".strip()
+        ),
+        store_alias=alias,
+        store_type=store_type,
+        store_location=location,
+        had_ledger_row=had_ledger_row,
+    )
 
 
 def serving_migrate_scope(
@@ -152,7 +223,7 @@ def serving_migrate_scope(
     """
     from ..retrieval import ServingCoordinator
 
-    scope, legacy_scope, resolved = _resolve_serving_scopes(
+    scope, legacy_scope, resolved, _context = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
     if scope.target_identity == legacy_scope.target_identity:

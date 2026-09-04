@@ -293,6 +293,9 @@ class LanceDBConfig(RetrievalStoreConfig):
         """The string handed to `lancedb.connect()`."""
         return self.path
 
+    def storage_location(self) -> str:
+        return self.path
+
     def local_data_path(self) -> Path:
         """Filesystem path for local-disk operations (mkdir, co-located lock).
 

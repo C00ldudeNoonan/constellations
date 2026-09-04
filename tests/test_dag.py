@@ -338,6 +338,57 @@ def test_every_model_kind_names_a_real_config_field() -> None:
     assert {kind.value for kind in ModelKind} <= set(MC.model_fields)
 
 
+def test_the_kind_vocabulary_is_pinned() -> None:
+    """A tripwire for the direction the check above cannot cover.
+
+    "Every `ModelKind` is a real field" is mechanical; "every kind block is a
+    `ModelKind`" is not, because nothing marks a field as a kind block — a new
+    `rerank:` block would simply be invisible to selection, labelled
+    "unknown", and left out of every error message that lists the options,
+    with nothing failing.
+
+    Three of those messages were *already* drifted when this was written:
+    `loader.py` and `model.py` both omitted `eval`, so an operator who forgot
+    a kind block was told about seven of the eight. They derive from
+    `ModelKind` now, which means adding a member fixes them all — and this
+    assertion is what makes adding one a deliberate act rather than a silent
+    one.
+    """
+    from stel.config.model import ModelKind
+
+    assert [kind.value for kind in ModelKind] == [
+        "extraction",
+        "transform",
+        "ml",
+        "chunk",
+        "embed",
+        "llm",
+        "search",
+        "eval",
+    ]
+
+
+def test_every_message_listing_the_kinds_lists_all_of_them() -> None:
+    """The messages that name the options must name all of them.
+
+    This is the same single-source requirement as the selector and the label,
+    one layer out: a user who declares no kind block learns what they could
+    have declared from these strings, so an incomplete one is wrong in the
+    place it is most likely to be read.
+    """
+    from stel.config.model import ModelFile, ModelKind
+
+    expected = "/".join(ModelKind)
+    assert "eval" in expected
+
+    # A bare ModelConfig declares no kind block; ModelFile is what refuses it,
+    # and its message is where a user learns what they could have declared.
+    with pytest.raises(ValueError, match="eval") as error:
+        ModelFile(models=[ModelConfig(name="nokind")])
+
+    assert expected in str(error.value)
+
+
 def test_every_kind_the_runner_can_report_is_selectable(
     kinded_dag: ProjectDAG,
 ) -> None:

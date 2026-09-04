@@ -565,3 +565,62 @@ def test_sweeping_an_orphaned_generation_clears_its_scope(
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         assert _generation_scope_rows(adapter, orphan) == 0
         assert ServingCoordinator(adapter).status(scope).status == "ready"
+
+
+# ─── an interrupted in-place publish is re-entered, not redone (issue #493) ─
+
+
+def test_an_interrupted_in_place_publish_resumes_from_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The common path. #474 and #498 settled re-entry for private generations;
+    this is the ordinary incremental publish with an unchanged configuration,
+    which writes in place and advances state per page. Killed between two
+    pages, the next run must pay for the page that was lost and nothing else:
+    rows whose state advanced are not republished (issue #493, part 2)."""
+    _write_project(tmp_path)
+    path = tmp_path / "models" / "retrieval.yml"
+    text = path.read_text(encoding="utf-8")
+    assert "batch_size: 2" in text
+    path.write_text(text.replace("batch_size: 2", "batch_size: 1"), encoding="utf-8")
+    _materialize_upstream(tmp_path, _rows())
+    [first] = run_project(tmp_path, select="context_search")
+    assert first.rows_written == 2
+
+    # Every upstream row changes, so the next publish has two pages of work.
+    _materialize_upstream(tmp_path, _rows().with_columns(pl.lit("edited").alias("title")))
+    scope, resolved = resolve_serving_scope(
+        tmp_path, profiles_dir=None, target=None, model_name="context_search"
+    )
+    real_upsert = LanceDBStore.upsert
+    writes = 0
+
+    def upsert(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal writes
+        receipt = real_upsert(self, *args, **kwargs)
+        writes += 1
+        # The second page, after the first page's write *and* its state have
+        # both landed. Failing inside the first upsert would leave that page
+        # written but unrecorded, and rule 2 of the checkpoint contract says
+        # an unrecorded page is redone — which is correct, and not re-entry.
+        if writes == 2:
+            raise RetrievalError("simulated store failure on the second page")
+        return receipt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LanceDBStore, "upsert", upsert)
+        with pytest.raises(RunError):
+            run_project(tmp_path, select="context_search")
+
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        # One page landed and its state advanced; the other did not.
+        state = adapter.fetch_state(scope)
+        assert len(state) == 2
+
+    [retry] = run_project(tmp_path, select="context_search")
+    assert retry.rows_written == 1, (
+        "the retry republished a page whose state had already advanced: the "
+        "in-place publish is not re-enterable"
+    )
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        assert ServingCoordinator(adapter).status(scope).status == "ready"

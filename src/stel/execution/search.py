@@ -927,20 +927,52 @@ def _seed_generation(
     log.info("%s: seeding a private generation from %s", model_name, source)
     store.create_collection(spec)
     seeded = store.seed_collection(spec, source=source)
-    # Copied page by page rather than through `replace_state_scope`, whose
-    # fence is checked against the serving ledger: a generation scope has no
-    # ledger entry of its own, so that check reports the publisher's authority
-    # as reassigned. The claim is still verified per page, which is the same
-    # protection the publish loop applies to its own state writes.
+    _seed_publication_state(
+        adapter,
+        coordinator,
+        serving_scope=serving_scope,
+        publish_scope=publish_scope,
+        lease=lease,
+        page_size=page_size,
+        code_version=code_version,
+    )
+    return seeded
+
+
+def _seed_publication_state(
+    adapter: WarehouseAdapter,
+    coordinator: ServingCoordinator,
+    *,
+    serving_scope: StateScope,
+    publish_scope: StateScope,
+    lease: PublishLease,
+    page_size: int,
+    code_version: str,
+) -> int:
+    """Copy the serving scope's publication state into a generation's, by page.
+
+    Returns the number of records copied. Its own function, with no store in
+    the signature, so the BigQuery pre-release gate can run exactly this
+    sequence against a real warehouse (issue #505): on the corpus #495 exists
+    for it is 3.6M state rows through paged MERGEs, which #431 showed full-scan
+    an unclustered `stel_state`.
+
+    Copied page by page rather than through `replace_state_scope`, whose fence
+    is checked against the serving ledger: a generation scope has no ledger
+    entry of its own, so that check reports the publisher's authority as
+    reassigned. The claim is still verified per page, which is the same
+    protection the publish loop applies to its own state writes.
+
+    Restamped to this run's code version, which is the whole claim being made:
+    the change was classified as reaching no row, so a row carried over is
+    current under the new configuration. Leaving the old version would mark
+    every row changed — reconciliation compares it alongside the fingerprint —
+    and the build would rewrite the corpus it had just copied.
+    """
+    copied = 0
     with adapter.state_page_reader(serving_scope, page_size=page_size) as reader:
         for batch in _state_batches(reader):
             coordinator.verify_publish(lease)
-            # Restamped to this run's code version, which is the whole claim
-            # being made: the change was classified as reaching no row, so a
-            # row carried over is current under the new configuration. Leaving
-            # the old version would mark every row changed — reconciliation
-            # compares it alongside the fingerprint — and the build would
-            # rewrite the corpus it had just copied.
             adapter.upsert_state(
                 publish_scope,
                 [
@@ -948,7 +980,8 @@ def _seed_generation(
                     for record in batch
                 ],
             )
-    return seeded
+            copied += len(batch)
+    return copied
 
 
 def _activate_generation(

@@ -16,7 +16,13 @@ from pathlib import Path
 
 import pytest
 
-from stel.adapters import StateScope, create_adapter, parse_warehouse_config
+from stel.adapters import (
+    StateRecord,
+    StateScope,
+    WarehouseAdapter,
+    create_adapter,
+    parse_warehouse_config,
+)
 from stel.adapters.bigquery import BigQueryAdapter
 from stel.retrieval import ServingCoordinator
 from stel.retrieval.coordination import STATUS_DEGRADED, STATUS_READY, ServingBusyError
@@ -147,6 +153,126 @@ def test_the_ledger_protocol_on_bigquery() -> None:
     try:
         with adapter:
             exercise_ledger_protocol(ServingCoordinator(adapter))
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+# ─── the state half of a seeded generation (issues #495, #505) ───────────────
+#
+# `_seed_publication_state` pages the serving scope's state out of stel_state
+# and upserts it into the new generation's scope — deliberately not through
+# `replace_state_scope`, whose fence checks a ledger entry a generation scope
+# does not have. On the 3.6M-row corpus #495 exists for, that is 3.6M state
+# rows through paged MERGEs, which #431 showed full-scan an unclustered
+# stel_state. A new BigQuery operation needs a live test in this file before
+# it ships (docs/release.md); this is that test, run on DuckDB always and on
+# BigQuery when STEL_BQ_TEST_PROJECT is set.
+#
+# What "bounded" means here, stated so nobody expects more of it: the gate
+# asserts residency — every page the seed hands to upsert_state is at most the
+# page size, and there are exactly as many as the scope needs — which is the
+# form the bounded-memory tests use, and the one failure mode a scratch-sized
+# scope can detect. It cannot detect an unclustered full scan by cost:
+# BigQuery bills a 10MB minimum per table per job, so at this size a clustered
+# and an unclustered MERGE bill identically. #431's clustering is pinned where
+# it is applied, in the state-table DDL.
+
+_SEED_ROWS = 2_500
+_SEED_PAGE = 1_000  # three pages: two full, one short
+
+
+def exercise_state_seeding(adapter: WarehouseAdapter, coordinator: ServingCoordinator) -> None:
+    """Seed a generation scope from a serving scope, exactly as a publish does."""
+    from stel.execution.search import _generation_state_scope, _seed_publication_state
+
+    serving = _scope("seed_live")
+    source = [StateRecord(f"k{i:06d}", f"fp{i:06d}", "v1") for i in range(_SEED_ROWS)]
+    adapter.upsert_state(serving, source)
+    lease = coordinator.acquire_publish(
+        serving,
+        expected_code_version="v2",
+        config_fingerprint="cfg2",
+        preserves_active_generation=True,
+    )
+    generation = _generation_state_scope("seed_live", "seed_live__gseed")
+
+    # Observe every page the seed writes, through the adapter it actually
+    # writes with. An instance attribute shadows the bound method and is
+    # removed afterwards, so the adapter is unchanged for the assertions.
+    pages: list[int] = []
+    real_upsert = adapter.upsert_state
+
+    def observed(scope: StateScope, records: list[StateRecord]) -> None:
+        if scope == generation:
+            pages.append(len(records))
+        real_upsert(scope, records)
+
+    adapter.upsert_state = observed  # type: ignore[method-assign]
+    try:
+        copied = _seed_publication_state(
+            adapter,
+            coordinator,
+            serving_scope=serving,
+            publish_scope=generation,
+            lease=lease,
+            page_size=_SEED_PAGE,
+            code_version="v2",
+        )
+    finally:
+        del adapter.upsert_state
+
+    assert copied == _SEED_ROWS
+    # Residency is bounded by the page, not the scope: a regression to loading
+    # the whole scope at once shows up here as one page carrying every row.
+    assert pages == [_SEED_PAGE, _SEED_PAGE, _SEED_ROWS - 2 * _SEED_PAGE], pages
+
+    # The seeded scope matches the source exactly, restamped to the new code
+    # version, and the source itself is untouched.
+    original = adapter.fetch_state(serving)
+    seeded = adapter.fetch_state(generation)
+    assert len(original) == _SEED_ROWS
+    assert set(seeded) == set(original)
+    assert all(
+        seeded[key].input_fingerprint == original[key].input_fingerprint for key in original
+    )
+    assert {value.code_version for value in seeded.values()} == {"v2"}
+    assert {value.code_version for value in original.values()} == {"v1"}
+
+    coordinator.mark_ready(
+        lease,
+        active_generation="gseed",
+        config_fingerprint="cfg2",
+        counts=(0, 0, _SEED_ROWS, 0),
+        active_collection="seed_live__gseed",
+    )
+    assert coordinator.status(serving).status == STATUS_READY
+
+
+def test_state_seeding_on_duckdb(tmp_path: Path) -> None:
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "seed.duckdb"), "schema": "main"}
+    )
+    with create_adapter(config) as adapter:
+        exercise_state_seeding(adapter, ServingCoordinator(adapter))
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_state_seeding_on_bigquery() -> None:
+    """The same sequence on the warehouse the #495 publish actually runs on."""
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "stel_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(config)
+    try:
+        with adapter:
+            exercise_state_seeding(adapter, ServingCoordinator(adapter))
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()

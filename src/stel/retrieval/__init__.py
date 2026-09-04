@@ -17,6 +17,7 @@ from .base import (
     SafeRetrievalTarget,
     StateRetrievalTarget,
     StoreRole,
+    sanitized_retrieval_cause,
 )
 from .coordination import (
     PublishLease,
@@ -94,6 +95,7 @@ __all__ = [
     "list_store_types",
     "parse_store_config",
     "rebuild_required",
+    "sanitized_retrieval_cause",
     "semantic_search_config",
     "store_class",
 ]

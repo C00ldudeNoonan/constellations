@@ -622,6 +622,15 @@ and traceback frames that the user-facing error path scrubs but a raw
 log stream would not — attach your own DEBUG handler if you need it for
 troubleshooting.
 
+A LanceDB store failure is reported with the operation, the step it was on,
+and the native exception's type, for example
+`LanceDB operation 'index creation' failed on BTree index for 'category'
+[ObjectStoreError] (code=lancedb_index_failed)`. The native message itself
+never reaches the CLI or `run_results.json`, because LanceDB quotes
+object-store URIs and response bodies verbatim; the error's cause chain holds
+only `Native retrieval error type: …`. The full native exception is logged at
+DEBUG on the `stel.retrieval.lancedb` logger.
+
 Under verbose, each incremental publication also emits safe telemetry
 (issue #292) — the progress reporter renders it on a TTY, the INFO log carries
 it on a captured/orchestrator run. DuckDB reports the relation, row count and

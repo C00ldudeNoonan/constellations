@@ -1279,12 +1279,50 @@ keep answering approximately under a configuration promising exact results
 
 Atomic replacement has these semantics:
 
-1. Build a new private generation that cannot receive production queries.
+1. Build into a private generation that cannot receive production queries —
+   resuming one an earlier attempt left behind, if there is one (below).
 2. Validate schema, count, required indexes, policy fields, and readiness.
 3. Atomically activate the new generation under the logical collection.
 4. Atomically replace the warehouse state snapshot.
 5. Mark the publication ledger ready, then retire the previous generation
    according to adapter retention policy.
+
+#### Resuming an abandoned generation (issue #492)
+
+A build that writes its rows and then fails before activating — an index build
+that hits a transient error, a publisher that is killed — leaves a collection
+that is complete and correct and that nothing can reach. The ledger never
+learned its name, so the next run minted a fresh token and the retirement sweep
+deleted it. On a 3.6M-row corpus that discarded 4.2 hours of correct writes to
+recover from a six-second failure in the last step, every time it happened.
+
+A rebuild now looks for such a generation before minting a new token, and
+adopts it when its stored configuration fingerprint equals the one this run
+publishes under. That fingerprint covers the search payload and the store type
+and not the collection name, so it identifies a build of the same configuration
+whatever random token it was given. Where several match, the one holding the
+most rows wins; the rest are swept as usual, and the sweep is told to spare the
+one being built into.
+
+Three properties make resuming safe rather than merely cheap:
+
+- **The rows are not trusted; the generation's publication state is.** State
+  advances only after a write lands, so it is never ahead of the store.
+  Reconciliation republishes everything state does not vouch for and removes
+  what the upstream no longer has, so what is skipped is only what state and
+  store agree on.
+- **A resumed generation is written with upsert, not append.** Append is the
+  fast path for a collection this run created, which is empty by construction.
+  A resumed one may hold a row whose state never advanced, and appending it
+  again would duplicate it; upsert is idempotent on the id.
+- **The post-publication row count still decides.** It compares the
+  collection against the rows this run *read* from the upstream, not the rows
+  it wrote, so it is unchanged by resuming — a resume that duplicated or
+  dropped a row fails validation instead of activating.
+
+Adoption happens before this run holds the publish claim, so a concurrent
+publisher can sweep the candidate in between. The publish detects that its
+adopted collection is gone, clears the stale state, and rebuilds in full.
 
 Step 4 requires an independently advertised warehouse capability for an atomic,
 fence-checked replacement of every state row in a scope. Per-record CRUD from

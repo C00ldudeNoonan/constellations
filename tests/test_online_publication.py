@@ -155,8 +155,19 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
         coordinator.validate_query(reader)
         coordinator.release_query(reader)
 
+    # The retry resumes the generation the failed attempt left behind instead
+    # of building a new one, so rows that were already published stay
+    # published and only what the failure actually cost is redone (issue
+    # #492). `indexes` is the production case: every row landed, the index
+    # build failed, and the retry writes nothing at all.
+    #
+    # Nothing here has to assert the collection came out right — the publish
+    # refuses to activate a generation whose row count disagrees with the rows
+    # it read, so a resume that duplicated or dropped a row would raise rather
+    # than reach `ready`.
+    expected_written = 0 if failure == "indexes" else 1
     [retry] = run_project(tmp_path, select="context_search")
-    assert retry.rows_written == 2
+    assert retry.rows_written == expected_written
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         assert ServingCoordinator(adapter).status(scope).status == "ready"
 
@@ -238,11 +249,13 @@ def test_retirement_waits_for_readers_of_superseded_generations(tmp_path: Path) 
             assert retire_superseded_generations(
                 store, logical_collection="context", active_collection=current.active_collection,
                 coordinator=coordinator, lease=claim,
+            spare=None,
             ) == []
             coordinator.release_query(reader)
             assert before.active_collection in retire_superseded_generations(
                 store, logical_collection="context", active_collection=current.active_collection,
                 coordinator=coordinator, lease=claim,
+            spare=None,
             )
             assert store.inspect_collection(current.active_collection) is not None
 

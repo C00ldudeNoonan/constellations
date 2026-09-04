@@ -52,6 +52,7 @@ from stel.retrieval import (
     create_store,
 )
 from stel.retrieval.retention import (
+    resumable_generation,
     retire_superseded_generations,
     superseded_generations,
 )
@@ -1611,7 +1612,7 @@ def test_drop_collection_refuses_a_collection_stel_does_not_own(
 # ─── generation retirement (issue #355) ─────────────────────────────────────
 
 
-def _make_collection(store: Any, name: str) -> None:
+def _make_collection(store: Any, name: str, *, fingerprint: str = "cfg1") -> None:
     store.create_collection(
         CollectionSpec(
             logical_name="ctx",
@@ -1627,7 +1628,7 @@ def _make_collection(store: Any, name: str) -> None:
             distance_metric=None,
             vector_search="exact",
             vector_index=None,
-            config_fingerprint="cfg1",
+            config_fingerprint=fingerprint,
             descriptor="{}",
             legacy_config_fingerprint="legacy1",
             arrow_schema=pa.schema(
@@ -1696,6 +1697,7 @@ def test_retirement_spares_the_active_generation(tmp_path: Path) -> None:
             active_collection=active,
             coordinator=coordinator,
             lease=lease,
+        spare=None,
         )
 
         assert retired == [superseded]
@@ -1717,6 +1719,7 @@ def test_retirement_is_idempotent(tmp_path: Path) -> None:
             active_collection=active,
             coordinator=coordinator,
             lease=lease,
+        spare=None,
         )
         second = retire_superseded_generations(
             store,
@@ -1724,6 +1727,7 @@ def test_retirement_is_idempotent(tmp_path: Path) -> None:
             active_collection=active,
             coordinator=coordinator,
             lease=lease,
+        spare=None,
         )
         assert len(first) == 1
         assert second == []
@@ -1746,6 +1750,7 @@ def test_retirement_does_not_reach_another_logical_collection(
             active_collection=None,
             coordinator=coordinator,
             lease=lease,
+        spare=None,
         )
         assert retired == [mine]
         assert theirs in store.list_collections()
@@ -1817,6 +1822,7 @@ def test_retirement_aborts_when_the_publish_lease_is_stale(
                 active_collection=None,
                 coordinator=coordinator,
                 lease=lease,
+            spare=None,
             )
         assert superseded in store.list_collections()
 
@@ -2280,3 +2286,127 @@ def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None
     )["output"]["serving_resource"]
     assert resource["schema_version"] == 2
     assert resource["vector"]["index"] == "ivf_pq"
+
+
+# ─── resuming a generation a failed publish left behind (issue #492) ────────
+
+
+def test_a_generation_built_under_this_configuration_is_resumable(
+    tmp_path: Path,
+) -> None:
+    """The whole point: a build that wrote its rows and died before activating
+    is correct and complete, and nothing could reach it.
+
+    In production this was 3,613,979 rows and 4.2 hours, discarded to recover
+    from a six-second failure in the index step.
+    """
+    store = _gen_store(tmp_path)
+    with store:
+        active = store.physical_collection("ctx", generation="a1b2")
+        orphan = store.physical_collection("ctx", generation="c3d4")
+        _make_collection(store, active)
+        _make_collection(store, orphan, fingerprint="cfg1")
+
+        found = resumable_generation(
+            store,
+            logical_collection="ctx",
+            active_collection=active,
+            config_fingerprint="cfg1",
+        )
+
+    assert found == orphan
+
+
+def test_a_generation_from_another_configuration_is_not_resumable(
+    tmp_path: Path,
+) -> None:
+    """Resuming across a configuration change would publish rows shaped for a
+    configuration nobody asked for, under the fingerprint of one they did."""
+    store = _gen_store(tmp_path)
+    with store:
+        active = store.physical_collection("ctx", generation="a1b2")
+        stale = store.physical_collection("ctx", generation="c3d4")
+        _make_collection(store, active)
+        _make_collection(store, stale, fingerprint="a-different-config")
+
+        assert (
+            resumable_generation(
+                store,
+                logical_collection="ctx",
+                active_collection=active,
+                config_fingerprint="cfg1",
+            )
+            is None
+        )
+
+
+def test_the_active_generation_is_never_resumed_into(tmp_path: Path) -> None:
+    """It is serving. Writing a rebuild into it is the in-place mutation
+    private generations exist to avoid."""
+    store = _gen_store(tmp_path)
+    with store:
+        active = store.physical_collection("ctx", generation="a1b2")
+        _make_collection(store, active, fingerprint="cfg1")
+
+        assert (
+            resumable_generation(
+                store,
+                logical_collection="ctx",
+                active_collection=active,
+                config_fingerprint="cfg1",
+            )
+            is None
+        )
+
+
+def test_the_generation_holding_the_most_rows_wins(tmp_path: Path) -> None:
+    """Two candidates means two abandoned attempts. The further along one
+    saves more, and the other is swept as usual."""
+    store = _gen_store(tmp_path)
+    with store:
+        active = store.physical_collection("ctx", generation="a1b2")
+        fewer = store.physical_collection("ctx", generation="c3d4")
+        more = store.physical_collection("ctx", generation="e5f6")
+        _make_collection(store, active)
+        for name, count in ((fewer, 2), (more, 5)):
+            _make_collection(store, name, fingerprint="cfg1")
+            store.append(
+                name,
+                _rows_for(range(count), body="row"),
+                id_field="id",
+                mutation_digest=f"digest-{name}",
+            )
+
+        found = resumable_generation(
+            store,
+            logical_collection="ctx",
+            active_collection=active,
+            config_fingerprint="cfg1",
+        )
+
+    assert found == more
+
+
+def test_the_sweep_spares_the_generation_being_built(tmp_path: Path) -> None:
+    """Without this the sweep deletes what the same run just adopted, which is
+    the loop that made a failed index build cost a full rebuild every time."""
+    store = _gen_store(tmp_path)
+    with store, _held_publish_lease(tmp_path) as (coordinator, lease, _scope):
+        active = store.physical_collection("ctx", generation="a1b2")
+        resuming = store.physical_collection("ctx", generation="c3d4")
+        doomed = store.physical_collection("ctx", generation="e5f6")
+        for name in (active, resuming, doomed):
+            _make_collection(store, name)
+
+        retired = retire_superseded_generations(
+            store,
+            logical_collection="ctx",
+            active_collection=active,
+            coordinator=coordinator,
+            lease=lease,
+            spare=resuming,
+        )
+
+        assert retired == [doomed]
+        assert resuming in store.list_collections()
+        assert active in store.list_collections()

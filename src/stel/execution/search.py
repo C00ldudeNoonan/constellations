@@ -57,7 +57,10 @@ from ..retrieval import (
 )
 from ..retrieval.base import GENERATION_MARKER
 from ..retrieval.publication_memory import log_publication_memory
-from ..retrieval.retention import retire_superseded_generations
+from ..retrieval.retention import (
+    resumable_generation,
+    retire_superseded_generations,
+)
 from ..retrieval.servability import (
     exact_advisory_row_threshold,
     exact_search_advisory,
@@ -209,17 +212,49 @@ def _run_search_model(
                 store_type=store_config.type,
                 resolved=resolved,
             )
+            resumed = False
             if rebuild:
                 _require_private_generation_build(store, model, subset_run=subset_run)
-                generation_token = uuid4().hex[:12]
-                physical = store.physical_collection(
-                    logical_collection, generation=generation_token
-                )
-                log.info(
-                    "%s: building a private search generation; activation follows "
-                    "row and index validation",
-                    model.name,
-                )
+                # The fingerprint identifies the configuration, not the
+                # collection, so it can be read from a spec built against the
+                # default name before this run has chosen one (issue #492).
+                # Its own `with store:`, because discovery has to read the
+                # store and the publisher's own block is entered below with a
+                # collection name this has not chosen yet. `__enter__`
+                # reconnects, so opening twice in sequence is not nesting.
+                with store:
+                    adoptable = resumable_generation(
+                        store,
+                        logical_collection=logical_collection,
+                        active_collection=active_collection or default_collection,
+                        config_fingerprint=_search_collection_spec(
+                            model=model,
+                            models_by_name=models_by_name,
+                            physical_collection=default_collection,
+                            upstream_schema=snapshot.schema,
+                            store_type=store_config.type,
+                            resolved=resolved,
+                        ).config_fingerprint,
+                    )
+                if adoptable is not None:
+                    physical = adoptable
+                    resumed = True
+                    log.info(
+                        "%s: resuming the private search generation left by an "
+                        "earlier attempt; rows it already published are not "
+                        "republished",
+                        model.name,
+                    )
+                else:
+                    generation_token = uuid4().hex[:12]
+                    physical = store.physical_collection(
+                        logical_collection, generation=generation_token
+                    )
+                    log.info(
+                        "%s: building a private search generation; activation "
+                        "follows row and index validation",
+                        model.name,
+                    )
             else:
                 physical = active_collection or default_collection
             spec = _search_collection_spec(
@@ -272,6 +307,9 @@ def _run_search_model(
                         active_collection=active_collection or default_collection,
                         coordinator=coordinator,
                         lease=publish_lease,
+                        # Without this the sweep deletes the generation this
+                        # run just adopted, which is the loop #492 describes.
+                        spare=physical,
                     )
                 warned_exact = False
                 exact_scan_warn_after = (
@@ -300,6 +338,21 @@ def _run_search_model(
                     else None
                 )
                 existing = store.inspect_collection(physical)
+                if resumed and existing is None:
+                    # Discovery runs before this run holds the publish claim,
+                    # so another publisher could have swept the adopted
+                    # generation in between. Its publication state would then
+                    # vouch for rows no collection holds any more, and the
+                    # reconciler would skip every one of them. Clearing it
+                    # turns this back into an ordinary first build under a name
+                    # that happens to be taken from the sweep (issue #492).
+                    log.warning(
+                        "%s: the resumable search generation disappeared before "
+                        "this publish claimed it; rebuilding it in full",
+                        model.name,
+                    )
+                    adapter.clear_state(publish_scope)
+                    resumed = False
                 force_publish = existing is None
                 collection_exists = existing is not None
                 # A private build inspects its own, still-empty target, so
@@ -486,7 +539,16 @@ def _run_search_model(
                         domain="dbt-ml-search-upsert-batch",
                     )
                     with timings.phase("store_write"):
-                        write = store.append if rebuild else store.upsert
+                        # Append is the fast path for a generation this run
+                        # created, which is empty by construction. A resumed
+                        # one is not: state advances only after a write lands,
+                        # so a row can be present in the store with its state
+                        # unrecorded, and appending it again would duplicate
+                        # it. Upsert is idempotent on the id, which is what
+                        # re-entering a partial build requires (issue #492).
+                        write = (
+                            store.append if rebuild and not resumed else store.upsert
+                        )
                         receipt = write(
                             physical,
                             pending,

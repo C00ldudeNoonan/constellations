@@ -74,6 +74,55 @@ def superseded_generations(
     )
 
 
+def resumable_generation(
+    store: RetrievalStore,
+    *,
+    logical_collection: str,
+    active_collection: str | None,
+    config_fingerprint: str,
+) -> str | None:
+    """A superseded generation this configuration can resume into (issue #492).
+
+    A private build that dies after writing its rows but before activating
+    leaves a collection that is correct and complete, and that nothing can
+    reach: the ledger never learned its name, and the next run mints a fresh
+    random token and sweeps this one away. On a 3.6M-row corpus that discarded
+    4.2 hours of correct writes to recover from a six-second failure in the
+    index step.
+
+    A generation is resumable when its stored configuration fingerprint equals
+    the one this run would publish under. That fingerprint covers the search
+    payload and the store type and *not* the collection name, so it identifies
+    a build of the same configuration whatever random token it was given.
+
+    Resuming is safe because the rows are not trusted — the generation's own
+    publication state is. That state advances only after a write lands, so it
+    is never ahead of the store; reconciliation republishes anything it does
+    not vouch for and removes what the upstream no longer has. What is skipped
+    is only what state and store agree on.
+
+    When several match, the one holding the most rows wins: it is the furthest
+    along, and the rest are swept as usual. Ties break on the name so the
+    choice is deterministic.
+    """
+    candidates = []
+    for name in superseded_generations(
+        store,
+        logical_collection=logical_collection,
+        active_collection=active_collection,
+    ):
+        metadata = store.inspect_collection(name)
+        if metadata is None or metadata.config_fingerprint != config_fingerprint:
+            continue
+        candidates.append((metadata.row_count, name))
+    if not candidates:
+        return None
+    # `max` on (row_count, name) would break ties on the *largest* name; sorting
+    # and taking the last of the best count keeps it explicit instead.
+    best = max(count for count, _ in candidates)
+    return sorted(name for count, name in candidates if count == best)[0]
+
+
 def retire_superseded_generations(
     store: RetrievalStore,
     *,
@@ -81,8 +130,15 @@ def retire_superseded_generations(
     active_collection: str | None,
     coordinator: ServingCoordinator,
     lease: PublishLease,
+    spare: str | None,
 ) -> list[str]:
     """Drop every unreachable generation, returning the names retired.
+
+    `spare` is the generation this publisher is about to build into, and is
+    required rather than defaulted: a sweep that does not know what its caller
+    is building will delete a resumed generation out from under it, which is
+    exactly the failure #492 describes. Pass the physical name in every case —
+    sparing a generation that does not exist yet is a no-op.
 
     The caller must hold the publish lease for this scope — see the module
     docstring for why that is what makes the sweep safe — and the lease is
@@ -113,6 +169,8 @@ def retire_superseded_generations(
         logical_collection=logical_collection,
         active_collection=active_collection,
     ):
+        if name == spare:
+            continue
         coordinator.verify_publish(lease)
         if store.drop_collection(name):
             retired.append(name)

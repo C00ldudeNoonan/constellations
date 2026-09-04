@@ -79,6 +79,37 @@ and `Models missing a ... block` listed six, both omitting `eval`, so a user
 who forgot a kind block was told about kinds that had been shipped for
 releases and not about one that had. They derive from `ModelKind` too now.
 
+### A failed publish no longer discards the rows it already wrote (issue #492)
+
+A private generation build that wrote its rows and then failed before
+activating left a collection that was complete, correct, and unreachable: the
+ledger never learned its name, the next run minted a fresh random token, and
+the retirement sweep deleted it. In production that meant a 3,613,979-row
+publish — 145 pages, 4.2 hours, every row correct — discarded to recover from a
+six-second failure in the index step, and the retry paying a full BigQuery
+re-read to do it all again.
+
+A rebuild now adopts such a generation instead of starting over, when its
+stored configuration fingerprint matches the one being published. The
+`indexes`-failure case writes **no rows at all** on retry: it builds the index
+the first attempt failed on and activates.
+
+- The retirement sweep is told which generation the run is building into, so it
+  cannot delete what the same run just adopted. `retire_superseded_generations`
+  takes `spare` as a required argument rather than a default, because a sweep
+  that does not know what its caller is building is the bug.
+- A resumed generation is written with **upsert, not append**: state advances
+  only after a write lands, so a row can be present with its state unrecorded,
+  and appending it again would duplicate it.
+- Safety is unchanged, not merely asserted. What is skipped is only what the
+  generation's own publication state and the store agree on, and the
+  post-publication row count compares against the rows the run *read*, so a
+  resume that duplicated or dropped a row fails validation instead of
+  activating.
+- Adoption runs before the publish claim, so a concurrent publisher can sweep
+  the candidate in between; the publish detects the collection is gone, clears
+  the stale state, and rebuilds in full.
+
 ### Token verification could not start a server, and now publishes its discovery metadata (issue #464)
 
 **Fixes a startup crash.** The MCP SDK refuses a `token_verifier` that arrives

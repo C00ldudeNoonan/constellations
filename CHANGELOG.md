@@ -25,6 +25,60 @@
   rejects. Worth correcting the issue's premise on the way past — the
   response-level codec is **LZ4-only**, so ZSTD was never available there.
 
+### The BigQuery pre-release gate now exercises state seeding (issue #505)
+
+#495 added a state-access sequence the release gate did not cover: seeding a
+private generation's publication state from the serving scope, paged out of
+`stel_state` and upserted page by page — deliberately not through
+`replace_state_scope`, whose fence checks a ledger entry a generation scope
+does not have. On the corpus #495 exists for that is 3.6M state rows through
+paged MERGEs, exactly the operation #431 showed full-scans an unclustered
+`stel_state`, and the v0.17.0 gate exercised it only incidentally.
+
+The state half of seeding is now its own function, with no store in its
+signature, so `tests/test_serving_ledger_live.py` runs exactly that sequence
+against a real warehouse: on DuckDB always, on BigQuery when
+`STEL_BQ_TEST_PROJECT` is set. It seeds a scope large enough to span three
+pages, asserts the seeded rows match the source exactly with the code version
+restamped and the source untouched, and asserts residency — every page the
+seed hands to `upsert_state` is at most the page size and there are exactly as
+many as the scope needs, so a regression to loading the whole scope at once
+fails the gate.
+
+Stated so nobody expects more of it: the gate cannot detect an unclustered
+full scan by cost. BigQuery bills a 10MB minimum per table per job, so at a
+scratch size a clustered and an unclustered MERGE bill identically. #431's
+clustering is pinned where it is applied, in the state-table DDL.
+
+### Every step is idempotent and re-enterable, and a gate now says so (issue #493)
+
+#492 stated the problem: a 4.2-hour search publish wrote every row correctly,
+failed six seconds into its index step, and the next run re-read the corpus
+because the step that failed was not separable from the steps that had not.
+#490, #491, #492, #495 and #502 fixed that incident piece by piece. This states
+the invariant they add up to, audits every step against it, and gates it.
+
+**The contract**, for every step: re-running it converges and never corrupts
+what is there; a step that failed resumes from where it stopped, and a step
+that succeeded is not redone because a later one failed. The unit of re-entry
+is the checkpoint each step already keeps — the flush window, the page, the
+generation — not a new phase ledger; ADR-0005 records why, and why
+`stel serving activate` was not added.
+
+**The audit** found both parts hold for every step, which is the outcome the
+issue said it might: it shrank to writing the contract down and gating it.
+Three kinds — SQL transforms, ML, eval — hold re-entry at whole-step
+granularity and are recorded as exceptions with the reason (the warehouse
+replaces the table atomically; there is no partial work to lose). The one cell
+nobody had tested, an ordinary in-place search publish killed between two
+pages, now has a test: the retry pays for the lost page and nothing else.
+
+**The gate**, `tests/test_reentry_contract.py`, holds the table as data. Every
+`run_*_model` entry point and every `timings.phase(...)` literal is scanned
+from the source and must have a row, every cited test must exist, and the list
+of steps that break the contract is pinned empty. `docs/architecture/idempotent-reentry.md`
+is the prose.
+
 ## v0.17.0 - 2026-09-04
 
 ### A failed private-generation build no longer leaks its state scope (issue #502)

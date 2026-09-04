@@ -32,8 +32,10 @@ SENTINEL = "gs://distinctive-bucket/prefix?token=distinctive-native-secret"
 PHYSICAL = "demo__dev__context"
 
 
-def _store(tmp_path: Path) -> LanceDBStore:
-    config = parse_store_config({"type": "lancedb", "path": str(tmp_path / "lance")})
+def _store(tmp_path: Path, **overrides: object) -> LanceDBStore:
+    config = parse_store_config(
+        {"type": "lancedb", "path": str(tmp_path / "lance"), **overrides}
+    )
     return LanceDBStore(
         config,
         project_name="demo",
@@ -170,7 +172,9 @@ def test_index_failure_names_the_index_and_native_type(
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="stel.retrieval.lancedb")
     spec = _spec(scalar_index_fields=scalar, full_text_fields=full_text)
-    with _store(tmp_path) as store:
+    # One attempt: the retry policy (#491) is pinned in test_lancedb_index_retry.py;
+    # this test pins the message shape of a build that fails outright.
+    with _store(tmp_path, index_build_attempts=1) as store:
         _publish(store, spec)
         _fail_on(monkeypatch, "create_index")
         with pytest.raises(RetrievalError) as exc_info:

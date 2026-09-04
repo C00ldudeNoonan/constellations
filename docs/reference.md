@@ -2214,6 +2214,30 @@ These are execution settings, not identity: changing one does not alter the
 store's descriptor, so it cannot reclassify a published collection or strand
 its incremental state.
 
+#### Retrying the index build
+
+The index build is the last step of a publish that may have been writing rows
+for hours, and a single transient object-store error there would otherwise
+discard the run. Each index build (BTree, FTS, vector) retries a native
+failure with doubling backoff: three attempts, five seconds before the first
+retry, by default. A retry is logged as a warning naming the index and the
+native exception's type; when every attempt fails, the error says so
+(`... failed on BTree index for 'category' after 3 attempts [...]`).
+
+```yaml
+          local:
+            type: lancedb
+            path: gs://bucket/prefix
+            index_build_attempts: 5        # 1–10; 1 disables retry
+            index_build_retry_seconds: 10  # 0–600; doubles after each attempt
+```
+
+Retrying is safe because `create_index(replace=True)` is idempotent and a
+partially built index is re-entered on the next publish anyway. A refusal
+stel raises itself (an `ivf_pq` corpus below the training floor, an unowned
+collection) is never retried. Like the cache budgets, these are execution
+settings and do not enter the store's identity.
+
 ### DuckDB-native search
 
 When the warehouse is already DuckDB, a separate retrieval system is an extra

@@ -169,10 +169,11 @@ uv run stel --project-dir examples/invoice_pipeline run
 uv run stel --project-dir examples/invoice_pipeline test
 ```
 
-Fifteen examples live in [`examples/`](examples/), covering
+Sixteen examples live in [`examples/`](examples/), covering
 invoices, blog posts, support tickets, arXiv quality checks, PDF and direct LLM
 extraction, classic text ML, document clustering, RAG chunks, governed SQL
-chunks, dbt handoff and embedded execution, and a metric-plus-evidence agent.
+chunks, dbt handoff and embedded execution, a metric-plus-evidence agent, and
+Notion pages landed by an EL tool and rendered back into documents.
 
 ## Security model
 
@@ -205,6 +206,9 @@ third-party projects or sensitive documents.
 - **[Warehouse-native SQL models](docs/architecture/sql-models.md)**
   — implemented `transform.type: sql` contract (compiled `ref()`, the SQL/Jinja
   trust boundary, and full/incremental adapter materialization).
+- **[SaaS context: land, then render](docs/saas-context.md)**
+  — why there is no `notion://` source: your EL tool lands the tables, stel
+  reads them with `warehouse://` and renders block rows back into documents.
 - **[Decision records](docs/adr/README.md)**
   — numbered, append-only records of decisions that had a real alternative,
   and the specific reason it lost.

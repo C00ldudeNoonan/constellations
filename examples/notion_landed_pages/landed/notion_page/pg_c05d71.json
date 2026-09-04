@@ -1,0 +1,8 @@
+{
+  "page_id": "pg_c05d71",
+  "title": "Expense policy",
+  "parent_page_id": null,
+  "database_id": "db_policies",
+  "properties_json": "{\"Owner\": \"Finance\", \"Status\": \"Draft\", \"Effective\": \"2026-01-01\"}",
+  "last_edited_time": "2026-09-01T17:48:03Z"
+}

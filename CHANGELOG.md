@@ -33,6 +33,12 @@ it — the label function in `cli.py` had been a verbatim copy of the one in
 `runner.py`, so the selector would have been a third thing able to disagree
 about what a model is.
 
+So had the messages that tell you which blocks exist, and two of them were
+already wrong: `Model 'x' is missing a ...` listed seven of the eight kinds
+and `Models missing a ... block` listed six, both omitting `eval`, so a user
+who forgot a kind block was told about kinds that had been shipped for
+releases and not about one that had. They derive from `ModelKind` too now.
+
 ### Token verification could not start a server, and now publishes its discovery metadata (issue #464)
 
 **Fixes a startup crash.** The MCP SDK refuses a `token_verifier` that arrives

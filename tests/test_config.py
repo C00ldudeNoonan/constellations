@@ -235,9 +235,11 @@ def test_update_when_changed_accepts_valid_incremental() -> None:
 
 
 def test_model_file_requires_kind_block() -> None:
+    # The list of options is derived from ModelKind rather than written out
+    # here, which is how it stopped omitting `search` and `eval` (issue #494).
     with pytest.raises(
         ValueError,
-        match="missing an extraction/transform/ml/chunk/embed/llm block",
+        match=r"missing a kind block \(extraction/.*?/eval\)",
     ):
         ModelFile.model_validate(
             {"version": 2, "models": [{"name": "kindless"}]}

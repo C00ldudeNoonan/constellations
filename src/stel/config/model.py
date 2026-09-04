@@ -1335,8 +1335,7 @@ class ModelFile(BaseModel):
         missing = [m.name for m in self.models if m.kind_block_count == 0]
         if missing:
             raise ValueError(
-                f"Models missing an extraction/transform/ml/chunk/embed/llm block "
-                f"or search block: "
+                f"Models missing a kind block ({'/'.join(ModelKind)}): "
                 f"{', '.join(sorted(missing))}"
             )
         return self

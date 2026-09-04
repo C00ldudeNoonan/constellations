@@ -17,7 +17,7 @@ from .identifiers import (
     LEGACY_PROJECT_FILENAME,
     PROJECT_FILENAME,
 )
-from .model import ModelConfig, protect_model_llm_credential_option
+from .model import ModelConfig, ModelKind, protect_model_llm_credential_option
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
 from .yaml_diagnostics import (
@@ -296,8 +296,8 @@ def _assert_has_kind(
             document.format_message(
                 path,
                 config_path,
-                f"Model '{model.name}' is missing an "
-                "extraction/transform/ml/chunk/embed/llm or search block",
+                f"Model '{model.name}' is missing a kind block "
+                f"({'/'.join(ModelKind)})",
             )
         )
 

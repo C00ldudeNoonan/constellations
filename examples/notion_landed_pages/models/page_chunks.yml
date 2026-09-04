@@ -1,0 +1,24 @@
+version: 2
+
+# Ordinary chunking over the rendered documents. Because the renderer emits
+# real markdown headings, heading attribution (#343) gives every chunk its
+# section, and the page's title, parent, and database ride onto each chunk as
+# columns for filtering.
+models:
+  - name: page_chunks
+    description: "Heading-attributed chunks of each rendered page"
+    depends_on: [ref('page_documents')]
+    chunk:
+      strategy: recursive
+      text_field: text
+      chunk_size: 400
+      chunk_overlap: 40
+      headings:
+        pattern: '^#{1,6} (.+)$'
+        column: section
+      in_text_metadata: [title]
+    materialization: incremental
+    tags: [notion]
+    tests:
+      - not_null: [chunk_id, document_id, text, section, title]
+      - unique: chunk_id

@@ -487,3 +487,81 @@ def test_online_index_type_switch_builds_the_declared_type_privately(tmp_path: P
     # Unchanged config afterwards: nothing to republish, nothing to rebuild.
     [rerun] = run_project(tmp_path, select="context_search")
     assert rerun.rows_written == 0
+
+
+# ─── a generation's publication state does not outlive it (issue #502) ──────
+
+
+def _generation_scope_rows(adapter: Any, generation: str) -> int:
+    from stel.execution.search import _generation_state_scope
+
+    return len(adapter.fetch_state(_generation_state_scope("context_search", generation)))
+
+
+def test_activation_clears_the_generation_scope(tmp_path: Path) -> None:
+    """The success half, asserted by nobody until now. Activation moves a
+    generation's state into the serving scope and clears the generation's own;
+    the code comment says leaving it would accumulate one dead scope per
+    rebuild, and this is what holds it to that."""
+    scope, resolved = _prepare(tmp_path)
+    run_project(tmp_path, select="context_search")
+
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        entry = ServingCoordinator(adapter).status(scope)
+        assert entry.status == "ready" and entry.active_collection is not None
+        assert adapter.fetch_state(scope), "the serving scope should now hold the state"
+        assert _generation_scope_rows(adapter, entry.active_collection) == 0
+
+
+def test_sweeping_an_orphaned_generation_clears_its_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure half. A failed private build keeps its scope on purpose, so
+    a retry can resume it rather than redo it (#492). A generation nothing will
+    ever resume — here, one built under a configuration a later run has moved
+    past — is swept, and its state has to go with it: #492's incident left
+    roughly 2.1M dead rows in `stel_state` this way."""
+    scope, resolved = _prepare(tmp_path)
+
+    def indexes(*args: Any, **kwargs: Any) -> Any:
+        raise RetrievalError("simulated index build failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LanceDBStore, "ensure_indexes", indexes)
+        with pytest.raises(RunError):
+            run_project(tmp_path, select="context_search")
+
+    assert resolved.retrieval is not None
+    store_config = resolved.retrieval.stores["primary"]
+    with LanceDBStore(
+        store_config, project_name="retrieval_demo", target_name="dev",
+        alias="primary", role=StoreRole.PUBLISH,
+    ) as store:
+        orphans = [name for name in store.list_collections() if "__g" in name]
+    assert len(orphans) == 1
+    [orphan] = orphans
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        # Kept, deliberately: this is exactly what a retry would resume from.
+        assert _generation_scope_rows(adapter, orphan) == 2
+
+    # A rebuild under a different configuration cannot resume that generation,
+    # so the sweep takes the collection — and, now, its scope.
+    path = tmp_path / "models" / "retrieval.yml"
+    text = path.read_text(encoding="utf-8")
+    assert "on_index_change: online" in text and "metric: cosine" in text
+    path.write_text(
+        text.replace("on_index_change: online", "on_index_change: rebuild").replace(
+            "metric: cosine", "metric: dot"
+        ),
+        encoding="utf-8",
+    )
+    run_project(tmp_path, select="context_search")
+
+    with LanceDBStore(
+        store_config, project_name="retrieval_demo", target_name="dev",
+        alias="primary", role=StoreRole.PUBLISH,
+    ) as store:
+        assert orphan not in store.list_collections()
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        assert _generation_scope_rows(adapter, orphan) == 0
+        assert ServingCoordinator(adapter).status(scope).status == "ready"

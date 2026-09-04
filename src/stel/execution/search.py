@@ -335,7 +335,7 @@ def _run_search_model(
                     # build's collection exists, so the sweep cannot list it
                     # as a candidate. Sparing the live generation is what
                     # `active_collection` does here.
-                    retire_superseded_generations(
+                    retired = retire_superseded_generations(
                         store,
                         logical_collection=logical_collection,
                         active_collection=active_collection or default_collection,
@@ -345,6 +345,18 @@ def _run_search_model(
                         # run just adopted, which is the loop #492 describes.
                         spare=physical,
                     )
+                    # A swept generation takes its publication state with it
+                    # (issue #502). That scope is cleared on activation and,
+                    # since #492, deliberately kept on failure so a retry can
+                    # resume the build. So a generation nothing will ever
+                    # resume — a losing candidate, or one built under a
+                    # configuration a later run has moved past — held its
+                    # state forever: one dead scope per failed rebuild, ~2.1M
+                    # rows of it after #492's incident, scanned past by every
+                    # later MERGE (#431). The sweep is the one place that knows
+                    # a generation is finished with.
+                    for name in retired:
+                        adapter.clear_state(_generation_state_scope(model.name, name))
                 warned_exact = False
                 exact_scan_warn_after = (
                     exact_advisory_row_threshold(dimensions=spec.vector_dimensions)

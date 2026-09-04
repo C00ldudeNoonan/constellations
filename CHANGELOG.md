@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Every step is idempotent and re-enterable, and a gate now says so (issue #493)
+
+#492 stated the problem: a 4.2-hour search publish wrote every row correctly,
+failed six seconds into its index step, and the next run re-read the corpus
+because the step that failed was not separable from the steps that had not.
+#490, #491, #492, #495 and #502 fixed that incident piece by piece. This states
+the invariant they add up to, audits every step against it, and gates it.
+
+**The contract**, for every step: re-running it converges and never corrupts
+what is there; a step that failed resumes from where it stopped, and a step
+that succeeded is not redone because a later one failed. The unit of re-entry
+is the checkpoint each step already keeps — the flush window, the page, the
+generation — not a new phase ledger; ADR-0005 records why, and why
+`stel serving activate` was not added.
+
+**The audit** found both parts hold for every step, which is the outcome the
+issue said it might: it shrank to writing the contract down and gating it.
+Three kinds — SQL transforms, ML, eval — hold re-entry at whole-step
+granularity and are recorded as exceptions with the reason (the warehouse
+replaces the table atomically; there is no partial work to lose). The one cell
+nobody had tested, an ordinary in-place search publish killed between two
+pages, now has a test: the retry pays for the lost page and nothing else.
+
+**The gate**, `tests/test_reentry_contract.py`, holds the table as data. Every
+`run_*_model` entry point and every `timings.phase(...)` literal is scanned
+from the source and must have a row, every cited test must exist, and the list
+of steps that break the contract is pinned empty. `docs/architecture/idempotent-reentry.md`
+is the prose.
+
 ## v0.17.0 - 2026-09-04
 
 ### A failed private-generation build no longer leaks its state scope (issue #502)

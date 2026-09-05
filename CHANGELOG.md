@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Approximate search can return true distances, not quantized ones (issue #520)
+
+#520 reported that an attribute filter, worth a ~60x speedup under `search:
+exact`, bought nothing once the collection moved to `approximate`, and asked
+whether stel filters before or after the search. It filters before: queries
+carry `prefilter=True` and LanceDB resolves them through the attribute's BTree
+scalar index, which its query plan confirms. The filter is not why the query
+is slow — under `approximate` the brute-force scan a filter used to prune is
+already gone, so there is no scan left for it to cut. A regression test now
+pins the prefilter, because a postfilter is invisible in a timing and obvious
+in the results: it takes the k nearest rows overall and discards the ones that
+do not match, so a selective filter comes back with an empty page.
+
+What the investigation did turn up is that `ivf_pq` answers from compressed
+codes, so both the order and the `score` are approximations. Measured on a
+100k-row collection, a filtered query returned recall@10 of 0.49 against exact
+ground truth with its reported score off by 0.40 in cosine units. The new
+`search.vector.refine_factor` re-ranks the index's candidates against the
+stored vectors: at 10, the same measurement returned recall 1.00 and an exact
+score. It is unset by default, refused under `search: exact`, and — because it
+changes how a query is answered rather than what was published — absent from
+the collection descriptor and from `code_version`, so turning it on rebuilds
+nothing and reprocesses nothing.
+
 ### Google Drive as a document source, Docs and Slides included (issue #514)
 
 `path: gdrive://<folderId>` reads a Drive folder the way `gs://` reads a

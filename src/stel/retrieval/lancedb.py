@@ -1043,6 +1043,7 @@ class LanceDBStore(RetrievalStore):
         limit: int,
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
+        refine_factor: int | None = None,
     ) -> pa.Table:
         failure: RetrievalError | None = None
         try:
@@ -1061,7 +1062,14 @@ class LanceDBStore(RetrievalStore):
             query = table.search(list(vector), vector_column_name=vector_field)
             where = _compile_predicates(predicates)
             if where is not None:
+                # Prefilter, so the scan is restricted *before* the search
+                # rather than after it. Under an ANN index this is what lets a
+                # selective filter still return a full page: a postfilter would
+                # take the k nearest rows overall and then discard the ones
+                # that do not match, returning almost nothing (issue #520).
                 query = query.where(where, prefilter=True)
+            if refine_factor is not None:
+                query = query.refine_factor(refine_factor)
             if columns is not None:
                 query = query.select(_include_score_column(columns, "_distance"))
             result = query.limit(limit).to_arrow()

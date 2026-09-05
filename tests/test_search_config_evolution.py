@@ -721,6 +721,31 @@ def test_an_index_type_change_alongside_a_dimension_change_still_rebuilds() -> N
     assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
 
 
+def test_refine_factor_does_not_invalidate_a_published_index() -> None:
+    """`refine_factor` re-ranks an ANN index's candidates at query time
+    (issue #520): it changes neither the rows written nor the index built.
+    Inside the fingerprint it would demand a blue/green rebuild and a full
+    re-embed to turn on a knob that only affects how a query is answered —
+    and the collection it most needs turning on for is the one large enough
+    to make that rebuild unaffordable."""
+    approximate = {**_APPROX_VECTOR}
+    refined = {**_APPROX_VECTOR, "refine_factor": 10}
+
+    assert _fingerprint(vector=refined) == _fingerprint(vector=approximate)
+    assert classify_changes(_search(vector=approximate), _search(vector=refined)) == []
+
+
+def test_refine_factor_is_dropped_from_the_descriptor_not_merely_ignored() -> None:
+    """A stored descriptor is compared field by field, so the knob has to be
+    absent from it rather than compared and found equal — otherwise a
+    collection stamped before the field existed reports a drift against one
+    stamped after it."""
+    descriptor = _search(vector={**_APPROX_VECTOR, "refine_factor": 10})
+
+    assert "refine_factor" not in descriptor["vector"]
+    assert descriptor["vector"]["search"] == "approximate"
+
+
 @pytest.mark.parametrize("index", ["ivf_pq", "ivf_hnsw_flat"])
 def test_an_index_type_under_exact_search_is_refused_at_config_time(index: str) -> None:
     """`exact` builds no index, so an `index` written under it would be accepted
@@ -784,3 +809,56 @@ def test_an_id_field_that_is_also_an_attribute_is_indexed_once() -> None:
     )
 
     assert fields == ("chunk_id",)
+
+
+# ─── refine_factor is a query knob, not an index property (issue #520) ──────
+
+
+def test_refine_factor_under_exact_search_is_refused_at_config_time() -> None:
+    """Same rule as `index`, same reason. Exact search computes true distances
+    over the stored vectors, so re-ranking them against those same vectors
+    changes nothing — accepting the key would be a flag that looks like a
+    decision and is not."""
+    with pytest.raises(ValidationError, match="only applies to search: approximate"):
+        _vector_model(search="exact", refine_factor=10)
+
+
+@pytest.mark.parametrize("value", [0, -1, 101])
+def test_refine_factor_is_bounded(value: int) -> None:
+    """The candidates fetched are `limit * refine_factor` full vectors, so an
+    unbounded value turns one query into an unbounded read."""
+    with pytest.raises(ValidationError):
+        _vector_model(search="approximate", refine_factor=value)
+
+
+def test_refine_factor_is_accepted_under_approximate_search() -> None:
+    model = _vector_model(search="approximate", refine_factor=10)
+
+    assert model.search is not None and model.search.vector is not None
+    assert model.search.vector.refine_factor == 10
+
+
+def test_an_unset_refine_factor_is_invisible_in_every_dump() -> None:
+    """The upgrade trap. Every fingerprint, the collection descriptor, the
+    manifest, and the code-version hash all start from a dump of this model,
+    so a new field that surfaced as `None` would have re-keyed every search
+    model ever published — reprocessing a corpus to add a knob nobody set."""
+    model = _vector_model(search="approximate")
+    assert model.search is not None and model.search.vector is not None
+
+    assert "refine_factor" not in model.search.vector.model_dump(mode="python")
+
+
+def test_setting_refine_factor_does_not_re_key_the_model(tmp_path: Path) -> None:
+    """And the other half: turning it *on* must not reprocess the corpus
+    either, because it changes how a query is answered and not one published
+    row."""
+    project = ProjectConfig(name="proj", version="0.1.0", profile="proj")
+    plain = compute_model_code_version(
+        _vector_model(search="approximate"), project, tmp_path
+    )
+    refined = compute_model_code_version(
+        _vector_model(search="approximate", refine_factor=10), project, tmp_path
+    )
+
+    assert plain == refined

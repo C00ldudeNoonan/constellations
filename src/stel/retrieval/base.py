@@ -674,7 +674,17 @@ class RetrievalStore(ABC):
         limit: int,
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
-    ) -> pa.Table: ...
+        refine_factor: int | None = None,
+    ) -> pa.Table:
+        """Rank rows by distance to `vector`.
+
+        `refine_factor` asks a store that answers from a *compressed* index to
+        re-rank its candidates against the stored vectors before returning
+        them, trading `limit * refine_factor` vector reads for an exact
+        ordering and an exact score (issue #520). It is advisory: a store that
+        always computes true distances ignores it, because there is nothing to
+        re-rank.
+        """
 
     @abstractmethod
     def text_search(

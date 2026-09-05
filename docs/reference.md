@@ -2561,6 +2561,41 @@ Three things follow from how the field is stamped:
   extension has one HNSW); declaring another type against it is refused at
   compile time, naming the LanceDB store.
 
+#### Re-ranking an approximate result — `refine_factor`
+
+`ivf_pq` answers from compressed codes, so both the order it returns and the
+`score` it reports are approximations of the true distance. On a 100k-row
+collection a filtered query returned recall@10 of 0.49 against exact
+ground truth, with the reported score off by 0.40 in cosine units — the same
+row's true distance was 0.96 and the index called it 1.84.
+
+`refine_factor` fetches `limit * refine_factor` candidates from the index,
+recomputes their true distances against the stored vectors, and returns the
+best `limit` of those:
+
+```yaml
+  vector:
+    field: embedding
+    dimensions: 768
+    search: approximate
+    index: ivf_pq
+    refine_factor: 10       # unset by default
+```
+
+At `refine_factor: 10` the same measurement returned recall 1.00 with an exact
+score. The cost is reading those extra vectors, which is small next to the
+query itself — 10x a limit of 5 at 768 dimensions is about 150 KB — but it is
+a read per query, so it is worth setting deliberately rather than everywhere.
+It is inert for `ivf_hnsw_flat`, which keeps raw vectors and is already exact
+on the candidates it visits, and it is refused under `search: exact`, which
+computes true distances and has nothing to re-rank.
+
+**It is a query-time knob, so turning it on costs nothing to adopt.** It is
+absent from the collection descriptor and from `code_version`: changing it
+neither rebuilds the collection, nor rebuilds its index, nor reprocesses a
+single row. The collections that most need it are the ones large enough to
+make a rebuild unaffordable, which is exactly why it is stamped this way.
+
 **stel estimates the build before paying for the rows.** Inside a container,
 a publish to a LanceDB store reads the cgroup memory ceiling and, from the row
 count, the dimensions, and the ratios above, warns when the build would need
@@ -2663,7 +2698,9 @@ difference, so a change is named rather than merely detected.
 
 Fields that only affect execution cadence are not part of the descriptor and
 never invalidate an index: **`batch_size`**, **`index_options`**, and
-`on_index_change` itself. Tuning publish pacing is free.
+`on_index_change` itself. Tuning publish pacing is free. So is
+**`vector: {refine_factor: ...}`**, which changes how a query is answered
+rather than what was published.
 
 Everything that defines a row's shape or meaning is:
 

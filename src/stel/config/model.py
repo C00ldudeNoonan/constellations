@@ -625,6 +625,18 @@ class SearchVectorConfig(BaseModel):
     # is dominated by training, which barely grows with the corpus — the one
     # that fits a memory-limited publisher at millions of rows (issue #476).
     index: VectorIndexType = DEFAULT_VECTOR_INDEX
+    # Re-rank the ANN index's candidates against the *stored* vectors before
+    # returning them (issue #520). An `ivf_pq` index answers from compressed
+    # codes, so both the ordering and the `_distance` it reports are
+    # quantization-approximate: measured at 100k rows, a filtered query
+    # returned recall@10 of 0.49 with the reported score off by 0.40 in cosine
+    # units, and refine_factor 10 took that to recall 1.00 with an exact score.
+    # The cost is fetching `limit * refine_factor` full vectors, so it is a
+    # query-time knob and not part of the collection's identity: changing it
+    # neither rebuilds the collection nor rebuilds its index. Null leaves
+    # LanceDB's default (no re-ranking). Inert under `search: exact`, which
+    # already computes true distances.
+    refine_factor: int | None = Field(default=None, gt=0, le=100)
     embedding: Literal["inherit"] | SearchEmbeddingIdentityConfig
 
     @model_validator(mode="after")
@@ -651,10 +663,18 @@ class SearchVectorConfig(BaseModel):
                 f"search.vector.index {self.index!r} only applies to "
                 "search: approximate; exact search builds no vector index"
             )
+        # Same rule, same reason: exact search computes true distances, so
+        # re-ranking them against the stored vectors would change nothing.
+        if "refine_factor" in self.model_fields_set and self.search != "approximate":
+            raise ValueError(
+                f"search.vector.refine_factor {self.refine_factor!r} only applies "
+                "to search: approximate; exact search already computes true "
+                "distances, so there is nothing to re-rank"
+            )
         return self
 
     @model_serializer(mode="wrap")
-    def _omit_the_default_index(
+    def _omit_the_defaults(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         # "Absent means default" is enforced here, at the model, rather than in
@@ -667,6 +687,11 @@ class SearchVectorConfig(BaseModel):
         data = handler(self)
         if data.get("index") == DEFAULT_VECTOR_INDEX:
             del data["index"]
+        # Same rule for the query-time knob added by #520: unset, it must be
+        # invisible, or adding the field to this model would have re-keyed
+        # every search model that has ever been published.
+        if data.get("refine_factor") is None:
+            data.pop("refine_factor", None)
         return data
 
 

@@ -765,6 +765,7 @@ def _execute_query(
             limit=candidate_limit,
             columns=included_fields,
             predicates=predicates,
+            refine_factor=search_config.vector.refine_factor,
         )
         vector_rows = _score_single(
             _rank_table(table, search_config.id_field),

@@ -152,7 +152,15 @@ def compute_code_version(
             if llm
             else None
         ),
-        "search": search.model_dump(mode="python") if search else None,
+        # `vector.refine_factor` re-ranks an ANN index's candidates at query
+        # time (issue #520). It changes no published row, so it must not
+        # re-key the model: turning it on would otherwise reprocess the corpus
+        # to change how a query is answered.
+        "search": (
+            search.model_dump(mode="python", exclude={"vector": {"refine_factor"}})
+            if search
+            else None
+        ),
         "agent_context": (
             agent_context.model_dump(mode="json") if agent_context else None
         ),

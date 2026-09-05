@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### A query reports where its wall clock went (issue #519)
+
+- **Nothing in the query path was timed.** Moving `sec_chunk_search` to
+  `approximate` with `index: ivf_pq` cut latency from ~275s to ~40s, but the
+  residual 40s could not be attributed — and text-only mode cost 22s while
+  doing no vector work at all, which points away from the ANN index without
+  saying where the time actually goes. The publish path grew exactly this
+  telemetry in 0.17.0 (#432) and it was decisive there.
+- `stel search -v` now reports the query's wall clock by phase on stderr:
+  `compile`, `warehouse_connect`, `lease`, `embed`, `store_open`, `inspect`,
+  `vector_search`, `text_search` and `fuse`. Phases are recorded only for the
+  work a mode actually does, so a text query records no vector phase.
+- Deliberately not all "search": a query pays to compile the project, connect
+  the warehouse, take a query lease, open the store and inspect the collection
+  before any index is touched. Those are the phases the 22s figure made
+  interesting.
+- Safe at INFO, which is where `-v` reads and where an orchestrator captures:
+  phase names and durations only, never the query text or row values. It
+  composes with `--output json`, which keeps stdout a single parseable payload.
+- `search()` takes an optional `timings=PhaseTimings()` so a caller can collect
+  the same phases programmatically. Omitted, nothing about a query changes.
+
+**Answering the issue's second question:** the MCP server pays these costs per
+query too. `stel mcp serve` calls the same `search()` and holds nothing between
+requests — the project is compiled, the warehouse connected and the store
+opened every time. Only Python's ~1s process startup is amortized, so the CLI
+figures are representative of a long-lived server's steady state rather than an
+artifact of per-invocation startup. Amortizing them is a separate change.
+
 ### Google Drive as a document source, Docs and Slides included (issue #514)
 
 `path: gdrive://<folderId>` reads a Drive folder the way `gs://` reads a

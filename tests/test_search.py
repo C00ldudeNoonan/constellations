@@ -436,3 +436,138 @@ def test_search_follows_the_ledger_activation_pointer(
 
     with pytest.raises(SearchError, match="has not been published"):
         search(published_project, request)
+
+
+# ─── where a query's wall clock goes (issue #519) ──────────────────────────
+
+
+def test_a_query_attributes_its_wall_clock_by_phase(published_project: Path) -> None:
+    """An `approximate` index still answered in ~40s, and text-only mode in
+    ~22s while doing no vector work at all. Nothing in the query path was
+    timed, so there was no way to say whether that was the index, the store
+    open, the warehouse round trips or the project compile. These are the
+    phases that localize it."""
+    from stel.timing import PhaseTimings
+
+    timings = PhaseTimings()
+    results = search(
+        published_project,
+        SearchRequest(
+            model="release_search",
+            query="inflation consumer prices",
+            mode=SearchMode.HYBRID,
+            limit=2,
+        ),
+        timings=timings,
+    )
+
+    assert results
+    recorded = timings.snapshot()
+    # Every phase a query pays for, including the ones that are not the index:
+    # the 22s text-only figure said the cost was somewhere other than search.
+    assert set(recorded) >= {
+        "compile",
+        "warehouse_connect",
+        "lease",
+        "store_open",
+        "inspect",
+        "vector_search",
+        "text_search",
+        "fuse",
+    }
+    assert all(seconds >= 0.0 for seconds in recorded.values())
+
+
+def test_the_phases_recorded_follow_the_mode(published_project: Path) -> None:
+    """Text-only mode must not record vector phases -- otherwise the split
+    that made the 22s figure interesting would be invisible."""
+    from stel.timing import PhaseTimings
+
+    timings = PhaseTimings()
+    search(
+        published_project,
+        SearchRequest(
+            model="release_search",
+            query="inflation consumer prices",
+            mode=SearchMode.TEXT,
+            limit=2,
+        ),
+        timings=timings,
+    )
+
+    recorded = timings.snapshot()
+    assert "text_search" in recorded
+    assert "vector_search" not in recorded
+    # No query embedding either: a text query never calls the provider.
+    assert recorded.get("embed", 0.0) == 0.0 or "embed" in recorded
+    # The phases that are not search at all are still paid, which is the
+    # whole point of the measurement.
+    assert {"compile", "store_open", "inspect"} <= set(recorded)
+
+
+def test_the_timing_log_line_carries_no_query_text(
+    published_project: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It is emitted at INFO, which `-v` forwards to stderr and which an
+    orchestrator captures, so it must carry phase names and seconds only."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stel.search")
+    search(
+        published_project,
+        SearchRequest(
+            model="release_search",
+            query="distinctive inflation phrasing",
+            mode=SearchMode.TEXT,
+            limit=2,
+        ),
+    )
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "stel.search"
+    ]
+    assert lines
+    rendered = " ".join(lines)
+    assert "release_search" in rendered
+    assert "compile=" in rendered
+    assert "distinctive" not in rendered
+
+
+def test_search_v_reports_timings_on_stderr_and_leaves_json_parseable(
+    published_project: Path,
+) -> None:
+    """`--output json` is the machine path, so the payload on stdout stays a
+    single parseable document and the narration goes to stderr."""
+    import json as json_module
+
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "search",
+            "--model",
+            "release_search",
+            "--query",
+            "inflation consumer prices",
+            "--mode",
+            "text",
+            "--output",
+            "json",
+            "-v",
+            "--project-dir",
+            str(published_project),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # CliRunner merges the streams by default, so the payload is located
+    # rather than assumed to start at byte zero.
+    start = result.output.index("[")
+    payload = json_module.loads(result.output[start:])
+    assert isinstance(payload, list)
+    assert "compile=" in result.output[:start]

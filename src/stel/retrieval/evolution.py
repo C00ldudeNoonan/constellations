@@ -53,6 +53,13 @@ _ADDITIVE_FIELDS = ("display_fields", "return_text_fields")
 # equal, and only a deliberate choice registers as a change.
 _VECTOR_INDEX_ONLY_FIELDS = frozenset({"search", "index"})
 
+# `vector` sub-fields dropped from the descriptor before it is compared or
+# hashed. `refine_factor` re-ranks an ANN index's candidates at *query* time
+# (issue #520); it changes neither the rows written nor the index built, so a
+# collection published before it was set must keep serving unchanged rather
+# than reporting a configuration drift and demanding a republish.
+_VECTOR_QUERY_ONLY_FIELDS = frozenset({"refine_factor"})
+
 
 class ChangeKind(StrEnum):
     """Whether a classified change can be served by the existing collection."""
@@ -106,11 +113,19 @@ def semantic_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     what remains is what a published row's shape and meaning depend on.
     """
     excluded = NON_SEMANTIC_FIELDS | ROUTING_FIELDS
-    return {
+    projected = {
         key: json_safe(value)
         for key, value in sorted(payload.items())
         if key not in excluded
     }
+    vector = projected.get("vector")
+    if isinstance(vector, Mapping):
+        projected["vector"] = {
+            key: value
+            for key, value in vector.items()
+            if key not in _VECTOR_QUERY_ONLY_FIELDS
+        }
+    return projected
 
 
 def classify_changes(

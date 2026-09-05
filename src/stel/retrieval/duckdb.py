@@ -749,7 +749,11 @@ class DuckDBStore(RetrievalStore):
         limit: int,
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
+        refine_factor: int | None = None,
     ) -> pa.Table:
+        # Ignored by contract: this store computes true distances over stored
+        # vectors, so there are no approximate candidates to re-rank (#520).
+        del refine_factor
         _validate_query_limit(limit)
         _validate_query_projection(columns)
         if not _IDENTIFIER_RE.fullmatch(vector_field):

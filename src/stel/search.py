@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any
 
@@ -40,6 +42,9 @@ from .retrieval import (
     collection_config_fingerprint,
     create_store,
 )
+from .timing import PhaseTimings
+
+log = logging.getLogger(__name__)
 
 
 class SearchError(Exception):
@@ -262,6 +267,7 @@ def search(
     target: str | None = None,
     profiles_dir: Path | None = None,
     policy_filters: Sequence[SearchFilter] = (),
+    timings: PhaseTimings | None = None,
 ) -> list[SearchResult]:
     """Query a published search index through a generation-pinned read lease.
 
@@ -269,20 +275,30 @@ def search(
     indexes: the calling service — not the end user — supplies predicates
     that must constrain every policy-role attribute. They are composed with
     user filters as mandatory prefilters inside the store; a governed query
-    without them fails closed. Public indexes reject the argument."""
+    without them fails closed. Public indexes reject the argument.
+
+    `timings` collects per-phase wall clock for one query (issue #519).
+    Passed in rather than returned because the result list is the contract
+    and callers read the phases differently: the CLI prints them, a server
+    would export them. Omitted, one is created and only logged.
+    """
+    timings = PhaseTimings() if timings is None else timings
+    started = perf_counter()
     project_dir = Path(project).resolve()
-    project_config, sources, models = load_project(project_dir)
-    validate_project_contract(project_config, sources, models, project_dir)
+    with timings.phase("compile"):
+        project_config, sources, models = load_project(project_dir)
+        validate_project_contract(project_config, sources, models, project_dir)
     model = next((item for item in models if item.name == request.model), None)
     if model is None or model.search is None:
         raise SearchError(f"Search index '{request.model}' was not found")
-    resolved = resolve_profile(
-        project_config,
-        project_dir,
-        target=target,
-        profiles_dir=profiles_dir,
-    )
-    validate_retrieval_capabilities([model], project_config, resolved)
+    with timings.phase("compile"):
+        resolved = resolve_profile(
+            project_config,
+            project_dir,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+        validate_retrieval_capabilities([model], project_config, resolved)
     search_config = model.search
     if resolved.retrieval is None:
         raise SearchError("The active profile has no retrieval configuration")
@@ -358,11 +374,16 @@ def search(
     candidate_limit = request.candidate_limit or min(max(request.limit * 4, 50), 1000)
 
     try:
+        connecting = perf_counter()
         with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+            # Timed on entry rather than around the block: the `with` spans
+            # the whole query, and what is wanted is the connect alone.
+            timings.add("warehouse_connect", perf_counter() - connecting)
             coordinator = ServingCoordinator(adapter)
-            lease = coordinator.acquire_query(
-                state_scope, legacy_scope=legacy_state_scope
-            )
+            with timings.phase("lease"):
+                lease = coordinator.acquire_query(
+                    state_scope, legacy_scope=legacy_state_scope
+                )
             try:
                 if lease.config_fingerprint != expected_fingerprint:
                     raise SearchError(
@@ -371,12 +392,13 @@ def search(
                     )
                 # The shared lease pins the ready generation through query
                 # embedding, store search, and result validation.
-                query_vector = _resolve_query_vector(
-                    model,
-                    models_by_name,
-                    request,
-                    resolved=resolved,
-                )
+                with timings.phase("embed"):
+                    query_vector = _resolve_query_vector(
+                        model,
+                        models_by_name,
+                        request,
+                        resolved=resolved,
+                    )
                 # Follow the ledger's activation pointer (issue #355) rather
                 # than recomputing the name: the logical collection resolves
                 # to whichever generation the lease pinned. A null pointer is
@@ -386,8 +408,11 @@ def search(
                     lease.pinned_collection
                     or store.physical_collection(logical_collection)
                 )
+                opening = perf_counter()
                 with store:
-                    metadata = store.inspect_collection(physical_collection)
+                    timings.add("store_open", perf_counter() - opening)
+                    with timings.phase("inspect"):
+                        metadata = store.inspect_collection(physical_collection)
                     if metadata is None:
                         raise SearchError(
                             f"Search index '{model.name}' has not been published; "
@@ -412,10 +437,13 @@ def search(
                         predicates,
                         candidate_limit,
                         included_fields,
+                        timings,
                     )
-                coordinator.validate_query(lease)
+                with timings.phase("lease"):
+                    coordinator.validate_query(lease)
             finally:
-                coordinator.release_query(lease)
+                with timings.phase("lease"):
+                    coordinator.release_query(lease)
     except SearchError:
         raise
     except (AdapterError, RetrievalError) as error:
@@ -434,6 +462,19 @@ def search(
         physical_collection=physical_collection,
         upstream=upstream,
         embedding=embedding if isinstance(embedding, Mapping) else None,
+    )
+    # Phase names and seconds only: no query text, no row values, nothing
+    # from the index. Safe at INFO, which is where `-v` reads (issue #519).
+    log.info(
+        "search %s mode=%s: %.3fs total (%s)",
+        model.name,
+        request.mode.value,
+        perf_counter() - started,
+        " ".join(
+            f"{name}={seconds:.3f}s"
+            for name, seconds in sorted(timings.snapshot().items())
+        )
+        or "no phases recorded",
     )
     return [
         _to_result(
@@ -752,21 +793,23 @@ def _execute_query(
     predicates: Sequence[RetrievalPredicate],
     candidate_limit: int,
     included_fields: Sequence[str],
+    timings: PhaseTimings,
 ) -> list[_ScoredRow]:
     search_config = model.search
     assert search_config is not None
     vector_rows: list[_ScoredRow] = []
     if request.mode in {SearchMode.VECTOR, SearchMode.HYBRID}:
         assert vector is not None and search_config.vector is not None
-        table = store.vector_search(
-            collection,
-            vector,
-            vector_field=search_config.vector.field,
-            limit=candidate_limit,
-            columns=included_fields,
-            predicates=predicates,
-            refine_factor=search_config.vector.refine_factor,
-        )
+        with timings.phase("vector_search"):
+            table = store.vector_search(
+                collection,
+                vector,
+                vector_field=search_config.vector.field,
+                limit=candidate_limit,
+                columns=included_fields,
+                predicates=predicates,
+                refine_factor=search_config.vector.refine_factor,
+            )
         vector_rows = _score_single(
             _rank_table(table, search_config.id_field),
             label="vector",
@@ -777,14 +820,15 @@ def _execute_query(
         assert request.query is not None and search_config.full_text is not None
         by_field: dict[str, list[_ScoredRow]] = {}
         for field in search_config.full_text.fields:
-            table = store.text_search(
-                collection,
-                request.query,
-                text_field=field,
-                limit=candidate_limit,
-                columns=included_fields,
-                predicates=predicates,
-            )
+            with timings.phase("text_search"):
+                table = store.text_search(
+                    collection,
+                    request.query,
+                    text_field=field,
+                    limit=candidate_limit,
+                    columns=included_fields,
+                    predicates=predicates,
+                )
             by_field[f"text:{field}"] = _score_single(
                 _rank_table(table, search_config.id_field),
                 label=f"text:{field}",
@@ -799,7 +843,8 @@ def _execute_query(
         return vector_rows
     if request.mode == SearchMode.TEXT:
         return text_rows
-    return _rrf({"vector": vector_rows, "text": text_rows})
+    with timings.phase("fuse"):
+        return _rrf({"vector": vector_rows, "text": text_rows})
 
 
 def _rank_table(table: pa.Table, id_field: str) -> list[_RankedRow]:

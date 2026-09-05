@@ -511,6 +511,7 @@ def show(ctx: click.Context, model_name: str, limit: int) -> None:
     default="table",
     show_default=True,
 )
+@_verbose_option
 @_project_context_options
 @click.pass_context
 def search_command(
@@ -524,8 +525,15 @@ def search_command(
     fields: tuple[str, ...],
     vector_json: str | None,
     output_format: str,
+    verbose: int,
 ) -> None:
-    """Query a published retrieval index without provider-specific request shapes."""
+    """Query a published retrieval index without provider-specific request shapes.
+
+    `-v` reports where the query's wall clock went -- compile, warehouse
+    connect, lease, embed, store open, inspect, the searches themselves --
+    on stderr, so it composes with `--output json` on stdout (issue #519).
+    """
+    _configure_output(verbose, json_output=output_format == "json")
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]

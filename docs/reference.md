@@ -388,7 +388,7 @@ stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval 
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 stel show <model> [--limit N]                            # peek at a materialized table
-stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}]
+stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
 stel serving recover <search-index> --target T --owner-terminated  # explicit authority reassignment after a crash
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
@@ -2600,6 +2600,36 @@ stel search --model chunk_search --query "inflation" \
 stel search --model chunk_search --query "labor market" \
   --filter category in '["employment", "wages"]'
 ```
+
+#### Where a query's time goes
+
+`-v` reports the query's wall clock by phase on stderr, so it composes with
+`--output json` on stdout:
+
+```bash
+stel search --model chunk_search --query "inflation" -v
+```
+
+```
+search chunk_search mode=hybrid: 39.812s total (compile=1.204s
+warehouse_connect=0.850s lease=2.113s embed=0.402s store_open=6.221s
+inspect=8.940s text_search=14.02s vector_search=5.83s fuse=0.004s)
+```
+
+The phases are deliberately not all "search": a query pays for compiling the
+project, connecting to the warehouse, taking a query lease, opening the store
+and inspecting the collection before any index is touched. An index that
+answers in 40s with 22s of that spent in text-only mode is not necessarily
+paying for the index, and there was previously no way to tell (issue #519).
+Phase names and durations only — no query text or row values reach the log, so
+it is safe at INFO where an orchestrator captures it.
+
+**The MCP server pays the same per-query costs.** `stel mcp serve` calls the
+same entry point and holds nothing between requests: the project is compiled,
+the warehouse connected and the store opened on every query. Only the ~1s
+Python process startup is amortized, so CLI timings are representative of a
+long-lived server's steady state rather than an artifact of per-invocation
+startup.
 
 Filters are repeatable `FIELD OP VALUE` triples. Operators are `eq`, `ne`,
 `lt`, `le`, `gt`, `ge`, `in`, and `array_contains_any`; the last two take a

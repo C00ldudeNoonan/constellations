@@ -44,6 +44,7 @@ from .logging_setup import configure_verbose_logging, resolve_verbosity
 from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
+from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
 from .profile import (
     PROFILES_FILENAME,
     ProfileError,
@@ -862,6 +863,67 @@ def _model_kind(model: ModelConfig) -> str:
     made a third (issue #494). Both delegate now.
     """
     return model.kind_label()
+
+
+@cli.command()
+@click.option(
+    "--select",
+    "select",
+    default=None,
+    help=(
+        "Selector expression (e.g. 'raw_invoices+', '+invoice_summary', "
+        "'tag:raw', 'kind:embed')."
+    ),
+)
+@click.option("--exclude", default=None, help="Selector expression for models to skip.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print target/plan.json to stdout instead of the table.",
+)
+@_verbose_option
+@_project_context_options
+@click.pass_context
+def plan(
+    ctx: click.Context,
+    select: str | None,
+    exclude: str | None,
+    json_output: bool,
+    verbose: int,
+) -> None:
+    """Report what the next run would reprocess, before it spends anything.
+
+    Compares each selected model's code_version against the rows its
+    published state records, names the downstream models a change reaches,
+    and estimates the provider requests those rows imply. Reads only stel's
+    own state table: no source discovery, no provider call, no model table.
+    """
+    project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    _configure_output(verbose, json_output=json_output)
+    try:
+        result = plan_project(
+            project_dir,
+            select=select,
+            exclude=exclude,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except (SelectionError, PlanError) as e:
+        raise click.ClickException(str(e)) from e
+    artifact = write_plan_artifact(project_dir, result)
+    if json_output:
+        click.echo(artifact.read_text(encoding="utf-8"))
+        return
+    if not result.models:
+        click.echo("No models selected.")
+        return
+    for line in format_plan_table(result):
+        click.echo(line)
 
 
 @cli.command()

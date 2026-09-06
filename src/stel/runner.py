@@ -1006,7 +1006,7 @@ def clean_project(
     if not target_dir.is_dir():
         raise RunError(f"Configured target path is not a directory: {target_dir}")
 
-    for filename in ("manifest.json", "run_results.json", "sources.yml"):
+    for filename in ("manifest.json", "run_results.json", "plan.json", "sources.yml"):
         artifact = target_dir / filename
         if artifact.is_symlink():
             raise RunError(f"Refusing to clean symlinked artifact {artifact}.")

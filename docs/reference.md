@@ -387,6 +387,7 @@ stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
+stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -586,6 +587,59 @@ extraction/transform/ml config and transform module source) against a
 manifest written by a previous `compile` or `run`. The CI recipe: store
 `target/manifest.json` from main, then on PRs run
 `stel build --select 'state:modified+' --state path/to/main-manifest/`.
+
+## Planning a change (`stel plan`)
+
+`state:modified` says *which* models a change touched. `stel plan` says what
+that costs: for every selected model, whether its `code_version` still matches
+the rows its published state records, how many rows the next run would
+reprocess, which downstream models the change reaches, and roughly how many
+provider requests that implies. It reads stel's own state table and nothing
+else — no source discovery, no provider call, no model table — so it is safe
+to run against production before a change is.
+
+```
+$ stel plan --select 'document_registry+'   # the rag_chunks_pipeline example, after changing chunk_size
+model              kind        mater.       status      state_rows  reprocess  est_calls
+----------------------------------------------------------------------------------------
+document_registry  extraction  incremental  unchanged            2          0          -
+document_chunks    chunk       incremental  changed              2          2          -
+  code_version differs for 2 of 2 published rows
+chunk_embeddings   embed       incremental  cascade              2        <=2        <=1
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+chunk_entities     llm         incremental  cascade              2        <=2        <=2
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+chunk_facts        llm         incremental  cascade              2        <=2        <=2
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+chunk_search       search      incremental  cascade              2        <=2          -
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+
+6 model(s) planned: 1 unchanged, 1 changed, 4 downstream of a change, 0 new, 0 rebuilt every run. Rows to reprocess: 2 from code changes, up to 8 more downstream. No source was discovered and no provider was called; changed inputs are found by the run itself.
+```
+
+The statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `unchanged` | Every published row carries the current `code_version`. Only an input that changed will run, and the run finds those itself. |
+| `changed` | Some published rows carry a different `code_version`. `reprocess` is exact: those rows. Cadence-only settings (`flush_every`, `batch_size`, `refine_factor`, `warehouse_options`, …) never produce this, for the same reason they never invalidate state. |
+| `cascade` | This model's own configuration is unchanged, but a planned upstream model is `changed` (or is itself downstream of one). A re-keyed chunk model gives its embed child new ids; a re-run transform gives its child new input fingerprints. The exact count needs the upstream output the run will produce, so `reprocess` is a ceiling: every published row, written `<=N`. |
+| `new` | No published state. The first run processes every input. |
+| `full` | `materialization: full` rebuilds from its input every run; nothing is skipped or reprocessed incrementally. Listed so a changed upstream is still seen to reach it. |
+
+`est_calls` is the provider request count those rows imply, for the kinds
+that spend money: an `embed:` model priced against its provider's own batch
+split, and one request per row for an `llm:` model or per document for
+`backend: llm` extraction. It is `-` for kinds with no provider, and for a
+`uses_llm` transform, whose fan-out per parent is the transform's own code.
+Batch submission is not modeled; a provider whose extra is not installed on
+the planning host leaves the count unknown rather than failing the plan.
+
+A plan connects to the warehouse the way a run does — the same profile,
+target, and preflight — and writes `target/plan.json`, which `--json` prints
+to stdout for an orchestrator gate. It does not fail on a large reprocess;
+refusing to spend is the reprocess guard's job (issue #530), and the plan is
+the number that guard reads.
 
 ## Progress output
 
@@ -4346,6 +4400,12 @@ run results under `target-path`:
   concurrency actually achieved, and is why both numbers are reported. A model
   that *fails* still reports what it measured: a slow failure is the one worth
   diagnosing.
+- **`plan.json`** — written by `stel plan`: per selected model, status
+  (`unchanged`, `changed`, `cascade`, `new`, `full`), `code_version`, the
+  state rows it holds and how many carry a stale code version, the rows the
+  next run would reprocess (with `reprocess_is_upper_bound` when an upstream
+  change makes that a ceiling), the upstream models that caused it, and the
+  estimated provider calls. `schema_version: 1`. `--json` prints it.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`stel docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `stel docs serve`.

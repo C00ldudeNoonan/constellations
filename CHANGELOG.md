@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### `stel plan` says what a change would reprocess before the run spends anything (issue #529)
+
+- **Nothing said what a configuration change costs until the run was already
+  paying for it.** `state:modified` names which models diverged from a
+  manifest, never how many published rows that reclassifies or how many
+  provider requests follow — and the cascade was invisible: a `chunk_size`
+  change re-keys every chunk id, re-embeds every chunk downstream, and
+  rebuilds the index. The astrolabe project works that out by hand in a YAML
+  comment.
+- `stel plan [--select] [--exclude] [--json]` classifies every selected model
+  against the rows its published state records: `unchanged`, `changed` (with
+  the exact stale-row count), `cascade` (downstream of a change, with every
+  published row as the ceiling), `new`, or `full`. Paid kinds report the
+  provider requests those rows imply — embed against the provider's own batch
+  split, one per row for `llm:`, one per document for `backend: llm`.
+- Reads only stel's own state table: one aggregate query per model, no source
+  discovery, no provider call, no model table. Written to `target/plan.json`
+  (`schema_version: 1`), which `--json` prints and `stel clean` removes.
+- `WarehouseAdapter.state_code_version_counts(scope)` is the read behind it,
+  implemented once in the base adapter over the portable state SQL both
+  warehouses already run, and `ProjectDAG.ancestors()` joins `descendants()`.
+- Cadence-only settings stay invisible here for the same reason they never
+  invalidate state; the plan is the number the reprocess guard (issue #530)
+  will read, not the guard itself.
+
 ### A query reports where its wall clock went (issue #519)
 
 - **Nothing in the query path was timed.** Moving `sec_chunk_search` to

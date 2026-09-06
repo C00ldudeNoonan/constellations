@@ -1611,6 +1611,31 @@ to see the plan first."""
         )
         return count
 
+    # ─── code-version accounting (issue #529) ─────────────────────────────
+
+    def state_code_version_counts(self, scope: StateScope) -> dict[str, int]:
+        """Rows in `scope`, grouped by the code_version that published them.
+
+        The read `stel plan` makes: comparing the keys against the model's
+        current code_version says how many published rows the next run would
+        reclassify as changed, without loading the scope. One aggregate query
+        per model, so a corpus of millions of rows costs one round trip.
+        Read-only; an absent state table means nothing has been published.
+        """
+        if self.table_column_names(STATE_TABLE) is None:
+            return {}
+        table = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        # The state table spells StateScope.stage as `state_scope`.
+        found = self.rows(
+            f"""
+            SELECT code_version, COUNT(*) FROM {table}
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+            GROUP BY code_version
+            """,
+            [scope.model_name, scope.stage, scope.target_identity],
+        )
+        return {str(code_version): int(count) for code_version, count in found}
+
     # ─── paged state reconciliation (issue #153) ──────────────────────────
 
     def fetch_state_subset(

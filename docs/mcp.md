@@ -414,6 +414,34 @@ also have bounded result and page sizes. Document cursors are tied to the
 model, document ID, and exact document-version ID, so they cannot be replayed
 against another document.
 
+A search hit carries the attributes the model declares `returned: true`, in
+an `attributes` object beside `citation` and `lineage`:
+
+```json
+{
+  "rank": 1,
+  "chunk_id": "0dc0526f…",
+  "snippet": "…",
+  "attributes": {
+    "symbol": "AAPL",
+    "form_type": "10-Q",
+    "filing_date_dt": "2018-02-01",
+    "section": "Risk Factors"
+  },
+  "citation": {"…": "…"},
+  "lineage": {"…": "…"}
+}
+```
+
+These are exactly the attributes `list_context_models` advertises under
+`retrieval.filter_fields`, so an agent can label and group the hits it
+filtered on without a second `get_document` round trip per result. Values
+arrive JSON-shaped: a `date` or `timestamp` attribute is an ISO string.
+
+`returned: false` withholds an attribute from both this response and
+`stel search`. It is the only control over what leaves the governed boundary,
+so an attribute declared for filtering alone should say so.
+
 Every response uses the `mcp_context/v1` schema and returns a structured error
 with a stable code. Unauthorized and nonexistent models or records both return
 `not_found_or_denied`; the server does not reveal which condition occurred.

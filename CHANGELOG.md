@@ -27,6 +27,40 @@
   invalidate state; the plan is the number the reprocess guard (issue #530)
   will read, not the guard itself.
 
+### MCP search hits carry the attributes the model declares returnable (issue #524)
+
+- **A hit carried no business attributes at all.** A model declaring `symbol`,
+  `form_type`, `filing_date` and `section` with `filter_role: user` and
+  `returned: true` could be filtered on all four through the MCP and returned
+  none of them, so an agent could scope a search to one ticker and still be
+  unable to say which ticker any hit belonged to. Labelling a citation meant
+  scraping the snippet text or spending a second `get_document` round trip per
+  hit, at the per-query cost #519 measured.
+- The values were never missing: `search()` already resolves the declared
+  `returned: true` set onto `SearchResult.metadata` and `stel search` already
+  returns it. `SearchContextResult` simply had nowhere to put it. It now
+  carries an `attributes` object beside `citation` and `lineage`.
+- **Additive within `mcp_context/v1`, not a v2.** The field is optional and
+  defaults to empty, so a model declaring no returnable attributes produces
+  the response it produced before. Bumping the version would break every
+  client to deliver a field the catalog already advertises under
+  `retrieval.filter_fields`. Recorded in
+  [ADR-0008](docs/adr/0008-mcp-hits-carry-declared-attributes.md), which also
+  says what a version bump is still reserved for.
+- Sourced from the hit, never from the warehouse row behind it. The row
+  carries columns the model never declared, policy columns among them, and
+  sourcing from it would make exposure a property of the table's shape rather
+  than of the model's declaration.
+- `search.json_value` is now public, because `mcp_context/v1` admits no `date`
+  and both surfaces need the same coercion. Two implementations of that rule
+  would drift into one surface rendering a value the other rejects.
+
+**Worth checking before upgrading:** `returned: true` now means the same thing
+on both surfaces. An attribute declared returnable for `stel search` will now
+also appear over MCP, including a `filter_role: policy` attribute if one was
+declared that way. Set `returned: false` on anything that should not leave the
+governed boundary.
+
 ### A query reports where its wall clock went (issue #519)
 
 - **Nothing in the query path was timed.** Moving `sec_chunk_search` to

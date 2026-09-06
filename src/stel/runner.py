@@ -55,12 +55,14 @@ from .execution import usage as _usage_execution
 from .logging_setup import REPORTER_ECHO_EXTRA
 from .manifest import compute_modified_models
 from .paths import resolve_within_project
+from .plan import plan_models
 from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
     resolve_profile,
 )
 from .progress import get_reporter
+from .reprocess_guard import format_refusals, guard_reprocess
 from .sources import SourceError, get_document_source
 
 log = logging.getLogger(__name__)
@@ -201,6 +203,7 @@ def run_project(
     state: Path | None = None,
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
+    accept_reprocess: bool = False,
 ) -> list[ModelRunResult]:
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
@@ -336,6 +339,17 @@ def run_project(
     started_at = datetime.now(UTC).isoformat()
     with adapter:
         log.info("connected to %s warehouse", resolved.warehouse.type)
+        _enforce_reprocess_guard(
+            selected,
+            models_by_name=models_by_name,
+            dag=dag,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            full_refresh=full_refresh,
+            accept_reprocess=accept_reprocess,
+        )
         if threads > 1 and len(selected) > 1:
             results_by_name = _run_in_batches(dag, selected, adapter, _run, threads)
         else:
@@ -377,6 +391,7 @@ def build_project(
     state: Path | None = None,
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
+    accept_reprocess: bool = False,
 ) -> BuildResult:
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
@@ -502,6 +517,17 @@ def build_project(
 
     with adapter:
         log.info("connected to %s warehouse", resolved.warehouse.type)
+        _enforce_reprocess_guard(
+            selected,
+            models_by_name=models_by_name,
+            dag=dag,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            full_refresh=full_refresh,
+            accept_reprocess=accept_reprocess,
+        )
         for name in selected:
             if name in blocked:
                 out.skipped.append(name)
@@ -796,6 +822,55 @@ def _run_budget_ledger(resolved: ResolvedProfile) -> BudgetLedger | None:
     if resolved.llm is None or resolved.llm.budget is None:
         return None
     return BudgetLedger(resolved.llm.budget, scope="run")
+
+
+def _enforce_reprocess_guard(
+    selected: list[str],
+    *,
+    models_by_name: Mapping[str, ModelConfig],
+    dag: ProjectDAG,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool,
+    accept_reprocess: bool,
+) -> None:
+    """Stop before the first model runs if a paid model would reprocess
+    published rows it was not told to (issue #530).
+
+    `--full-refresh` and `--accept-reprocess` are the operator saying so.
+    Otherwise the whole selection is planned -- every model, because the
+    cascade an embed model pays for starts at a chunk model above it -- and
+    any `on_code_change: fail` model over its limit refuses the run. The plan
+    is one aggregate query per selected model; a selection with nothing under
+    the guard skips it entirely."""
+    if full_refresh or accept_reprocess:
+        return
+    planned = [models_by_name[name] for name in selected]
+    guarded = [
+        model
+        for model in planned
+        if (model.embed is not None and model.embed.on_code_change == "fail")
+        or (model.llm is not None and model.llm.on_code_change == "fail")
+    ]
+    if not guarded:
+        return
+    plans = plan_models(
+        planned,
+        dag=dag,
+        project=project,
+        project_dir=project_dir,
+        adapter=adapter,
+        resolved=resolved,
+    )
+    refusals = guard_reprocess(plans)
+    if refusals:
+        raise RunError(format_refusals(refusals))
+    log.info(
+        "reprocess guard: %d guarded model(s) within their reprocess_limit",
+        len(guarded),
+    )
 
 
 def _run_model(

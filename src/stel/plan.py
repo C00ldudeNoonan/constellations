@@ -80,6 +80,10 @@ class ModelPlan:
     provider: str | None
     provider_model: str | None
     reason: str
+    #: The model's `on_code_change` policy and `reprocess_limit` (issue #530);
+    #: None for a kind that carries no guard.
+    reprocess_policy: str | None = None
+    reprocess_limit: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +101,8 @@ class ModelPlan:
             "provider": self.provider,
             "provider_model": self.provider_model,
             "reason": self.reason,
+            "reprocess_policy": self.reprocess_policy,
+            "reprocess_limit": self.reprocess_limit,
         }
 
 
@@ -150,7 +156,7 @@ def plan_project(
     planned = [models_by_name[name] for name in selected]
     validate_warehouse_capabilities(planned, adapter)
     with adapter:
-        plans = _plan_models(
+        plans = plan_models(
             planned,
             dag=dag,
             project=project,
@@ -182,7 +188,7 @@ def write_plan_artifact(project_dir: Path, plan: ProjectPlan) -> Path:
     return out
 
 
-def _plan_models(
+def plan_models(
     planned: list[ModelConfig],
     *,
     dag: ProjectDAG,
@@ -191,6 +197,10 @@ def _plan_models(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
 ) -> list[ModelPlan]:
+    """Plan `planned` (in execution order) against an open adapter.
+
+    The runner calls this before the first model runs so the reprocess guard
+    (issue #530) reads the same numbers `stel plan` prints."""
     # Planned models whose own code_version moved. A change reaches every
     # descendant, through cascade and full models alike, and each of those
     # descendants has the same root in its ancestry -- so naming the roots is
@@ -301,6 +311,7 @@ def _classify(
     calls, provider, provider_model = _estimate_provider_calls(
         model, rows, resolved=resolved, project=project, project_dir=project_dir
     )
+    policy = model.embed if model.embed is not None else model.llm
     if status == "full":
         # A full model pays for every input every run, and the plan does not
         # count inputs; reporting 0 would read as "free".
@@ -320,6 +331,8 @@ def _classify(
         provider=provider,
         provider_model=provider_model,
         reason=reason,
+        reprocess_policy=policy.on_code_change if policy is not None else None,
+        reprocess_limit=policy.reprocess_limit if policy is not None else None,
     )
 
 

@@ -382,10 +382,10 @@ stel init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh proj
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
-stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
+stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
-stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
+stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
 stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
@@ -637,9 +637,66 @@ the planning host leaves the count unknown rather than failing the plan.
 
 A plan connects to the warehouse the way a run does — the same profile,
 target, and preflight — and writes `target/plan.json`, which `--json` prints
-to stdout for an orchestrator gate. It does not fail on a large reprocess;
-refusing to spend is the reprocess guard's job (issue #530), and the plan is
-the number that guard reads.
+to stdout for an orchestrator gate. `stel plan` itself never fails on a large
+reprocess; it reports, and its footer names the models a run would refuse
+under the guard below.
+
+### Refusing to spend: `on_code_change`
+
+A search index refuses a rebuild-required change by default. Embed and llm
+models now do the same for the thing that costs them money — reprocessing
+rows they already published:
+
+```yaml
+- name: chunk_embeddings
+  depends_on: [ref('document_chunks')]
+  embed:
+    provider: vertex
+    model: text-embedding-005
+    ...
+    on_code_change: fail      # fail (default) | reprocess
+    reprocess_limit: 0        # published rows a `fail` model tolerates reprocessing
+```
+
+Before the first model runs, `stel run` and `stel build` plan the whole
+selection exactly as `stel plan` does, and any embed or llm model under
+`on_code_change: fail` whose plan says more than `reprocess_limit` published
+rows would reprocess — its own configuration changed (`changed`), or a model
+above it did (`cascade`) — stops the run with every refused model and every
+way forward named:
+
+```
+Refusing to start: 1 model(s) would reprocess published rows at provider cost (on_code_change: fail).
+  chunk_embeddings (embed, vertex/text-embedding-005): up to 3,613,979 of 3,613,979 published rows would reprocess; about 28,235 provider request(s); reprocess_limit is 0. upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row.
+Run `stel plan` for the whole picture. To proceed: `--accept-reprocess` (reprocess these rows incrementally), `--full-refresh` (rebuild), or set `on_code_change: reprocess` or a higher `reprocess_limit` on the model.
+```
+
+Nothing has run when this fires: no source was discovered into the warehouse,
+no model table was touched, no provider was called. The ways forward:
+
+- **`--accept-reprocess`** proceeds with the incremental run as planned. This
+  is the flag for "yes, I changed the embedding model on purpose".
+- **`--full-refresh`** rebuilds, and was always an explicit request to
+  reprocess everything, so the guard never applies to it.
+- **`on_code_change: reprocess`** on the model restores the old behaviour for
+  that model. **`reprocess_limit: N`** keeps `fail` but tolerates up to `N`
+  rows, which is what a small model or a resume of an interrupted, already
+  accepted reprocess wants.
+
+What the guard does not do: a `new` model (no published state) and a `full`
+model never trip it, since a first build and a declared rebuild are not
+surprises; a selection with no guarded model skips the planning queries
+entirely; and `backend: llm` extraction and `uses_llm` transforms are not
+guarded yet, because their state is document-keyed and their per-parent
+fan-out is their own code. Both are on the theme this shipped under. A
+`--source-filter` or `--read-filter` run is still guarded against the whole
+published state, which is the right conservatism for a partition run over a
+changed model.
+
+The policy fields are not part of `code_version`, for the same reason
+`on_index_change` is not: relaxing a guard must never itself be a reprocess.
+ADR [0008](adr/0008-reprocess-guard-defaults-to-fail.md) records why `fail` is
+the default rather than a warning.
 
 ## Progress output
 

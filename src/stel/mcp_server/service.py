@@ -29,6 +29,7 @@ from ..search import (
     SearchMode,
     SearchRequest,
     SearchResult,
+    SearchSession,
     json_value,
     search,
 )
@@ -129,6 +130,17 @@ class ContextSearch(Protocol):
 
 
 class PortableContextSearch:
+    """Serve queries from one long-lived `SearchSession` (issue #523).
+
+    This class used to hold only paths and call `search()`, which recompiled
+    the project, resolved the profile and reopened the retrieval store on
+    every request -- so a served query paid the same setup a one-shot CLI
+    invocation does, and the store's index cache was discarded before a
+    second query could hit it. The session keeps all three across requests;
+    the query lease is still taken per request, because it is the generation
+    pin rather than setup.
+    """
+
     def __init__(
         self,
         project_dir: Path,
@@ -136,9 +148,9 @@ class PortableContextSearch:
         target: str | None,
         profiles_dir: Path | None,
     ) -> None:
-        self._project_dir = project_dir
-        self._target = target
-        self._profiles_dir = profiles_dir
+        self._session = SearchSession(
+            project_dir, target=target, profiles_dir=profiles_dir
+        )
 
     def execute(
         self,
@@ -147,12 +159,14 @@ class PortableContextSearch:
         policy_filters: Sequence[SearchFilter],
     ) -> Sequence[SearchResult]:
         return search(
-            self._project_dir,
+            self._session.project_dir,
             request,
-            target=self._target,
-            profiles_dir=self._profiles_dir,
             policy_filters=policy_filters,
+            session=self._session,
         )
+
+    def close(self) -> None:
+        self._session.close()
 
 
 class ContextServiceError(Exception):
@@ -449,6 +463,11 @@ class ContextService:
 
     def close(self) -> None:
         self._limiter.close()
+        # `ContextSearch` is a protocol with no close(): an in-memory or test
+        # search satisfies it without holding a store to release (issue #523).
+        closing = getattr(self._search, "close", None)
+        if closing is not None:
+            closing()
 
     def warm_up(self) -> None:
         """Resolve warehouse credentials and connectivity before serving.

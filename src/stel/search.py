@@ -198,7 +198,7 @@ class SearchProvenance:
             "logical_collection": self.logical_collection,
             "physical_collection": self.physical_collection,
             "upstream": self.upstream,
-            "embedding": _json_value(self.embedding),
+            "embedding": json_value(self.embedding),
         }
 
 
@@ -234,9 +234,9 @@ class SearchResult:
             "score": self.score,
             "raw_score": self.raw_score,
             "raw_score_kind": self.raw_score_kind,
-            "text": _json_value(self.text),
-            "metadata": _json_value(self.metadata),
-            "display": _json_value(self.display),
+            "text": json_value(self.text),
+            "metadata": json_value(self.metadata),
+            "display": json_value(self.display),
             "contributing_ranks": dict(self.contributing_ranks),
             "provenance": self.provenance.to_dict(),
         }
@@ -985,11 +985,19 @@ def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(value))
 
 
-def _json_value(value: Any) -> Any:
+def json_value(value: Any) -> Any:
+    """Coerce a search value into something JSON and Pydantic will take.
+
+    Public because two surfaces need the *same* coercion: the CLI's
+    `--output json` and the MCP `mcp_context/v1` contract, whose value
+    type admits no `date` (issue #524). Two implementations of this would
+    drift, and the drift would show up as one surface rendering a filing
+    date the other rejects.
+    """
     if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
+        return {str(key): json_value(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
-        return [_json_value(item) for item in value]
+        return [json_value(item) for item in value]
     if isinstance(value, date | datetime):
         return value.isoformat()
     return value

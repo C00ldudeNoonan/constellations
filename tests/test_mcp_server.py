@@ -101,9 +101,12 @@ class FakeRepository:
 
 
 class FakeSearch(ContextSearch):
-    def __init__(self) -> None:
+    def __init__(self, metadata: Mapping[str, Any] | None = None) -> None:
         self.request: SearchRequest | None = None
         self.policy_filters: tuple[SearchFilter, ...] = ()
+        # What `search()` resolved from the model's `returned: true`
+        # declaration for the hit (issue #524).
+        self.metadata = metadata
 
     def execute(
         self,
@@ -114,8 +117,20 @@ class FakeSearch(ContextSearch):
         self.request = request
         self.policy_filters = tuple(policy_filters)
         return (
-            _hit(CONTEXT_ALLOWED_1, DOC_ALLOWED, CHUNK_ALLOWED_1, rank=1),
-            _hit(CONTEXT_HIDDEN, DOC_HIDDEN, CHUNK_HIDDEN, rank=2),
+            _hit(
+                CONTEXT_ALLOWED_1,
+                DOC_ALLOWED,
+                CHUNK_ALLOWED_1,
+                rank=1,
+                metadata=self.metadata,
+            ),
+            _hit(
+                CONTEXT_HIDDEN,
+                DOC_HIDDEN,
+                CHUNK_HIDDEN,
+                rank=2,
+                metadata=self.metadata,
+            ),
         )
 
 
@@ -421,6 +436,7 @@ def _hit(
     chunk_id: str,
     *,
     rank: int,
+    metadata: Mapping[str, Any] | None = None,
 ) -> SearchResult:
     return SearchResult(
         record_id=context_id,
@@ -431,7 +447,7 @@ def _hit(
         raw_score=None,
         raw_score_kind=None,
         text={"text": "retrieval content is not trusted by the MCP boundary"},
-        metadata={},
+        metadata=dict(metadata or {}),
         display={},
         contributing_ranks={"text": rank},
         provenance=SearchProvenance(
@@ -453,8 +469,9 @@ def _service(
     principal: Principal | None = None,
     settings: ContextServerSettings | None = None,
     repository: FakeRepository | None = None,
+    hit_metadata: Mapping[str, Any] | None = None,
 ) -> tuple[ContextService, FakeSearch]:
-    fake_search = FakeSearch()
+    fake_search = FakeSearch(hit_metadata)
     service = ContextService(
         catalog=_artifact_catalog(),
         repository=repository or FakeRepository(_fixture_rows()),
@@ -1173,3 +1190,107 @@ def test_a_request_scoped_resolver_sees_the_calling_thread_context() -> None:
 
     assert response.error is None, response.error
     assert [model.name for model in response.models] == ["context_search"]
+
+
+# ─── hits carry what the model declares returnable (issue #524) ────────────
+
+
+def test_a_hit_carries_the_attributes_the_model_declares_returned() -> None:
+    """A hit carried no business attributes at all, so a search scoped to one
+    ticker could not say which ticker any hit belonged to. The values were
+    already on the row that produced the hit; nothing was carrying them across
+    the MCP boundary."""
+    service, _ = _service(
+        hit_metadata={
+            "symbol": "AAPL",
+            "form_type": "10-Q",
+            "section": "Risk Factors",
+        }
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="tariffs", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.results[0].attributes == {
+        "symbol": "AAPL",
+        "form_type": "10-Q",
+        "section": "Risk Factors",
+    }
+
+
+def test_declared_attribute_values_are_json_safe() -> None:
+    """`mcp_context/v1` admits no `date`, so a filing date has to arrive as a
+    string. The CLI and the MCP share one coercion precisely so the two
+    surfaces cannot disagree about a value the model declares."""
+    from datetime import date
+
+    service, _ = _service(
+        hit_metadata={
+            "filing_date_dt": date(2018, 2, 1),
+            "restated": False,
+            "page_count": 38,
+            "tags": ["tariffs", "supply-chain"],
+        }
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="tariffs", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.results[0].attributes == {
+        "filing_date_dt": "2018-02-01",
+        "restated": False,
+        "page_count": 38,
+        "tags": ["tariffs", "supply-chain"],
+    }
+
+
+def test_a_model_declaring_no_returned_attributes_is_unchanged() -> None:
+    """Additive within `mcp_context/v1`: a model that declares none produces
+    the response it produced before the field existed."""
+    service, _ = _service()
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.results[0].attributes == {}
+
+
+def test_attributes_come_from_the_hit_not_the_warehouse_row() -> None:
+    """The row behind a hit carries columns the model never declared -- policy
+    values among them. Sourcing the field from the hit's resolved
+    `returned: true` set is what keeps an undeclared column from riding along
+    just because it sits on the same row."""
+    service, _ = _service(hit_metadata={"symbol": "AAPL"})
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="tariffs", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    attributes = response.results[0].attributes
+    assert attributes == {"symbol": "AAPL"}
+    # The fixture row carries these; none is declared returnable.
+    for undeclared in ("tenant_id", "classification", "text", "context_id"):
+        assert undeclared not in attributes

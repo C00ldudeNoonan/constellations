@@ -29,6 +29,7 @@ from ..search import (
     SearchMode,
     SearchRequest,
     SearchResult,
+    json_value,
     search,
 )
 from .authorization import (
@@ -1066,6 +1067,10 @@ class ContextService:
             freshness=_freshness(row),
             citation=_citation(row),
             lineage=_lineage(resource, row),
+            # From the hit, not the warehouse row: `search()` already resolved
+            # exactly the declared `returned: true` set, so this needs no
+            # second read and cannot disagree with what the model declares.
+            attributes=json_value(hit.metadata),
         )
 
     def _document_chunk(

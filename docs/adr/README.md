@@ -16,6 +16,7 @@ history (issue #311).
 | [0005](0005-re-entry-unit-is-the-existing-checkpoint.md) | Re-entry resumes from each step's existing checkpoint; no phase ledger, no activate command | accepted |
 | [0006](0006-saas-context-is-landed-then-rendered.md) | SaaS context is landed by an EL tool and rendered by stel; no first-party connectors | accepted |
 | [0007](0007-native-drive-files-carry-a-change-token.md) | Native Drive files carry a change token named as such, never a fake content hash | accepted |
+| [0008](0008-mcp-hits-carry-declared-attributes.md) | A returnable attribute is additive within `mcp_context/v1`, not a v2 | accepted |
 
 ## When to write one
 

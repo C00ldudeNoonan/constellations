@@ -213,6 +213,16 @@ class SearchContextResult(BaseModel):
     freshness: FreshnessDescriptor
     citation: CitationDescriptor
     lineage: CompactLineage
+    # The attributes the model declares `returned: true`, which the catalog
+    # already advertises and callers already filter on (issue #524). Without
+    # them a hit cannot say which symbol, form or section it came from, so an
+    # agent can scope a search to one ticker and be unable to label the answer.
+    #
+    # Additive within `mcp_context/v1`, and defaulted: a model that declares
+    # none produces the response it produced before. See
+    # `docs/adr/0008-mcp-hits-carry-declared-attributes.md` for why this is not
+    # a v2.
+    attributes: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class SearchContextResponse(BaseModel):

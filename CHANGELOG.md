@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### `search_context` takes a `candidate_limit`, like the CLI always has (issue #525)
+
+`stel search` exposes `--candidate-limit` — how many candidates each retrieval
+mode fetches before fusion — and the MCP tool did not, so the two paths asked
+the same index for different amounts of work and only one of them could be
+tuned. An agent had no way to give hybrid fusion more to work with; raising
+`limit` asks for more results, which is a different thing.
+
+`search_context` now accepts it, with the CLI's bounds. It must be at least
+`limit`, and a request below that is a named bad argument rather than an
+internal error. Operators bound it with a new `max_candidates` setting
+(default 1000, the portable maximum), because more candidates means more store
+work per request — the same reason `max_results` bounds the response. Omitted,
+nothing about a query changes.
+
+**Correcting the reason this was filed.** #525 argued from the premise that
+filters behave as a postfilter and can therefore starve a filtered result
+page. They do not: filters are compiled as *prefilters* inside the store and
+resolved through the attribute's scalar index, so the candidates a mode
+returns already satisfy them and none are discarded afterwards (#520, pinned
+by `tests/test_approximate_search_quality.py`). A selective filter returns a
+full page. The knob is worth having for CLI/MCP parity and for tuning fusion
+depth, not as a workaround for starvation that does not occur — and the
+issue's companion suggestion, scaling the candidate set automatically when
+filters are present, is deliberately not implemented, since under prefiltering
+it would buy nothing.
+
 ### Embed and llm models refuse to reprocess published rows unannounced (issue #530)
 
 - **The kinds that spend money had no gate.** A search index refuses a

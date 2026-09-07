@@ -83,6 +83,12 @@ class ContextServerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_results: int = Field(default=20, ge=1, le=100)
+    # Ceiling on `search_context`'s `candidate_limit` (issue #525). A caller
+    # asking for more candidates asks the store for more work, which on a
+    # served transport is the operator's budget to bound, exactly as
+    # `max_results` bounds the response. The default is the portable maximum,
+    # so this only ever narrows.
+    max_candidates: int = Field(default=1000, ge=1, le=1000)
     max_document_chunks: int = Field(default=50, ge=1, le=100)
     max_entities_per_context: int = Field(default=50, ge=1, le=1000)
     max_snippet_bytes: int = Field(default=2000, ge=64, le=100_000)
@@ -673,6 +679,22 @@ class ContextService:
                 MCPErrorCode.INVALID_REQUEST,
                 f"limit must not exceed {self._settings.max_results}",
             )
+        if request.candidate_limit is not None:
+            if request.candidate_limit > self._settings.max_candidates:
+                raise ContextServiceError(
+                    MCPErrorCode.INVALID_REQUEST,
+                    f"candidate_limit must not exceed {self._settings.max_candidates}",
+                )
+            if request.candidate_limit < request.limit:
+                # The portable request enforces this too, but as a ValueError
+                # the caller would see as an internal failure rather than as
+                # the bad argument it is.
+                raise ContextServiceError(
+                    MCPErrorCode.INVALID_REQUEST,
+                    "candidate_limit must be at least limit; it is how many "
+                    "candidates are fetched before fusion, not how many results "
+                    "are returned",
+                )
         if request.mode not in resource.modes:
             raise ContextServiceError(
                 MCPErrorCode.CAPABILITY_UNAVAILABLE,
@@ -687,6 +709,7 @@ class ContextService:
                 query=request.query,
                 mode=SearchMode(request.mode),
                 limit=request.limit,
+                candidate_limit=request.candidate_limit,
                 filters=filters,
             ),
             policy_filters=authorized.policy_filters,

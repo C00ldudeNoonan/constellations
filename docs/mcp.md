@@ -414,6 +414,22 @@ also have bounded result and page sizes. Document cursors are tied to the
 model, document ID, and exact document-version ID, so they cannot be replayed
 against another document.
 
+**Widening the candidate set.** `search_context` accepts `candidate_limit`,
+matching the `--candidate-limit` flag on `stel search`: how many candidates
+each retrieval mode fetches *before* fusion, which is not how many results
+come back — that stays `limit`. Unset, it scales with `limit`, which is the
+right default for most queries; raising it gives hybrid fusion more to work
+with when a query's two arms disagree, at the cost of more store work per
+request. It must be at least `limit`, and the operator bounds it with
+`max_candidates` (default 1000, the portable maximum) the same way
+`max_results` bounds the response.
+
+Note that a `filters` argument does **not** need a wider candidate set to
+avoid starving the result page. stel applies declared attribute filters as
+*prefilters* inside the store, so the candidates a mode returns already
+satisfy them and none are discarded after retrieval; a selective filter
+returns a full page rather than a short one.
+
 A search hit carries the attributes the model declares `returned: true`, in
 an `attributes` object beside `citation` and `lineage`:
 

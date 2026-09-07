@@ -128,6 +128,12 @@ class SearchContextRequest(BaseModel):
     query: str = Field(min_length=1, max_length=32_768)
     mode: Literal["vector", "text", "hybrid"] = "hybrid"
     limit: int = Field(default=10, ge=1, le=100)
+    # Candidates each retrieval mode fetches before fusion, matching the
+    # `--candidate-limit` CLI flag's bounds (issue #525). Unset keeps the
+    # portable default, which scales with `limit`. Raising it deepens what
+    # hybrid fusion has to work with; it does not change how many results
+    # come back, which is `limit`.
+    candidate_limit: int | None = Field(default=None, ge=1, le=1000)
     filters: tuple[BusinessFilter, ...] = ()
 
 

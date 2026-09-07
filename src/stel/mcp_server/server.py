@@ -74,10 +74,16 @@ def create_mcp_server(
         query: str,
         mode: Literal["vector", "text", "hybrid"] = "hybrid",
         limit: int = 10,
+        candidate_limit: int | None = None,
         filters: list[BusinessFilter] | None = None,
         schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> SearchContextResponse:
-        """Search an available context model with caller-derived authorization."""
+        """Search an available context model with caller-derived authorization.
+
+        `candidate_limit` is how many candidates each retrieval mode fetches
+        before fusion, not how many results come back — that stays `limit`.
+        Unset, it scales with `limit`.
+        """
         return service.search_context(
             SearchContextRequest(
                 schema_version=schema_version,
@@ -85,6 +91,7 @@ def create_mcp_server(
                 query=query,
                 mode=mode,
                 limit=limit,
+                candidate_limit=candidate_limit,
                 filters=tuple(filters or ()),
             )
         )

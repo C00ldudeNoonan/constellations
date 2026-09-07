@@ -793,3 +793,151 @@ def test_a_one_shot_query_still_creates_the_serving_tables(
         )
 
     assert ensures == 2
+
+
+# ─── the held warehouse connection (issue #523, increment 4) ────────────────
+
+
+def _count_adapter_opens(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Every adapter the search path constructs, in order."""
+    import stel.search as search_module
+
+    opened: list[Any] = []
+    real_create_adapter = search_module.create_adapter
+
+    def tracking_create_adapter(*args: Any, **kwargs: Any) -> Any:
+        adapter = real_create_adapter(*args, **kwargs)
+        opened.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(search_module, "create_adapter", tracking_create_adapter)
+    return opened
+
+
+def _allow_held_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the DuckDB test warehouse behave like a network one for the test.
+
+    A file-backed DuckDB warehouse refuses to be held (its open handle is an
+    exclusive lock); BigQuery and MotherDuck accept. The tests run on DuckDB,
+    so the adapter's answer is overridden to exercise the held path.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    monkeypatch.setattr(DuckDBAdapter, "supports_held_connection", lambda self: True)
+
+
+def _request() -> SearchRequest:
+    return SearchRequest(
+        model="release_search",
+        query="inflation consumer prices",
+        mode=SearchMode.TEXT,
+        limit=2,
+    )
+
+
+def test_a_session_holds_the_warehouse_open_when_the_adapter_allows(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One connection for the life of the session, connected on the first
+    query only. On BigQuery every open is a ~2s credential resolution, and a
+    served query used to pay it three or more times (#523)."""
+    from stel.timing import PhaseTimings
+
+    _allow_held_connections(monkeypatch)
+    opened = _count_adapter_opens(monkeypatch)
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    try:
+        connects: list[bool] = []
+        for _ in range(3):
+            timings = PhaseTimings()
+            assert search(published_project, _request(), session=session, timings=timings)
+            connects.append("warehouse_connect" in timings.snapshot())
+    finally:
+        session.close()
+
+    assert len(opened) == 1
+    assert connects == [True, False, False]
+    # Closing the session closes the connection it held.
+    assert opened[0]._con is None
+
+
+def test_a_file_backed_warehouse_still_connects_per_query(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open DuckDB file is an exclusive lock; a server holding it would
+    block `stel run` in another process for as long as it ran."""
+    opened = _count_adapter_opens(monkeypatch)
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    try:
+        for _ in range(3):
+            assert search(published_project, _request(), session=session)
+        assert session._warehouse is None
+    finally:
+        session.close()
+
+    assert len(opened) == 3
+    assert all(adapter._con is None for adapter in opened)
+
+
+def test_a_session_reconnects_after_a_held_connection_fails(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held connection that has broken must not be served to later queries."""
+    from stel.adapters.base import AdapterError
+
+    _allow_held_connections(monkeypatch)
+    opened = _count_adapter_opens(monkeypatch)
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    try:
+        assert search(published_project, _request(), session=session)
+        held = session._warehouse
+        assert held is opened[0]
+
+        def fail(*args: Any, **kwargs: Any) -> Any:
+            raise AdapterError("warehouse connection lost")
+
+        monkeypatch.setattr(held, "execute", fail)
+        with pytest.raises(SearchError, match="warehouse connection lost"):
+            search(published_project, _request(), session=session)
+        assert session._warehouse is None
+
+        # The next query reconnects rather than inheriting the failure.
+        assert search(published_project, _request(), session=session)
+        assert session._warehouse is opened[1]
+    finally:
+        session.close()
+
+    assert len(opened) == 2
+
+
+def test_a_held_connection_serializes_statements_across_threads(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP tools run on the SDK's worker threads and a DuckDB connection
+    is not thread-safe, so a held one is guarded per statement -- not per
+    query, which would serialize execution rather than I/O (#432)."""
+    import threading
+
+    _allow_held_connections(monkeypatch)
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    failures: list[BaseException] = []
+
+    def query() -> None:
+        try:
+            assert search(published_project, _request(), session=session)
+        except BaseException as error:  # collected, so the test reports it
+            failures.append(error)
+
+    try:
+        workers = [threading.Thread(target=query) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    finally:
+        session.close()
+    assert failures == []

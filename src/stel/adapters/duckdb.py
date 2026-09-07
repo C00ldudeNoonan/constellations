@@ -465,6 +465,15 @@ class DuckDBAdapter(WarehouseAdapter):
         cursor.execute(f"SET TimeZone='{_SESSION_TIME_ZONE}'")
         return cursor
 
+    def supports_held_connection(self) -> bool:
+        # An open DuckDB file is an exclusive lock: one process reads and
+        # writes, or several read. A server holding it would block `stel run`
+        # in another terminal for as long as it served. MotherDuck is the same
+        # engine reached over the network, with no file to lock.
+        config = self.config
+        assert isinstance(config, DuckDBWarehouseConfig)
+        return config.is_motherduck
+
     def _close(self) -> None:
         if self._con is not None:
             self._con.close()

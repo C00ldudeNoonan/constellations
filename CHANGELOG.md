@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### The MCP server holds its warehouse connection across requests (issue #523)
+
+- **A served query opened the warehouse three or more times.** Once for its
+  lease, once to re-read each hit's row, once per entity relation, once more
+  for the query log, and on BigQuery each open is a credential resolution of
+  about two seconds. The store was already held across requests (#534); the
+  warehouse connection was the last increment of #523.
+- The serving session now holds one warehouse connection when the adapter
+  says it may outlive a request, and the MCP repository's reads and log
+  writes go through the same session, so every warehouse touch of a served
+  query shares one connection. Statements are serialized per call across
+  concurrent tool threads, not per query. A held connection that raises an
+  adapter error is discarded and the next request reconnects.
+- `WarehouseAdapter.supports_held_connection()` is the adapter's say: true
+  for BigQuery and MotherDuck, false for a file-backed DuckDB warehouse,
+  whose open handle is an exclusive lock that would block `stel run` in
+  another process for as long as the server ran. That target keeps its
+  per-request connection.
+- The serialized adapter wrapper the runner uses under `--threads` moved to
+  `stel.adapters.serialized.SerializedAdapter`, since the serving session
+  needs the same guard.
+
 ### `stel eval --compare` says which variant is better (issue #532)
 
 - **Two variants existed side by side, and nothing said which one won.**

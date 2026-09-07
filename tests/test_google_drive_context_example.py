@@ -199,3 +199,70 @@ def test_the_folder_is_answerable_through_the_mcp_service(
         assert deck.results[0].citation.section_path == ("Q3 kickoff", "2. Risks")
     finally:
         service.close()
+
+
+# ─── the held warehouse connection (issue #523, increment 4) ────────────────
+
+
+def _count_adapter_opens(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Every warehouse adapter the serving session constructs, in order."""
+    import stel.search as search_module
+
+    opened: list[Any] = []
+    real_create_adapter = search_module.create_adapter
+
+    def tracking_create_adapter(*args: Any, **kwargs: Any) -> Any:
+        adapter = real_create_adapter(*args, **kwargs)
+        opened.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(search_module, "create_adapter", tracking_create_adapter)
+    return opened
+
+
+def _serve_two_queries(project: Path) -> None:
+    service = ContextService.from_project(project)
+    try:
+        service.warm_up()
+        for _ in range(2):
+            response = service.search_context(
+                SearchContextRequest(model="context_search", query="disk encryption", mode="text")
+            )
+            assert response.error is None, response.error
+            assert response.results
+    finally:
+        service.close()
+
+
+def test_a_served_query_opens_the_warehouse_more_than_once_per_request(
+    built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The baseline the held connection removes on a network warehouse: the
+    search lease, the re-read of the hits' rows and the registry each open
+    their own connection on every request when the adapter cannot be held."""
+    monkeypatch.setenv("STEL_MCP_PRINCIPAL_ID", "local-operator")
+    monkeypatch.setenv("STEL_MCP_TENANT_ID", "drive")
+    write_manifest(built)
+    opened = _count_adapter_opens(monkeypatch)
+    _serve_two_queries(built)
+    # The warm-up, then at least three per request.
+    assert len(opened) >= 1 + 2 * 3
+    assert all(adapter._con is None for adapter in opened)
+
+
+def test_a_served_query_shares_the_sessions_held_connection(
+    built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a holdable adapter the warm-up's open is the only one: the search
+    lease, every hit re-read and the query log share it, and closing the
+    service closes it."""
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    monkeypatch.setenv("STEL_MCP_PRINCIPAL_ID", "local-operator")
+    monkeypatch.setenv("STEL_MCP_TENANT_ID", "drive")
+    write_manifest(built)
+    monkeypatch.setattr(DuckDBAdapter, "supports_held_connection", lambda self: True)
+    opened = _count_adapter_opens(monkeypatch)
+    _serve_two_queries(built)
+    assert len(opened) == 1
+    assert opened[0]._con is None

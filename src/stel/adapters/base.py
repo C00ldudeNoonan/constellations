@@ -998,6 +998,18 @@ class WarehouseAdapter(ABC):
     ) -> None:
         self._close()
 
+    def supports_held_connection(self) -> bool:
+        """Whether one open connection may be held for a process lifetime
+        without excluding other processes from the warehouse (issue #523).
+
+        A serving process reuses its connection across requests when this is
+        true. False is the safe answer and the default: a file-backed engine
+        holds an exclusive lock for as long as it is open, so a server that
+        kept it would block every `stel run` in another process until it
+        exited. A network warehouse has no such lock and overrides this.
+        """
+        return False
+
     @abstractmethod
     def _connect(self) -> None: ...
 

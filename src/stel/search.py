@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -11,12 +11,13 @@ from pathlib import Path
 from threading import Lock, RLock
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa
 
-from .adapters import create_adapter
+from .adapters import WarehouseAdapter, create_adapter
 from .adapters.base import AdapterError, StateScope
+from .adapters.serialized import SerializedAdapter
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
 from .config.model import ModelConfig, SearchAttributeConfig
@@ -297,9 +298,17 @@ class SearchSession:
     magnitude, and the explanation for the "warm is no faster than cold"
     observation in both #461 and #519.
 
+    The warehouse connection is held too, when the adapter says one may
+    outlive a request (`supports_held_connection`). A served query opens the
+    warehouse for its lease, then again for every re-read of the hits' rows
+    and once more for the query log -- three or more opens per request, each
+    a credential resolution on BigQuery -- and every one now shares the
+    session's connection. A file-backed DuckDB warehouse still connects per
+    call, because its open handle is an exclusive lock that would block
+    `stel run` in another process for as long as the server ran.
+
     Deliberately not cached: the query lease. It is the generation pin and the
-    concurrency control, so it is re-taken per request even here. Also not
-    cached: the warehouse connection, which is a separate increment (#523).
+    concurrency control, so it is re-taken per request even here.
 
     Concurrency: the MCP tools are registered as synchronous functions, so the
     SDK runs them off the event loop and concurrent callers are not
@@ -324,12 +333,21 @@ class SearchSession:
         self._stores: dict[str, RetrievalStore] = {}
         self._store_locks: dict[str, Lock] = {}
         self._schema_ensured = False
+        # The held warehouse, if the adapter allows one: the entered adapter
+        # (to close) and its per-statement guard (to hand out). None until
+        # the first operation, and None again after a discard.
+        self._warehouse: WarehouseAdapter | None = None
+        self._warehouse_guarded: WarehouseAdapter | None = None
+        self._statement_lock = Lock()
+        # Decided on the first open and remembered, so a file-backed warehouse
+        # does not construct a throwaway adapter per call to ask again.
+        self._warehouse_holdable: bool | None = None
 
-    def resolve(self, timings: PhaseTimings) -> _ResolvedProject:
+    def resolve(self, timings: PhaseTimings | None) -> _ResolvedProject:
         """Compile the project and resolve the profile, once per session."""
         with self._lock:
             if self._resolved is None:
-                with timings.phase("compile"):
+                with timings.phase("compile") if timings is not None else nullcontext():
                     project_config, sources, models = load_project(self.project_dir)
                     validate_project_contract(
                         project_config, sources, models, self.project_dir
@@ -370,6 +388,75 @@ class SearchSession:
                 self._stores[alias] = store
                 self._store_locks[alias] = Lock()
             return store
+
+    @contextmanager
+    def warehouse(self, timings: PhaseTimings | None) -> Iterator[WarehouseAdapter]:
+        """An open warehouse adapter for one operation.
+
+        Held across operations when the adapter allows it, opened and closed
+        per call otherwise. A held adapter serializes concurrent tool threads
+        per statement, not per operation: the #432 lesson is that a lock
+        spanning a whole query serializes execution rather than I/O. An
+        `AdapterError` inside the block discards a held connection, so the
+        next operation reconnects rather than inheriting the failure.
+        """
+        resolved = self.resolve(timings).profile
+        with self._lock:
+            held, fresh = self._warehouse_for_call(resolved, timings)
+        if held is not None:
+            try:
+                yield held
+            except AdapterError:
+                self.discard_warehouse()
+                raise
+            return
+        connecting = perf_counter()
+        with fresh as adapter:
+            # Timed on entry rather than around the block: the `with` spans
+            # the whole operation, and what is wanted is the connect alone.
+            _record(timings, "warehouse_connect", perf_counter() - connecting)
+            yield adapter
+
+    def _warehouse_for_call(
+        self, resolved: ResolvedProfile, timings: PhaseTimings | None
+    ) -> tuple[WarehouseAdapter | None, WarehouseAdapter]:
+        """The held connection, or an unentered adapter for this call alone.
+
+        The adapter decides which on the first call and the answer is kept,
+        so a file-backed warehouse constructs exactly one adapter per call
+        rather than a second to ask again. Called under the session lock.
+        """
+        if self._warehouse_guarded is not None:
+            return self._warehouse_guarded, self._warehouse_guarded
+        adapter = create_adapter(resolved.warehouse, project_dir=self.project_dir)
+        if self._warehouse_holdable is None:
+            self._warehouse_holdable = adapter.supports_held_connection()
+        if not self._warehouse_holdable:
+            return None, adapter
+        connecting = perf_counter()
+        adapter.__enter__()
+        _record(timings, "warehouse_connect", perf_counter() - connecting)
+        self._warehouse = adapter
+        self._warehouse_guarded = cast(
+            WarehouseAdapter, SerializedAdapter(adapter, self._statement_lock)
+        )
+        return self._warehouse_guarded, self._warehouse_guarded
+
+    def discard_warehouse(self) -> None:
+        """Drop a held connection that failed, so the next operation reconnects.
+
+        Closing is best-effort for the same reason `discard_store` is: the
+        connection is already being discarded, and a failure to close a broken
+        one must not mask the error that caused the discard."""
+        with self._lock:
+            adapter = self._warehouse
+            self._warehouse = None
+            self._warehouse_guarded = None
+        if adapter is not None:
+            try:
+                adapter.__exit__(None, None, None)
+            except Exception:  # see the docstring
+                log.debug("Discarding a failed warehouse connection raised on close")
 
     def needs_schema_ensure(self) -> bool:
         """Whether a coordinator built now should create the serving tables.
@@ -419,8 +506,14 @@ class SearchSession:
             aliases = list(self._stores)
         for alias in aliases:
             self.discard_store(alias)
+        self.discard_warehouse()
         with self._lock:
             self._resolved = None
+
+
+def _record(timings: PhaseTimings | None, phase: str, seconds: float) -> None:
+    if timings is not None:
+        timings.add(phase, seconds)
 
 
 def search(
@@ -479,7 +572,6 @@ def _search(
     timings: PhaseTimings,
     started: float,
 ) -> list[SearchResult]:
-    project_dir = session.project_dir
     context = session.resolve(timings)
     project_config = context.project_config
     resolved = context.profile
@@ -567,11 +659,7 @@ def _search(
     candidate_limit = request.candidate_limit or min(max(request.limit * 4, 50), 1000)
 
     try:
-        connecting = perf_counter()
-        with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-            # Timed on entry rather than around the block: the `with` spans
-            # the whole query, and what is wanted is the connect alone.
-            timings.add("warehouse_connect", perf_counter() - connecting)
+        with session.warehouse(timings) as adapter:
             ensuring_schema = session.needs_schema_ensure()
             coordinator = ServingCoordinator(adapter, ensure_schema=ensuring_schema)
             if ensuring_schema:
@@ -644,7 +732,8 @@ def _search(
         # A cached store that has failed stays failed, and every later query
         # on this session would inherit it -- so drop it and let the next one
         # reopen (issue #523). AdapterError is a warehouse failure, not a
-        # store one, and leaves the store cached.
+        # store one, and leaves the store cached; `session.warehouse()` has
+        # already discarded a held connection on it.
         if isinstance(error, RetrievalError):
             session.discard_store(alias)
         raise SearchError(str(error)) from None

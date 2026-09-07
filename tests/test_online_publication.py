@@ -51,7 +51,7 @@ def test_online_switch_appends_privately_and_preserves_readers(
     real_seed = LanceDBStore.seed_collection
 
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         first_reader = coordinator.acquire_query(scope)
         readers = [first_reader]
@@ -116,7 +116,7 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
 ) -> None:
     scope, resolved = _prepare(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         original_state = adapter.fetch_state(scope)
         real_seed = LanceDBStore.seed_collection
@@ -184,7 +184,7 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
     [retry] = run_project(tmp_path, select="context_search")
     assert retry.rows_written == expected_written
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        recovered = ServingCoordinator(adapter).status(scope)
+        recovered = ServingCoordinator(adapter, ensure_schema=True).status(scope)
         assert recovered.status == "ready"
         assert recovered.active_collection is not None
     assert resolved.retrieval is not None
@@ -205,7 +205,7 @@ def test_online_incompatible_change_is_refused_before_claim(tmp_path: Path) -> N
         encoding="utf-8",
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         with pytest.raises(RunError, match="requires a rebuild"):
             run_project(tmp_path, select="context_search")
@@ -217,7 +217,7 @@ def test_existing_publisher_is_refused_before_planning_store_io(
 ) -> None:
     scope, resolved = _prepare(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         current = coordinator.status(scope)
         assert current.config_fingerprint is not None
         coordinator.acquire_publish(
@@ -236,7 +236,7 @@ def test_existing_publisher_is_refused_before_planning_store_io(
 def test_online_subset_change_cannot_replace_the_complete_index(tmp_path: Path) -> None:
     scope, resolved = _prepare(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         with pytest.raises(RunError, match="unfiltered run"):
             run_project(
@@ -249,7 +249,7 @@ def test_retirement_waits_for_readers_of_superseded_generations(tmp_path: Path) 
     scope, resolved = _prepare(tmp_path)
     run_project(tmp_path, select="context_search")
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         reader = coordinator.acquire_query(scope)
         run_project(tmp_path, select="context_search", full_refresh=True)
@@ -292,7 +292,7 @@ def test_online_change_includes_concurrent_warehouse_row_changes(tmp_path: Path)
     [result] = run_project(tmp_path, select="context_search")
     assert result.rows_written == 2
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert resolved.retrieval is not None and entry.active_collection is not None
     with LanceDBStore(
         resolved.retrieval.stores["primary"],
@@ -309,7 +309,7 @@ def test_online_can_replace_with_an_empty_snapshot(tmp_path: Path) -> None:
     [result] = run_project(tmp_path, select="context_search")
     assert result.rows_written == 0
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert entry.status == "ready" and entry.active_collection is not None
     assert resolved.retrieval is not None
     with LanceDBStore(
@@ -328,7 +328,7 @@ def test_strategy_can_switch_back_to_exact_without_mutating_ann_generation(
     scope, resolved = _prepare(tmp_path)
     run_project(tmp_path, select="context_search")
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         old = coordinator.status(scope)
         reader = coordinator.acquire_query(scope)
         path = tmp_path / "models" / "retrieval.yml"
@@ -374,7 +374,7 @@ def test_online_widens_attributes_in_a_private_generation(tmp_path: Path) -> Non
     _materialize_upstream(tmp_path, _rows().with_columns(pl.lit("filing").alias("section")))
     run_project(tmp_path, select="context_search")
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert resolved.retrieval is not None and entry.active_collection is not None
     with LanceDBStore(
         resolved.retrieval.stores["primary"],
@@ -392,7 +392,7 @@ def test_online_widens_attributes_in_a_private_generation(tmp_path: Path) -> Non
 def test_in_place_publish_still_refuses_active_readers(tmp_path: Path) -> None:
     scope, resolved = _prepare(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         reader = coordinator.acquire_query(scope)
         with pytest.raises(ServingBusyError):
             coordinator.acquire_publish(
@@ -410,7 +410,7 @@ def test_online_publish_recovers_a_scope_left_failed_with_no_generation(tmp_path
     generation from the warehouse and activate it, with nothing to retain."""
     scope, resolved = _prepare(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         assert before.config_fingerprint is not None
         # A stranded in-place publisher: the claim clears the pointer, then dies.
@@ -427,7 +427,7 @@ def test_online_publish_recovers_a_scope_left_failed_with_no_generation(tmp_path
     assert result.rows_written == 2
 
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         after = coordinator.status(scope)
         assert after.status == "ready"
         assert after.active_generation is not None
@@ -448,7 +448,7 @@ def test_online_index_type_switch_builds_the_declared_type_privately(tmp_path: P
     scope, resolved = _prepare(tmp_path)
     run_project(tmp_path, select="context_search")  # approximate, default type
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         old = coordinator.status(scope)
         reader = coordinator.acquire_query(scope)
         path = tmp_path / "models" / "retrieval.yml"
@@ -507,7 +507,7 @@ def test_activation_clears_the_generation_scope(tmp_path: Path) -> None:
     run_project(tmp_path, select="context_search")
 
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
         assert entry.status == "ready" and entry.active_collection is not None
         assert adapter.fetch_state(scope), "the serving scope should now hold the state"
         assert _generation_scope_rows(adapter, entry.active_collection) == 0
@@ -564,7 +564,7 @@ def test_sweeping_an_orphaned_generation_clears_its_scope(
         assert orphan not in store.list_collections()
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         assert _generation_scope_rows(adapter, orphan) == 0
-        assert ServingCoordinator(adapter).status(scope).status == "ready"
+        assert ServingCoordinator(adapter, ensure_schema=True).status(scope).status == "ready"
 
 
 # ─── an interrupted in-place publish is re-entered, not redone (issue #493) ─
@@ -623,7 +623,7 @@ def test_an_interrupted_in_place_publish_resumes_from_state(
         "in-place publish is not re-enterable"
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        assert ServingCoordinator(adapter).status(scope).status == "ready"
+        assert ServingCoordinator(adapter, ensure_schema=True).status(scope).status == "ready"
 
 
 # ─── a complete resume does not read the corpus again (issue #508) ──────────
@@ -711,7 +711,7 @@ def test_a_complete_resume_skips_the_warehouse_read(
     assert retry.rows_written == 0
     assert retry.documents_skipped == 2
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert entry.status == "ready"
     assert entry.active_collection is not None and "__g" in entry.active_collection
     assert resolved.retrieval is not None
@@ -746,7 +746,7 @@ def test_a_moved_upstream_is_read_on_resume(
 
     assert retry.rows_written == 2, "a moved upstream must be re-read and reconciled"
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert entry.status == "ready" and entry.active_collection is not None
     assert resolved.retrieval is not None
     with LanceDBStore(
@@ -775,7 +775,7 @@ def test_a_resumed_generation_reconciles_deletions(
 
     assert retry.documents_deleted == 1
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert entry.status == "ready" and entry.active_collection is not None
     assert resolved.retrieval is not None
     with LanceDBStore(

@@ -316,6 +316,7 @@ class SearchSession:
         self._resolved: _ResolvedProject | None = None
         self._stores: dict[str, RetrievalStore] = {}
         self._store_locks: dict[str, Lock] = {}
+        self._schema_ensured = False
 
     def resolve(self, timings: PhaseTimings) -> _ResolvedProject:
         """Compile the project and resolve the profile, once per session."""
@@ -362,6 +363,26 @@ class SearchSession:
                 self._stores[alias] = store
                 self._store_locks[alias] = Lock()
             return store
+
+    def needs_schema_ensure(self) -> bool:
+        """Whether a coordinator built now should create the serving tables.
+
+        True until one has (issue #535). The tables cannot vanish under a
+        running session, so re-creating them per query bought nothing and cost
+        two BigQuery jobs and a column probe on every request.
+        """
+        with self._lock:
+            return not self._schema_ensured
+
+    def mark_schema_ensured(self) -> None:
+        """Record that a coordinator finished creating the serving tables.
+
+        Called after the coordinator is built, not before: a construction that
+        raised has not ensured anything, and the next query should try again
+        rather than inherit an assumption from a failure.
+        """
+        with self._lock:
+            self._schema_ensured = True
 
     def store_guard(self, alias: str) -> AbstractContextManager[Any]:
         """Serialize store I/O for one alias across concurrent tool threads."""
@@ -544,7 +565,10 @@ def _search(
             # Timed on entry rather than around the block: the `with` spans
             # the whole query, and what is wanted is the connect alone.
             timings.add("warehouse_connect", perf_counter() - connecting)
-            coordinator = ServingCoordinator(adapter)
+            ensuring_schema = session.needs_schema_ensure()
+            coordinator = ServingCoordinator(adapter, ensure_schema=ensuring_schema)
+            if ensuring_schema:
+                session.mark_schema_ensured()
             with timings.phase("lease"):
                 lease = coordinator.acquire_query(
                     state_scope, legacy_scope=legacy_state_scope

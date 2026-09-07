@@ -133,7 +133,7 @@ def serving_status(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         return _report(
             coordinator.status(scope),
             resolved=resolved,
@@ -173,7 +173,7 @@ def serving_recover(
             f"{resolved.target_name} to confirm that is the one you mean."
         )
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         had_row = coordinator.scope_exists(scope)
         entry = coordinator.recover(scope, owner_terminated=owner_terminated)
         return _report(
@@ -229,7 +229,7 @@ def serving_migrate_scope(
     if scope.target_identity == legacy_scope.target_identity:
         return {"model": model_name, "state_rows": 0, "ledger_rows": 0}
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         # Ledger first: it is the row that decides whether an index is
         # considered published at all. If the state move fails after it, a
         # re-run finds the ledger already moved and finishes the state.

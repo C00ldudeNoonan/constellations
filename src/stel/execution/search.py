@@ -158,7 +158,7 @@ def _run_search_model(
     rows_seen = 0
     spec: CollectionSpec | None = None
     state_scope: StateScope | None = None
-    coordinator = ServingCoordinator(adapter)
+    coordinator = ServingCoordinator(adapter, ensure_schema=True)
     publish_lease: PublishLease | None = None
     active_generation: str | None = None
     state_swapped = False

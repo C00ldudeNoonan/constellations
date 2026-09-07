@@ -529,7 +529,7 @@ def test_failed_index_validation_keeps_receipted_state_and_blocks_readiness(
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         assert sorted(adapter.fetch_state(scope)) == ["c1", "c2"]
-        assert ServingCoordinator(adapter).status(scope).status == "failed"
+        assert ServingCoordinator(adapter, ensure_schema=True).status(scope).status == "failed"
     with store:
         metadata = store.inspect_collection("retrieval_demo__dev__context")
         assert metadata is not None
@@ -540,7 +540,7 @@ def test_failed_index_validation_keeps_receipted_state_and_blocks_readiness(
     assert retry[0].rows_inserted == 0
     assert retry[0].documents_skipped == 2
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        assert ServingCoordinator(adapter).status(scope).status == "ready"
+        assert ServingCoordinator(adapter, ensure_schema=True).status(scope).status == "ready"
 
 
 def test_failed_snapshot_validation_keeps_receipted_state_and_blocks_readiness(
@@ -580,7 +580,7 @@ def test_failed_snapshot_validation_keeps_receipted_state_and_blocks_readiness(
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         assert sorted(adapter.fetch_state(scope)) == ["c1", "c2"]
-        assert ServingCoordinator(adapter).status(scope).status == "failed"
+        assert ServingCoordinator(adapter, ensure_schema=True).status(scope).status == "failed"
 
     monkeypatch.undo()
     retry = run_project(tmp_path, select="context_search")
@@ -645,7 +645,7 @@ def test_unacknowledged_receipt_advances_no_state(
             ).state_descriptor("context").descriptor(),
         )
         assert adapter.fetch_state(scope) == {}
-        assert ServingCoordinator(adapter).status(scope).status == "failed"
+        assert ServingCoordinator(adapter, ensure_schema=True).status(scope).status == "failed"
 
 
 def test_invalid_vector_fails_without_content_or_id_in_error(tmp_path: Path) -> None:
@@ -811,14 +811,14 @@ def test_full_refresh_rebuilds_into_a_private_generation_and_activates(
         tmp_path, profiles_dir=None, target=None, model_name="context_search"
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        before = ServingCoordinator(adapter).status(scope)
+        before = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     # An in-place publish leaves the pointer null: the unsuffixed default.
     assert before.active_collection is None
 
     run_project(tmp_path, select="context_search", full_refresh=True)
 
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        after = ServingCoordinator(adapter).status(scope)
+        after = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert after.status == "ready"
     assert after.active_collection is not None
     assert "__g" in after.active_collection
@@ -1362,7 +1362,7 @@ def test_rebuild_policy_replaces_the_index_on_an_incompatible_change(
         tmp_path, profiles_dir=None, target=None, model_name="context_search"
     )
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        entry = ServingCoordinator(adapter).status(scope)
+        entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     assert entry.status == "ready"
     assert entry.active_collection is not None and "__g" in entry.active_collection
 
@@ -1651,7 +1651,7 @@ def _held_publish_lease(tmp_path: Path) -> Iterator[tuple[Any, Any, Any]]:
         }
     )
     with create_adapter(config) as adapter:
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         scope = StateScope.for_target_descriptor(
             "ctx_search",
             stage="retrieval_publish",

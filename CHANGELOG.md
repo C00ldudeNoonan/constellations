@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Embed and llm models refuse to reprocess published rows unannounced (issue #530)
+
+- **The kinds that spend money had no gate.** A search index refuses a
+  rebuild-required change by default; an embed or llm model whose identity
+  changed — or whose chunk model above it re-keyed every id — silently
+  reprocessed the corpus at provider prices with only the run budget in the
+  way, a tripwire sized for runaway loops, not for "you changed the embedding
+  model".
+- `embed.on_code_change` and `llm.on_code_change` (`fail` by default, or
+  `reprocess`) with `reprocess_limit` (rows, default 0). Before the first model
+  runs, `stel run` and `stel build` plan the selection exactly as `stel plan`
+  does and stop on any guarded model that would reprocess more than its limit,
+  naming every refused model, the rows and estimated requests, and every way
+  forward. `--accept-reprocess` proceeds; `--full-refresh` was always explicit
+  and never trips it; `new` and `full` models never do either.
+- The guard reads the plan rather than inspecting state inside each execution
+  path, which is what lets it see the cascade: an embed model whose own config
+  is unchanged still stops when the chunk model above it changed. A selection
+  with no guarded model skips the planning queries.
+- The policy fields are excluded from `code_version`, like `on_index_change`:
+  relaxing a guard must never itself be a reprocess. `stel plan`'s footer names
+  the models a run would refuse. ADR-0008 records why the default is `fail`
+  rather than a warning, and what is deliberately not guarded yet
+  (`backend: llm` extraction, `uses_llm` transforms).
+- **Upgrade note.** An existing project that changes an embed or llm model's
+  identity, or anything above it, now needs `--accept-reprocess` once (or
+  `on_code_change: reprocess` on the model) where it used to reprocess
+  silently. A first build and an unchanged corpus are unaffected.
+
+### `stel plan` says what a change would reprocess before the run spends anything (issue #529)
+
+- **Nothing said what a configuration change costs until the run was already
+  paying for it.** `state:modified` names which models diverged from a
+  manifest, never how many published rows that reclassifies or how many
+  provider requests follow — and the cascade was invisible: a `chunk_size`
+  change re-keys every chunk id, re-embeds every chunk downstream, and
+  rebuilds the index. The astrolabe project works that out by hand in a YAML
+  comment.
+- `stel plan [--select] [--exclude] [--json]` classifies every selected model
+  against the rows its published state records: `unchanged`, `changed` (with
+  the exact stale-row count), `cascade` (downstream of a change, with every
+  published row as the ceiling), `new`, or `full`. Paid kinds report the
+  provider requests those rows imply — embed against the provider's own batch
+  split, one per row for `llm:`, one per document for `backend: llm`.
+- Reads only stel's own state table: one aggregate query per model, no source
+  discovery, no provider call, no model table. Written to `target/plan.json`
+  (`schema_version: 1`), which `--json` prints and `stel clean` removes.
+- `WarehouseAdapter.state_code_version_counts(scope)` is the read behind it,
+  implemented once in the base adapter over the portable state SQL both
+  warehouses already run, and `ProjectDAG.ancestors()` joins `descendants()`.
+- Cadence-only settings stay invisible here for the same reason they never
+  invalidate state; the plan is the number the reprocess guard (issue #530)
+  will read, not the guard itself.
+
 ### MCP search hits carry the attributes the model declares returnable (issue #524)
 
 - **A hit carried no business attributes at all.** A model declaring `symbol`,

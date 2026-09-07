@@ -44,6 +44,7 @@ from .logging_setup import configure_verbose_logging, resolve_verbosity
 from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .paths import resolve_within_project
+from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
 from .profile import (
     PROFILES_FILENAME,
     ProfileError,
@@ -62,6 +63,7 @@ from .prompts import (
 from .providers import (
     get_inference_provider,
 )
+from .reprocess_guard import guard_reprocess
 from .retrieval.servability import (
     DEFAULT_CONTEXT_TIMEOUT_SECONDS,
     MAX_CONTEXT_TIMEOUT_SECONDS,
@@ -866,7 +868,89 @@ def _model_kind(model: ModelConfig) -> str:
 
 @cli.command()
 @click.option(
+    "--select",
+    "select",
+    default=None,
+    help=(
+        "Selector expression (e.g. 'raw_invoices+', '+invoice_summary', "
+        "'tag:raw', 'kind:embed')."
+    ),
+)
+@click.option("--exclude", default=None, help="Selector expression for models to skip.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print target/plan.json to stdout instead of the table.",
+)
+@_verbose_option
+@_project_context_options
+@click.pass_context
+def plan(
+    ctx: click.Context,
+    select: str | None,
+    exclude: str | None,
+    json_output: bool,
+    verbose: int,
+) -> None:
+    """Report what the next run would reprocess, before it spends anything.
+
+    Compares each selected model's code_version against the rows its
+    published state records, names the downstream models a change reaches,
+    and estimates the provider requests those rows imply. Reads only stel's
+    own state table: no source discovery, no provider call, no model table.
+    """
+    project_dir: Path = ctx.obj["project_dir"]
+    profiles_dir = ctx.obj["profiles_dir"]
+    target = ctx.obj["target"]
+    _configure_output(verbose, json_output=json_output)
+    try:
+        result = plan_project(
+            project_dir,
+            select=select,
+            exclude=exclude,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except (SelectionError, PlanError) as e:
+        raise click.ClickException(str(e)) from e
+    artifact = write_plan_artifact(project_dir, result)
+    if json_output:
+        click.echo(artifact.read_text(encoding="utf-8"))
+        return
+    if not result.models:
+        click.echo("No models selected.")
+        return
+    for line in format_plan_table(result):
+        click.echo(line)
+    refusals = guard_reprocess(result.models)
+    if refusals:
+        click.echo("")
+        click.echo(
+            f"`stel run` would refuse to start: {len(refusals)} model(s) under "
+            "on_code_change: fail would reprocess more than their reprocess_limit:"
+        )
+        for refusal in refusals:
+            click.echo(f"  {refusal.describe()}")
+        click.echo(
+            "Pass --accept-reprocess or --full-refresh, or set on_code_change: "
+            "reprocess on the model."
+        )
+
+
+@cli.command()
+@click.option(
     "--full-refresh", is_flag=True, help="Ignore incremental state and reprocess everything."
+)
+@click.option(
+    "--accept-reprocess",
+    is_flag=True,
+    help=(
+        "Proceed when an embed or llm model would reprocess published rows at "
+        "provider cost (on_code_change: fail). `stel plan` shows what that is."
+    ),
 )
 @click.option(
     "--select",
@@ -931,6 +1015,7 @@ def _model_kind(model: ModelConfig) -> str:
 def run(
     ctx: click.Context,
     full_refresh: bool,
+    accept_reprocess: bool,
     select: str | None,
     exclude: str | None,
     watch: bool,
@@ -960,6 +1045,7 @@ def run(
             threads=threads,
             source_filter=source_filter,
             read_filter=read_filter,
+            accept_reprocess=accept_reprocess,
         )
         return
 
@@ -976,6 +1062,7 @@ def run(
             state=state,
             source_filter=source_filter,
             read_filter=read_filter,
+            accept_reprocess=accept_reprocess,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1098,6 +1185,14 @@ def _usage_summary(
 @click.option(
     "--full-refresh", is_flag=True, help="Ignore incremental state and reprocess everything."
 )
+@click.option(
+    "--accept-reprocess",
+    is_flag=True,
+    help=(
+        "Proceed when an embed or llm model would reprocess published rows at "
+        "provider cost (on_code_change: fail). `stel plan` shows what that is."
+    ),
+)
 @click.option("--select", "select", default=None, help="Selector expression.")
 @click.option("--exclude", default=None, help="Selector expression for nodes to exclude.")
 @click.option(
@@ -1151,6 +1246,7 @@ def _usage_summary(
 def build(
     ctx: click.Context,
     full_refresh: bool,
+    accept_reprocess: bool,
     select: str | None,
     exclude: str | None,
     threads: int,
@@ -1181,6 +1277,7 @@ def build(
             state=state,
             source_filter=source_filter,
             read_filter=read_filter,
+            accept_reprocess=accept_reprocess,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e

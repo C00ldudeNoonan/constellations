@@ -140,6 +140,10 @@ class ProjectDAG:
         """All nodes transitively downstream of `name` (excluding `name`)."""
         return _bfs(name, self.successors)
 
+    def ancestors(self, name: str) -> set[str]:
+        """All nodes transitively upstream of `name` (excluding `name`)."""
+        return _bfs(name, self.predecessors)
+
     def required_sources(self, model_names: list[str]) -> list[str]:
         """Source ancestors required by `model_names`, in graph order."""
         required: set[str] = set()

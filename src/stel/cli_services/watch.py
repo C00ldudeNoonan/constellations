@@ -33,6 +33,7 @@ def run_watch(
     threads: int = 1,
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
+    accept_reprocess: bool = False,
 ) -> None:
     """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
     from watchfiles import watch
@@ -93,6 +94,7 @@ def run_watch(
                 threads=threads,
                 source_filter=source_filter,
                 read_filter=read_filter,
+                accept_reprocess=accept_reprocess,
             )
         except (*CONFIG_ERRORS, RunError) as e:
             click.echo(f"error: {e}", err=True)

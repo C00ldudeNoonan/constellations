@@ -446,6 +446,15 @@ class EmbedConfig(BaseModel):
     # output content -- including it would re-embed every existing corpus at
     # provider prices on upgrade.
     flush_every: int = Field(default=5000, gt=0)
+    # Refuse to start a run that would pay for published rows again (issue
+    # #530): a changed embed identity, or an upstream change that re-keys the
+    # input, reprocesses the corpus at provider prices with nothing but the
+    # budget cap in the way. `fail` stops before the first model runs when
+    # more than `reprocess_limit` published rows would reprocess; the run
+    # proceeds with `--accept-reprocess` or `--full-refresh`. Policy, not
+    # identity: both are excluded from code_version like `on_index_change`.
+    on_code_change: Literal["fail", "reprocess"] = "fail"
+    reprocess_limit: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _validate_fields(self) -> EmbedConfig:
@@ -528,6 +537,11 @@ class LLMTransformConfig(BaseModel):
     # (f"{id_value}__{ordinal}") and its position within the parent's output.
     row_id_field: str = Field(default="llm_row_id", min_length=1)
     ordinal_field: str = Field(default="ordinal", min_length=1)
+    # Same guard as `embed.on_code_change` (issue #530): one provider call per
+    # row makes an unannounced reprocess the most expensive thing this model
+    # can do. Excluded from code_version.
+    on_code_change: Literal["fail", "reprocess"] = "fail"
+    reprocess_limit: int = Field(default=0, ge=0)
 
     @field_validator("prompt")
     @classmethod

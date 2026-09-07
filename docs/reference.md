@@ -382,11 +382,12 @@ stel init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh proj
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
-stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
+stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
-stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
+stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
+stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -586,6 +587,116 @@ extraction/transform/ml config and transform module source) against a
 manifest written by a previous `compile` or `run`. The CI recipe: store
 `target/manifest.json` from main, then on PRs run
 `stel build --select 'state:modified+' --state path/to/main-manifest/`.
+
+## Planning a change (`stel plan`)
+
+`state:modified` says *which* models a change touched. `stel plan` says what
+that costs: for every selected model, whether its `code_version` still matches
+the rows its published state records, how many rows the next run would
+reprocess, which downstream models the change reaches, and roughly how many
+provider requests that implies. It reads stel's own state table and nothing
+else — no source discovery, no provider call, no model table — so it is safe
+to run against production before a change is.
+
+```
+$ stel plan --select 'document_registry+'   # the rag_chunks_pipeline example, after changing chunk_size
+model              kind        mater.       status      state_rows  reprocess  est_calls
+----------------------------------------------------------------------------------------
+document_registry  extraction  incremental  unchanged            2          0          -
+document_chunks    chunk       incremental  changed              2          2          -
+  code_version differs for 2 of 2 published rows
+chunk_embeddings   embed       incremental  cascade              2        <=2        <=1
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+chunk_entities     llm         incremental  cascade              2        <=2        <=2
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+chunk_facts        llm         incremental  cascade              2        <=2        <=2
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+chunk_search       search      incremental  cascade              2        <=2          -
+  upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
+
+6 model(s) planned: 1 unchanged, 1 changed, 4 downstream of a change, 0 new, 0 rebuilt every run. Rows to reprocess: 2 from code changes, up to 8 more downstream. No source was discovered and no provider was called; changed inputs are found by the run itself.
+```
+
+The statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `unchanged` | Every published row carries the current `code_version`. Only an input that changed will run, and the run finds those itself. |
+| `changed` | Some published rows carry a different `code_version`. `reprocess` is exact: those rows. Cadence-only settings (`flush_every`, `batch_size`, `refine_factor`, `warehouse_options`, …) never produce this, for the same reason they never invalidate state. |
+| `cascade` | This model's own configuration is unchanged, but a planned upstream model is `changed` (or is itself downstream of one). A re-keyed chunk model gives its embed child new ids; a re-run transform gives its child new input fingerprints. The exact count needs the upstream output the run will produce, so `reprocess` is a ceiling: every published row, written `<=N`. |
+| `new` | No published state. The first run processes every input. |
+| `full` | `materialization: full` rebuilds from its input every run; nothing is skipped or reprocessed incrementally. Listed so a changed upstream is still seen to reach it. |
+
+`est_calls` is the provider request count those rows imply, for the kinds
+that spend money: an `embed:` model priced against its provider's own batch
+split, and one request per row for an `llm:` model or per document for
+`backend: llm` extraction. It is `-` for kinds with no provider, and for a
+`uses_llm` transform, whose fan-out per parent is the transform's own code.
+Batch submission is not modeled; a provider whose extra is not installed on
+the planning host leaves the count unknown rather than failing the plan.
+
+A plan connects to the warehouse the way a run does — the same profile,
+target, and preflight — and writes `target/plan.json`, which `--json` prints
+to stdout for an orchestrator gate. `stel plan` itself never fails on a large
+reprocess; it reports, and its footer names the models a run would refuse
+under the guard below.
+
+### Refusing to spend: `on_code_change`
+
+A search index refuses a rebuild-required change by default. Embed and llm
+models now do the same for the thing that costs them money — reprocessing
+rows they already published:
+
+```yaml
+- name: chunk_embeddings
+  depends_on: [ref('document_chunks')]
+  embed:
+    provider: vertex
+    model: text-embedding-005
+    ...
+    on_code_change: fail      # fail (default) | reprocess
+    reprocess_limit: 0        # published rows a `fail` model tolerates reprocessing
+```
+
+Before the first model runs, `stel run` and `stel build` plan the whole
+selection exactly as `stel plan` does, and any embed or llm model under
+`on_code_change: fail` whose plan says more than `reprocess_limit` published
+rows would reprocess — its own configuration changed (`changed`), or a model
+above it did (`cascade`) — stops the run with every refused model and every
+way forward named:
+
+```
+Refusing to start: 1 model(s) would reprocess published rows at provider cost (on_code_change: fail).
+  chunk_embeddings (embed, vertex/text-embedding-005): up to 3,613,979 of 3,613,979 published rows would reprocess; about 28,235 provider request(s); reprocess_limit is 0. upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row.
+Run `stel plan` for the whole picture. To proceed: `--accept-reprocess` (reprocess these rows incrementally), `--full-refresh` (rebuild), or set `on_code_change: reprocess` or a higher `reprocess_limit` on the model.
+```
+
+Nothing has run when this fires: no source was discovered into the warehouse,
+no model table was touched, no provider was called. The ways forward:
+
+- **`--accept-reprocess`** proceeds with the incremental run as planned. This
+  is the flag for "yes, I changed the embedding model on purpose".
+- **`--full-refresh`** rebuilds, and was always an explicit request to
+  reprocess everything, so the guard never applies to it.
+- **`on_code_change: reprocess`** on the model restores the old behaviour for
+  that model. **`reprocess_limit: N`** keeps `fail` but tolerates up to `N`
+  rows, which is what a small model or a resume of an interrupted, already
+  accepted reprocess wants.
+
+What the guard does not do: a `new` model (no published state) and a `full`
+model never trip it, since a first build and a declared rebuild are not
+surprises; a selection with no guarded model skips the planning queries
+entirely; and `backend: llm` extraction and `uses_llm` transforms are not
+guarded yet, because their state is document-keyed and their per-parent
+fan-out is their own code. Both are on the theme this shipped under. A
+`--source-filter` or `--read-filter` run is still guarded against the whole
+published state, which is the right conservatism for a partition run over a
+changed model.
+
+The policy fields are not part of `code_version`, for the same reason
+`on_index_change` is not: relaxing a guard must never itself be a reprocess.
+ADR [0008](adr/0008-reprocess-guard-defaults-to-fail.md) records why `fail` is
+the default rather than a warning.
 
 ## Progress output
 
@@ -4346,6 +4457,12 @@ run results under `target-path`:
   concurrency actually achieved, and is why both numbers are reported. A model
   that *fails* still reports what it measured: a slow failure is the one worth
   diagnosing.
+- **`plan.json`** — written by `stel plan`: per selected model, status
+  (`unchanged`, `changed`, `cascade`, `new`, `full`), `code_version`, the
+  state rows it holds and how many carry a stale code version, the rows the
+  next run would reprocess (with `reprocess_is_upper_bound` when an upstream
+  change makes that a ceiling), the upstream models that caused it, and the
+  estimated provider calls. `schema_version: 1`. `--json` prints it.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`stel docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `stel docs serve`.

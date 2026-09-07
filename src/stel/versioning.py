@@ -76,7 +76,19 @@ def compute_document_id(scope: str, relative_path: str) -> str:
 # Embed settings that shape execution rather than output. Excluded from
 # code_version so tuning throughput never re-embeds a corpus at provider cost.
 _EMBED_EXECUTION_FIELDS = frozenset(
-    {"batch_size", "max_retries", "flush_every", "max_concurrent"}
+    {
+        "batch_size",
+        "max_retries",
+        "flush_every",
+        "max_concurrent",
+        # The reprocess guard (issue #530) decides whether a run may start;
+        # putting it in the identity would make relaxing it a reprocess.
+        "on_code_change",
+        "reprocess_limit",
+    }
+)
+_LLM_EXECUTION_FIELDS = frozenset(
+    {"max_concurrent", "max_retries", "flush_every", "on_code_change", "reprocess_limit"}
 )
 
 
@@ -148,7 +160,7 @@ def compute_code_version(
         "llm": (
             dict(effective_llm)
             if effective_llm is not None
-            else llm.model_dump(exclude={"max_concurrent", "max_retries", "flush_every"})
+            else llm.model_dump(exclude=set(_LLM_EXECUTION_FIELDS))
             if llm
             else None
         ),

@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import pickle
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,7 @@ from stel.adapters.bigquery import (
     _coalesced_batches,
     to_query_parameters,
 )
+from stel.adapters.serialized import SerializedAdapter
 from stel.config.identifiers import LEGACY_SCHEMA_NAME
 from stel.credentials import ProtectedCredential
 from stel.timing import PhaseTimings
@@ -3850,6 +3852,42 @@ def test_integration_append_rows_creates_accumulates_and_widens() -> None:
                 f"SELECT invocation_id FROM {adapter.table_ref('run_log')} "
                 "ORDER BY invocation_id"
             ) == [("i1",), ("i2",), ("i3",)]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_a_held_connection_answers_from_several_threads() -> None:
+    """Live cover for the serving session's held connection (issue #523).
+
+    BigQuery says one connection may outlive a request, and the fake client
+    cannot say whether the real one survives being shared across the MCP
+    SDK's tool threads. One entered adapter, guarded per statement, answers a
+    query from each of four threads.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        assert adapter.supports_held_connection()
+        with adapter:
+            guarded = SerializedAdapter(adapter, threading.Lock())
+            answers: list[Any] = []
+
+            def ask(n: int) -> None:
+                answers.append(guarded.rows(f"SELECT {n}"))
+
+            workers = [threading.Thread(target=ask, args=(n,)) for n in range(4)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            assert sorted(answers) == [[(n,)] for n in range(4)]
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()

@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any, Protocol
 
-from ..adapters import create_adapter
 from ..adapters.base import AdapterError, ReadPredicate
 from ..append_log import QUERY_LOG_SCHEMA, write_rows
-from ..config import load_project
-from ..profile import resolve_profile
+from ..search import SearchSession
 
 log = logging.getLogger(__name__)
 
@@ -54,38 +51,34 @@ class ContextRepository(Protocol):
 
 
 class WarehouseContextRepository:
-    def __init__(
-        self,
-        project_dir: Path,
-        *,
-        target: str | None = None,
-        profiles_dir: Path | None = None,
-    ) -> None:
-        self._project_dir = project_dir
-        project, _, _ = load_project(project_dir)
-        self._resolved = resolve_profile(
-            project,
-            project_dir,
-            target=target,
-            profiles_dir=profiles_dir,
-        )
+    """Warehouse reads for the MCP service, through the serving session.
+
+    The session is shared with `PortableContextSearch` so the re-read of each
+    hit's row, the query-log write and the query's own lease all use one
+    warehouse connection when the adapter allows one to be held (issue
+    #523); before that, every one of them opened its own.
+    """
+
+    def __init__(self, session: SearchSession) -> None:
+        self._session = session
+        # Resolved now, not on first request: a bad profile should fail the
+        # service's construction, before a transport starts.
+        self._resolved = session.resolve(None).profile
 
     def query_log_captures_text(self) -> bool:
         config = self._resolved.mcp_query_log
         return config is not None and config.enabled and config.capture_query_text
 
     def warm_up(self) -> None:
-        """Open and close the warehouse once, exactly as a request would.
+        """Open the warehouse once, exactly as a request would.
 
-        Credentials resolve lazily inside each request's adapter open; under
-        stdio serving a hang or failure there surfaces only as a per-call
-        "timeout" with no diagnostics (issue #365). Warming up at startup
-        makes a broken auth setup fail loudly at boot instead.
+        Credentials resolve lazily inside the adapter open; under stdio
+        serving a hang or failure there surfaces only as a per-call "timeout"
+        with no diagnostics (issue #365). Warming up at startup makes a broken
+        auth setup fail loudly at boot instead. When the session holds its
+        connection, this is the open the first request would otherwise pay.
         """
-        with create_adapter(
-            self._resolved.warehouse,
-            project_dir=self._project_dir,
-        ):
+        with self._session.warehouse(None):
             pass
 
     def log_query(self, row: Mapping[str, Any]) -> None:
@@ -98,17 +91,20 @@ class WarehouseContextRepository:
         if config is None or not config.enabled:
             return
         try:
-            with create_adapter(
-                self._resolved.warehouse,
-                project_dir=self._project_dir,
-            ) as adapter:
-                write_rows(
+            with self._session.warehouse(None) as adapter:
+                written = write_rows(
                     adapter,
                     config,
                     [dict(row)],
                     schema=QUERY_LOG_SCHEMA,
                     what="the MCP query log",
                 )
+                if written < 1:
+                    # `write_rows` keeps its best-effort contract by swallowing
+                    # the adapter's error, so a broken held connection would
+                    # otherwise survive to fail the next request. Retiring it
+                    # costs one reconnect; keeping it costs a served answer.
+                    self._session.retire_warehouse(adapter)
         except Exception as error:
             log.warning(
                 "Could not open the warehouse to write the MCP query log [%s]; "
@@ -128,10 +124,7 @@ class WarehouseContextRepository:
             raise ValueError("max_rows must be positive")
         rows: list[Mapping[str, Any]] = []
         try:
-            with create_adapter(
-                self._resolved.warehouse,
-                project_dir=self._project_dir,
-            ) as adapter:
+            with self._session.warehouse(None) as adapter:
                 if relation not in adapter.list_tables():
                     return ()
                 with adapter.table_snapshot(

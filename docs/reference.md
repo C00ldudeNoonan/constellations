@@ -2947,8 +2947,19 @@ second and later queries on one session cost:
 | **total** | **38.8s** | **24.2s** |
 
 The lease is deliberately not cached: it pins the generation a query reads and
-is what makes a concurrent publish safe. The warehouse connection is not
-cached either, which is why `warehouse_connect` still appears on every query.
+is what makes a concurrent publish safe.
+
+The warehouse connection is held across requests when the adapter says one
+may be: BigQuery and MotherDuck have no exclusive lock to hold, so one
+connection serves every request, and the re-read of each hit's row and the
+query-log write that follow a search share it rather than opening their own.
+A served query used to open the warehouse three or more times, each a
+credential resolution of about two seconds on BigQuery; on a session that
+holds its connection, `warehouse_connect` appears on the first request only.
+A file-backed DuckDB warehouse still connects per request, because an open
+DuckDB file is an exclusive lock and a server that kept it would block
+`stel run` in another process for as long as it ran. A held connection that
+fails is discarded, and the next request reconnects.
 
 Filters are repeatable `FIELD OP VALUE` triples. Operators are `eq`, `ne`,
 `lt`, `le`, `gt`, `ge`, `in`, and `array_contains_any`; the last two take a

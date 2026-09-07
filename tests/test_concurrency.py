@@ -4,7 +4,7 @@ Two properties, both of which were quietly false and neither of which any
 existing test could see:
 
 - A streaming stage must not hold the shared adapter lock for its whole run.
-  `_SerializedAdapter` serializes warehouse access so models can share one
+  `SerializedAdapter` serializes warehouse access so models can share one
   connection under `--threads N`, but it special-cased `table_snapshot` and
   held the lock across the entire context. A streaming stage keeps that context
   open for its whole run — provider calls and publishes included — so the first
@@ -32,8 +32,8 @@ import polars as pl
 import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
+from stel.adapters.serialized import SerializedAdapter
 from stel.budget import LLMBudgetConfig
-from stel.runner import _SerializedAdapter
 
 
 def _adapter(tmp_path: Path) -> Any:
@@ -52,7 +52,7 @@ def test_a_snapshot_does_not_hold_the_adapter_lock_while_streaming(
 ) -> None:
     """The #432 regression, asserted where it is observable.
 
-    Under `--threads N` every model shares one `_SerializedAdapter`. If the
+    Under `--threads N` every model shares one `SerializedAdapter`. If the
     lock is held for the snapshot's whole context, no other model can make a
     single warehouse call until the streaming stage finishes — which for embed
     or chunk is the entire model, provider latency included.
@@ -62,7 +62,7 @@ def test_a_snapshot_does_not_hold_the_adapter_lock_while_streaming(
             "rows", pl.DataFrame({"id": [f"r{i}" for i in range(20)]})
         )
         lock = threading.Lock()
-        guarded = _SerializedAdapter(adapter, lock)
+        guarded = SerializedAdapter(adapter, lock)
 
         with guarded.table_snapshot("rows", batch_size=5) as snapshot:
             # Mid-stream: consume one batch, then check the lock is free.
@@ -94,7 +94,7 @@ def test_the_snapshot_open_is_still_guarded(tmp_path: Path) -> None:
             return real_snapshot(*args, **kwargs)
 
         adapter.table_snapshot = spy  # type: ignore[method-assign]
-        guarded = _SerializedAdapter(adapter, lock)
+        guarded = SerializedAdapter(adapter, lock)
         with guarded.table_snapshot("rows") as snapshot:
             list(snapshot)
 
@@ -112,7 +112,7 @@ def test_a_failing_snapshot_still_closes_under_the_lock(tmp_path: Path) -> None:
             "rows", pl.DataFrame({"id": [f"r{i}" for i in range(10)]})
         )
         lock = threading.Lock()
-        guarded = _SerializedAdapter(adapter, lock)
+        guarded = SerializedAdapter(adapter, lock)
 
         with pytest.raises(RuntimeError, match="deliberate"):
             with guarded.table_snapshot("rows", batch_size=2) as snapshot:

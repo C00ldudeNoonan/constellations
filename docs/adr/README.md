@@ -18,6 +18,7 @@ history (issue #311).
 | [0007](0007-native-drive-files-carry-a-change-token.md) | Native Drive files carry a change token named as such, never a fake content hash | accepted |
 | [0008](0008-reprocess-guard-defaults-to-fail.md) | Paid models refuse an unannounced reprocess by default; the guard reads the plan, not per-stage state | accepted |
 | [0008](0008-mcp-hits-carry-declared-attributes.md) | A returnable attribute is additive within `mcp_context/v1`, not a v2 | accepted |
+| [0009](0009-serving-holds-the-warehouse-when-the-adapter-allows.md) | The serving session holds its warehouse connection only when the adapter says one may outlive a request | accepted |
 
 ## When to write one
 

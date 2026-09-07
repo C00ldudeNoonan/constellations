@@ -11,12 +11,12 @@ from typing import Any, cast
 import duckdb
 import pytest
 
+from stel.adapters.serialized import SerializedAdapter
 from stel.config import ConfigError
 from stel.config.source import SourceConfig
 from stel.manifest import write_run_results
 from stel.runner import (
     RunError,
-    _SerializedAdapter,
     build_project,
     clean_project,
     run_project,
@@ -476,7 +476,7 @@ def test_serialized_adapter_releases_the_lock_while_a_snapshot_streams() -> None
             second_call_finished.set()
             return []
 
-    guarded = _SerializedAdapter(cast(Any, Adapter()), threading.Lock())
+    guarded = SerializedAdapter(cast(Any, Adapter()), threading.Lock())
 
     def hold_snapshot() -> None:
         with guarded.table_snapshot("upstream"):

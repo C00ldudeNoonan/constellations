@@ -1420,6 +1420,11 @@ class BigQueryAdapter(WarehouseAdapter):
     def _connect(self) -> None:
         self._client = self._make_client()
 
+    def supports_held_connection(self) -> bool:
+        # A client over HTTP; nothing about holding it excludes another
+        # process, and each open costs a credential resolution (~2s).
+        return True
+
     def _close(self) -> None:
         bqstorage_client = self._bqstorage_client
         client = self._client

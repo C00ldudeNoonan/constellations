@@ -142,21 +142,15 @@ class PortableContextSearch:
     the project, resolved the profile and reopened the retrieval store on
     every request -- so a served query paid the same setup a one-shot CLI
     invocation does, and the store's index cache was discarded before a
-    second query could hit it. The session keeps all three across requests;
-    the query lease is still taken per request, because it is the generation
-    pin rather than setup.
+    second query could hit it. The session keeps all three across requests,
+    and the warehouse connection too where the adapter allows it; the query
+    lease is still taken per request, because it is the generation pin
+    rather than setup. The session is the service's, shared with its
+    repository, so the reads that follow a search use the same connection.
     """
 
-    def __init__(
-        self,
-        project_dir: Path,
-        *,
-        target: str | None,
-        profiles_dir: Path | None,
-    ) -> None:
-        self._session = SearchSession(
-            project_dir, target=target, profiles_dir=profiles_dir
-        )
+    def __init__(self, session: SearchSession) -> None:
+        self._session = session
 
     def execute(
         self,
@@ -441,11 +435,8 @@ class ContextService:
                 "a grants relation builds an authorization provider, so "
                 "supplying both leaves it ambiguous which policy is in force."
             )
-        repository = WarehouseContextRepository(
-            project_dir,
-            target=target,
-            profiles_dir=profiles_dir,
-        )
+        session = SearchSession(project_dir, target=target, profiles_dir=profiles_dir)
+        repository = WarehouseContextRepository(session)
         if grants_relation is not None:
             authorization = GrantAuthorizationProvider(
                 WarehouseGrantStore(
@@ -457,11 +448,7 @@ class ContextService:
         return cls(
             catalog=ArtifactCatalog.load(project_dir, expected_target=target),
             repository=repository,
-            context_search=PortableContextSearch(
-                project_dir,
-                target=target,
-                profiles_dir=profiles_dir,
-            ),
+            context_search=PortableContextSearch(session),
             principal_resolver=principal_resolver or EnvironmentPrincipalResolver(),
             authorization=authorization or ClaimAuthorizationProvider(),
             settings=settings,

@@ -9,8 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,10 +18,10 @@ from typing import Any, cast
 from .adapters import (
     ReadPredicate,
     ReadPredicateOperator,
-    TableReadSnapshot,
     WarehouseAdapter,
     create_adapter,
 )
+from .adapters.serialized import SerializedAdapter
 from .append_log import RUN_LOG_SCHEMA, run_log_rows, write_rows
 from .budget import BudgetLedger
 from .checks import TestResult, run_model_tests, validate_test_requirements
@@ -116,72 +115,6 @@ def _modified_set(
         project=project,
         resolved=resolved,
     )
-
-
-class _SerializedAdapter:
-    """Serializes every adapter method call behind a lock so independent models
-    can run on separate threads while sharing one warehouse connection. Property
-    access (schema_ref, catalog, …) passes through untouched; only callables are
-    guarded, which covers all the read/write paths the runner uses."""
-
-    def __init__(self, adapter: WarehouseAdapter, lock: threading.Lock) -> None:
-        self._adapter = adapter
-        self._lock = lock
-
-    @contextmanager
-    def table_snapshot(
-        self,
-        table: str,
-        *,
-        columns: Sequence[str] | None = None,
-        batch_size: int = 10_000,
-        predicate: Any = None,
-        key_column: str | None = None,
-    ) -> Iterator[TableReadSnapshot]:
-        """Guard the open; stream unlocked (issue #432).
-
-        Holding the lock across the whole context serialized `--threads N` down
-        to one model at a time, because a streaming stage keeps its snapshot
-        open for its entire run — provider calls and publishes included. That is
-        not serialized I/O, it is serialized execution, and it arrived with the
-        bounded-memory work: before #411 and #423, embed and chunk read through
-        `read_table`, which takes the generic per-call lock and releases it.
-
-        Streaming unlocked is safe for the same reason `state_page_reader` has
-        always been: both adapters open a **dedicated cursor** for the snapshot
-        (`DuckDBAdapter._cursor()`, BigQuery's own query job), so the read does
-        not share the session the lock protects. Creating that cursor does touch
-        the shared connection, so the open stays guarded.
-        """
-        with self._lock:
-            manager = self._adapter.table_snapshot(
-                table,
-                columns=columns,
-                batch_size=batch_size,
-                predicate=predicate,
-                key_column=key_column,
-            )
-            snapshot = manager.__enter__()
-        try:
-            yield snapshot
-        except BaseException as error:
-            with self._lock:
-                if not manager.__exit__(type(error), error, error.__traceback__):
-                    raise
-        else:
-            with self._lock:
-                manager.__exit__(None, None, None)
-
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._adapter, name)
-        if not callable(attr):
-            return attr
-
-        def guarded(*args: Any, **kwargs: Any) -> Any:
-            with self._lock:
-                return attr(*args, **kwargs)
-
-        return guarded
 
 
 @dataclass
@@ -622,7 +555,7 @@ def _run_in_batches(
 ) -> dict[str, ModelRunResult]:
     """Run topological generations: models within a batch are independent and
     run concurrently; all warehouse access is serialized behind a lock."""
-    guarded = cast(WarehouseAdapter, _SerializedAdapter(adapter, threading.Lock()))
+    guarded = cast(WarehouseAdapter, SerializedAdapter(adapter, threading.Lock()))
     results_by_name: dict[str, ModelRunResult] = {}
     for batch in dag.parallel_batches(selected):
         if len(batch) == 1:

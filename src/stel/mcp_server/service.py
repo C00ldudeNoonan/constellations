@@ -126,6 +126,26 @@ class ContextServerSettings(BaseModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class CallerInfo:
+    """Who asked, and over what, for one MCP request (issue #528).
+
+    The MCP `initialize` handshake carries `clientInfo`, and it is the only
+    thing that distinguishes Claude Desktop from Code from Cowork on the
+    server side -- the distinction #528 exists to measure, because the clients
+    people actually query from write no transcript anywhere reachable.
+
+    Optional throughout: a direct `ContextService` call has no MCP client and
+    no transport, and `None` is the correct answer for it rather than a
+    default standing in for one.
+    """
+
+    request_id: str | None = None
+    client_name: str | None = None
+    client_version: str | None = None
+    transport: str | None = None
+
+
 class ContextSearch(Protocol):
     def execute(
         self,
@@ -461,6 +481,9 @@ class ContextService:
         closing = getattr(self._search, "close", None)
         if closing is not None:
             closing()
+        # Flushes whatever the query log has buffered (issue #528). Last, so a
+        # row recorded by a request still in flight above is not stranded.
+        self._repository.close()
 
     def warm_up(self) -> None:
         """Resolve warehouse credentials and connectivity before serving.
@@ -480,7 +503,12 @@ class ContextService:
             lambda error: ListContextModelsResponse(error=error),
         )
 
-    def search_context(self, request: SearchContextRequest) -> SearchContextResponse:
+    def search_context(
+        self,
+        request: SearchContextRequest,
+        *,
+        caller: CallerInfo | None = None,
+    ) -> SearchContextResponse:
         # The log row is collected inside the guarded operation but written
         # after it returns, so a slow warehouse cannot spend the request
         # deadline and turn a served answer into a TIMEOUT (Codex review,
@@ -488,7 +516,7 @@ class ContextService:
         # concurrency.
         pending: list[Mapping[str, Any]] = []
         response = self._respond(
-            lambda: self._search_context(request, pending),
+            lambda: self._search_context(request, pending, caller),
             lambda error: SearchContextResponse(error=error),
         )
         for row in pending:
@@ -657,6 +685,7 @@ class ContextService:
         self,
         request: SearchContextRequest,
         pending_log: list[Mapping[str, Any]] | None = None,
+        caller: CallerInfo | None = None,
     ) -> SearchContextResponse:
         started = monotonic()
         authorized = self._authorize_resource(request.model)
@@ -741,6 +770,7 @@ class ContextService:
                     resource_name=resource.name,
                     results=results,
                     elapsed_ms=round((monotonic() - started) * 1000, 3),
+                    caller=caller,
                 )
             )
         return SearchContextResponse(results=results)
@@ -754,6 +784,7 @@ class ContextService:
         resource_name: str,
         results: tuple[SearchContextResult, ...],
         elapsed_ms: float,
+        caller: CallerInfo | None,
     ) -> Mapping[str, Any]:
         """Build one served query's log row.
 
@@ -770,8 +801,18 @@ class ContextService:
         caller-supplied and ignored for policy, so logging it would file a
         served query under a tenant the caller merely asserted.
         """
+        caller = caller or CallerInfo()
         return {
             "logged_at": datetime.now(UTC).isoformat(),
+            # Server-generated per request, so a client-side trace and this
+            # row can be lined up when a caller reports a slow query (#528).
+            "request_id": caller.request_id,
+            # From the MCP `initialize` handshake. This is what separates
+            # Desktop from Code from Cowork, which is the question #528 was
+            # filed to answer and the one no client-side transcript can.
+            "client_name": caller.client_name,
+            "client_version": caller.client_version,
+            "transport": caller.transport,
             "principal_id": principal.subject_id,
             "tenant_id": _authorizing_tenant(policy_filters),
             "model_name": resource_name,

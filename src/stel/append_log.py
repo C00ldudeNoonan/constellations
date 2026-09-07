@@ -82,6 +82,14 @@ RUN_LOG_SCHEMA: dict[str, Any] = {
 
 QUERY_LOG_SCHEMA: dict[str, Any] = {
     "logged_at": pl.String,
+    # Request and client identity (issue #528). Nullable throughout: a direct
+    # service call has no MCP client, and an older client may send no
+    # `clientInfo`. BigQuery appends allow field addition, so a log written by
+    # an earlier stel widens rather than breaking on the first new write.
+    "request_id": pl.String,
+    "client_name": pl.String,
+    "client_version": pl.String,
+    "transport": pl.String,
     "principal_id": pl.String,
     "tenant_id": pl.String,
     "model_name": pl.String,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ import pytest
 
 from stel.adapters.base import ReadPredicate, ReadPredicateOperator
 from stel.agent_context import AgentContextGrain, contract_descriptor
+from stel.append_log import QUERY_LOG_SCHEMA
 from stel.mcp_server.authorization import (
     ClaimAuthorizationProvider,
     PolicyAttribute,
@@ -70,6 +72,7 @@ class FakeRepository:
         self.logged: list[Mapping[str, Any]] = []
         self._capture_query_text = capture_query_text
         self.warm_ups = 0
+        self.closes = 0
 
     def log_query(self, row: Mapping[str, Any]) -> None:
         self.logged.append(row)
@@ -79,6 +82,9 @@ class FakeRepository:
 
     def warm_up(self) -> None:
         self.warm_ups += 1
+
+    def close(self) -> None:
+        self.closes += 1
 
     def read_rows(
         self,
@@ -1394,3 +1400,168 @@ async def test_the_tool_schema_offers_candidate_limit_to_callers() -> None:
             assert "candidate_limit" in search_tool.inputSchema["properties"]
     finally:
         service.close()
+
+
+def test_a_served_query_does_not_wait_for_its_own_log_write() -> None:
+    """The log write is batched onto a background thread (issue #528).
+
+    It used to open a warehouse connection and append one row per query. On
+    BigQuery that is a connect plus a Parquet load job -- seconds, charged to
+    the query that produced the row, on a path that had just been taken from
+    39.7s to 13.7s. `test_a_slow_log_write_cannot_time_out_a_served_answer`
+    proves the write is outside the *deadline*; this proves the caller does
+    not wait for it at all.
+    """
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    released = threading.Event()
+    written: list[Mapping[str, Any]] = []
+
+    def slow_write(rows: list[Mapping[str, Any]]) -> None:
+        released.wait(timeout=5)
+        written.extend(rows)
+
+    buffer = BufferedQueryLog(
+        slow_write, max_rows_per_flush=1, flush_interval_seconds=0.05
+    )
+    started = time.monotonic()
+    buffer.submit({"logged_at": "now"})
+    submit_seconds = time.monotonic() - started
+
+    # The writer is still blocked, so anything but a near-instant return means
+    # the caller is waiting on the warehouse.
+    assert submit_seconds < 0.1
+    assert written == []
+
+    released.set()
+    buffer.close(timeout_seconds=5)
+    assert len(written) == 1
+
+
+def test_a_full_query_log_queue_drops_rows_rather_than_blocking() -> None:
+    """A log line must never cost an answer, including in latency."""
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    release = threading.Event()
+
+    def blocked_write(rows: list[Mapping[str, Any]]) -> None:
+        release.wait(timeout=5)
+
+    buffer = BufferedQueryLog(
+        blocked_write,
+        max_rows_per_flush=1,
+        flush_interval_seconds=0.05,
+        max_pending=2,
+    )
+    try:
+        started = time.monotonic()
+        for index in range(50):
+            buffer.submit({"logged_at": str(index)})
+        assert time.monotonic() - started < 1.0
+        assert buffer.dropped_rows > 0
+    finally:
+        release.set()
+        buffer.close(timeout_seconds=5)
+
+
+def test_a_quiet_server_still_flushes_its_last_query() -> None:
+    """Batching by size alone would strand the final row of a quiet server."""
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    written: list[Mapping[str, Any]] = []
+
+    def record(rows: list[Mapping[str, Any]]) -> None:
+        written.extend(rows)
+
+    buffer = BufferedQueryLog(
+        record, max_rows_per_flush=100, flush_interval_seconds=0.05
+    )
+    try:
+        buffer.submit({"logged_at": "only-one"})
+        deadline = time.monotonic() + 5
+        while not written and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        buffer.close(timeout_seconds=5)
+
+    assert len(written) == 1
+
+
+def test_a_failing_log_writer_does_not_stop_later_batches() -> None:
+    """One bad batch must not silently end all logging for the process."""
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    seen: list[str] = []
+
+    def flaky_write(rows: list[Mapping[str, Any]]) -> None:
+        if any(row["logged_at"] == "boom" for row in rows):
+            raise RuntimeError("warehouse said no")
+        seen.extend(str(row["logged_at"]) for row in rows)
+
+    buffer = BufferedQueryLog(
+        flaky_write, max_rows_per_flush=1, flush_interval_seconds=0.05
+    )
+    try:
+        buffer.submit({"logged_at": "boom"})
+        buffer.submit({"logged_at": "after"})
+        deadline = time.monotonic() + 5
+        while "after" not in seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        buffer.close(timeout_seconds=5)
+
+    assert seen == ["after"]
+
+
+def test_the_log_row_carries_the_calling_client_and_request() -> None:
+    """The field #528 exists for: which client asked.
+
+    Claude Desktop and Cowork expose no hooks and write no transcript anywhere
+    reachable, so the handshake's `clientInfo` is the only place the server
+    can learn who is querying the index.
+    """
+    from stel.mcp_server.service import CallerInfo
+
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            ),
+            caller=CallerInfo(
+                request_id="req-7",
+                client_name="claude-desktop",
+                client_version="1.2.3",
+                transport="stdio",
+            ),
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    row = repository.logged[0]
+    assert row["request_id"] == "req-7"
+    assert row["client_name"] == "claude-desktop"
+    assert row["client_version"] == "1.2.3"
+    assert row["transport"] == "stdio"
+
+
+def test_a_log_row_without_a_caller_is_still_written() -> None:
+    """A direct service call has no MCP client, and null is the honest answer
+    rather than a default standing in for one."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    row = repository.logged[0]
+    assert row["client_name"] is None
+    assert row["request_id"] is None
+    assert set(QUERY_LOG_SCHEMA) >= set(row)

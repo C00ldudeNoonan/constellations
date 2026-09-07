@@ -4353,6 +4353,8 @@ my_project:
         enabled: true
         relation: stel_mcp_query_log  # default
         capture_query_text: false     # default — see below
+        flush_max_rows: 100           # default
+        flush_interval_seconds: 5.0   # default
 ```
 
 **`run_log`** (issue #306) — one row per model per invocation: `invocation_id`,
@@ -4365,17 +4367,38 @@ meters, not a second meter. A `status: budget_exceeded` row makes a tripped
 budget visible after the fact rather than only in the terminal output of the
 run that hit it.
 
-**`mcp_query_log`** (issue #329) — one row per served `search_context` call:
-`logged_at`, `principal_id`, `tenant_id`, `model_name`, `mode`,
-`query_fingerprint`, `requested_limit`, `result_count`, `zero_results`,
-`returned_chunk_ids`, `top_score`, `elapsed_ms`. Written **after**
-authorization and policy filtering, so a row reflects what the caller was
-allowed to see — a log of pre-filter hits would leak the existence of
-documents the principal cannot read — and a denied request logs nothing.
+**`mcp_query_log`** (issues #329, #528) — one row per served `search_context`
+call: `logged_at`, `request_id`, `client_name`, `client_version`, `transport`,
+`principal_id`, `tenant_id`, `model_name`, `mode`, `query_fingerprint`,
+`requested_limit`, `result_count`, `zero_results`, `returned_chunk_ids`,
+`top_score`, `elapsed_ms`. Written **after** authorization and policy
+filtering, so a row reflects what the caller was allowed to see — a log of
+pre-filter hits would leak the existence of documents the principal cannot
+read — and a denied request logs nothing.
 
 `zero_results` is the cheapest retrieval-quality signal there is: a question
 the index cannot answer is what a chunking or metadata gap looks like from
 outside, so it is a column rather than something to reconstruct.
+
+`client_name` and `client_version` come from the MCP `initialize` handshake,
+and are the only way to tell which client is querying an index: a desktop chat
+client and a coding agent reach the same server over the same transport, and
+neither writes a record the server can read. Both are null when a client sends
+no `clientInfo`, as the protocol permits.
+
+**Rows are batched off the request path.** A served query hands its row to an
+in-process buffer and returns; a background thread writes whole batches,
+flushing after `flush_max_rows` rows or `flush_interval_seconds`, whichever
+comes first, and again at shutdown. That matters more than it sounds: one
+append per query means one warehouse connection and one write job per query,
+which on BigQuery is seconds charged to the query that produced the row. The
+interval is what makes a quiet server's last query land rather than waiting
+for the next one.
+
+The buffer is bounded and **lossy under pressure**: if writes fall behind far
+enough to fill it, rows are dropped with a warning rather than queued without
+limit or pushed back onto the caller. A log line must never cost an answer,
+in failure or in latency.
 
 ### Two rules worth knowing
 
@@ -4383,8 +4406,9 @@ outside, so it is a column rather than something to reconstruct.
 that rejects one, a permission an operator forgot, a relation someone renamed
 — none of that turns a successful run into a failed one, or a served MCP
 answer into an error. Failures are a single warning naming the exception
-class. The query-log write also happens *outside* the MCP request deadline,
-so a stalled warehouse cannot spend a caller's timeout budget.
+class. The query-log write also happens *outside* the MCP request deadline —
+and, since #528, off the request path entirely — so a stalled warehouse can
+neither spend a caller's timeout budget nor slow a served answer.
 
 Both relations are created with **explicit column types** rather than types
 inferred from the first batch — otherwise a first run with no LLM model (or a

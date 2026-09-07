@@ -21,9 +21,14 @@
   Chunk ids are content-hashed, so two chunk sizes of one corpus share no
   record ids and a record-level golden set cannot judge a chunking change;
   under `document`, hits collapse to their `document_id_field` at the rank of
-  their best record and the golden set's ids are document ids. The compiler
-  requires the search model to declare that field. `retrieval_eval.json` is
-  version 2: each result carries its `granularity`.
+  their best record, fetched wider until the deepest cutoff is filled, and
+  the golden set's ids are document ids. The compiler requires the search
+  model to declare that field. `retrieval_eval.json` is version 2: each
+  result carries its `granularity`.
+- Two golden-set contract gaps now fail early instead of scoring wrong: a
+  repeated `query_id` is refused before any query runs, and an `at` cutoff
+  above 1000 (the most records one search request returns) is a config
+  error rather than a silently truncated ranking.
 
 ### Experiments have a convention, and what they leave behind has a listing (issue #531)
 

@@ -17,6 +17,7 @@ from stel.retrieval_eval import (
     run_retrieval_evaluation,
 )
 from stel.runner import run_project
+from stel.search import SearchProvenance, SearchRequest, SearchResult
 
 # ── self-contained fixture project (3 topically distinct docs) ─────────────
 
@@ -533,3 +534,133 @@ def test_malformed_golden_json_field_raises_eval_error_with_context(
     run_project(eval_project, select="search_golden")
     with pytest.raises(RetrievalEvalError, match=r"'q_broken'.*'relevant_ids'.*not valid JSON"):
         run_retrieval_evaluation(eval_project)
+
+
+# ── golden-set contract gaps that must fail early (issue #532 review) ─────────
+
+def test_retrieval_test_config_rejects_cutoff_above_search_ceiling() -> None:
+    with pytest.raises(ValueError, match="at most 1000"):
+        RetrievalTestConfig(name="t", golden_set="ref('g')", at=[10, 1001])
+
+
+def test_duplicate_query_ids_are_rejected_before_any_query(
+    eval_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (eval_project / "golden" / "q_prices_again.json").write_text(
+        json.dumps(
+            {"query_id": "q_prices", "query_text": "prices", "relevant_ids": ["x"]}
+        ),
+        encoding="utf-8",
+    )
+    run_project(eval_project, select="search_golden")
+
+    def refuse(*args: Any, **kwargs: Any) -> list[Any]:
+        raise AssertionError("a query ran against a golden set with repeated ids")
+
+    monkeypatch.setattr("stel.retrieval_eval.search", refuse)
+    with pytest.raises(RetrievalEvalError, match=r"repeats query_id \['q_prices'\]"):
+        run_retrieval_evaluation(eval_project)
+
+
+# ── document granularity fills the deepest cutoff ────────────────────────────
+
+_DOCUMENT_TEST_YAML = """\
+    retrieval_tests:
+      - name: by_document
+        golden_set: ref('search_golden')
+        mode: text
+        at: [2]
+        granularity: document
+"""
+
+
+def _hit(record_id: str, document_id: str) -> SearchResult:
+    return SearchResult(
+        record_id=record_id,
+        document_id=document_id,
+        chunk_id=record_id,
+        rank=0,
+        score=1.0,
+        raw_score=None,
+        raw_score_kind=None,
+        text={},
+        metadata={},
+        display={},
+        contributing_ranks={},
+        provenance=SearchProvenance(
+            project="eval_demo",
+            model="release_search",
+            unique_id="search_index.eval_demo.release_search",
+            target="dev",
+            store_type="fake",
+            logical_collection="c",
+            physical_collection="c",
+            upstream="release_embeddings",
+            embedding=None,
+        ),
+    )
+
+
+def _document_project(tmp_path: Path) -> Path:
+    project = _write_project(tmp_path, retrieval_tests_yaml=_DOCUMENT_TEST_YAML)
+    run_project(project)
+    _write_golden_rows(
+        project,
+        [{"query_id": "q", "query_text": "anything", "relevant_ids": ["doc_b"]}],
+    )
+    run_project(project, select="search_golden")
+    return project
+
+
+def _fake_index(
+    monkeypatch: pytest.MonkeyPatch, records: list[tuple[str, str]]
+) -> list[int]:
+    """Stand in for `search()` with a fixed ranking of (record, document)
+    pairs, honoring `limit`; returns the limits requested, in order."""
+    limits: list[int] = []
+
+    def fake(project_dir: Path, request: SearchRequest, **kwargs: Any) -> list[SearchResult]:
+        limits.append(request.limit)
+        return [_hit(r, d) for r, d in records[: request.limit]]
+
+    monkeypatch.setattr("stel.retrieval_eval.search", fake)
+    return limits
+
+
+def test_document_ranking_is_fetched_wider_until_the_cutoff_is_filled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Twelve records of one document ahead of the second document: the first
+    # over-fetch (4 x 2 = 8) sees one document, the next (32) sees both.
+    records = [(f"a{i}", "doc_a") for i in range(12)] + [("b0", "doc_b")]
+    limits = _fake_index(monkeypatch, records)
+    [result] = run_retrieval_evaluation(_document_project(tmp_path))
+    assert limits == [8, 32]
+    [query] = result.per_query
+    assert query.ranked_ids == ("doc_a", "doc_b")
+    assert result.aggregate["recall"][2] == 1.0
+
+
+def test_document_ranking_stops_when_the_index_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Five matching records, all one document: fewer than asked means
+    # nothing more matches, and the one-document ranking is the truth.
+    limits = _fake_index(monkeypatch, [(f"a{i}", "doc_a") for i in range(5)])
+    [result] = run_retrieval_evaluation(_document_project(tmp_path))
+    assert limits == [8]
+    [query] = result.per_query
+    assert query.ranked_ids == ("doc_a",)
+    assert result.aggregate["recall"][2] == 0.0
+
+
+def test_document_ranking_refuses_an_incomplete_ranking_at_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A thousand records of one document: the ceiling is reached with the
+    # cutoff unfilled, and scoring that would call every other document a
+    # miss it was never asked about.
+    limits = _fake_index(monkeypatch, [(f"a{i}", "doc_a") for i in range(1000)])
+    with pytest.raises(RetrievalEvalError, match="span only 1 distinct document"):
+        run_retrieval_evaluation(_document_project(tmp_path))
+    assert limits == [8, 32, 128, 512, 1000]

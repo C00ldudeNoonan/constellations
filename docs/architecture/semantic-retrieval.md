@@ -1593,9 +1593,14 @@ content-hashed: two chunk sizes of one corpus share no record ids, so a
 record-level golden set cannot judge a chunking change. Under document
 granularity the evaluator asks the index for four times the deepest cutoff,
 collapses hits to their `document_id_field` at the rank of their best record,
-truncates to the deepest cutoff, and scores that ranking; `required_ids` and
-`excluded_ids` are document ids too. The compiler requires the search model
-to declare a `document_id_field`.
+and asks again four times wider until the ranking holds the deepest cutoff's
+worth of distinct documents or the index returns fewer records than asked;
+reaching the 1000-record request ceiling with neither fails the test rather
+than scoring an incomplete ranking. It then truncates to the deepest cutoff
+and scores; `required_ids` and `excluded_ids` are document ids too. The
+compiler requires the search model to declare a `document_id_field`, and
+`at` cutoffs above 1000 are rejected at config time under either
+granularity, since no request can fill them.
 
 ### Metrics and edge cases
 

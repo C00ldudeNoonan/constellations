@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from collections import Counter
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from .hashing import canonical_fingerprint
 from .profile import ResolvedProfile, resolve_profile
 from .retrieval_metrics import QueryMetrics, aggregate_metrics, evaluate_query
 from .search import (
+    SEARCH_LIMIT_CEILING,
     SearchError,
     SearchFilter,
     SearchFilterOperator,
@@ -173,14 +175,22 @@ def _run_one(
             f"Retrieval test '{test.name}' golden_set '{golden_name}' has no rows"
         )
 
+    query_ids = [_require_str(row, "query_id", golden_name) for row in golden_rows]
+    repeated = sorted(query_id for query_id, n in Counter(query_ids).items() if n > 1)
+    if repeated:
+        # The contract says unique; a repeat would score twice and, in a
+        # comparison, join one side's rows to the other's by id.
+        raise RetrievalEvalError(
+            f"Golden-set '{golden_name}' repeats query_id {repeated}; query_id "
+            "must be unique within a golden set"
+        )
+
     mode = SearchMode(test.mode) if test.mode else _default_mode(model.search.query.modes)
-    limit = _request_limit(test)
 
     per_query: list[QueryMetrics] = []
     violations: list[PolicyViolation] = []
     store_provenance: dict[str, Any] | None = None
-    for row in golden_rows:
-        query_id = _require_str(row, "query_id", golden_name)
+    for row, query_id in zip(golden_rows, query_ids, strict=True):
 
         def _ctx(field_name: str, _query_id: str = query_id) -> str:
             return _field_context(golden_name, _query_id, field_name)
@@ -190,23 +200,32 @@ def _run_one(
             query=row.get("query_text") or None,
             vector=_parse_vector(row.get("query_vector"), context=_ctx("query_vector")),
             mode=SearchMode(row["mode"]) if row.get("mode") else mode,
-            limit=limit,
             filters=_parse_filters(row.get("filters"), context=_ctx("filters")),
         )
         policy_filters = _parse_filters(row.get("policy_filters"), context=_ctx("policy_filters"))
-        try:
-            hits = search(
-                project_dir,
-                request,
-                target=target,
-                profiles_dir=profiles_dir,
-                policy_filters=policy_filters,
-            )
-        except SearchError as e:
-            raise RetrievalEvalError(
-                f"Retrieval test '{test.name}' query '{query_id}' failed: {e}"
-            ) from e
-        ranked_ids = _ranked_ids(hits, granularity=test.granularity)[: max(test.at)]
+
+        def _fetch(
+            limit: int,
+            _request: SearchRequest = request,
+            _policy: tuple[SearchFilter, ...] = policy_filters,
+            _query_id: str = query_id,
+        ) -> Sequence[SearchResult]:
+            try:
+                return search(
+                    project_dir,
+                    replace(_request, limit=limit),
+                    target=target,
+                    profiles_dir=profiles_dir,
+                    policy_filters=_policy,
+                )
+            except SearchError as e:
+                raise RetrievalEvalError(
+                    f"Retrieval test '{test.name}' query '{_query_id}' failed: {e}"
+                ) from e
+
+        hits, ranked_ids = _retrieve_ranking(
+            _fetch, test, context=f"Retrieval test '{test.name}' query '{query_id}'"
+        )
         if store_provenance is None and hits:
             # Safe store identity (type, target, logical/physical collection) —
             # the same provenance a real caller sees, captured once per test
@@ -276,27 +295,50 @@ def _run_one(
 
 
 # Several records of one document can occupy the top of a ranking, so a
-# document-granularity test asks the index for more records than cutoffs it
-# scores and collapses them; the same over-fetch `search()` itself uses
-# ahead of fusion. Bounded by the request contract's ceiling.
+# document-granularity test asks the index for more records than the
+# cutoffs it scores -- the same multiplier `search()` uses ahead of fusion --
+# and asks again, wider, until the deepest cutoff is filled.
 _DOCUMENT_OVERFETCH = 4
-_REQUEST_LIMIT_CEILING = 1000
 
 
-def _request_limit(test: RetrievalTestConfig) -> int:
+def _retrieve_ranking(
+    fetch: Callable[[int], Sequence[SearchResult]],
+    test: RetrievalTestConfig,
+    *,
+    context: str,
+) -> tuple[Sequence[SearchResult], list[str]]:
+    """The hits and the ranking the golden set judges: record ids as
+    returned, or each hit's document at the rank of its best record.
+
+    Under document granularity the ranking is complete when it holds the
+    deepest cutoff's worth of distinct documents or the index returned fewer
+    records than asked (nothing more matches). Reaching the request ceiling
+    with neither is refused: scoring an incomplete ranking would count
+    documents the index was never asked for as misses."""
     deepest = max(test.at)
     if test.granularity == "record":
-        return min(deepest, _REQUEST_LIMIT_CEILING)
-    return min(deepest * _DOCUMENT_OVERFETCH, _REQUEST_LIMIT_CEILING)
+        hits = fetch(deepest)
+        return hits, [hit.record_id for hit in hits]
+    limit = min(deepest * _DOCUMENT_OVERFETCH, SEARCH_LIMIT_CEILING)
+    while True:
+        hits = fetch(limit)
+        ranked = _collapse_to_documents(hits)
+        if len(ranked) >= deepest or len(hits) < limit:
+            return hits, ranked[:deepest]
+        if limit >= SEARCH_LIMIT_CEILING:
+            raise RetrievalEvalError(
+                f"{context}: the first {limit} records span only {len(ranked)} distinct "
+                f"document(s), fewer than the deepest cutoff {deepest}, and one request "
+                f"cannot return more than {SEARCH_LIMIT_CEILING}; lower `at` or judge "
+                "at record granularity"
+            )
+        limit = min(limit * _DOCUMENT_OVERFETCH, SEARCH_LIMIT_CEILING)
 
 
-def _ranked_ids(hits: Sequence[SearchResult], *, granularity: str) -> list[str]:
-    """The ranking the golden set judges: record ids as returned, or each
-    hit's document at the rank of its best record. A hit without a document
-    id under document granularity is a data defect in the index, not a
-    silent zero -- the compiler already requires `document_id_field`."""
-    if granularity == "record":
-        return [hit.record_id for hit in hits]
+def _collapse_to_documents(hits: Sequence[SearchResult]) -> list[str]:
+    """A hit without a document id under document granularity is a data
+    defect in the index, not a silent zero -- the compiler already requires
+    `document_id_field`."""
     ranked: list[str] = []
     seen: set[str] = set()
     for hit in hits:

@@ -948,6 +948,14 @@ class RetrievalTestConfig(BaseModel):
             raise ValueError("retrieval_tests.at must not be empty")
         if any(isinstance(k, bool) or k <= 0 for k in self.at):
             raise ValueError("retrieval_tests.at must contain positive integers")
+        # `search.SEARCH_LIMIT_CEILING`, restated here because `search`
+        # imports this module. A cutoff no request can fill would otherwise
+        # score ranks the index was never asked for as misses.
+        if any(k > 1000 for k in self.at):
+            raise ValueError(
+                "retrieval_tests.at cutoffs must be at most 1000, the most records "
+                "one search request can return"
+            )
         if len(self.at) != len(set(self.at)):
             raise ValueError("retrieval_tests.at must not contain duplicate cutoffs")
         for key in self.thresholds:

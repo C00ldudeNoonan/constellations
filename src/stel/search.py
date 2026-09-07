@@ -113,6 +113,11 @@ class SearchFilter:
         )
 
 
+# The most records one request may ask for. Named because the evaluator
+# sizes its document-granularity over-fetch against it (issue #532).
+SEARCH_LIMIT_CEILING = 1000
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class SearchRequest:
     model: str
@@ -139,13 +144,15 @@ class SearchRequest:
             or len(self.query.encode()) > 32_768
         ):
             raise ValueError("search query must be a non-empty string within 32768 bytes")
-        if isinstance(self.limit, bool) or not 1 <= self.limit <= 1000:
-            raise ValueError("search limit must be between 1 and 1000")
+        if isinstance(self.limit, bool) or not 1 <= self.limit <= SEARCH_LIMIT_CEILING:
+            raise ValueError(f"search limit must be between 1 and {SEARCH_LIMIT_CEILING}")
         if self.candidate_limit is not None and (
             isinstance(self.candidate_limit, bool)
-            or not self.limit <= self.candidate_limit <= 1000
+            or not self.limit <= self.candidate_limit <= SEARCH_LIMIT_CEILING
         ):
-            raise ValueError("search candidate_limit must be between limit and 1000")
+            raise ValueError(
+                f"search candidate_limit must be between limit and {SEARCH_LIMIT_CEILING}"
+            )
         if self.vector is not None:
             if any(isinstance(value, bool) for value in self.vector):
                 raise ValueError("search vector must contain finite numeric values")

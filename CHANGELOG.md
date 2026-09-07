@@ -14,7 +14,9 @@
   writes go through the same session, so every warehouse touch of a served
   query shares one connection. Statements are serialized per call across
   concurrent tool threads, not per query. A held connection that raises an
-  adapter error is discarded and the next request reconnects.
+  adapter error is retired and the next request reconnects; it closes once
+  every request still using it has finished, and closing the server waits
+  for those, so a query lease is never released on a closed connection.
 - `WarehouseAdapter.supports_held_connection()` is the adapter's say: true
   for BigQuery and MotherDuck, false for a file-backed DuckDB warehouse,
   whose open handle is an exclusive lock that would block `stel run` in

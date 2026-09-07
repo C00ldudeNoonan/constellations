@@ -8,7 +8,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
-from threading import Lock, RLock
+from threading import Condition, Lock, RLock
 from time import perf_counter
 from types import MappingProxyType
 from typing import Any, cast
@@ -279,6 +279,32 @@ class _ResolvedProject:
     profile: ResolvedProfile
 
 
+# How long `SearchSession.close()` waits for operations still holding the
+# warehouse connection before leaving the close to the last of them. The MCP
+# limiter abandons a timed-out worker rather than joining it, so a request can
+# outlive the service that served it; its query lease releases on this very
+# connection, and closing under it would leak the lease.
+_DRAIN_SECONDS = 30.0
+
+
+@dataclass
+class _HeldWarehouse:
+    """The session's warehouse connection and who is using it.
+
+    `holders` counts operations inside `SearchSession.warehouse()` on this
+    connection. Retiring marks it as no longer the session's; the last holder
+    to leave closes it, so an operation that captured it before the retire --
+    one still holding a query lease, whose release runs on this connection --
+    finishes on a live connection rather than a closed one.
+    """
+
+    raw: WarehouseAdapter
+    guarded: WarehouseAdapter
+    holders: int = 0
+    retired: bool = False
+    closed: bool = False
+
+
 class SearchSession:
     """Query setup a long-lived server reuses across requests (issue #523).
 
@@ -336,9 +362,9 @@ class SearchSession:
         # The held warehouse, if the adapter allows one: the entered adapter
         # (to close) and its per-statement guard (to hand out). None until
         # the first operation, and None again after a discard.
-        self._warehouse: WarehouseAdapter | None = None
-        self._warehouse_guarded: WarehouseAdapter | None = None
+        self._held: _HeldWarehouse | None = None
         self._statement_lock = Lock()
+        self._drained = Condition(self._lock)
         # Decided on the first open and remembered, so a file-backed warehouse
         # does not construct a throwaway adapter per call to ask again.
         self._warehouse_holdable: bool | None = None
@@ -397,37 +423,43 @@ class SearchSession:
         per call otherwise. A held adapter serializes concurrent tool threads
         per statement, not per operation: the #432 lesson is that a lock
         spanning a whole query serializes execution rather than I/O. An
-        `AdapterError` inside the block discards a held connection, so the
-        next operation reconnects rather than inheriting the failure.
+        `AdapterError` inside the block retires the held connection, so the
+        next operation reconnects rather than inheriting the failure; the
+        connection itself closes once every operation using it has left.
         """
         resolved = self.resolve(timings).profile
         with self._lock:
             held, fresh = self._warehouse_for_call(resolved, timings)
-        if held is not None:
-            try:
-                yield held
-            except AdapterError:
-                self.discard_warehouse()
-                raise
+            if held is not None:
+                held.holders += 1
+        if held is None:
+            assert fresh is not None
+            connecting = perf_counter()
+            with fresh as adapter:
+                # Timed on entry rather than around the block: the `with`
+                # spans the whole operation, and what is wanted is the connect.
+                _record(timings, "warehouse_connect", perf_counter() - connecting)
+                yield adapter
             return
-        connecting = perf_counter()
-        with fresh as adapter:
-            # Timed on entry rather than around the block: the `with` spans
-            # the whole operation, and what is wanted is the connect alone.
-            _record(timings, "warehouse_connect", perf_counter() - connecting)
-            yield adapter
+        try:
+            yield held.guarded
+        except AdapterError:
+            self.retire_warehouse(held.guarded)
+            raise
+        finally:
+            self._release(held)
 
     def _warehouse_for_call(
         self, resolved: ResolvedProfile, timings: PhaseTimings | None
-    ) -> tuple[WarehouseAdapter | None, WarehouseAdapter]:
+    ) -> tuple[_HeldWarehouse | None, WarehouseAdapter | None]:
         """The held connection, or an unentered adapter for this call alone.
 
         The adapter decides which on the first call and the answer is kept,
         so a file-backed warehouse constructs exactly one adapter per call
         rather than a second to ask again. Called under the session lock.
         """
-        if self._warehouse_guarded is not None:
-            return self._warehouse_guarded, self._warehouse_guarded
+        if self._held is not None:
+            return self._held, None
         adapter = create_adapter(resolved.warehouse, project_dir=self.project_dir)
         if self._warehouse_holdable is None:
             self._warehouse_holdable = adapter.supports_held_connection()
@@ -436,27 +468,69 @@ class SearchSession:
         connecting = perf_counter()
         adapter.__enter__()
         _record(timings, "warehouse_connect", perf_counter() - connecting)
-        self._warehouse = adapter
-        self._warehouse_guarded = cast(
-            WarehouseAdapter, SerializedAdapter(adapter, self._statement_lock)
+        self._held = _HeldWarehouse(
+            raw=adapter,
+            guarded=cast(WarehouseAdapter, SerializedAdapter(adapter, self._statement_lock)),
         )
-        return self._warehouse_guarded, self._warehouse_guarded
+        return self._held, None
 
-    def discard_warehouse(self) -> None:
-        """Drop a held connection that failed, so the next operation reconnects.
-
-        Closing is best-effort for the same reason `discard_store` is: the
-        connection is already being discarded, and a failure to close a broken
-        one must not mask the error that caused the discard."""
+    def _release(self, held: _HeldWarehouse) -> None:
         with self._lock:
-            adapter = self._warehouse
-            self._warehouse = None
-            self._warehouse_guarded = None
-        if adapter is not None:
-            try:
-                adapter.__exit__(None, None, None)
-            except Exception:  # see the docstring
-                log.debug("Discarding a failed warehouse connection raised on close")
+            held.holders -= 1
+            closing = held.retired and held.holders == 0 and _take_close(held)
+            self._drained.notify_all()
+        if closing:
+            _close_quietly(held.raw)
+
+    def retire_warehouse(self, adapter: WarehouseAdapter) -> None:
+        """Stop handing out `adapter`, if it is still the session's connection.
+
+        Identity-checked: two operations that captured the same connection
+        can fail in turn, and the second must not retire the replacement the
+        first's failure already caused. The connection closes when its last
+        holder leaves, not here -- an operation that captured it before the
+        retire may still be releasing its query lease on it.
+        """
+        with self._lock:
+            held = self._held
+            if held is None or held.guarded is not adapter:
+                return
+            self._held = None
+            held.retired = True
+            closing = held.holders == 0 and _take_close(held)
+        if closing:
+            _close_quietly(held.raw)
+
+    def _close_warehouse(self) -> None:
+        """Retire the held connection and wait for its holders to finish.
+
+        A service can close while a request is still running -- the MCP
+        limiter abandons a timed-out worker rather than joining it -- and
+        that request may hold a query lease whose release runs on this
+        connection. Closing under it would leak the lease and block
+        publication until `stel serving recover`. So the close waits for the
+        holders, up to `_DRAIN_SECONDS`; past that the last holder closes the
+        connection when it leaves, and a warning says so.
+        """
+        with self._lock:
+            held = self._held
+            self._held = None
+            if held is None:
+                return
+            held.retired = True
+            drained = self._drained.wait_for(
+                lambda: held.holders == 0, timeout=_DRAIN_SECONDS
+            )
+            closing = drained and _take_close(held)
+            remaining = held.holders
+        if closing:
+            _close_quietly(held.raw)
+        elif not drained:
+            log.warning(
+                "Closing the search session with %d warehouse operation(s) still "
+                "running; the connection closes when the last one finishes",
+                remaining,
+            )
 
     def needs_schema_ensure(self) -> bool:
         """Whether a coordinator built now should create the serving tables.
@@ -506,9 +580,27 @@ class SearchSession:
             aliases = list(self._stores)
         for alias in aliases:
             self.discard_store(alias)
-        self.discard_warehouse()
+        self._close_warehouse()
         with self._lock:
             self._resolved = None
+
+
+def _take_close(held: _HeldWarehouse) -> bool:
+    """Claim the one close of a retired connection. Called under the lock."""
+    if held.closed:
+        return False
+    held.closed = True
+    return True
+
+
+def _close_quietly(adapter: WarehouseAdapter) -> None:
+    """Best-effort, for the same reason `discard_store` is: the connection is
+    already retired, and a failure to close a broken one must not mask the
+    error that retired it."""
+    try:
+        adapter.__exit__(None, None, None)
+    except Exception:  # see the docstring
+        log.debug("Closing a retired warehouse connection raised")
 
 
 def _record(timings: PhaseTimings | None, phase: str, seconds: float) -> None:
@@ -733,7 +825,7 @@ def _search(
         # on this session would inherit it -- so drop it and let the next one
         # reopen (issue #523). AdapterError is a warehouse failure, not a
         # store one, and leaves the store cached; `session.warehouse()` has
-        # already discarded a held connection on it.
+        # already retired a held connection on it.
         if isinstance(error, RetrievalError):
             session.discard_store(alias)
         raise SearchError(str(error)) from None

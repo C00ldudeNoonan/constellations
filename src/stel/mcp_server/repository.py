@@ -92,13 +92,19 @@ class WarehouseContextRepository:
             return
         try:
             with self._session.warehouse(None) as adapter:
-                write_rows(
+                written = write_rows(
                     adapter,
                     config,
                     [dict(row)],
                     schema=QUERY_LOG_SCHEMA,
                     what="the MCP query log",
                 )
+                if written < 1:
+                    # `write_rows` keeps its best-effort contract by swallowing
+                    # the adapter's error, so a broken held connection would
+                    # otherwise survive to fail the next request. Retiring it
+                    # costs one reconnect; keeping it costs a served answer.
+                    self._session.retire_warehouse(adapter)
         except Exception as error:
             log.warning(
                 "Could not open the warehouse to write the MCP query log [%s]; "

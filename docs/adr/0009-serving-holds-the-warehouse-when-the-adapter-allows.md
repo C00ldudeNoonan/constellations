@@ -34,7 +34,12 @@ writes go through the same session, so every warehouse touch of a served
 query shares the one connection. Statements on it are serialized per call
 by `SerializedAdapter`, the wrapper the runner already uses under
 `--threads`, not per query. An `AdapterError` raised inside any operation
-discards the held connection, and the next operation reconnects. A
+retires the held connection, and the next operation reconnects; the retired
+connection closes when the last operation using it leaves, because an
+operation that captured it may still be releasing its query lease on it.
+Closing the session waits for those operations, bounded, for the same
+reason: the MCP limiter abandons a timed-out worker rather than joining it,
+and closing the connection under a live lease would leak the lease. A
 file-backed warehouse keeps a connection per call and pays
 `warehouse_connect` every time, as before.
 
@@ -87,6 +92,10 @@ the measurement to take first.
 - A new adapter inherits `False` and must opt in. That is the safe default:
   the wrong answer here blocks other processes, and an adapter author knows
   whether their connection is a lock.
-- A held connection that breaks costs one failed request; the discard makes
-  the next one reconnect rather than inherit the failure. Nothing detects a
-  silently dead connection ahead of use, and nothing was asked to.
+- A held connection that breaks costs one failed request; retiring it makes
+  the next one reconnect rather than inherit the failure, and an operation
+  that had already captured it finishes on it. Nothing detects a silently
+  dead connection ahead of use, and nothing was asked to.
+- A query-log write that fails retires the connection it used. The log's
+  contract stays best-effort, but the failure is more often the connection
+  than the log, and a reconnect is cheaper than a failed answer.

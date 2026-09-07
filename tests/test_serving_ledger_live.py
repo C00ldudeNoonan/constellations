@@ -136,7 +136,7 @@ def test_the_ledger_protocol_on_duckdb(tmp_path: Path) -> None:
         {"type": "duckdb", "path": str(tmp_path / "ledger.duckdb"), "schema": "main"}
     )
     with create_adapter(config) as adapter:
-        exercise_ledger_protocol(ServingCoordinator(adapter))
+        exercise_ledger_protocol(ServingCoordinator(adapter, ensure_schema=True))
 
 
 @pytest.mark.skipif(
@@ -154,7 +154,7 @@ def test_the_ledger_protocol_on_bigquery() -> None:
     adapter = create_adapter(config)
     try:
         with adapter:
-            exercise_ledger_protocol(ServingCoordinator(adapter))
+            exercise_ledger_protocol(ServingCoordinator(adapter, ensure_schema=True))
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()
@@ -253,7 +253,7 @@ def test_state_seeding_on_duckdb(tmp_path: Path) -> None:
         {"type": "duckdb", "path": str(tmp_path / "seed.duckdb"), "schema": "main"}
     )
     with create_adapter(config) as adapter:
-        exercise_state_seeding(adapter, ServingCoordinator(adapter))
+        exercise_state_seeding(adapter, ServingCoordinator(adapter, ensure_schema=True))
 
 
 @pytest.mark.skipif(
@@ -271,7 +271,7 @@ def test_state_seeding_on_bigquery() -> None:
     adapter = create_adapter(config)
     try:
         with adapter:
-            exercise_state_seeding(adapter, ServingCoordinator(adapter))
+            exercise_state_seeding(adapter, ServingCoordinator(adapter, ensure_schema=True))
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()

@@ -49,7 +49,7 @@ def _scope(model_name: str = "context_search") -> StateScope:
 def coordinator(tmp_path: Path) -> Any:
     adapter_cm = create_adapter(_wh(tmp_path / "serving.duckdb"))
     with adapter_cm as adapter:
-        yield ServingCoordinator(adapter)
+        yield ServingCoordinator(adapter, ensure_schema=True)
 
 
 # ─── publish claims and fencing ─────────────────────────────────────────────
@@ -379,6 +379,38 @@ def test_query_pin_fails_validation_after_authority_change(coordinator: Any) -> 
         coordinator.validate_query(query)
 
 
+def test_query_pin_fails_validation_once_its_lease_row_is_gone(
+    coordinator: Any,
+) -> None:
+    """The held-check alone must reject, with the ledger left untouched.
+
+    `test_query_pin_fails_validation_after_authority_change` goes through
+    `recover`, which deletes pins *and* bumps the fence, so it passes on the
+    fence check alone and never proves the lease lookup does anything. Issue
+    #535 folded that lookup into the ledger read as a correlated subquery;
+    this is the case that tells the two halves apart.
+    """
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease, active_generation="gen1", config_fingerprint="cfg1", counts=(1, 0, 0, 0)
+    )
+    query = coordinator.acquire_query(scope)
+    coordinator.validate_query(query)
+
+    coordinator.release_query(query)
+
+    # Ledger unchanged: same fence, same generation, still ready. Only the
+    # pin is gone, so only the held-check can catch this.
+    entry = coordinator.status(scope)
+    assert entry.fencing_token == query.fencing_token
+    assert entry.active_generation == query.pinned_generation
+    with pytest.raises(StaleServingLeaseError, match="no longer active"):
+        coordinator.validate_query(query)
+
+
 def test_recovery_requires_explicit_owner_termination(coordinator: Any) -> None:
     scope = _scope()
     with pytest.raises(ServingCoordinationError, match="terminating the previous owner"):
@@ -614,7 +646,8 @@ def _ledger_status(project: Path, model_name: str = "release_search") -> Any:
     project_config, _sources, _models = load_project(project)
     resolved = resolve_profile(project_config, project)
     with create_adapter(resolved.warehouse, project_dir=project) as adapter:
-        return ServingCoordinator(adapter).status(_serving_scope(project, model_name))
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
+        return coordinator.status(_serving_scope(project, model_name))
 
 
 def test_publication_marks_scope_ready_and_serves_queries(tmp_path: Path) -> None:
@@ -694,7 +727,7 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
     resolved = resolve_profile(project_config, project)
     scope = _serving_scope(project)
     with create_adapter(resolved.warehouse, project_dir=project) as adapter:
-        ServingCoordinator(adapter).acquire_publish(
+        ServingCoordinator(adapter, ensure_schema=True).acquire_publish(
             scope, expected_code_version="crashed", config_fingerprint="crashed"
         )
 
@@ -851,7 +884,7 @@ def test_serving_recover_refuses_a_defaulted_target_without_touching_anything(
     project_config, _sources, _models = load_project(project)
     resolved = resolve_profile(project_config, project)
     with create_adapter(resolved.warehouse, project_dir=project) as adapter:
-        before = ServingCoordinator(adapter).status(scope)
+        before = ServingCoordinator(adapter, ensure_schema=True).status(scope)
 
     result = CliRunner().invoke(
         cli,
@@ -873,7 +906,7 @@ def test_serving_recover_refuses_a_defaulted_target_without_touching_anything(
     assert "lancedb" in result.output
 
     with create_adapter(resolved.warehouse, project_dir=project) as adapter:
-        after = ServingCoordinator(adapter).status(scope)
+        after = ServingCoordinator(adapter, ensure_schema=True).status(scope)
     # Refused before anything moved: the resolution it needed to name the
     # default is a read.
     assert after.fencing_token == before.fencing_token
@@ -1321,7 +1354,7 @@ def test_a_ledger_predating_generations_gains_the_activation_column(
             adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
         )
 
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
 
         assert "active_collection" in (
             adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()

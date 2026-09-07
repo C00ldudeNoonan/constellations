@@ -481,7 +481,7 @@ def test_replace_state_scope_preserves_other_scopes(tmp_path: Path) -> None:
 def test_fenced_replace_succeeds_only_for_the_live_claim(tmp_path: Path) -> None:
     with _open_adapter(tmp_path) as adapter:
         _seed(adapter, ["old"])
-        coordinator = ServingCoordinator(adapter)
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
         lease = coordinator.acquire_publish(
             SCOPE, expected_code_version="v2", config_fingerprint="cfg"
         )

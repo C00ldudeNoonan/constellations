@@ -21,6 +21,7 @@ from stel.search import (
     SearchFilterOperator,
     SearchMode,
     SearchRequest,
+    SearchSession,
     _rank_table,
     search,
 )
@@ -718,3 +719,77 @@ def test_a_session_from_another_project_is_refused(
             )
     finally:
         session.close()
+
+
+def test_a_session_creates_the_serving_tables_once(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two `CREATE TABLE IF NOT EXISTS` jobs and a column probe per query is
+    ~1.7s on BigQuery, spent on tables the previous query had just read (#535).
+    """
+    from stel.retrieval import coordination
+
+    ensures = 0
+    real_ensure = coordination.ServingCoordinator._ensure_tables
+
+    def counting_ensure(self: Any) -> None:
+        nonlocal ensures
+        ensures += 1
+        real_ensure(self)
+
+    monkeypatch.setattr(
+        coordination.ServingCoordinator, "_ensure_tables", counting_ensure
+    )
+
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    try:
+        for _ in range(3):
+            assert search(
+                published_project,
+                SearchRequest(
+                    model="release_search",
+                    query="inflation consumer prices",
+                    mode=SearchMode.TEXT,
+                    limit=2,
+                ),
+                session=session,
+            )
+    finally:
+        session.close()
+
+    assert ensures == 1
+
+
+def test_a_one_shot_query_still_creates_the_serving_tables(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip is a session optimization, not a change to what a cold call
+    guarantees: a CLI query owns its session and must still ensure."""
+    from stel.retrieval import coordination
+
+    ensures = 0
+    real_ensure = coordination.ServingCoordinator._ensure_tables
+
+    def counting_ensure(self: Any) -> None:
+        nonlocal ensures
+        ensures += 1
+        real_ensure(self)
+
+    monkeypatch.setattr(
+        coordination.ServingCoordinator, "_ensure_tables", counting_ensure
+    )
+
+    for _ in range(2):
+        assert search(
+            published_project,
+            SearchRequest(
+                model="release_search",
+                query="inflation consumer prices",
+                mode=SearchMode.TEXT,
+                limit=2,
+            ),
+        )
+
+    assert ensures == 2

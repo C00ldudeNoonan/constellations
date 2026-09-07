@@ -386,7 +386,7 @@ stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] 
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
-stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}]
+stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
@@ -845,6 +845,102 @@ stel run --select ticket_tfidf__min_df_1__ngram_range_1_2
 Axis names must be valid identifiers. Empty axis lists and slug collisions
 (two combinations that produce the same name) are rejected at project load
 time with a clear error.
+
+### Experimenting with variants
+
+`for_each` is also the way to try a change without touching the model that
+is serving. The pattern, worked on the chain where the cost lives:
+
+```yaml
+# models/document_chunks.yml -- the step under test
+- name: document_chunks
+  depends_on: [ref('document_registry')]
+  for_each:
+    chunk_size: [800, 1200]          # one axis: the question being asked
+  chunk:
+    strategy: recursive
+    chunk_size: ${matrix.chunk_size}
+  materialization: incremental
+```
+
+That expands to `document_chunks__chunk_size_800` and
+`document_chunks__chunk_size_1200`, each with its own table and its own
+incremental state, both tagged `document_chunks`. The models below it need a
+variant to point at, so the embed and search models get the same axis and
+reference their own variant:
+
+```yaml
+- name: chunk_embeddings
+  for_each:
+    chunk_size: [800, 1200]
+  depends_on: ["ref('document_chunks__chunk_size_${matrix.chunk_size}')"]
+  embed: { ... }
+
+- name: chunk_search
+  for_each:
+    chunk_size: [800, 1200]
+  depends_on: ["ref('chunk_embeddings__chunk_size_${matrix.chunk_size}')"]
+  search:
+    collection: document_chunks_${matrix.chunk_size}   # two collections, no cutover
+    ...
+```
+
+Then:
+
+```bash
+stel plan --select 'tag:document_chunks+'   # the new variants are `new`; nothing existing re-keys
+stel run  --select 'tag:document_chunks+'   # both branches build side by side
+stel eval --select 'tag:chunk_search'       # score each variant on the same golden set
+```
+
+The selector deliberately stops at the step under test: the models above it
+are the serving pipeline and already exist. On a fresh warehouse, or to pick
+up a source change at the same time, `'+tag:document_chunks+'` builds them
+too.
+
+Three properties make this safe. The serving variant is untouched: a new
+variant has no published state, so it is `new` in the plan and trips no
+guard, and the original's state is not re-keyed. Nothing is shared: each
+variant owns a table, a state scope, and a collection. And the comparison is
+a query, because every variant carries its own `code_version` and the run
+log records each.
+
+**When the experiment ends.** Keep the winner by dropping the axis and
+writing its value into the base model. That is a `code_version` change, so
+run `stel plan` first: the base model's own state is stale and reprocesses,
+and everything below it cascades; on a paid kind the guard will ask. The
+losers are now unreferenced, and stel does not delete what a project no longer
+names:
+
+```
+$ stel ls --orphans     # the invoice example, after deleting monthly_totals.yml and renaming raw_invoices
+name                            kind               rows  detail
+---------------------------------------------------------------
+monthly_totals                  table                 4
+raw_invoices                    table                 5
+raw_invoices                    state_scope           5  stage=materialization code_versions=1 last_run_at=2026-09-07T12:12:23
+
+2 table(s) and 1 state scope(s) in schema stel are claimed by no model in this project. Nothing was removed; drop what you no longer need explicitly.
+```
+
+lists every table in the target schema and every `stel_state` scope that no
+model in the project claims, with row counts, so the leftovers are noticed
+rather than discovered in a storage bill. It is read-only and connects to the
+warehouse the way a run does; `--output json` is the machine form. Dropping
+them is a separate, explicit act.
+
+The same listing catches the other two ways state gets stranded: a renamed
+model (its old table and scope stay behind, and the new name starts from
+nothing, which is why `stel plan` reports it as `new`), and a model file
+deleted from the project. A shared schema shows anything else living in it
+too, which is what "unclaimed" means; the report names the schema it looked
+in.
+
+**A target per experiment** is the other shape, for a change that must
+re-key the serving model itself (a new embedding model, a different
+`id_field`): point a second profile target at its own dataset and store,
+`stel run --target experiment`, and compare across targets. It costs a full
+build; it never touches production state.
 
 ## Profiles
 

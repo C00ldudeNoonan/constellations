@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### `stel eval --compare` says which variant is better (issue #532)
+
+- **Two variants existed side by side, and nothing said which one won.**
+  `stel eval` scored each against its golden set and wrote one artifact per
+  model; comparing chunk size 800 to 1200, or prompt v3 to v4, was two evals
+  and a diff of JSON by eye.
+- `stel eval --compare EXPR [--baseline MODEL]` runs the ordinary per-model
+  evaluation for every selected variant and reports them against one
+  baseline: a column per model, a row per metric at each cutoff with each
+  variant's delta, and per variant the queries whose score moved with the
+  ranking on both sides. Compared models must carry the same tests on the
+  same golden set at the same cutoffs and granularity, or the comparison is
+  refused naming both before a query runs. `target/retrieval_compare.json`
+  (version 1) carries metrics, each side's `code_version`, and query ids, and
+  never chunk text; `--json` prints it. Exit 1 when any side fails.
+- `retrieval_tests[].granularity: record | document` (default `record`).
+  Chunk ids are content-hashed, so two chunk sizes of one corpus share no
+  record ids and a record-level golden set cannot judge a chunking change;
+  under `document`, hits collapse to their `document_id_field` at the rank of
+  their best record and the golden set's ids are document ids. The compiler
+  requires the search model to declare that field. `retrieval_eval.json` is
+  version 2: each result carries its `granularity`.
+
 ### Experiments have a convention, and what they leave behind has a listing (issue #531)
 
 - **Trying a variant of one step had no documented shape, and finishing one

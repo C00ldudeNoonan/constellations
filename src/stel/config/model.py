@@ -934,6 +934,11 @@ class RetrievalTestConfig(BaseModel):
     mode: Literal["vector", "text", "hybrid"] | None = None
     at: tuple[int, ...] = (10,)
     thresholds: dict[str, RetrievalThresholdConfig] = Field(default_factory=dict)
+    # What the golden set's ids name. `record` scores the index's own record
+    # ids; `document` collapses hits to their `document_id_field` in rank
+    # order and scores those, so one golden set can judge variants whose
+    # record ids differ -- two chunk sizes of the same corpus (issue #532).
+    granularity: Literal["record", "document"] = "record"
 
     @model_validator(mode="after")
     def _validate_contract(self) -> RetrievalTestConfig:

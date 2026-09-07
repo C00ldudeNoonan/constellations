@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from .search import (
     SearchFilterOperator,
     SearchMode,
     SearchRequest,
+    SearchResult,
     search,
 )
 
@@ -65,6 +67,7 @@ class RetrievalTestResult:
     test_name: str
     golden_set: str
     mode: str
+    granularity: str = "record"
     per_query: list[QueryMetrics] = field(default_factory=list)
     aggregate: dict[str, dict[int, float]] = field(default_factory=dict)
     thresholds: list[ThresholdStatus] = field(default_factory=list)
@@ -100,9 +103,31 @@ def run_retrieval_evaluation(
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     resolved = resolve_profile(project, project_dir, target=target, profiles_dir=profiles_dir)
-    models_by_name = {m.name: m for m in models}
-
     selected = set(dag.select_models(select=select, exclude=exclude))
+    return evaluate_search_models(
+        project_dir,
+        models,
+        resolved,
+        selected=selected,
+        target=target,
+        profiles_dir=profiles_dir,
+    )
+
+
+def evaluate_search_models(
+    project_dir: Path,
+    models: list[ModelConfig],
+    resolved: ResolvedProfile,
+    *,
+    selected: set[str],
+    target: str | None,
+    profiles_dir: Path | None,
+) -> list[RetrievalTestResult]:
+    """Every `retrieval_tests` entry on the selected search models, in
+    project order, against one warehouse connection. The loaded-project
+    entry point for callers that already validated and resolved (the
+    comparison in `retrieval_compare.py`), so a project is compiled once."""
+    models_by_name = {m.name: m for m in models}
     targets = [
         (model, test)
         for model in models
@@ -149,7 +174,7 @@ def _run_one(
         )
 
     mode = SearchMode(test.mode) if test.mode else _default_mode(model.search.query.modes)
-    limit = max(test.at)
+    limit = _request_limit(test)
 
     per_query: list[QueryMetrics] = []
     violations: list[PolicyViolation] = []
@@ -181,7 +206,7 @@ def _run_one(
             raise RetrievalEvalError(
                 f"Retrieval test '{test.name}' query '{query_id}' failed: {e}"
             ) from e
-        ranked_ids = [hit.record_id for hit in hits]
+        ranked_ids = _ranked_ids(hits, granularity=test.granularity)[: max(test.at)]
         if store_provenance is None and hits:
             # Safe store identity (type, target, logical/physical collection) —
             # the same provenance a real caller sees, captured once per test
@@ -236,6 +261,7 @@ def _run_one(
         test_name=test.name,
         golden_set=golden_name,
         mode=mode.value,
+        granularity=test.granularity,
         per_query=per_query,
         aggregate=aggregate,
         thresholds=thresholds,
@@ -247,6 +273,43 @@ def _run_one(
             golden_rows, domain="dbt_ml/retrieval_eval/golden_set"
         ),
     )
+
+
+# Several records of one document can occupy the top of a ranking, so a
+# document-granularity test asks the index for more records than cutoffs it
+# scores and collapses them; the same over-fetch `search()` itself uses
+# ahead of fusion. Bounded by the request contract's ceiling.
+_DOCUMENT_OVERFETCH = 4
+_REQUEST_LIMIT_CEILING = 1000
+
+
+def _request_limit(test: RetrievalTestConfig) -> int:
+    deepest = max(test.at)
+    if test.granularity == "record":
+        return min(deepest, _REQUEST_LIMIT_CEILING)
+    return min(deepest * _DOCUMENT_OVERFETCH, _REQUEST_LIMIT_CEILING)
+
+
+def _ranked_ids(hits: Sequence[SearchResult], *, granularity: str) -> list[str]:
+    """The ranking the golden set judges: record ids as returned, or each
+    hit's document at the rank of its best record. A hit without a document
+    id under document granularity is a data defect in the index, not a
+    silent zero -- the compiler already requires `document_id_field`."""
+    if granularity == "record":
+        return [hit.record_id for hit in hits]
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for hit in hits:
+        if hit.document_id is None:
+            raise RetrievalEvalError(
+                f"Record '{hit.record_id}' carries no document id; a "
+                "`granularity: document` test cannot place it"
+            )
+        if hit.document_id in seen:
+            continue
+        seen.add(hit.document_id)
+        ranked.append(hit.document_id)
+    return ranked
 
 
 def _default_mode(declared_modes: frozenset[str]) -> SearchMode:
@@ -368,7 +431,8 @@ def _parse_filters(value: Any, *, context: str) -> tuple[SearchFilter, ...]:
 
 
 RETRIEVAL_EVAL_FILENAME = "retrieval_eval.json"
-RETRIEVAL_EVAL_ARTIFACT_VERSION = 1
+# 2: each result carries `granularity` (issue #532).
+RETRIEVAL_EVAL_ARTIFACT_VERSION = 2
 
 
 def build_retrieval_eval_artifact(
@@ -387,6 +451,7 @@ def build_retrieval_eval_artifact(
                 "golden_set": r.golden_set,
                 "golden_set_hash": r.golden_set_hash,
                 "mode": r.mode,
+                "granularity": r.granularity,
                 "store": r.store_provenance,
                 "embedding": r.embedding_identity,
                 "status": r.status,

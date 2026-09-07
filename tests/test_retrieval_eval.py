@@ -402,9 +402,10 @@ def test_artifact_schema_has_no_secrets_and_expected_shape(eval_project: Path) -
     results = run_retrieval_evaluation(eval_project)
     project, _sources, _models = load_project(eval_project)
     artifact = build_retrieval_eval_artifact(project, results)
-    assert artifact["version"] == 1
+    assert artifact["version"] == 2
     assert artifact["project"] == "eval_demo"
     entry = artifact["results"][0]
+    assert entry["granularity"] == "record"
     for key in (
         "model",
         "test",

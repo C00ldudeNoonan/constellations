@@ -1862,8 +1862,9 @@ def mcp() -> None:
         "Take each caller's identity from X-Stel-Principal-Id and friends. "
         "ONLY safe when a proxy in front authenticates the caller and "
         "OVERWRITES those headers — reachable directly, any caller can claim "
-        "any tenant. Required for a network transport until token "
-        "verification lands."
+        "any tenant. The weakest of the three options: prefer --jwt-* or "
+        "--introspection-*, which verify the caller rather than trusting a "
+        "hop in front of it."
     ),
 )
 @click.option(

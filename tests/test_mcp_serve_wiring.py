@@ -26,6 +26,7 @@ A configuration that an operator can legally type belongs in `CONFIGURATIONS`.
 """
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -170,3 +171,67 @@ def test_both_verifiers_are_represented() -> None:
     assert "--jwt-issuer" in flags
     assert "--introspection-endpoint" in flags
     assert "--trust-proxy-principal-headers" in flags
+
+
+# ─── a healthy stdio server writes nothing to stderr (issue #526) ───────────
+
+
+def test_the_upstream_lifespan_warning_is_swallowed() -> None:
+    """pydantic-settings 2.15+ warns that the SDK's `Settings.lifespan` holds
+    an unresolved forward reference, because that module defines `FastMCP`
+    after `Settings`. Harmless here — stel passes no lifespan and reads none
+    from a settings source — but on stdio, stderr *is* the client's log, and
+    this is the only line a healthy server writes there, directly above the
+    connection lines where it reads like their cause.
+
+    Raised synthetically: the pinned pydantic-settings predates the warning,
+    so asserting on a real one would pass without testing anything.
+    """
+    from stel.mcp_server.server import _without_the_upstream_lifespan_warning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with _without_the_upstream_lifespan_warning():
+            warnings.warn(
+                "Field 'lifespan' has an incomplete definition: its annotation "
+                "contains an unresolved forward reference, so settings sources "
+                "may fail to correctly resolve its value.",
+                UserWarning,
+                stacklevel=1,
+            )
+
+    assert caught == []
+
+
+def test_every_other_warning_still_reaches_the_operator() -> None:
+    """The suppression is one message wide on purpose. Silencing the SDK
+    generally would hide the next thing it has to say."""
+    from stel.mcp_server.server import _without_the_upstream_lifespan_warning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with _without_the_upstream_lifespan_warning():
+            warnings.warn("the token verifier is deprecated", UserWarning, stacklevel=1)
+
+    assert [str(item.message) for item in caught] == [
+        "the token verifier is deprecated"
+    ]
+
+
+def test_the_suppression_does_not_outlive_the_construction() -> None:
+    """`catch_warnings` restores the filter list, so a matching warning raised
+    later in the process is still reported."""
+    from stel.mcp_server.server import _without_the_upstream_lifespan_warning
+
+    with _without_the_upstream_lifespan_warning():
+        pass
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        warnings.warn(
+            "Field 'lifespan' has an unresolved forward reference",
+            UserWarning,
+            stacklevel=1,
+        )
+
+    assert len(caught) == 1

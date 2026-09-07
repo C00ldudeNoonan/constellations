@@ -96,6 +96,13 @@ identity the server started with, applying that identity's tenant filters to
 everyone's queries. Nothing about the responses would look wrong, which is why
 this is a refusal rather than a warning.
 
+There are three ways to supply that identity, and the one above is the
+weakest. Prefer [verifying tokens](#verifying-tokens-instead-of-trusting-a-proxy)
+— `--jwt-*` for JWTs, `--introspection-*` for opaque ones — which check the
+caller itself rather than trusting whatever sits in front of it. Proxy headers
+are documented first because they are the simplest thing to stand up, not
+because they are the right default.
+
 `--trust-proxy-principal-headers` reads each caller's identity from:
 
 | header | meaning |

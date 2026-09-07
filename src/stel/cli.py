@@ -69,6 +69,11 @@ from .retrieval.servability import (
     DEFAULT_CONTEXT_TIMEOUT_SECONDS,
     MAX_CONTEXT_TIMEOUT_SECONDS,
 )
+from .retrieval_compare import (
+    compare_retrieval_variants,
+    format_comparison,
+    write_retrieval_compare_artifact,
+)
 from .retrieval_eval import (
     RetrievalEvalError,
     run_retrieval_evaluation,
@@ -1464,6 +1469,23 @@ def test(
     "--select", "select", default=None, help="Selector expression for search models to evaluate."
 )
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
+@click.option(
+    "--compare",
+    "compare",
+    default=None,
+    metavar="EXPR",
+    help=(
+        "Selector for two or more variants of one search model to score on the same "
+        "golden set and report side by side, with each variant's delta from the baseline "
+        "and the queries that moved. Writes target-path/retrieval_compare.json."
+    ),
+)
+@click.option(
+    "--baseline",
+    default=None,
+    metavar="MODEL",
+    help="With --compare: the model deltas are measured from (default: the first selected).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Print the eval artifact to stdout.")
 @_verbose_option
 @_project_context_options
@@ -1472,6 +1494,8 @@ def eval_(
     ctx: click.Context,
     select: str | None,
     exclude: str | None,
+    compare: str | None,
+    baseline: str | None,
     as_json: bool,
     verbose: int,
 ) -> None:
@@ -1483,6 +1507,23 @@ def eval_(
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
     _configure_output(verbose, json_output=as_json)
+    if compare is not None:
+        if select is not None or exclude is not None:
+            raise click.UsageError(
+                "--compare is itself the selection; --select/--exclude do not apply."
+            )
+        _eval_compare(
+            ctx,
+            project_dir,
+            compare=compare,
+            baseline=baseline,
+            target=target,
+            profiles_dir=profiles_dir,
+            as_json=as_json,
+        )
+        return
+    if baseline is not None:
+        raise click.UsageError("--baseline only applies with --compare.")
     try:
         results = run_retrieval_evaluation(
             project_dir,
@@ -1533,6 +1574,51 @@ def eval_(
     summary += f", {failed} failed (of {len(results)})"
     click.echo(summary)
     click.echo(f"Wrote {artifact_path}")
+    if failed:
+        ctx.exit(1)
+
+
+def _eval_compare(
+    ctx: click.Context,
+    project_dir: Path,
+    *,
+    compare: str,
+    baseline: str | None,
+    target: str | None,
+    profiles_dir: Path | None,
+    as_json: bool,
+) -> None:
+    """`stel eval --compare` (issue #532): the per-model evaluation for every
+    selected variant, then one comparison against the baseline. Exits 1 when
+    any side fails, exactly as the plain form does for that side alone."""
+    try:
+        comparison = compare_retrieval_variants(
+            project_dir,
+            compare=compare,
+            baseline=baseline,
+            target=target,
+            profiles_dir=profiles_dir,
+        )
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    except RetrievalEvalError as e:
+        raise click.ClickException(str(e)) from e
+
+    project, _sources, _models = _load(project_dir)
+    write_retrieval_eval_artifact(project_dir, project, list(comparison.results))
+    artifact_path = write_retrieval_compare_artifact(project_dir, project, comparison)
+    failed = comparison.status() == "fail"
+    if as_json:
+        click.echo(artifact_path.read_text(encoding="utf-8"))
+    else:
+        for line in format_comparison(comparison):
+            click.echo(line)
+        click.echo(
+            f"{len(comparison.models) - 1} variant(s) compared against "
+            f"{comparison.baseline} on {len(comparison.tests)} test(s): "
+            f"{comparison.status()}"
+        )
+        click.echo(f"Wrote {artifact_path}")
     if failed:
         ctx.exit(1)
 

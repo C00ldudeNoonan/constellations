@@ -385,6 +385,7 @@ stel graph                                               # Mermaid DAG to stdout
 stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
+stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one golden set: deltas, and the queries that moved
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
@@ -890,7 +891,7 @@ Then:
 ```bash
 stel plan --select 'tag:document_chunks+'   # the new variants are `new`; nothing existing re-keys
 stel run  --select 'tag:document_chunks+'   # both branches build side by side
-stel eval --select 'tag:chunk_search'       # score each variant on the same golden set
+stel eval --compare 'tag:chunk_search'      # score every variant on one golden set, side by side
 ```
 
 The selector deliberately stops at the step under test: the models above it
@@ -901,9 +902,54 @@ too.
 Three properties make this safe. The serving variant is untouched: a new
 variant has no published state, so it is `new` in the plan and trips no
 guard, and the original's state is not re-keyed. Nothing is shared: each
-variant owns a table, a state scope, and a collection. And the comparison is
-a query, because every variant carries its own `code_version` and the run
-log records each.
+variant owns a table, a state scope, and a collection. And every variant
+carries its own `code_version`, so a number can always be tied back to the
+configuration that produced it.
+
+**Which one is better.** `stel eval --compare` runs the ordinary per-model
+evaluation for every selected variant and lines the results up against one
+baseline: a column per model, a row per metric at each cutoff, each variant's
+cell carrying its delta from the baseline, and then, per variant, the queries
+whose score moved with the ranking on both sides, so a regression is
+traceable to examples rather than to a number.
+
+```
+$ stel eval --compare 'release_search__chunk_size_1000 release_search__chunk_size_60'
+quality: golden_set=search_golden (2 queries, granularity=document); baseline release_search__chunk_size_1000
+metric        release_search__chunk_size_1000  release_search__chunk_size_60
+----------------------------------------------------------------------------
+recall@1      1.000                            0.500 (-0.500)
+precision@1   1.000                            0.500 (-0.500)
+hit_rate@1    1.000                            0.500 (-0.500)
+mrr@1         1.000                            0.500 (-0.500)
+ndcg@1        1.000                            0.500 (-0.500)
+status        pass                             fail
+  release_search__chunk_size_60: 1 query(ies) moved
+    q_labor: hit_rate@1 -1.000, mrr@1 -1.000, ndcg@1 -1.000, precision@1 -1.000, recall@1 -1.000
+      ranked [2c03cf70873f77779d678a51e095a4be] -> [a8ef16df98f67c48d4175fe5b0ddad96]
+
+1 variant(s) compared against release_search__chunk_size_1000 on 1 test(s): fail
+Wrote target/retrieval_compare.json
+```
+
+The first-named model is the baseline; with a tag or graph selector the
+models sort by name, so pass `--baseline` to choose. Every compared model
+must carry the same tests on the same golden set, at the same cutoffs and
+granularity, or the comparison is refused naming both models before a query
+runs. The exit code is the plain form's: 1 if any side's status is `fail`.
+`--json` prints `target/retrieval_compare.json`, which carries the metrics,
+each side's `code_version`, and query ids with the ids each side ranked, and
+never chunk text or anything from a profile; the per-model
+`retrieval_eval.json` is written alongside.
+
+One thing to know about the golden set: its `relevant_ids` name records by
+the index's `id_field`, and chunk ids are content-hashed, so two chunk sizes
+of one corpus share no ids. A test that judges a chunking change labels
+documents instead, with `granularity: document` on the retrieval test: hits
+collapse to their `document_id_field` in rank order, at the rank of their
+best chunk, and the golden set's ids are document ids. Variants that keep
+the record ids (embedding model, index type, search mode, `refine_factor`)
+compare fine at the default `granularity: record`.
 
 **When the experiment ends.** Keep the winner by dropping the axis and
 writing its value into the base model. That is a `code_version` change, so

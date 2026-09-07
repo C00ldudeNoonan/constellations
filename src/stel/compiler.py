@@ -844,6 +844,14 @@ def _validate_retrieval_tests(model: ModelConfig, model_names: set[str]) -> None
                 f"in `query.modes` ({sorted(model.search.query.modes)})",
                 ("retrieval_tests",),
             )
+        if test.granularity == "document" and model.search.document_id_field is None:
+            raise _model_error(
+                model,
+                f"Retrieval test '{test.name}' on '{model.name}' sets "
+                "`granularity: document`, but the search index declares no "
+                "`document_id_field` to collapse hits on",
+                ("retrieval_tests",),
+            )
 
 
 def _validate_materialization(model: ModelConfig) -> None:

@@ -934,6 +934,11 @@ class RetrievalTestConfig(BaseModel):
     mode: Literal["vector", "text", "hybrid"] | None = None
     at: tuple[int, ...] = (10,)
     thresholds: dict[str, RetrievalThresholdConfig] = Field(default_factory=dict)
+    # What the golden set's ids name. `record` scores the index's own record
+    # ids; `document` collapses hits to their `document_id_field` in rank
+    # order and scores those, so one golden set can judge variants whose
+    # record ids differ -- two chunk sizes of the same corpus (issue #532).
+    granularity: Literal["record", "document"] = "record"
 
     @model_validator(mode="after")
     def _validate_contract(self) -> RetrievalTestConfig:
@@ -943,6 +948,14 @@ class RetrievalTestConfig(BaseModel):
             raise ValueError("retrieval_tests.at must not be empty")
         if any(isinstance(k, bool) or k <= 0 for k in self.at):
             raise ValueError("retrieval_tests.at must contain positive integers")
+        # `search.SEARCH_LIMIT_CEILING`, restated here because `search`
+        # imports this module. A cutoff no request can fill would otherwise
+        # score ranks the index was never asked for as misses.
+        if any(k > 1000 for k in self.at):
+            raise ValueError(
+                "retrieval_tests.at cutoffs must be at most 1000, the most records "
+                "one search request can return"
+            )
         if len(self.at) != len(set(self.at)):
             raise ValueError("retrieval_tests.at must not contain duplicate cutoffs")
         for key in self.thresholds:

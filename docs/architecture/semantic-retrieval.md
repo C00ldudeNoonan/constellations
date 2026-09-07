@@ -1548,6 +1548,8 @@ models:
         mode: hybrid          # optional; defaults to the richest mode the
                                # index declares (hybrid > vector > text)
         at: [5, 10]
+        granularity: record   # optional; `document` collapses hits to their
+                               # document_id_field in rank order and judges those
         thresholds:
           recall_at_10: {min: 0.90, severity: error}
           mrr_at_10: {min: 0.75, severity: warn}
@@ -1574,7 +1576,7 @@ The referenced model's materialized rows carry:
 | `query_id` | yes | stable identifier, unique per golden set |
 | `query_text` | for text/hybrid modes | query string |
 | `query_vector` | for vector/hybrid modes | precomputed vector (JSON array), bypassing the embedding provider so evaluation stays deterministic and offline-capable even for a real/hosted provider |
-| `relevant_ids` | no | JSON array of relevant record IDs (binary relevance). Absent/empty means "no ground truth for this query" — see below |
+| `relevant_ids` | no | JSON array of relevant IDs (binary relevance): record IDs, or document IDs when the test declares `granularity: document`. Absent/empty means "no ground truth for this query" — see below |
 | `graded_relevance` | no | JSON object mapping ID → non-negative grade, for NDCG. Defaults to grade 1 for each `relevant_ids` member when omitted |
 | `required_ids` | no | JSON array that must ALL appear in results — a hard policy assertion |
 | `excluded_ids` | no | JSON array that must NEVER appear — a hard policy assertion |
@@ -1585,6 +1587,20 @@ The referenced model's materialized rows carry:
 Array/object-typed columns are declared `data_type: json`; stel stores them as
 JSON text (the same representation used elsewhere for nested field data) and
 the evaluator parses them back on read.
+
+`granularity: document` (issue #532) exists because chunk ids are
+content-hashed: two chunk sizes of one corpus share no record ids, so a
+record-level golden set cannot judge a chunking change. Under document
+granularity the evaluator asks the index for four times the deepest cutoff,
+collapses hits to their `document_id_field` at the rank of their best record,
+and asks again four times wider until the ranking holds the deepest cutoff's
+worth of distinct documents or the index returns fewer records than asked;
+reaching the 1000-record request ceiling with neither fails the test rather
+than scoring an incomplete ranking. It then truncates to the deepest cutoff
+and scores; `required_ids` and `excluded_ids` are document ids too. The
+compiler requires the search model to declare a `document_id_field`, and
+`at` cutoffs above 1000 are rejected at config time under either
+granularity, since no request can fill them.
 
 ### Metrics and edge cases
 
@@ -1632,7 +1648,29 @@ intentionally does not key off it — the golden set is data, not code), the saf
 store provenance and embedding identity `search()` already returns per query,
 per-query ranked IDs/diagnosis/metrics, aggregates, threshold outcomes, and
 policy violations. It never contains secrets, credential-bearing profile
-values, or raw embedding vectors.
+values, or raw embedding vectors. Artifact version 2 added each result's
+`granularity`.
+
+### Comparing variants (issue #532)
+
+`stel eval --compare EXPR [--baseline MODEL]` runs the same per-model
+evaluation for every search model `EXPR` selects and emits one comparison
+against the baseline (the first-named model, or name order under a tag or
+graph selector): per test, each side's aggregate and status, each variant's
+delta from the baseline for every metric at every cutoff, and the queries
+whose per-query score moved, with the ids each side ranked. A rank change
+that moves no metric is not reported — two irrelevant results swapping
+places is noise. There is no second scorer; `retrieval_compare.py` only lines
+up `retrieval_eval.py`'s numbers.
+
+Comparability is checked before any query runs: every compared model must
+declare the same test names, each on the same golden set, at the same `at`
+cutoffs and `granularity`, or the comparison is refused naming both models
+and the field that differs. The artifact is `target-path/retrieval_compare.json`
+(version 1): metrics, model names, each side's `code_version`, and query ids
+with ranked ids; never chunk text, prompt text, or profile values. The
+per-model `retrieval_eval.json` is written alongside. The exit code follows
+the plain form: 1 when any side's status is `fail`.
 
 ### dbt export
 

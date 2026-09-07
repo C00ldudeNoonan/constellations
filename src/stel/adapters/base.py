@@ -309,6 +309,16 @@ class StatePageRecord:
 
 
 @dataclass(frozen=True)
+class StateScopeSummary:
+    """One state scope as `list_state_scopes` reports it (issue #531)."""
+
+    scope: StateScope
+    rows: int
+    code_versions: int
+    last_run_at: str | None
+
+
+@dataclass(frozen=True)
 class StatePage:
     """One bounded, key-ordered page of scoped state records.
 
@@ -1636,6 +1646,38 @@ to see the plan first."""
         )
         return {str(code_version): int(count) for code_version, count in found}
 
+    def list_state_scopes(self) -> list[StateScopeSummary]:
+        """Every state scope the warehouse holds, with its size and activity.
+
+        The read `stel ls --orphans` makes to find state no model in the
+        project claims any more (issue #531): a renamed model or a dropped
+        `for_each` variant leaves its scope behind with nothing pointing at
+        it. One aggregate query; read-only; an absent state table is an empty
+        warehouse, not an error.
+        """
+        if self.table_column_names(STATE_TABLE) is None:
+            return []
+        table = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        # The state table spells StateScope.stage as `state_scope`.
+        found = self.rows(
+            f"""
+            SELECT model_name, state_scope, target_identity,
+                   COUNT(*), COUNT(DISTINCT code_version), MAX(last_run_at)
+            FROM {table}
+            GROUP BY model_name, state_scope, target_identity
+            ORDER BY model_name, state_scope, target_identity
+            """
+        )
+        return [
+            StateScopeSummary(
+                scope=StateScope(str(model_name), str(stage), str(target_identity)),
+                rows=int(rows),
+                code_versions=int(versions),
+                last_run_at=_isoformat_or_none(last_run_at),
+            )
+            for model_name, stage, target_identity, rows, versions, last_run_at in found
+        ]
+
     # ─── paged state reconciliation (issue #153) ──────────────────────────
 
     def fetch_state_subset(
@@ -1737,6 +1779,16 @@ to see the plan first."""
             f"Warehouse adapter '{self.adapter_type()}' does not implement "
             "atomic state scope replacement"
         )
+
+
+def _isoformat_or_none(value: Any) -> str | None:
+    """Timestamps come back as datetime on DuckDB and BigQuery alike, but the
+    listing is a report, so a string is what it carries."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def _validated_state_batches(

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +23,27 @@ from .contracts import (
 from .grants import DEFAULT_GRANT_TTL_SECONDS
 from .service import ContextServerSettings, ContextService
 
+# The SDK's `Settings.lifespan` is annotated with a forward reference to
+# `FastMCP`, which that module defines *after* `Settings`, so the annotation is
+# never resolved and pydantic-settings 2.15+ warns about it while building the
+# model. Cosmetic here — stel passes no lifespan and reads none from a settings
+# source, and the field resolves to None — but on a stdio transport stderr *is*
+# the client's log, and this is the only line a healthy server writes there. It
+# then sits directly above the connection lines in Claude Desktop's log, where
+# it reads like the cause of an unrelated failure (issue #526).
+#
+# Narrow on purpose: one message, around one construction. Anything else the
+# SDK warns about still reaches the operator. Removable once the SDK resolves
+# the annotation.
+_UPSTREAM_LIFESPAN_WARNING = r".*'lifespan'.*unresolved forward reference.*"
+
+
+@contextmanager
+def _without_the_upstream_lifespan_warning() -> Iterator[None]:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_UPSTREAM_LIFESPAN_WARNING)
+        yield
+
 
 def create_mcp_server(
     service: ContextService,
@@ -36,22 +60,24 @@ def create_mcp_server(
     auth = _auth_settings(
         token_verifier, issuer_url=issuer_url, public_url=public_url
     )
-    app = fastmcp.FastMCP(
-        "stel",
-        instructions=(
-            "Read-only governed document context. Use dbt MCP, not this server, "
-            "for semantic-layer metrics."
-        ),
-        json_response=True,
-        # When present, the SDK verifies the bearer token before any tool runs
-        # and exposes the result to `AccessTokenPrincipalResolver` (issue
-        # #392). Absent, the server is unauthenticated and only a trusted
-        # proxy in front can supply identity.
-        token_verifier=token_verifier,
-        # Required by the SDK whenever a verifier is present, and the source of
-        # the discovery metadata (issue #464). See `_auth_settings`.
-        auth=auth,
-    )
+    with _without_the_upstream_lifespan_warning():
+        app = fastmcp.FastMCP(
+            "stel",
+            instructions=(
+                "Read-only governed document context. Use dbt MCP, not this server, "
+                "for semantic-layer metrics."
+            ),
+            json_response=True,
+            # When present, the SDK verifies the bearer token before any tool
+            # runs and exposes the result to `AccessTokenPrincipalResolver`
+            # (issue #392). Absent, the server is unauthenticated and only a
+            # trusted proxy in front can supply identity.
+            token_verifier=token_verifier,
+            # Required by the SDK whenever a verifier is present, and the
+            # source of the discovery metadata (issue #464). See
+            # `_auth_settings`.
+            auth=auth,
+        )
 
     @app.tool()  # type: ignore[untyped-decorator]
     def list_context_models(

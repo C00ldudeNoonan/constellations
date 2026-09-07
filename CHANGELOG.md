@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### `mcp serve` stops pointing at the weakest auth option, and stops warning on start (issue #526)
+
+Two things an operator hits while wiring the server into a desktop MCP client.
+Neither was a behavior defect; both cost time when something *else* goes wrong.
+
+**The `--trust-proxy-principal-headers` help text was stale.** It ended with
+"Required for a network transport until token verification lands" — which
+landed: `--jwt-*` in #392 and opaque-token introspection in #464, both
+documented in the same `--help` output. Read literally it told an operator to
+adopt the least safe of three options, undercutting the careful hazard warning
+around it. It now names itself as the weakest and points at the two that verify
+the caller instead of trusting a hop in front of it. `docs/mcp.md` says the same
+where it introduces the network transport, since its first example uses proxy
+headers because they are simplest to stand up, not because they are the right
+default.
+
+**The server no longer emits a pydantic warning on every start.** The SDK
+annotates `Settings.lifespan` with a forward reference to `FastMCP`, which that
+module defines after `Settings`, so the annotation never resolves and
+pydantic-settings 2.15+ warns while building the model. Harmless for stel — no
+lifespan is passed, none is read from a settings source, and the field resolves
+to `None` — but on stdio, stderr *is* the client's log, and this was the only
+line a healthy server wrote there. In Claude Desktop's log it sat directly above
+the connection lines, reading like their cause. It is now suppressed around that
+one construction, by that one message, so anything else the SDK has to say still
+reaches the operator; the suppression can go once the SDK resolves the
+annotation.
+
 ### `stel eval --compare` says which variant is better (issue #532)
 
 - **Two variants existed side by side, and nothing said which one won.**

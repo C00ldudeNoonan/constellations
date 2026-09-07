@@ -1294,3 +1294,103 @@ def test_attributes_come_from_the_hit_not_the_warehouse_row() -> None:
     # The fixture row carries these; none is declared returnable.
     for undeclared in ("tenant_id", "classification", "text", "context_id"):
         assert undeclared not in attributes
+
+
+# ─── candidate_limit reaches the store (issue #525) ─────────────────────────
+
+
+def test_candidate_limit_is_passed_through_to_the_search_request() -> None:
+    """The parity gap #525 reported: `--candidate-limit` exists on the CLI and
+    had no equivalent here, so the two paths asked the same index for
+    different amounts of work and only one of them could be tuned."""
+    service, search = _service()
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation", mode="text", candidate_limit=200
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert search.request is not None
+    assert search.request.candidate_limit == 200
+
+
+def test_an_omitted_candidate_limit_leaves_the_portable_default() -> None:
+    """Absent, nothing about a query changes: `search()` still derives the
+    candidate set from `limit`."""
+    service, search = _service()
+    try:
+        service.search_context(
+            SearchContextRequest(model="context_search", query="inflation", mode="text")
+        )
+    finally:
+        service.close()
+
+    assert search.request is not None
+    assert search.request.candidate_limit is None
+
+
+def test_a_candidate_limit_below_limit_is_a_named_bad_argument() -> None:
+    """The portable request rejects this too, but as a ValueError the caller
+    would see as an internal failure rather than as the bad argument it is."""
+    service, _ = _service()
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation", mode="text",
+                limit=20, candidate_limit=5,
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INVALID_REQUEST
+    assert response.results == ()
+
+
+def test_the_operator_can_cap_how_many_candidates_a_caller_may_request() -> None:
+    """More candidates is more store work, which on a served transport is the
+    operator's budget to bound — the same reason `max_results` exists."""
+    service, _ = _service(settings=ContextServerSettings(max_candidates=100))
+    try:
+        allowed = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation", mode="text", candidate_limit=100
+            )
+        )
+        refused = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation", mode="text", candidate_limit=101
+            )
+        )
+    finally:
+        service.close()
+
+    assert allowed.error is None
+    assert refused.error is not None
+    assert refused.error.code is MCPErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.anyio
+async def test_the_tool_schema_offers_candidate_limit_to_callers() -> None:
+    """An argument the service honors but the tool does not advertise is
+    unreachable for every MCP client, which is the shape of the original gap."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    service, _ = _service()
+    app = create_mcp_server(service)
+    try:
+        async with create_connected_server_and_client_session(
+            app, raise_exceptions=True
+        ) as session:
+            tools = await session.list_tools()
+            search_tool = next(
+                tool for tool in tools.tools if tool.name == "search_context"
+            )
+            assert "candidate_limit" in search_tool.inputSchema["properties"]
+    finally:
+        service.close()

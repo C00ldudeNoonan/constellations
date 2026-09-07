@@ -1019,11 +1019,26 @@ my_project:
         timeout_seconds: 60
         provider_options:
           project: my-gcp-project       # optional if ADC can infer it
-          location: global             # use a model-supported Vertex location
+          location: us-central1         # a region, not `global` -- see below
           task_type: RETRIEVAL_DOCUMENT
           query_task_type: RETRIEVAL_QUERY
           auto_truncate: false
 ```
+
+**Prefer a regional location to `global` for anything that serves queries.**
+Both work, and `location` is execution routing rather than embedding
+semantics, so changing it does not alter the embedding identity and needs no
+republish. But on a connection that is not already warm, the `global` endpoint
+was measured at ~10.2s per request against ~0.27s for `us-central1` — a fixed
+cost, the same at a 5-second idle gap as at 60, and not attributable to DNS,
+TLS, credential refresh, retry backoff, or connection-pool settings
+(issue #536).
+
+That only bites a sparse request pattern. A bulk `embed:` backfill issues
+requests back to back, keeps its connections warm and barely notices. An
+agent querying a served index a few seconds apart pays it on every query, and
+it dominated the query profile until it was found. `global` remains the right
+choice when a model or quota is only available there.
 
 The model ID and output dimensionality remain reviewable model semantics:
 

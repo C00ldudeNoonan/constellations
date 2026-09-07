@@ -60,7 +60,8 @@ embedding:
   timeout_seconds: 60
   provider_options:
     project: your-gcp-project
-    location: global
+    location: us-central1   # a region; `global` costs ~10s on a cold
+                            # connection when queries are sparse (issue #536)
     task_type: RETRIEVAL_DOCUMENT
     query_task_type: RETRIEVAL_QUERY
     auto_truncate: false

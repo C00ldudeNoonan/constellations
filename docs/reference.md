@@ -2770,12 +2770,28 @@ paying for the index, and there was previously no way to tell (issue #519).
 Phase names and durations only — no query text or row values reach the log, so
 it is safe at INFO where an orchestrator captures it.
 
-**The MCP server pays the same per-query costs.** `stel mcp serve` calls the
-same entry point and holds nothing between requests: the project is compiled,
-the warehouse connected and the store opened on every query. Only the ~1s
-Python process startup is amortized, so CLI timings are representative of a
-long-lived server's steady state rather than an artifact of per-invocation
-startup.
+**A CLI query pays setup a served query does not.** `stel mcp serve` keeps
+one search session for the life of the server, so the project is compiled and
+the retrieval store opened once rather than per request (issue #523). A CLI
+invocation owns its session and closes it, so every run pays that setup again.
+
+Holding the store open matters for more than the `store_open` phase it
+removes. The store's connection carries the index cache budget, and an index
+cache cannot stay resident across queries if the connection is dropped after
+each one. Measured against a 3.6M-row collection over object storage, the
+second and later queries on one session cost:
+
+| phase | first query | later queries |
+|---|---:|---:|
+| compile | 0.34s | — |
+| store_open | 1.68s | — |
+| text_search | 4.68s | 0.96s |
+| vector_search | 5.47s | 0.62s |
+| **total** | **38.8s** | **24.2s** |
+
+The lease is deliberately not cached: it pins the generation a query reads and
+is what makes a concurrent publish safe. The warehouse connection is not
+cached either, which is why `warehouse_connect` still appears on every query.
 
 Filters are repeatable `FIELD OP VALUE` triples. Operators are `eq`, `ne`,
 `lt`, `le`, `gt`, `ge`, `in`, and `array_contains_any`; the last two take a

@@ -571,3 +571,150 @@ def test_search_v_reports_timings_on_stderr_and_leaves_json_parseable(
     payload = json_module.loads(result.output[start:])
     assert isinstance(payload, list)
     assert "compile=" in result.output[:start]
+
+
+def test_a_session_compiles_once_and_holds_its_store_open(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The setup a long-lived server reuses is done once, not per query (#523).
+
+    Recompiling and reopening per request is what made a served query cost the
+    same as a one-shot CLI invocation, and it threw away the store's index
+    cache between queries -- the expensive half, measured at ~10x on the
+    vector lookup against a 3.6M-row collection.
+    """
+    import stel.search as search_module
+
+    compiles = 0
+    real_load_project = search_module.load_project
+
+    def counting_load_project(*args: Any, **kwargs: Any) -> Any:
+        nonlocal compiles
+        compiles += 1
+        return real_load_project(*args, **kwargs)
+
+    monkeypatch.setattr(search_module, "load_project", counting_load_project)
+
+    opens = 0
+    real_create_store = search_module.create_store
+
+    def counting_create_store(*args: Any, **kwargs: Any) -> Any:
+        nonlocal opens
+        opens += 1
+        return real_create_store(*args, **kwargs)
+
+    monkeypatch.setattr(search_module, "create_store", counting_create_store)
+
+    session = search_module.SearchSession(
+        published_project, target=None, profiles_dir=None
+    )
+    try:
+        for _ in range(3):
+            results = search(
+                published_project,
+                SearchRequest(
+                    model="release_search",
+                    query="inflation consumer prices",
+                    mode=SearchMode.HYBRID,
+                    limit=2,
+                ),
+                session=session,
+            )
+            assert results
+    finally:
+        session.close()
+
+    assert compiles == 1
+    assert opens == 1
+
+
+def test_a_session_reopens_a_store_whose_connection_failed(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached store that has broken must not be served to later queries."""
+    from stel.retrieval import RetrievalError
+    from stel.search import SearchSession
+
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    request = SearchRequest(
+        model="release_search",
+        query="inflation consumer prices",
+        mode=SearchMode.TEXT,
+        limit=2,
+    )
+    try:
+        assert search(published_project, request, session=session)
+        alias = next(iter(session._stores))
+        store = session._stores[alias]
+
+        def fail(*args: Any, **kwargs: Any) -> Any:
+            raise RetrievalError("store connection lost")
+
+        monkeypatch.setattr(store, "inspect_collection", fail)
+        with pytest.raises(SearchError, match="store connection lost"):
+            search(published_project, request, session=session)
+        assert alias not in session._stores
+
+        # The next query rebuilds rather than inheriting the failure.
+        assert search(published_project, request, session=session)
+    finally:
+        session.close()
+
+
+def test_search_without_a_session_closes_the_store_it_opened(
+    published_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-shot call still owns its store, so the CLI leaks no connection."""
+    import stel.search as search_module
+
+    opened: list[Any] = []
+    real_create_store = search_module.create_store
+
+    def tracking_create_store(*args: Any, **kwargs: Any) -> Any:
+        store = real_create_store(*args, **kwargs)
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr(search_module, "create_store", tracking_create_store)
+    assert search(
+        published_project,
+        SearchRequest(
+            model="release_search",
+            query="inflation consumer prices",
+            mode=SearchMode.TEXT,
+            limit=2,
+        ),
+    )
+
+    assert len(opened) == 1
+    assert opened[0]._db is None
+
+
+def test_a_session_from_another_project_is_refused(
+    published_project: Path,
+    tmp_path: Path,
+) -> None:
+    """Preferring one of two disagreeing project paths would serve results
+    from a project the caller never named."""
+    from stel.search import SearchSession
+
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    session = SearchSession(other, target=None, profiles_dir=None)
+    try:
+        with pytest.raises(SearchError, match="different project"):
+            search(
+                published_project,
+                SearchRequest(
+                    model="release_search",
+                    query="inflation",
+                    mode=SearchMode.TEXT,
+                    limit=1,
+                ),
+                session=session,
+            )
+    finally:
+        session.close()

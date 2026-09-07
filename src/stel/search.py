@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
+from threading import Lock, RLock
 from time import perf_counter
 from types import MappingProxyType
 from typing import Any
@@ -37,6 +39,7 @@ from .retrieval import (
     RetrievalFeature,
     RetrievalPredicate,
     RetrievalPredicateOperator,
+    RetrievalStore,
     ServingCoordinator,
     StoreRole,
     collection_config_fingerprint,
@@ -260,6 +263,138 @@ class _ScoredRow:
     contributing_ranks: Mapping[str, int]
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedProject:
+    project_config: Any
+    models: tuple[ModelConfig, ...]
+    models_by_name: Mapping[str, ModelConfig]
+    profile: ResolvedProfile
+
+
+class SearchSession:
+    """Query setup a long-lived server reuses across requests (issue #523).
+
+    A query's warehouse lease, its embedding and its index lookups are per
+    request. Compiling the project, resolving the profile and opening the
+    retrieval store are not: none of them can change under a running server,
+    which is why `WarehouseContextRepository` already caches the first two.
+    The search path cached none of them, so every MCP request redid all three.
+
+    Holding the store open is the reason this class exists, and it buys far
+    more than the connect it saves. `LanceDBStore.__enter__` builds the
+    `lancedb.Session` that carries the configured index cache budget (#479),
+    and a store closed after every query throws that cache away before a
+    second query can hit it. Measured against the 3.6M-row prod collection
+    over GCS, holding one store open across queries took `vector_search` from
+    7.87s to 0.76s and `text_search` from 5.86s to 1.00s -- an order of
+    magnitude, and the explanation for the "warm is no faster than cold"
+    observation in both #461 and #519.
+
+    Deliberately not cached: the query lease. It is the generation pin and the
+    concurrency control, so it is re-taken per request even here. Also not
+    cached: the warehouse connection, which is a separate increment (#523).
+
+    Concurrency: the MCP tools are registered as synchronous functions, so the
+    SDK runs them off the event loop and concurrent callers are not
+    serialized. `store_guard()` serializes store I/O per store, and the #432
+    lesson is why it is not wider than that -- a lock spanning the whole query
+    would serialize the lease round trips and the provider call too, which is
+    serialized execution rather than serialized I/O.
+    """
+
+    def __init__(
+        self,
+        project: str | Path,
+        *,
+        target: str | None,
+        profiles_dir: Path | None,
+    ) -> None:
+        self.project_dir = Path(project).resolve()
+        self._target = target
+        self._profiles_dir = profiles_dir
+        self._lock = RLock()
+        self._resolved: _ResolvedProject | None = None
+        self._stores: dict[str, RetrievalStore] = {}
+        self._store_locks: dict[str, Lock] = {}
+
+    def resolve(self, timings: PhaseTimings) -> _ResolvedProject:
+        """Compile the project and resolve the profile, once per session."""
+        with self._lock:
+            if self._resolved is None:
+                with timings.phase("compile"):
+                    project_config, sources, models = load_project(self.project_dir)
+                    validate_project_contract(
+                        project_config, sources, models, self.project_dir
+                    )
+                    resolved = resolve_profile(
+                        project_config,
+                        self.project_dir,
+                        target=self._target,
+                        profiles_dir=self._profiles_dir,
+                    )
+                self._resolved = _ResolvedProject(
+                    project_config=project_config,
+                    models=tuple(models),
+                    models_by_name={item.name: item for item in models},
+                    profile=resolved,
+                )
+            return self._resolved
+
+    def store(
+        self,
+        alias: str,
+        build: Callable[[], RetrievalStore],
+        timings: PhaseTimings,
+    ) -> RetrievalStore:
+        """Return an entered store for `alias`, opening it on first use.
+
+        The store stays open for the life of the session; `close()` releases
+        it. `build` is called only on a miss, so a cache hit costs no store
+        construction and, more to the point, no reconnect.
+        """
+        with self._lock:
+            store = self._stores.get(alias)
+            if store is None:
+                opening = perf_counter()
+                store = build()
+                store.__enter__()
+                timings.add("store_open", perf_counter() - opening)
+                self._stores[alias] = store
+                self._store_locks[alias] = Lock()
+            return store
+
+    def store_guard(self, alias: str) -> AbstractContextManager[Any]:
+        """Serialize store I/O for one alias across concurrent tool threads."""
+        with self._lock:
+            guard = self._store_locks.get(alias)
+        return nullcontext() if guard is None else guard
+
+    def discard_store(self, alias: str) -> None:
+        """Drop a store whose connection failed, so the next query rebuilds it.
+
+        A cached connection that has broken stays broken, and every later
+        query would inherit the failure. Exiting is best-effort for the same
+        reason: the store is already being discarded, and a failure to close a
+        broken connection must not mask the error that caused the discard.
+        """
+        with self._lock:
+            store = self._stores.pop(alias, None)
+            self._store_locks.pop(alias, None)
+        if store is not None:
+            try:
+                store.__exit__(None, None, None)
+            except Exception:  # see the docstring
+                log.debug("Discarding a failed retrieval store raised on close")
+
+    def close(self) -> None:
+        with self._lock:
+            aliases = list(self._stores)
+        for alias in aliases:
+            self.discard_store(alias)
+        with self._lock:
+            self._resolved = None
+
+
 def search(
     project: str | Path,
     request: SearchRequest,
@@ -268,6 +403,7 @@ def search(
     profiles_dir: Path | None = None,
     policy_filters: Sequence[SearchFilter] = (),
     timings: PhaseTimings | None = None,
+    session: SearchSession | None = None,
 ) -> list[SearchResult]:
     """Query a published search index through a generation-pinned read lease.
 
@@ -281,24 +417,48 @@ def search(
     Passed in rather than returned because the result list is the contract
     and callers read the phases differently: the CLI prints them, a server
     would export them. Omitted, one is created and only logged.
+
+    `session` supplies the reusable half of that setup (issue #523). Omitted,
+    a private one is built and closed around this single query, which is what
+    a one-shot CLI invocation wants; a long-lived server passes one in and
+    keeps the compiled project and the open store across requests.
     """
     timings = PhaseTimings() if timings is None else timings
     started = perf_counter()
-    project_dir = Path(project).resolve()
-    with timings.phase("compile"):
-        project_config, sources, models = load_project(project_dir)
-        validate_project_contract(project_config, sources, models, project_dir)
-    model = next((item for item in models if item.name == request.model), None)
+    owned_session = session is None
+    if session is None:
+        session = SearchSession(project, target=target, profiles_dir=profiles_dir)
+    elif session.project_dir != Path(project).resolve():
+        # Both were given and they disagree. Silently preferring one would
+        # serve results from a project the caller did not name.
+        raise SearchError(
+            "The search session belongs to a different project than the one queried"
+        )
+    try:
+        return _search(
+            session, request, policy_filters=policy_filters, timings=timings, started=started
+        )
+    finally:
+        if owned_session:
+            session.close()
+
+
+def _search(
+    session: SearchSession,
+    request: SearchRequest,
+    *,
+    policy_filters: Sequence[SearchFilter],
+    timings: PhaseTimings,
+    started: float,
+) -> list[SearchResult]:
+    project_dir = session.project_dir
+    context = session.resolve(timings)
+    project_config = context.project_config
+    resolved = context.profile
+    model = context.models_by_name.get(request.model)
     if model is None or model.search is None:
         raise SearchError(f"Search index '{request.model}' was not found")
-    with timings.phase("compile"):
-        resolved = resolve_profile(
-            project_config,
-            project_dir,
-            target=target,
-            profiles_dir=profiles_dir,
-        )
-        validate_retrieval_capabilities([model], project_config, resolved)
+    validate_retrieval_capabilities([model], project_config, resolved)
     search_config = model.search
     if resolved.retrieval is None:
         raise SearchError("The active profile has no retrieval configuration")
@@ -310,13 +470,18 @@ def search(
         raise SearchError(
             f"Search index '{model.name}' does not allow {request.mode.value} queries"
         )
-    store = create_store(
-        store_config,
-        project_name=project_config.name,
-        target_name=resolved.target_name,
-        alias=alias,
-        # Querying: ANN latency depends on the index staying resident.
-        role=StoreRole.SERVE,
+    # Querying: ANN latency depends on the index staying resident, which is
+    # what the session's held-open store actually delivers (issue #523).
+    store = session.store(
+        alias,
+        lambda: create_store(
+            store_config,
+            project_name=project_config.name,
+            target_name=resolved.target_name,
+            alias=alias,
+            role=StoreRole.SERVE,
+        ),
+        timings,
     )
     _validate_capabilities(
         model,
@@ -340,7 +505,7 @@ def search(
         policy_predicates = ()
     predicates = policy_predicates + _resolve_predicates(model, request.filters)
     included_fields = _resolve_result_fields(model, request.fields)
-    models_by_name = {item.name: item for item in models}
+    models_by_name = context.models_by_name
     embedding_options = _search_embedding_options(
         model,
         models_by_name,
@@ -408,9 +573,7 @@ def search(
                     lease.pinned_collection
                     or store.physical_collection(logical_collection)
                 )
-                opening = perf_counter()
-                with store:
-                    timings.add("store_open", perf_counter() - opening)
+                with session.store_guard(alias):
                     with timings.phase("inspect"):
                         metadata = store.inspect_collection(physical_collection)
                     if metadata is None:
@@ -447,6 +610,12 @@ def search(
     except SearchError:
         raise
     except (AdapterError, RetrievalError) as error:
+        # A cached store that has failed stays failed, and every later query
+        # on this session would inherit it -- so drop it and let the next one
+        # reopen (issue #523). AdapterError is a warehouse failure, not a
+        # store one, and leaves the store cached.
+        if isinstance(error, RetrievalError):
+            session.discard_store(alias)
         raise SearchError(str(error)) from None
 
     vector_config = effective_config.get("vector")

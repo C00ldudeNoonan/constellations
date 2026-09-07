@@ -141,10 +141,27 @@ class ServingCoordinator:
     and dies with the scope it describes.
     """
 
-    def __init__(self, adapter: WarehouseAdapter) -> None:
+    def __init__(self, adapter: WarehouseAdapter, *, ensure_schema: bool) -> None:
+        """`ensure_schema` False skips creating the ledger and lease tables.
+
+        Required rather than defaulted (issue #535): the query path builds a
+        coordinator per request, and each construction was two `CREATE TABLE
+        IF NOT EXISTS` jobs plus a column probe -- ~1.7s per query on
+        BigQuery, spent on tables the previous query had just read. Whether a
+        caller is the first to touch this schema is something only the caller
+        knows, and a default would quietly pick one answer for all five call
+        sites.
+
+        Pass True whenever the schema may not exist yet: every publish and
+        administrative path, and the first query of a serving session. A
+        served query that skips it and finds no ledger still reports "has not
+        been published" from the read below, because a scope with no ledger
+        row and a scope with no ledger table are the same answer to a reader.
+        """
         self._adapter = adapter
-        self._ensure_tables()
-        self._ensure_ledger_columns()
+        if ensure_schema:
+            self._ensure_tables()
+            self._ensure_ledger_columns()
 
     # ─── table management ─────────────────────────────────────────────────
 
@@ -356,6 +373,51 @@ class ServingCoordinator:
                 "run `stel serving recover` after terminating all publishers"
             )
         return rows[0]
+
+    def _read_row_and_lease(
+        self, lease: QueryLease
+    ) -> tuple[tuple[Any, ...] | None, bool]:
+        """The scope's ledger row plus whether this exact pin is still held.
+
+        One statement rather than two (issue #535). The correlated subquery
+        counts the caller's own lease row under the full identity the pin was
+        issued with, so a lease that was released, fenced out or re-issued
+        under a different generation reads as not held -- the same predicate
+        the separate query used.
+        """
+        rows = self._adapter.rows(
+            f"""
+            SELECT fencing_token, status, publication_id, expected_code_version,
+                   config_fingerprint, active_generation, safe_error_code,
+                   rows_inserted, rows_updated, rows_skipped, rows_deleted,
+                   active_collection,
+                   (
+                       SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
+                       WHERE model_name = ? AND stage = ? AND target_identity = ?
+                         AND lease_id = ? AND fencing_token = ?
+                         AND pinned_generation = ? AND config_fingerprint = ?
+                   )
+            FROM {self._ref(LEDGER_TABLE)}
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+            """,
+            [
+                *self._scope_params(lease.scope),
+                lease.lease_id,
+                lease.fencing_token,
+                lease.pinned_generation,
+                lease.config_fingerprint,
+                *self._scope_params(lease.scope),
+            ],
+        )
+        if not rows:
+            return None, False
+        if len(rows) > 1:
+            raise ServingCoordinationError(
+                "Serving ledger holds conflicting rows for one scope; "
+                "run `stel serving recover` after terminating all publishers"
+            )
+        row = rows[0]
+        return row[:-1], bool(row[-1])
 
     def _lease_count(self, scope: StateScope) -> int:
         rows = self._adapter.rows(
@@ -791,21 +853,16 @@ class ServingCoordinator:
         In-place publishers cannot acquire while any pin exists. Private
         publishers never mutate pinned collections, and retirement waits for
         all pins to drain. Recovery deletes pins, fencing out zombie readers.
+
+        The ledger read and the held-check travel in one statement (issue
+        #535). They were two, and on BigQuery a statement is a query job with
+        a floor near a second regardless of what it reads -- one job carrying
+        both facts measured at 0.85s against 0.81s + 0.81s for the pair. The
+        facts are the same and so is the verdict below; only the round trip
+        is gone. Reading both at one timestamp is also marginally stronger
+        than reading them at two.
         """
-        row = self._read_row(lease.scope)
-        held = self._adapter.rows(
-            f"""SELECT 1 FROM {self._ref(LEASE_TABLE)}
-                WHERE model_name = ? AND stage = ? AND target_identity = ?
-                  AND lease_id = ? AND fencing_token = ?
-                  AND pinned_generation = ? AND config_fingerprint = ?""",
-            [
-                *self._scope_params(lease.scope),
-                lease.lease_id,
-                lease.fencing_token,
-                lease.pinned_generation,
-                lease.config_fingerprint,
-            ],
-        )
+        row, held = self._read_row_and_lease(lease)
         if (
             row is None
             or not held

@@ -43,6 +43,7 @@ from .freshness import check_freshness
 from .logging_setup import configure_verbose_logging, resolve_verbosity
 from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
+from .orphans import find_orphans, format_orphans
 from .paths import resolve_within_project
 from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
 from .profile import (
@@ -797,6 +798,15 @@ class _ResourceListRow(TypedDict):
     show_default=True,
     help="Output format.",
 )
+@click.option(
+    "--orphans",
+    is_flag=True,
+    help=(
+        "List warehouse tables and state scopes in the target schema that no "
+        "model in this project claims (a renamed model, a dropped for_each "
+        "variant). Read-only; connects to the warehouse."
+    ),
+)
 @_project_context_options
 @click.pass_context
 def ls(
@@ -805,9 +815,17 @@ def ls(
     exclude: str | None,
     resource_type: str,
     output: str,
+    orphans: bool,
 ) -> None:
     """List project resources (models/sources) matching a selector."""
     project_dir: Path = ctx.obj["project_dir"]
+    if orphans:
+        if select is not None or exclude is not None:
+            raise click.UsageError(
+                "--orphans lists what no model claims; --select/--exclude do not apply."
+            )
+        _ls_orphans(ctx, project_dir, output=output)
+        return
     _, sources, models = _load(project_dir)
     dag = _build_dag(sources, models)
     models_by_name = {m.name: m for m in models}
@@ -854,6 +872,22 @@ def ls(
     for row in rows:
         tags = ",".join(row["tags"]) if row["tags"] else "-"
         click.echo(f"{row['name']:<24}{row['resource_type']:<10}{row['kind']:<12}{tags}")
+
+
+def _ls_orphans(ctx: click.Context, project_dir: Path, *, output: str) -> None:
+    try:
+        report = find_orphans(
+            project_dir,
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+        )
+    except _CONFIG_ERRORS as e:
+        raise ConfigClickError(str(e)) from e
+    if output == "json":
+        click.echo(json.dumps(report.to_dict(), indent=2))
+        return
+    for line in format_orphans(report):
+        click.echo(line)
 
 
 def _model_kind(model: ModelConfig) -> str:

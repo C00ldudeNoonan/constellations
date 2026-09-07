@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Experiments have a convention, and what they leave behind has a listing (issue #531)
+
+- **Trying a variant of one step had no documented shape, and finishing one
+  left tables and state nobody could see.** Editing the serving model in place
+  re-keys its state; `for_each` was documented as a matrix, not as the way to
+  run an A/B beside production; and a renamed model, a dropped variant, or a
+  deleted model file orphaned its table and its `stel_state` scope with nothing
+  listing them.
+- The reference now documents the pattern under `for_each`: one axis on the
+  step under test, the same axis on the models below it referencing their own
+  variant, `tag:<base>+` to run the branches side by side, `stel plan` to
+  confirm the serving variant is untouched, and `stel eval` on the same golden
+  set. Plus the target-per-experiment shape for a change that must re-key the
+  serving model, and what to do when the experiment ends.
+- `stel ls --orphans` lists every table in the target schema and every
+  `stel_state` scope no model in the project claims, with row counts and each
+  scope's stage, distinct code versions, and last activity. Read-only. Deleting
+  stays an explicit act outside stel, per the cleanup invariant. `--output json`
+  is the machine form.
+- `WarehouseAdapter.list_state_scopes()` is the read behind it, one aggregate
+  query implemented once in the base adapter over the portable state SQL.
 ### `search_context` takes a `candidate_limit`, like the CLI always has (issue #525)
 
 `stel search` exposes `--candidate-limit` — how many candidates each retrieval

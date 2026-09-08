@@ -1406,61 +1406,83 @@ class DuckDBAdapter(WarehouseAdapter):
         validate_state_keys(record_keys)
         self._delete_state_rows(scope, record_keys)
 
-    def _upsert_state_rows(
+    def _state_frame(
         self, scope: StateScope, records: Sequence[StateRecord]
+    ) -> pl.DataFrame:
+        """One window of state records as a frame, for a set-based write."""
+        return pl.DataFrame(
+            {
+                "model_name": [scope.model_name] * len(records),
+                "state_scope": [scope.stage] * len(records),
+                "target_identity": [scope.target_identity] * len(records),
+                "record_key": [record.record_key for record in records],
+                "input_fingerprint": [record.input_fingerprint for record in records],
+                "code_version": [record.code_version for record in records],
+            },
+            schema={
+                "model_name": pl.String,
+                "state_scope": pl.String,
+                "target_identity": pl.String,
+                "record_key": pl.String,
+                "input_fingerprint": pl.String,
+                "code_version": pl.String,
+            },
+        )
+
+    def _write_state_rows(
+        self, scope: StateScope, records: Sequence[StateRecord], *, on_conflict: str
     ) -> None:
-        self.connection.executemany(
-            f"""
-            INSERT INTO {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} (
-                model_name, state_scope, target_identity, record_key,
-                input_fingerprint, code_version, last_run_at
+        """Insert one window of state rows in a single statement.
+
+        This used to be `executemany`, which DuckDB runs as one execution per
+        parameter set — and the engine is columnar, so per-row execution is the
+        one shape it is worst at. Measured on this adapter: a 100-record window
+        cost 1.24s and a 2000-record window 42.2s, degrading per row as the
+        window grew, against 0.008s and 0.022s for the same rows bound as a
+        frame. Advancing state was ~60% of a local embed run and is now
+        immaterial. BigQuery never had this: its state writes are already one
+        MERGE.
+        """
+        if not records:
+            return
+        self.connection.register("stel_state_rows", self._state_frame(scope, records))
+        try:
+            self.connection.execute(
+                f"""
+                INSERT INTO {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} (
+                    model_name, state_scope, target_identity, record_key,
+                    input_fingerprint, code_version, last_run_at
+                )
+                SELECT
+                    model_name, state_scope, target_identity, record_key,
+                    input_fingerprint, code_version, current_timestamp
+                FROM stel_state_rows
+                {on_conflict}
+                """
             )
-            VALUES (?, ?, ?, ?, ?, ?, current_timestamp)
+        finally:
+            self.connection.unregister("stel_state_rows")
+
+    _STATE_ON_CONFLICT = """
             ON CONFLICT (
                 model_name, state_scope, target_identity, record_key
             ) DO UPDATE SET
                 input_fingerprint = excluded.input_fingerprint,
                 code_version = excluded.code_version,
                 last_run_at  = excluded.last_run_at
-            """,
-            [
-                [
-                    scope.model_name,
-                    scope.stage,
-                    scope.target_identity,
-                    record.record_key,
-                    record.input_fingerprint,
-                    record.code_version,
-                ]
-                for record in records
-            ],
-        )
+    """
+
+    def _upsert_state_rows(
+        self, scope: StateScope, records: Sequence[StateRecord]
+    ) -> None:
+        self._write_state_rows(scope, records, on_conflict=self._STATE_ON_CONFLICT)
 
     def _insert_state_rows(
         self, scope: StateScope, records: Sequence[StateRecord]
     ) -> None:
-        if not records:
-            return
-        self.connection.executemany(
-            f"""
-            INSERT INTO {self.schema_ref}.{self.quote_ident(_STATE_TABLE)} (
-                model_name, state_scope, target_identity, record_key,
-                input_fingerprint, code_version, last_run_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, current_timestamp)
-            """,
-            [
-                [
-                    scope.model_name,
-                    scope.stage,
-                    scope.target_identity,
-                    record.record_key,
-                    record.input_fingerprint,
-                    record.code_version,
-                ]
-                for record in records
-            ],
-        )
+        # `replace_state` clears the scope first, so there is nothing to
+        # conflict with and the plain insert is correct here.
+        self._write_state_rows(scope, records, on_conflict="")
 
     def _clear_state_rows(self, scope: StateScope) -> None:
         self.connection.execute(

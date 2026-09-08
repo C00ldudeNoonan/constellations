@@ -4370,8 +4370,9 @@ run that hit it.
 **`mcp_query_log`** (issues #329, #528) — one row per served `search_context`
 call: `logged_at`, `request_id`, `client_name`, `client_version`, `transport`,
 `principal_id`, `tenant_id`, `model_name`, `mode`, `query_fingerprint`,
-`requested_limit`, `result_count`, `zero_results`, `returned_chunk_ids`,
-`top_score`, `elapsed_ms`. Written **after** authorization and policy
+`requested_limit`, `candidate_limit`, `filters`, `result_count`,
+`zero_results`, `returned_chunk_ids`, `top_score`, `served_generation`,
+`phase_ms`, `elapsed_ms`, `error_code`. Written **after** authorization and policy
 filtering, so a row reflects what the caller was allowed to see — a log of
 pre-filter hits would leak the existence of documents the principal cannot
 read — and a denied request logs nothing.
@@ -4385,6 +4386,36 @@ and are the only way to tell which client is querying an index: a desktop chat
 client and a coding agent reach the same server over the same transport, and
 neither writes a record the server can read. Both are null when a client sends
 no `clientInfo`, as the protocol permits.
+
+`phase_ms` is the same breakdown `stel search -v` prints, as JSON
+milliseconds, per request rather than per run: `compile`, `warehouse_connect`,
+`lease`, `embed`, `store_open`, `inspect`, the searches, and `fuse`. Phase
+names and durations only — no query text and no row values, the same content
+already considered safe to log at INFO. `filters` records the *user* filters
+of the request, never the policy filters: those are the authorization context
+the service computed, and logging them would record the shape of a tenant
+boundary beside the principal it applies to. It records each filter's **field
+and operator, and its value only under `capture_query_text`** — a filter value
+is user-authored content exactly as a query is (`email eq
+alice@example.com` is a person's address written by a caller), so it follows
+the same opt-in. Field and operator are not: they name the index's own
+declared attributes, already public in the catalog, and they are what answers
+"how often do agents filter, and on which fields". `served_generation` names the
+index build that answered, so latency and recall attach to a generation rather
+than to a model name that outlives it.
+
+`error_code` is null on a served answer and carries the contract code on a
+refused one — a timeout, a size cap, an internal failure. A search that
+succeeded and was then refused for exceeding `max_response_bytes` keeps its
+row, stamped with the code: what the query did is the useful half of a
+size-cap failure. `zero_results` is null on any row carrying an `error_code`,
+because a refusal is not a question the index could not answer, and counting
+one as such would inflate the very rate a chunking or recall decision rests
+on. **Two codes are
+never logged**: `missing_principal` and `not_found_or_denied`. Logging happens
+after authorization, so a request refused there leaves no row at all and the
+log cannot be used to probe which models exist. Every code that *is* logged
+describes what the server did rather than what the caller was allowed to see.
 
 **Rows are batched off the request path.** A served query hands its row to an
 in-process buffer and returns; a background thread writes whole batches,

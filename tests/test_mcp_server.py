@@ -44,6 +44,7 @@ from stel.search import (
     SearchRequest,
     SearchResult,
 )
+from stel.timing import PhaseTimings
 
 DOC_ALLOWED = "a" * 32
 VERSION_ALLOWED = "b" * 32
@@ -119,9 +120,14 @@ class FakeSearch(ContextSearch):
         request: SearchRequest,
         *,
         policy_filters: Sequence[SearchFilter],
+        timings: PhaseTimings | None = None,
     ) -> Sequence[SearchResult]:
         self.request = request
         self.policy_filters = tuple(policy_filters)
+        if timings is not None:
+            # A real query records phases; the double records one, so a row
+            # built from it still exercises the `phase_ms` column.
+            timings.add("text_search", 0.25)
         return (
             _hit(
                 CONTEXT_ALLOWED_1,
@@ -464,6 +470,7 @@ def _hit(
             store_type="fake",
             logical_collection="context_search",
             physical_collection="context_search__generation",
+            generation="g-test",
             upstream="model.context_demo.context_embeddings",
             embedding=None,
         ),
@@ -476,8 +483,9 @@ def _service(
     settings: ContextServerSettings | None = None,
     repository: FakeRepository | None = None,
     hit_metadata: Mapping[str, Any] | None = None,
+    search: FakeSearch | None = None,
 ) -> tuple[ContextService, FakeSearch]:
-    fake_search = FakeSearch(hit_metadata)
+    fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
         catalog=_artifact_catalog(),
         repository=repository or FakeRepository(_fixture_rows()),
@@ -856,8 +864,9 @@ class EmptySearch(FakeSearch):
         request: SearchRequest,
         *,
         policy_filters: Sequence[SearchFilter],
+        timings: PhaseTimings | None = None,
     ) -> Sequence[SearchResult]:
-        del request, policy_filters
+        del request, policy_filters, timings
         return ()
 
 
@@ -1604,3 +1613,209 @@ def test_a_steady_trickle_of_queries_still_flushes_on_the_interval() -> None:
         buffer.close(timeout_seconds=5)
 
     assert flushed_while_running, "a steady trickle never flushed within 3s"
+
+
+def test_the_log_row_carries_the_request_and_where_its_time_went() -> None:
+    """`phase_ms`, `filters` and `candidate_limit` per request (issue #528).
+
+    #519 got a phase breakdown behind `stel search -v`; a served query had no
+    equivalent, so latency could only ever be discussed as an anecdote. The
+    filters and candidate limit are the evidence #525 rests on — how often
+    agents actually filter is not reconstructable from the results.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search",
+                query="inflation and employment",
+                mode="text",
+                candidate_limit=200,
+                filters=(
+                    BusinessFilter(
+                        field="category",
+                        operator=FilterOperator.EQUAL,
+                        value="macro",
+                    ),
+                ),
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    row = repository.logged[0]
+    assert row["candidate_limit"] == 200
+    # Field and operator, no value: a filter value is user-authored content
+    # exactly as a query is, so it follows `capture_query_text` (Codex review).
+    assert json.loads(row["filters"]) == [{"field": "category", "operator": "eq"}]
+    # Milliseconds, not seconds: the column is named for the unit it holds.
+    assert json.loads(row["phase_ms"]) == {"text_search": 250.0}
+    assert row["served_generation"] == "g-test"
+    assert row["error_code"] is None
+
+
+def test_an_unfiltered_query_records_no_filters() -> None:
+    """Null rather than an empty list, so `filters IS NOT NULL` is the whole
+    query for "did this caller filter"."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    row = repository.logged[0]
+    assert row["filters"] is None
+    assert row["candidate_limit"] is None
+
+
+def test_an_operational_failure_is_logged_with_its_code() -> None:
+    """A refused request used to log nothing, so the log was silent about
+    exactly the traffic an operator most wants to see (issue #528)."""
+
+    class SlowSearch(FakeSearch):
+        def execute(
+            self,
+            request: SearchRequest,
+            *,
+            policy_filters: Sequence[SearchFilter],
+            timings: PhaseTimings | None = None,
+        ) -> Sequence[SearchResult]:
+            del request, policy_filters, timings
+            time.sleep(0.3)
+            return ()
+
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        search=SlowSearch(),
+        settings=ContextServerSettings(timeout_seconds=0.05),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.TIMEOUT
+    row = repository.logged[0]
+    assert row["error_code"] == "timeout"
+    assert row["result_count"] == 0
+    # Null, not True: a timeout is not a question the index could not answer,
+    # and counting it as one would inflate the retrieval-quality signal.
+    assert row["zero_results"] is None
+    # No authorization happened for this row, and it does not pretend one did.
+    assert row["principal_id"] is None
+    assert row["served_generation"] is None
+    assert set(QUERY_LOG_SCHEMA) >= set(row)
+
+
+def test_an_authorization_refusal_still_logs_nothing() -> None:
+    """The one guarantee the error rows must not erode.
+
+    `test_a_denied_request_logs_nothing` states it: logging happens after
+    authorization, so a refused request leaves no row and cannot be used to
+    probe which models exist. Every other code describes what the server did
+    -- a deadline, a size cap, a failure -- and discloses nothing about what
+    the caller was allowed to see.
+    """
+    service, _ = _service(
+        principal=Principal("intruder", tenant_id="other"),
+        repository=(repository := FakeRepository(_fixture_rows())),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(model="context_search", query="x", mode="text")
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.NOT_FOUND_OR_DENIED
+    assert repository.logged == []
+
+
+def test_filter_values_follow_the_query_text_opt_in() -> None:
+    """A filter value is user-authored content, exactly as a query is.
+
+    `email eq alice@example.com` is a person's address written by a caller,
+    and serializing it into a durable log would carry it past the opt-in that
+    exists to govern precisely that (Codex review, #528). Field and operator
+    are not user-authored — they name the index's own declared attributes,
+    already public in the catalog — and they are what the evidence needs.
+    """
+    request = SearchContextRequest(
+        model="context_search",
+        query="inflation and employment",
+        mode="text",
+        filters=(
+            BusinessFilter(
+                field="category", operator=FilterOperator.EQUAL, value="macro"
+            ),
+        ),
+    )
+
+    private = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=private)
+    try:
+        service.search_context(request)
+    finally:
+        service.close()
+    assert json.loads(private.logged[0]["filters"]) == [
+        {"field": "category", "operator": "eq"}
+    ]
+
+    opted_in = FakeRepository(_fixture_rows(), capture_query_text=True)
+    service, _ = _service(repository=opted_in)
+    try:
+        service.search_context(request)
+    finally:
+        service.close()
+    assert json.loads(opted_in.logged[0]["filters"]) == [
+        {"field": "category", "operator": "eq", "value": "macro"}
+    ]
+
+
+def test_a_response_refused_for_size_is_not_logged_as_a_served_answer() -> None:
+    """The search succeeded and the serialized response was then refused.
+
+    The row is built inside the guarded operation, so it already existed and
+    read as a served answer while the caller got `response_limit` (Codex
+    review, #528). It is stamped rather than replaced: what the query did is
+    the useful half of a size-cap failure.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        # Smaller than any real response, so serialization always overruns.
+        settings=ContextServerSettings(max_response_bytes=1024),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.RESPONSE_LIMIT
+    assert len(repository.logged) == 1
+    row = repository.logged[0]
+    assert row["error_code"] == "response_limit"
+    # The search really ran, and what it did is worth keeping.
+    assert row["result_count"] == 1
+    assert row["phase_ms"] is not None
+    # But it is not a zero-result query, and not a served answer.
+    assert row["zero_results"] is None

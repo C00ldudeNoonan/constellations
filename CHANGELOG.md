@@ -17,6 +17,7 @@
   never re-scanned. The `pip` alert on the same stale paths has no fixed
   release; the root lock already holds the newest pip, a dev-only transitive
   of pip-audit.
+
 ### DuckDB advances state in one statement per window, not one per row (issue #549)
 
 The DuckDB adapter wrote incremental state with `executemany`, which DuckDB

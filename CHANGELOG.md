@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Dependencies
+
+- `pypdf` floor raised from 6.16.1 to 6.18.0 (the `pdf` extra), picking up
+  the two security fixes since: a limit on Roman-numeral values (6.17.0) and
+  on indirect-object token length (6.18.0), both crafted-document hardening.
+  The three Dependabot alerts that prompted the look (a possible infinite
+  loop in `TreeObject.insert_child`, long runtimes retrieving outlines and
+  extracting XForm objects) were fixed in 6.16.0 and 6.16.1, which the lock
+  has carried since #446; the alerts name `stel/uv.lock` and
+  `dbt-ml/uv.lock`, manifest paths that ended with #320 and that Dependabot
+  never re-scanned. The `pip` alert on the same stale paths has no fixed
+  release; the root lock already holds the newest pip, a dev-only transitive
+  of pip-audit.
+
 ### The MCP server holds its warehouse connection across requests (issue #523)
 
 - **A served query opened the warehouse three or more times.** Once for its

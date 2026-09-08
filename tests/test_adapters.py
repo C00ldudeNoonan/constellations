@@ -1220,3 +1220,71 @@ def test_a_relative_temp_directory_resolves_against_the_project(tmp_path: Path) 
     assert config.temp_directory == (project / "target" / "spill").resolve()
     with create_adapter(config) as adapter:
         assert _duckdb_setting(adapter, "temp_directory") == str(config.temp_directory)
+
+
+# ─── state writes are set-based, not row-by-row (issue #432) ───────────────
+
+
+def test_a_whole_window_of_state_upserts_in_one_statement(tmp_path: Path) -> None:
+    """The window sizes this actually runs at. `executemany` ran one execution
+    per record, which a columnar engine is worst at: a 2000-record window —
+    the default `flush_every` — measured 42s against 0.02s for the same rows
+    bound as a frame. Correctness is what is pinned here; the size is chosen
+    so the path under test is the one production uses."""
+    window = [_state(f"doc-{index}", f"hash-{index}", "v1") for index in range(2000)]
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.upsert_state(_scope(), window)
+        stored = adapter.fetch_state(_scope())
+
+    assert len(stored) == 2000
+    assert stored["doc-0"] == StateValue("hash-0", "v1")
+    assert stored["doc-1999"] == StateValue("hash-1999", "v1")
+
+
+def test_a_window_updates_the_rows_it_repeats_and_inserts_the_rest(
+    tmp_path: Path,
+) -> None:
+    """The ON CONFLICT half. A resumed or re-run window overlaps what is
+    already recorded, and those rows must move to the new fingerprint rather
+    than being duplicated or left behind."""
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.upsert_state(
+            _scope(), [_state("a", "old", "v1"), _state("b", "old", "v1")]
+        )
+        adapter.upsert_state(
+            _scope(), [_state("b", "new", "v2"), _state("c", "new", "v2")]
+        )
+        stored = adapter.fetch_state(_scope())
+
+    assert stored == {
+        "a": StateValue("old", "v1"),
+        "b": StateValue("new", "v2"),
+        "c": StateValue("new", "v2"),
+    }
+
+
+def test_a_window_repeating_one_key_is_still_refused(tmp_path: Path) -> None:
+    """The invariant the set-based write depends on. One statement cannot
+    update the same row twice, where one execution per record could. The
+    refusal predates this and has to keep holding, or the failure moves from
+    a named error into the engine."""
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        with pytest.raises(AdapterError, match="duplicate record_key"):
+            adapter.upsert_state(
+                _scope(), [_state("doc-1", "a", "v1"), _state("doc-1", "b", "v1")]
+            )
+
+
+def test_replace_state_writes_a_whole_window_after_clearing(tmp_path: Path) -> None:
+    """`replace_state` clears the scope first, so its insert has nothing to
+    conflict with — the reason that path carries no ON CONFLICT clause."""
+    with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
+        adapter.upsert_state(_scope(), [_state("stale", "old", "v1")])
+        adapter.replace_state(
+            _scope(), [_state(f"doc-{index}", "fresh", "v2") for index in range(500)]
+        )
+        stored = adapter.fetch_state(_scope())
+
+    assert "stale" not in stored
+    assert len(stored) == 500
+    assert stored["doc-0"] == StateValue("fresh", "v2")

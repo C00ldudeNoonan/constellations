@@ -4353,6 +4353,8 @@ my_project:
         enabled: true
         relation: stel_mcp_query_log  # default
         capture_query_text: false     # default — see below
+        flush_max_rows: 100           # default
+        flush_interval_seconds: 5.0   # default
 ```
 
 **`run_log`** (issue #306) — one row per model per invocation: `invocation_id`,
@@ -4365,17 +4367,69 @@ meters, not a second meter. A `status: budget_exceeded` row makes a tripped
 budget visible after the fact rather than only in the terminal output of the
 run that hit it.
 
-**`mcp_query_log`** (issue #329) — one row per served `search_context` call:
-`logged_at`, `principal_id`, `tenant_id`, `model_name`, `mode`,
-`query_fingerprint`, `requested_limit`, `result_count`, `zero_results`,
-`returned_chunk_ids`, `top_score`, `elapsed_ms`. Written **after**
-authorization and policy filtering, so a row reflects what the caller was
-allowed to see — a log of pre-filter hits would leak the existence of
-documents the principal cannot read — and a denied request logs nothing.
+**`mcp_query_log`** (issues #329, #528) — one row per served `search_context`
+call: `logged_at`, `request_id`, `client_name`, `client_version`, `transport`,
+`principal_id`, `tenant_id`, `model_name`, `mode`, `query_fingerprint`,
+`requested_limit`, `candidate_limit`, `filters`, `result_count`,
+`zero_results`, `returned_chunk_ids`, `top_score`, `served_generation`,
+`phase_ms`, `elapsed_ms`, `error_code`. Written **after** authorization and policy
+filtering, so a row reflects what the caller was allowed to see — a log of
+pre-filter hits would leak the existence of documents the principal cannot
+read — and a denied request logs nothing.
 
 `zero_results` is the cheapest retrieval-quality signal there is: a question
 the index cannot answer is what a chunking or metadata gap looks like from
 outside, so it is a column rather than something to reconstruct.
+
+`client_name` and `client_version` come from the MCP `initialize` handshake,
+and are the only way to tell which client is querying an index: a desktop chat
+client and a coding agent reach the same server over the same transport, and
+neither writes a record the server can read. Both are null when a client sends
+no `clientInfo`, as the protocol permits.
+
+`phase_ms` is the same breakdown `stel search -v` prints, as JSON
+milliseconds, per request rather than per run: `compile`, `warehouse_connect`,
+`lease`, `embed`, `store_open`, `inspect`, the searches, and `fuse`. Phase
+names and durations only — no query text and no row values, the same content
+already considered safe to log at INFO. `filters` records the *user* filters
+of the request, never the policy filters: those are the authorization context
+the service computed, and logging them would record the shape of a tenant
+boundary beside the principal it applies to. It records each filter's **field
+and operator, and its value only under `capture_query_text`** — a filter value
+is user-authored content exactly as a query is (`email eq
+alice@example.com` is a person's address written by a caller), so it follows
+the same opt-in. Field and operator are not: they name the index's own
+declared attributes, already public in the catalog, and they are what answers
+"how often do agents filter, and on which fields". `served_generation` names the
+index build that answered, so latency and recall attach to a generation rather
+than to a model name that outlives it.
+
+`error_code` is null on a served answer and carries the contract code on a
+refused one — a timeout, a size cap, an internal failure. A search that
+succeeded and was then refused for exceeding `max_response_bytes` keeps its
+row, stamped with the code: what the query did is the useful half of a
+size-cap failure. `zero_results` is null on any row carrying an `error_code`,
+because a refusal is not a question the index could not answer, and counting
+one as such would inflate the very rate a chunking or recall decision rests
+on. **Two codes are
+never logged**: `missing_principal` and `not_found_or_denied`. Logging happens
+after authorization, so a request refused there leaves no row at all and the
+log cannot be used to probe which models exist. Every code that *is* logged
+describes what the server did rather than what the caller was allowed to see.
+
+**Rows are batched off the request path.** A served query hands its row to an
+in-process buffer and returns; a background thread writes whole batches,
+flushing after `flush_max_rows` rows or `flush_interval_seconds`, whichever
+comes first, and again at shutdown. That matters more than it sounds: one
+append per query means one warehouse connection and one write job per query,
+which on BigQuery is seconds charged to the query that produced the row. The
+interval is what makes a quiet server's last query land rather than waiting
+for the next one.
+
+The buffer is bounded and **lossy under pressure**: if writes fall behind far
+enough to fill it, rows are dropped with a warning rather than queued without
+limit or pushed back onto the caller. A log line must never cost an answer,
+in failure or in latency.
 
 ### Two rules worth knowing
 
@@ -4383,8 +4437,9 @@ outside, so it is a column rather than something to reconstruct.
 that rejects one, a permission an operator forgot, a relation someone renamed
 — none of that turns a successful run into a failed one, or a served MCP
 answer into an error. Failures are a single warning naming the exception
-class. The query-log write also happens *outside* the MCP request deadline,
-so a stalled warehouse cannot spend a caller's timeout budget.
+class. The query-log write also happens *outside* the MCP request deadline —
+and, since #528, off the request path entirely — so a stalled warehouse can
+neither spend a caller's timeout budget nor slow a served answer.
 
 Both relations are created with **explicit column types** rather than types
 inferred from the first batch — otherwise a first run with no LLM model (or a

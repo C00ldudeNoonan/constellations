@@ -82,6 +82,14 @@ RUN_LOG_SCHEMA: dict[str, Any] = {
 
 QUERY_LOG_SCHEMA: dict[str, Any] = {
     "logged_at": pl.String,
+    # Request and client identity (issue #528). Nullable throughout: a direct
+    # service call has no MCP client, and an older client may send no
+    # `clientInfo`. BigQuery appends allow field addition, so a log written by
+    # an earlier stel widens rather than breaking on the first new write.
+    "request_id": pl.String,
+    "client_name": pl.String,
+    "client_version": pl.String,
+    "transport": pl.String,
     "principal_id": pl.String,
     "tenant_id": pl.String,
     "model_name": pl.String,
@@ -94,6 +102,18 @@ QUERY_LOG_SCHEMA: dict[str, Any] = {
     "returned_chunk_ids": pl.List(pl.String),
     "top_score": pl.Float64,
     "elapsed_ms": pl.Float64,
+    # The request as made, and where its time went (issue #528). `filters`
+    # and `phase_ms` are JSON strings rather than nested types: both are
+    # open-ended shapes, and a log that outlives the release which wrote it
+    # should not need a schema migration to record one more phase.
+    "candidate_limit": pl.Int64,
+    "filters": pl.String,
+    "phase_ms": pl.String,
+    "served_generation": pl.String,
+    # Null on a served answer; the contract code on a refused one. A refused
+    # request used to log nothing at all, which made the log silent about
+    # exactly the traffic an operator most wants to see.
+    "error_code": pl.String,
 }
 
 

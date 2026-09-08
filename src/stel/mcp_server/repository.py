@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from threading import Lock
 from typing import Any, Protocol
 
+from ..adapters import create_adapter
 from ..adapters.base import AdapterError, ReadPredicate
 from ..append_log import QUERY_LOG_SCHEMA, write_rows
 from ..search import SearchSession
+from .query_log import BufferedQueryLog
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +52,14 @@ class ContextRepository(Protocol):
         """
         return None
 
+    def close(self) -> None:
+        """Flush anything buffered and release resources (issue #528).
+
+        A default no-op, for the same reason as `warm_up`: a repository that
+        buffers nothing has nothing to flush.
+        """
+        return None
+
 
 class WarehouseContextRepository:
     """Warehouse reads for the MCP service, through the serving session.
@@ -64,6 +75,8 @@ class WarehouseContextRepository:
         # Resolved now, not on first request: a bad profile should fail the
         # service's construction, before a transport starts.
         self._resolved = session.resolve(None).profile
+        self._query_log_lock = Lock()
+        self._query_log_buffer: BufferedQueryLog | None = None
 
     def query_log_captures_text(self) -> bool:
         config = self._resolved.mcp_query_log
@@ -82,35 +95,75 @@ class WarehouseContextRepository:
             pass
 
     def log_query(self, row: Mapping[str, Any]) -> None:
-        """Append a served query to the log, if this target enabled one.
+        """Queue a served query for the log, if this target enabled one.
+
+        Returns as soon as the row is buffered (issue #528). #523 took the
+        per-query *connect* out of this path by sharing the session's
+        warehouse; the append itself was still one write per query, inline
+        before the response returned, and on BigQuery a write is a Parquet
+        load job. Batching removes the rest.
 
         Best-effort by contract (see `append_log`): serving an answer must
-        never fail because its log line could not be written.
+        never fail, or wait, because its log line could not be written.
+        """
+        config = self._resolved.mcp_query_log
+        if config is None or not config.enabled:
+            return
+        self._query_log().submit(row)
+
+    def _query_log(self) -> BufferedQueryLog:
+        """The buffer for this target, created on first use."""
+        config = self._resolved.mcp_query_log
+        assert config is not None
+        with self._query_log_lock:
+            if self._query_log_buffer is None:
+                self._query_log_buffer = BufferedQueryLog(
+                    self._write_query_log_batch,
+                    max_rows_per_flush=config.flush_max_rows,
+                    flush_interval_seconds=config.flush_interval_seconds,
+                )
+            return self._query_log_buffer
+
+    def _write_query_log_batch(self, rows: list[Mapping[str, Any]]) -> None:
+        """Append one batch. Runs on the drain thread, so it never raises.
+
+        Opens its own adapter rather than borrowing the session's held
+        connection. The session guards that connection, so a batch written
+        through it would block whichever request wanted it next for the length
+        of a load job -- moving the cost off the logging call and onto an
+        unrelated query, which is the problem this is here to remove. One
+        connect per batch is the price of not contending, and a batch covers
+        many queries.
         """
         config = self._resolved.mcp_query_log
         if config is None or not config.enabled:
             return
         try:
-            with self._session.warehouse(None) as adapter:
-                written = write_rows(
+            with create_adapter(
+                self._resolved.warehouse,
+                project_dir=self._session.project_dir,
+            ) as adapter:
+                write_rows(
                     adapter,
                     config,
-                    [dict(row)],
+                    [dict(row) for row in rows],
                     schema=QUERY_LOG_SCHEMA,
                     what="the MCP query log",
                 )
-                if written < 1:
-                    # `write_rows` keeps its best-effort contract by swallowing
-                    # the adapter's error, so a broken held connection would
-                    # otherwise survive to fail the next request. Retiring it
-                    # costs one reconnect; keeping it costs a served answer.
-                    self._session.retire_warehouse(adapter)
         except Exception as error:
             log.warning(
                 "Could not open the warehouse to write the MCP query log [%s]; "
-                "the response is unaffected",
+                "%d row(s) discarded, responses unaffected",
                 type(error).__name__,
+                len(rows),
             )
+
+    def close(self) -> None:
+        """Flush any buffered query-log rows. Safe to call more than once."""
+        with self._query_log_lock:
+            buffer = self._query_log_buffer
+        if buffer is not None:
+            buffer.close()
 
     def read_rows(
         self,

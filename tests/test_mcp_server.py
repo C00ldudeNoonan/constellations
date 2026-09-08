@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ import pytest
 
 from stel.adapters.base import ReadPredicate, ReadPredicateOperator
 from stel.agent_context import AgentContextGrain, contract_descriptor
+from stel.append_log import QUERY_LOG_SCHEMA
 from stel.mcp_server.authorization import (
     ClaimAuthorizationProvider,
     PolicyAttribute,
@@ -42,6 +44,7 @@ from stel.search import (
     SearchRequest,
     SearchResult,
 )
+from stel.timing import PhaseTimings
 
 DOC_ALLOWED = "a" * 32
 VERSION_ALLOWED = "b" * 32
@@ -70,6 +73,7 @@ class FakeRepository:
         self.logged: list[Mapping[str, Any]] = []
         self._capture_query_text = capture_query_text
         self.warm_ups = 0
+        self.closes = 0
 
     def log_query(self, row: Mapping[str, Any]) -> None:
         self.logged.append(row)
@@ -79,6 +83,9 @@ class FakeRepository:
 
     def warm_up(self) -> None:
         self.warm_ups += 1
+
+    def close(self) -> None:
+        self.closes += 1
 
     def read_rows(
         self,
@@ -113,9 +120,14 @@ class FakeSearch(ContextSearch):
         request: SearchRequest,
         *,
         policy_filters: Sequence[SearchFilter],
+        timings: PhaseTimings | None = None,
     ) -> Sequence[SearchResult]:
         self.request = request
         self.policy_filters = tuple(policy_filters)
+        if timings is not None:
+            # A real query records phases; the double records one, so a row
+            # built from it still exercises the `phase_ms` column.
+            timings.add("text_search", 0.25)
         return (
             _hit(
                 CONTEXT_ALLOWED_1,
@@ -458,6 +470,7 @@ def _hit(
             store_type="fake",
             logical_collection="context_search",
             physical_collection="context_search__generation",
+            generation="g-test",
             upstream="model.context_demo.context_embeddings",
             embedding=None,
         ),
@@ -470,8 +483,9 @@ def _service(
     settings: ContextServerSettings | None = None,
     repository: FakeRepository | None = None,
     hit_metadata: Mapping[str, Any] | None = None,
+    search: FakeSearch | None = None,
 ) -> tuple[ContextService, FakeSearch]:
-    fake_search = FakeSearch(hit_metadata)
+    fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
         catalog=_artifact_catalog(),
         repository=repository or FakeRepository(_fixture_rows()),
@@ -850,8 +864,9 @@ class EmptySearch(FakeSearch):
         request: SearchRequest,
         *,
         policy_filters: Sequence[SearchFilter],
+        timings: PhaseTimings | None = None,
     ) -> Sequence[SearchResult]:
-        del request, policy_filters
+        del request, policy_filters, timings
         return ()
 
 
@@ -1394,3 +1409,413 @@ async def test_the_tool_schema_offers_candidate_limit_to_callers() -> None:
             assert "candidate_limit" in search_tool.inputSchema["properties"]
     finally:
         service.close()
+
+
+def test_a_served_query_does_not_wait_for_its_own_log_write() -> None:
+    """The log write is batched onto a background thread (issue #528).
+
+    It used to open a warehouse connection and append one row per query. On
+    BigQuery that is a connect plus a Parquet load job -- seconds, charged to
+    the query that produced the row, on a path that had just been taken from
+    39.7s to 13.7s. `test_a_slow_log_write_cannot_time_out_a_served_answer`
+    proves the write is outside the *deadline*; this proves the caller does
+    not wait for it at all.
+    """
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    released = threading.Event()
+    written: list[Mapping[str, Any]] = []
+
+    def slow_write(rows: list[Mapping[str, Any]]) -> None:
+        released.wait(timeout=5)
+        written.extend(rows)
+
+    buffer = BufferedQueryLog(
+        slow_write, max_rows_per_flush=1, flush_interval_seconds=0.05
+    )
+    started = time.monotonic()
+    buffer.submit({"logged_at": "now"})
+    submit_seconds = time.monotonic() - started
+
+    # The writer is still blocked, so anything but a near-instant return means
+    # the caller is waiting on the warehouse.
+    assert submit_seconds < 0.1
+    assert written == []
+
+    released.set()
+    buffer.close(timeout_seconds=5)
+    assert len(written) == 1
+
+
+def test_a_full_query_log_queue_drops_rows_rather_than_blocking() -> None:
+    """A log line must never cost an answer, including in latency."""
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    release = threading.Event()
+
+    def blocked_write(rows: list[Mapping[str, Any]]) -> None:
+        release.wait(timeout=5)
+
+    buffer = BufferedQueryLog(
+        blocked_write,
+        max_rows_per_flush=1,
+        flush_interval_seconds=0.05,
+        max_pending=2,
+    )
+    try:
+        started = time.monotonic()
+        for index in range(50):
+            buffer.submit({"logged_at": str(index)})
+        assert time.monotonic() - started < 1.0
+        assert buffer.dropped_rows > 0
+    finally:
+        release.set()
+        buffer.close(timeout_seconds=5)
+
+
+def test_a_quiet_server_still_flushes_its_last_query() -> None:
+    """Batching by size alone would strand the final row of a quiet server."""
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    written: list[Mapping[str, Any]] = []
+
+    def record(rows: list[Mapping[str, Any]]) -> None:
+        written.extend(rows)
+
+    buffer = BufferedQueryLog(
+        record, max_rows_per_flush=100, flush_interval_seconds=0.05
+    )
+    try:
+        buffer.submit({"logged_at": "only-one"})
+        deadline = time.monotonic() + 5
+        while not written and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        buffer.close(timeout_seconds=5)
+
+    assert len(written) == 1
+
+
+def test_a_failing_log_writer_does_not_stop_later_batches() -> None:
+    """One bad batch must not silently end all logging for the process."""
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    seen: list[str] = []
+
+    def flaky_write(rows: list[Mapping[str, Any]]) -> None:
+        if any(row["logged_at"] == "boom" for row in rows):
+            raise RuntimeError("warehouse said no")
+        seen.extend(str(row["logged_at"]) for row in rows)
+
+    buffer = BufferedQueryLog(
+        flaky_write, max_rows_per_flush=1, flush_interval_seconds=0.05
+    )
+    try:
+        buffer.submit({"logged_at": "boom"})
+        buffer.submit({"logged_at": "after"})
+        deadline = time.monotonic() + 5
+        while "after" not in seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        buffer.close(timeout_seconds=5)
+
+    assert seen == ["after"]
+
+
+def test_the_log_row_carries_the_calling_client_and_request() -> None:
+    """The field #528 exists for: which client asked.
+
+    Claude Desktop and Cowork expose no hooks and write no transcript anywhere
+    reachable, so the handshake's `clientInfo` is the only place the server
+    can learn who is querying the index.
+    """
+    from stel.mcp_server.service import CallerInfo
+
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            ),
+            caller=CallerInfo(
+                request_id="req-7",
+                client_name="claude-desktop",
+                client_version="1.2.3",
+                transport="stdio",
+            ),
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    row = repository.logged[0]
+    assert row["request_id"] == "req-7"
+    assert row["client_name"] == "claude-desktop"
+    assert row["client_version"] == "1.2.3"
+    assert row["transport"] == "stdio"
+
+
+def test_a_log_row_without_a_caller_is_still_written() -> None:
+    """A direct service call has no MCP client, and null is the honest answer
+    rather than a default standing in for one."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    row = repository.logged[0]
+    assert row["client_name"] is None
+    assert row["request_id"] is None
+    assert set(QUERY_LOG_SCHEMA) >= set(row)
+
+
+def test_a_steady_trickle_of_queries_still_flushes_on_the_interval() -> None:
+    """The interval runs from the batch's first row, not its last.
+
+    A server taking one query every so often — each gap shorter than the
+    flush interval, never enough queries at once to reach `flush_max_rows` —
+    restarted the wait on every row, so the batch could sit unwritten for as
+    long as the traffic lasted. That contradicts the documented "whichever
+    comes first" and widens what a crash loses (Codex review, #528).
+    """
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    written: list[Mapping[str, Any]] = []
+
+    def record(rows: list[Mapping[str, Any]]) -> None:
+        written.extend(rows)
+
+    # A row cap far out of reach, so only the interval can trigger the flush.
+    buffer = BufferedQueryLog(
+        record, max_rows_per_flush=1000, flush_interval_seconds=0.3
+    )
+    # Recorded *before* close, which flushes unconditionally and would make
+    # this pass against the very bug it is here to catch.
+    flushed_while_running = False
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            buffer.submit({"logged_at": str(time.monotonic())})
+            # Comfortably shorter than the interval: under the old loop each
+            # of these reset the wait and nothing was ever written.
+            time.sleep(0.05)
+            if written:
+                flushed_while_running = True
+                break
+    finally:
+        buffer.close(timeout_seconds=5)
+
+    assert flushed_while_running, "a steady trickle never flushed within 3s"
+
+
+def test_the_log_row_carries_the_request_and_where_its_time_went() -> None:
+    """`phase_ms`, `filters` and `candidate_limit` per request (issue #528).
+
+    #519 got a phase breakdown behind `stel search -v`; a served query had no
+    equivalent, so latency could only ever be discussed as an anecdote. The
+    filters and candidate limit are the evidence #525 rests on — how often
+    agents actually filter is not reconstructable from the results.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search",
+                query="inflation and employment",
+                mode="text",
+                candidate_limit=200,
+                filters=(
+                    BusinessFilter(
+                        field="category",
+                        operator=FilterOperator.EQUAL,
+                        value="macro",
+                    ),
+                ),
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    row = repository.logged[0]
+    assert row["candidate_limit"] == 200
+    # Field and operator, no value: a filter value is user-authored content
+    # exactly as a query is, so it follows `capture_query_text` (Codex review).
+    assert json.loads(row["filters"]) == [{"field": "category", "operator": "eq"}]
+    # Milliseconds, not seconds: the column is named for the unit it holds.
+    assert json.loads(row["phase_ms"]) == {"text_search": 250.0}
+    assert row["served_generation"] == "g-test"
+    assert row["error_code"] is None
+
+
+def test_an_unfiltered_query_records_no_filters() -> None:
+    """Null rather than an empty list, so `filters IS NOT NULL` is the whole
+    query for "did this caller filter"."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    row = repository.logged[0]
+    assert row["filters"] is None
+    assert row["candidate_limit"] is None
+
+
+def test_an_operational_failure_is_logged_with_its_code() -> None:
+    """A refused request used to log nothing, so the log was silent about
+    exactly the traffic an operator most wants to see (issue #528)."""
+
+    class SlowSearch(FakeSearch):
+        def execute(
+            self,
+            request: SearchRequest,
+            *,
+            policy_filters: Sequence[SearchFilter],
+            timings: PhaseTimings | None = None,
+        ) -> Sequence[SearchResult]:
+            del request, policy_filters, timings
+            time.sleep(0.3)
+            return ()
+
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        search=SlowSearch(),
+        settings=ContextServerSettings(timeout_seconds=0.05),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.TIMEOUT
+    row = repository.logged[0]
+    assert row["error_code"] == "timeout"
+    assert row["result_count"] == 0
+    # Null, not True: a timeout is not a question the index could not answer,
+    # and counting it as one would inflate the retrieval-quality signal.
+    assert row["zero_results"] is None
+    # No authorization happened for this row, and it does not pretend one did.
+    assert row["principal_id"] is None
+    assert row["served_generation"] is None
+    assert set(QUERY_LOG_SCHEMA) >= set(row)
+
+
+def test_an_authorization_refusal_still_logs_nothing() -> None:
+    """The one guarantee the error rows must not erode.
+
+    `test_a_denied_request_logs_nothing` states it: logging happens after
+    authorization, so a refused request leaves no row and cannot be used to
+    probe which models exist. Every other code describes what the server did
+    -- a deadline, a size cap, a failure -- and discloses nothing about what
+    the caller was allowed to see.
+    """
+    service, _ = _service(
+        principal=Principal("intruder", tenant_id="other"),
+        repository=(repository := FakeRepository(_fixture_rows())),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(model="context_search", query="x", mode="text")
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.NOT_FOUND_OR_DENIED
+    assert repository.logged == []
+
+
+def test_filter_values_follow_the_query_text_opt_in() -> None:
+    """A filter value is user-authored content, exactly as a query is.
+
+    `email eq alice@example.com` is a person's address written by a caller,
+    and serializing it into a durable log would carry it past the opt-in that
+    exists to govern precisely that (Codex review, #528). Field and operator
+    are not user-authored — they name the index's own declared attributes,
+    already public in the catalog — and they are what the evidence needs.
+    """
+    request = SearchContextRequest(
+        model="context_search",
+        query="inflation and employment",
+        mode="text",
+        filters=(
+            BusinessFilter(
+                field="category", operator=FilterOperator.EQUAL, value="macro"
+            ),
+        ),
+    )
+
+    private = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=private)
+    try:
+        service.search_context(request)
+    finally:
+        service.close()
+    assert json.loads(private.logged[0]["filters"]) == [
+        {"field": "category", "operator": "eq"}
+    ]
+
+    opted_in = FakeRepository(_fixture_rows(), capture_query_text=True)
+    service, _ = _service(repository=opted_in)
+    try:
+        service.search_context(request)
+    finally:
+        service.close()
+    assert json.loads(opted_in.logged[0]["filters"]) == [
+        {"field": "category", "operator": "eq", "value": "macro"}
+    ]
+
+
+def test_a_response_refused_for_size_is_not_logged_as_a_served_answer() -> None:
+    """The search succeeded and the serialized response was then refused.
+
+    The row is built inside the guarded operation, so it already existed and
+    read as a served answer while the caller got `response_limit` (Codex
+    review, #528). It is stamped rather than replaced: what the query did is
+    the useful half of a size-cap failure.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        # Smaller than any real response, so serialization always overruns.
+        settings=ContextServerSettings(max_response_bytes=1024),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.RESPONSE_LIMIT
+    assert len(repository.logged) == 1
+    row = repository.logged[0]
+    assert row["error_code"] == "response_limit"
+    # The search really ran, and what it did is worth keeping.
+    assert row["result_count"] == 1
+    assert row["phase_ms"] is not None
+    # But it is not a zero-result query, and not a served answer.
+    assert row["zero_results"] is None

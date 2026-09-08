@@ -595,6 +595,7 @@ def _hit(record_id: str, document_id: str) -> SearchResult:
             store_type="fake",
             logical_collection="c",
             physical_collection="c",
+            generation=None,
             upstream="release_embeddings",
             embedding=None,
         ),

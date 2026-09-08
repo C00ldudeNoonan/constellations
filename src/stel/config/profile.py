@@ -371,6 +371,13 @@ class QueryLogConfig(AppendLogConfig):
 
     relation: str = "stel_mcp_query_log"
     capture_query_text: bool = False
+    # Batching, so a served query pays no warehouse round trip for its own
+    # log line (issue #528). Rows are written by a background thread, one
+    # connect and one append per batch rather than per query. Whichever
+    # threshold comes first wins; the interval is what makes a quiet server's
+    # last query land rather than waiting for the next one.
+    flush_max_rows: int = Field(default=100, ge=1, le=10_000)
+    flush_interval_seconds: float = Field(default=5.0, gt=0, le=300)
 
 
 class RunLogConfig(AppendLogConfig):

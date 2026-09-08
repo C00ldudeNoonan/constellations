@@ -17,6 +17,32 @@
   never re-scanned. The `pip` alert on the same stale paths has no fixed
   release; the root lock already holds the newest pip, a dev-only transitive
   of pip-audit.
+### DuckDB advances state in one statement per window, not one per row (issue #549)
+
+The DuckDB adapter wrote incremental state with `executemany`, which DuckDB
+runs as one execution per record — the shape a columnar engine handles worst.
+At the default `flush_every: 2000`, advancing state for a single window cost
+**42 seconds**, and it degraded per row as the window grew, so the default
+flush size was the worst case rather than the best. Every flushing stage paid
+it: extraction, chunk, embed and llm all publish through `FlushPublisher`,
+which advances state after each window.
+
+The window is now bound as a frame and inserted in one statement, following
+the same `register`/`unregister` pattern the adapter already uses to
+materialize. A 2000-record window goes from 42.25s to 0.02s, and a 100-record
+one from 1.24s to 0.008s. On a 400-document chunk-and-embed project, state
+advancement fell from 29.3s to 0.25s and the whole run from 48.9s to 6.8s;
+this repository's own test suite went from 10:28 to 6:39.
+
+**DuckDB and MotherDuck only.** BigQuery already writes state as a single
+MERGE, tuned in #431 and #256 — the lesson was learned on the newer adapter
+and never carried back to the default one.
+
+One behavioural difference makes the change safe rather than merely faster: a
+single statement cannot update the same row twice, where one execution per
+record could. `validate_state_records` already refuses duplicate `record_key`
+values before either path is reached, so the case cannot arise, and that
+refusal is now pinned by a test because the set-based write depends on it.
 
 ### The MCP query log records who asked, what it cost, and every tool call (issue #528)
 

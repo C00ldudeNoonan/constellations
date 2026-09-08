@@ -82,6 +82,11 @@ RUN_LOG_SCHEMA: dict[str, Any] = {
 
 QUERY_LOG_SCHEMA: dict[str, Any] = {
     "logged_at": pl.String,
+    # Which tool served the call (issue #528). The log began as one row per
+    # `search_context`, so every other column is search-shaped; the columns a
+    # tool has no answer for are null rather than zero, and `tool` is what
+    # tells a reader which of those nulls mean "not applicable".
+    "tool": pl.String,
     # Request and client identity (issue #528). Nullable throughout: a direct
     # service call has no MCP client, and an older client may send no
     # `clientInfo`. BigQuery appends allow field addition, so a log written by
@@ -93,6 +98,9 @@ QUERY_LOG_SCHEMA: dict[str, Any] = {
     "principal_id": pl.String,
     "tenant_id": pl.String,
     "model_name": pl.String,
+    # What the call asked for, when that is one thing: a document id, or a
+    # lineage reference. Null for a search, whose subject is the query.
+    "target_id": pl.String,
     "mode": pl.String,
     "query_fingerprint": pl.String,
     "query_text": pl.String,

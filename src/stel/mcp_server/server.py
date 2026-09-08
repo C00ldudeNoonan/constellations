@@ -125,7 +125,8 @@ def create_mcp_server(
                 schema_version=schema_version,
                 limit=limit,
                 cursor=cursor,
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     @app.tool()  # type: ignore[untyped-decorator]
@@ -175,7 +176,8 @@ def create_mcp_server(
                 document_version_id=document_version_id,
                 limit=limit,
                 cursor=cursor,
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     @app.tool()  # type: ignore[untyped-decorator]
@@ -192,7 +194,8 @@ def create_mcp_server(
                 model=model,
                 reference_type=reference_type,
                 reference_id=reference_id,
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     return app

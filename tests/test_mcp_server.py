@@ -1819,3 +1819,139 @@ def test_a_response_refused_for_size_is_not_logged_as_a_served_answer() -> None:
     assert row["phase_ms"] is not None
     # But it is not a zero-result query, and not a served answer.
     assert row["zero_results"] is None
+
+
+def test_every_tool_logs_its_call_not_only_search() -> None:
+    """The log covered `search_context` alone, so three of the four tools an
+    agent uses were invisible to it (issue #528).
+
+    Each row says which tool served it and what it asked for; the columns a
+    tool has no answer for are null rather than zero, because a
+    `list_context_models` call has no mode and no generation and should not
+    claim one.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        assert service.list_context_models(ListContextModelsRequest()).error is None
+        assert (
+            service.get_document(
+                GetDocumentRequest(
+                    model="context_search",
+                    document_id=DOC_ALLOWED,
+                    document_version_id=VERSION_ALLOWED,
+                    limit=1,
+                )
+            ).error
+            is None
+        )
+        assert (
+            service.get_context_lineage(
+                GetContextLineageRequest(
+                    model="context_search",
+                    reference_type=LineageReferenceType.CONTEXT,
+                    reference_id=CONTEXT_ALLOWED_1,
+                )
+            ).error
+            is None
+        )
+        assert (
+            service.search_context(
+                SearchContextRequest(
+                    model="context_search",
+                    query="inflation and employment",
+                    mode="text",
+                )
+            ).error
+            is None
+        )
+    finally:
+        service.close()
+
+    rows = {row["tool"]: row for row in repository.logged}
+    assert set(rows) == {
+        "list_context_models",
+        "get_document",
+        "get_context_lineage",
+        "search_context",
+    }
+    for row in rows.values():
+        # Every row carries the whole column set, so a reader never has to
+        # know which release added which column.
+        assert set(row) == set(QUERY_LOG_SCHEMA)
+        assert row["error_code"] is None
+        assert row["elapsed_ms"] is not None
+
+    listing = rows["list_context_models"]
+    assert listing["result_count"] == 1
+    assert listing["model_name"] is None
+    assert listing["target_id"] is None
+    # A listing has no mode, no generation and no phases, and says so.
+    assert listing["mode"] is None
+    assert listing["served_generation"] is None
+    assert listing["phase_ms"] is None
+
+    document = rows["get_document"]
+    assert document["model_name"] == "context_search"
+    assert document["target_id"] == DOC_ALLOWED
+    assert document["returned_chunk_ids"] == [CHUNK_ALLOWED_1]
+    assert document["query_fingerprint"] is None
+
+    lineage = rows["get_context_lineage"]
+    assert lineage["target_id"] == CONTEXT_ALLOWED_1
+    assert lineage["result_count"] == 1
+    assert lineage["zero_results"] is False
+
+    assert rows["search_context"]["mode"] == "text"
+    assert rows["search_context"]["phase_ms"] is not None
+
+
+def test_a_refused_document_fetch_is_logged_with_its_tool() -> None:
+    """Operational refusals reach the log for every tool, not just search."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        settings=ContextServerSettings(max_document_chunks=2),
+    )
+    try:
+        response = service.get_document(
+            GetDocumentRequest(
+                model="context_search",
+                document_id=DOC_ALLOWED,
+                document_version_id=VERSION_ALLOWED,
+                limit=50,
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INVALID_REQUEST
+    row = repository.logged[0]
+    assert row["tool"] == "get_document"
+    assert row["error_code"] == "invalid_request"
+    assert row["target_id"] == DOC_ALLOWED
+    assert row["requested_limit"] == 50
+    assert row["zero_results"] is None
+
+
+def test_an_unauthorized_document_fetch_still_logs_nothing() -> None:
+    """The authorization guarantee holds for every tool, not just search."""
+    service, _ = _service(
+        principal=Principal("intruder", tenant_id="other"),
+        repository=(repository := FakeRepository(_fixture_rows())),
+    )
+    try:
+        response = service.get_document(
+            GetDocumentRequest(
+                model="context_search",
+                document_id=DOC_ALLOWED,
+                document_version_id=VERSION_ALLOWED,
+                limit=1,
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert repository.logged == []

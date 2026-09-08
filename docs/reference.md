@@ -4367,19 +4367,31 @@ meters, not a second meter. A `status: budget_exceeded` row makes a tripped
 budget visible after the fact rather than only in the terminal output of the
 run that hit it.
 
-**`mcp_query_log`** (issues #329, #528) — one row per served `search_context`
-call: `logged_at`, `request_id`, `client_name`, `client_version`, `transport`,
-`principal_id`, `tenant_id`, `model_name`, `mode`, `query_fingerprint`,
-`requested_limit`, `candidate_limit`, `filters`, `result_count`,
-`zero_results`, `returned_chunk_ids`, `top_score`, `served_generation`,
-`phase_ms`, `elapsed_ms`, `error_code`. Written **after** authorization and policy
+**`mcp_query_log`** (issues #329, #528) — one row per served tool call, for
+all four tools: `logged_at`, `tool`, `request_id`, `client_name`,
+`client_version`, `transport`, `principal_id`, `tenant_id`, `model_name`,
+`target_id`, `mode`, `query_fingerprint`, `requested_limit`,
+`candidate_limit`, `filters`, `result_count`, `zero_results`,
+`returned_chunk_ids`, `top_score`, `served_generation`, `phase_ms`,
+`elapsed_ms`, `error_code`. Written **after** authorization and policy
 filtering, so a row reflects what the caller was allowed to see — a log of
 pre-filter hits would leak the existence of documents the principal cannot
 read — and a denied request logs nothing.
 
 `zero_results` is the cheapest retrieval-quality signal there is: a question
 the index cannot answer is what a chunking or metadata gap looks like from
-outside, so it is a column rather than something to reconstruct.
+outside, so it is a column rather than something to reconstruct. On a
+`list_context_models` row it says something different and equally useful — a
+caller who can see no models at all is usually a grants misconfiguration.
+
+`tool` names which of `search_context`, `get_document`, `list_context_models`
+or `get_context_lineage` served the call. The schema is search-shaped because
+that is where it started, so the columns a tool has no answer for are **null
+rather than zero**: a listing has no mode, no generation and no phases and
+does not claim any. `target_id` is what a call asked for when that is one
+thing — a document id, or a lineage reference — and is null for a search,
+whose subject is the query. Every row carries the whole column set, so a
+reader never has to know which release added which column.
 
 `client_name` and `client_version` come from the MCP `initialize` handshake,
 and are the only way to tell which client is querying an index: a desktop chat

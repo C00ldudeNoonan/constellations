@@ -192,6 +192,11 @@ class SearchProvenance:
     store_type: str
     logical_collection: str
     physical_collection: str
+    # The ready generation the query lease pinned (issue #528). The physical
+    # collection name usually carries it as a suffix, but not for an index
+    # published before generations existed, and a consumer should not have to
+    # parse a name to learn which build answered it.
+    generation: str | None
     upstream: str
     embedding: Mapping[str, Any] | None
 
@@ -208,6 +213,7 @@ class SearchProvenance:
             "store_type": self.store_type,
             "logical_collection": self.logical_collection,
             "physical_collection": self.physical_collection,
+            "generation": self.generation,
             "upstream": self.upstream,
             "embedding": json_value(self.embedding),
         }
@@ -841,6 +847,7 @@ def _search(
         store_type=store_config.type,
         logical_collection=logical_collection,
         physical_collection=physical_collection,
+        generation=lease.pinned_generation,
         upstream=upstream,
         embedding=embedding if isinstance(embedding, Mapping) else None,
     )

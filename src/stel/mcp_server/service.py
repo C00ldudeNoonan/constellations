@@ -33,6 +33,7 @@ from ..search import (
     json_value,
     search,
 )
+from ..timing import PhaseTimings
 from .authorization import (
     AuthorizationError,
     AuthorizationProvider,
@@ -126,13 +127,100 @@ class ContextServerSettings(BaseModel):
         return self
 
 
+# Refusals that stay unlogged, preserving the guarantee
+# `test_a_denied_request_logs_nothing` states: logging happens after
+# authorization, so a refused request leaves no row and cannot be used to
+# probe which models exist. Every other code describes what the *server* did
+# -- a deadline, a size cap, a failure -- and says nothing about what the
+# caller was or was not allowed to see.
+_UNLOGGED_ERROR_CODES = frozenset(
+    {MCPErrorCode.MISSING_PRINCIPAL, MCPErrorCode.NOT_FOUND_OR_DENIED}
+)
+
+
+def _filters_json(
+    filters: Sequence[BusinessFilter], *, capture_values: bool
+) -> str | None:
+    """The user filters of a request, as JSON, for the query log (issue #528).
+
+    User filters only. Policy filters are the authorization context the
+    service computed, not something the caller asked for, and logging them
+    would record the shape of a tenant boundary next to the principal it
+    applies to. `tenant_id` already carries what an operator needs.
+
+    **Values are recorded only under `capture_query_text`** (Codex review).
+    A filter value is user-authored content exactly as a query is -- `email eq
+    alice@example.com` is a person's address written by a caller -- and
+    serializing it would have carried that into a durable log past the opt-in
+    that exists to govern precisely this. Field and operator are not: they
+    name the index's own declared attributes, which are already public in the
+    catalog, and they are what the evidence needs. "How often do agents
+    filter, and on which fields" is answered without a single value.
+
+    A fingerprint was considered instead of omission and rejected: filter
+    values are frequently low-cardinality (a ticker, a form type, a section),
+    so a hash of one is trivially reversed by enumeration and would offer
+    protection it does not have.
+    """
+    if not filters:
+        return None
+    return json.dumps(
+        [
+            {"field": item.field, "operator": item.operator.value}
+            | ({"value": json_value(item.value)} if capture_values else {})
+            for item in filters
+        ],
+        sort_keys=True,
+    )
+
+
+def _phase_ms_json(timings: PhaseTimings) -> str | None:
+    """A query's phase breakdown as JSON milliseconds, or None if unmeasured."""
+    snapshot = timings.snapshot()
+    if not snapshot:
+        return None
+    return json.dumps(
+        {name: round(seconds * 1000, 3) for name, seconds in snapshot.items()},
+        sort_keys=True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CallerInfo:
+    """Who asked, and over what, for one MCP request (issue #528).
+
+    The MCP `initialize` handshake carries `clientInfo`, and it is the only
+    thing that distinguishes Claude Desktop from Code from Cowork on the
+    server side -- the distinction #528 exists to measure, because the clients
+    people actually query from write no transcript anywhere reachable.
+
+    Optional throughout: a direct `ContextService` call has no MCP client and
+    no transport, and `None` is the correct answer for it rather than a
+    default standing in for one.
+    """
+
+    request_id: str | None = None
+    client_name: str | None = None
+    client_version: str | None = None
+    transport: str | None = None
+
+
 class ContextSearch(Protocol):
     def execute(
         self,
         request: SearchRequest,
         *,
         policy_filters: Sequence[SearchFilter],
-    ) -> Sequence[SearchResult]: ...
+        timings: PhaseTimings | None = None,
+    ) -> Sequence[SearchResult]:
+        """`timings`, when given, collects the query's per-phase wall clock.
+
+        Optional so a search that measures nothing still satisfies the
+        protocol, and defaulted rather than required because a caller that
+        does not want the breakdown should not have to build one (issue
+        #528, on the timing #519 added).
+        """
+        ...
 
 
 class PortableContextSearch:
@@ -157,12 +245,14 @@ class PortableContextSearch:
         request: SearchRequest,
         *,
         policy_filters: Sequence[SearchFilter],
+        timings: PhaseTimings | None = None,
     ) -> Sequence[SearchResult]:
         return search(
             self._session.project_dir,
             request,
             policy_filters=policy_filters,
             session=self._session,
+            timings=timings,
         )
 
     def close(self) -> None:
@@ -225,7 +315,21 @@ def timeout_error(timeout_seconds: float) -> ContextServiceError:
 
 
 T = TypeVar("T")
-ResponseT = TypeVar("ResponseT", bound=BaseModel)
+class _ToolResponse(Protocol):
+    """What `_respond` and `_respond_and_log` need of a tool response.
+
+    Narrower than `BaseModel`, and deliberately: `_respond_and_log` reads
+    `error` to decide whether a call was refused, which `BaseModel` does not
+    promise. Every one of the four tool responses carries both members
+    (issue #528).
+    """
+
+    error: ToolError | None
+
+    def model_dump_json(self) -> str: ...
+
+
+ResponseT = TypeVar("ResponseT", bound=_ToolResponse)
 
 
 # Requests with no resolvable principal share this bucket when per-principal
@@ -461,6 +565,9 @@ class ContextService:
         closing = getattr(self._search, "close", None)
         if closing is not None:
             closing()
+        # Flushes whatever the query log has buffered (issue #528). Last, so a
+        # row recorded by a request still in flight above is not stranded.
+        self._repository.close()
 
     def warm_up(self) -> None:
         """Resolve warehouse credentials and connectivity before serving.
@@ -474,40 +581,198 @@ class ContextService:
     def list_context_models(
         self,
         request: ListContextModelsRequest,
+        *,
+        caller: CallerInfo | None = None,
     ) -> ListContextModelsResponse:
-        return self._respond(
-            lambda: self._list_context_models(request),
+        pending: list[Mapping[str, Any]] = []
+        return self._respond_and_log(
+            lambda: self._list_context_models(request, pending, caller),
             lambda error: ListContextModelsResponse(error=error),
+            pending=pending,
+            error_row=lambda error: self._base_log_row("list_context_models", caller)
+            | {"requested_limit": request.limit, "error_code": error.code.value},
         )
 
-    def search_context(self, request: SearchContextRequest) -> SearchContextResponse:
+    def _base_log_row(self, tool: str, caller: CallerInfo | None) -> dict[str, Any]:
+        """Every column the query log has, defaulted to "not applicable".
+
+        Built here rather than per tool so a row is never missing a key the
+        schema declares, and so adding a column does not mean editing four
+        builders and finding the fifth in production. Each tool overrides only
+        what it can answer; the rest stay null, and `tool` is what tells a
+        reader which nulls mean what (issue #528).
+        """
+        caller = caller or CallerInfo()
+        return {
+            "logged_at": datetime.now(UTC).isoformat(),
+            "tool": tool,
+            # Server-generated per request, so a client-side trace and this
+            # row can be lined up when a caller reports a slow call (#528).
+            "request_id": caller.request_id,
+            # From the MCP `initialize` handshake. This is what separates
+            # Desktop from Code from Cowork, which is the question #528 was
+            # filed to answer and the one no client-side transcript can.
+            "client_name": caller.client_name,
+            "client_version": caller.client_version,
+            "transport": caller.transport,
+            "principal_id": None,
+            "tenant_id": None,
+            "model_name": None,
+            "target_id": None,
+            "mode": None,
+            "query_fingerprint": None,
+            "query_text": None,
+            "requested_limit": None,
+            "candidate_limit": None,
+            "filters": None,
+            "result_count": None,
+            "zero_results": None,
+            "returned_chunk_ids": [],
+            "top_score": None,
+            "served_generation": None,
+            "phase_ms": None,
+            "elapsed_ms": None,
+            "error_code": None,
+        }
+
+    def _respond_and_log(
+        self,
+        operation: Callable[[], ResponseT],
+        error_response: Callable[[ToolError], ResponseT],
+        *,
+        pending: list[Mapping[str, Any]],
+        error_row: Callable[[ToolError], Mapping[str, Any]],
+    ) -> ResponseT:
+        """Serve one call and log it, whatever the outcome.
+
+        The row is collected inside the guarded operation but written after it
+        returns, so a slow warehouse cannot spend the request deadline and
+        turn a served answer into a TIMEOUT (Codex review, #333). A per-call
+        list keeps that thread-safe under the limiter's concurrency.
+        """
+        response = self._respond(operation, error_response)
+        error = response.error
+        if error is not None and error.code not in _UNLOGGED_ERROR_CODES:
+            # A refused request logged nothing at all, so the log was silent
+            # about timeouts, oversized responses and internal failures --
+            # exactly the traffic an operator wants to see (issue #528).
+            if pending:
+                # The operation succeeded and `_respond` then refused its
+                # serialized response for exceeding `max_response_bytes`. The
+                # row is worth keeping -- it carries what the call really did
+                # -- but must not read as a served answer when the caller got
+                # an error (Codex review). Stamped rather than replaced.
+                pending[:] = [
+                    {**row, "error_code": error.code.value, "zero_results": None}
+                    for row in pending
+                ]
+            else:
+                pending.append(error_row(error))
+        for row in pending:
+            self._repository.log_query(row)
+        return response
+
+    def search_context(
+        self,
+        request: SearchContextRequest,
+        *,
+        caller: CallerInfo | None = None,
+    ) -> SearchContextResponse:
         # The log row is collected inside the guarded operation but written
         # after it returns, so a slow warehouse cannot spend the request
         # deadline and turn a served answer into a TIMEOUT (Codex review,
         # #333). A per-call list keeps this thread-safe under the limiter's
         # concurrency.
         pending: list[Mapping[str, Any]] = []
-        response = self._respond(
-            lambda: self._search_context(request, pending),
+        return self._respond_and_log(
+            lambda: self._search_context(request, pending, caller),
             lambda error: SearchContextResponse(error=error),
+            pending=pending,
+            error_row=lambda error: self._error_log_row(request, error, caller),
         )
-        for row in pending:
-            self._repository.log_query(row)
-        return response
 
-    def get_document(self, request: GetDocumentRequest) -> GetDocumentResponse:
-        return self._respond(
-            lambda: self._get_document(request),
+    def _error_log_row(
+        self,
+        request: SearchContextRequest,
+        error: ToolError,
+        caller: CallerInfo | None,
+    ) -> Mapping[str, Any]:
+        """One refused query's log row.
+
+        Principal and tenant are null rather than best-guess: a request can
+        be refused *because* identity did not resolve, and a row that named
+        a principal the service never authorized would be worse than one that
+        admits it does not know.
+        """
+        return self._base_log_row("search_context", caller) | {
+            # Caller-supplied, and deliberately not checked against what
+            # exists: what someone asked for when they were refused is the
+            # point of the row.
+            "model_name": request.model,
+            "mode": request.mode,
+            "query_fingerprint": query_fingerprint(request.query),
+            "query_text": (
+                request.query if self._repository.query_log_captures_text() else None
+            ),
+            "requested_limit": request.limit,
+            "result_count": 0,
+            # Null, not True: `zero_results` is the retrieval-quality signal
+            # -- a question the index could not answer -- and a timeout or an
+            # internal failure is not that. Counting refusals as zero-result
+            # queries would inflate exactly the rate a chunking or recall
+            # decision rests on (Codex review). Failures are counted through
+            # `error_code`.
+            "zero_results": None,
+            "returned_chunk_ids": [],
+            "top_score": None,
+            "elapsed_ms": None,
+            "candidate_limit": request.candidate_limit,
+            "filters": _filters_json(
+                request.filters,
+                capture_values=self._repository.query_log_captures_text(),
+            ),
+            "phase_ms": None,
+            "served_generation": None,
+            "error_code": error.code.value,
+        }
+
+    def get_document(
+        self,
+        request: GetDocumentRequest,
+        *,
+        caller: CallerInfo | None = None,
+    ) -> GetDocumentResponse:
+        pending: list[Mapping[str, Any]] = []
+        return self._respond_and_log(
+            lambda: self._get_document(request, pending, caller),
             lambda error: GetDocumentResponse(error=error),
+            pending=pending,
+            error_row=lambda error: self._base_log_row("get_document", caller)
+            | {
+                "model_name": request.model,
+                "target_id": request.document_id,
+                "requested_limit": request.limit,
+                "error_code": error.code.value,
+            },
         )
 
     def get_context_lineage(
         self,
         request: GetContextLineageRequest,
+        *,
+        caller: CallerInfo | None = None,
     ) -> GetContextLineageResponse:
-        return self._respond(
-            lambda: self._get_context_lineage(request),
+        pending: list[Mapping[str, Any]] = []
+        return self._respond_and_log(
+            lambda: self._get_context_lineage(request, pending, caller),
             lambda error: GetContextLineageResponse(error=error),
+            pending=pending,
+            error_row=lambda error: self._base_log_row("get_context_lineage", caller)
+            | {
+                "model_name": request.model,
+                "target_id": request.reference_id,
+                "error_code": error.code.value,
+            },
         )
 
     def _respond(
@@ -618,7 +883,10 @@ class ContextService:
     def _list_context_models(
         self,
         request: ListContextModelsRequest,
+        pending_log: list[Mapping[str, Any]] | None = None,
+        caller: CallerInfo | None = None,
     ) -> ListContextModelsResponse:
+        started = monotonic()
         principal = self._principal()
         available: list[ContextResource] = []
         for resource in self._catalog.all():
@@ -643,13 +911,25 @@ class ContextService:
             if len(available) > len(page) and page
             else None
         )
+        models = tuple(
+            resource.summary(entity_types=self._entity_types(resource, principal))
+            for resource in page
+        )
+        if pending_log is not None:
+            pending_log.append(
+                self._base_log_row("list_context_models", caller)
+                | {
+                    "principal_id": principal.subject_id,
+                    "requested_limit": request.limit,
+                    "result_count": len(models),
+                    # A caller who can see no models at all is usually a
+                    # grants misconfiguration, and this is where that shows.
+                    "zero_results": not models,
+                    "elapsed_ms": round((monotonic() - started) * 1000, 3),
+                }
+            )
         return ListContextModelsResponse(
-            models=tuple(
-                resource.summary(
-                    entity_types=self._entity_types(resource, principal)
-                )
-                for resource in page
-            ),
+            models=models,
             next_cursor=next_cursor,
         )
 
@@ -657,6 +937,7 @@ class ContextService:
         self,
         request: SearchContextRequest,
         pending_log: list[Mapping[str, Any]] | None = None,
+        caller: CallerInfo | None = None,
     ) -> SearchContextResponse:
         started = monotonic()
         authorized = self._authorize_resource(request.model)
@@ -690,6 +971,7 @@ class ContextService:
         filters = tuple(
             self._business_filter(resource, item) for item in request.filters
         )
+        timings = PhaseTimings()
         hits = self._search.execute(
             SearchRequest(
                 model=resource.name,
@@ -700,6 +982,7 @@ class ContextService:
                 filters=filters,
             ),
             policy_filters=authorized.policy_filters,
+            timings=timings,
         )
         chunk_rows = self._chunks_for_hits(resource, hits)
         registry_rows = self._registry_by_versions(
@@ -741,6 +1024,9 @@ class ContextService:
                     resource_name=resource.name,
                     results=results,
                     elapsed_ms=round((monotonic() - started) * 1000, 3),
+                    caller=caller,
+                    timings=timings,
+                    hits=hits,
                 )
             )
         return SearchContextResponse(results=results)
@@ -754,6 +1040,9 @@ class ContextService:
         resource_name: str,
         results: tuple[SearchContextResult, ...],
         elapsed_ms: float,
+        caller: CallerInfo | None,
+        timings: PhaseTimings,
+        hits: Sequence[SearchResult],
     ) -> Mapping[str, Any]:
         """Build one served query's log row.
 
@@ -770,8 +1059,7 @@ class ContextService:
         caller-supplied and ignored for policy, so logging it would file a
         served query under a tenant the caller merely asserted.
         """
-        return {
-            "logged_at": datetime.now(UTC).isoformat(),
+        return self._base_log_row("search_context", caller) | {
             "principal_id": principal.subject_id,
             "tenant_id": _authorizing_tenant(policy_filters),
             "model_name": resource_name,
@@ -790,9 +1078,33 @@ class ContextService:
             "returned_chunk_ids": [result.chunk_id for result in results],
             "top_score": results[0].score if results else None,
             "elapsed_ms": elapsed_ms,
+            # The lever a filtered agent query has and the filters it used
+            # (issues #525, #528): how often callers actually filter is what
+            # says whether widening the candidate set matters, and that
+            # cannot be reconstructed from the results.
+            "candidate_limit": request.candidate_limit,
+            "filters": _filters_json(
+                request.filters,
+                capture_values=self._repository.query_log_captures_text(),
+            ),
+            # Where this query's wall clock went, per phase, in milliseconds
+            # (the breakdown #519 asked for, per request rather than per
+            # `-v` run). Phase names and durations only -- the same thing
+            # already considered safe to log at INFO.
+            "phase_ms": _phase_ms_json(timings),
+            # Which index build answered, so latency and recall attach to a
+            # generation rather than to a model name that outlives it.
+            "served_generation": hits[0].provenance.generation if hits else None,
+            "error_code": None,
         }
 
-    def _get_document(self, request: GetDocumentRequest) -> GetDocumentResponse:
+    def _get_document(
+        self,
+        request: GetDocumentRequest,
+        pending_log: list[Mapping[str, Any]] | None = None,
+        caller: CallerInfo | None = None,
+    ) -> GetDocumentResponse:
+        started = monotonic()
         authorized = self._authorize_resource(request.model)
         if request.limit > self._settings.max_document_chunks:
             raise ContextServiceError(
@@ -855,6 +1167,22 @@ class ContextService:
             if len(ordered) > len(page) and page
             else None
         )
+        chunks = tuple(self._document_chunk(row, links) for row in page)
+        if pending_log is not None:
+            pending_log.append(
+                self._base_log_row("get_document", caller)
+                | {
+                    "principal_id": authorized.principal.subject_id,
+                    "tenant_id": _authorizing_tenant(authorized.policy_filters),
+                    "model_name": resource.name,
+                    "target_id": request.document_id,
+                    "requested_limit": request.limit,
+                    "result_count": len(chunks),
+                    "zero_results": not chunks,
+                    "returned_chunk_ids": [chunk.chunk_id for chunk in chunks],
+                    "elapsed_ms": round((monotonic() - started) * 1000, 3),
+                }
+            )
         return GetDocumentResponse(
             document_id=request.document_id,
             document_version_id=request.document_version_id,
@@ -862,14 +1190,17 @@ class ContextService:
             interval=_interval(registry),
             freshness=_freshness(registry),
             lineage=_lineage(resource, all_ordered[0]),
-            chunks=tuple(self._document_chunk(row, links) for row in page),
+            chunks=chunks,
             next_cursor=next_cursor,
         )
 
     def _get_context_lineage(
         self,
         request: GetContextLineageRequest,
+        pending_log: list[Mapping[str, Any]] | None = None,
+        caller: CallerInfo | None = None,
     ) -> GetContextLineageResponse:
+        started = monotonic()
         authorized = self._authorize_resource(request.model)
         resource = authorized.resource
         field = {
@@ -904,6 +1235,22 @@ class ContextService:
                 continue
             context_id = _required_string(row, "context_id")
             links = self._entity_links(resource, {context_id})
+            if pending_log is not None:
+                pending_log.append(
+                    self._base_log_row("get_context_lineage", caller)
+                    | {
+                        "principal_id": authorized.principal.subject_id,
+                        "tenant_id": _authorizing_tenant(authorized.policy_filters),
+                        "model_name": resource.name,
+                        "target_id": request.reference_id,
+                        "result_count": 1,
+                        "zero_results": False,
+                        "returned_chunk_ids": [
+                            _required_string(row, "chunk_id"),
+                        ],
+                        "elapsed_ms": round((monotonic() - started) * 1000, 3),
+                    }
+                )
             return GetContextLineageResponse(
                 record=ContextLineageRecord(
                     document_id=_required_string(row, "document_id"),

@@ -21,7 +21,40 @@ from .contracts import (
     SearchContextResponse,
 )
 from .grants import DEFAULT_GRANT_TTL_SECONDS
-from .service import ContextServerSettings, ContextService
+from .service import CallerInfo, ContextServerSettings, ContextService
+
+
+def _caller_info(transport: str | None) -> CallerInfo:
+    """Identify the caller of the request being served (issue #528).
+
+    Read from the SDK's request contextvar rather than through an injected
+    `Context` parameter: FastMCP derives a tool's input schema from its
+    signature, and a parameter added for telemetry would either appear in
+    that schema or depend on the SDK recognising its annotation. The
+    contextvar leaves the tool contract untouched.
+
+    Best-effort by construction. The handshake's `clientInfo` is optional in
+    the protocol, the contextvar is unset outside a request, and every field
+    here is nullable -- a log row that cannot say who called is still worth
+    more than a failed query.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+    except ImportError:  # pragma: no cover - mcp is an optional extra
+        return CallerInfo(transport=transport)
+    try:
+        context = request_ctx.get()
+    except LookupError:
+        return CallerInfo(transport=transport)
+    client = getattr(getattr(context, "session", None), "client_params", None)
+    info = getattr(client, "clientInfo", None)
+    request_id = getattr(context, "request_id", None)
+    return CallerInfo(
+        request_id=None if request_id is None else str(request_id),
+        client_name=getattr(info, "name", None),
+        client_version=getattr(info, "version", None),
+        transport=transport,
+    )
 
 # The SDK's `Settings.lifespan` is annotated with a forward reference to
 # `FastMCP`, which that module defines *after* `Settings`, so the annotation is
@@ -51,6 +84,7 @@ def create_mcp_server(
     *,
     issuer_url: str | None = None,
     public_url: str | None = None,
+    transport: str | None = None,
 ) -> Any:
     fastmcp = import_optional_dependency(
         "mcp.server.fastmcp",
@@ -91,7 +125,8 @@ def create_mcp_server(
                 schema_version=schema_version,
                 limit=limit,
                 cursor=cursor,
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     @app.tool()  # type: ignore[untyped-decorator]
@@ -119,7 +154,8 @@ def create_mcp_server(
                 limit=limit,
                 candidate_limit=candidate_limit,
                 filters=tuple(filters or ()),
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     @app.tool()  # type: ignore[untyped-decorator]
@@ -140,7 +176,8 @@ def create_mcp_server(
                 document_version_id=document_version_id,
                 limit=limit,
                 cursor=cursor,
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     @app.tool()  # type: ignore[untyped-decorator]
@@ -157,7 +194,8 @@ def create_mcp_server(
                 model=model,
                 reference_type=reference_type,
                 reference_id=reference_id,
-            )
+            ),
+            caller=_caller_info(transport),
         )
 
     return app
@@ -354,6 +392,7 @@ def _run(
             token_verifier=token_verifier,
             issuer_url=issuer_url,
             public_url=public_url,
+            transport=transport,
         )
         for name, value in settings.items():
             setattr(app.settings, name, value)

@@ -1027,12 +1027,23 @@ def test_closing_the_session_waits_for_an_operation_in_flight(
     assert opened[0]._con is None
 
 
-def test_a_failed_log_write_retires_the_held_connection(
+def test_a_failed_log_write_cannot_damage_the_held_connection(
     published_project: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`write_rows` swallows the adapter's error by contract, so without this
-    a broken held connection would survive to fail the next request."""
+    """A failing query-log write leaves the serving connection untouched.
+
+    This replaces `test_a_failed_log_write_retires_the_held_connection`, whose
+    premise #528 removed. The log write used to go through the session's held
+    connection, so `write_rows` swallowing the adapter's error by contract
+    meant a broken connection survived to fail the next request -- and
+    retiring it was the fix.
+
+    Batches are now written by the drain thread through their own adapter, so
+    the held connection is never involved in a log write at all. That is a
+    stronger guarantee than retiring after the fact, and this asserts it
+    directly: the write fails, and serving's connection is still there.
+    """
     import dataclasses
 
     from stel.config.profile import QueryLogConfig
@@ -1048,16 +1059,23 @@ def test_a_failed_log_write_retires_the_held_connection(
             repository._resolved, mcp_query_log=QueryLogConfig(enabled=True)
         )
         repository.warm_up()
-        assert session._held is not None
+        held = session._held
+        assert held is not None
 
-        monkeypatch.setattr(repository_module, "write_rows", lambda *a, **k: 0)
+        def failing_write(*args: Any, **kwargs: Any) -> int:
+            raise RuntimeError("warehouse rejected the append")
+
+        monkeypatch.setattr(repository_module, "write_rows", failing_write)
         repository.log_query({"query_id": "q"})
-        assert session._held is None
-        assert opened[0]._con is None
+        # Flushes the batch, so the failing write has actually happened.
+        repository.close()
 
-        # The next operation reconnects.
+        assert session._held is held
+        # Still usable, and without reconnecting: the failed log write never
+        # touched it, so there is nothing to recover from.
+        serving_opens = len(opened)
         with session.warehouse(None):
             pass
-        assert len(opened) == 2
+        assert len(opened) == serving_opens
     finally:
         session.close()

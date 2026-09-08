@@ -138,23 +138,36 @@ _UNLOGGED_ERROR_CODES = frozenset(
 )
 
 
-def _filters_json(filters: Sequence[BusinessFilter]) -> str | None:
+def _filters_json(
+    filters: Sequence[BusinessFilter], *, capture_values: bool
+) -> str | None:
     """The user filters of a request, as JSON, for the query log (issue #528).
 
     User filters only. Policy filters are the authorization context the
     service computed, not something the caller asked for, and logging them
     would record the shape of a tenant boundary next to the principal it
     applies to. `tenant_id` already carries what an operator needs.
+
+    **Values are recorded only under `capture_query_text`** (Codex review).
+    A filter value is user-authored content exactly as a query is -- `email eq
+    alice@example.com` is a person's address written by a caller -- and
+    serializing it would have carried that into a durable log past the opt-in
+    that exists to govern precisely this. Field and operator are not: they
+    name the index's own declared attributes, which are already public in the
+    catalog, and they are what the evidence needs. "How often do agents
+    filter, and on which fields" is answered without a single value.
+
+    A fingerprint was considered instead of omission and rejected: filter
+    values are frequently low-cardinality (a ticker, a form type, a section),
+    so a hash of one is trivially reversed by enumeration and would offer
+    protection it does not have.
     """
     if not filters:
         return None
     return json.dumps(
         [
-            {
-                "field": item.field,
-                "operator": item.operator.value,
-                "value": json_value(item.value),
-            }
+            {"field": item.field, "operator": item.operator.value}
+            | ({"value": json_value(item.value)} if capture_values else {})
             for item in filters
         ],
         sort_keys=True,
@@ -576,12 +589,23 @@ class ContextService:
             lambda: self._search_context(request, pending, caller),
             lambda error: SearchContextResponse(error=error),
         )
-        if not pending and response.error is not None:
+        if response.error is not None and response.error.code not in _UNLOGGED_ERROR_CODES:
             # A refused request logged nothing at all, so the log was silent
             # about timeouts, oversized responses and internal failures --
             # exactly the traffic an operator wants to see (issue #528).
-            # Recorded with the request as made and no result fields.
-            if response.error.code not in _UNLOGGED_ERROR_CODES:
+            if pending:
+                # The search succeeded and `_respond` then refused its
+                # serialized response for exceeding `max_response_bytes`. The
+                # row is already built and is worth keeping -- it carries the
+                # phases and the result count the search really produced --
+                # but it must not read as a served answer when the caller got
+                # an error (Codex review). Stamped rather than replaced: what
+                # the query did is the useful half of a size-cap failure.
+                pending[:] = [
+                    {**row, "error_code": response.error.code.value, "zero_results": None}
+                    for row in pending
+                ]
+            else:
                 pending.append(self._error_log_row(request, response.error, caller))
         for row in pending:
             self._repository.log_query(row)
@@ -620,12 +644,21 @@ class ContextService:
             ),
             "requested_limit": request.limit,
             "result_count": 0,
-            "zero_results": True,
+            # Null, not True: `zero_results` is the retrieval-quality signal
+            # -- a question the index could not answer -- and a timeout or an
+            # internal failure is not that. Counting refusals as zero-result
+            # queries would inflate exactly the rate a chunking or recall
+            # decision rests on (Codex review). Failures are counted through
+            # `error_code`.
+            "zero_results": None,
             "returned_chunk_ids": [],
             "top_score": None,
             "elapsed_ms": None,
             "candidate_limit": request.candidate_limit,
-            "filters": _filters_json(request.filters),
+            "filters": _filters_json(
+                request.filters,
+                capture_values=self._repository.query_log_captures_text(),
+            ),
             "phase_ms": None,
             "served_generation": None,
             "error_code": error.code.value,
@@ -950,7 +983,10 @@ class ContextService:
             # says whether widening the candidate set matters, and that
             # cannot be reconstructed from the results.
             "candidate_limit": request.candidate_limit,
-            "filters": _filters_json(request.filters),
+            "filters": _filters_json(
+                request.filters,
+                capture_values=self._repository.query_log_captures_text(),
+            ),
             # Where this query's wall clock went, per phase, in milliseconds
             # (the breakdown #519 asked for, per request rather than per
             # `-v` run). Phase names and durations only -- the same thing

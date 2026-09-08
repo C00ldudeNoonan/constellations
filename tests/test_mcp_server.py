@@ -1647,9 +1647,9 @@ def test_the_log_row_carries_the_request_and_where_its_time_went() -> None:
     assert response.error is None
     row = repository.logged[0]
     assert row["candidate_limit"] == 200
-    assert json.loads(row["filters"]) == [
-        {"field": "category", "operator": "eq", "value": "macro"}
-    ]
+    # Field and operator, no value: a filter value is user-authored content
+    # exactly as a query is, so it follows `capture_query_text` (Codex review).
+    assert json.loads(row["filters"]) == [{"field": "category", "operator": "eq"}]
     # Milliseconds, not seconds: the column is named for the unit it holds.
     assert json.loads(row["phase_ms"]) == {"text_search": 250.0}
     assert row["served_generation"] == "g-test"
@@ -1711,7 +1711,9 @@ def test_an_operational_failure_is_logged_with_its_code() -> None:
     row = repository.logged[0]
     assert row["error_code"] == "timeout"
     assert row["result_count"] == 0
-    assert row["zero_results"] is True
+    # Null, not True: a timeout is not a question the index could not answer,
+    # and counting it as one would inflate the retrieval-quality signal.
+    assert row["zero_results"] is None
     # No authorization happened for this row, and it does not pretend one did.
     assert row["principal_id"] is None
     assert row["served_generation"] is None
@@ -1741,3 +1743,79 @@ def test_an_authorization_refusal_still_logs_nothing() -> None:
     assert response.error is not None
     assert response.error.code is MCPErrorCode.NOT_FOUND_OR_DENIED
     assert repository.logged == []
+
+
+def test_filter_values_follow_the_query_text_opt_in() -> None:
+    """A filter value is user-authored content, exactly as a query is.
+
+    `email eq alice@example.com` is a person's address written by a caller,
+    and serializing it into a durable log would carry it past the opt-in that
+    exists to govern precisely that (Codex review, #528). Field and operator
+    are not user-authored — they name the index's own declared attributes,
+    already public in the catalog — and they are what the evidence needs.
+    """
+    request = SearchContextRequest(
+        model="context_search",
+        query="inflation and employment",
+        mode="text",
+        filters=(
+            BusinessFilter(
+                field="category", operator=FilterOperator.EQUAL, value="macro"
+            ),
+        ),
+    )
+
+    private = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=private)
+    try:
+        service.search_context(request)
+    finally:
+        service.close()
+    assert json.loads(private.logged[0]["filters"]) == [
+        {"field": "category", "operator": "eq"}
+    ]
+
+    opted_in = FakeRepository(_fixture_rows(), capture_query_text=True)
+    service, _ = _service(repository=opted_in)
+    try:
+        service.search_context(request)
+    finally:
+        service.close()
+    assert json.loads(opted_in.logged[0]["filters"]) == [
+        {"field": "category", "operator": "eq", "value": "macro"}
+    ]
+
+
+def test_a_response_refused_for_size_is_not_logged_as_a_served_answer() -> None:
+    """The search succeeded and the serialized response was then refused.
+
+    The row is built inside the guarded operation, so it already existed and
+    read as a served answer while the caller got `response_limit` (Codex
+    review, #528). It is stamped rather than replaced: what the query did is
+    the useful half of a size-cap failure.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        # Smaller than any real response, so serialization always overruns.
+        settings=ContextServerSettings(max_response_bytes=1024),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.RESPONSE_LIMIT
+    assert len(repository.logged) == 1
+    row = repository.logged[0]
+    assert row["error_code"] == "response_limit"
+    # The search really ran, and what it did is worth keeping.
+    assert row["result_count"] == 1
+    assert row["phase_ms"] is not None
+    # But it is not a zero-result query, and not a served answer.
+    assert row["zero_results"] is None

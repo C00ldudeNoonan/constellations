@@ -4394,12 +4394,24 @@ names and durations only — no query text and no row values, the same content
 already considered safe to log at INFO. `filters` records the *user* filters
 of the request, never the policy filters: those are the authorization context
 the service computed, and logging them would record the shape of a tenant
-boundary beside the principal it applies to. `served_generation` names the
+boundary beside the principal it applies to. It records each filter's **field
+and operator, and its value only under `capture_query_text`** — a filter value
+is user-authored content exactly as a query is (`email eq
+alice@example.com` is a person's address written by a caller), so it follows
+the same opt-in. Field and operator are not: they name the index's own
+declared attributes, already public in the catalog, and they are what answers
+"how often do agents filter, and on which fields". `served_generation` names the
 index build that answered, so latency and recall attach to a generation rather
 than to a model name that outlives it.
 
 `error_code` is null on a served answer and carries the contract code on a
-refused one — a timeout, a size cap, an internal failure. **Two codes are
+refused one — a timeout, a size cap, an internal failure. A search that
+succeeded and was then refused for exceeding `max_response_bytes` keeps its
+row, stamped with the code: what the query did is the useful half of a
+size-cap failure. `zero_results` is null on any row carrying an `error_code`,
+because a refusal is not a question the index could not answer, and counting
+one as such would inflate the very rate a chunking or recall decision rests
+on. **Two codes are
 never logged**: `missing_principal` and `not_found_or_denied`. Logging happens
 after authorization, so a request refused there leaves no row at all and the
 log cannot be used to probe which models exist. Every code that *is* logged

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Dependencies
+
+- `pypdf` floor raised to 6.18.0 (the `pdf` extra). 6.17.0 and 6.18.0 fix
+  three advisories Dependabot raised against 6.16.2: a possible infinite loop
+  in `TreeObject.insert_child`, and long runtimes or large memory use when
+  retrieving outlines and when extracting XForm objects, each on a crafted
+  document. The PDF backend parses operator-supplied documents, so a crafted
+  file is a denial of service against a run rather than a code-execution risk;
+  the upgrade closes it either way.
+
 ### The MCP server holds its warehouse connection across requests (issue #523)
 
 - **A served query opened the warehouse three or more times.** Once for its

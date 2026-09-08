@@ -27,6 +27,7 @@ import logging
 import queue
 import threading
 from collections.abc import Mapping
+from time import monotonic
 from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
@@ -136,15 +137,30 @@ class BufferedQueryLog:
 
     def _drain(self) -> None:
         batch: list[Mapping[str, Any]] = []
+        # When the batch's oldest row must be written by, or None when the
+        # batch is empty. The wait is the *remaining* time rather than the
+        # full interval, because a steady trickle of queries -- each arriving
+        # sooner than the interval, never enough of them to reach
+        # `max_rows_per_flush` -- would otherwise restart the wait on every
+        # row and hold the batch indefinitely. "Whichever comes first" has to
+        # mean the interval measured from the first row, not from the last
+        # (Codex review, #528).
+        deadline: float | None = None
         while True:
+            wait = (
+                self._flush_interval_seconds
+                if deadline is None
+                else max(0.0, deadline - monotonic())
+            )
             try:
-                row = self._queue.get(timeout=self._flush_interval_seconds)
+                row = self._queue.get(timeout=wait)
             except queue.Empty:
-                # The interval elapsed with nothing new: flush what is held so
-                # a quiet server's last query still reaches the warehouse
+                # Nothing new before the deadline: flush what is held, so a
+                # quiet server's last query still reaches the warehouse
                 # rather than waiting for the next one.
                 self._flush(batch)
                 batch = []
+                deadline = None
                 if self._closed:
                     return
                 continue
@@ -152,9 +168,12 @@ class BufferedQueryLog:
                 self._flush(batch)
                 return
             batch.append(row)
-            if len(batch) >= self._max_rows_per_flush:
+            if deadline is None:
+                deadline = monotonic() + self._flush_interval_seconds
+            if len(batch) >= self._max_rows_per_flush or monotonic() >= deadline:
                 self._flush(batch)
                 batch = []
+                deadline = None
 
     def _flush(self, batch: list[Mapping[str, Any]]) -> None:
         if not batch:

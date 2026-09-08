@@ -1565,3 +1565,42 @@ def test_a_log_row_without_a_caller_is_still_written() -> None:
     assert row["client_name"] is None
     assert row["request_id"] is None
     assert set(QUERY_LOG_SCHEMA) >= set(row)
+
+
+def test_a_steady_trickle_of_queries_still_flushes_on_the_interval() -> None:
+    """The interval runs from the batch's first row, not its last.
+
+    A server taking one query every so often — each gap shorter than the
+    flush interval, never enough queries at once to reach `flush_max_rows` —
+    restarted the wait on every row, so the batch could sit unwritten for as
+    long as the traffic lasted. That contradicts the documented "whichever
+    comes first" and widens what a crash loses (Codex review, #528).
+    """
+    from stel.mcp_server.query_log import BufferedQueryLog
+
+    written: list[Mapping[str, Any]] = []
+
+    def record(rows: list[Mapping[str, Any]]) -> None:
+        written.extend(rows)
+
+    # A row cap far out of reach, so only the interval can trigger the flush.
+    buffer = BufferedQueryLog(
+        record, max_rows_per_flush=1000, flush_interval_seconds=0.3
+    )
+    # Recorded *before* close, which flushes unconditionally and would make
+    # this pass against the very bug it is here to catch.
+    flushed_while_running = False
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            buffer.submit({"logged_at": str(time.monotonic())})
+            # Comfortably shorter than the interval: under the old loop each
+            # of these reset the wait and nothing was ever written.
+            time.sleep(0.05)
+            if written:
+                flushed_while_running = True
+                break
+    finally:
+        buffer.close(timeout_seconds=5)
+
+    assert flushed_while_running, "a steady trickle never flushed within 3s"

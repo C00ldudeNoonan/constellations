@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.18.0 - 2026-09-08
+
 ### Dependencies
 
 - `pypdf` floor raised from 6.16.1 to 6.18.0 (the `pdf` extra), picking up
@@ -15,6 +17,7 @@
   never re-scanned. The `pip` alert on the same stale paths has no fixed
   release; the root lock already holds the newest pip, a dev-only transitive
   of pip-audit.
+
 ### DuckDB advances state in one statement per window, not one per row (issue #549)
 
 The DuckDB adapter wrote incremental state with `executemany`, which DuckDB
@@ -42,6 +45,46 @@ record could. `validate_state_records` already refuses duplicate `record_key`
 values before either path is reached, so the case cannot arise, and that
 refusal is now pinned by a test because the set-based write depends on it.
 
+### The MCP query log records who asked, what it cost, and every tool call (issue #528)
+
+- **The query log has existed since #329, but it cost too much to turn on and
+  saw one tool.** `log_query` opened its own warehouse connection and appended
+  one row inline before `search_context` returned, which on BigQuery is a
+  connect plus a load job per query: seconds, charged to the query that
+  produced the row. And three of the four tools an agent uses left no record
+  at all.
+- Rows are now batched off the request path. A served call hands its row to a
+  bounded in-process buffer and returns; a background thread writes whole
+  batches, flushing after `flush_max_rows` (default 100) or
+  `flush_interval_seconds` (default 5.0), whichever comes first, and again at
+  shutdown. Lossy under pressure by design: a full buffer drops rows with a
+  warning rather than blocking a caller, and a failed batch is discarded
+  rather than retried into a backlog. Batches write through their own adapter,
+  so a failed log write cannot damage the connection serving holds.
+- New columns. `request_id`, `client_name`, `client_version` and `transport`
+  come from the MCP `initialize` handshake, the only place a server can learn
+  whether a desktop chat client or a coding agent is querying an index; they
+  are read from the SDK's request context rather than a tool parameter, so the
+  public tool schema is unchanged. `phase_ms` is the #519 breakdown per
+  request. `filters` records the request's user filters, never the policy
+  filters, and a filter's value only under `capture_query_text`.
+  `candidate_limit`, `served_generation` and `error_code` (null on a served
+  answer) complete the set. `missing_principal` and `not_found_or_denied` still
+  log nothing, so the log cannot be used to probe which models exist; a
+  response refused for size keeps its row, stamped with the code.
+- All four tools log. `tool` names which one served the call and `target_id`
+  is what it asked for when that is one thing, a document id or a lineage
+  reference. Every row carries the whole column set, and the columns a tool has
+  no answer for are null rather than zero, so a listing does not claim a
+  measurement it never made.
+- `SearchProvenance.generation` names the index build that answered, and
+  `stel search --output json` reports it directly. BigQuery appends allow field
+  addition, so a log written by an earlier stel widens on the first new write
+  rather than breaking.
+- Not added: `response_truncated`. The server refuses an oversized response
+  rather than truncating one, so the column would always be false;
+  `error_code` covers it.
+
 ### The MCP server holds its warehouse connection across requests (issue #523)
 
 - **A served query opened the warehouse three or more times.** Once for its
@@ -49,6 +92,19 @@ refusal is now pinned by a test because the set-based write depends on it.
   for the query log, and on BigQuery each open is a credential resolution of
   about two seconds. The store was already held across requests (#534); the
   warehouse connection was the last increment of #523.
+- The session itself arrived with #534. `SearchSession` holds the compiled
+  project, the resolved profile and an open retrieval store per alias for the
+  life of the server; `search()` takes an optional `session=` and builds a
+  private one when omitted, so a CLI query still owns and closes its store.
+  Holding the store is the whole payoff: the store's connection carries the
+  index cache budget (#479), which a store closed after each query allocated,
+  filled and discarded, the "warm is no faster than cold" observation in #461
+  and #519. Against a 3.6M-row collection over object storage, the second and
+  later queries on one session ran their text and vector searches about seven
+  times faster (0.96s and 0.62s against 4.68s and 5.47s), 24.2s a query
+  against 38.8s. A store whose connection raises a retrieval error is
+  discarded so the next query rebuilds it, and a session for a different
+  project than the one queried is refused.
 - The serving session now holds one warehouse connection when the adapter
   says it may outlive a request, and the MCP repository's reads and log
   writes go through the same session, so every warehouse touch of a served
@@ -143,6 +199,7 @@ annotation.
   is the machine form.
 - `WarehouseAdapter.list_state_scopes()` is the read behind it, one aggregate
   query implemented once in the base adapter over the portable state SQL.
+
 ### `search_context` takes a `candidate_limit`, like the CLI always has (issue #525)
 
 `stel search` exposes `--candidate-limit` — how many candidates each retrieval
@@ -169,6 +226,47 @@ depth, not as a workaround for starvation that does not occur — and the
 issue's companion suggestion, scaling the candidate set automatically when
 filters are present, is deliberately not implemented, since under prefiltering
 it would buy nothing.
+
+### A served query makes four fewer warehouse round trips (issue #535)
+
+- **Ten statements per query, not the eight the issue counted, and the cost is
+  per round trip.** Instrumenting the BigQuery adapter during a real query
+  showed 13.6s of SQL inside an 18.9s query: a `CREATE TABLE IF NOT EXISTS`
+  for each of the serving ledger and lease tables on every query, landing
+  between `warehouse_connect` and `lease` where no #519 phase counted them,
+  and each `validate_query` reading the ledger row and the lease as two
+  statements. A SELECT costs about a second whatever it carries, so folding
+  statements together is free and removing them is the only lever.
+- The serving schema is ensured once per session rather than once per query.
+  `ensure_schema` is a required parameter on the coordinator, because whether a
+  caller is first to touch a schema is something only the caller knows, and a
+  default would quietly pick one answer for all five call sites. Each
+  `validate_query` now reads both facts in one statement, the held-check a
+  correlated subquery under the full identity the pin was issued with, so a
+  lease released, fenced out or re-issued under another generation still reads
+  as not held.
+- Six statements instead of ten; the same query went from 19.0s to 13.7s on a
+  warm session. Deliberately untouched: the re-validation `acquire_query` ends
+  with, which closes a window between two DML statements that have no
+  cross-statement snapshot isolation, and the lease INSERT and DELETE
+  themselves, which are a question of where the pin lives rather than a
+  round-trip count.
+
+### Vertex embeddings want a regional location, not `global` (issue #536)
+
+- Both documented Vertex embedding examples showed `location: global`, one
+  with a comment that read as the neutral default. It is not: on a connection
+  that is not already warm, `global` costs about 10.2s per request where
+  `us-central1` costs 0.27s, constant whatever the idle gap. Retry backoff,
+  DNS, TLS, token refresh and HTTP keepalive were each ruled out by
+  measurement. Through `search()` against a 3.6M-row index, that is a warm
+  hybrid query at 24.2s against 15.4s.
+- Docs only: stel's own default was already `us-central1`. `location` is an
+  execution option, not a semantic one, so changing it enters no embedding
+  identity and implies no republish. `global` remains correct when a model or
+  quota is only available there, and a bulk `embed:` backfill barely notices
+  because back-to-back requests keep the connection warm; the sparse,
+  interactive query pattern is what pays.
 
 ### Embed and llm models refuse to reprocess published rows unannounced (issue #530)
 
@@ -286,6 +384,7 @@ requests — the project is compiled, the warehouse connected and the store
 opened every time. Only Python's ~1s process startup is amortized, so the CLI
 figures are representative of a long-lived server's steady state rather than an
 artifact of per-invocation startup. Amortizing them is a separate change.
+
 ### Approximate search can return true distances, not quantized ones (issue #520)
 
 #520 reported that an attribute filter, worth a ~60x speedup under `search:
@@ -336,6 +435,7 @@ serve`, with citations naming the document, the section or slide, and the
 against an in-memory Drive, so the default suite needs no credentials; a
 credential-gated test covers the live API. This is the one first-party SaaS
 source ADR-0006 allows, because Drive is file-grained.
+
 ### SaaS context: land, then render (issue #352)
 
 "Can stel read my Notion?" now has one answer, written down. stel ships no

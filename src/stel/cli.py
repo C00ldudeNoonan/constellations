@@ -2218,6 +2218,15 @@ def mcp_serve(
         "name=model.column (repeatable). Enum-field outputs fit directly."
     ),
 )
+@click.option(
+    "--names-model",
+    default=None,
+    help=(
+        "Model giving concepts their display names, keyed `canonical_id` with "
+        "`display_name` and an optional `description`. Without it a concept "
+        "shows its most frequent mention text."
+    ),
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -2235,6 +2244,7 @@ def concept_cloud(
     embed_model: str | None,
     with_query_log: bool,
     dimensions: tuple[str, ...],
+    names_model: str | None,
     verbose: int,
 ) -> None:
     """Render the self-contained 3D concept-cloud artifact (#255).
@@ -2280,6 +2290,7 @@ def concept_cloud(
             embed_model=embed_model,
             with_query_log=with_query_log,
             dimension_specs=dimension_specs or None,
+            names_model=names_model,
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e

@@ -266,7 +266,7 @@ def test_read_relation_rejects_hostile_names(tmp_path: Path) -> None:
         {"type": "duckdb", "path": str(tmp_path / "q.duckdb"), "schema": "main"}
     )
     with create_adapter(cfg) as adapter:
-        with pytest.raises(Exception, match="invalid"):
+        with pytest.raises(ValueError, match="invalid"):
             adapter.read_relation("rawdata.posts; DROP TABLE x")
 
 

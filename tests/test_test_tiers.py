@@ -163,3 +163,39 @@ def test_the_known_cross_imports_have_not_quietly_grown() -> None:
         f"these are no longer cross-importing, so drop them from "
         f"_KNOWN_CROSS_IMPORTS: {stale}"
     )
+
+
+def test_no_new_bare_exception_pins() -> None:
+    """`pytest.raises(Exception, match=...)` is a weak assertion (#518).
+
+    It passes when *any* exception carries that text, so a test meant to prove
+    "config rejects this" also passes when an unrelated crash happens to
+    mention the same word. Twenty-three of these were tightened to the type
+    actually raised, discovered by instrumenting the runs rather than by
+    reading the code.
+
+    Two remain and say why in a comment beside them: one asserts DuckDB's own
+    `BinderException`, which is a vendored internal with no compatibility
+    promise, and one only runs where symlinks can be created, so its real type
+    was never observed and narrowing on a guess would be worse than an
+    honestly broad pin.
+    """
+    # This file names the pattern in prose and in the check below, so it
+    # would otherwise report itself.
+    allowed = {"test_identifier_quoting.py", "test_promotion.py",
+               Path(__file__).name}
+    offenders = []
+    for path in sorted(TESTS.glob("test_*.py")):
+        if path.name in allowed:
+            continue
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if "pytest.raises(Exception" in line:
+                offenders.append(f"{path.name}:{number}")
+
+    assert not offenders, (
+        "pin the exception type actually raised rather than `Exception`; if it "
+        "genuinely has to be broad, say why beside it and add the file to "
+        f"`allowed` here: {offenders}"
+    )

@@ -1324,7 +1324,7 @@ def test_a_failure_mid_run_keeps_the_batches_that_committed(
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(DuckDBAdapter, "replace_children", _fail_on_third)
-    with pytest.raises(Exception, match="warehouse blew up"):
+    with pytest.raises(RuntimeError, match="warehouse blew up"):
         run_project(project)
 
     # Two batches committed before the failure, and their state advanced.
@@ -1437,7 +1437,7 @@ def test_a_later_batch_that_adds_a_column_still_reconciles_schema(
 
     # The edited module changes code_version, so every parent reprocesses —
     # batch 1 (d0) emits the original schema, batch 2 (d1) adds a column.
-    with pytest.raises(Exception, match="Schema change"):
+    with pytest.raises(RunError, match="Schema change"):
         run_project(project)
 
 

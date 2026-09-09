@@ -89,6 +89,32 @@ _KNOWN_CROSS_IMPORTS = {
 }
 
 
+def _imported_test_modules(node: ast.AST) -> list[str]:
+    """Every sibling test module one import statement reaches, in any form.
+
+    Three spellings reach the same place and only one of them was caught
+    (Codex review, #518):
+
+        from tests.test_x import helper    ImportFrom, module="tests.test_x"
+        import tests.test_x                Import,     alias="tests.test_x"
+        from tests import test_x           ImportFrom, module="tests", alias
+
+    A contract that only rejects the first is worse than none, because it
+    reads as enforcement while two ordinary spellings walk past it.
+    """
+    if isinstance(node, ast.Import):
+        return [a.name for a in node.names if a.name.startswith("tests.test_")]
+    if isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        if module.startswith("tests.test_"):
+            return [module]
+        if module == "tests":
+            return [
+                f"tests.{a.name}" for a in node.names if a.name.startswith("test_")
+            ]
+    return []
+
+
 def test_no_new_test_module_imports_another_test_module() -> None:
     """Shared fixtures live in a support module, not in a sibling test (#518).
 
@@ -106,12 +132,10 @@ def test_no_new_test_module_imports_another_test_module() -> None:
     for path in sorted(TESTS.glob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                "tests.test_"
-            ):
-                if (path.name, node.module) in _KNOWN_CROSS_IMPORTS:
+            for target in _imported_test_modules(node):
+                if (path.name, target) in _KNOWN_CROSS_IMPORTS:
                     continue
-                offenders.append(f"{path.name} -> {node.module}:{node.lineno}")
+                offenders.append(f"{path.name} -> {target}:{node.lineno}")
 
     assert not offenders, (
         "test modules must not import from each other; move the shared helper "

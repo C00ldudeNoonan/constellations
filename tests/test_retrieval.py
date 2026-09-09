@@ -69,6 +69,11 @@ from tests.support_retrieval import (
 # does either is missing this.
 pytestmark = pytest.mark.e2e
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 
 

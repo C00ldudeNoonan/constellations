@@ -22,6 +22,11 @@ from stel.retrieval.servability import (
     index_build_peak_bytes,
 )
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 # The corpus from issue #473: 3,613,979 rows x 768 float32 on a 20 GiB box.
 _ROWS = 3_613_979
 _DIMS = 768

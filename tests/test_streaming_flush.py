@@ -27,6 +27,11 @@ from stel.providers import (
 from stel.runner import RunError, run_project
 from stel.synth import generate_invoice_texts, generate_invoices
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 @pytest.fixture
 def flushing_project(tmp_path: Path, example_project_dir: Path) -> Path:

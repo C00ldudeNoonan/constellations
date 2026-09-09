@@ -27,6 +27,11 @@ from stel.retrieval_eval import RetrievalEvalError, RetrievalTestResult
 from stel.retrieval_metrics import QueryDiagnosis, QueryMetrics
 from stel.runner import run_project
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 # Three documents. At a large chunk size the labor report, which carries both
 # query terms twice, outranks the release calendar for "payroll unemployment";
 # at a small one the report splits into fragments carrying one term each and

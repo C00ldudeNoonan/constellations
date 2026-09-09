@@ -12,6 +12,11 @@ from stel.config.model import ModelConfig
 from stel.runner import RunError, _prepare_subset_run, run_project
 from stel.synth import generate_invoices
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 def _extraction_model(
     name: str, materialization: Literal["full", "incremental"] = "incremental"

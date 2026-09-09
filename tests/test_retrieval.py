@@ -58,6 +58,11 @@ from stel.retrieval.retention import (
 )
 from stel.runner import RunError, run_project
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 def _write_project(tmp_path: Path, *, allow_public: bool = True) -> None:
     (tmp_path / "sources").mkdir()

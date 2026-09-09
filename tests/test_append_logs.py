@@ -10,6 +10,7 @@ explicit opt-in).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,11 @@ from stel.append_log import (
 )
 from stel.config.profile import QueryLogConfig, RunLogConfig
 from stel.execution.contracts import ModelRunResult
+
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `tests/test_test_tiers.py` fails if this is
+# missing from a file that does.
+pytestmark = pytest.mark.e2e
 
 # ─── the shared mechanism ───────────────────────────────────────────────────
 
@@ -420,3 +426,43 @@ def test_provider_reported_cost_stands_in_when_no_estimate_exists() -> None:
     )
 
     assert rows[0]["estimated_cost_usd"] == pytest.approx(0.5)
+
+
+def test_a_cli_run_configures_logging_process_wide() -> None:
+    """First half of a pair (#518). Does what `stel ... -v` does: turns off
+    propagation on the `stel` logger so progress lines reach the operator
+    rather than a parent handler."""
+    from stel.logging_setup import configure_verbose_logging
+
+    configure_verbose_logging(verbosity=1)
+    assert logging.getLogger("stel").propagate is False
+
+
+def test_a_later_log_assertion_still_sees_stel_records(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Second half: the test after it must not inherit that.
+
+    `caplog` listens on the *root* logger, so a leaked `propagate = False`
+    silently blinds every later assertion about a `stel` record. That was
+    real -- one CLI test in `test_search.py` broke
+    `test_a_failed_log_write_does_not_raise` here whenever the two files ran
+    together -- and the full suite passed anyway, because a third file
+    happened to reconfigure logging in between. **CI could not catch it**; it
+    appeared only when someone ran a subset.
+
+    The autouse fixture in `conftest.py` restores the logger between tests.
+    This pair is what fails if it stops.
+    """
+    assert logging.getLogger("stel").propagate is True
+
+    written = write_rows(
+        _BrokenAdapter(),
+        RunLogConfig(enabled=True, relation="stel_run_log"),
+        [{"n": 1}],
+        schema={"n": pl.Int64},
+        what="the run log",
+    )
+
+    assert written == 0
+    assert "Could not write the run log" in caplog.text

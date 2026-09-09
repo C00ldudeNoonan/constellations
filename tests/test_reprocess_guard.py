@@ -14,6 +14,11 @@ from stel.reprocess_guard import format_refusals, guard_reprocess
 from stel.runner import RunError, build_project, run_project
 from stel.versioning import compute_code_version
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
 

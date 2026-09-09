@@ -87,11 +87,64 @@ uv run pytest -q
 
 Use targeted tests while iterating, then run the full audit/lint/type/test set
 before handing off implementation, configuration, template, or dependency
-changes. Run `uv build` for packaging or release changes. The default suite must
+changes. `uv run pytest -q -m "not e2e"` is the fast loop -- 2,521 tests in
+~82s against ~396s for everything -- and CI runs the whole suite regardless. Run `uv build` for packaging or release changes. The default suite must
 not require live provider or cloud credentials; opt-in integration tests must be
 credential-gated and have deterministic unit coverage. Update `uv.lock` only
 when required by an intentional `pyproject.toml` metadata or dependency change,
 and exclude unrelated resolution churn.
+
+## Tests
+
+The suite is the main safety net for a project with one user and no staging
+environment, so it is worth stating what it is for. These are habits the suite
+already follows; writing them down is what keeps a new test held to them rather
+than added by accretion (issue #518).
+
+- **Every documented behavior gets a pin.** Docs cannot drift from code, and
+  error messages are product: a user reads them, so a change to one is a change
+  to the product.
+- **Every incident gets its test.** The fix is a claim; the test is what keeps
+  it fixed. Cite the issue in the docstring so the next reader knows what the
+  case is defending.
+- **Contracts as data.** `test_reentry_contract.py` and `test_frozen_names.py`
+  fail when a step or a name appears without a row. A contract nobody can add
+  to silently is worth more than a document.
+- **Examples run.** Every README claim is executed, never only asserted in
+  prose.
+- **Doubles, not mocks of the network.** `FakeRepository`, `FakeSearch`,
+  `_FakeStorageClient` and `FakeDrive` implement the same protocol as the real
+  client, so a signature change breaks them.
+
+**Two tiers.** A file that calls `run_project`, `create_store` or
+`export_concept_cloud` declares `pytestmark = pytest.mark.e2e`. Those 59 of 158
+files carry roughly 80% of the suite's wall clock, so `-m "not e2e"` is the
+loop worth running between edits and the full suite is what you run before
+handing off. `test_test_tiers.py` fails if a file that runs a project is
+missing the marker, and again if the e2e files ever become the majority --
+the split is a contract, not a convention, because a fast tier nobody trusts
+is one everybody stops using.
+
+**One test per distinct failure mode, never one per line of a description.**
+Two tests that fail together for the same reason are one test and one
+maintenance cost.
+
+**A test that cannot fail is worse than no test**, because it reports safety it
+does not provide. When a test guards something load-bearing -- a security
+property, an ordering guarantee, a rule the code comments argue for -- break
+the code deliberately and watch it fail before trusting it. Restore by copying
+a backup, never with `git checkout --`, which discards uncommitted work. Real
+examples this caught: a query-log test that asserted rows written *after* the
+buffer flushed on close, so it passed against the very bug it was written for;
+and a concept-cloud test whose period axis assertion held for both the correct
+and the broken derivation.
+
+**Isolate process-global state.** Logging configuration, module-level caches
+and environment variables outlive the test that set them, and the resulting
+failure surfaces in an unrelated file -- or, worse, only in a subset run that
+CI never performs. Restore such state in an autouse fixture in
+`tests/conftest.py` rather than in the test that happens to touch it, because
+the next test to touch it will not know to.
 
 ## Change, GitHub, and Linear hygiene
 

@@ -14,6 +14,11 @@ from stel.config.model import ModelConfig, TransformConfig
 from stel.runner import run_project
 from stel.sql_models import compile_sql, discover_refs
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 # ── template surface: is_incremental() / this ───────────────────────────────
 
 def test_discover_refs_allows_is_incremental_call() -> None:

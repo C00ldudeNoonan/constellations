@@ -22,6 +22,11 @@ from stel.config.source import SourceConfig, validate_relation_name
 from stel.sources import DocumentRef, SourceError, get_document_source
 from stel.sources.warehouse import WarehouseDocumentSource
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 # ─── config surface ─────────────────────────────────────────────────────────
 
 

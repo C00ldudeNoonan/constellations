@@ -11,11 +11,17 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from stel.cli import cli
 from stel.manifest import build_run_results
 from stel.runner import run_project
+
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
 
 SELECTOR_WARNING = "selector '.price' for field 'price' matched nothing"
 

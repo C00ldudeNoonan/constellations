@@ -18,6 +18,11 @@ from stel.providers.deterministic import DeterministicEmbeddingProvider
 from stel.runner import RunError, run_project
 from stel.versioning import compute_model_code_version
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 def _embedding_project(tmp_path: Path) -> Path:
     project = tmp_path / "project"

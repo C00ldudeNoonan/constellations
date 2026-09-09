@@ -10,6 +10,11 @@ from stel.manifest import write_run_results
 from stel.runner import run_project
 from stel.synth import generate_invoices, generate_support_tickets
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 @pytest.fixture
 def fresh_project(tmp_path: Path, example_project_dir: Path) -> Path:

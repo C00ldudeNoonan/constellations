@@ -19,6 +19,11 @@ from stel.runner import run_project
 from stel.sources import GoogleDriveDocumentSource
 from tests.test_gdrive_source import ROOT, FakeDrive
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 _EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "google_drive_context"
 _T = "2026-08-20T09:00:00.000Z"
 

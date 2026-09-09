@@ -18,6 +18,7 @@ import pytest
 from stel.credentials import CredentialReference
 from stel.hashing import canonical_fingerprint
 from stel.retrieval import LanceDBStore, RetrievalError, StoreRole, parse_store_config
+from stel.retrieval.base import RetrievalConfigError
 from stel.retrieval.lancedb import LanceDBConfig
 
 
@@ -71,7 +72,7 @@ def test_storage_options_default_empty() -> None:
      "password", "api_key", "gcs_credential"],
 )
 def test_secret_looking_key_rejected_from_routing(secret_key: str) -> None:
-    with pytest.raises(Exception, match="non-secret routing only"):
+    with pytest.raises(RetrievalConfigError, match="non-secret routing only"):
         _config("gs://bucket/prefix", storage_options={secret_key: "x"})
 
 
@@ -88,13 +89,13 @@ def test_storage_options_env_reference_is_redacted() -> None:
 
 
 def test_empty_path_rejected() -> None:
-    with pytest.raises(Exception, match="non-empty local path or cloud URI"):
+    with pytest.raises(RetrievalConfigError, match="non-empty local path or cloud URI"):
         _config("   ")
 
 
 @pytest.mark.parametrize("bad", ["s3://", "gs://", "gs:///prefix", "az:///c/p"])
 def test_malformed_cloud_uri_rejected_at_parse_time(bad: str) -> None:
-    with pytest.raises(Exception, match="must include a bucket/container"):
+    with pytest.raises(RetrievalConfigError, match="must include a bucket/container"):
         _config(bad)
 
 

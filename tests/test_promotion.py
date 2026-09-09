@@ -17,6 +17,7 @@ import duckdb
 import pytest
 import yaml
 
+from stel.config import ConfigError
 from stel.promotion import GoldenSetFile, PromotionError, load_golden_set
 from stel.retrieval_eval import run_retrieval_evaluation
 from stel.runner import run_project
@@ -339,7 +340,7 @@ def test_promoting_in_the_wrong_id_space_fails_loudly(tmp_path: Path) -> None:
     # The index keys on chunk_id; promote context_ids instead.
     _write_promotion(project, id_space="context_id", queries=[_promoted(project)])
 
-    with pytest.raises(Exception, match="context_id"):
+    with pytest.raises(ConfigError, match="context_id"):
         run_project(project, select="promoted_goldens")
 
 
@@ -365,7 +366,7 @@ def test_an_invalid_promotion_fails_before_anything_executes(tmp_path: Path) -> 
         ],
     )
 
-    with pytest.raises(Exception, match="context_id"):
+    with pytest.raises(ConfigError, match="context_id"):
         run_project(project)
 
     # Nothing ran: no warehouse file, so no extraction, embedding, or publish.
@@ -403,6 +404,10 @@ def test_a_symlinked_promotion_artifact_is_refused(tmp_path: Path) -> None:
     except OSError:  # pragma: no cover - platform-dependent privilege
         pytest.skip("creating symlinks requires privileges on this platform")
 
+    # Left broad (issue #518): this case only runs where symlinks can be
+    # created, which is not this machine, so the real type was never
+    # observed. Narrowing it on a guess would be a worse test than an
+    # honestly broad one.
     with pytest.raises(Exception, match="symlink"):
         run_project(project)
 
@@ -417,7 +422,7 @@ def test_a_path_outside_the_project_is_refused(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(Exception, match="outside the project"):
+    with pytest.raises(ConfigError, match="outside the project"):
         run_project(project)
 
 
@@ -425,7 +430,7 @@ def test_an_unknown_search_model_is_refused(tmp_path: Path) -> None:
     project = _project(tmp_path, search_model="no_such_model")
     _write_promotion(project, id_space="chunk_id", queries=[])
 
-    with pytest.raises(Exception, match="not a model in this project"):
+    with pytest.raises(ConfigError, match="not a model in this project"):
         run_project(project)
 
 

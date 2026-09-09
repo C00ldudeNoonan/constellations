@@ -1277,7 +1277,7 @@ def test_online_policy_is_refused_when_the_store_cannot_build_private_generation
     )
     monkeypatch.setattr(LanceDBStore, "capabilities", classmethod(lambda cls: reduced))
 
-    with pytest.raises(Exception, match="private_generation_build"):
+    with pytest.raises(ConfigError, match="private_generation_build"):
         validate_retrieval_capabilities(models, project, resolved)
 
 
@@ -1347,7 +1347,7 @@ def test_a_store_config_refusal_stops_the_compile(
         lambda self, *, vector_search, vector_index: "this store will not build that index",
     )
 
-    with pytest.raises(Exception, match="will not build that index"):
+    with pytest.raises(ConfigError, match="will not build that index"):
         validate_retrieval_capabilities(models, project, resolved)
 
 
@@ -2089,7 +2089,7 @@ def test_compiler_points_a_type_refusal_at_the_index_field(
         lambda self, *, vector_search, vector_index: f"no {vector_index} here",
     )
 
-    with pytest.raises(Exception, match=r"no ivf_pq here") as error:
+    with pytest.raises(ConfigError, match=r"no ivf_pq here") as error:
         validate_retrieval_capabilities(models, project, resolved)
     assert "index" in str(error.value)
 

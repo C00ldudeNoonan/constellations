@@ -89,7 +89,7 @@ _KNOWN_CROSS_IMPORTS = {
 }
 
 
-def _imported_test_modules(node: ast.AST) -> list[str]:
+def _imported_test_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     """Every sibling test module one import statement reaches, in any form.
 
     Three spellings reach the same place and only one of them was caught
@@ -132,6 +132,11 @@ def test_no_new_test_module_imports_another_test_module() -> None:
     for path in sorted(TESTS.glob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
+            # Narrowed before use so `node.lineno` is known to exist: `ast.AST`
+            # does not declare it, and only Linux CI surfaced that, because the
+            # Windows-only `os.mkfifo` diagnostic masked the count locally.
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
             for target in _imported_test_modules(node):
                 if (path.name, target) in _KNOWN_CROSS_IMPORTS:
                     continue

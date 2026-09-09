@@ -1167,20 +1167,31 @@ my_project:
           auto_truncate: false
 ```
 
-**Prefer a regional location to `global` for anything that serves queries.**
+**Prefer a regional location to `global` for embeddings that serve queries.**
 Both work, and `location` is execution routing rather than embedding
 semantics, so changing it does not alter the embedding identity and needs no
-republish. But on a connection that is not already warm, the `global` endpoint
-was measured at ~10.2s per request against ~0.27s for `us-central1` — a fixed
-cost, the same at a 5-second idle gap as at 60, and not attributable to DNS,
-TLS, credential refresh, retry backoff, or connection-pool settings
+republish. But an embedding request on a connection that is not already warm
+was measured at ~10.2s against `global`, and ~0.27s against `us-central1`
 (issue #536).
 
-That only bites a sparse request pattern. A bulk `embed:` backfill issues
-requests back to back, keeps its connections warm and barely notices. An
-agent querying a served index a few seconds apart pays it on every query, and
-it dominated the query profile until it was found. `global` remains the right
-choice when a model or quota is only available there.
+The cost is **the server's time to first byte on a new connection**, and
+nothing on the client. An httpcore trace of a cold call puts 81ms in the TCP
+connect, 47ms in the TLS handshake and 1ms in sending the request, then
+10.327s waiting for the first response byte; a second call on the same
+connection answers in 0.168s. It is not DNS, TLS, credential refresh, retry
+backoff, or connection-pool settings — raising httpx's `keepalive_expiry`
+changes nothing, because the connection is closed either way before the next
+request.
+
+It is also specific to embeddings rather than to `global` as such: a
+`gemini-2.5-flash-lite` inference call over the same `global` endpoint answers
+in 0.48s after the same idle gap. Only the embedding service shows it.
+
+That means it bites exactly one request pattern: a sparse one. A bulk `embed:`
+backfill issues requests back to back, keeps its connection warm, and barely
+notices. An agent querying a served index a few seconds apart pays it on every
+query, and it dominated the query profile until it was found. `global` remains
+the right choice when a model or quota is only available there.
 
 The model ID and output dimensionality remain reviewable model semantics:
 

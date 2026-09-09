@@ -24,6 +24,11 @@ from stel.runner import run_project
 from stel.sources import DocumentRef, DocumentSource, SourceScan
 from stel.versioning import compute_model_code_version
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 def _write_hook(project_dir: Path, source: str) -> Path:
     hook_dir = project_dir / "post_extract"

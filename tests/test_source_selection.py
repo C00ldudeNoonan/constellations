@@ -13,6 +13,11 @@ from stel.manifest import write_run_results
 from stel.runner import build_project, run_project
 from stel.sources import DocumentRef, GCSDocumentSource, LocalDocumentSource
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 @pytest.fixture
 def mixed_source_project(tmp_path: Path) -> Path:

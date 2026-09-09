@@ -35,6 +35,11 @@ from stel.adapters import create_adapter, parse_warehouse_config
 from stel.adapters.serialized import SerializedAdapter
 from stel.budget import LLMBudgetConfig
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 def _adapter(tmp_path: Path) -> Any:
     return create_adapter(

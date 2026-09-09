@@ -25,6 +25,11 @@ from stel.sources import LocalDocumentSource
 from stel.synth import generate_invoices, generate_support_tickets
 from stel.versioning import compute_document_id
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 
 def test_build_runs_and_tests_in_order(fresh_project: Path) -> None:
     generate_invoices(10, fresh_project / "data" / "invoices", seed=1)

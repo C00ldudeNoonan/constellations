@@ -10,6 +10,11 @@ import pytest
 from stel.manifest import build_manifest
 from stel.runner import RunError, run_project
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 _PROJECT_YML = "name: llmmodels\nversion: '0.1.0'\nprofile: llmmodels\n"
 _PROFILES_YML = (
     "llmmodels:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"

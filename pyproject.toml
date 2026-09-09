@@ -112,4 +112,10 @@ include = ["src/stel", "typecheck", "tests", "examples", "scripts"]
 missing-type-argument = "error"
 
 [tool.pytest.ini_options]
+# Test tiers (issue #518). `e2e` marks a file that runs a whole project or
+# opens a retrieval store: ~80% of the suite's wall clock lives there, so
+# `-m "not e2e"` is the fast local loop and CI still runs everything.
+markers = [
+    "e2e: runs a whole project or opens a retrieval store",
+]
 testpaths = ["tests"]

@@ -59,6 +59,11 @@ from stel.execution.embed import _INPUT_BATCH_ROWS
 from stel.execution.llm import _INPUT_BATCH_ROWS as _LLM_INPUT_BATCH_ROWS
 from stel.runner import run_project
 
+# Runs a whole project or opens a retrieval store, so it belongs to the
+# `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
+# does either is missing this.
+pytestmark = pytest.mark.e2e
+
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "stel"
 
 # A read whose residency is bounded by something other than the corpus.

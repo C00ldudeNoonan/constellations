@@ -497,6 +497,33 @@ def dag_plane_from_stel_manifest(manifest: dict[str, Any]) -> tuple[DagPlane, di
     return DagPlane(nodes=tuple(nodes), edges=tuple(edges)), id_by_name
 
 
+def _dbt_source_ids(manifest: dict[str, Any]) -> dict[tuple[str, str], str]:
+    """Map (source name, table name) to each source node's dbt `unique_id`.
+
+    dbt's grammar for a source unique_id is
+    `source.<dbt_project>.<source_name>.<table>` -- four segments, with the
+    *dbt project's* name in the second. stel used to rebuild the id as
+    `source.<source_name>.<table>`, which never matches a real manifest, so
+    `--dbt-manifest` failed for every consumer project and the error told the
+    operator to fix the one thing that was already right (issue #552).
+
+    Read from the manifest's own `source_name` and `name` fields rather than
+    parsed out of the id, because those are what dbt records and they cannot
+    drift from the id grammar. The positional fallback covers a hand-written
+    manifest that omits them, and works for either segment count: the source
+    and table are always the last two.
+    """
+    ids: dict[tuple[str, str], str] = {}
+    for uid, entry in manifest.get("sources", {}).items():
+        segments = uid.split(".")
+        source = entry.get("source_name") or (
+            segments[-2] if len(segments) >= 2 else uid
+        )
+        table = entry.get("name") or segments[-1]
+        ids[(str(source), str(table))] = uid
+    return ids
+
+
 def dag_plane_from_dbt_manifest(manifest: dict[str, Any]) -> DagPlane:
     """Plane from a downstream dbt `manifest.json` (sources + models + exposures,
     lineage from `parent_map`)."""
@@ -557,23 +584,24 @@ def export_concept_cloud(
         manifest = json.loads(Path(dbt_manifest).read_text(encoding="utf-8"))
         dag_plane = dag_plane_from_dbt_manifest(manifest)
         source = source_name or default_dbt_source_name(project.name)
-        linking_node_id = f"source.{source}.{linking_model}"
+        source_ids = _dbt_source_ids(manifest)
+        linking_node_id = source_ids.get((source, linking_model))
         # The cross-layer edges are the entire reason to pass a dbt manifest,
         # and they are built only for a node id that resolves. A name that does
         # not match what the consumer's project actually declares used to
         # render a cloud with the DAG join silently missing, which looks like a
         # working export.
-        if linking_node_id not in {node.id for node in dag_plane.nodes}:
-            declared = sorted(
-                node.id.split(".")[1]
-                for node in dag_plane.nodes
-                if node.id.startswith("source.")
-            )
+        if linking_node_id is None or linking_node_id not in {
+            node.id for node in dag_plane.nodes
+        }:
+            declared = sorted({name for name, _ in source_ids})
             raise ConceptCloudExportError(
-                f"'{linking_node_id}' is not in the dbt manifest, so the "
-                f"concept-to-DAG edges would be empty. Pass --source-name to "
-                f"match what `emit-dbt-sources --source-name` wrote into that "
-                f"project. Sources it declares: {sorted(set(declared)) or '(none)'}."
+                f"'{linking_model}' is not declared as a source named "
+                f"'{source}' in the dbt manifest, so the concept-to-DAG edges "
+                f"would be empty. The linking model has to appear in that "
+                f"manifest: re-run `emit-dbt-sources --source-name` and merge "
+                f"the result into the consumer project before exporting. "
+                f"Source names it declares: {declared or '(none)'}."
             )
     else:
         target_dir = (project_path / project.target_path).resolve()

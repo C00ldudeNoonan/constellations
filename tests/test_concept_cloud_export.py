@@ -210,9 +210,17 @@ def test_export_concept_cloud_wrapper_stitches_a_dbt_manifest(tmp_path: Path) ->
         adapter.materialize_full("link_entities", _links())
         adapter.materialize_full("extract_relations", _relations())
 
-    linking_source = "source.dbt_ml_economic_data.link_entities"
+    linking_source = (
+        "source.consumer_dbt_project.dbt_ml_economic_data.link_entities"
+    )
     manifest = {
-        "sources": {linking_source: {"name": "link_entities", "resource_type": "source"}},
+        "sources": {
+            linking_source: {
+                "name": "link_entities",
+                "source_name": "dbt_ml_economic_data",
+                "resource_type": "source",
+            }
+        },
         "nodes": {
             "model.economic_data.mart_entity_network": {
                 "name": "mart_entity_network", "resource_type": "model"
@@ -266,10 +274,22 @@ def _manifest_project(tmp_path: pathlib.Path) -> None:
         adapter.materialize_full("link_entities", _links())
 
 
-def _write_manifest(tmp_path: pathlib.Path, linking_source: str) -> pathlib.Path:
+def _write_manifest(tmp_path: pathlib.Path, source_name: str) -> pathlib.Path:
+    """A manifest shaped the way dbt actually writes one (issue #552).
+
+    dbt's unique_id for a source table is
+    `source.<dbt_project>.<source_name>.<table>` -- four segments, with the
+    dbt project's name second. The fixtures used to use three, which is a
+    shape dbt never produces, so the tests agreed with the bug: the lookup
+    rebuilt a three-segment id and matched a fixture that had one.
+    """
     manifest = {
         "sources": {
-            linking_source: {"name": "link_entities", "resource_type": "source"}
+            f"source.consumer_dbt_project.{source_name}.link_entities": {
+                "name": "link_entities",
+                "source_name": source_name,
+                "resource_type": "source",
+            }
         },
         "nodes": {},
         "exposures": {},
@@ -287,8 +307,7 @@ def test_source_name_override_reaches_the_dbt_manifest_lookup(
     records, so the concept-cloud lookup has to be told the same name. It used
     to reconstruct the default and ignore the override entirely."""
     _manifest_project(tmp_path)
-    linking_source = "source.econ_custom.link_entities"
-    manifest_path = _write_manifest(tmp_path, linking_source)
+    manifest_path = _write_manifest(tmp_path, "econ_custom")
 
     export = export_concept_cloud(
         tmp_path,
@@ -296,7 +315,11 @@ def test_source_name_override_reaches_the_dbt_manifest_lookup(
         dbt_manifest=manifest_path,
         source_name="econ_custom",
     )
-    assert {e.dag_node for e in export.cross_layer_edges} == {linking_source}
+    # The four-segment id dbt writes, resolved from the manifest's own fields
+    # rather than rebuilt from the source name (issue #552).
+    assert {e.dag_node for e in export.cross_layer_edges} == {
+        "source.consumer_dbt_project.econ_custom.link_entities"
+    }
 
 
 def test_a_source_name_that_does_not_resolve_is_an_error_not_an_empty_join(
@@ -306,7 +329,7 @@ def test_a_source_name_that_does_not_resolve_is_an_error_not_an_empty_join(
     zero of them and reporting success renders a cloud that looks fine and is
     missing the feature that was asked for."""
     _manifest_project(tmp_path)
-    manifest_path = _write_manifest(tmp_path, "source.econ_custom.link_entities")
+    manifest_path = _write_manifest(tmp_path, "econ_custom")
 
     with pytest.raises(ConceptCloudExportError) as excinfo:
         export_concept_cloud(
@@ -315,8 +338,11 @@ def test_a_source_name_that_does_not_resolve_is_an_error_not_an_empty_join(
             dbt_manifest=manifest_path,
         )
     message = str(excinfo.value)
-    assert "source.dbt_ml_economic_data.link_entities" in message
-    assert "--source-name" in message
+    assert "'link_entities' is not declared as a source named" in message
+    assert "dbt_ml_economic_data" in message
+    # The linking model has to be in the manifest at all, which is the step
+    # that is actually missing when this fires (issue #552).
+    assert "emit-dbt-sources" in message
     # The message has to name what the manifest does declare, or the operator
     # has nothing to correct it to.
     assert "econ_custom" in message
@@ -470,3 +496,90 @@ def test_dimension_values_outside_the_declared_set_cannot_ship() -> None:
             dimensions=(DimensionDef(name="tone", values=("positive",),
                                      source="column"),),
         )
+
+
+def test_a_real_dbt_manifest_id_resolves(tmp_path: pathlib.Path) -> None:
+    """The shape a real consumer manifest has (issue #552).
+
+    dbt writes `source.<dbt_project>.<source_name>.<table>`. stel rebuilt the
+    id as `source.<source_name>.<table>`, so `--dbt-manifest` failed against
+    every real manifest, and the error's "sources it declares" hint listed the
+    dbt *project* name -- pointing the operator at a `--source-name` value
+    that could not work, when the one they passed was already right.
+
+    The id here is copied from the report: the astrolabe project's own
+    manifest, whose sources were written by `emit-dbt-sources --source-name
+    dbt_ml_document_extraction`.
+    """
+    _manifest_project(tmp_path)
+    linking_source = (
+        "source.dbt_project.dbt_ml_document_extraction.link_entities"
+    )
+    manifest = {
+        "sources": {
+            linking_source: {
+                "name": "link_entities",
+                "source_name": "dbt_ml_document_extraction",
+                "resource_type": "source",
+            }
+        },
+        "nodes": {
+            "model.dbt_project.mart_entity_network": {
+                "name": "mart_entity_network",
+                "resource_type": "model",
+            }
+        },
+        "exposures": {},
+        "parent_map": {"model.dbt_project.mart_entity_network": [linking_source]},
+    }
+    manifest_path = tmp_path / "dbt_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    export = export_concept_cloud(
+        tmp_path,
+        linking_model="link_entities",
+        dbt_manifest=manifest_path,
+        source_name="dbt_ml_document_extraction",
+    )
+
+    assert {e.dag_node for e in export.cross_layer_edges} == {linking_source}
+
+
+def test_the_unresolved_hint_lists_source_names_not_the_dbt_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The hint pointed at the wrong thing in exactly the case it exists for.
+
+    Reading `unique_id.split(".")[1]` yields the dbt project name for a real
+    four-segment id, so an operator was told to pass `--source-name
+    dbt_project` -- a value that can never match (issue #552).
+    """
+    _manifest_project(tmp_path)
+    manifest = {
+        "sources": {
+            "source.dbt_project.dbt_ml_document_extraction.link_entities": {
+                "name": "link_entities",
+                "source_name": "dbt_ml_document_extraction",
+                "resource_type": "source",
+            }
+        },
+        "nodes": {},
+        "exposures": {},
+        "parent_map": {},
+    }
+    manifest_path = tmp_path / "dbt_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ConceptCloudExportError) as excinfo:
+        export_concept_cloud(
+            tmp_path,
+            linking_model="link_entities",
+            dbt_manifest=manifest_path,
+            source_name="wrong_name",
+        )
+
+    message = str(excinfo.value)
+    assert "dbt_ml_document_extraction" in message
+    # The dbt project name is not a source name and must not be offered as one.
+    assert "dbt_project'" not in message
+    assert "['dbt_project']" not in message

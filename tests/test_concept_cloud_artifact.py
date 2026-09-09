@@ -276,3 +276,68 @@ def test_the_viewer_escapes_warehouse_text_before_it_becomes_markup() -> None:
     # No unescaped interpolation of node text is left in the detail panel.
     assert "${node.name}" not in html
     assert "${node.id}" not in html
+
+
+# ─── v3: the period slider (issue #553) ─────────────────────────────────────
+
+
+def _timed_export() -> ConceptCloudExport:
+    """A bundle with a period axis, as `--time-field` produces."""
+    return ConceptCloudExport(
+        generated_at="2026-01-01T00:00:00Z",
+        project="timed",
+        dag_plane=DagPlane(nodes=()),
+        concepts=(
+            Concept(
+                canonical_id="FERC", display="FERC", frequency=3,
+                provenance=Provenance(model="link_entities", documents=3),
+                by_period={"2019": 1, "2020": 1, "2021": 1},
+            ),
+            Concept(
+                canonical_id="COVID", display="COVID-19", frequency=2,
+                provenance=Provenance(model="link_entities", documents=2),
+                by_period={"2020": 2},
+            ),
+        ),
+        periods=("2019", "2020", "2021"),
+    )
+
+
+def test_the_period_slider_is_wired_to_the_bundle_axis() -> None:
+    """v3 (#553): a period control that steps the axis the bundle carries."""
+    html = render_concept_cloud(_timed_export())
+
+    assert 'id="period"' in html and 'id="period-ctl"' in html
+    # The axis comes from the bundle, not from the concepts.
+    assert "DATA.periods" in html
+    # Stop 0 is "all periods", so the totals stay one drag away.
+    assert 'id="period-val">all<' in html
+    assert "periodFreq" in html and "periodWeight" in html
+
+
+def test_the_period_control_stays_hidden_without_an_axis() -> None:
+    """A bundle with no time field must not grow a slider over nothing."""
+    html = render_concept_cloud(placeholder_export())
+    island = _extract_data_island(html)
+
+    assert island["periods"] == []
+    # Present in the template but not shown: the control reveals itself only
+    # when `DATA.periods` is non-empty.
+    assert 'id="period-ctl" style="display:none"' in html
+
+
+def test_the_period_never_feeds_the_force_simulation() -> None:
+    """Layout is computed once over every period, so a star that grows is
+    recognisably the same star (#553, and #555's first item).
+
+    `nodeVal` drives the simulation, so it must read the *total*. The period
+    changes only what a star looks like — its drawn radius — and whether it
+    is shown at all.
+    """
+    html = render_concept_cloud(_timed_export())
+
+    # The simulation reads the unchanging total...
+    assert ".nodeVal(n => n.kind === \"dag\" ? 6 : Math.max(2, n.val))" in html
+    # ...while appearance and visibility read the period.
+    assert "starRadius(periodFreq(n)) / n.__baseRadius" in html
+    assert "if (period !== null && freq === 0) return false;" in html

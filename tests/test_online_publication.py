@@ -18,11 +18,11 @@ from stel.retrieval.coordination import (
 )
 from stel.retrieval.retention import retire_superseded_generations
 from stel.runner import RunError, run_project
-from tests.test_retrieval import (
-    _materialize_upstream,
-    _rows,
-    _set_index_change_policy,
-    _write_project,
+from tests.support_retrieval import (
+    materialize_upstream,
+    prepare_online_switch,
+    sample_rows,
+    write_project,
 )
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
@@ -31,27 +31,10 @@ from tests.test_retrieval import (
 pytestmark = pytest.mark.e2e
 
 
-def _prepare(project: Path) -> tuple[Any, Any]:
-    _write_project(project)
-    _set_index_change_policy(project, "online")
-    _materialize_upstream(project, _rows())
-    run_project(project, select="context_search")
-    path = project / "models" / "retrieval.yml"
-    path.write_text(
-        path.read_text(encoding="utf-8")
-        .replace("search: exact", "search: approximate")
-        .replace("batch_size: 2", "batch_size: 1"),
-        encoding="utf-8",
-    )
-    return resolve_serving_scope(
-        project, profiles_dir=None, target=None, model_name="context_search"
-    )
-
-
 def test_online_switch_appends_privately_and_preserves_readers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     written: list[str] = []
     real_seed = LanceDBStore.seed_collection
 
@@ -119,7 +102,7 @@ def test_online_switch_appends_privately_and_preserves_readers(
 def test_online_failure_keeps_the_old_index_and_retry_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
@@ -203,7 +186,7 @@ def test_online_failure_keeps_the_old_index_and_retry_succeeds(
 
 
 def test_online_incompatible_change_is_refused_before_claim(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     path = tmp_path / "models" / "retrieval.yml"
     path.write_text(
         path.read_text(encoding="utf-8").replace("metric: cosine", "metric: dot"),
@@ -220,7 +203,7 @@ def test_online_incompatible_change_is_refused_before_claim(tmp_path: Path) -> N
 def test_existing_publisher_is_refused_before_planning_store_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         current = coordinator.status(scope)
@@ -239,7 +222,7 @@ def test_existing_publisher_is_refused_before_planning_store_io(
 
 
 def test_online_subset_change_cannot_replace_the_complete_index(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
@@ -251,7 +234,7 @@ def test_online_subset_change_cannot_replace_the_complete_index(tmp_path: Path) 
 
 
 def test_retirement_waits_for_readers_of_superseded_generations(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
@@ -291,9 +274,9 @@ def test_retirement_waits_for_readers_of_superseded_generations(tmp_path: Path) 
 
 
 def test_online_change_includes_concurrent_warehouse_row_changes(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
-    changed = _rows().with_columns(pl.lit("new title").alias("title"))
-    _materialize_upstream(tmp_path, changed)
+    scope, resolved = prepare_online_switch(tmp_path)
+    changed = sample_rows().with_columns(pl.lit("new title").alias("title"))
+    materialize_upstream(tmp_path, changed)
     [result] = run_project(tmp_path, select="context_search")
     assert result.rows_written == 2
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
@@ -309,8 +292,8 @@ def test_online_change_includes_concurrent_warehouse_row_changes(tmp_path: Path)
 
 
 def test_online_can_replace_with_an_empty_snapshot(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
-    _materialize_upstream(tmp_path, _rows().head(0))
+    scope, resolved = prepare_online_switch(tmp_path)
+    materialize_upstream(tmp_path, sample_rows().head(0))
     [result] = run_project(tmp_path, select="context_search")
     assert result.rows_written == 0
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
@@ -330,7 +313,7 @@ def test_online_can_replace_with_an_empty_snapshot(tmp_path: Path) -> None:
 def test_strategy_can_switch_back_to_exact_without_mutating_ann_generation(
     tmp_path: Path, policy: str,
 ) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
@@ -364,7 +347,7 @@ def test_strategy_can_switch_back_to_exact_without_mutating_ann_generation(
 
 
 def test_online_widens_attributes_in_a_private_generation(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     path = tmp_path / "models" / "retrieval.yml"
     path.write_text(
         path.read_text(encoding="utf-8").replace(
@@ -376,7 +359,7 @@ def test_online_widens_attributes_in_a_private_generation(tmp_path: Path) -> Non
             "          returned: true\n",
         ), encoding="utf-8",
     )
-    _materialize_upstream(tmp_path, _rows().with_columns(pl.lit("filing").alias("section")))
+    materialize_upstream(tmp_path, sample_rows().with_columns(pl.lit("filing").alias("section")))
     run_project(tmp_path, select="context_search")
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         entry = ServingCoordinator(adapter, ensure_schema=True).status(scope)
@@ -395,7 +378,7 @@ def test_online_widens_attributes_in_a_private_generation(tmp_path: Path) -> Non
 
 
 def test_in_place_publish_still_refuses_active_readers(tmp_path: Path) -> None:
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         reader = coordinator.acquire_query(scope)
@@ -413,7 +396,7 @@ def test_online_publish_recovers_a_scope_left_failed_with_no_generation(tmp_path
     `stel serving recover --owner-terminated` ran, and the ledger is `failed`
     with no active generation. The next `online` run must build a private
     generation from the warehouse and activate it, with nothing to retain."""
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
@@ -450,7 +433,7 @@ def test_online_index_type_switch_builds_the_declared_type_privately(tmp_path: P
     activation. `ivf_hnsw_sq` here because this fixture has two rows and
     LanceDB needs 256 to train `ivf_pq`; the PQ build, type switch, and the
     too-small refusal are covered at the store level."""
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")  # approximate, default type
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
@@ -508,7 +491,7 @@ def test_activation_clears_the_generation_scope(tmp_path: Path) -> None:
     generation's state into the serving scope and clears the generation's own;
     the code comment says leaving it would accumulate one dead scope per
     rebuild, and this is what holds it to that."""
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")
 
     with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
@@ -526,7 +509,7 @@ def test_sweeping_an_orphaned_generation_clears_its_scope(
     ever resume — here, one built under a configuration a later run has moved
     past — is swept, and its state has to go with it: #492's incident left
     roughly 2.1M dead rows in `stel_state` this way."""
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
 
     def indexes(*args: Any, **kwargs: Any) -> Any:
         raise RetrievalError("simulated index build failure")
@@ -583,17 +566,17 @@ def test_an_interrupted_in_place_publish_resumes_from_state(
     which writes in place and advances state per page. Killed between two
     pages, the next run must pay for the page that was lost and nothing else:
     rows whose state advanced are not republished (issue #493, part 2)."""
-    _write_project(tmp_path)
+    write_project(tmp_path)
     path = tmp_path / "models" / "retrieval.yml"
     text = path.read_text(encoding="utf-8")
     assert "batch_size: 2" in text
     path.write_text(text.replace("batch_size: 2", "batch_size: 1"), encoding="utf-8")
-    _materialize_upstream(tmp_path, _rows())
+    materialize_upstream(tmp_path, sample_rows())
     [first] = run_project(tmp_path, select="context_search")
     assert first.rows_written == 2
 
     # Every upstream row changes, so the next publish has two pages of work.
-    _materialize_upstream(tmp_path, _rows().with_columns(pl.lit("edited").alias("title")))
+    materialize_upstream(tmp_path, sample_rows().with_columns(pl.lit("edited").alias("title")))
     scope, resolved = resolve_serving_scope(
         tmp_path, profiles_dir=None, target=None, model_name="context_search"
     )
@@ -702,7 +685,7 @@ def test_a_complete_resume_skips_the_warehouse_read(
     a single upstream page — asserted by making any read fail the test."""
     from stel.adapters.base import TableReadSnapshot
 
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     _pin_upstream_generation(monkeypatch, "A")
     _fail_the_index_build_once(tmp_path, monkeypatch)
 
@@ -739,12 +722,12 @@ def test_a_moved_upstream_is_read_on_resume(
     """The complement: the skip is earned by an unchanged upstream, never
     assumed. A different generation on retry means the corpus may differ, and
     the resume reads it — here picking up a row edited in between."""
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     _pin_upstream_generation(monkeypatch, "A")
     _fail_the_index_build_once(tmp_path, monkeypatch)
 
-    _materialize_upstream(
-        tmp_path, _rows().with_columns(pl.lit("edited").alias("title"))
+    materialize_upstream(
+        tmp_path, sample_rows().with_columns(pl.lit("edited").alias("title"))
     )
     _pin_upstream_generation(monkeypatch, "B")
     [retry] = run_project(tmp_path, select="context_search")
@@ -771,11 +754,11 @@ def test_a_resumed_generation_reconciles_deletions(
     not — the failed build wrote rows the retry's stream never mentions, so a
     document removed in between survived in the adopted generation. Runs
     unpatched, on the read path."""
-    scope, resolved = _prepare(tmp_path)
+    scope, resolved = prepare_online_switch(tmp_path)
     _fail_the_index_build_once(tmp_path, monkeypatch)
 
     # One of the two upstream rows disappears before the retry.
-    _materialize_upstream(tmp_path, _rows().head(1))
+    materialize_upstream(tmp_path, sample_rows().head(1))
     [retry] = run_project(tmp_path, select="context_search")
 
     assert retry.documents_deleted == 1

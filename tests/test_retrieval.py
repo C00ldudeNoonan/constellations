@@ -57,6 +57,12 @@ from stel.retrieval.retention import (
     superseded_generations,
 )
 from stel.runner import RunError, run_project
+from tests.support_retrieval import (
+    materialize_upstream,
+    sample_rows,
+    set_index_change_policy,
+    write_project,
+)
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
 # `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
@@ -64,104 +70,6 @@ from stel.runner import RunError, run_project
 pytestmark = pytest.mark.e2e
 
 
-def _write_project(tmp_path: Path, *, allow_public: bool = True) -> None:
-    (tmp_path / "sources").mkdir()
-    (tmp_path / "models").mkdir()
-    (tmp_path / "data").mkdir()
-    (tmp_path / "stel_project.yml").write_text(
-        "\n".join(
-            [
-                "name: retrieval_demo",
-                "version: '0.1.0'",
-                "profile: retrieval_demo",
-                "source-paths: [sources]",
-                "model-paths: [models]",
-            ]
-        )
-    )
-    (tmp_path / "profiles.yml").write_text(
-        "\n".join(
-            [
-                "retrieval_demo:",
-                "  target: dev",
-                "  outputs:",
-                "    dev:",
-                "      warehouse:",
-                "        type: duckdb",
-                "        path: target/demo.duckdb",
-                "        schema: analytics",
-                "      retrieval:",
-                "        default: primary",
-                f"        allow_public_indexes: {str(allow_public).lower()}",
-                "        stores:",
-                "          primary:",
-                "            type: lancedb",
-                "            path: target/lancedb",
-                "            collection_template: '{project}__{target}__{collection}'",
-            ]
-        )
-    )
-    (tmp_path / "sources" / "documents.yml").write_text(
-        "\n".join(
-            [
-                "version: 2",
-                "sources:",
-                "  - name: documents",
-                "    path: data",
-                "    file_pattern: '*.json'",
-            ]
-        )
-    )
-    (tmp_path / "models" / "retrieval.yml").write_text(
-        "\n".join(
-            [
-                "version: 2",
-                "models:",
-                "  - name: embedding_rows",
-                "    source: ref('documents')",
-                "    extraction:",
-                "      backend: json",
-                "  - name: context_search",
-                "    depends_on: [ref('embedding_rows')]",
-                "    materialization: incremental",
-                "    tags: [retrieval, economic-data]",
-                "    search:",
-                "      access: public",
-                "      store: primary",
-                "      collection: context",
-                "      id_field: chunk_id",
-                "      document_id_field: document_id",
-                "      chunk_id_field: chunk_id",
-                "      text_fields: [text]",
-                "      return_text_fields: [text]",
-                "      vector:",
-                "        field: embedding",
-                "        dimensions: 2",
-                "        metric: cosine",
-                "        search: exact",
-                "        embedding:",
-                "          provider: fixture",
-                "          model: deterministic-2d-v1",
-                "          provider_contract_version: 2",
-                "          provider_implementation: tests:v1",
-                "          semantic_config_fingerprint: deterministic-2d-v1",
-                "          dimensions: 2",
-                "      full_text:",
-                "        fields: [text]",
-                "      attributes:",
-                "        - name: category",
-                "          data_type: string",
-                "          filter_role: user",
-                "          returned: true",
-                "      display_fields: [title]",
-                "      query:",
-                "        modes: [vector, text, filter]",
-                "        consistency: strong",
-                "      on_index_change: fail",
-                "      batch_size: 2",
-            ]
-        )
-    )
 
 
 def _write_typed_attribute_project(tmp_path: Path) -> None:
@@ -172,7 +80,7 @@ def _write_typed_attribute_project(tmp_path: Path) -> None:
     accepted a filter the query path could not execute, so the failure landed
     on the querying agent rather than the author.
     """
-    _write_project(tmp_path)
+    write_project(tmp_path)
     models = tmp_path / "models" / "retrieval.yml"
     models.write_text(
         models.read_text().replace(
@@ -238,40 +146,13 @@ def _typed_rows() -> pl.DataFrame:
     )
 
 
-def _rows(version: int = 1) -> pl.DataFrame:
-    if version == 1:
-        return pl.DataFrame(
-            {
-                "chunk_id": ["c1", "c2"],
-                "document_id": ["d1", "d2"],
-                "text": ["inflation slowed", "employment increased"],
-                "embedding": [[1.0, 0.0], [0.0, 1.0]],
-                "category": ["prices", "labor"],
-                "title": ["CPI", "Payrolls"],
-            }
-        )
-    return pl.DataFrame(
-        {
-            "chunk_id": ["c1", "c3"],
-            "document_id": ["d1", "d3"],
-            "text": ["inflation declined", "output expanded"],
-            "embedding": [[0.9, 0.1], [0.5, 0.5]],
-            "category": ["prices", "growth"],
-            "title": ["CPI revision", "GDP"],
-        }
-    )
 
 
-def _materialize_upstream(tmp_path: Path, rows: pl.DataFrame) -> None:
-    project, _, _ = load_project(tmp_path)
-    resolved = resolve_profile(project, tmp_path)
-    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
-        adapter.materialize_full("embedding_rows", rows)
 
 
 def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     first = run_project(tmp_path, select="context_search")
     assert len(first) == 1
@@ -324,7 +205,7 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
         assert unchanged is not None
         assert unchanged.physical_generation == generation
 
-    _materialize_upstream(tmp_path, _rows(version=2))
+    materialize_upstream(tmp_path, sample_rows(version=2))
     third = run_project(tmp_path, select="context_search")
     assert third[0].rows_inserted == 1
     assert third[0].rows_updated == 1
@@ -344,7 +225,7 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
 
 
 def test_search_manifest_v2_and_dbt_export_projection(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     manifest = build_manifest(tmp_path)
 
     assert manifest["manifest_version"] == 2
@@ -366,7 +247,7 @@ def test_search_manifest_v2_and_dbt_export_projection(tmp_path: Path) -> None:
 
 
 def test_public_search_requires_operator_profile_opt_in(tmp_path: Path) -> None:
-    _write_project(tmp_path, allow_public=False)
+    write_project(tmp_path, allow_public=False)
     project, sources, models = load_project(tmp_path)
     validate_project_contract(project, sources, models, tmp_path)
     resolved = resolve_profile(project, tmp_path)
@@ -378,7 +259,7 @@ def test_public_search_requires_operator_profile_opt_in(tmp_path: Path) -> None:
 def test_inherited_embedding_identity_requires_an_upstream_embed_resource(
     tmp_path: Path,
 ) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     identity = "\n".join(
         [
@@ -399,7 +280,7 @@ def test_inherited_embedding_identity_requires_an_upstream_embed_resource(
 
 
 def test_hybrid_mode_is_validated_against_store_capabilities(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
         model_path.read_text().replace(
@@ -429,8 +310,8 @@ def test_search_predicate_rejects_nonfinite_values() -> None:
 
 
 def test_search_state_is_scoped_to_safe_target(tmp_path: Path) -> None:
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
 
     project, _, _ = load_project(tmp_path)
@@ -457,8 +338,8 @@ def test_search_state_is_scoped_to_safe_target(tmp_path: Path) -> None:
 def test_failed_store_mutation_does_not_advance_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     def fail_upsert(*args: object, **kwargs: object) -> object:
         raise RetrievalError("safe injected failure")
@@ -507,8 +388,8 @@ def test_failed_index_validation_keeps_receipted_state_and_blocks_readiness(
     """A failure after durable receipts keeps acknowledged state (issue #153):
     per-batch advancement records exactly what the store acknowledged, while
     the serving ledger keeps the failed publication unqueryable."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     def fail_indexes(*args: object, **kwargs: object) -> object:
         raise RetrievalError("safe injected index failure")
@@ -554,8 +435,8 @@ def test_failed_snapshot_validation_keeps_receipted_state_and_blocks_readiness(
     """Snapshot invalidation after publication keeps receipt-acknowledged
     state (issue #153) but never activates readiness; the retry reconciles
     from recorded state instead of republishing acknowledged rows."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     def fail_snapshot_validation(self: TableReadSnapshot) -> None:
         raise AdapterError("safe injected generation failure")
@@ -598,8 +479,8 @@ def test_search_publication_never_fetches_the_full_state_scope(
 ) -> None:
     """Acceptance for issue #153: the production publication path reconciles
     through bounded subset lookups and paged stale discovery only."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     first = run_project(tmp_path, select="context_search")
     assert first[0].rows_inserted == 2
 
@@ -621,8 +502,8 @@ def test_unacknowledged_receipt_advances_no_state(
 ) -> None:
     """State advances only behind exact durable receipts (issue #153): an
     unacknowledged upsert fails the run before any state row is written."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     original_upsert = LanceDBStore.upsert
 
@@ -654,9 +535,9 @@ def test_unacknowledged_receipt_advances_no_state(
 
 
 def test_invalid_vector_fails_without_content_or_id_in_error(tmp_path: Path) -> None:
-    _write_project(tmp_path)
-    rows = _rows().with_columns(pl.Series("embedding", [[float("nan"), 0.0], [0.0, 1.0]]))
-    _materialize_upstream(tmp_path, rows)
+    write_project(tmp_path)
+    rows = sample_rows().with_columns(pl.Series("embedding", [[float("nan"), 0.0], [0.0, 1.0]]))
+    materialize_upstream(tmp_path, rows)
 
     with pytest.raises(RunError) as raised:
         run_project(tmp_path, select="context_search")
@@ -667,11 +548,11 @@ def test_invalid_vector_fails_without_content_or_id_in_error(tmp_path: Path) -> 
 
 
 def test_wrong_vector_dimensions_fail_without_store_mutation(tmp_path: Path) -> None:
-    _write_project(tmp_path)
-    rows = _rows().with_columns(
+    write_project(tmp_path)
+    rows = sample_rows().with_columns(
         pl.Series("embedding", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     )
-    _materialize_upstream(tmp_path, rows)
+    materialize_upstream(tmp_path, rows)
 
     with pytest.raises(RunError, match="dimensions"):
         run_project(tmp_path, select="context_search")
@@ -694,10 +575,10 @@ def test_wrong_vector_dimensions_fail_without_store_mutation(tmp_path: Path) -> 
 def test_invalid_record_id_fails_before_collection_creation(
     tmp_path: Path, record_id: str
 ) -> None:
-    _write_project(tmp_path)
-    _materialize_upstream(
+    write_project(tmp_path)
+    materialize_upstream(
         tmp_path,
-        _rows().with_columns(
+        sample_rows().with_columns(
             pl.when(pl.col("chunk_id") == "c1")
             .then(pl.lit(record_id))
             .otherwise(pl.col("chunk_id"))
@@ -724,12 +605,12 @@ def test_invalid_record_id_fails_before_collection_creation(
 
 
 def test_search_attribute_schema_mismatch_fails_before_store_io(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
         model_path.read_text().replace("data_type: string", "data_type: integer")
     )
-    _materialize_upstream(tmp_path, _rows())
+    materialize_upstream(tmp_path, sample_rows())
 
     with pytest.raises(RunError, match="warehouse type"):
         run_project(tmp_path, select="context_search")
@@ -737,15 +618,15 @@ def test_search_attribute_schema_mismatch_fails_before_store_io(tmp_path: Path) 
 
 
 def test_nonfinite_search_attribute_fails_safely(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
         model_path.read_text().replace("data_type: string", "data_type: float")
     )
-    rows = _rows().with_columns(
+    rows = sample_rows().with_columns(
         pl.Series("category", [float("inf"), 1.0], dtype=pl.Float64)
     )
-    _materialize_upstream(tmp_path, rows)
+    materialize_upstream(tmp_path, rows)
 
     with pytest.raises(RunError) as raised:
         run_project(tmp_path, select="context_search")
@@ -754,7 +635,7 @@ def test_nonfinite_search_attribute_fails_safely(tmp_path: Path) -> None:
 
 
 def test_empty_input_creates_typed_empty_collection(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     empty = pl.DataFrame(
         {
             "chunk_id": pl.Series([], dtype=pl.String),
@@ -765,7 +646,7 @@ def test_empty_input_creates_typed_empty_collection(tmp_path: Path) -> None:
             "title": pl.Series([], dtype=pl.String),
         }
     )
-    _materialize_upstream(tmp_path, empty)
+    materialize_upstream(tmp_path, empty)
 
     result = run_project(tmp_path, select="context_search")
     assert result[0].rows_written == 0
@@ -808,8 +689,8 @@ def test_full_refresh_rebuilds_into_a_private_generation_and_activates(
     physical collection than before, the ledger must point at it, and the
     superseded one must be gone.
     """
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
 
     scope, resolved = resolve_serving_scope(
@@ -838,12 +719,12 @@ def test_full_refresh_rebuilds_into_a_private_generation_and_activates(
         # pointed at an empty collection would satisfy every check above.
         rebuilt = store.inspect_collection(after.active_collection)
     assert rebuilt is not None
-    assert rebuilt.row_count == len(_rows())
+    assert rebuilt.row_count == len(sample_rows())
 
 
 def test_index_config_change_leaves_existing_collection_untouched(tmp_path: Path) -> None:
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(model_path.read_text().replace("metric: cosine", "metric: dot"))
@@ -874,8 +755,8 @@ def test_tuning_batch_size_does_not_invalidate_the_published_index(
     rows a publish sends per call and never what a row contains, but it used
     to sit inside the collection fingerprint — so tuning publish pacing
     demanded a blue/green rebuild and a full re-embed of the corpus."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
 
     model_path = tmp_path / "models" / "retrieval.yml"
@@ -908,8 +789,8 @@ def test_a_rebuild_forcing_change_names_the_field_that_forced_it(
     """The old failure said only that the configuration had changed, which left
     the operator to diff the YAML themselves and gave no signal whether the
     change was additive or genuinely invalidating."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
@@ -921,7 +802,7 @@ def test_a_rebuild_forcing_change_names_the_field_that_forced_it(
 
 
 def test_search_collection_collisions_fail_before_store_io(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     duplicate = "\n".join(
         [
@@ -951,7 +832,7 @@ def test_search_collection_collisions_fail_before_store_io(tmp_path: Path) -> No
 
 
 def test_search_collection_collisions_ignore_profile_aliases(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     profiles_path = tmp_path / "profiles.yml"
     profiles_path.write_text(
         profiles_path.read_text()
@@ -997,7 +878,7 @@ def test_search_collection_collisions_ignore_profile_aliases(tmp_path: Path) -> 
 def test_search_cli_lists_resource_and_show_rejects_relation_access(
     tmp_path: Path,
 ) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     runner = CliRunner()
 
     listed = runner.invoke(
@@ -1022,8 +903,8 @@ def test_search_cli_lists_resource_and_show_rejects_relation_access(
 
 
 def test_build_routes_search_without_warehouse_schema_tests(tmp_path: Path) -> None:
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     result = CliRunner().invoke(
         cli,
@@ -1103,7 +984,7 @@ def test_search_config_fingerprint_is_stable_across_hash_seeds() -> None:
 
 
 def test_lancedb_query_api_rejects_unowned_collections(tmp_path: Path) -> None:
-    _write_project(tmp_path)
+    write_project(tmp_path)
     external_path = tmp_path / "target" / "lancedb"
     database = lancedb.connect(external_path)
     database.create_table(
@@ -1152,7 +1033,7 @@ def test_every_declared_attribute_type_round_trips_a_filter(tmp_path: Path) -> N
     UTC check. Fixed in #339, which pins the session.
     """
     _write_typed_attribute_project(tmp_path)
-    _materialize_upstream(tmp_path, _typed_rows())
+    materialize_upstream(tmp_path, _typed_rows())
     run_project(tmp_path, select="context_search")
 
     project, _, _ = load_project(tmp_path)
@@ -1323,24 +1204,13 @@ def test_duckdb_reads_timestamps_as_stored_not_as_host_local(
     assert rows[0]["at"] == stored
 
 
-def _set_index_change_policy(tmp_path: Path, policy: str) -> None:
-    path = tmp_path / "models" / "context_search.yml"
-    candidates = [path] if path.exists() else list((tmp_path / "models").glob("*.yml"))
-    for candidate in candidates:
-        text = candidate.read_text()
-        if "on_index_change: fail" in text:
-            candidate.write_text(
-                text.replace("on_index_change: fail", f"on_index_change: {policy}")
-            )
-            return
-    raise AssertionError("fixture no longer declares on_index_change")
 
 
 def test_rebuild_policy_now_compiles(tmp_path: Path) -> None:
     """LanceDB advertises private_generation_build, so `rebuild` is a policy it
     can honor — it builds a new generation and activates it (issue #355)."""
-    _write_project(tmp_path)
-    _set_index_change_policy(tmp_path, "rebuild")
+    write_project(tmp_path)
+    set_index_change_policy(tmp_path, "rebuild")
     project, sources, models = load_project(tmp_path)
 
     validate_project_contract(project, sources, models, tmp_path)
@@ -1351,9 +1221,9 @@ def test_rebuild_policy_replaces_the_index_on_an_incompatible_change(
 ) -> None:
     """The change that `fail` refuses, `rebuild` absorbs — without a window in
     which the collection is empty or half-built."""
-    _write_project(tmp_path)
-    _set_index_change_policy(tmp_path, "rebuild")
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    set_index_change_policy(tmp_path, "rebuild")
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
 
     model_path = tmp_path / "models" / "retrieval.yml"
@@ -1376,8 +1246,8 @@ def test_online_policy_compiles_against_a_store_that_builds_private_generations(
     tmp_path: Path,
 ) -> None:
     """Online updates require an independent generation, not live mutation."""
-    _write_project(tmp_path)
-    _set_index_change_policy(tmp_path, "online")
+    write_project(tmp_path)
+    set_index_change_policy(tmp_path, "online")
     project, sources, models = load_project(tmp_path)
     validate_project_contract(project, sources, models, tmp_path)
     resolved = resolve_profile(project, tmp_path)
@@ -1392,8 +1262,8 @@ def test_online_policy_is_refused_when_the_store_cannot_build_private_generation
     from stel.retrieval.base import RetrievalFeature
     from stel.retrieval.lancedb import LanceDBStore
 
-    _write_project(tmp_path)
-    _set_index_change_policy(tmp_path, "online")
+    write_project(tmp_path)
+    set_index_change_policy(tmp_path, "online")
     project, sources, models = load_project(tmp_path)
     validate_project_contract(project, sources, models, tmp_path)
     resolved = resolve_profile(project, tmp_path)
@@ -1426,8 +1296,8 @@ def test_a_first_publish_warns_while_it_is_still_streaming(
     """
     from stel.retrieval import servability
 
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     monkeypatch.setattr(servability, "_SCAN_BYTES_PER_SECOND", 0.1)
 
     with caplog.at_level(logging.WARNING, logger="stel.execution.search"):
@@ -1444,8 +1314,8 @@ def test_a_small_first_publish_says_nothing(
     """The same path at the real threshold. Two rows is not a design problem,
     and a warning on every publish would be the noise that hides the one that
     matters."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
 
     with caplog.at_level(logging.WARNING, logger="stel.execution.search"):
         run_project(tmp_path, select="context_search")
@@ -1466,7 +1336,7 @@ def test_a_store_config_refusal_stops_the_compile(
     """
     from stel.retrieval.lancedb import LanceDBStore
 
-    _write_project(tmp_path)
+    write_project(tmp_path)
     project, sources, models = load_project(tmp_path)
     validate_project_contract(project, sources, models, tmp_path)
     resolved = resolve_profile(project, tmp_path)
@@ -1484,7 +1354,7 @@ def test_a_store_config_refusal_stops_the_compile(
 def test_a_store_with_nothing_to_refuse_compiles(tmp_path: Path) -> None:
     """The default is permissive: the base implementation returns None, so a
     store with no config-dependent refusals is unaffected by the seam."""
-    _write_project(tmp_path)
+    write_project(tmp_path)
     project, sources, models = load_project(tmp_path)
     validate_project_contract(project, sources, models, tmp_path)
     resolved = resolve_profile(project, tmp_path)
@@ -1844,8 +1714,8 @@ def test_a_rebuild_that_fails_after_the_state_swap_clears_the_stale_state(
 
     The failure path clears that state, so the next run republishes in full.
     """
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
 
     scope, resolved = resolve_serving_scope(
@@ -1871,7 +1741,7 @@ def test_a_rebuild_that_fails_after_the_state_swap_clears_the_stale_state(
     results = run_project(tmp_path, select="context_search")
     published = next(r for r in results if r.model_name == "context_search")
     # Every row republished rather than skipped as already-published.
-    assert published.rows_written == len(_rows())
+    assert published.rows_written == len(sample_rows())
 
 
 def test_a_failure_after_activation_keeps_the_activated_state(
@@ -1881,8 +1751,8 @@ def test_a_failure_after_activation_keeps_the_activated_state(
     generation. Clearing it because a later step failed would leave the ledger
     ready with empty state, and re-embed the whole index on the next run.
     """
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     run_project(tmp_path, select="context_search")
     # A first rebuild has no predecessor to retire, so take two: the second
     # supersedes the first and does reach the post-activation drop.
@@ -1913,14 +1783,14 @@ def test_a_subset_invocation_defers_stale_reconciliation(tmp_path: Path) -> None
     not stale. A partitioned orchestration upstream must not have the search
     index deleting every other partition's records — reconciliation belongs
     to the next unfiltered run, which must still perform it."""
-    _write_project(tmp_path)
-    _materialize_upstream(tmp_path, _rows())
+    write_project(tmp_path)
+    materialize_upstream(tmp_path, sample_rows())
     first = run_project(tmp_path, select="context_search")
     assert first[0].rows_inserted == 2
 
     # The upstream shrinks by one record, and the invocation is a subset run
     # (read_filter present). The vanished record must survive.
-    _materialize_upstream(tmp_path, _rows(version=2))
+    materialize_upstream(tmp_path, sample_rows(version=2))
     [filtered] = run_project(
         tmp_path,
         select="context_search",
@@ -2202,7 +2072,7 @@ def test_compiler_points_a_type_refusal_at_the_index_field(
     operator chose the type deliberately, and that is the line to change."""
     from stel.retrieval.lancedb import LanceDBStore
 
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
         model_path.read_text(encoding="utf-8").replace(
@@ -2276,7 +2146,7 @@ def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None
     an additive one: a consumer pinning version 1 should fail loudly rather
     than read the wider shape as the narrower. The default is never written,
     so the only difference between the versions is a declared `index`."""
-    _write_project(tmp_path)
+    write_project(tmp_path)
     resource = next(
         model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
     )["output"]["serving_resource"]

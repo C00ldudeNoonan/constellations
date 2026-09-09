@@ -21,6 +21,12 @@ from stel.retrieval.servability import (
     index_build_advisory_row_threshold,
     index_build_peak_bytes,
 )
+from tests.support_retrieval import (
+    materialize_upstream,
+    prepare_online_switch,
+    sample_rows,
+    write_project,
+)
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
 # `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
@@ -200,9 +206,8 @@ def test_an_existing_collection_is_warned_about_before_the_first_row_is_read(
     site alone would speak a batch later, so this pins the earlier one."""
     from stel.execution import search as search_module
     from stel.runner import run_project
-    from tests.test_online_publication import _prepare
 
-    _prepare(tmp_path)  # publishes exact, then flips the config to approximate
+    prepare_online_switch(tmp_path)  # publishes exact, then flips the config to approximate
     # 2 rows x 2 dims x 4 B x 3.2 = 51.2 B of estimated build; 75% of 60 B is 45 B.
     monkeypatch.setattr(search_module, "container_memory_limit_bytes", lambda: 60)
     order: list[str] = []
@@ -241,9 +246,8 @@ def test_a_first_publish_speaks_as_the_streamed_count_crosses_the_line(
     from stel.execution import search as search_module
     from stel.retrieval import LanceDBStore
     from stel.runner import run_project
-    from tests.test_retrieval import _materialize_upstream, _rows, _write_project
 
-    _write_project(tmp_path)
+    write_project(tmp_path)
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
         model_path.read_text(encoding="utf-8").replace(
@@ -251,7 +255,7 @@ def test_a_first_publish_speaks_as_the_streamed_count_crosses_the_line(
         ),
         encoding="utf-8",
     )
-    _materialize_upstream(tmp_path, _rows())
+    materialize_upstream(tmp_path, sample_rows())
     monkeypatch.setattr(search_module, "container_memory_limit_bytes", lambda: 60)
     order: list[str] = []
     real_ensure = LanceDBStore.ensure_indexes
@@ -302,9 +306,8 @@ def test_an_unchanged_rerun_of_a_large_indexed_collection_says_nothing(
     silence. The pre-run site fires only for a private generation now."""
     from stel.execution import search as search_module
     from stel.runner import run_project
-    from tests.test_online_publication import _prepare
 
-    _prepare(tmp_path)
+    prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")  # builds the ANN index privately
     monkeypatch.setattr(search_module, "container_memory_limit_bytes", lambda: 60)
 
@@ -325,12 +328,10 @@ def test_an_in_place_write_is_warned_about_before_the_build(
     from stel.execution import search as search_module
     from stel.retrieval import LanceDBStore
     from stel.runner import run_project
-    from tests.test_online_publication import _prepare
-    from tests.test_retrieval import _materialize_upstream, _rows
 
-    _prepare(tmp_path)
+    prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")
-    _materialize_upstream(tmp_path, _rows().with_columns(pl.lit("changed").alias("title")))
+    materialize_upstream(tmp_path, sample_rows().with_columns(pl.lit("changed").alias("title")))
     monkeypatch.setattr(search_module, "container_memory_limit_bytes", lambda: 60)
     order: list[str] = []
     real_ensure = LanceDBStore.ensure_indexes

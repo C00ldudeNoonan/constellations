@@ -19,7 +19,7 @@ import json
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import polars as pl
 
@@ -55,6 +55,75 @@ def _col(frame: pl.DataFrame, name: str) -> pl.Series | None:
     return frame[name] if name in frame.columns else None
 
 
+# Column names the names relation must use. Fixed rather than configurable:
+# the operator writes this model for this flag, and a table that calls them
+# something else aliases them in SQL, which is the dbt-shaped answer.
+_NAMES_ID_COLUMN = "canonical_id"
+_NAMES_DISPLAY_COLUMN = "display_name"
+_NAMES_DESCRIPTION_COLUMN = "description"
+
+
+class ConceptName(NamedTuple):
+    """An operator-supplied display name and description for one canonical id."""
+
+    display: str | None
+    description: str | None
+
+
+def _clean(value: object | None) -> str | None:
+    """Warehouse text as a non-empty string, or None for null/blank."""
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def concept_names(frame: pl.DataFrame) -> dict[str, ConceptName]:
+    """Operator-supplied display names and descriptions, by canonical id (#554).
+
+    Nothing in the pipeline knows that `PNR` is Pentair or that `FERC` regulates
+    electricity transmission, so a map of tickers and acronyms cannot be read
+    without a relation the operator maintains. This reads it: `canonical_id`
+    plus `display_name`, and `description` when the table carries one.
+
+    Duplicate ids are refused rather than resolved. A warehouse read has no
+    promised row order, so "first row wins" would let a map's labels change
+    between two exports of unchanged data.
+    """
+    for required in (_NAMES_ID_COLUMN, _NAMES_DISPLAY_COLUMN):
+        if required not in frame.columns:
+            raise ConceptCloudExportError(
+                f"names model needs `{_NAMES_ID_COLUMN}` and "
+                f"`{_NAMES_DISPLAY_COLUMN}` columns (optionally "
+                f"`{_NAMES_DESCRIPTION_COLUMN}`); it is missing `{required}`"
+            )
+    ids = frame[_NAMES_ID_COLUMN]
+    display_column = frame[_NAMES_DISPLAY_COLUMN]
+    description_column = _col(frame, _NAMES_DESCRIPTION_COLUMN)
+    names: dict[str, ConceptName] = {}
+    duplicates: set[str] = set()
+    for i in range(frame.height):
+        if ids[i] is None:
+            continue
+        canonical_id = str(ids[i])
+        if canonical_id in names:
+            duplicates.add(canonical_id)
+            continue
+        names[canonical_id] = ConceptName(
+            display=_clean(display_column[i]),
+            description=(
+                _clean(description_column[i])
+                if description_column is not None else None
+            ),
+        )
+    if duplicates:
+        listed = ", ".join(sorted(duplicates)[:5])
+        raise ConceptCloudExportError(
+            f"names model has more than one row for {len(duplicates)} "
+            f"canonical id(s): {listed}. One row per concept."
+        )
+    return names
+
+
 def build_concept_cloud(
     *,
     project: str,
@@ -71,6 +140,7 @@ def build_concept_cloud(
     vector_field: str = "embedding",
     query_log: pl.DataFrame | None = None,
     dimension_columns: dict[str, tuple[pl.DataFrame, str]] | None = None,
+    names: pl.DataFrame | None = None,
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -86,6 +156,7 @@ def build_concept_cloud(
         links, entities=entities, linking_model=linking_model,
         linking_node_id=linking_node_id if linking_node_id in node_ids else None,
         top_n=top_n, statuses=statuses,
+        names=concept_names(names) if names is not None else {},
     )
     kept = {c.canonical_id for c in concepts}
     concept_edges = _aggregate_edges(relations, canonical_of, kept)
@@ -147,6 +218,7 @@ def _aggregate_concepts(
     linking_node_id: str | None,
     top_n: int,
     statuses: tuple[str, ...],
+    names: dict[str, ConceptName],
 ) -> tuple[list[Concept], dict[str, str]]:
     if "canonical_id" not in links.columns or "mention_id" not in links.columns:
         raise ConceptCloudExportError(
@@ -178,9 +250,17 @@ def _aggregate_concepts(
             [r.get("label") for r in rows]
             + [label_by_mention.get(str(r["mention_id"])) for r in rows]
         )
-        display = _first(
-            [r.get("mention_text") for r in rows]
-            + [text_by_mention.get(str(r["mention_id"])) for r in rows]
+        # Within a row the row's own text wins over entity-table enrichment;
+        # across rows the most frequent text wins, ties broken lexically. Same
+        # rule `column_dimension` applies, for the same reason: whichever
+        # mention the frame happened to yield first is not a concept's name.
+        # An operator-supplied name outranks both.
+        name = names.get(cid)
+        display = (name.display if name else None) or _most_common(
+            [
+                r.get("mention_text") or text_by_mention.get(str(r["mention_id"]))
+                for r in rows
+            ]
         ) or cid
         ambiguous = any(r.get("status") == "ambiguous" for r in rows)
         scores = [
@@ -192,6 +272,7 @@ def _aggregate_concepts(
         concepts.append(Concept(
             canonical_id=cid,
             display=str(display),
+            description=name.description if name else None,
             label=str(label) if label is not None else None,
             frequency=len(rows),
             link_status="ambiguous" if ambiguous else "matched",
@@ -473,6 +554,21 @@ def _first(values: list[object]) -> object | None:
     return None
 
 
+def _most_common(values: list[object | None]) -> str | None:
+    """The most frequent non-blank value, ties broken lexically.
+
+    Deterministic by construction: the frame's row order never reaches the
+    result, so two exports of unchanged data name a concept the same way.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for value in values:
+        if value is not None and (text := str(value).strip()):
+            counts[text] += 1
+    if not counts:
+        return None
+    return min(counts, key=lambda text: (-counts[text], text))
+
+
 def dag_plane_from_stel_manifest(manifest: dict[str, Any]) -> tuple[DagPlane, dict[str, str]]:
     """Plane from stel's own manifest. Returns the plane and a name→node-id map
     (so the caller can resolve the linking model's node)."""
@@ -563,6 +659,7 @@ def export_concept_cloud(
     vector_field: str = "embedding",
     with_query_log: bool = False,
     dimension_specs: dict[str, str] | None = None,
+    names_model: str | None = None,
 ) -> ConceptCloudExport:
     """Read the project's tables through the active adapter and build a bundle.
 
@@ -619,6 +716,7 @@ def export_concept_cloud(
         relations = adapter.read_table(relation_model) if relation_model else None
         entities = adapter.read_table(entity_model) if entity_model else None
         embeddings = adapter.read_table(embed_model) if embed_model else None
+        names = adapter.read_table(names_model) if names_model else None
         query_log = None
         if with_query_log:
             # The log is opt-in and may not exist yet; an absent relation is
@@ -653,4 +751,5 @@ def export_concept_cloud(
         vector_field=vector_field,
         query_log=query_log,
         dimension_columns=dimension_columns or None,
+        names=names,
     )

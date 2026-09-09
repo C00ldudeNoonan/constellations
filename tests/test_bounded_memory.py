@@ -175,11 +175,14 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
     (
         "concept_cloud/export.py",
         "export_concept_cloud",
-        6,
+        7,
         EXCEPTION,
         "an artifact export, not a pipeline stage: it builds one self-contained "
         "file from several models at once and has no flush window to be bounded "
-        "by. Reads embeddings whole, so it is corpus-scale on a large project",
+        "by. Reads embeddings whole, so it is corpus-scale on a large project. "
+        "The 7th read is the #554 names relation, which is at concept grain -- "
+        "bounded by distinct canonical ids, and strictly smaller than the "
+        "mention-grain reads already here",
     ),
 )
 

@@ -220,3 +220,59 @@ def test_lineage_mode_shows_beams_without_requiring_a_selection() -> None:
     assert "? touching.has(linkKey(l)) : true" in html
     # Two-state beam color: bright when traced, ember otherwise.
     assert "#ffcb47" in html and "#7a6329" in html
+
+
+# ── display names and descriptions (#554) ──────────────────────────────────
+
+
+def _described_export(description: str) -> ConceptCloudExport:
+    return ConceptCloudExport(
+        generated_at="2026-08-04T00:00:00Z",
+        project="p",
+        dag_plane=DagPlane(
+            nodes=(DagNode(id="model.p.m", label="m", resource_type="model"),)
+        ),
+        concepts=(
+            Concept(
+                canonical_id="org:pnr",
+                display="Pentair",
+                description=description,
+                frequency=1,
+                provenance=Provenance(model="m"),
+            ),
+        ),
+    )
+
+
+def test_a_concept_description_reaches_the_bundle_and_the_viewer() -> None:
+    """"I need to know what the entities mean" -- the first thing a user said
+    on opening a real map of tickers and acronyms (issue #554)."""
+    html = render_concept_cloud(
+        _described_export("Water treatment equipment maker (NYSE: PNR).")
+    )
+    island = _extract_data_island(html)
+    assert island["concepts"][0]["description"] == (
+        "Water treatment equipment maker (NYSE: PNR)."
+    )
+    # Both surfaces the issue asks for: the click panel and the hover tooltip.
+    assert 'class="desc"' in html
+    assert "n.description ?" in html
+
+
+def test_the_viewer_escapes_warehouse_text_before_it_becomes_markup() -> None:
+    """Descriptions are free text an operator wrote, and the panel and the
+    library's tooltip both render as HTML. The JSON island is already
+    breakout-proof; this is the second half of that."""
+    html = render_concept_cloud(_described_export("<img src=x onerror=alert(1)>"))
+    # The payload survives into the bundle verbatim (escaped only as JSON)...
+    assert _extract_data_island(html)["concepts"][0]["description"] == (
+        "<img src=x onerror=alert(1)>"
+    )
+    # ...and every place it can reach markup goes through `esc`.
+    assert "const esc = s =>" in html
+    assert "${esc(node.description)}" in html
+    assert "${esc(truncate(n.description, 90))}" in html
+    assert "${esc(node.name)}" in html
+    # No unescaped interpolation of node text is left in the detail panel.
+    assert "${node.name}" not in html
+    assert "${node.id}" not in html

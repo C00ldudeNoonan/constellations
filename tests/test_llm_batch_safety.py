@@ -236,7 +236,7 @@ def test_interrupted_batch_resumes_without_resubmission(
     backend = get_backend("llm")
     _FakeNativeProvider.fail_polls_remaining = 1
 
-    with pytest.raises(Exception, match="batch inference failed"):
+    with pytest.raises(ProviderBatchError, match="batch inference failed"):
         backend.extract_batch_with_metrics(docs[:2], _options(tmp_path))
 
     assert _FakeNativeProvider.submissions == ["job-0"]
@@ -263,7 +263,7 @@ def test_persisted_job_state_is_artifact_safe(
 ) -> None:
     backend = get_backend("llm")
     _FakeNativeProvider.fail_polls_remaining = 1
-    with pytest.raises(Exception, match="batch inference failed"):
+    with pytest.raises(ProviderBatchError, match="batch inference failed"):
         backend.extract_batch_with_metrics(docs[:2], _options(tmp_path))
 
     cache_path = tmp_path / "cache.duckdb"

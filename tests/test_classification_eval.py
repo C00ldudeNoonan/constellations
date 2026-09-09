@@ -15,6 +15,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from stel.classification_metrics import as_rows, join_pairs, score
 from stel.config.model import EvalConfig, ModelConfig
@@ -174,20 +175,20 @@ def test_config_ref_parsing_agrees_with_dag_parse_ref() -> None:
 
 
 def test_an_empty_relation_name_is_rejected() -> None:
-    with pytest.raises(Exception, match="must name a model"):
+    with pytest.raises(ValidationError, match="must name a model"):
         ModelConfig(name="signal_eval", eval=_eval_config(predictions="  "))
 
 
 def test_declaring_depends_on_directly_is_rejected() -> None:
     # Two sources of truth for the same edges is how they drift.
-    with pytest.raises(Exception, match="must not declare `depends_on:`"):
+    with pytest.raises(ValidationError, match="must not declare `depends_on:`"):
         ModelConfig(
             name="signal_eval", eval=_eval_config(), depends_on=["ref('something')"]
         )
 
 
 def test_eval_participates_in_single_kind_validation() -> None:
-    with pytest.raises(Exception, match="multiple kind blocks"):
+    with pytest.raises(ValidationError, match="multiple kind blocks"):
         ModelConfig(
             name="signal_eval",
             eval=_eval_config(),

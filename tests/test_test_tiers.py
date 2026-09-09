@@ -77,3 +77,130 @@ def test_the_fast_tier_is_actually_most_of_the_files() -> None:
         "majority, so either the split needs revisiting or new tests are "
         "reaching for a whole project when a unit would do"
     )
+
+
+# Cross-module imports that predate the rule below. Both are the same shape as
+# the retrieval one this issue fixed -- a sibling test module's helpers used as
+# an API -- and both are the next to move into support modules. Listed rather
+# than hidden so the remaining work is visible and no *new* one can appear.
+_KNOWN_CROSS_IMPORTS = {
+    ("test_google_drive_context_example.py", "tests.test_gdrive_source"),
+    ("test_mcp_rate_limits.py", "tests.test_mcp_server"),
+}
+
+
+def _imported_test_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
+    """Every sibling test module one import statement reaches, in any form.
+
+    Three spellings reach the same place and only one of them was caught
+    (Codex review, #518):
+
+        from tests.test_x import helper    ImportFrom, module="tests.test_x"
+        import tests.test_x                Import,     alias="tests.test_x"
+        from tests import test_x           ImportFrom, module="tests", alias
+
+    A contract that only rejects the first is worse than none, because it
+    reads as enforcement while two ordinary spellings walk past it.
+    """
+    if isinstance(node, ast.Import):
+        return [a.name for a in node.names if a.name.startswith("tests.test_")]
+    if isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        if module.startswith("tests.test_"):
+            return [module]
+        if module == "tests":
+            return [
+                f"tests.{a.name}" for a in node.names if a.name.startswith("test_")
+            ]
+    return []
+
+
+def test_no_new_test_module_imports_another_test_module() -> None:
+    """Shared fixtures live in a support module, not in a sibling test (#518).
+
+    Four files used to import private helpers out of `test_retrieval.py` and
+    `test_online_publication.py`, two of them from *inside test bodies*. That
+    is fragile in a specific way: renaming a leading-underscore function is
+    normally a free local edit, and there it silently broke other files. The
+    inline placement also hid the dependency from anyone reading the imports,
+    and breaks the module-level import rule in AGENTS.md.
+
+    `support_retrieval.py` is where such a helper goes now. This fails on any
+    cross-module import that is not one of the two already known.
+    """
+    offenders = []
+    for path in sorted(TESTS.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            # Narrowed before use so `node.lineno` is known to exist: `ast.AST`
+            # does not declare it, and only Linux CI surfaced that, because the
+            # Windows-only `os.mkfifo` diagnostic masked the count locally.
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            for target in _imported_test_modules(node):
+                if (path.name, target) in _KNOWN_CROSS_IMPORTS:
+                    continue
+                offenders.append(f"{path.name} -> {target}:{node.lineno}")
+
+    assert not offenders, (
+        "test modules must not import from each other; move the shared helper "
+        f"into a support module beside `support_retrieval.py`: {offenders}"
+    )
+
+
+def test_the_known_cross_imports_have_not_quietly_grown() -> None:
+    """The allowlist is a debt register, not a licence.
+
+    If one of these is fixed the entry should go; if a file stops importing
+    that way this fails and says so, which is the prompt to delete the line
+    rather than let the list outlive the problem.
+    """
+    stale = []
+    for name, module in sorted(_KNOWN_CROSS_IMPORTS):
+        tree = ast.parse((TESTS / name).read_text(encoding="utf-8"))
+        if not any(
+            isinstance(n, ast.ImportFrom) and n.module == module
+            for n in ast.walk(tree)
+        ):
+            stale.append(f"{name} -> {module}")
+
+    assert not stale, (
+        f"these are no longer cross-importing, so drop them from "
+        f"_KNOWN_CROSS_IMPORTS: {stale}"
+    )
+
+
+def test_no_new_bare_exception_pins() -> None:
+    """`pytest.raises(Exception, match=...)` is a weak assertion (#518).
+
+    It passes when *any* exception carries that text, so a test meant to prove
+    "config rejects this" also passes when an unrelated crash happens to
+    mention the same word. Twenty-three of these were tightened to the type
+    actually raised, discovered by instrumenting the runs rather than by
+    reading the code.
+
+    Two remain and say why in a comment beside them: one asserts DuckDB's own
+    `BinderException`, which is a vendored internal with no compatibility
+    promise, and one only runs where symlinks can be created, so its real type
+    was never observed and narrowing on a guess would be worse than an
+    honestly broad pin.
+    """
+    # This file names the pattern in prose and in the check below, so it
+    # would otherwise report itself.
+    allowed = {"test_identifier_quoting.py", "test_promotion.py",
+               Path(__file__).name}
+    offenders = []
+    for path in sorted(TESTS.glob("test_*.py")):
+        if path.name in allowed:
+            continue
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if "pytest.raises(Exception" in line:
+                offenders.append(f"{path.name}:{number}")
+
+    assert not offenders, (
+        "pin the exception type actually raised rather than `Exception`; if it "
+        "genuinely has to be broad, say why beside it and add the file to "
+        f"`allowed` here: {offenders}"
+    )

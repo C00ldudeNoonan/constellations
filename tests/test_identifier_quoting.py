@@ -107,6 +107,11 @@ def test_injection_shaped_column_does_not_execute(tmp_path: Path) -> None:
     with create_adapter(_wh(tmp_path / "t.duckdb")) as adapter:
         adapter.materialize_full("victims", pl.DataFrame({"x": [1]}))
         table_ref = adapter.table_ref("victims")
+        # Deliberately broad (issue #518): the real type is DuckDB's own
+        # `BinderException`, and naming it would couple this test to a
+        # vendored internal that carries no compatibility promise. The
+        # claim is that the engine rejects the identifier, not which
+        # class it uses to say so.
         with pytest.raises(Exception, match=r"(?i)column|binder"):
             evaluate_test_spec(
                 {"not_null": ['x"; DROP TABLE victims; --']},

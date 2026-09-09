@@ -20,6 +20,7 @@ import pytest
 from stel.adapters import WarehouseAdapter, create_adapter, parse_warehouse_config
 from stel.backends.llm_backend import _apply_enum_portability, _input_schema
 from stel.checks.runner import run_model_tests
+from stel.config import ConfigError
 from stel.config.model import FieldConfig, ModelConfig
 from stel.llm_map import build_fields_spec
 
@@ -292,7 +293,7 @@ def test_enum_only_model_requires_schema_test_capability(
         ),
     )
 
-    with pytest.raises(Exception, match="model tests"):
+    with pytest.raises(ConfigError, match="model tests"):
         compiler.validate_warehouse_capabilities([_model()], "duckdb")
 
 

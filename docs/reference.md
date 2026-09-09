@@ -4323,6 +4323,29 @@ filter, and lineage mode (off by default) with click-to-trace beams. It opens
 focused on the hottest retrieved concept — or the most frequent one — rather
 than the whole graph.
 
+**A time axis** (`--time-field <column> [--time-grain year|quarter|month]`).
+Point the export at a column on the linking model carrying each mention's date
+and every concept and edge gains per-period counts, with the bundle carrying
+the period axis. One artifact then covers every period, rather than one export
+per period: positions, dimensions and the layout are computed once, so a
+concept stays where it is as the period changes and a star that grows is
+recognisably the same star.
+
+Absence is the signal, so a period a concept has no mentions in is **omitted**
+rather than written as zero — "first named in 2019" is a fact the bundle
+carries by not carrying anything. A mention whose date is null or unparseable
+counts toward the concept's total and toward no period, so a total can exceed
+the sum of its periods; bucketing an unreadable date would put mentions in a
+period they are not from, which is worse. An edge is attributed to a period
+only when **both** its mentions fall in the same one — a pair named in
+different periods was not named together in either.
+
+The axis is every period the corpus covers, taken before `--top-n` trimming: a
+period whose only concepts were trimmed is still a period, and skipping it
+would read a gap as missing data. Note that `--top-n` still selects on *total*
+frequency, so a concept that dominates one period but is rare overall can be
+trimmed before the axis ever shows it.
+
 **Semantic positions** (`--embed-model <model>`). Point the export at an embed
 model over the linking mentions and each concept is placed at the centroid of
 its mention vectors, projected to 3D at export time (PCA; deterministic).

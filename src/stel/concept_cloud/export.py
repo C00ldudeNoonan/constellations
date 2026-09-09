@@ -16,10 +16,10 @@ upstream; otherwise a concept shows its canonical id.
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from datetime import UTC, datetime
+from collections import Counter, defaultdict
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import polars as pl
 
@@ -141,6 +141,8 @@ def build_concept_cloud(
     query_log: pl.DataFrame | None = None,
     dimension_columns: dict[str, tuple[pl.DataFrame, str]] | None = None,
     names: pl.DataFrame | None = None,
+    time_field: str | None = None,
+    time_grain: TimeGrain = "year",
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -152,14 +154,20 @@ def build_concept_cloud(
     generated_at = generated_at or datetime.now(UTC).isoformat()
     node_ids = {node.id for node in dag_plane.nodes}
 
-    concepts, canonical_of = _aggregate_concepts(
+    concepts, canonical_of, period_of = _aggregate_concepts(
         links, entities=entities, linking_model=linking_model,
         linking_node_id=linking_node_id if linking_node_id in node_ids else None,
         top_n=top_n, statuses=statuses,
         names=concept_names(names) if names is not None else {},
+        time_field=time_field, time_grain=time_grain,
     )
     kept = {c.canonical_id for c in concepts}
-    concept_edges = _aggregate_edges(relations, canonical_of, kept)
+    concept_edges = _aggregate_edges(relations, canonical_of, kept, period_of)
+    # The axis is every period the corpus covers, taken from the mentions
+    # before top-N rather than from the concepts that survived it: a period
+    # whose only concepts were trimmed is still a period, and a slider that
+    # skipped it would read a gap as missing data (issue #553).
+    periods = tuple(sorted(set(period_of.values())))
 
     if embeddings is not None:
         positions = concept_positions(
@@ -207,7 +215,55 @@ def build_concept_cloud(
         concept_edges=concept_edges,
         cross_layer_edges=cross_layer_edges,
         dimensions=tuple(dimension_defs),
+        periods=periods,
     )
+
+
+TimeGrain = Literal["year", "quarter", "month"]
+
+
+def _period_key(value: object, grain: TimeGrain) -> str | None:
+    """The period a mention falls in, or None when it has no usable date.
+
+    Accepts what a warehouse column actually yields (issue #553): a date or
+    datetime, an ISO-ish string, or a bare year as an int or string. Anything
+    else -- null, empty, unparseable -- returns None and is counted in the
+    concept's total but left out of `by_period`. Silently bucketing an
+    unreadable date would put mentions in a period they are not from, which is
+    worse than a total that exceeds the sum of its periods.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        moment = value if isinstance(value, date) else value.date()
+        return _format_period(moment.year, moment.month, grain)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        # A bare year, which is how `filing_year` and its kin arrive. Narrower
+        # than "any int" on purpose: 202503 is not a year and should not read
+        # as one.
+        return str(value) if 1000 <= value <= 9999 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 4 and text.isdigit():
+        return _format_period(int(text), 1, grain) if grain != "year" else text
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _format_period(moment.year, moment.month, grain)
+
+
+def _format_period(year: int, month: int, grain: TimeGrain) -> str:
+    """Render a period key. Sortable as a string, which is what the bundle's
+    ascending `periods` axis and the viewer's slider both rely on."""
+    if grain == "year":
+        return f"{year:04d}"
+    if grain == "quarter":
+        return f"{year:04d}Q{(month - 1) // 3 + 1}"
+    return f"{year:04d}-{month:02d}"
 
 
 def _aggregate_concepts(
@@ -219,7 +275,9 @@ def _aggregate_concepts(
     top_n: int,
     statuses: tuple[str, ...],
     names: dict[str, ConceptName],
-) -> tuple[list[Concept], dict[str, str]]:
+    time_field: str | None,
+    time_grain: TimeGrain,
+) -> tuple[list[Concept], dict[str, str], dict[str, str]]:
     if "canonical_id" not in links.columns or "mention_id" not in links.columns:
         raise ConceptCloudExportError(
             "entity-linking output must have `canonical_id` and `mention_id` columns"
@@ -228,18 +286,31 @@ def _aggregate_concepts(
     if "status" in frame.columns:
         frame = frame.filter(pl.col("status").is_in(list(statuses)))
     if frame.height == 0:
-        return [], {}
+        return [], {}, {}
 
     # Enrich label/text from the entity table when linking did not carry them.
     label_by_mention, text_by_mention = _mention_enrichment(frame, entities)
 
+    if time_field is not None and time_field not in frame.columns:
+        raise ConceptCloudExportError(
+            f"--time-field '{time_field}' is not a column on the linking model; "
+            f"it has: {sorted(frame.columns)}"
+        )
+
     canonical_of: dict[str, str] = {}
+    # Mention id -> period, so the edge aggregation can bucket a relation by
+    # the period of the mentions it connects without re-reading the frame.
+    period_of: dict[str, str] = {}
     rows_by_canonical: dict[str, list[dict[str, object]]] = defaultdict(list)
     for row in frame.iter_rows(named=True):
         cid = str(row["canonical_id"])
         mid = str(row["mention_id"])
         canonical_of[mid] = cid
         rows_by_canonical[cid].append(row)
+        if time_field is not None:
+            period = _period_key(row.get(time_field), time_grain)
+            if period is not None:
+                period_of[mid] = period
 
     concepts: list[Concept] = []
     for cid, rows in rows_by_canonical.items():
@@ -269,6 +340,10 @@ def _aggregate_concepts(
             and not isinstance(score, bool)
         ]
         source_node = linking_node_id if linking_node_id else None
+        by_period = Counter(
+            period for r in rows
+            if (period := period_of.get(str(r["mention_id"]))) is not None
+        )
         concepts.append(Concept(
             canonical_id=cid,
             display=str(display),
@@ -280,6 +355,7 @@ def _aggregate_concepts(
             provenance=Provenance(
                 model=linking_model, source_node=source_node, documents=len(documents)
             ),
+            by_period=dict(by_period),
         ))
 
     # Deterministic top-N: most frequent first, canonical_id breaks ties.
@@ -287,7 +363,7 @@ def _aggregate_concepts(
     concepts = concepts[: max(0, top_n)]
     kept = {c.canonical_id for c in concepts}
     canonical_of = {m: c for m, c in canonical_of.items() if c in kept}
-    return concepts, canonical_of
+    return concepts, canonical_of, period_of
 
 
 def _mention_enrichment(
@@ -313,6 +389,7 @@ def _aggregate_edges(
     relations: pl.DataFrame | None,
     canonical_of: dict[str, str],
     kept: set[str],
+    period_of: dict[str, str],
 ) -> tuple[ConceptEdge, ...]:
     if relations is None or relations.height == 0 or not kept:
         return ()
@@ -321,6 +398,7 @@ def _aggregate_edges(
         return ()
     EdgeKey = tuple[str, str, str, str, bool]
     weights: dict[EdgeKey, int] = defaultdict(int)
+    edge_periods: dict[EdgeKey, Counter[str]] = defaultdict(Counter)
     confidences: dict[EdgeKey, float | None] = {}
     for row in relations.iter_rows(named=True):
         s = canonical_of.get(str(row["subject_mention_id"]))
@@ -333,6 +411,14 @@ def _aggregate_edges(
         method = str(row.get("method") or "co_occurrence")
         key: EdgeKey = (pair[0], pair[1], str(row["relation_type"]), method, directed)
         weights[key] += 1
+        # A relation belongs to a period when both its mentions do and agree.
+        # Requiring agreement rather than picking the subject's period keeps a
+        # cross-period relation out of both, which is the honest answer: the
+        # pair was not named together *in* either one (issue #553).
+        subject_period = period_of.get(str(row["subject_mention_id"]))
+        object_period = period_of.get(str(row["object_mention_id"]))
+        if subject_period is not None and subject_period == object_period:
+            edge_periods[key][subject_period] += 1
         conf = row.get("confidence")
         if isinstance(conf, (int, float)) and not isinstance(conf, bool):
             prev = confidences.get(key)
@@ -345,6 +431,7 @@ def _aggregate_edges(
             method=cast(ConceptEdgeMethod, method), directed=directed,
             weight=weights[(src, tgt, rtype, method, directed)],
             confidence=confidences.get((src, tgt, rtype, method, directed)),
+            by_period=dict(edge_periods[(src, tgt, rtype, method, directed)]),
         )
         for (src, tgt, rtype, method, directed) in sorted(weights)
     )
@@ -659,6 +746,8 @@ def export_concept_cloud(
     vector_field: str = "embedding",
     with_query_log: bool = False,
     dimension_specs: dict[str, str] | None = None,
+    time_field: str | None = None,
+    time_grain: TimeGrain = "year",
     names_model: str | None = None,
 ) -> ConceptCloudExport:
     """Read the project's tables through the active adapter and build a bundle.
@@ -752,4 +841,6 @@ def export_concept_cloud(
         query_log=query_log,
         dimension_columns=dimension_columns or None,
         names=names,
+        time_field=time_field,
+        time_grain=time_grain,
     )

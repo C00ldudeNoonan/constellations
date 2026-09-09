@@ -143,6 +143,7 @@ def build_concept_cloud(
     names: pl.DataFrame | None = None,
     time_field: str | None = None,
     time_grain: TimeGrain = "year",
+    top_n_per_period: int = 0,
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -160,6 +161,7 @@ def build_concept_cloud(
         top_n=top_n, statuses=statuses,
         names=concept_names(names) if names is not None else {},
         time_field=time_field, time_grain=time_grain,
+        top_n_per_period=top_n_per_period,
     )
     kept = {c.canonical_id for c in concepts}
     concept_edges = _aggregate_edges(relations, canonical_of, kept, period_of)
@@ -277,6 +279,7 @@ def _aggregate_concepts(
     names: dict[str, ConceptName],
     time_field: str | None,
     time_grain: TimeGrain,
+    top_n_per_period: int,
 ) -> tuple[list[Concept], dict[str, str], dict[str, str]]:
     if "canonical_id" not in links.columns or "mention_id" not in links.columns:
         raise ConceptCloudExportError(
@@ -360,8 +363,25 @@ def _aggregate_concepts(
 
     # Deterministic top-N: most frequent first, canonical_id breaks ties.
     concepts.sort(key=lambda c: (-c.frequency, c.canonical_id))
-    concepts = concepts[: max(0, top_n)]
-    kept = {c.canonical_id for c in concepts}
+    selected = {c.canonical_id for c in concepts[: max(0, top_n)]}
+    # Plus, optionally, what was biggest *within* a period (issue #553). Total
+    # frequency is the wrong lens for a time axis: a concept that dominates one
+    # period and is unremarkable across the corpus -- a risk that enters, a
+    # regulator that appears once and matters enormously that year -- is
+    # exactly what a slider exists to show, and exactly what ranking on totals
+    # trims first. Off by default because it grows the bundle, and node count
+    # is what the viewer's performance follows.
+    if top_n_per_period > 0:
+        for period in sorted({p for c in concepts for p in c.by_period}):
+            ranked = sorted(
+                (c for c in concepts if c.by_period.get(period)),
+                key=lambda c: (-c.by_period[period], c.canonical_id),
+            )
+            selected.update(c.canonical_id for c in ranked[:top_n_per_period])
+    # Re-filtered rather than re-sorted: the list is already in the canonical
+    # order, and the union must not disturb it.
+    concepts = [c for c in concepts if c.canonical_id in selected]
+    kept = selected
     canonical_of = {m: c for m, c in canonical_of.items() if c in kept}
     return concepts, canonical_of, period_of
 
@@ -748,6 +768,7 @@ def export_concept_cloud(
     dimension_specs: dict[str, str] | None = None,
     time_field: str | None = None,
     time_grain: TimeGrain = "year",
+    top_n_per_period: int = 0,
     names_model: str | None = None,
 ) -> ConceptCloudExport:
     """Read the project's tables through the active adapter and build a bundle.
@@ -758,6 +779,12 @@ def export_concept_cloud(
     from ..adapters import create_adapter
     from ..dbt_export import default_dbt_source_name
     from ..profile import resolve_profile
+
+    if top_n_per_period > 0 and time_field is None:
+        raise ConceptCloudExportError(
+            "--top-n-per-period selects the biggest concepts within each period, "
+            "so it needs --time-field to know what the periods are"
+        )
 
     project_path = Path(project_dir)
     project, _, _ = load_project(project_path)
@@ -843,4 +870,5 @@ def export_concept_cloud(
         names=names,
         time_field=time_field,
         time_grain=time_grain,
+        top_n_per_period=top_n_per_period,
     )

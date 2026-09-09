@@ -992,3 +992,79 @@ def test_the_period_axis_survives_top_n_trimming() -> None:
     assert export.concepts[0].by_period == {"2019": 3}
     # ...but 2021 is still part of the corpus, and still on the axis.
     assert export.periods == ("2019", "2021")
+
+
+def test_top_n_per_period_keeps_a_risk_that_only_one_period_cared_about() -> None:
+    """The case the flag exists for (issue #553).
+
+    Ranking on total frequency trims exactly what a time axis is meant to
+    show: something that enters, dominates one period, and is unremarkable
+    across the corpus. Here `SUPPLY` is named twice in 2021 and never again,
+    while three other concepts each out-total it — so `--top-n 3` drops it and
+    the slider can never show it arriving.
+    """
+    links = pl.DataFrame(
+        {
+            "mention_id": [f"m{i}" for i in range(1, 12)],
+            "canonical_id": [
+                "FERC", "FERC", "FERC",
+                "AES", "AES", "AES",
+                "EU", "EU", "EU",
+                "SUPPLY", "SUPPLY",
+            ],
+            "mention_text": [
+                "FERC", "FERC", "FERC", "AES", "AES", "AES",
+                "EU", "EU", "EU", "supply chain", "supply chain",
+            ],
+            "filing_year": [
+                2019, 2020, 2021, 2019, 2020, 2021,
+                2019, 2020, 2021, 2021, 2021,
+            ],
+        }
+    )
+    without = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year", top_n=3,
+    )
+    assert "SUPPLY" not in {c.canonical_id for c in without.concepts}
+
+    # SUPPLY is the second-biggest thing that happened in 2021, so a
+    # per-period rank of 2 reaches it.
+    with_flag = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year", top_n=3,
+        top_n_per_period=2,
+    )
+    by_id = {c.canonical_id: c for c in with_flag.concepts}
+    assert "SUPPLY" in by_id
+    assert by_id["SUPPLY"].by_period == {"2021": 2}
+    # The overall top-3 are still there; the flag is a union, not a swap.
+    assert {"FERC", "AES", "EU"} <= set(by_id)
+
+
+def test_top_n_per_period_keeps_the_canonical_order() -> None:
+    """The union must not disturb the deterministic ordering."""
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3", "m4"],
+            "canonical_id": ["BIG", "BIG", "BIG", "RARE"],
+            "mention_text": ["BIG", "BIG", "BIG", "RARE"],
+            "filing_year": [2019, 2019, 2019, 2021],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year",
+        top_n=1, top_n_per_period=1,
+    )
+    # Most frequent first, exactly as without the flag.
+    assert [c.canonical_id for c in export.concepts] == ["BIG", "RARE"]
+
+
+def test_top_n_per_period_without_a_time_field_is_refused() -> None:
+    """Silently doing nothing would look like the flag working."""
+    with pytest.raises(ConceptCloudExportError) as excinfo:
+        export_concept_cloud(
+            pathlib.Path("."), linking_model="link_entities", top_n_per_period=5
+        )
+    assert "needs --time-field" in str(excinfo.value)

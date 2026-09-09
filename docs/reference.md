@@ -4342,9 +4342,19 @@ different periods was not named together in either.
 
 The axis is every period the corpus covers, taken before `--top-n` trimming: a
 period whose only concepts were trimmed is still a period, and skipping it
-would read a gap as missing data. Note that `--top-n` still selects on *total*
-frequency, so a concept that dominates one period but is rare overall can be
-trimmed before the axis ever shows it.
+would read a gap as missing data.
+
+**`--top-n-per-period N` keeps what mattered *within* a period.** `--top-n`
+ranks on total frequency across the corpus, which trims exactly what a time
+axis exists to show: a risk that enters, dominates one period, and is
+unremarkable over fifteen years is out-totalled by every steady concept and
+disappears before the slider can show it arriving. The flag adds the N biggest
+concepts in each period to whatever `--top-n` kept — a union, not a swap, and
+the ordering is unchanged.
+
+It is off by default because it grows the bundle, and node count is what the
+viewer's performance follows. It needs `--time-field`, and says so rather than
+quietly doing nothing without one.
 
 **Semantic positions** (`--embed-model <model>`). Point the export at an embed
 model over the linking mentions and each concept is placed at the centroid of

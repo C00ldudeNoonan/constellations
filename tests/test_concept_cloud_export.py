@@ -13,6 +13,7 @@ from stel.concept_cloud import (
     DagNode,
     DagPlane,
     build_concept_cloud,
+    concept_names,
     dag_plane_from_dbt_manifest,
     dag_plane_from_stel_manifest,
     export_concept_cloud,
@@ -67,7 +68,10 @@ def test_build_aggregates_concepts_and_drops_unmatched() -> None:
     by_id = {c.canonical_id: c for c in export.concepts}
     assert set(by_id) == {"org:acme", "gpe:ny"}  # m4 (unmatched) dropped
     assert by_id["org:acme"].frequency == 2
-    assert by_id["org:acme"].display == "Acme"          # first non-null text
+    # "Acme" and "Acme Corp" appear once each; the lexical tie-break picks
+    # "Acme". `test_display_is_the_most_frequent_mention_text` is the case
+    # that actually discriminates the rule.
+    assert by_id["org:acme"].display == "Acme"
     assert by_id["org:acme"].label == "ORG"
     assert by_id["org:acme"].link_status == "matched"
     assert by_id["org:acme"].provenance.documents == 2  # d1, d2
@@ -583,3 +587,218 @@ def test_the_unresolved_hint_lists_source_names_not_the_dbt_project(
     # The dbt project name is not a source name and must not be offered as one.
     assert "dbt_project'" not in message
     assert "['dbt_project']" not in message
+
+
+# ── display names and descriptions (#554) ──────────────────────────────────
+
+
+def _text_links() -> pl.DataFrame:
+    """One concept whose first row's text is not its most frequent one.
+
+    Under the old `_first` rule this concept was named "Pentair Water
+    Solutions plc" -- whichever mention the frame happened to yield first.
+    """
+    return pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3", "m4"],
+            "canonical_id": ["org:pnr"] * 4,
+            "document_id": ["d1", "d2", "d3", "d4"],
+            "status": ["matched"] * 4,
+            "label": ["ORG"] * 4,
+            "mention_text": [
+                "Pentair Water Solutions plc", "Pentair", "Pentair", "PNR",
+            ],
+        }
+    )
+
+
+def _names() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "canonical_id": ["org:pnr"],
+            "display_name": ["Pentair"],
+            "description": ["Water treatment equipment manufacturer (NYSE: PNR)."],
+        }
+    )
+
+
+def test_display_is_the_most_frequent_mention_text() -> None:
+    """Row order must not name a concept (issue #554).
+
+    A real map showed `US`, `U.K.`, `Aon` and `American Water Works Company,
+    Inc.` side by side because each was whichever mention text the linking
+    frame yielded first.
+    """
+    export = build_concept_cloud(
+        project="p", links=_text_links(), dag_plane=_plane(),
+    )
+    concept = export.concepts[0]
+    assert concept.display == "Pentair"      # 2 mentions, not the first row's
+    assert concept.description is None       # nothing supplies one by default
+
+
+def test_display_ties_break_lexically_not_by_row_order() -> None:
+    links = _text_links().with_columns(
+        pl.Series("mention_text", ["Zebra", "Zebra", "Alpha", "Alpha"])
+    )
+    reversed_rows = links.reverse()
+    assert (
+        build_concept_cloud(project="p", links=links, dag_plane=_plane())
+        .concepts[0].display
+        == build_concept_cloud(project="p", links=reversed_rows, dag_plane=_plane())
+        .concepts[0].display
+        == "Alpha"
+    )
+
+
+def test_entity_text_enriches_only_rows_without_their_own_text() -> None:
+    """Enrichment is per row, then counted -- not a second list appended after
+    every row's own text, which is what made the old rule order-dependent."""
+    links = _text_links().with_columns(
+        pl.Series("mention_text", ["Pentair plc", None, None, None])
+    )
+    entities = pl.DataFrame(
+        {"entity_id": ["m2", "m3", "m4"], "entity_text": ["Pentair"] * 3}
+    )
+    export = build_concept_cloud(
+        project="p", links=links, entities=entities, dag_plane=_plane(),
+    )
+    assert export.concepts[0].display == "Pentair"
+
+
+def test_names_model_supplies_the_display_name_and_description() -> None:
+    export = build_concept_cloud(
+        project="p", links=_text_links(), dag_plane=_plane(), names=_names(),
+    )
+    concept = export.concepts[0]
+    assert concept.display == "Pentair"
+    assert concept.description == (
+        "Water treatment equipment manufacturer (NYSE: PNR)."
+    )
+
+
+def test_names_model_outranks_the_most_frequent_mention() -> None:
+    names = _names().with_columns(pl.Series("display_name", ["Pentair plc"]))
+    export = build_concept_cloud(
+        project="p", links=_text_links(), dag_plane=_plane(), names=names,
+    )
+    assert export.concepts[0].display == "Pentair plc"
+
+
+def test_names_model_blank_cells_fall_back_rather_than_blanking_a_node() -> None:
+    names = pl.DataFrame(
+        {
+            "canonical_id": ["org:pnr"],
+            "display_name": ["   "],
+            "description": [""],
+        }
+    )
+    concept = build_concept_cloud(
+        project="p", links=_text_links(), dag_plane=_plane(), names=names,
+    ).concepts[0]
+    assert concept.display == "Pentair"   # the mention-text rule, not a blank
+    assert concept.description is None
+
+
+def test_names_model_covers_only_the_concepts_it_names() -> None:
+    export = build_concept_cloud(
+        project="p", links=_links(), dag_plane=_plane(),
+        names=pl.DataFrame(
+            {"canonical_id": ["org:acme"], "display_name": ["Acme Corporation"]}
+        ),
+    )
+    by_id = {c.canonical_id: c for c in export.concepts}
+    assert by_id["org:acme"].display == "Acme Corporation"
+    assert by_id["gpe:ny"].display == "New York"   # unnamed, unchanged
+    assert by_id["gpe:ny"].description is None
+
+
+def test_names_model_without_a_description_column_is_fine() -> None:
+    names = pl.DataFrame(
+        {"canonical_id": ["org:pnr"], "display_name": ["Pentair"]}
+    )
+    assert concept_names(names)["org:pnr"].description is None
+
+
+def test_names_model_missing_a_required_column_is_refused_by_name() -> None:
+    with pytest.raises(ConceptCloudExportError, match="display_name"):
+        concept_names(pl.DataFrame({"canonical_id": ["org:pnr"]}))
+    with pytest.raises(ConceptCloudExportError, match="canonical_id"):
+        concept_names(pl.DataFrame({"display_name": ["Pentair"]}))
+
+
+def test_names_model_duplicate_canonical_id_is_refused() -> None:
+    """A warehouse read promises no row order, so "first row wins" would let
+    the map's labels change between two exports of unchanged data."""
+    names = pl.DataFrame(
+        {
+            "canonical_id": ["org:pnr", "org:pnr"],
+            "display_name": ["Pentair", "Pentair plc"],
+        }
+    )
+    with pytest.raises(ConceptCloudExportError, match="more than one row"):
+        concept_names(names)
+
+
+def test_export_reads_the_names_model_through_the_adapter(
+    tmp_path: pathlib.Path,
+) -> None:
+    _manifest_project(tmp_path)
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        adapter.materialize_full(
+            "concept_names",
+            pl.DataFrame(
+                {
+                    "canonical_id": ["org:acme"],
+                    "display_name": ["Acme Corporation"],
+                    "description": ["A fictional maker of anvils."],
+                }
+            ),
+        )
+
+    export = export_concept_cloud(
+        tmp_path, linking_model="link_entities", names_model="concept_names",
+    )
+    by_id = {c.canonical_id: c for c in export.concepts}
+    assert by_id["org:acme"].display == "Acme Corporation"
+    assert by_id["org:acme"].description == "A fictional maker of anvils."
+
+
+def test_cli_names_model_reaches_the_export(tmp_path: pathlib.Path) -> None:
+    """The flag is hand-wired to a keyword argument; a typo there would leave
+    it silently None and every node back on its mention text."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    _manifest_project(tmp_path)
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        adapter.materialize_full(
+            "concept_names",
+            pl.DataFrame(
+                {
+                    "canonical_id": ["org:acme"],
+                    "display_name": ["Acme Corporation"],
+                    "description": ["A fictional maker of anvils."],
+                }
+            ),
+        )
+
+    out = tmp_path / "cloud.html"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir", str(tmp_path), "concept-cloud",
+            "--linking-model", "link_entities",
+            "--names-model", "concept_names",
+            "--output", str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    html = out.read_text(encoding="utf-8")
+    assert "Acme Corporation" in html
+    assert "A fictional maker of anvils." in html

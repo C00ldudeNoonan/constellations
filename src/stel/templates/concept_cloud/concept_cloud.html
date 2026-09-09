@@ -62,6 +62,8 @@
       box-shadow: 0 8px 32px rgba(0, 0, 0, .35); }
     #detail strong { letter-spacing: .02em; }
     #detail .k { color: var(--muted); }
+    #detail .desc { display: block; margin: 6px 0 8px; color: var(--fg);
+      opacity: .82; line-height: 1.45; }
     footer { position: fixed; bottom: 10px; right: 14px; z-index: 10;
       color: var(--muted); font-size: 11px; letter-spacing: .04em; }
     a { color: var(--accent); }
@@ -249,22 +251,32 @@
     // and the sprite tints the library does not know about.
     let fullRefresh = () => {};
 
+    // Concept names and descriptions are warehouse text an operator wrote, and
+    // both the panel and the library's tooltip render as HTML. Escape at the
+    // one place they enter markup rather than trusting the table.
+    const esc = s => String(s ?? "").replace(/[&<>"']/g,
+      c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    const truncate = (s, n) => s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s;
+
     function showDetail(node) {
       const el = document.getElementById("detail");
       if (!node) { el.style.display = "none"; return; }
       el.style.display = "block";
       if (node.kind === "concept") {
         const dims = Object.entries(node.dimensions || {})
-          .map(([k, v]) => `<span class="k">${k}</span> ${v}`).join(" · ");
-        el.innerHTML = `<strong>${node.name}</strong><br>` +
-          `<span class="k">id</span> ${node.id}<br>` +
-          `<span class="k">type</span> ${node.label} · ` +
+          .map(([k, v]) => `<span class="k">${esc(k)}</span> ${esc(v)}`).join(" · ");
+        el.innerHTML = `<strong>${esc(node.name)}</strong>` +
+          (node.description ? `<span class="desc">${esc(node.description)}</span>`
+                            : "<br>") +
+          `<span class="k">id</span> ${esc(node.id)}<br>` +
+          `<span class="k">type</span> ${esc(node.label)} · ` +
           `<span class="k">freq</span> ${node.frequency} · ` +
-          `<span class="k">link</span> ${node.link_status}` +
+          `<span class="k">link</span> ${esc(node.link_status)}` +
           (dims ? `<br>${dims}` : "");
       } else {
-        el.innerHTML = `<strong>${node.name}</strong><br>` +
-          `<span class="k">dbt ${node.resource_type}</span><br>${node.id}`;
+        el.innerHTML = `<strong>${esc(node.name)}</strong><br>` +
+          `<span class="k">dbt ${esc(node.resource_type)}</span><br>${esc(node.id)}`;
       }
     }
 
@@ -394,7 +406,8 @@
       DATA.concepts.forEach(c => {
         const node = {
           id: c.canonical_id, name: c.display, kind: "concept", label: c.label || "—",
-          val: c.frequency, link_status: c.link_status, frequency: c.frequency,
+          description: c.description || "", val: c.frequency,
+          link_status: c.link_status, frequency: c.frequency,
           dimensions: c.dimensions || {}, labelled: labelled.has(c.canonical_id),
         };
         if (c.position) {
@@ -487,9 +500,12 @@
         .graphData({ nodes, links })
         .nodeThreeObject(starObject)
         .nodeLabel(n => n.kind === "concept"
-          ? `${n.name} · ${n.label} · freq ${n.frequency}`
+          ? `${esc(n.name)} · ${esc(n.label)} · freq ${n.frequency}`
           + (isOrphan(n.id) ? " · orphan" : "")
-          : `${n.name} · ${n.resource_type}`
+          // The panel carries the whole description; the tooltip follows the
+          // cursor, so it gets a first line and nothing more.
+          + (n.description ? `<br>${esc(truncate(n.description, 90))}` : "")
+          : `${esc(n.name)} · ${esc(n.resource_type)}`
           + (isOrphan(n.id) ? " · orphan" : ""))
         .nodeVal(n => n.kind === "dag" ? 6 : Math.max(2, n.val))
         .nodeVisibility(nodeVisible)

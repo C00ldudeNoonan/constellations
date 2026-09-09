@@ -4320,6 +4320,36 @@ bundle — never vectors or text — and concepts stay pinned to their positions
 in the viewer, because position *is* the meaning. Without the flag, layout
 falls back to the force simulation.
 
+**Names and descriptions** (`--names-model <model>`, issue #554). Without it a
+concept is named by its **most frequent** mention text, ties broken lexically —
+deterministic, but still whatever the corpus happens to call the thing, so a
+real map ends up mixing tickers, acronyms, short names and legal names (`PNR`
+beside `American Water Works Company, Inc.`). Nothing in the pipeline knows
+what `FERC` *is*.
+
+`--names-model` points at a concept-keyed relation the operator maintains:
+
+| column | |
+|---|---|
+| `canonical_id` | required; the key the cloud is built on |
+| `display_name` | required; what the node is called |
+| `description` | optional; what the concept *is* |
+
+The name replaces the mention-derived one and the description shows in the
+click panel and the hover tooltip. A concept the relation does not name keeps
+the mention-text fallback, and a blank cell falls back rather than blanking a
+node. Column names are fixed — alias them in the model if your table calls
+them something else. Two rows for one `canonical_id` is refused: a warehouse
+read promises no row order, so picking one would let the map's labels change
+between two exports of unchanged data.
+
+```bash
+stel --project-dir path/to/stel_project concept-cloud \
+  --linking-model link_entities \
+  --names-model concept_names \
+  -o cloud.html
+```
+
 **Categorical dimensions** (issue #345). Beyond the built-in entity-type
 coloring:
 
@@ -4334,7 +4364,8 @@ coloring:
 
 **Prerequisites.** The cloud is keyed on `canonical_id`, so an entity-linking
 (`link_entities`) model must have run; and human-readable node labels require the
-NLP/linking models to set `include_text: true` (otherwise nodes show ids).
+NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
+`--names-model` that supplies them directly.
 
 **Boundaries.** The artifact reads only exported/queried output tables — no
 warehouse credentials ever enter it, and raw document text appears only when the

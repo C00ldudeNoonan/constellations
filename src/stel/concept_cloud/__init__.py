@@ -20,6 +20,7 @@ from .demo import demo_export
 from .export import (
     ConceptCloudExportError,
     build_concept_cloud,
+    concept_names,
     dag_plane_from_dbt_manifest,
     dag_plane_from_stel_manifest,
     export_concept_cloud,
@@ -50,6 +51,7 @@ __all__ = [
     "DagPlane",
     "Provenance",
     "build_concept_cloud",
+    "concept_names",
     "dag_plane_from_dbt_manifest",
     "dag_plane_from_stel_manifest",
     "demo_export",

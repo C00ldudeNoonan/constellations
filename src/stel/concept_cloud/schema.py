@@ -164,6 +164,10 @@ class Concept(_Frozen):
 
     canonical_id: str
     display: str
+    # What this concept *is*, in the operator's words (#554). A map of tickers
+    # and acronyms is unreadable without it, and no pipeline table knows it —
+    # it comes from the names relation the operator maintains, never inferred.
+    description: str | None = None
     label: str | None = None
     namespace: str | None = None
     # COUNT of mentions for this canonical id; drives node size. >= 1.
@@ -183,6 +187,13 @@ class Concept(_Frozen):
     @classmethod
     def _non_empty(cls, value: str) -> str:
         return _require_non_empty(value)
+
+    @field_validator("description")
+    @classmethod
+    def _blank_description_is_absent(cls, value: str | None) -> str | None:
+        # A names relation with an empty cell means "no description", not a
+        # concept whose description is whitespace.
+        return value.strip() or None if value is not None else None
 
     @field_validator("match_score")
     @classmethod

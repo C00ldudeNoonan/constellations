@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Concepts can carry a name and a description (issue #554)
+
+A concept's node text was the first mention text the linking frame happened to
+yield, so a real SEC risk-factor map showed `US`, `U.K.`, `Aon`, `AES` and
+`American Water Works Company, Inc.` side by side — a ticker, an acronym, a
+short name and a legal name, chosen by row order. Nothing on the map said what
+any of them were.
+
+Two changes:
+
+- **The fallback is now deterministic.** A concept takes its **most frequent**
+  mention text, ties broken lexically — the rule `column_dimension` already
+  applies to dimension values. Entity-table enrichment is resolved per row
+  before counting, so a row's own text still wins over enrichment.
+- **`concept-cloud --names-model <model>`** reads a concept-keyed relation of
+  `canonical_id`, `display_name` and an optional `description`. The name
+  replaces the mention-derived one; the description shows in the click panel
+  and the hover tooltip. Unnamed concepts and blank cells fall back rather
+  than blanking a node, and two rows for one `canonical_id` is refused —
+  a warehouse read promises no row order, so resolving it silently would let
+  a map's labels change between two exports of unchanged data.
+
+`Concept.description` is additive within `schema_version` 2.
+
+The viewer now escapes concept text where it enters markup. The JSON island
+was already breakout-proof (`<` is escaped to `<`), but the detail panel
+and the library's tooltip interpolate into HTML, and a description is longer
+and freer text than anything that reached them before.
+
 ## v0.18.0 - 2026-09-08
 
 ### Dependencies

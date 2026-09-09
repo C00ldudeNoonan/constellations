@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
+from jinja2.exceptions import UndefinedError
 
 from stel.adapters.base import AdapterError
 from stel.adapters.duckdb import DuckDBAdapter, DuckDBWarehouseConfig
@@ -63,7 +64,7 @@ def test_compile_sql_renders_incremental_branch_false() -> None:
 def test_compile_sql_this_undefined_for_full_model() -> None:
     # A full-type model has no incremental branch; referencing `this` without
     # is_incremental/this being supplied must fail, not silently render blank.
-    with pytest.raises(Exception, match="'this' is undefined"):
+    with pytest.raises(UndefinedError, match="'this' is undefined"):
         compile_sql(
             "select * from {{ this }}",
             model_name="m",

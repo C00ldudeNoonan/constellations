@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from click.exceptions import ClickException
 
 import stel.cli as cli
 from stel.cli_services.context import (
@@ -78,7 +79,7 @@ def test_watch_reports_no_source_paths(
     )
     # No source files exist on disk yet, so the watch service refuses to start
     # its loop — reachable now without invoking the CLI or watchfiles.
-    with pytest.raises(Exception, match="No source paths exist on disk"):
+    with pytest.raises(ClickException, match="No source paths exist on disk"):
         run_watch(
             project,
             profiles_dir=None,

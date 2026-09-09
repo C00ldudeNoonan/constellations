@@ -4297,6 +4297,15 @@ entity-linking output supplies canonical concepts (sized by mention frequency,
 colored by entity type) and the mention→canonical map; the relation grain
 supplies typed concept-to-concept edges; and the DAG plane comes from the
 downstream dbt `manifest.json` (or stel's own if `--dbt-manifest` is omitted).
+
+**The linking model has to appear in the manifest you pass.** The cross-layer
+edges join stel's concepts to the dbt DAG through that one node, so the
+consumer project must declare the linking model as a dbt source — run
+`stel emit-dbt-sources --source-name <name>` and merge the result into that
+project before exporting, and pass the same `--source-name` here. A project
+that adds star-map models on the stel side has to re-run it; without that
+step, the export refuses rather than rendering a cloud whose DAG join is
+silently empty.
 The viewer has orbit controls, a color-by picker over every dimension, a
 text search, per-value legend toggles, an orphan highlight, a min-frequency
 filter, and lineage mode (off by default) with click-to-trace beams. It opens

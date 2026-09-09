@@ -16,7 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # Bumped when the bundle shape changes so the artifact and the export job can
 # evolve independently; the artifact refuses a bundle it does not understand.
 # v2 (issue #345): baked 3D positions and categorical dimensions.
-CONCEPT_CLOUD_SCHEMA_VERSION = "2"
+# v3 (issue #553): per-period counts on concepts and edges, plus the bundle's
+# period axis, so one artifact can be stepped through time instead of one
+# artifact per period.
+CONCEPT_CLOUD_SCHEMA_VERSION = "3"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -182,6 +185,11 @@ class Concept(_Frozen):
     # bundle and every value must be in that def's declared set; a concept
     # absent from a dimension simply omits the key.
     dimensions: dict[str, str] = Field(default_factory=dict)
+    # Period key -> mention count (issue #553). Empty when the export declared
+    # no time field. A period the concept has no mentions in is *absent*, not
+    # zero: absence is the signal ("first named in 2019"), and writing zeros
+    # for every period of every concept would dominate the bundle.
+    by_period: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("canonical_id", "display")
     @classmethod
@@ -215,6 +223,10 @@ class ConceptEdge(_Frozen):
     method: ConceptEdgeMethod = "co_occurrence"
     weight: int = Field(ge=1, default=1)
     confidence: float | None = None
+    # Period key -> relation count (issue #553), on the same terms as
+    # `Concept.by_period`: absent means the pair was not named together in
+    # that period.
+    by_period: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("source", "target", "relation_type")
     @classmethod
@@ -252,7 +264,7 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["2"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["3"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane
@@ -261,6 +273,12 @@ class ConceptCloudExport(_Frozen):
     cross_layer_edges: tuple[CrossLayerEdge, ...] = ()
     # Declared categorical dimensions (issue #345); order is picker order.
     dimensions: tuple[DimensionDef, ...] = ()
+    # Every period key present in the export, ascending (issue #553). This is
+    # the slider's axis, and it is carried explicitly rather than derived from
+    # the concepts: a period in which nothing was mentioned is still a period
+    # the corpus covers, and a slider that skipped it would misread a gap as
+    # absent data. Empty when no time field was declared.
+    periods: tuple[str, ...] = ()
 
     @field_validator("generated_at", "project")
     @classmethod
@@ -288,8 +306,30 @@ class ConceptCloudExport(_Frozen):
                         f"concept '{concept.canonical_id}' has value {value!r} "
                         f"outside dimension '{name}' declared set"
                     )
+        # A per-period count keyed on a period the bundle does not declare
+        # would be invisible to the slider, which iterates the axis -- so it
+        # is a bundle that cannot render what it contains, and is rejected
+        # here rather than silently dropped by the viewer (issue #553).
+        declared_periods = set(self.periods)
+        if len(declared_periods) != len(self.periods):
+            raise ValueError("periods must be unique")
+        if tuple(sorted(self.periods)) != self.periods:
+            raise ValueError("periods must be sorted ascending")
+        for concept in self.concepts:
+            undeclared = set(concept.by_period) - declared_periods
+            if undeclared:
+                raise ValueError(
+                    f"concept '{concept.canonical_id}' has counts for "
+                    f"undeclared period(s) {sorted(undeclared)}"
+                )
         node_ids = {node.id for node in self.dag_plane.nodes}
         for edge in self.concept_edges:
+            undeclared = set(edge.by_period) - declared_periods
+            if undeclared:
+                raise ValueError(
+                    f"concept_edge '{edge.source}'->'{edge.target}' has counts "
+                    f"for undeclared period(s) {sorted(undeclared)}"
+                )
             for endpoint in (edge.source, edge.target):
                 if endpoint not in concept_ids:
                     raise ValueError(

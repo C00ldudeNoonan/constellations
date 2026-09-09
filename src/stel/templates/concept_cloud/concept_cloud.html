@@ -86,6 +86,10 @@
         <input type="range" id="minfreq" min="0" max="100" value="0">
       </label>
       <label class="ctl"><input type="checkbox" id="lineage"> Lineage mode (dbt plane + beams)</label>
+      <label class="ctl" id="period-ctl" style="display:none">
+        Period: <span class="val" id="period-val">all</span>
+        <input type="range" id="period" min="0" max="0" value="0">
+      </label>
     </div>
   </aside>
   <aside id="detail"></aside>
@@ -140,9 +144,18 @@
     let colorBy = DIMENSIONS[0];
     const hidden = new Set();   // values of the CURRENT dimension toggled off
     let selected = null;        // currently selected node id
+    // Node id -> node, so the detail card can be re-rendered when the period
+    // changes without waiting for the next click.
+    const nodeById = new Map();
     let Graph = null;           // assigned once the library loads
     let highlightOrphans = false;
     let minFreq = 0;            // hide concepts below this mention frequency
+    // Selected period key, or null for "all periods" (issue #553). Only ever
+    // changes what a star *looks like* and whether it is shown -- never
+    // `nodeVal`, which feeds the force simulation. Layout is computed once
+    // over every period, so a star that grows is recognisably the same star.
+    let period = null;
+    const PERIODS = [];
     // Lineage mode (#345 Q4/Q5): OFF by default — the star map is the primary
     // view; toggling on drops the dbt plane in beneath and enables the beams.
     let lineageMode = false;
@@ -245,6 +258,25 @@
         lineageMode = lineage.checked;
         if (Graph) fullRefresh();
       });
+      // The period axis comes from the bundle rather than from the concepts,
+      // so a period in which nothing was named is still a stop on the slider
+      // -- a gap is a fact about the corpus, not missing data (issue #553).
+      PERIODS.push(...(DATA.periods || []));
+      if (PERIODS.length) {
+        const ctl = document.getElementById("period-ctl");
+        const periodSlider = document.getElementById("period");
+        const periodVal = document.getElementById("period-val");
+        ctl.style.display = "";
+        // Stop 0 is "all periods", so the totals stay one drag away.
+        periodSlider.max = String(PERIODS.length);
+        periodSlider.addEventListener("input", () => {
+          const index = Number(periodSlider.value);
+          period = index === 0 ? null : PERIODS[index - 1];
+          periodVal.textContent = period === null ? "all" : period;
+          if (Graph) fullRefresh();
+          if (selected) showDetail(nodeById.get(selected));
+        });
+      }
     }
 
     // Set once buildGraph runs; refreshes both the library-driven accessors
@@ -271,7 +303,10 @@
                             : "<br>") +
           `<span class="k">id</span> ${esc(node.id)}<br>` +
           `<span class="k">type</span> ${esc(node.label)} · ` +
-          `<span class="k">freq</span> ${node.frequency} · ` +
+          `<span class="k">freq</span> ${node.frequency}` +
+          (period !== null
+            ? ` <span class="k">in ${esc(period)}</span> ${node.by_period?.[period] || 0}`
+            : "") + " · " +
           `<span class="k">link</span> ${esc(node.link_status)}` +
           (dims ? `<br>${dims}` : "");
       } else {
@@ -409,6 +444,7 @@
           description: c.description || "", val: c.frequency,
           link_status: c.link_status, frequency: c.frequency,
           dimensions: c.dimensions || {}, labelled: labelled.has(c.canonical_id),
+          by_period: c.by_period || {},
         };
         if (c.position) {
           node.fx = c.position.x;
@@ -422,10 +458,13 @@
       DATA.concept_edges.forEach(e => links.push({
         source: e.source, target: e.target, kind: "concept",
         relation_type: e.relation_type, method: e.method, directed: e.directed,
+        by_period: e.by_period || {},
       }));
       DATA.cross_layer_edges.forEach(e => links.push({
         source: e.concept, target: e.dag_node, kind: "cross",
       }));
+
+      nodes.forEach(n => nodeById.set(n.id, n));
 
       const neighbors = new Map();
       links.forEach(l => {
@@ -452,10 +491,32 @@
         return DIM;
       }
 
+      // A concept's mentions in the selected period, or its total when no
+      // period is selected. A period the concept has no mentions in is absent
+      // from `by_period` rather than zero, which is exactly the signal: the
+      // star was not there yet, or is gone.
+      function periodFreq(n) {
+        if (period === null || n.kind !== "concept") return n.frequency;
+        return n.by_period[period] || 0;
+      }
+
+      function periodWeight(l) {
+        if (period === null || l.kind !== "concept") return 1;
+        return (l.by_period || {})[period] || 0;
+      }
+
+      // The radius the star is drawn at. Matches the formula `starObject`
+      // bakes into the geometry, so scaling by the ratio of the two is exact.
+      const starRadius = f => 1.6 + Math.sqrt(f) * 0.55;
+
       function nodeVisible(n) {
         if (n.kind === "dag") return lineageMode;
         if (hidden.has(colorBy.valueOf(n))) return false;
-        return n.frequency >= minFreq;
+        const freq = periodFreq(n);
+        // Absent in this period means absent from the sky. Scaling it to
+        // nothing would leave a dot that reads as "tiny", not as "not yet".
+        if (period !== null && freq === 0) return false;
+        return freq >= minFreq;
       }
 
       const THREE = three();
@@ -471,7 +532,7 @@
         if (!THREE || n.kind !== "concept") return undefined;
         const group = new THREE.Group();
         const color = conceptColor(n);
-        const radius = 1.6 + Math.sqrt(n.frequency) * 0.55;
+        const radius = starRadius(n.frequency);
         const coreMaterial = new THREE.MeshBasicMaterial({ color });
         const core = new THREE.Mesh(
           new THREE.SphereGeometry(radius, 24, 16), coreMaterial);
@@ -485,6 +546,12 @@
         group.add(halo);
         n.__coreMaterial = coreMaterial;
         n.__starMaterial = haloMaterial;
+        // Kept so the period slider can resize a star by scaling what is
+        // already built. Rebuilding the geometry per period would rebuild the
+        // scene, and the whole point is that nothing moves (issue #553).
+        n.__core = core;
+        n.__halo = halo;
+        n.__baseRadius = radius;
         if (n.labelled) {
           const label = makeLabelSprite(THREE, n.name);
           label.position.set(0, -(radius * 2 + 4), 0);
@@ -515,6 +582,9 @@
           const s = l.source, t = l.target;
           if (l.kind !== "concept" && !lineageMode) return false;
           if (typeof s === "object" && (!nodeVisible(s) || !nodeVisible(t))) return false;
+          // A pair not named together in this period draws no line, on the
+          // same terms as a concept absent from it.
+          if (l.kind === "concept" && periodWeight(l) === 0) return false;
           // Lineage mode shows every beam faintly — the point of the mode is
           // seeing the two maps connected, not clicking blind — and the
           // selected star's beams brighten below. With a selection, only its
@@ -565,6 +635,14 @@
         for (const n of nodes) {
           if (n.__coreMaterial) n.__coreMaterial.color.set(conceptColor(n));
           if (n.__starMaterial) n.__starMaterial.color.set(conceptColor(n));
+          if (n.__core && n.__baseRadius) {
+            // Size follows the period; position does not. The label keeps its
+            // own scale and offset so text stays readable as a star shrinks.
+            const scale = starRadius(periodFreq(n)) / n.__baseRadius;
+            n.__core.scale.setScalar(scale);
+            const halo = n.__baseRadius * scale * 7;
+            if (n.__halo) n.__halo.scale.set(halo, halo, 1);
+          }
           if (n.__labelMaterial) {
             const receded = selected && n.id !== selected &&
               !(neighbors.get(selected) || new Set()).has(n.id);

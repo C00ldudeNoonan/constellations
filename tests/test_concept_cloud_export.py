@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import pathlib
 from pathlib import Path
+from typing import Any, cast
 
 import polars as pl
 import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
 from stel.concept_cloud import (
+    Concept,
+    ConceptCloudExport,
     ConceptCloudExportError,
     DagNode,
     DagPlane,
+    Provenance,
     build_concept_cloud,
     concept_names,
     dag_plane_from_dbt_manifest,
@@ -802,3 +806,265 @@ def test_cli_names_model_reaches_the_export(tmp_path: pathlib.Path) -> None:
     html = out.read_text(encoding="utf-8")
     assert "Acme Corporation" in html
     assert "A fictional maker of anvils." in html
+
+
+# ─── v3: a time axis (issue #553) ───────────────────────────────────────────
+
+
+def _timed_links() -> pl.DataFrame:
+    """Mentions carrying a filing year, the shape #553 describes."""
+    return pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3", "m4", "m5"],
+            "canonical_id": ["FERC", "FERC", "FERC", "AES", "AES"],
+            "mention_text": ["FERC", "FERC", "FERC", "AES", "AES"],
+            "document_id": ["d1", "d2", "d3", "d1", "d3"],
+            "filing_year": [2019, 2019, 2021, 2019, 2021],
+        }
+    )
+
+
+def test_a_time_field_gives_each_concept_its_periods() -> None:
+    """One bundle covering every period, instead of one artifact per period."""
+    export = build_concept_cloud(
+        project="p",
+        links=_timed_links(),
+        dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities",
+        time_field="filing_year",
+    )
+
+    assert export.schema_version == "3"
+    assert export.periods == ("2019", "2021")
+    by_id = {c.canonical_id: c for c in export.concepts}
+    assert by_id["FERC"].by_period == {"2019": 2, "2021": 1}
+    assert by_id["AES"].by_period == {"2019": 1, "2021": 1}
+    # Totals are unchanged by the axis.
+    assert by_id["FERC"].frequency == 3
+
+
+def test_without_a_time_field_the_bundle_has_no_periods() -> None:
+    """The axis is opt-in; nothing changes for an export that omits it."""
+    export = build_concept_cloud(
+        project="p",
+        links=_timed_links(),
+        dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities",
+    )
+
+    assert export.periods == ()
+    assert all(c.by_period == {} for c in export.concepts)
+
+
+@pytest.mark.parametrize(
+    ("grain", "expected"),
+    [
+        ("year", "2021"),
+        ("quarter", "2021Q3"),
+        ("month", "2021-08"),
+    ],
+)
+def test_the_grain_decides_the_period_key(grain: str, expected: str) -> None:
+    """Keys are sortable as strings, which is what the ascending axis and the
+    viewer's slider both rely on."""
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1"],
+            "canonical_id": ["FERC"],
+            "mention_text": ["FERC"],
+            "filed_at": ["2021-08-14T00:00:00"],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities",
+        time_field="filed_at", time_grain=cast(Any, grain),
+    )
+    assert export.periods == (expected,)
+    assert export.concepts[0].by_period == {expected: 1}
+
+
+def test_a_mention_with_no_usable_date_counts_in_the_total_only() -> None:
+    """Silently bucketing an unreadable date would put mentions in a period
+    they are not from, which is worse than a total exceeding its periods."""
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3"],
+            "canonical_id": ["FERC", "FERC", "FERC"],
+            "mention_text": ["FERC", "FERC", "FERC"],
+            "filing_year": ["2019", None, "not a date"],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year",
+    )
+    concept = export.concepts[0]
+    assert concept.frequency == 3
+    assert concept.by_period == {"2019": 1}
+    assert sum(concept.by_period.values()) < concept.frequency
+
+
+def test_an_edge_is_periodized_only_when_both_mentions_agree() -> None:
+    """A pair named in different periods was not named together *in* either."""
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3", "m4"],
+            "canonical_id": ["AES", "FERC", "AES", "FERC"],
+            "mention_text": ["AES", "FERC", "AES", "FERC"],
+            "filing_year": [2019, 2019, 2019, 2021],
+        }
+    )
+    relations = pl.DataFrame(
+        {
+            "subject_mention_id": ["m1", "m3"],
+            "object_mention_id": ["m2", "m4"],
+            "relation_type": ["co_mention", "co_mention"],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        relations=relations, linking_model="link_entities",
+        time_field="filing_year",
+    )
+
+    edge = export.concept_edges[0]
+    # Both relations count toward the total; only the same-period one is
+    # attributed to a period.
+    assert edge.weight == 2
+    assert edge.by_period == {"2019": 1}
+
+
+def test_a_missing_time_field_column_is_a_named_error() -> None:
+    """Naming a column that is not there must not silently yield no periods."""
+    with pytest.raises(ConceptCloudExportError) as excinfo:
+        build_concept_cloud(
+            project="p", links=_timed_links(), dag_plane=DagPlane(nodes=()),
+            linking_model="link_entities", time_field="nope",
+        )
+    assert "'nope' is not a column on the linking model" in str(excinfo.value)
+
+
+def test_a_bundle_cannot_count_a_period_it_does_not_declare() -> None:
+    """The slider iterates the axis, so a count keyed outside it would be
+    invisible — a bundle that cannot render what it contains."""
+    with pytest.raises(ValueError, match="undeclared period"):
+        ConceptCloudExport(
+            generated_at="2026-01-01T00:00:00Z",
+            project="p",
+            dag_plane=DagPlane(nodes=()),
+            concepts=(
+                Concept(
+                    canonical_id="FERC",
+                    display="FERC",
+                    frequency=1,
+                    provenance=Provenance(model="link_entities", documents=1),
+                    by_period={"2019": 1},
+                ),
+            ),
+            periods=("2021",),
+        )
+
+
+def test_the_period_axis_survives_top_n_trimming() -> None:
+    """The axis is every period the corpus covers, not every period that
+    happened to survive `top_n`.
+
+    A period whose only concepts were trimmed is still a period the corpus
+    covers, and a slider that skipped it would read a gap as missing data
+    rather than as "nothing was named then" (issue #553).
+    """
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3", "m4"],
+            "canonical_id": ["FERC", "FERC", "FERC", "RARE"],
+            "mention_text": ["FERC", "FERC", "FERC", "RARE"],
+            "filing_year": [2019, 2019, 2019, 2021],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year", top_n=1,
+    )
+
+    # Only the frequent concept survived...
+    assert [c.canonical_id for c in export.concepts] == ["FERC"]
+    assert export.concepts[0].by_period == {"2019": 3}
+    # ...but 2021 is still part of the corpus, and still on the axis.
+    assert export.periods == ("2019", "2021")
+
+
+def test_top_n_per_period_keeps_a_risk_that_only_one_period_cared_about() -> None:
+    """The case the flag exists for (issue #553).
+
+    Ranking on total frequency trims exactly what a time axis is meant to
+    show: something that enters, dominates one period, and is unremarkable
+    across the corpus. Here `SUPPLY` is named twice in 2021 and never again,
+    while three other concepts each out-total it — so `--top-n 3` drops it and
+    the slider can never show it arriving.
+    """
+    links = pl.DataFrame(
+        {
+            "mention_id": [f"m{i}" for i in range(1, 12)],
+            "canonical_id": [
+                "FERC", "FERC", "FERC",
+                "AES", "AES", "AES",
+                "EU", "EU", "EU",
+                "SUPPLY", "SUPPLY",
+            ],
+            "mention_text": [
+                "FERC", "FERC", "FERC", "AES", "AES", "AES",
+                "EU", "EU", "EU", "supply chain", "supply chain",
+            ],
+            "filing_year": [
+                2019, 2020, 2021, 2019, 2020, 2021,
+                2019, 2020, 2021, 2021, 2021,
+            ],
+        }
+    )
+    without = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year", top_n=3,
+    )
+    assert "SUPPLY" not in {c.canonical_id for c in without.concepts}
+
+    # SUPPLY is the second-biggest thing that happened in 2021, so a
+    # per-period rank of 2 reaches it.
+    with_flag = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year", top_n=3,
+        top_n_per_period=2,
+    )
+    by_id = {c.canonical_id: c for c in with_flag.concepts}
+    assert "SUPPLY" in by_id
+    assert by_id["SUPPLY"].by_period == {"2021": 2}
+    # The overall top-3 are still there; the flag is a union, not a swap.
+    assert {"FERC", "AES", "EU"} <= set(by_id)
+
+
+def test_top_n_per_period_keeps_the_canonical_order() -> None:
+    """The union must not disturb the deterministic ordering."""
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2", "m3", "m4"],
+            "canonical_id": ["BIG", "BIG", "BIG", "RARE"],
+            "mention_text": ["BIG", "BIG", "BIG", "RARE"],
+            "filing_year": [2019, 2019, 2019, 2021],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=DagPlane(nodes=()),
+        linking_model="link_entities", time_field="filing_year",
+        top_n=1, top_n_per_period=1,
+    )
+    # Most frequent first, exactly as without the flag.
+    assert [c.canonical_id for c in export.concepts] == ["BIG", "RARE"]
+
+
+def test_top_n_per_period_without_a_time_field_is_refused() -> None:
+    """Silently doing nothing would look like the flag working."""
+    with pytest.raises(ConceptCloudExportError) as excinfo:
+        export_concept_cloud(
+            pathlib.Path("."), linking_model="link_entities", top_n_per_period=5
+        )
+    assert "needs --time-field" in str(excinfo.value)

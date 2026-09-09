@@ -19,6 +19,7 @@ from .artifact import render_concept_cloud, write_concept_cloud
 from .demo import demo_export
 from .export import (
     ConceptCloudExportError,
+    TimeGrain,
     build_concept_cloud,
     concept_names,
     dag_plane_from_dbt_manifest,
@@ -50,6 +51,7 @@ __all__ = [
     "DagNode",
     "DagPlane",
     "Provenance",
+    "TimeGrain",
     "build_concept_cloud",
     "concept_names",
     "dag_plane_from_dbt_manifest",

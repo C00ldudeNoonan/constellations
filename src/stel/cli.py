@@ -5,7 +5,7 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 import click
 
@@ -25,6 +25,7 @@ from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .concept_cloud import (
     ConceptCloudExportError,
+    TimeGrain,
     demo_export,
     export_concept_cloud,
     placeholder_export,
@@ -2227,6 +2228,35 @@ def mcp_serve(
         "shows its most frequent mention text."
     ),
 )
+@click.option(
+    "--time-field",
+    default=None,
+    help=(
+        "Column on the linking model carrying each mention's date or period. "
+        "Adds per-period counts to concepts and edges so one artifact covers "
+        "every period instead of one artifact per period."
+    ),
+)
+@click.option(
+    "--time-grain",
+    type=click.Choice(["year", "quarter", "month"]),
+    default="year",
+    show_default=True,
+    help="Period size for --time-field.",
+)
+@click.option(
+    "--top-n-per-period",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help=(
+        "Also keep the N biggest concepts *within* each period, on top of "
+        "--top-n over the whole corpus. Ranking on totals trims exactly what "
+        "a time axis is for: something that enters, dominates one period and "
+        "is unremarkable across the corpus. Grows the bundle. Needs "
+        "--time-field."
+    ),
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -2245,6 +2275,9 @@ def concept_cloud(
     with_query_log: bool,
     dimensions: tuple[str, ...],
     names_model: str | None,
+    time_field: str | None,
+    time_grain: str,
+    top_n_per_period: int,
     verbose: int,
 ) -> None:
     """Render the self-contained 3D concept-cloud artifact (#255).
@@ -2291,6 +2324,9 @@ def concept_cloud(
             with_query_log=with_query_log,
             dimension_specs=dimension_specs or None,
             names_model=names_model,
+            time_field=time_field,
+            time_grain=cast(TimeGrain, time_grain),
+            top_n_per_period=top_n_per_period,
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e

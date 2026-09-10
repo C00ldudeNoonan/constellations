@@ -64,6 +64,14 @@
     #detail .k { color: var(--muted); }
     #detail .desc { display: block; margin: 6px 0 8px; color: var(--fg);
       opacity: .82; line-height: 1.45; }
+    /* A concept's history: one bar per period, the current one lit. */
+    .spark { display: flex; align-items: flex-end; gap: 1px; height: 32px;
+      margin: 8px 0 6px; }
+    /* Legible on its own with no period selected -- the dimming exists to
+       make the current period stand out, not to make the strip look off. */
+    .spark i { flex: 1 1 0; min-width: 2px; background: var(--accent);
+      opacity: .62; border-radius: 1px 1px 0 0; transition: opacity .15s; }
+    .spark i.now { opacity: 1; }
     footer { position: fixed; bottom: 10px; right: 14px; z-index: 10;
       color: var(--muted); font-size: 11px; letter-spacing: .04em; }
     a { color: var(--accent); }
@@ -84,6 +92,10 @@
       <label class="ctl">
         Min frequency: <span class="val" id="minfreq-val">0</span>
         <input type="range" id="minfreq" min="0" max="100" value="0">
+      </label>
+      <label class="ctl" id="minweight-ctl" style="display:none">
+        Min edge strength: <span class="val" id="minweight-val">1</span>
+        <input type="range" id="minweight" min="1" max="1" value="1">
       </label>
       <label class="ctl"><input type="checkbox" id="lineage"> Lineage mode (dbt plane + beams)</label>
       <label class="ctl" id="period-ctl" style="display:none">
@@ -150,6 +162,7 @@
     let Graph = null;           // assigned once the library loads
     let highlightOrphans = false;
     let minFreq = 0;            // hide concepts below this mention frequency
+    let minWeight = 1;          // hide constellation lines below this strength
     // Selected period key, or null for "all periods" (issue #553). Only ever
     // changes what a star *looks like* and whether it is shown -- never
     // `nodeVal`, which feeds the force simulation. Layout is computed once
@@ -253,6 +266,23 @@
         sliderVal.textContent = slider.value;
         if (Graph) fullRefresh();
       });
+      // Edge strength (#555 item 4). Shown only when the edges actually carry
+      // different weights: a slider whose every stop looks the same is a
+      // control that teaches the reader the map has nothing to say here.
+      const maxWeight = (DATA.concept_edges || [])
+        .reduce((m, e) => Math.max(m, e.weight || 1), 1);
+      if (maxWeight > 1) {
+        const weightCtl = document.getElementById("minweight-ctl");
+        const weightSlider = document.getElementById("minweight");
+        const weightVal = document.getElementById("minweight-val");
+        weightCtl.style.display = "";
+        weightSlider.max = String(maxWeight);
+        weightSlider.addEventListener("input", () => {
+          minWeight = Number(weightSlider.value);
+          weightVal.textContent = weightSlider.value;
+          if (Graph) fullRefresh();
+        });
+      }
       const lineage = document.getElementById("lineage");
       lineage.addEventListener("change", () => {
         lineageMode = lineage.checked;
@@ -291,6 +321,31 @@
 
     const truncate = (s, n) => s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s;
 
+    // A concept's history, drawn from the per-period counts already in the
+    // bundle (#555 item 2). The size of a star says how often a concept is
+    // named; only this says when it arrived and when it mattered most, which
+    // on a risk-factor map is usually the actual finding.
+    function sparkline(node) {
+      if (!PERIODS.length || node.kind !== "concept") return "";
+      const counts = PERIODS.map(p => node.by_period?.[p] || 0);
+      const peak = Math.max(...counts);
+      // A concept with no per-period counts at all predates the time field or
+      // was never linked to one; an empty frame would claim it was never named.
+      if (peak === 0) return "";
+      const bars = PERIODS.map((p, i) => {
+        // A period with no mentions keeps its slot at zero height. Giving it a
+        // minimum stub would draw "named once" and "not yet named" alike, and
+        // the difference is the whole point of the strip.
+        const height = counts[i] === 0
+          ? 0 : Math.max(6, Math.round((counts[i] / peak) * 100));
+        return `<i class="${p === period ? "now" : ""}" ` +
+          `style="height:${height}%" title="${esc(p)}: ${counts[i]}"></i>`;
+      }).join("");
+      return `<div class="spark">${bars}</div>` +
+        `<span class="k">first</span> ${esc(PERIODS[counts.findIndex(c => c > 0)])} · ` +
+        `<span class="k">peak</span> ${esc(PERIODS[counts.indexOf(peak)])} (${peak})`;
+    }
+
     function showDetail(node) {
       const el = document.getElementById("detail");
       if (!node) { el.style.display = "none"; return; }
@@ -308,7 +363,8 @@
             ? ` <span class="k">in ${esc(period)}</span> ${node.by_period?.[period] || 0}`
             : "") + " · " +
           `<span class="k">link</span> ${esc(node.link_status)}` +
-          (dims ? `<br>${dims}` : "");
+          (dims ? `<br>${dims}` : "") +
+          sparkline(node);
       } else {
         el.innerHTML = `<strong>${esc(node.name)}</strong><br>` +
           `<span class="k">dbt ${esc(node.resource_type)}</span><br>${esc(node.id)}`;
@@ -458,6 +514,10 @@
       DATA.concept_edges.forEach(e => links.push({
         source: e.source, target: e.target, kind: "concept",
         relation_type: e.relation_type, method: e.method, directed: e.directed,
+        // The collapsed relation count (#555 item 4). The exporter has always
+        // kept it; until now the viewer dropped it here, so a pair named in
+        // 900 sentences drew the same hairline as a pair named once.
+        weight: e.weight || 1,
         by_period: e.by_period || {},
       }));
       DATA.cross_layer_edges.forEach(e => links.push({
@@ -500,10 +560,19 @@
         return n.by_period[period] || 0;
       }
 
+      // How strongly a pair is named in the current view: their co-occurrence
+      // count in the selected period, or across the whole corpus when no
+      // period is chosen. Zero means "not named together here", which is why
+      // the line disappears rather than thinning to nothing.
       function periodWeight(l) {
-        if (period === null || l.kind !== "concept") return 1;
+        if (l.kind !== "concept") return 1;
+        if (period === null) return l.weight || 1;
         return (l.by_period || {})[period] || 0;
       }
+
+      // Log, not linear: co-occurrence is long-tailed, and on a linear scale
+      // one dominant pair flattens every other line to the same hairline.
+      const weightWidth = w => 0.35 + Math.log1p(w) * 0.32;
 
       // The radius the star is drawn at. Matches the formula `starObject`
       // bakes into the geometry, so scaling by the ratio of the two is exact.
@@ -583,8 +652,10 @@
           if (l.kind !== "concept" && !lineageMode) return false;
           if (typeof s === "object" && (!nodeVisible(s) || !nodeVisible(t))) return false;
           // A pair not named together in this period draws no line, on the
-          // same terms as a concept absent from it.
-          if (l.kind === "concept" && periodWeight(l) === 0) return false;
+          // same terms as a concept absent from it -- and the strength filter
+          // is the same test one notch up (#555 item 4), so a weak pair and an
+          // absent one both simply stop being drawn.
+          if (l.kind === "concept" && periodWeight(l) < minWeight) return false;
           // Lineage mode shows every beam faintly — the point of the mode is
           // seeing the two maps connected, not clicking blind — and the
           // selected star's beams brighten below. With a selection, only its
@@ -605,9 +676,15 @@
             ? (touching.has(linkKey(l)) ? "#cfe3ff" : "#232c3a")
             : "#8fa5c4";
         })
+        // Constellation line thickness carries co-occurrence strength, so
+        // "which regulator does this sector co-mention most" is visible on the
+        // map rather than one filter away (#555 item 4). A selected star's own
+        // lines keep their relative weights and are drawn heavier as a group.
         .linkWidth(l => l.kind === "cross"
           ? (selected && touching.has(linkKey(l)) ? 2.2 : 0.5)
-          : (l.kind === "concept" ? (selected && touching.has(linkKey(l)) ? 1.6 : 0.7) : 0.8))
+          : (l.kind === "concept"
+            ? weightWidth(periodWeight(l)) * (selected && touching.has(linkKey(l)) ? 2 : 1)
+            : 0.8))
         .linkDirectionalArrowLength(l => l.kind === "concept" && l.directed ? 3 : 0)
         .linkDirectionalParticles(l =>
           l.kind === "cross" && touching.has(linkKey(l)) ? 3 : 0)

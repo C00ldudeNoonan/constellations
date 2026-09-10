@@ -365,16 +365,24 @@ policy attribute — a context model declaring one by that name is refused,
 because one grant with two meanings is how an operator revokes a row filter
 while believing they revoked a connection identity.
 
-Only governed context reads take an identity. stel's own tables — the serving
-ledger and query lease, the grants relation itself, the MCP query log — always
-connect as the operator. That ordering is not a preference: reading grants is
-what *resolves* a caller's identity, so it necessarily happens first.
+Only context reads take an identity. stel's own tables — the serving ledger
+and query lease, the grants relation itself, the MCP query log — always connect
+as the operator. That ordering is not a preference: reading grants is what
+*resolves* a caller's identity, so it necessarily happens first.
+
+A **public** context model is the one place an identity is not required. It
+declares no policy attributes and no tenancy boundary, so there is nothing for
+a narrower principal to enforce, and a caller with no `warehouse_identity`
+grant reads it on the operator's connection exactly as before. A caller who
+*has* one still uses it there, so a model marked public in error does not also
+lose the warehouse-side limit.
 
 Three refusals, none of which fall back to the operator's credentials:
 
-- **A subject with no `warehouse_identity` grant is denied**, indistinguishably
-  from having no grants at all. A missing row must never read as
-  "unprotected".
+- **A subject with no `warehouse_identity` grant is denied** any *governed*
+  model, indistinguishably from having no grants at all. A missing row must
+  never read as "unprotected". Public models stay listed and readable, so a
+  missing grant narrows the catalog rather than emptying it.
 - **A subject with two is a configuration error**, not a denial. A subject may
   legitimately hold several `tenant_id` grants; it cannot legitimately execute
   as two principals, and reporting that as "denied" would leave you with an

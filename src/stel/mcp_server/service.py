@@ -16,7 +16,12 @@ from typing import Any, Protocol, TypeVar, cast
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..adapters import adapter_supports_identity_scoped_connection
-from ..adapters.base import ReadPredicate, ReadPredicateOperator, WarehouseIdentity
+from ..adapters.base import (
+    OPERATOR_IDENTITY,
+    ReadPredicate,
+    ReadPredicateOperator,
+    WarehouseIdentity,
+)
 from ..agent_context import citation_locator, freshness_status
 from ..append_log import query_fingerprint
 from ..retrieval.servability import (
@@ -902,13 +907,49 @@ class ContextService:
         except AuthorizationError:
             raise _not_found_or_denied() from None
         return _AuthorizedResource(
-            principal, resource, policy_filters, self._identity_for(principal)
+            principal,
+            resource,
+            policy_filters,
+            self._identity_for(principal, access=resource.access),
         )
 
-    def _identity_for(self, principal: Principal) -> WarehouseIdentity:
-        """The warehouse principal this caller's governed reads execute as.
+    def _identity_for(
+        self, principal: Principal, *, access: str
+    ) -> WarehouseIdentity:
+        """The warehouse principal this caller's reads of one resource run as.
 
-        Per caller, not per resource, so it is resolved once per request.
+        Resolved per resource rather than per request, because whether an
+        identity is *required* depends on what is being read. A public
+        resource declares no policy attributes and no tenancy boundary, so
+        there is nothing for a narrower principal to enforce: a caller with no
+        `warehouse_identity` grant reads it on the operator's connection,
+        exactly as before enforcement existed. Requiring one would deny public
+        data to every caller who has not been provisioned, which is a
+        regression rather than a boundary.
+
+        A caller who *does* have an identity still uses it for public reads.
+        `access` comes from the catalog, so a resource marked public in error
+        is precisely the "bug in stel" this layer defends against, and it
+        should not also lose the warehouse-side limit.
+        """
+        identity = self._identity_or_none(principal, access=access)
+        if identity is None:
+            # No identity granted for a governed resource. Deliberately
+            # indistinguishable from having no grants at all, and deliberately
+            # not a fall back to the operator's credentials.
+            raise _not_found_or_denied()
+        return identity
+
+    def _identity_or_none(
+        self, principal: Principal, *, access: str
+    ) -> WarehouseIdentity | None:
+        """`_identity_for`, returning None where it would deny.
+
+        `list_context_models` needs to *skip* a resource the caller cannot
+        read rather than fail the whole listing, and the denial it raises is a
+        `ContextServiceError` — not the `AuthorizationError` that loop already
+        catches. Splitting the lookup from the response keeps that difference
+        visible instead of leaving it to an except clause that would not fire.
         """
         try:
             return self._warehouse_identity.identity_for(principal)
@@ -918,10 +959,7 @@ class ContextService:
             # operator with nothing to act on (ADR-0010).
             raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
         except AuthorizationError:
-            # No identity granted. Deliberately indistinguishable from having
-            # no grants at all, and deliberately not a fall back to the
-            # operator's credentials.
-            raise _not_found_or_denied() from None
+            return OPERATOR_IDENTITY if access == "public" else None
 
     def _list_context_models(
         self,
@@ -931,8 +969,11 @@ class ContextService:
     ) -> ListContextModelsResponse:
         started = monotonic()
         principal = self._principal()
-        identity = self._identity_for(principal)
         available: list[ContextResource] = []
+        # Per resource, not once for the catalog: a caller with no warehouse
+        # identity may still list every public model, and resolving once up
+        # front would deny the whole catalog instead.
+        identities: dict[str, WarehouseIdentity] = {}
         for resource in self._catalog.all():
             try:
                 self._authorization.search_policy_filters(
@@ -944,6 +985,10 @@ class ContextService:
                 raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
             except AuthorizationError:
                 continue
+            identity = self._identity_or_none(principal, access=resource.access)
+            if identity is None:
+                continue
+            identities[resource.name] = identity
             available.append(resource)
         after = _decode_list_cursor(request.cursor)
         if after is not None:
@@ -958,7 +1003,7 @@ class ContextService:
         models = tuple(
             resource.summary(
                 entity_types=self._entity_types(
-                    resource, principal, identity=identity
+                    resource, principal, identity=identities[resource.name]
                 )
             )
             for resource in page

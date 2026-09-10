@@ -49,7 +49,7 @@ operator-supplied name for the warehouse principal that read should execute
 as. It is resolved from a **reserved `warehouse_identity` attribute in the
 existing grants relation**, keyed by `subject_id` like every other grant.
 
-Three rules make it a boundary rather than a hint:
+Four rules make it a boundary rather than a hint:
 
 1. **Exactly one, or refuse — but the two refusals differ.** Zero
    `warehouse_identity` grants is a **denial**, indistinguishable from having
@@ -62,10 +62,17 @@ Three rules make it a boundary rather than a hint:
    `GrantConfigurationError` already exists in that module.
 2. **Split by purpose, not by request.** The operator connection keeps the
    serving ledger and query lease, the grants relation, and the query log.
-   Only governed context reads take an identity. The grant read is what
-   resolves the identity, so it necessarily precedes it and runs as the
-   operator.
-3. **Capability, not behaviour.** `supports_identity_scoped_connection()`
+   Only context reads take an identity. The grant read is what resolves the
+   identity, so it necessarily precedes it and runs as the operator.
+3. **A public resource does not *require* an identity, but uses one.** It
+   declares no policy attributes and no tenancy boundary, so a narrower
+   principal has nothing to enforce; requiring one would deny public data to
+   every caller not yet provisioned, which is a regression rather than a
+   boundary. A caller who *has* an identity still reads public resources
+   under it — `access` comes from the catalog, so a resource marked public in
+   error is precisely the "bug in stel" this layer defends against, and it
+   should not also lose the warehouse-side limit.
+4. **Capability, not behaviour.** `supports_identity_scoped_connection()`
    sits beside `supports_held_connection()`. Enforcement configured against an
    adapter that returns `False` is refused **at startup**, not downgraded.
 

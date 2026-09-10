@@ -125,20 +125,34 @@ def test_an_adapter_claiming_the_capability_receives_the_narrowed_config() -> No
     # Registered directly rather than through `register`: what is under test
     # is `create_adapter`'s identity plumbing, and satisfying all 22 abstract
     # methods of `WarehouseAdapter` would say nothing more about it. The
-    # registry is process-global, so the entry is removed again below --
-    # a stub left in it would surface as an unrelated failure elsewhere.
+    # registry is process-global; `_restore_adapter_registry` in conftest
+    # snapshots and restores it, which a local `finally` could not do -- a
+    # pop only removes, so it would delete an entry this test replaced.
     _REGISTRY["identity-test"] = cast(type[WarehouseAdapter], _IdentityAwareAdapter)
-    try:
-        config = _IdentityAwareConfig(type="identity-test")
-        with create_adapter(config, identity=WarehouseIdentity("svc@example.com")):
-            pass
-        with create_adapter(config, identity=OPERATOR_IDENTITY):
-            pass
-        assert adapter_supports_identity_scoped_connection("identity-test") is True
-    finally:
-        _REGISTRY.pop("identity-test", None)
+    config = _IdentityAwareConfig(type="identity-test")
+    with create_adapter(config, identity=WarehouseIdentity("svc@example.com")):
+        pass
+    with create_adapter(config, identity=OPERATOR_IDENTITY):
+        pass
 
+    assert adapter_supports_identity_scoped_connection("identity-test") is True
     assert seen == ["svc@example.com", None]
+
+
+# `_restore_adapter_registry` (conftest) has to *restore*, not just delete what
+# a test added -- a `finally` that pops its own key would leave a real adapter
+# missing if the test had replaced one. These two pin that across tests, which
+# is the only place the property is observable (PR #570 review).
+
+
+def test_replacing_a_registered_adapter_is_contained() -> None:
+    _REGISTRY["duckdb"] = cast(type[WarehouseAdapter], _StubAdapter)
+    assert _REGISTRY["duckdb"] is _StubAdapter
+
+
+def test_the_replaced_adapter_is_back_for_the_next_test() -> None:
+    assert _REGISTRY["duckdb"] is not _StubAdapter
+    assert adapter_supports_identity_scoped_connection("duckdb") is False
 
 
 # ─── resolving the identity from grants ─────────────────────────────────────

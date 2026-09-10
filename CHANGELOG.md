@@ -23,10 +23,12 @@ This lands the seam that closes it — the contract, not yet an implementation.
   identity, so it necessarily precedes one — `read_rows` now requires an
   explicit `identity`, with no default, so every call site states which
   connection it wants.
-- **Three refusals, no fallbacks.** No grant is a denial; two grants is a
-  configuration error, not a denial; and a warehouse that cannot execute reads
-  as a named principal refuses at startup rather than serving every caller on
-  the operator's credentials.
+- **Three refusals, no fallbacks.** No grant denies any *governed* model; two
+  grants is a configuration error, not a denial; and a warehouse that cannot
+  execute reads as a named principal refuses at startup rather than serving
+  every caller on the operator's credentials. A **public** model is the
+  exception: it has no tenancy boundary to enforce, so it stays readable
+  without a grant — and still uses one when the caller has it.
 - **`supports_identity_scoped_connection()` is False on every shipped
   adapter**, so `enforce_warehouse_identity` cannot yet be turned on. BigQuery
   (service-account impersonation, which needs no new secret — #568) and

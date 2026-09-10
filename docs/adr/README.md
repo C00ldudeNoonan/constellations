@@ -19,6 +19,7 @@ history (issue #311).
 | [0008](0008-reprocess-guard-defaults-to-fail.md) | Paid models refuse an unannounced reprocess by default; the guard reads the plan, not per-stage state | accepted |
 | [0008](0008-mcp-hits-carry-declared-attributes.md) | A returnable attribute is additive within `mcp_context/v1`, not a v2 | accepted |
 | [0009](0009-serving-holds-the-warehouse-when-the-adapter-allows.md) | The serving session holds its warehouse connection only when the adapter says one may outlive a request | accepted |
+| [0010](0010-warehouse-identity-is-a-granted-attribute.md) | The warehouse identity a governed read runs as is a granted attribute, resolved per subject; missing or ambiguous is a refusal | accepted |
 
 ## When to write one
 

@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### A governed read can execute as a warehouse principal narrower than the operator (issue #395)
+
+Grants (#392/#396) moved authorization to an operator-owned relation, so a
+forged header buys a caller nothing. They do not make the warehouse *refuse* a
+query stel should not have issued: one process holds one set of credentials for
+every caller, so a policy filter that is dropped or mis-compiled is answered
+anyway, and the blast radius of one bug in the filter path is every caller's
+data.
+
+This lands the seam that closes it — the contract, not yet an implementation.
+
+- **A warehouse identity is a reserved `warehouse_identity` grant**, keyed by
+  `subject_id` like every other grant, naming the principal a subject's
+  governed reads execute as. It names who to connect as, never how to
+  authenticate, so it carries no secret.
+- **Split by purpose, not by request.** Only governed context reads take an
+  identity; the serving ledger and query lease, the grants relation, and the
+  query log always connect as the operator. Reading grants is what resolves an
+  identity, so it necessarily precedes one — `read_rows` now requires an
+  explicit `identity`, with no default, so every call site states which
+  connection it wants.
+- **Three refusals, no fallbacks.** No grant is a denial; two grants is a
+  configuration error, not a denial; and a warehouse that cannot execute reads
+  as a named principal refuses at startup rather than serving every caller on
+  the operator's credentials.
+- **`supports_identity_scoped_connection()` is False on every shipped
+  adapter**, so `enforce_warehouse_identity` cannot yet be turned on. BigQuery
+  (service-account impersonation, which needs no new secret — #568) and
+  MotherDuck (per-caller tokens, which do — #569) are tracked separately.
+
+`docs/adr/0010-warehouse-identity-is-a-granted-attribute.md` records why the
+identity is a granted attribute rather than a tenant: the grants store is keyed
+on subject, a subject may hold several `tenant_id` values, and the service
+already declines to name one where no single value is honest.
+
 ### Concepts can carry a name and a description (issue #554)
 
 A concept's node text was the first mention text the linking frame happened to

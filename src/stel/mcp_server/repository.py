@@ -6,7 +6,12 @@ from threading import Lock
 from typing import Any, Protocol
 
 from ..adapters import create_adapter
-from ..adapters.base import AdapterError, ReadPredicate
+from ..adapters.base import (
+    OPERATOR_IDENTITY,
+    AdapterError,
+    ReadPredicate,
+    WarehouseIdentity,
+)
 from ..append_log import QUERY_LOG_SCHEMA, write_rows
 from ..search import SearchSession
 from .query_log import BufferedQueryLog
@@ -27,10 +32,21 @@ class ContextRepository(Protocol):
         self,
         relation: str,
         *,
+        identity: WarehouseIdentity,
         predicates: Sequence[ReadPredicate],
         max_rows: int,
         columns: Sequence[str] | None = None,
-    ) -> tuple[Mapping[str, Any], ...]: ...
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Read rows, connecting as `identity` (issue #395, ADR-0010).
+
+        `identity` is required and has no default on purpose. Governed context
+        passes the caller's warehouse identity; stel's own infrastructure —
+        the grants relation, the query log, the serving ledger — passes
+        `OPERATOR_IDENTITY` explicitly. A default would make the operator's
+        credentials the answer for any call site that forgot to think about
+        it, which is the silent downgrade this seam exists to prevent.
+        """
+        ...
 
     def log_query(self, row: Mapping[str, Any]) -> None:
         """Append one served query to the MCP query log (issue #329).
@@ -142,6 +158,8 @@ class WarehouseContextRepository:
             with create_adapter(
                 self._resolved.warehouse,
                 project_dir=self._session.project_dir,
+                # The query log is stel's own table, never a caller's.
+                identity=OPERATOR_IDENTITY,
             ) as adapter:
                 write_rows(
                     adapter,
@@ -169,6 +187,7 @@ class WarehouseContextRepository:
         self,
         relation: str,
         *,
+        identity: WarehouseIdentity,
         predicates: Sequence[ReadPredicate],
         max_rows: int,
         columns: Sequence[str] | None = None,
@@ -177,7 +196,7 @@ class WarehouseContextRepository:
             raise ValueError("max_rows must be positive")
         rows: list[Mapping[str, Any]] = []
         try:
-            with self._session.warehouse(None) as adapter:
+            with self._session.warehouse(None, identity=identity) as adapter:
                 if relation not in adapter.list_tables():
                     return ()
                 with adapter.table_snapshot(

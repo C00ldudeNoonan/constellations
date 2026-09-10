@@ -9,10 +9,12 @@ from pydantic import ValidationError
 from ..config.profile import WarehouseConfig
 from ..credentials import CredentialFreeUrl, CredentialReference
 from .base import (
+    OPERATOR_IDENTITY,
     AdapterConfigError,
     AdapterError,
     WarehouseAdapter,
     WarehouseCapability,
+    WarehouseIdentity,
 )
 
 
@@ -169,15 +171,42 @@ def parse_warehouse_config(raw: dict[str, Any] | WarehouseConfig) -> WarehouseCo
 
 
 def create_adapter(
-    config: WarehouseConfig, *, project_dir: Path | None = None
+    config: WarehouseConfig,
+    *,
+    project_dir: Path | None = None,
+    identity: WarehouseIdentity = OPERATOR_IDENTITY,
 ) -> WarehouseAdapter:
+    """An adapter for `config`, connecting as `identity` (issue #395).
+
+    `identity` defaults to the operator, which is every path except a served
+    governed read: stel's own ledger, lease, grants relation and query log all
+    connect as the operator by contract. A non-operator identity against an
+    adapter that cannot narrow its principal raises rather than quietly
+    connecting as the operator (ADR-0010).
+    """
     cls = _REGISTRY.get(config.type)
     if cls is None:
         raise UnknownAdapterError(
             f"No adapter registered for warehouse.type='{config.type}'. "
             f"Known: {sorted(_REGISTRY)}"
         )
-    return cls(config, project_dir=project_dir)
+    return cls(cls.config_for_identity(config, identity), project_dir=project_dir)
+
+
+def adapter_supports_identity_scoped_connection(adapter_type: str) -> bool:
+    """Whether `adapter_type` can execute reads as a named principal (#395).
+
+    Asked at startup, before anything is opened, so a deployment that
+    configured identity-scoped serving against an adapter that cannot do it
+    fails loudly instead of serving with the operator's credentials.
+    """
+    cls = _REGISTRY.get(adapter_type)
+    if cls is None:
+        raise UnknownAdapterError(
+            f"No adapter registered for warehouse.type='{adapter_type}'. "
+            f"Known: {sorted(_REGISTRY)}"
+        )
+    return cls.supports_identity_scoped_connection()
 
 
 def list_adapter_types() -> list[str]:

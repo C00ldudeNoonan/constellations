@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from stel.adapters.base import ReadPredicate
+from stel.adapters.base import ReadPredicate, WarehouseIdentity
 from stel.mcp_server.authorization import (
     AuthorizationError,
     ClaimAuthorizationProvider,
@@ -156,16 +156,19 @@ class _FakeRepository:
     def __init__(self, rows: Sequence[Mapping[str, Any]]) -> None:
         self._rows = rows
         self.reads: list[tuple[str, Sequence[ReadPredicate]]] = []
+        self.identities: list[WarehouseIdentity] = []
 
     def read_rows(
         self,
         relation: str,
         *,
+        identity: WarehouseIdentity,
         predicates: Sequence[ReadPredicate],
         max_rows: int,
         columns: Sequence[str] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         self.reads.append((relation, predicates))
+        self.identities.append(identity)
         subject = predicates[0].value
         return tuple(row for row in self._rows if row["subject_id"] == subject)
 
@@ -285,6 +288,7 @@ def test_malformed_grant_row_is_a_configuration_error_not_a_denial() -> None:
             self,
             relation: str,
             *,
+            identity: WarehouseIdentity,
             predicates: Sequence[ReadPredicate],
             max_rows: int,
             columns: Sequence[str] | None = None,

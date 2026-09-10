@@ -1276,6 +1276,26 @@ depends on the network between the client and BigQuery and on the client's CPU
 headroom, neither of which stel can know, which is why there is no inferred
 default.
 
+A worked example, so the numbers above have something to sit against. Reading
+120,000 rows of a 768-float-vector-plus-chunk-text relation from BigQuery US to
+a developer machine, three runs per codec, seconds:
+
+| codec | wall | transfer | decode |
+|---|---:|---:|---:|
+| `none` | 20.7 | 13.2 | 1.0 |
+| `lz4` | 14.4 | 8.0 | 1.5 |
+| `zstd` | 15.0 | 7.3 | 2.5 |
+
+Transfer runs about **13x** decode uncompressed, so this read has room to
+trade and either codec takes roughly 30% off the wall clock. Which codec is
+not decidable from these numbers: the wall-clock gap between them is inside
+run-to-run variance, and `lz4` won two of three runs. The structural
+difference is what to reason from — `zstd` consistently moves fewer bytes
+(7.3s against 8.0s) and consistently costs more CPU to unpack (2.5s against
+1.5s), so it pulls ahead as the network gets slower and falls behind as it
+gets faster. A client colocated with the data is a different regime again, and
+may not be transfer-bound at all.
+
 `zstd` is Google's own recommendation and compresses harder; `lz4` trades
 ratio for throughput and is the better pick when the client is closer to
 CPU-bound. Both are decoded by pyarrow transparently.

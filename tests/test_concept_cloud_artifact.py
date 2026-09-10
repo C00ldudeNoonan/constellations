@@ -8,6 +8,7 @@ from typing import Any
 from stel.concept_cloud import (
     Concept,
     ConceptCloudExport,
+    ConceptEdge,
     DagNode,
     DagPlane,
     Provenance,
@@ -341,3 +342,110 @@ def test_the_period_never_feeds_the_force_simulation() -> None:
     # ...while appearance and visibility read the period.
     assert "starRadius(periodFreq(n)) / n.__baseRadius" in html
     assert "if (period !== null && freq === 0) return false;" in html
+
+
+# ─── the concept history and edge strength (issue #555 items 2 and 4) ───────
+
+
+def _weighted_export() -> ConceptCloudExport:
+    """A bundle whose edges carry unequal weights, as a real corpus produces."""
+    return ConceptCloudExport(
+        generated_at="2026-01-01T00:00:00Z",
+        project="weighted",
+        dag_plane=DagPlane(nodes=()),
+        concepts=(
+            Concept(
+                canonical_id="FERC", display="FERC", frequency=3,
+                provenance=Provenance(model="link_entities", documents=3),
+                by_period={"2019": 1, "2020": 1, "2021": 1},
+            ),
+            Concept(
+                canonical_id="COVID", display="COVID-19", frequency=2,
+                provenance=Provenance(model="link_entities", documents=2),
+                by_period={"2020": 2},
+            ),
+        ),
+        concept_edges=(
+            ConceptEdge(
+                source="FERC", target="COVID", relation_type="co_occurs",
+                weight=900, by_period={"2020": 900},
+            ),
+        ),
+        periods=("2019", "2020", "2021"),
+    )
+
+
+def test_the_detail_card_draws_a_concept_history() -> None:
+    """The per-period counts become a strip, not just the current count (#555).
+
+    The bundle has carried `by_period` since #553 and the card read exactly one
+    number out of it. "When did this arrive and when did it matter most" is the
+    question a risk-factor map is usually asked, and the totals cannot answer
+    it.
+    """
+    html = render_concept_cloud(_timed_export())
+
+    assert "function sparkline(node)" in html
+    # Actually reached from the card, rather than defined and orphaned.
+    assert "sparkline(node);" in html
+    assert '<div class="spark">' in html
+    # The strip is read against the period slider: the current bar is lit.
+    assert '`<i class="${p === period ? "now" : ""}" ' in html
+    # ...and it says the two dates that make the strip worth reading.
+    assert '<span class="k">first</span>' in html
+    assert '<span class="k">peak</span>' in html
+
+
+def test_an_absent_period_draws_no_bar_rather_than_a_stub() -> None:
+    """A gap in the strip is a fact about the corpus, not a rendering artifact.
+
+    This is the assertion worth having: giving every slot a minimum height
+    makes "named once" and "not named yet" look identical, which is precisely
+    the distinction the strip exists to show. The floor applies only to
+    non-zero counts, so a single mention stays visible without inventing one.
+    """
+    html = render_concept_cloud(_timed_export())
+
+    assert "const height = counts[i] === 0" in html
+    assert "? 0 : Math.max(6, Math.round((counts[i] / peak) * 100));" in html
+    # A concept with no per-period counts renders no strip at all.
+    assert "if (peak === 0) return \"\";" in html
+
+
+def test_edge_weight_reaches_the_viewer_and_sets_line_width() -> None:
+    """Co-occurrence strength is drawn, not just exported (#555 item 4).
+
+    `ConceptEdge.weight` has been populated since the exporter first collapsed
+    relation rows to pairs; the viewer dropped it when building its link
+    objects, so every constellation line was the same hairline regardless of
+    whether the pair was named once or nine hundred times.
+    """
+    html = render_concept_cloud(_weighted_export())
+    island = _extract_data_island(html)
+
+    assert island["concept_edges"][0]["weight"] == 900
+    # Carried onto the link the library actually draws...
+    assert "weight: e.weight || 1," in html
+    # ...and read by the width accessor, log-scaled for a long tail.
+    assert "const weightWidth = w => 0.35 + Math.log1p(w) * 0.32;" in html
+    assert "weightWidth(periodWeight(l))" in html
+    # With a period selected, strength means strength *in that period*.
+    assert "if (period === null) return l.weight || 1;" in html
+
+
+def test_the_strength_filter_stays_hidden_when_every_edge_is_equal() -> None:
+    """A slider whose every stop looks the same teaches the wrong lesson.
+
+    Weight defaults to 1, so a bundle from a corpus with no repeated pairs has
+    a real edge list and nothing to filter on. Showing the control there would
+    invite a reader to drag it and conclude the map is broken.
+    """
+    shown = render_concept_cloud(_weighted_export())
+    assert "if (maxWeight > 1) {" in shown
+
+    # Hidden by default in the markup; revealed only by that guard.
+    assert 'id="minweight-ctl" style="display:none"' in shown
+    assert "weightCtl.style.display = \"\";" in shown
+
+    # The filter and the period test are the same test one notch up.
+    assert "if (l.kind === \"concept\" && periodWeight(l) < minWeight) return false;" in shown

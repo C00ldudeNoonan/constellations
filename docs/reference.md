@@ -4343,6 +4343,15 @@ filter, and lineage mode (off by default) with click-to-trace beams. It opens
 focused on the hottest retrieved concept — or the most frequent one — rather
 than the whole graph.
 
+**Constellation lines carry co-occurrence strength.** A line's thickness
+follows the number of relation rows collapsed into that pair, log-scaled
+because the distribution is long-tailed and a linear scale flattens everything
+below the top pair. A **min edge strength** filter hides the faint pairs, which
+is what turns "which regulator does this sector co-mention most" from a
+reading exercise into a drag. The control appears only when the edges actually
+carry different weights — with a time axis it filters on the pair's count *in
+the selected period*, not its total.
+
 **A time axis** (`--time-field <column> [--time-grain year|quarter|month]`).
 Point the export at a column on the linking model carrying each mention's date
 and every concept and edge gains per-period counts, with the bundle carrying
@@ -4363,6 +4372,13 @@ different periods was not named together in either.
 The axis is every period the corpus covers, taken before `--top-n` trimming: a
 period whose only concepts were trimmed is still a period, and skipping it
 would read a gap as missing data.
+
+With an axis present, a selected concept's detail card draws its **history** —
+one bar per period with the current one lit, and `first`/`peak` beneath it. A
+period the concept was not named in draws no bar at all rather than a minimum
+stub, on the same terms as the omission above: "named once" and "not named
+yet" have to look different, because on a risk-factor map the difference is
+usually the finding.
 
 **`--top-n-per-period N` keeps what mattered *within* a period.** `--top-n`
 ranks on total frequency across the corpus, which trims exactly what a time

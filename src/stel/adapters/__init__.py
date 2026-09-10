@@ -36,6 +36,7 @@ from .migration import (
 from .registry import (
     UnknownAdapterError,
     adapter_capabilities,
+    adapter_supports_identity_scoped_connection,
     create_adapter,
     list_adapter_types,
     parse_warehouse_config,
@@ -71,6 +72,7 @@ __all__ = [
     "WarehouseAdapter",
     "WarehouseCapability",
     "adapter_capabilities",
+    "adapter_supports_identity_scoped_connection",
     "apply_name_migration",
     "create_adapter",
     "list_adapter_types",

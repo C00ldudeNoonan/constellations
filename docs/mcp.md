@@ -338,10 +338,64 @@ if a revocation must take effect immediately.
 
 Two limits worth stating plainly. stel is still the enforcement point: grants
 make policy central and auditable, but they do not make the warehouse refuse a
-query stel should not have issued — per-tenant warehouse credentials are the
-layer that does that, and they compose with this. And the grants relation is
-as trustworthy as its write path; treat it as production access control, not
-as a model that anything downstream may edit.
+query stel should not have issued — that is what a warehouse identity is for,
+below, and it composes with this rather than replacing it. And the grants
+relation is as trustworthy as its write path; treat it as production access
+control, not as a model that anything downstream may edit.
+
+### Warehouse identity
+
+Grants protect against a *malicious caller*. They do not protect against a
+*bug in stel*: one process holds one set of warehouse credentials for every
+caller, so a policy filter that is dropped, mis-compiled, or skipped by a code
+path that forgot to apply one is answered by the warehouse anyway. The blast
+radius of a single bug in the filter path is every caller's data.
+
+A **warehouse identity** closes that. It is a reserved grant naming the
+warehouse principal a subject's governed reads execute as:
+
+| `subject_id` | `attribute` | `value` |
+| --- | --- | --- |
+| `alice@example.com` | `tenant_id` | `acme` |
+| `alice@example.com` | `warehouse_identity` | `stel-acme@project.iam.gserviceaccount.com` |
+
+The value names *who to connect as*, never how to authenticate, so it carries
+no secret and is safe in logs and diagnostics. It cannot also be used as a
+policy attribute — a context model declaring one by that name is refused,
+because one grant with two meanings is how an operator revokes a row filter
+while believing they revoked a connection identity.
+
+Only context reads take an identity. stel's own tables — the serving ledger
+and query lease, the grants relation itself, the MCP query log — always connect
+as the operator. That ordering is not a preference: reading grants is what
+*resolves* a caller's identity, so it necessarily happens first.
+
+A **public** context model is the one place an identity is not required. It
+declares no policy attributes and no tenancy boundary, so there is nothing for
+a narrower principal to enforce, and a caller with no `warehouse_identity`
+grant reads it on the operator's connection exactly as before. A caller who
+*has* one still uses it there, so a model marked public in error does not also
+lose the warehouse-side limit.
+
+Three refusals, none of which fall back to the operator's credentials:
+
+- **A subject with no `warehouse_identity` grant is denied** any *governed*
+  model, indistinguishably from having no grants at all. A missing row must
+  never read as "unprotected". Public models stay listed and readable, so a
+  missing grant narrows the catalog rather than emptying it.
+- **A subject with two is a configuration error**, not a denial. A subject may
+  legitimately hold several `tenant_id` grants; it cannot legitimately execute
+  as two principals, and reporting that as "denied" would leave you with an
+  empty catalog and no reason for it.
+- **A warehouse that cannot execute reads as a named principal refuses at
+  startup.** Not at the first request, and never by quietly serving on the
+  operator's credentials.
+
+That last one applies to every adapter stel ships today: **no adapter
+implements the capability yet**, so this contract is in place and not yet
+usable. BigQuery (via service-account impersonation, #568) and MotherDuck (via
+per-caller tokens, #569) are tracked separately. `docs/adr/0010-warehouse-identity-is-a-granted-attribute.md`
+records why the identity is a granted attribute rather than a tenant.
 
 Queries are logged with the tenant the policy actually filtered to, not the
 tenant the caller claimed, so the audit trail stays meaningful when those

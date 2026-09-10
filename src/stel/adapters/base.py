@@ -73,6 +73,40 @@ class AdapterCapabilityError(AdapterError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class WarehouseIdentity:
+    """Which warehouse principal a read executes as (issue #395, ADR-0010).
+
+    stel is the enforcement point for governed context: it compiles a policy
+    filter and the warehouse runs whatever it is sent. A served deployment can
+    narrow that by executing a caller's reads as a principal smaller than the
+    operator, so a dropped or mis-compiled filter is refused by the warehouse
+    rather than answered.
+
+    `principal` is an opaque, operator-supplied name — a BigQuery
+    service-account email, say. It is **not a credential**: it names who to be,
+    never how to authenticate, so it carries no secret and is safe in logs and
+    diagnostics. `None` means the operator's own credentials, which is what
+    stel's own infrastructure (the serving ledger, the query lease, the grants
+    relation, the query log) always uses.
+    """
+
+    principal: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.principal is not None and not self.principal.strip():
+            raise ValueError("warehouse identity principal must not be blank")
+
+    @property
+    def is_operator(self) -> bool:
+        return self.principal is None
+
+
+# The operator's own credentials: stel's infrastructure reads and every
+# deployment that has not opted into identity-scoped reads.
+OPERATOR_IDENTITY = WarehouseIdentity()
+
+
 @dataclass(frozen=True)
 class StateScope:
     model_name: str
@@ -1009,6 +1043,46 @@ class WarehouseAdapter(ABC):
         exited. A network warehouse has no such lock and overrides this.
         """
         return False
+
+    @classmethod
+    def supports_identity_scoped_connection(cls) -> bool:
+        """Whether this engine can execute reads as a narrower principal than
+        the operator, given a `WarehouseIdentity` (issue #395, ADR-0010).
+
+        False is the safe answer and the default. An adapter says True only
+        when it also overrides `config_for_identity`, and enforcement
+        configured against an adapter that says False is refused at startup
+        rather than silently downgraded to the operator's credentials. A
+        deployment that believes it has warehouse-level enforcement and does
+        not is the failure this exists to prevent, so it must never be
+        reachable by omission.
+
+        A classmethod because the startup check has a config and needs the
+        answer before it opens anything.
+        """
+        return False
+
+    @classmethod
+    def config_for_identity(
+        cls, config: WarehouseConfig, identity: WarehouseIdentity
+    ) -> WarehouseConfig:
+        """`config`, connecting as `identity`'s principal instead of the operator.
+
+        The write half of `supports_identity_scoped_connection`. An adapter
+        claiming the capability overrides this to return a copy carrying the
+        narrower principal; the default refuses anything but the operator.
+
+        Refusing rather than returning `config` unchanged is the point — a
+        silent no-op would hand the operator's credentials to a caller the
+        deployment believes is constrained. `identity.principal` names who to
+        connect as, never how to authenticate, so no credential passes here.
+        """
+        if identity.is_operator:
+            return config
+        raise AdapterCapabilityError(
+            f"warehouse.type='{config.type}' cannot execute reads as a named "
+            "principal, so identity-scoped serving cannot be enforced on it"
+        )
 
     @abstractmethod
     def _connect(self) -> None: ...

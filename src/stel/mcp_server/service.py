@@ -15,7 +15,13 @@ from typing import Any, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..adapters.base import ReadPredicate, ReadPredicateOperator
+from ..adapters import adapter_supports_identity_scoped_connection
+from ..adapters.base import (
+    OPERATOR_IDENTITY,
+    ReadPredicate,
+    ReadPredicateOperator,
+    WarehouseIdentity,
+)
 from ..agent_context import citation_locator, freshness_status
 from ..append_log import query_fingerprint
 from ..retrieval.servability import (
@@ -70,7 +76,10 @@ from .grants import (
     DEFAULT_GRANT_TTL_SECONDS,
     GrantAuthorizationProvider,
     GrantConfigurationError,
+    GrantWarehouseIdentityResolver,
+    OperatorWarehouseIdentityResolver,
     WarehouseGrantStore,
+    WarehouseIdentityResolver,
 )
 from .repository import (
     ContextRepository,
@@ -484,6 +493,10 @@ class _AuthorizedResource:
     principal: Principal
     resource: ContextResource
     policy_filters: tuple[SearchFilter, ...]
+    # The warehouse principal this request's governed reads execute as
+    # (issue #395, ADR-0010). `OPERATOR_IDENTITY` unless the deployment
+    # opted into identity-scoped serving.
+    warehouse_identity: WarehouseIdentity
 
 
 class ContextService:
@@ -495,6 +508,7 @@ class ContextService:
         context_search: ContextSearch,
         principal_resolver: PrincipalResolver,
         authorization: AuthorizationProvider,
+        warehouse_identity: WarehouseIdentityResolver | None = None,
         settings: ContextServerSettings | None = None,
     ) -> None:
         self._catalog = catalog
@@ -502,6 +516,9 @@ class ContextService:
         self._search = context_search
         self._principal_resolver = principal_resolver
         self._authorization = authorization
+        self._warehouse_identity = (
+            warehouse_identity or OperatorWarehouseIdentityResolver()
+        )
         self._settings = settings or ContextServerSettings()
         self._limiter = _OperationLimiter(
             max_concurrency=self._settings.max_concurrency,
@@ -523,6 +540,7 @@ class ContextService:
         authorization: AuthorizationProvider | None = None,
         grants_relation: str | None = None,
         grant_ttl_seconds: float = DEFAULT_GRANT_TTL_SECONDS,
+        enforce_warehouse_identity: bool = False,
         settings: ContextServerSettings | None = None,
     ) -> ContextService:
         """Build a service against a project directory.
@@ -539,22 +557,32 @@ class ContextService:
                 "a grants relation builds an authorization provider, so "
                 "supplying both leaves it ambiguous which policy is in force."
             )
+        if enforce_warehouse_identity and grants_relation is None:
+            raise ValueError(
+                "enforce_warehouse_identity needs a grants_relation: the "
+                "warehouse identity a caller reads as is a grant, so there is "
+                "nowhere to look it up without one."
+            )
         session = SearchSession(project_dir, target=target, profiles_dir=profiles_dir)
         repository = WarehouseContextRepository(session)
+        warehouse_identity: WarehouseIdentityResolver | None = None
         if grants_relation is not None:
-            authorization = GrantAuthorizationProvider(
-                WarehouseGrantStore(
-                    repository,
-                    relation=grants_relation,
-                    ttl_seconds=grant_ttl_seconds,
-                )
+            store = WarehouseGrantStore(
+                repository,
+                relation=grants_relation,
+                ttl_seconds=grant_ttl_seconds,
             )
+            authorization = GrantAuthorizationProvider(store)
+            if enforce_warehouse_identity:
+                _refuse_unenforceable_identity(session)
+                warehouse_identity = GrantWarehouseIdentityResolver(store)
         return cls(
             catalog=ArtifactCatalog.load(project_dir, expected_target=target),
             repository=repository,
             context_search=PortableContextSearch(session),
             principal_resolver=principal_resolver or EnvironmentPrincipalResolver(),
             authorization=authorization or ClaimAuthorizationProvider(),
+            warehouse_identity=warehouse_identity,
             settings=settings,
         )
 
@@ -878,7 +906,60 @@ class ContextService:
             raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
         except AuthorizationError:
             raise _not_found_or_denied() from None
-        return _AuthorizedResource(principal, resource, policy_filters)
+        return _AuthorizedResource(
+            principal,
+            resource,
+            policy_filters,
+            self._identity_for(principal, access=resource.access),
+        )
+
+    def _identity_for(
+        self, principal: Principal, *, access: str
+    ) -> WarehouseIdentity:
+        """The warehouse principal this caller's reads of one resource run as.
+
+        Resolved per resource rather than per request, because whether an
+        identity is *required* depends on what is being read. A public
+        resource declares no policy attributes and no tenancy boundary, so
+        there is nothing for a narrower principal to enforce: a caller with no
+        `warehouse_identity` grant reads it on the operator's connection,
+        exactly as before enforcement existed. Requiring one would deny public
+        data to every caller who has not been provisioned, which is a
+        regression rather than a boundary.
+
+        A caller who *does* have an identity still uses it for public reads.
+        `access` comes from the catalog, so a resource marked public in error
+        is precisely the "bug in stel" this layer defends against, and it
+        should not also lose the warehouse-side limit.
+        """
+        identity = self._identity_or_none(principal, access=access)
+        if identity is None:
+            # No identity granted for a governed resource. Deliberately
+            # indistinguishable from having no grants at all, and deliberately
+            # not a fall back to the operator's credentials.
+            raise _not_found_or_denied()
+        return identity
+
+    def _identity_or_none(
+        self, principal: Principal, *, access: str
+    ) -> WarehouseIdentity | None:
+        """`_identity_for`, returning None where it would deny.
+
+        `list_context_models` needs to *skip* a resource the caller cannot
+        read rather than fail the whole listing, and the denial it raises is a
+        `ContextServiceError` — not the `AuthorizationError` that loop already
+        catches. Splitting the lookup from the response keeps that difference
+        visible instead of leaving it to an except clause that would not fire.
+        """
+        try:
+            return self._warehouse_identity.identity_for(principal)
+        except GrantConfigurationError as exc:
+            # A subject granted two warehouse identities is a contradictory
+            # relation, not a denial: reporting it as "denied" would leave the
+            # operator with nothing to act on (ADR-0010).
+            raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
+        except AuthorizationError:
+            return OPERATOR_IDENTITY if access == "public" else None
 
     def _list_context_models(
         self,
@@ -889,6 +970,10 @@ class ContextService:
         started = monotonic()
         principal = self._principal()
         available: list[ContextResource] = []
+        # Per resource, not once for the catalog: a caller with no warehouse
+        # identity may still list every public model, and resolving once up
+        # front would deny the whole catalog instead.
+        identities: dict[str, WarehouseIdentity] = {}
         for resource in self._catalog.all():
             try:
                 self._authorization.search_policy_filters(
@@ -900,6 +985,10 @@ class ContextService:
                 raise ContextServiceError(MCPErrorCode.INTERNAL, str(exc)) from None
             except AuthorizationError:
                 continue
+            identity = self._identity_or_none(principal, access=resource.access)
+            if identity is None:
+                continue
+            identities[resource.name] = identity
             available.append(resource)
         after = _decode_list_cursor(request.cursor)
         if after is not None:
@@ -912,7 +1001,11 @@ class ContextService:
             else None
         )
         models = tuple(
-            resource.summary(entity_types=self._entity_types(resource, principal))
+            resource.summary(
+                entity_types=self._entity_types(
+                    resource, principal, identity=identities[resource.name]
+                )
+            )
             for resource in page
         )
         if pending_log is not None:
@@ -984,7 +1077,9 @@ class ContextService:
             policy_filters=authorized.policy_filters,
             timings=timings,
         )
-        chunk_rows = self._chunks_for_hits(resource, hits)
+        chunk_rows = self._chunks_for_hits(
+            resource, hits, identity=authorized.warehouse_identity
+        )
         registry_rows = self._registry_by_versions(
             resource,
             {
@@ -992,6 +1087,7 @@ class ContextService:
                 for row in chunk_rows.values()
                 if isinstance(row.get("document_version_id"), str)
             },
+            identity=authorized.warehouse_identity,
         )
         readable: list[tuple[SearchResult, Mapping[str, Any], Mapping[str, Any]]] = []
         for hit in hits:
@@ -1010,6 +1106,7 @@ class ContextService:
         links = self._entity_links(
             resource,
             {str(row["context_id"]) for _, row, _ in readable},
+            identity=authorized.warehouse_identity,
         )
         results = tuple(
             self._search_result(resource, hit, row, registry, links)
@@ -1114,6 +1211,7 @@ class ContextService:
         resource = authorized.resource
         registry_rows = self._repository.read_rows(
             resource.registry_relation,
+            identity=authorized.warehouse_identity,
             predicates=(
                 _eq("document_id", request.document_id),
                 _eq("document_version_id", request.document_version_id),
@@ -1129,6 +1227,7 @@ class ContextService:
         registry = registry_rows[0]
         rows = self._repository.read_rows(
             resource.context_relation,
+            identity=authorized.warehouse_identity,
             predicates=(
                 _eq("document_id", request.document_id),
                 _eq("document_version_id", request.document_version_id),
@@ -1153,6 +1252,7 @@ class ContextService:
         links = self._entity_links(
             resource,
             {str(row["context_id"]) for row in page},
+            identity=authorized.warehouse_identity,
         )
         next_cursor = (
             _encode_cursor(
@@ -1217,6 +1317,7 @@ class ContextService:
             )
         rows = self._repository.read_rows(
             resource.context_relation,
+            identity=authorized.warehouse_identity,
             predicates=(_eq(field, request.reference_id),),
             max_rows=self._settings.max_scan_rows,
         )
@@ -1225,7 +1326,9 @@ class ContextService:
             version_id = row.get("document_version_id")
             if not isinstance(version_id, str):
                 continue
-            registry = self._registry_by_versions(resource, {version_id}).get(version_id)
+            registry = self._registry_by_versions(
+                resource, {version_id}, identity=authorized.warehouse_identity
+            ).get(version_id)
             if registry is None or not self._can_read_pair(
                 resource,
                 authorized.principal,
@@ -1234,7 +1337,9 @@ class ContextService:
             ):
                 continue
             context_id = _required_string(row, "context_id")
-            links = self._entity_links(resource, {context_id})
+            links = self._entity_links(
+                resource, {context_id}, identity=authorized.warehouse_identity
+            )
             if pending_log is not None:
                 pending_log.append(
                     self._base_log_row("get_context_lineage", caller)
@@ -1289,6 +1394,8 @@ class ContextService:
         self,
         resource: ContextResource,
         hits: Sequence[SearchResult],
+        *,
+        identity: WarehouseIdentity,
     ) -> dict[str, Mapping[str, Any]]:
         if resource.id_field not in {"context_id", "chunk_id"}:
             raise ContextServiceError(
@@ -1300,6 +1407,7 @@ class ContextService:
             return {}
         rows = self._repository.read_rows(
             resource.context_relation,
+            identity=identity,
             predicates=(_in(resource.id_field, values),),
             max_rows=self._settings.max_scan_rows,
         )
@@ -1319,11 +1427,14 @@ class ContextService:
         self,
         resource: ContextResource,
         versions: set[str],
+        *,
+        identity: WarehouseIdentity,
     ) -> dict[str, Mapping[str, Any]]:
         if not versions:
             return {}
         rows = self._repository.read_rows(
             resource.registry_relation,
+            identity=identity,
             predicates=(_in("document_version_id", tuple(sorted(versions))),),
             max_rows=self._settings.max_scan_rows,
         )
@@ -1337,6 +1448,8 @@ class ContextService:
         self,
         resource: ContextResource,
         context_ids: set[str],
+        *,
+        identity: WarehouseIdentity,
     ) -> dict[str, tuple[ContextEntity, ...]]:
         grouped: dict[str, list[ContextEntity]] = {}
         if not context_ids:
@@ -1344,6 +1457,7 @@ class ContextService:
         for relation in resource.entity_relations:
             rows = self._repository.read_rows(
                 relation,
+                identity=identity,
                 predicates=(
                     _in("context_id", tuple(sorted(context_ids))),
                     _is_null("recorded_to"),
@@ -1367,12 +1481,15 @@ class ContextService:
         self,
         resource: ContextResource,
         principal: Principal,
+        *,
+        identity: WarehouseIdentity,
     ) -> tuple[str, ...]:
         links: list[Mapping[str, Any]] = []
         for relation in resource.entity_relations:
             links.extend(
                 self._repository.read_rows(
                     relation,
+                    identity=identity,
                     predicates=(_is_null("recorded_to"),),
                     max_rows=self._settings.max_scan_rows,
                     columns=("context_id", "entity_name"),
@@ -1391,6 +1508,7 @@ class ContextService:
             return ()
         chunks = self._repository.read_rows(
             resource.context_relation,
+            identity=identity,
             predicates=(_in("context_id", tuple(sorted(context_ids))),),
             max_rows=self._settings.max_scan_rows,
         )
@@ -1691,3 +1809,22 @@ def _decode_document_cursor(
             "The pagination cursor is invalid",
         )
     return after[0], after[1]
+
+
+def _refuse_unenforceable_identity(session: SearchSession) -> None:
+    """Refuse at startup if this warehouse cannot execute reads as a principal.
+
+    The whole value of identity-scoped serving is that the warehouse refuses a
+    query stel should not have issued. An adapter that cannot narrow its
+    principal would serve every caller on the operator's credentials while the
+    deployment believed otherwise — a silent success, which is worse than not
+    offering the feature (issue #395, ADR-0010).
+    """
+    warehouse_type = session.resolve(None).profile.warehouse.type
+    if not adapter_supports_identity_scoped_connection(warehouse_type):
+        raise ValueError(
+            f"warehouse.type='{warehouse_type}' cannot execute reads as a named "
+            "principal, so enforce_warehouse_identity cannot be honoured. "
+            "Serving would silently use the operator's credentials for every "
+            "caller."
+        )

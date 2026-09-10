@@ -12,10 +12,16 @@ from typing import Any, cast
 
 import pytest
 
-from stel.adapters.base import ReadPredicate, ReadPredicateOperator
+from stel.adapters.base import (
+    OPERATOR_IDENTITY,
+    ReadPredicate,
+    ReadPredicateOperator,
+    WarehouseIdentity,
+)
 from stel.agent_context import AgentContextGrain, contract_descriptor
 from stel.append_log import QUERY_LOG_SCHEMA
 from stel.mcp_server.authorization import (
+    AuthorizationError,
     ClaimAuthorizationProvider,
     PolicyAttribute,
     Principal,
@@ -32,6 +38,7 @@ from stel.mcp_server.contracts import (
     MCPErrorCode,
     SearchContextRequest,
 )
+from stel.mcp_server.grants import WarehouseIdentityResolver
 from stel.mcp_server.server import create_mcp_server
 from stel.mcp_server.service import (
     ContextSearch,
@@ -68,6 +75,7 @@ class FakeRepository:
     ) -> None:
         self.rows = rows
         self.calls: list[tuple[str, tuple[ReadPredicate, ...]]] = []
+        self.identities: list[WarehouseIdentity] = []
         # Query-log rows the service handed us (issue #329), so tests can
         # assert what a served query records without a warehouse.
         self.logged: list[Mapping[str, Any]] = []
@@ -91,12 +99,16 @@ class FakeRepository:
         self,
         relation: str,
         *,
+        identity: WarehouseIdentity,
         predicates: Sequence[ReadPredicate],
         max_rows: int,
         columns: Sequence[str] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         del columns
         self.calls.append((relation, tuple(predicates)))
+        # Which warehouse principal each read ran as (issue #395): the point
+        # of the seam is that a governed read and stel's own reads differ.
+        self.identities.append(identity)
         selected = tuple(
             row
             for row in self.rows.get(relation, ())
@@ -158,7 +170,7 @@ def _matches(row: Mapping[str, Any], predicate: ReadPredicate) -> bool:
     raise AssertionError(f"unsupported fixture predicate {predicate.operator}")
 
 
-def _artifact_catalog() -> ArtifactCatalog:
+def _artifact_catalog(*, with_public_model: bool = False) -> ArtifactCatalog:
     registry_id = "model.context_demo.document_registry"
     chunks_id = "model.context_demo.document_chunks"
     links_id = "model.context_demo.context_entity_links"
@@ -246,9 +258,36 @@ def _artifact_catalog() -> ArtifactCatalog:
             ],
         },
     }
+    results = [{"model_name": "context_search", "status": "success"}]
+    if with_public_model:
+        public_id = "search_index.context_demo.public_search"
+        manifest["models"].append(
+            {
+                "name": "public_search",
+                "unique_id": public_id,
+                "resource_type": "search_index",
+                "description": "Public economic document context",
+                "access": "public",
+                "output": {
+                    "type": "serving_resource",
+                    "serving_resource": {
+                        "store_type": "fake",
+                        "id_field": "context_id",
+                        "attributes": [],
+                        "query": {
+                            "modes": ["hybrid", "text", "vector"],
+                            "consistency": "strong",
+                        },
+                    },
+                },
+            }
+        )
+        manifest["dag"]["execution_order"].append(public_id)
+        manifest["dag"]["edges"].append([embed_id, public_id])
+        results.append({"model_name": "public_search", "status": "success"})
     run_results = {
         "metadata": {"generated_at": "2026-07-20T12:00:00+00:00"},
-        "results": [{"model_name": "context_search", "status": "success"}],
+        "results": results,
     }
     return ArtifactCatalog.from_payloads(manifest, run_results=run_results)
 
@@ -484,10 +523,12 @@ def _service(
     repository: FakeRepository | None = None,
     hit_metadata: Mapping[str, Any] | None = None,
     search: FakeSearch | None = None,
+    warehouse_identity: WarehouseIdentityResolver | None = None,
+    with_public_model: bool = False,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
-        catalog=_artifact_catalog(),
+        catalog=_artifact_catalog(with_public_model=with_public_model),
         repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
         principal_resolver=StaticPrincipalResolver(
@@ -500,6 +541,7 @@ def _service(
             )
         ),
         authorization=ClaimAuthorizationProvider(),
+        warehouse_identity=warehouse_identity,
         settings=settings,
     )
     return service, fake_search
@@ -1955,3 +1997,125 @@ def test_an_unauthorized_document_fetch_still_logs_nothing() -> None:
 
     assert response.error is not None
     assert repository.logged == []
+
+
+# ─── warehouse identity (issue #395, ADR-0010) ──────────────────────────────
+
+
+class _FixedWarehouseIdentity:
+    """A resolver standing in for the grant-backed one."""
+
+    def __init__(self, identity: WarehouseIdentity) -> None:
+        self._identity = identity
+
+    def identity_for(self, principal: Principal) -> WarehouseIdentity:
+        del principal
+        return self._identity
+
+
+def test_governed_reads_run_as_the_callers_warehouse_identity() -> None:
+    """The property the whole seam exists for: a served answer is assembled
+    from reads executed as a principal narrower than the operator, so a
+    dropped policy filter is refused by the warehouse rather than answered."""
+    repository = FakeRepository(_fixture_rows())
+    caller = WarehouseIdentity("svc-research@example.com")
+    service, _ = _service(
+        repository=repository, warehouse_identity=_FixedWarehouseIdentity(caller)
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(model="context_search", query="quarterly revenue")
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert repository.identities, "the search must have read something"
+    assert set(repository.identities) == {caller}
+
+
+def test_an_unconfigured_deployment_still_reads_as_the_operator() -> None:
+    """stdio and single-tenant use are unaffected: without an identity
+    resolver every read is the operator's, exactly as before #395."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        service.search_context(
+            SearchContextRequest(model="context_search", query="quarterly revenue")
+        )
+    finally:
+        service.close()
+
+    assert repository.identities
+    assert set(repository.identities) == {OPERATOR_IDENTITY}
+
+
+class _NoGrantedIdentity:
+    """The grant-backed resolver's behaviour for an unprovisioned subject."""
+
+    def identity_for(self, principal: Principal) -> WarehouseIdentity:
+        del principal
+        raise AuthorizationError("The caller has no warehouse identity grant")
+
+
+def test_a_public_model_is_still_readable_without_a_warehouse_identity() -> None:
+    """A public resource declares no policy attributes and no tenancy
+    boundary, so there is nothing for a narrower principal to enforce.
+
+    Requiring an identity for one would deny public data to every caller who
+    has not been provisioned -- a regression, not a boundary (PR #570 review).
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        warehouse_identity=_NoGrantedIdentity(),
+        with_public_model=True,
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.error is None
+    # The governed model is denied for want of an identity; the public one is
+    # not, and the catalog is not emptied by the denial.
+    assert [model.name for model in response.models] == ["public_search"]
+    assert set(repository.identities) == {OPERATOR_IDENTITY}
+
+
+def test_a_governed_model_without_an_identity_is_denied_not_served() -> None:
+    """The other half: enforcement on, no grant, governed resource."""
+    service, _ = _service(warehouse_identity=_NoGrantedIdentity())
+    try:
+        response = service.search_context(
+            SearchContextRequest(model="context_search", query="quarterly revenue")
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code == MCPErrorCode.NOT_FOUND_OR_DENIED
+
+
+def test_a_public_model_still_uses_an_identity_when_the_caller_has_one() -> None:
+    """`access` comes from the catalog, so a resource marked public in error
+    is exactly the "bug in stel" this layer defends against. A caller who has
+    an identity keeps the warehouse-side limit on public reads too."""
+    repository = FakeRepository(_fixture_rows())
+    caller = WarehouseIdentity("svc-research@example.com")
+    service, _ = _service(
+        repository=repository,
+        warehouse_identity=_FixedWarehouseIdentity(caller),
+        with_public_model=True,
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert {model.name for model in response.models} == {
+        "context_search",
+        "public_search",
+    }
+    assert set(repository.identities) == {caller}

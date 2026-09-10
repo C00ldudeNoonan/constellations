@@ -42,3 +42,27 @@ def _restore_stel_logging() -> Iterator[None]:
         logger.handlers[:] = handlers
         logger.setLevel(level)
         logger.propagate = propagate
+
+
+@pytest.fixture(autouse=True)
+def _restore_adapter_registry() -> Iterator[None]:
+    """Undo whatever a test did to the adapter registry (issue #518, #395).
+
+    `_REGISTRY` is process-global and `register` is a plain assignment, so a
+    test that registers a stub adapter leaves it there for every test that
+    follows -- and one that registers a name an adapter already owns replaces
+    the real adapter, which surfaces as an unrelated failure in some other
+    file.
+
+    Snapshotting here rather than in the test that happens to register one,
+    because the next such test will not know to: a `finally` that deletes its
+    own key restores nothing if the key was already taken.
+    """
+    from stel.adapters.registry import _REGISTRY
+
+    snapshot = dict(_REGISTRY)
+    try:
+        yield
+    finally:
+        _REGISTRY.clear()
+        _REGISTRY.update(snapshot)

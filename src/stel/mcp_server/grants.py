@@ -26,7 +26,12 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Protocol
 
-from ..adapters.base import ReadPredicate, ReadPredicateOperator
+from ..adapters.base import (
+    OPERATOR_IDENTITY,
+    ReadPredicate,
+    ReadPredicateOperator,
+    WarehouseIdentity,
+)
 from ..search import SearchFilter, SearchFilterOperator
 from .authorization import (
     AuthorizationError,
@@ -43,6 +48,14 @@ SUBJECT_COLUMN = "subject_id"
 ATTRIBUTE_COLUMN = "attribute"
 VALUE_COLUMN = "value"
 GRANT_COLUMNS = (SUBJECT_COLUMN, ATTRIBUTE_COLUMN, VALUE_COLUMN)
+
+# Reserved: names the warehouse principal a subject's governed reads execute
+# as, rather than a value to filter rows by (issue #395, ADR-0010). It lives
+# in this relation so it inherits operator ownership, the TTL that bounds
+# revocation, the per-subject cache and its sweep — but it is not a policy
+# attribute, and a context model that declares one by this name is refused
+# rather than quietly given a second meaning.
+WAREHOUSE_IDENTITY_ATTRIBUTE = "warehouse_identity"
 
 # A grant read per request would put a warehouse round trip in the latency of
 # every search. Grants change on human timescales, so a short TTL is the right
@@ -91,6 +104,7 @@ class GrantRowReader(Protocol):
         self,
         relation: str,
         *,
+        identity: WarehouseIdentity,
         predicates: Sequence[ReadPredicate],
         max_rows: int,
         columns: Sequence[str] | None = None,
@@ -183,6 +197,10 @@ class WarehouseGrantStore:
     def _read(self, subject_id: str) -> tuple[Grant, ...]:
         rows = self._repository.read_rows(
             self._relation,
+            # The grants relation is operator-owned, and reading it is what
+            # resolves a caller's identity -- so it necessarily precedes one
+            # and cannot be read under one (ADR-0010).
+            identity=OPERATOR_IDENTITY,
             predicates=[
                 ReadPredicate(SUBJECT_COLUMN, ReadPredicateOperator.EQUAL, subject_id)
             ],
@@ -228,6 +246,7 @@ class GrantAuthorizationProvider:
     ) -> tuple[SearchFilter, ...]:
         if access == "public":
             return ()
+        _refuse_reserved_attributes(attributes)
         granted = _granted_values(self._store, principal.subject_id)
         filters: list[SearchFilter] = []
         for attribute in attributes:
@@ -283,6 +302,7 @@ class GrantAuthorizationProvider:
             return True
         if not attributes:
             return False
+        _refuse_reserved_attributes(attributes)
         granted = _granted_values(self._store, principal.subject_id)
         for attribute in attributes:
             allowed = granted.get(attribute.name, ())
@@ -301,3 +321,71 @@ def _granted_values(store: GrantStore, subject_id: str) -> dict[str, tuple[str, 
     for grant in store.grants_for(subject_id):
         values[grant.attribute] = (*values.get(grant.attribute, ()), grant.value)
     return values
+
+
+def _refuse_reserved_attributes(attributes: Sequence[PolicyAttribute]) -> None:
+    """A context model may not declare the reserved identity attribute.
+
+    `warehouse_identity` grants say who to connect as; treating one as a row
+    filter would silently give the same grant two meanings, and an operator
+    revoking a filter value would be changing a connection identity without
+    knowing it (ADR-0010).
+    """
+    for attribute in attributes:
+        if attribute.name == WAREHOUSE_IDENTITY_ATTRIBUTE:
+            raise GrantConfigurationError(
+                f"'{WAREHOUSE_IDENTITY_ATTRIBUTE}' is reserved: it names the "
+                "warehouse principal a read executes as, so it cannot also be "
+                "a policy attribute. Rename the context model's attribute."
+            )
+
+
+class WarehouseIdentityResolver(Protocol):
+    def identity_for(self, principal: Principal) -> WarehouseIdentity: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorWarehouseIdentityResolver:
+    """Every read runs as the operator — the default, and what stel has always
+    done. Deployments that have not opted into identity-scoped serving keep
+    exactly today's behaviour, including stdio and single-tenant use."""
+
+    def identity_for(self, principal: Principal) -> WarehouseIdentity:
+        return OPERATOR_IDENTITY
+
+
+class GrantWarehouseIdentityResolver:
+    """The warehouse principal a subject's governed reads execute as (#395).
+
+    Read from the reserved `warehouse_identity` grant, so the mapping is
+    operator-owned and revocable on the same TTL as every other grant. Two
+    outcomes are not "pick one":
+
+    * **No grant is a denial.** There is no fallback to the operator's
+      credentials — a missing row must never read as "unprotected", which is
+      the silent-success failure this layer exists to remove.
+    * **More than one is a configuration error, not a denial.** A subject may
+      legitimately hold several `tenant_id` grants; it cannot legitimately
+      execute as two principals at once. Reporting that as "denied" would
+      leave the operator with no signal, exactly as `GrantConfigurationError`
+      exists to avoid elsewhere in this module.
+    """
+
+    def __init__(self, store: GrantStore) -> None:
+        self._store = store
+
+    def identity_for(self, principal: Principal) -> WarehouseIdentity:
+        values = _granted_values(self._store, principal.subject_id).get(
+            WAREHOUSE_IDENTITY_ATTRIBUTE, ()
+        )
+        if not values:
+            raise AuthorizationError(
+                "The caller has no warehouse identity grant"
+            )
+        if len(set(values)) > 1:
+            raise GrantConfigurationError(
+                f"Subject has {len(set(values))} '{WAREHOUSE_IDENTITY_ATTRIBUTE}' "
+                "grants and can execute as only one principal. Leave exactly "
+                "one row for this subject."
+            )
+        return WarehouseIdentity(values[0])

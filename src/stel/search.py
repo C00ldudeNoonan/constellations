@@ -16,7 +16,12 @@ from typing import Any, cast
 import pyarrow as pa
 
 from .adapters import WarehouseAdapter, create_adapter
-from .adapters.base import AdapterError, StateScope
+from .adapters.base import (
+    OPERATOR_IDENTITY,
+    AdapterError,
+    StateScope,
+    WarehouseIdentity,
+)
 from .adapters.serialized import SerializedAdapter
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
@@ -422,8 +427,13 @@ class SearchSession:
             return store
 
     @contextmanager
-    def warehouse(self, timings: PhaseTimings | None) -> Iterator[WarehouseAdapter]:
-        """An open warehouse adapter for one operation.
+    def warehouse(
+        self,
+        timings: PhaseTimings | None,
+        *,
+        identity: WarehouseIdentity = OPERATOR_IDENTITY,
+    ) -> Iterator[WarehouseAdapter]:
+        """An open warehouse adapter for one operation, connecting as `identity`.
 
         Held across operations when the adapter allows it, opened and closed
         per call otherwise. A held adapter serializes concurrent tool threads
@@ -432,8 +442,23 @@ class SearchSession:
         `AdapterError` inside the block retires the held connection, so the
         next operation reconnects rather than inheriting the failure; the
         connection itself closes once every operation using it has left.
+
+        Only the **operator** connection is ever held. A narrower identity
+        (issue #395, ADR-0010) opens and closes per call: the session holds
+        one connection, and handing a caller-scoped one to the next request
+        would be the exact confusion this seam exists to prevent. Holding
+        per identity needs a bounded, swept pool — deferred to the adapter
+        work, where the cost it saves can be measured rather than guessed.
         """
         resolved = self.resolve(timings).profile
+        if not identity.is_operator:
+            connecting = perf_counter()
+            with create_adapter(
+                resolved.warehouse, project_dir=self.project_dir, identity=identity
+            ) as adapter:
+                _record(timings, "warehouse_connect", perf_counter() - connecting)
+                yield adapter
+            return
         with self._lock:
             held, fresh = self._warehouse_for_call(resolved, timings)
             if held is not None:

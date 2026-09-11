@@ -1888,6 +1888,18 @@ def mcp() -> None:
         "long a revoked grant keeps applying."
     ),
 )
+@click.option(
+    "--enforce-warehouse-identity",
+    is_flag=True,
+    default=False,
+    help=(
+        "Execute each caller's governed reads as the warehouse principal "
+        "named by their reserved 'warehouse_identity' grant, so the warehouse "
+        "refuses a query stel's filters should not have issued. Requires "
+        "--grants-relation, and refuses to start on a warehouse that cannot "
+        "connect as a named principal."
+    ),
+)
 @_project_context_options
 @click.pass_context
 def mcp_serve(
@@ -1913,6 +1925,7 @@ def mcp_serve(
     max_scan_rows: int,
     grants_relation: str | None,
     grant_ttl_seconds: float | None,
+    enforce_warehouse_identity: bool,
 ) -> None:
     """Run the read-only stel MCP server.
 
@@ -1956,6 +1969,15 @@ def mcp_serve(
             max_response_bytes=max_response_bytes,
             max_scan_rows=max_scan_rows,
         )
+        if enforce_warehouse_identity and grants_relation is None:
+            # Checked here as well as in `from_project` so the operator gets
+            # the usual exit-2 configuration diagnostic before any warehouse
+            # work, rather than a traceback out of service construction.
+            raise ConfigClickError(
+                "--enforce-warehouse-identity needs --grants-relation: the "
+                "warehouse identity a caller reads as is a reserved grant, so "
+                "there is nowhere to look it up without a grants relation."
+            )
         if transport == "stdio":
             if trust_proxy_principal_headers:
                 raise ConfigClickError(
@@ -1977,6 +1999,7 @@ def mcp_serve(
                 profiles_dir=ctx.obj["profiles_dir"],
                 grants_relation=grants_relation,
                 grant_ttl_seconds=grant_ttl_seconds,
+                enforce_warehouse_identity=enforce_warehouse_identity,
                 settings=settings,
             )
             return
@@ -2128,11 +2151,22 @@ def mcp_serve(
             profiles_dir=ctx.obj["profiles_dir"],
             grants_relation=grants_relation,
             grant_ttl_seconds=grant_ttl_seconds,
+            enforce_warehouse_identity=enforce_warehouse_identity,
             settings=settings,
         )
     except ValidationError as error:
         raise ConfigClickError(str(error)) from error
-    except (ArtifactCatalogError, AuthorizationError, *_CONFIG_ERRORS) as error:
+    except (
+        ArtifactCatalogError,
+        AuthorizationError,
+        # `--enforce-warehouse-identity` against a warehouse that cannot
+        # connect as a named principal refuses from `from_project` as a
+        # `ValueError` once the profile resolves (#568). It is a
+        # configuration mistake, so it exits 2 with a diagnostic rather than
+        # a traceback.
+        ValueError,
+        *_CONFIG_ERRORS,
+    ) as error:
         raise ConfigClickError(str(error)) from error
     except TokenVerificationError as error:
         # Raised at construction, before anything listens: a plaintext JWKS

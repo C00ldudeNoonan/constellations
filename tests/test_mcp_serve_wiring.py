@@ -71,6 +71,12 @@ CONFIGURATIONS: dict[str, list[str]] = {
         "--transport", "sse",
         "--trust-proxy-principal-headers",
     ],
+    # Warehouse-identity enforcement (#568). A flag the CLI accepts but never
+    # boots is the same class of bug this file exists for.
+    "stdio-enforced-warehouse-identity": [
+        "--grants-relation", "ops.grants",
+        "--enforce-warehouse-identity",
+    ],
 }
 
 

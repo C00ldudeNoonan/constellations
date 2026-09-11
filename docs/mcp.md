@@ -365,6 +365,16 @@ policy attribute — a context model declaring one by that name is refused,
 because one grant with two meanings is how an operator revokes a row filter
 while believing they revoked a connection identity.
 
+Turn it on with `--enforce-warehouse-identity`, which requires
+`--grants-relation` because the identity *is* a grant:
+
+```bash
+stel mcp serve --transport streamable-http --trust-proxy-principal-headers   --grants-relation ops.grants --enforce-warehouse-identity
+```
+
+The flag is off by default. Left off, the grants above still govern what each
+caller may read; every read simply executes on the operator's connection.
+
 Only context reads take an identity. stel's own tables — the serving ledger
 and query lease, the grants relation itself, the MCP query log — always connect
 as the operator. That ordering is not a preference: reading grants is what

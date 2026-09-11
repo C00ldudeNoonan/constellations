@@ -1226,6 +1226,26 @@ def test_classification_heartbeat_fires_within_a_long_scan(
     assert "2 processed" in heartbeats[0]
 
 
+def test_classification_names_its_phase_before_the_first_heartbeat(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A "0 processed" heartbeat should read as "still opening the read", not
+    as a hang with nothing to act on (issue #573: 21 identical zero-count
+    heartbeats were observed over 5.5 minutes before the first real count).
+    Worded distinctly from "classifying parent rows" so it does not itself
+    get counted as a heartbeat by the test above."""
+    project = _project(tmp_path)
+    _write_doc(project, "a.json", "word")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    phase_lines = [
+        r.message for r in caplog.records if "to begin classification" in r.message
+    ]
+    assert len(phase_lines) == 1
+
+
 def test_a_heartbeat_fires_while_the_snapshot_read_is_still_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -36,6 +36,13 @@ MCP_TENANT_ID_ENV = "STEL_MCP_TENANT_ID"
 MCP_ACCESS_GROUPS_ENV = "STEL_MCP_ACCESS_GROUPS"
 MCP_POLICY_CLAIMS_ENV = "STEL_MCP_POLICY_CLAIMS"
 
+# Who the grants audit log records as having made a change (issue #580).
+# Advisory, not authenticated: anyone who can run `stel grants` can set it,
+# exactly as anyone who can run `stel grants` can write the relation. It exists
+# so a provisioning job can name itself instead of logging a service account's
+# OS user, not to establish identity.
+GRANTS_ACTOR_ENV = "STEL_GRANTS_ACTOR"
+
 # Every variable above, for enumeration by tests and diagnostics.
 ENV_VARS: tuple[str, ...] = (
     PROFILES_DIR_ENV,
@@ -45,6 +52,7 @@ ENV_VARS: tuple[str, ...] = (
     MCP_TENANT_ID_ENV,
     MCP_ACCESS_GROUPS_ENV,
     MCP_POLICY_CLAIMS_ENV,
+    GRANTS_ACTOR_ENV,
 )
 
 

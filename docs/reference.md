@@ -396,6 +396,7 @@ stel serving recover <search-index> --target T --owner-terminated  # explicit au
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
 stel grants list [--subject S] [--relation R]            # what the governed MCP server authorizes from
 stel grants show <subject>                               # one subject's grants, and what it reads as
+stel grants history [--subject S] [--limit N]            # recorded changes, newest first: who changed what, when
 stel grants grant <subject> <attribute> <value> --target T    # permit one policy value; idempotent
 stel grants revoke <subject> <attribute> [value] --target T   # remove one value, or every value of the attribute
 stel grants identity set <subject> <principal> --target T     # the warehouse principal the subject reads as

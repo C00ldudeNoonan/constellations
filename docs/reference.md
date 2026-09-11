@@ -394,6 +394,12 @@ stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FI
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
 stel serving recover <search-index> --target T --owner-terminated  # explicit authority reassignment after a crash
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
+stel grants list [--subject S] [--relation R]            # what the governed MCP server authorizes from
+stel grants show <subject>                               # one subject's grants, and what it reads as
+stel grants grant <subject> <attribute> <value> --target T    # permit one policy value; idempotent
+stel grants revoke <subject> <attribute> [value] --target T   # remove one value, or every value of the attribute
+stel grants identity set <subject> <principal> --target T     # the warehouse principal the subject reads as
+stel grants identity clear <subject> --target T               # remove it; denies under --enforce-warehouse-identity
 stel suggest dbt --from RELATION --dbt-project DIR       # propose `description:` for under-documented dbt models
 stel providers list [--output {table,json}]              # built-in + entry-point providers, incompatible plugins flagged
 stel source freshness                                    # mtime vs warn_after/error_after

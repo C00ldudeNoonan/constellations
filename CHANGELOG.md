@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### `stel grants` writes the relation the governed server authorizes from (issue #577)
+
+- **The grants relation had a reader and no writer.** `WarehouseGrantStore`
+  has resolved a caller's policy from an operator-owned
+  `(subject_id, attribute, value)` relation since #396, and #576 made it
+  possible to turn warehouse-identity enforcement on — but nothing created
+  that relation, wrote a row, or removed one. Production access control was
+  administered by hand-written SQL, and stel, the enforcement point, could not
+  report on its own policy.
+- `stel grants list` / `show` / `grant` / `revoke`, plus
+  `stel grants identity set` / `clear`. The relation is created on first use.
+- **`grant` is idempotent** and `revoke` reports how many rows matched. Zero
+  matched rows usually means a typo in the subject, which otherwise looks
+  exactly like a successful revocation.
+- **The reserved `warehouse_identity` attribute gets its own commands and is
+  refused by the generic path.** It names the principal a read connects as
+  rather than a value to filter rows by (ADR-0010); reaching it through
+  `grant`/`revoke` would give one row two meanings, so an operator removing
+  what looked like a filter value would silently change a connection identity.
+  `identity set` replaces rather than appends, because a subject holding two
+  identities is a configuration error the server refuses outright.
+- **Every mutating command requires an explicit `--target`**, as
+  `stel serving recover` does (#511). Writing an authorization row into the
+  wrong warehouse grants access somewhere nobody is looking. Reads do not
+  require one, and every command prints the target, warehouse and relation it
+  resolved — so a `--relation` that disagrees with the server's
+  `--grants-relation` is visible rather than silent.
+
+**Worth knowing:** revocation is a hard delete, which keeps the request-path
+grant read a plain equality scan rather than a validity-window resolution on
+every query. There is no built-in history of who was entitled to what; an
+append-only audit log is a separate change. Revocation is also not immediate —
+a running server keeps applying a removed grant for up to
+`--grant-ttl-seconds`.
+
 ### A governed read can execute as a warehouse principal narrower than the operator (issue #395)
 
 Grants (#392/#396) moved authorization to an operator-owned relation, so a

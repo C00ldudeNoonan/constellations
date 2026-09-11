@@ -336,6 +336,48 @@ Grants are cached per subject for `--grant-ttl-seconds` (default 60). That TTL
 is the ceiling on how long a revoked grant keeps working — restart the server
 if a revocation must take effect immediately.
 
+### Administering the relation
+
+`stel grants` creates the relation on first use and writes it, so production
+access control is not administered by hand-written SQL:
+
+```bash
+stel grants list --target prod
+stel grants show analyst@example.com --target prod
+stel grants grant analyst@example.com tenant_id acme --target prod
+stel grants revoke analyst@example.com tenant_id acme --target prod
+```
+
+`grant` is idempotent — re-granting what a subject already holds writes
+nothing rather than adding a duplicate row. `revoke` with no value removes
+every value of that attribute, and reports how many rows matched: zero usually
+means a typo in the subject, which otherwise looks exactly like success.
+
+The reserved `warehouse_identity` attribute has its own commands, because it
+names the principal a read *connects as* rather than a value to filter rows
+by. `set` replaces rather than appends, since a subject holding two identities
+is a configuration error the server refuses:
+
+```bash
+stel grants identity set analyst@example.com reader@project.iam.gserviceaccount.com --target prod
+stel grants identity clear analyst@example.com --target prod
+```
+
+Clearing an identity **denies** that subject's governed reads under
+`--enforce-warehouse-identity`. It does not fall back to the operator's
+credentials.
+
+Every mutating command requires an explicit `--target`. Writing an
+authorization row into the wrong warehouse grants access in a place nobody is
+looking, so it is refused rather than defaulted — the same rule
+`stel serving recover` follows. Reads do not require one. Every command prints
+the target, warehouse and relation it resolved, so a `--relation` that does
+not match the server's `--grants-relation` is visible rather than silent.
+
+Revocation is a hard delete: the row is gone, which keeps the request-path
+read a plain equality scan. Keep your own history if you need to answer who
+was entitled to what last month.
+
 Two limits worth stating plainly. stel is still the enforcement point: grants
 make policy central and auditable, but they do not make the warehouse refuse a
 query stel should not have issued — that is what a warehouse identity is for,

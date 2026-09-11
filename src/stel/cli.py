@@ -2631,6 +2631,273 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
     )
 
 
+# Duplicated as literals rather than imported, because a Click decorator's
+# default is evaluated at import and `stel.cli_services.grants` pulls the
+# adapter and search stacks -- a cost every `stel --help` would pay for one
+# string. `tests/test_grants_cli.py` pins both against their source of truth,
+# so a rename fails a test rather than drifting.
+_DEFAULT_GRANTS_RELATION = "stel_grants"
+_WAREHOUSE_IDENTITY = "warehouse_identity"
+
+
+@cli.group()
+@_project_context_options
+def grants() -> None:
+    """Administer the grants relation a governed MCP server authorizes from.
+
+    `stel mcp serve --grants-relation` looks a caller's policy up by
+    authenticated subject rather than trusting what the request carried. These
+    commands are what write that relation.
+    """
+
+
+def _grants_relation_option(command: Callable[..., Any]) -> Callable[..., Any]:
+    return click.option(
+        "--relation",
+        default=_DEFAULT_GRANTS_RELATION,
+        show_default=True,
+        help=(
+            "Grants relation to administer. Must match the server's "
+            "--grants-relation, or the server authorizes from a different table."
+        ),
+    )(command)
+
+
+def _echo_grants_context(report: Any) -> None:
+    """Name the relation and warehouse before the rows.
+
+    An empty grant list is equally true of a subject with no access and of a
+    relation the server never reads, and those are opposite outcomes. Same
+    reasoning as `_echo_serving_context` (issue #511); ASCII only, to match.
+    """
+    click.echo(f"target:    {report.target}")
+    click.echo(f"warehouse: {report.warehouse}")
+    click.echo(f"relation:  {report.relation}")
+
+
+def _echo_grant_rows(report: Any) -> None:
+    if not report.rows:
+        click.echo("grants:    (none)")
+        return
+    click.echo("grants:")
+    for row in report.rows:
+        marker = " (identity)" if row.attribute == _WAREHOUSE_IDENTITY else ""
+        click.echo(f"  {row.subject_id}  {row.attribute}={row.value}{marker}")
+
+
+def _run_grants(operation: Callable[[], Any]) -> Any:
+    try:
+        return operation()
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except AdapterError as e:
+        raise click.ClickException(str(e)) from e
+
+
+@grants.command("list")
+@click.option("--subject", default=None, help="Show one subject only.")
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_list(ctx: click.Context, subject: str | None, relation: str) -> None:
+    """Show the grants this target's relation holds."""
+    from .cli_services.grants import list_grants
+
+    report = _run_grants(
+        lambda: list_grants(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            relation=relation,
+            subject=subject,
+        )
+    )
+    _echo_grants_context(report)
+    _echo_grant_rows(report)
+
+
+@grants.command("show")
+@click.argument("subject")
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_show(ctx: click.Context, subject: str, relation: str) -> None:
+    """Show what one subject is permitted, and what it reads as."""
+    from .cli_services.grants import list_grants
+
+    report = _run_grants(
+        lambda: list_grants(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            relation=relation,
+            subject=subject,
+        )
+    )
+    _echo_grants_context(report)
+    _echo_grant_rows(report)
+    if not report.rows:
+        click.echo(
+            f"note:      '{subject}' holds no grants here, so a governed "
+            "request from it is refused. Check --target and --relation if you "
+            "expected otherwise."
+        )
+
+
+@grants.command("grant")
+@click.argument("subject")
+@click.argument("attribute")
+@click.argument("value")
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_grant(
+    ctx: click.Context, subject: str, attribute: str, value: str, relation: str
+) -> None:
+    """Permit one value of one policy attribute for SUBJECT.
+
+    Idempotent: re-granting what a subject already holds writes nothing.
+    """
+    from .cli_services.grants import grant as _grant
+
+    report = _run_grants(
+        lambda: _grant(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            subject=subject,
+            attribute=attribute,
+            value=value,
+            relation=relation,
+        )
+    )
+    _echo_grants_context(report)
+    _echo_grant_rows(report)
+    click.echo(f"Granted {attribute}={value} to '{subject}'.")
+
+
+@grants.command("revoke")
+@click.argument("subject")
+@click.argument("attribute")
+@click.argument("value", required=False)
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_revoke(
+    ctx: click.Context,
+    subject: str,
+    attribute: str,
+    value: str | None,
+    relation: str,
+) -> None:
+    """Remove one VALUE, or every value of ATTRIBUTE, for SUBJECT."""
+    from .cli_services.grants import revoke as _revoke
+
+    report = _run_grants(
+        lambda: _revoke(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            subject=subject,
+            attribute=attribute,
+            value=value,
+            relation=relation,
+        )
+    )
+    _echo_grants_context(report)
+    _echo_grant_rows(report)
+    if not report.rows_affected:
+        click.echo(
+            f"note:      nothing matched {attribute}"
+            f"{'=' + value if value else ''} for '{subject}', so nothing was "
+            "revoked. A typo in the subject looks exactly like this."
+        )
+        return
+    click.echo(
+        f"Revoked {report.rows_affected} row(s) of {attribute} from "
+        f"'{subject}'. A running server keeps applying them for up to its "
+        "--grant-ttl-seconds; restart it to cut that short."
+    )
+
+
+@grants.group("identity")
+@_project_context_options
+def grants_identity() -> None:
+    """Administer the warehouse principal a subject's reads execute as.
+
+    Separate from `grant` because `warehouse_identity` is not a policy value:
+    it names the principal a governed read connects as (ADR-0010). A subject
+    may hold many `tenant_id` grants; it may hold exactly one identity.
+    """
+
+
+@grants_identity.command("set")
+@click.argument("subject")
+@click.argument("principal")
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_identity_set(
+    ctx: click.Context, subject: str, principal: str, relation: str
+) -> None:
+    """Make SUBJECT's governed reads execute as PRINCIPAL.
+
+    Replaces any principal the subject already had, because a second one is a
+    configuration error the server refuses rather than a second permission.
+    """
+    from .cli_services.grants import set_identity
+
+    report = _run_grants(
+        lambda: set_identity(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            subject=subject,
+            principal=principal,
+            relation=relation,
+        )
+    )
+    _echo_grants_context(report)
+    _echo_grant_rows(report)
+    click.echo(f"'{subject}' now reads as {principal}.")
+
+
+@grants_identity.command("clear")
+@click.argument("subject")
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_identity_clear(
+    ctx: click.Context, subject: str, relation: str
+) -> None:
+    """Remove SUBJECT's warehouse identity.
+
+    This denies the subject's governed reads under an enforcing server. It
+    does not fall back to the operator's credentials: a missing identity must
+    never read as unprotected.
+    """
+    from .cli_services.grants import clear_identity
+
+    report = _run_grants(
+        lambda: clear_identity(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            subject=subject,
+            relation=relation,
+        )
+    )
+    _echo_grants_context(report)
+    _echo_grant_rows(report)
+    if not report.rows_affected:
+        click.echo(f"note:      '{subject}' had no warehouse identity here.")
+        return
+    click.echo(
+        f"Cleared the warehouse identity for '{subject}'. Under "
+        "--enforce-warehouse-identity its governed reads are now refused."
+    )
+
+
 @cli.command()
 @click.option(
     "--from-candidates",

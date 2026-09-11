@@ -5,9 +5,10 @@ and the warehouse runs whatever it is sent, so one bug in the filter path
 reaches every caller's data. Executing a caller's reads as a narrower warehouse
 principal is the layer that makes the warehouse refuse instead.
 
-No adapter implements the capability yet, so the contract is pinned here
-against a test adapter. That is deliberate: the refusal semantics are what must
-be right *before* BigQuery impersonation or MotherDuck tokens land, not after.
+Refusal and pooling semantics were pinned here against a test adapter before
+either real implementation landed, which is why they are exercised abstractly
+below rather than only through BigQuery. BigQuery impersonation is #568;
+MotherDuck per-caller tokens are the open design question in #569.
 """
 from __future__ import annotations
 
@@ -64,11 +65,15 @@ def test_a_blank_principal_is_refused_rather_than_read_as_the_operator() -> None
 # ─── the adapter capability ─────────────────────────────────────────────────
 
 
-def test_no_shipped_adapter_can_scope_a_connection_to_a_principal() -> None:
-    """The seam is inert until an adapter implements it, and that is the
-    point: this pins that nothing claims the capability by inheriting it."""
+def test_only_the_adapters_that_implement_the_capability_claim_it() -> None:
+    """The default is inert; a claim exists only where #568/#569 landed it.
+
+    BigQuery narrows via impersonation with no new secret (#568) and claims
+    the capability. DuckDB/MotherDuck cannot yet -- #569 is the open design
+    question for a per-caller token -- so it still inherits the safe default.
+    """
     assert adapter_supports_identity_scoped_connection("duckdb") is False
-    assert adapter_supports_identity_scoped_connection("bigquery") is False
+    assert adapter_supports_identity_scoped_connection("bigquery") is True
 
 
 def test_an_adapter_that_cannot_scope_refuses_rather_than_connecting_as_operator(

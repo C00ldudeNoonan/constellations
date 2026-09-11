@@ -391,11 +391,22 @@ Three refusals, none of which fall back to the operator's credentials:
   startup.** Not at the first request, and never by quietly serving on the
   operator's credentials.
 
-That last one applies to every adapter stel ships today: **no adapter
-implements the capability yet**, so this contract is in place and not yet
-usable. BigQuery (via service-account impersonation, #568) and MotherDuck (via
-per-caller tokens, #569) are tracked separately. `docs/adr/0010-warehouse-identity-is-a-granted-attribute.md`
-records why the identity is a granted attribute rather than a tenant.
+**BigQuery implements the capability with no new secret (#568).** A caller
+identity becomes the `impersonate_service_account` the profile could already
+set — `warehouse_identity`'s value is a service-account email, wrapped onto
+the operator's own credentials exactly as a profile-configured impersonation
+target is. Nothing new is stored, resolved, or revealed. A profile that
+already sets `impersonate_service_account` cannot also serve caller identities:
+the two would compose into an implicit delegation chain the operator never
+stated, so that combination refuses at startup rather than chaining silently.
+
+MotherDuck cannot yet: its token is a `CredentialReference` — an
+environment-variable name — and N callers is not N environment variables.
+That is the open design question in #569. Local (file-backed) DuckDB is out of
+scope entirely; it never holds a connection across requests to begin with.
+`docs/adr/0010-warehouse-identity-is-a-granted-attribute.md` records why the
+identity is a granted attribute rather than a tenant, and why adapters differ
+in kind rather than degree here.
 
 Queries are logged with the tenant the policy actually filtered to, not the
 tenant the caller claimed, so the audit trail stays meaningful when those

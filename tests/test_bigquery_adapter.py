@@ -20,6 +20,7 @@ import pytest
 from pydantic import ValidationError
 
 from stel.adapters import (
+    AdapterCapabilityError,
     AdapterError,
     LegacyWarehouseNamesError,
     ReadPredicate,
@@ -44,10 +45,12 @@ from stel.adapters.base import (
     LEGACY_STAGING_TABLE_PREFIX,
     LEGACY_STATE_TABLE,
     LEGACY_TEST_FAILURES_TABLE_PREFIX,
+    OPERATOR_IDENTITY,
     SERVING_LEASE_TABLE,
     SERVING_LEDGER_TABLE,
     STATE_TABLE,
     TEST_FAILURES_TABLE_PREFIX,
+    WarehouseIdentity,
 )
 from stel.adapters.bigquery import (
     _STATE_CLUSTER_FIELDS,
@@ -2917,6 +2920,113 @@ def test_credentials_impersonation_wraps_source(
     assert isinstance(creds, _FakeImpersonated)
     assert isinstance(captured["source"], _FakeSource)
     assert captured["principal"] == "runner@proj.iam.gserviceaccount.com"
+
+
+# ─── the warehouse-identity seam (issue #568, ADR-0010) ─────────────────────
+
+
+def test_bigquery_claims_the_identity_scoped_connection_capability() -> None:
+    """No new secret is introduced (#568): the capability rides the same
+    `impersonate_service_account` field the profile can already set."""
+    from stel.adapters import adapter_supports_identity_scoped_connection
+
+    assert adapter_supports_identity_scoped_connection("bigquery") is True
+
+
+def test_config_for_identity_sets_impersonation_and_nothing_else() -> None:
+    """The write half of the capability: a caller identity becomes the
+    impersonation target, and every other field -- `quota_project` and
+    `scopes` included, both applied after impersonation in `_credentials` --
+    passes through untouched."""
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "dataset": "ds",
+            "quota_project": "billing-proj",
+            "scopes": ["https://www.googleapis.com/auth/bigquery"],
+        }
+    )
+    assert isinstance(config, BigQueryWarehouseConfig)
+
+    scoped = BigQueryAdapter.config_for_identity(
+        config, WarehouseIdentity("svc-acme@example.com")
+    )
+    assert isinstance(scoped, BigQueryWarehouseConfig)
+    assert scoped.impersonate_service_account == "svc-acme@example.com"
+    assert scoped.quota_project == "billing-proj"
+    assert scoped.scopes == ["https://www.googleapis.com/auth/bigquery"]
+    # The source config is a Pydantic model; `model_copy` must not mutate it.
+    assert config.impersonate_service_account is None
+
+
+def test_config_for_identity_is_a_no_op_for_the_operator() -> None:
+    """The operator identity is every path except a served governed read
+    (#395); it must return the config unchanged, impersonation included."""
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "dataset": "ds",
+            "impersonate_service_account": "runner@proj.iam.gserviceaccount.com",
+        }
+    )
+    assert BigQueryAdapter.config_for_identity(config, OPERATOR_IDENTITY) is config
+
+
+def test_config_for_identity_refuses_to_compose_with_operator_impersonation() -> None:
+    """An operator-configured impersonation target and a caller identity
+    cannot both apply (#568): composing them is an implicit delegation chain
+    the operator never stated, so this is a configuration error, not a
+    silent chain of impersonation the deployment did not intend."""
+    config = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": "proj",
+            "dataset": "ds",
+            "impersonate_service_account": "runner@proj.iam.gserviceaccount.com",
+        }
+    )
+    with pytest.raises(AdapterCapabilityError, match="already set"):
+        BigQueryAdapter.config_for_identity(config, WarehouseIdentity("svc@example.com"))
+
+
+def test_create_adapter_wires_a_caller_identity_through_to_impersonation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end through `create_adapter` (#395's plumbing, #568's adapter):
+    a caller identity reaches `_credentials()` as the impersonation target,
+    the same mechanism `test_credentials_impersonation_wraps_source` pins for
+    an operator-configured target."""
+    from google.auth import impersonated_credentials
+    from google.oauth2 import service_account
+
+    captured: dict[str, Any] = {}
+
+    class _FakeSource:
+        pass
+
+    class _FakeImpersonated:
+        def __init__(
+            self, source_credentials: Any, target_principal: str, target_scopes: list[Any]
+        ) -> None:
+            captured["principal"] = target_principal
+
+    monkeypatch.setattr(
+        service_account.Credentials,
+        "from_service_account_file",
+        staticmethod(lambda path, scopes=None: _FakeSource()),
+    )
+    monkeypatch.setattr(impersonated_credentials, "Credentials", _FakeImpersonated)
+
+    config = parse_warehouse_config(
+        {"type": "bigquery", "project": "proj", "dataset": "ds", "keyfile": "./sa.json"}
+    )
+    adapter = create_adapter(config, identity=WarehouseIdentity("svc@example.com"))
+    assert isinstance(adapter, BigQueryAdapter)
+    adapter._credentials()
+
+    assert captured["principal"] == "svc@example.com"
 
 
 def test_environment_keyfile_resolves_relative_to_project_at_sdk_boundary(

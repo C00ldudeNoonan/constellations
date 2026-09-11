@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,11 +31,20 @@ from ..state_reconciliation import iter_validated_state_pages
 from ..versioning import compute_code_version
 from .checkpoint import FlushPublisher
 from .contracts import ModelRunResult, RunError
+from .heartbeat import Heartbeat
 from .values import scalarize, warehouse_key_cast_matches_python
 from .warehouse import warehouse_options
 
+log = logging.getLogger(__name__)
+
 _CHUNK_GENERATED_FIELDS = CHUNK_GENERATED_FIELDS
 _CHUNK_INPUT_EXCLUDED_FIELDS = _CHUNK_GENERATED_FIELDS
+
+# This model kind's own throttle (issue #573), independent of
+# `transform.py`'s -- a chunk model's window can legitimately be slower or
+# faster per row than a transform's classification pass.
+_HEARTBEAT_ROWS = 5_000
+_HEARTBEAT_SECONDS = 15.0
 
 # Read batch sizes for the two input passes (issue #423), matching embed's.
 # The id pass is projected to one narrow column so it can afford a wide batch;
@@ -186,7 +196,34 @@ def run_chunk_model(
     window_changed: list[str] = []
     window_documents = 0
 
-    with get_reporter().model_task(model.name, "chunk", upstream_rows) as task:
+    # The terminal progress bar (`task.advance`) is TTY-only; the `--json
+    # --verbose` launcher log the issue was filed against never sees it, so a
+    # chunk model's whole parent scan logged nothing for 619 seconds (#573).
+    # The heartbeat below is `run_sql_model`'s classification-pass mechanism
+    # (#469), reused rather than reimplemented for the same reason: a chunk
+    # window is I/O-bound in the same shape a classification scan is, so it
+    # needs the same watchdog that fires from elapsed time alone while the
+    # thread is blocked reading a batch, not only between rows.
+    heartbeat = Heartbeat(rows=_HEARTBEAT_ROWS, seconds=_HEARTBEAT_SECONDS)
+    rows_seen = 0
+
+    def _log_heartbeat(count: int, elapsed: float) -> None:
+        log.info(
+            "%s: scanning parent rows: %d processed (%.1fs elapsed)",
+            model.name,
+            count,
+            elapsed,
+        )
+
+    # Named once, before the loop, on the same reasoning as the classify
+    # pass's leading line: a "0 processed" heartbeat should read as "still
+    # opening the read", not as a hang with nothing to act on.
+    log.info("%s: reading parent table '%s' to begin scanning", model.name, upstream)
+
+    with (
+        get_reporter().model_task(model.name, "chunk", upstream_rows) as task,
+        heartbeat.watch(_log_heartbeat),
+    ):
         # Streamed, not read whole (issue #423). The id comes off each record
         # rather than from a parallel list, so this needs no correspondence
         # with the id pass above — which matters, because `table_snapshot`
@@ -199,6 +236,16 @@ def run_chunk_model(
                 assert isinstance(batch_frame, pl.DataFrame)
                 for record in batch_frame.iter_rows(named=True):
                     task.advance(1)
+                    rows_seen += 1
+                    # Checked per row, not per batch, on the same reasoning
+                    # as the classify pass (issue #469): `update()` keeps the
+                    # watchdog's count current; `try_claim()` here catches the
+                    # common case (progress between rows) without waiting on
+                    # the watchdog's own timer tick.
+                    heartbeat.update(rows_seen)
+                    claimed = heartbeat.try_claim()
+                    if claimed is not None:
+                        _log_heartbeat(*claimed)
                     document_id = str(record["document_id"])
                     raw_text = record[chunk_config.text_field]
                     text = "" if raw_text is None else str(raw_text)

@@ -1394,3 +1394,58 @@ def test_chunk_flush_every_does_not_move_code_version(tmp_path: Path) -> None:
         )
 
     assert version(5000) == version(7)
+
+
+# ─── the parent-scan heartbeat (issue #573) ──────────────────────────────────
+
+
+def test_chunk_heartbeat_fires_within_a_long_scan(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chunk kind logged nothing for its whole parent scan (#573: 619s of
+    silence on a real corpus before "finished ...: 0 row(s)"), the same
+    silence #469 fixed for the transform kind. A heartbeat must fire mid-scan
+    here too, on the same throttle mechanism (`heartbeat.py`), not a
+    reimplementation of it."""
+    import logging
+
+    from stel.execution import chunk as chunk_module
+    from stel.runner import run_project
+
+    monkeypatch.setattr(chunk_module, "_HEARTBEAT_ROWS", 2)
+    monkeypatch.setattr(chunk_module, "_HEARTBEAT_SECONDS", 1_000.0)
+    project = _chunk_project(tmp_path)
+    for index in range(5):
+        _write_doc(project, f"d{index}.json", f"Doc {index}", f"word{index}")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    heartbeats = [
+        r.message for r in caplog.records if "scanning parent rows" in r.message
+    ]
+    assert len(heartbeats) >= 2
+    assert "2 processed" in heartbeats[0]
+
+
+def test_chunk_scan_names_its_phase_before_the_first_heartbeat(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A "0 processed" heartbeat should read as "still opening the read", not
+    as a hang with nothing to act on (#573) -- the same ambiguity the
+    transform kind's leading line resolves for its classification pass."""
+    import logging
+
+    from stel.runner import run_project
+
+    project = _chunk_project(tmp_path)
+    _write_doc(project, "a.json", "Doc A", "short body")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    phase_lines = [
+        r.message for r in caplog.records if "to begin scanning" in r.message
+    ]
+    assert len(phase_lines) == 1
+    assert "document_chunks" in phase_lines[0]

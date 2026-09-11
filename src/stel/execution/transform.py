@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import contextlib
 import logging
-import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from time import monotonic
 from typing import Any
 
 import polars as pl
@@ -48,6 +45,7 @@ from ..transforms import (
 from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
 from .errors import artifact_error_text
+from .heartbeat import Heartbeat
 from .warehouse import warehouse_options
 
 log = logging.getLogger(__name__)
@@ -58,70 +56,14 @@ log = logging.getLogger(__name__)
 # a hang. A heartbeat fires on whichever comes first — this many more rows
 # seen, or this many seconds since the last one — because a slow per-row scan
 # can go a long time between count milestones.
+#
+# Kept as this module's own constants, rather than read from `heartbeat.py`'s
+# defaults, so a caller here can tune them independently of
+# `run_chunk_model`'s (issue #573) — and so a test can
+# `monkeypatch.setattr(transform, "_HEARTBEAT_ROWS", ...)` without reaching
+# into a module it is not testing.
 _HEARTBEAT_ROWS = 5_000
 _HEARTBEAT_SECONDS = 15.0
-
-
-class _Heartbeat:
-    """Tracks whether a periodic progress line has earned its place, and can
-    run a background watchdog so one still fires purely from elapsed time
-    while the calling thread is blocked inside a warehouse read (issue #469
-    Codex review): checking only between processed rows misses a slow query
-    or a stalled batch fetch, either of which can hold the thread — with
-    nothing yet to check a heartbeat against — for the run's whole duration.
-
-    `update()`/`try_claim()` from the calling thread and the watchdog's own
-    timer share one lock, so whichever notices first claims the heartbeat and
-    the other is a no-op rather than a duplicate log line.
-    """
-
-    def __init__(self) -> None:
-        self._start = monotonic()
-        self._at_count = 0
-        self._at_time = self._start
-        self._count = 0
-        self._lock = threading.Lock()
-
-    def update(self, count: int) -> None:
-        """Record progress the calling thread has made; no logging here."""
-        with self._lock:
-            self._count = count
-
-    def try_claim(self) -> tuple[int, float] | None:
-        """If a heartbeat is due, atomically claims it and returns
-        (count, elapsed) to log. Returns None otherwise, including when
-        another caller (the watchdog, or the row loop) claimed it first."""
-        with self._lock:
-            now = monotonic()
-            if (
-                self._count - self._at_count < _HEARTBEAT_ROWS
-                and now - self._at_time < _HEARTBEAT_SECONDS
-            ):
-                return None
-            self._at_count = self._count
-            self._at_time = now
-            return self._at_count, now - self._start
-
-    @contextlib.contextmanager
-    def watch(self, log_line: Callable[[int, float], None]) -> Iterator[None]:
-        """Calls `log_line(count, elapsed)` from a background thread whenever
-        a heartbeat is due, covering any stretch where the calling thread is
-        blocked in I/O rather than between rows."""
-        stop = threading.Event()
-
-        def _run() -> None:
-            while not stop.wait(_HEARTBEAT_SECONDS):
-                claimed = self.try_claim()
-                if claimed is not None:
-                    log_line(*claimed)
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        try:
-            yield
-        finally:
-            stop.set()
-            thread.join(timeout=_HEARTBEAT_SECONDS)
 
 
 def run_sql_model(
@@ -879,7 +821,7 @@ def _stream_parent_digests(
     """
     digests: dict[str, list[str]] = {}
     rows_seen = 0
-    heartbeat = _Heartbeat()
+    heartbeat = Heartbeat(rows=_HEARTBEAT_ROWS, seconds=_HEARTBEAT_SECONDS)
 
     def _log_heartbeat(count: int, elapsed: float) -> None:
         log.info(
@@ -888,6 +830,15 @@ def _stream_parent_digests(
             count,
             elapsed,
         )
+
+    # Named once, before the loop, so a "0 processed" heartbeat (issue #573:
+    # 21 of them over 5.5 minutes was observed before the first non-zero
+    # count) reads as "still opening the read" rather than "hung with no
+    # information to act on". Worded distinctly from the heartbeat's own
+    # "classifying parent rows" line -- this is the phase name the counter
+    # was missing, not a second counter -- so tests filtering on that phrase
+    # see only the count heartbeats.
+    log.info("%s: reading parent table '%s' to begin classification", model_name, table)
 
     # The watchdog starts before `table_snapshot()` is even called, since
     # opening it is itself a blocking warehouse round trip (e.g. BigQuery

@@ -59,6 +59,7 @@ from ..timing import PhaseTimings
 from .base import (
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
+    AdapterCapabilityError,
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
@@ -79,6 +80,7 @@ from .base import (
     TableSnapshotGenerationChangedError,
     WarehouseAdapter,
     WarehouseCapability,
+    WarehouseIdentity,
     change_predicate,
     decode_state_cursor,
     encode_state_cursor,
@@ -1110,6 +1112,46 @@ class BigQueryAdapter(WarehouseAdapter):
     @classmethod
     def config_model(cls) -> type[WarehouseConfig]:
         return BigQueryWarehouseConfig
+
+    @classmethod
+    def supports_identity_scoped_connection(cls) -> bool:
+        """BigQuery can narrow to a named principal with no new secret (#568,
+        ADR-0010): `impersonate_service_account` wraps the operator's own
+        credentials via `impersonated_credentials.Credentials` rather than
+        resolving a credential for the identity. See `config_for_identity`."""
+        return True
+
+    @classmethod
+    def config_for_identity(
+        cls, config: WarehouseConfig, identity: WarehouseIdentity
+    ) -> WarehouseConfig:
+        """`config`, impersonating `identity`'s principal instead of the
+        operator's own credentials (#568).
+
+        Every other field is untouched, so `quota_project` and `scopes` -- both
+        applied after impersonation in `_credentials` -- carry through
+        unchanged, and so does the operator's own `impersonate_service_account`
+        when `identity` is the operator.
+
+        A profile that already impersonates cannot also carry a caller
+        identity: composing them would mean the caller's reads execute as
+        whatever the operator's own impersonation target can further
+        impersonate, an implicit delegation chain the operator never stated.
+        Refusing at startup surfaces that as a configuration error instead of
+        a silent, unintended chain.
+        """
+        assert isinstance(config, BigQueryWarehouseConfig)
+        if identity.is_operator:
+            return config
+        if config.impersonate_service_account is not None:
+            raise AdapterCapabilityError(
+                "warehouse.impersonate_service_account is already set; a "
+                "caller-scoped identity cannot be composed underneath an "
+                "operator-configured impersonation target"
+            )
+        return config.model_copy(
+            update={"impersonate_service_account": identity.principal}
+        )
 
     @classmethod
     def capabilities(cls) -> frozenset[WarehouseCapability]:

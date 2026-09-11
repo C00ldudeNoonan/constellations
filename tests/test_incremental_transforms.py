@@ -1246,6 +1246,70 @@ def test_classification_names_its_phase_before_the_first_heartbeat(
     assert len(phase_lines) == 1
 
 
+# ─── the classification-mismatch breakdown (issue #572, diagnostic only) ────
+
+
+def test_a_code_version_only_change_is_reported_separately_from_an_input_change(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#572: the SEC corpus republished 3.6M byte-identical rows because a
+    changed `code_version` forces a full recompute+rewrite even when the
+    parent's actual input content -- and so, often, the output -- did not
+    change. This is the diagnostic that would have said so: it reports how
+    many "changed" parents differ only in `code_version`, distinctly from how
+    many have a genuine input change, without altering which parents get
+    reprocessed. A future output-fingerprint short-circuit is only worth
+    building where this number is large; this is how an operator would know.
+
+    Editing the transform module between two runs -- with the same input
+    document -- changes `code_version` (the module's source feeds it) while
+    leaving `input_fingerprint` untouched, which is exactly the case this
+    diagnostic exists to separate out.
+    """
+    project = _project(tmp_path)
+    _write_doc(project, "a.json", "hello world")
+    run_project(project)
+
+    (project / "transforms" / "word_tokens.py").write_text(
+        _TRANSFORM_SOURCE + "\n# a comment; no behavior change\n"
+    )
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    breakdown = [
+        r.message for r in caplog.records if "code_version only" in r.message
+    ]
+    assert len(breakdown) == 1
+    assert "1 changed parent(s)" in breakdown[0]
+    assert "0 input change" in breakdown[0]
+    assert "1 code_version only" in breakdown[0]
+
+
+def test_a_genuine_input_change_is_not_counted_as_code_version_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half of the same claim: a parent whose document content
+    actually changed must land in the input-change bucket, not the
+    code_version-only one -- otherwise the breakdown would flatter every
+    reprocess as "probably skippable" regardless of whether it is."""
+    project = _project(tmp_path)
+    _write_doc(project, "a.json", "hello world")
+    run_project(project)
+
+    _write_doc(project, "a.json", "a different document entirely")
+
+    with caplog.at_level(logging.INFO, logger="stel"):
+        run_project(project)
+
+    breakdown = [
+        r.message for r in caplog.records if "code_version only" in r.message
+    ]
+    assert len(breakdown) == 1
+    assert "1 input change" in breakdown[0]
+    assert "0 code_version only" in breakdown[0]
+
+
 def test_a_heartbeat_fires_while_the_snapshot_read_is_still_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

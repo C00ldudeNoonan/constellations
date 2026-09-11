@@ -416,6 +416,16 @@ def _run_incremental_transform(
     state_records: list[StateRecord] = []
     changed: list[str] = []
     skipped = 0
+    # Diagnostic only (issue #572): breaks "changed" down by which half of
+    # `StateValue` actually differed. A parent whose `input_fingerprint`
+    # still matches -- only `code_version` moved -- is exactly the case a
+    # future output-fingerprint short-circuit would catch: its inputs are
+    # provably the same, so its outputs are a deterministic function of
+    # something unchanged, and a full recompute+republish is one candidate
+    # for skipping the write on. Logged, not acted on: this changes no
+    # classification decision above, only what gets reported after it.
+    changed_input = 0
+    changed_code_version_only = 0
     for parent_key, row_digests in digests_by_parent.items():
         reference_fingerprints = dict(table_reference_fingerprints)
         for name, by_parent in keyed_reference_fingerprints.items():
@@ -432,8 +442,22 @@ def _run_incremental_transform(
                 continue
             if prior is not None:
                 changed.append(parent_key)
+                if prior.input_fingerprint == fingerprint:
+                    changed_code_version_only += 1
+                else:
+                    changed_input += 1
         processed_parents.append(parent_key)
         state_records.append(StateRecord(parent_key, fingerprint, code_version))
+
+    if changed:
+        log.info(
+            "%s: %d changed parent(s) -- %d input change, %d code_version "
+            "only (same inputs; output may be unchanged too, issue #572)",
+            model.name,
+            len(changed),
+            changed_input,
+            changed_code_version_only,
+        )
 
     # Under a subset run the classification pass saw a deliberate slice of
     # the parents, so every other partition's parent would look removed;

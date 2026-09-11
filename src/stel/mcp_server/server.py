@@ -211,6 +211,7 @@ def serve_stdio(
     profiles_dir: Path | None = None,
     grants_relation: str | None = None,
     grant_ttl_seconds: float | None = None,
+    enforce_warehouse_identity: bool = False,
     settings: ContextServerSettings | None = None,
 ) -> None:
     service = ContextService.from_project(
@@ -219,6 +220,7 @@ def serve_stdio(
         profiles_dir=profiles_dir,
         grants_relation=grants_relation,
         grant_ttl_seconds=grant_ttl_seconds or DEFAULT_GRANT_TTL_SECONDS,
+        enforce_warehouse_identity=enforce_warehouse_identity,
         settings=settings,
     )
     _run(service, transport="stdio")
@@ -238,6 +240,7 @@ def serve_network(
     profiles_dir: Path | None = None,
     grants_relation: str | None = None,
     grant_ttl_seconds: float | None = None,
+    enforce_warehouse_identity: bool = False,
     settings: ContextServerSettings | None = None,
 ) -> None:
     """Serve over a network transport with a per-request principal resolver.
@@ -264,6 +267,7 @@ def serve_network(
         profiles_dir=profiles_dir,
         grants_relation=grants_relation,
         grant_ttl_seconds=grant_ttl_seconds or DEFAULT_GRANT_TTL_SECONDS,
+        enforce_warehouse_identity=enforce_warehouse_identity,
         settings=settings,
         principal_resolver=principal_resolver,
     )

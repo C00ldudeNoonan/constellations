@@ -280,6 +280,117 @@ def test_enforcement_on_an_adapter_that_cannot_do_it_fails_at_startup(
         )
 
 
+# --- the CLI surface (#568) ------------------------------------------------
+#
+# The refusals above are properties of `from_project`. Until `stel mcp serve`
+# could pass the flag, none of them were reachable by an operator: the seam
+# was enforced everywhere except at the place it is turned on.
+
+
+def _write_project(root: Path, warehouse: str) -> None:
+    (root / "stel_project.yml").write_text(
+        "name: p\nversion: '0.1.0'\nprofile: p\n", encoding="utf-8"
+    )
+    (root / "profiles.yml").write_text(
+        "p:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
+        + warehouse,
+        encoding="utf-8",
+    )
+
+
+def _serve(root: Path, *args: str) -> Any:
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    return CliRunner().invoke(cli, ["--project-dir", str(root), "mcp", "serve", *args])
+
+
+def test_the_cli_flag_reaches_the_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A flag that is accepted and does nothing looks, from the outside, like
+    enforcement. This is the test that fails if the option is declared and
+    never passed down."""
+    from stel.mcp_server import server as server_module
+
+    seen: dict[str, Any] = {}
+
+    def _capture(project_dir: Path, **kwargs: Any) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(server_module, "serve_stdio", _capture)
+    _write_project(tmp_path, "        type: duckdb\n        path: w.duckdb\n")
+
+    result = _serve(
+        tmp_path, "--grants-relation", "ops.grants", "--enforce-warehouse-identity"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["enforce_warehouse_identity"] is True
+    assert seen["grants_relation"] == "ops.grants"
+
+
+def test_enforcement_without_a_grants_relation_is_refused_at_the_cli(
+    tmp_path: Path,
+) -> None:
+    """Exit 2 with a diagnostic, not a traceback out of service construction,
+    and before any warehouse work."""
+    _write_project(tmp_path, "        type: duckdb\n        path: w.duckdb\n")
+
+    result = _serve(tmp_path, "--enforce-warehouse-identity")
+
+    assert result.exit_code == 2
+    assert "--enforce-warehouse-identity needs --grants-relation" in result.output
+
+
+def test_the_cli_refuses_a_warehouse_that_cannot_scope_its_identity(
+    tmp_path: Path,
+) -> None:
+    """The refusal names the type: "this warehouse cannot" is not actionable
+    without saying which warehouse it is looking at."""
+    _write_project(
+        tmp_path,
+        "        type: duckdb\n        path: "
+        + str(tmp_path / "w.duckdb")
+        + "\n        schema: main\n",
+    )
+
+    result = _serve(
+        tmp_path, "--grants-relation", "ops.grants", "--enforce-warehouse-identity"
+    )
+
+    assert result.exit_code == 2
+    assert "cannot execute reads as a named principal" in result.output
+    assert "duckdb" in result.output
+
+
+def test_the_cli_lets_a_bigquery_target_past_the_identity_gate(
+    tmp_path: Path,
+) -> None:
+    """BigQuery implements the capability, so enforcement must not refuse it.
+
+    The run still fails -- there is no built project behind this profile -- but
+    it fails *past* the identity gate, which is the distinction under test. A
+    BigQuery target refused here would make the feature unusable on the one
+    warehouse that currently supports it.
+    """
+    _write_project(
+        tmp_path,
+        "        type: bigquery\n        project: p\n        dataset: d\n",
+    )
+
+    result = _serve(
+        tmp_path, "--grants-relation", "ops.grants", "--enforce-warehouse-identity"
+    )
+
+    assert "cannot execute reads as a named principal" not in result.output
+    # Asserting only the absence would pass just as well if the CLI had failed
+    # before ever reaching the gate. Naming where it *did* stop is what makes
+    # this test capable of failing.
+    assert "manifest.json" in result.output
+
+
 class _RecordingReader:
     """A `GrantRowReader` that remembers which principal each read ran as."""
 

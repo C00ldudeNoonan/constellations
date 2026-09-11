@@ -4222,6 +4222,96 @@ def test_integration_compressed_reads_round_trip(codec: str) -> None:
         adapter._reset_storage_for_test()
 
 
+# A service account the operator may impersonate (it holds
+# `roles/iam.serviceAccountTokenCreator` on it) and which has **no** BigQuery
+# access to `STEL_BQ_TEST_PROJECT`. Both halves matter: without the first the
+# test cannot reach BigQuery at all, and without the second there is nothing to
+# be refused. There is deliberately no default -- a guessed principal would
+# fail for the wrong reason and read as a pass.
+_BQ_DENIED_PRINCIPAL = os.environ.get("STEL_BQ_TEST_DENIED_PRINCIPAL")
+
+
+@pytest.mark.skipif(
+    not (_BQ_PROJECT and _BQ_DENIED_PRINCIPAL),
+    reason=(
+        "set STEL_BQ_TEST_PROJECT and STEL_BQ_TEST_DENIED_PRINCIPAL (a service "
+        "account the operator holds roles/iam.serviceAccountTokenCreator on, "
+        "and which has no BigQuery access to that project) to run the "
+        "warehouse-identity refusal proof"
+    ),
+)
+def test_integration_a_caller_identity_is_actually_refused_by_bigquery() -> None:
+    """The warehouse refuses a read stel would have allowed (#568, #395).
+
+    Everything else about the identity seam is a config transformation, and a
+    config transformation tested only against a fake proves that stel *sends*
+    a different principal, never that BigQuery *enforces* one. Without this
+    test the feature is a `model_copy` call wearing the word "security".
+
+    The proof is the contrast, not the failure on its own:
+
+    1. the operator reads the table, so the relation exists and the query is
+       well-formed -- a refusal below cannot be a missing table or bad SQL;
+    2. the identical read, through a config differing only in
+       `impersonate_service_account`, is refused by BigQuery.
+
+    The refusal must be `Forbidden` specifically. An impersonation that never
+    happened -- the operator lacking `serviceAccountTokenCreator` on the
+    target -- surfaces as `RefreshError` through the same `AdapterError`
+    wrapper, and accepting that would let a misconfigured environment report
+    this property as proven while no BigQuery permission check ever ran.
+    """
+    from google.api_core.exceptions import Forbidden
+
+    # The skipif above guarantees this; restating it narrows the type and
+    # keeps the gate's invariant visible where the value is used.
+    assert _BQ_DENIED_PRINCIPAL is not None
+    denied = _BQ_DENIED_PRINCIPAL
+
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    relation = f"{dataset}.governed"
+    operator_adapter = create_adapter(cfg)
+    try:
+        with operator_adapter:
+            operator_adapter.materialize_full(
+                "governed",
+                pl.DataFrame({"doc_id": ["d1", "d2"], "tenant_id": ["a", "b"]}),
+            )
+            assert operator_adapter.read_relation(relation).height == 2
+
+        caller_cfg = BigQueryAdapter.config_for_identity(
+            cfg, WarehouseIdentity(principal=denied)
+        )
+        assert isinstance(caller_cfg, BigQueryWarehouseConfig)
+        assert caller_cfg.impersonate_service_account == denied
+
+        caller_adapter = create_adapter(caller_cfg)
+        try:
+            with caller_adapter:
+                with pytest.raises(AdapterError) as refused:
+                    caller_adapter.read_relation(relation)
+        finally:
+            assert isinstance(caller_adapter, BigQueryAdapter)
+            caller_adapter._reset_storage_for_test()
+
+        assert isinstance(refused.value.__cause__, Forbidden), (
+            "expected BigQuery to deny the impersonated principal; got "
+            f"{type(refused.value.__cause__).__name__}. A RefreshError here "
+            "means STEL_BQ_TEST_DENIED_PRINCIPAL could not be impersonated at "
+            "all, so nothing about BigQuery's enforcement was tested."
+        )
+        # The sanitized wrapper names the class, never the engine's message:
+        # a denial is not a channel for the principal's own diagnostics.
+        assert f"cannot read relation '{relation}'" in str(refused.value)
+        assert denied not in str(refused.value)
+    finally:
+        assert isinstance(operator_adapter, BigQueryAdapter)
+        operator_adapter._reset_storage_for_test()
+
+
 _UNCOVERED_BY_LIVE_TESTS = frozenset(
     {
         "clear_state",

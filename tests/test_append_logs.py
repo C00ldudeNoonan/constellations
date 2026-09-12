@@ -26,6 +26,7 @@ from stel.append_log import (
     run_log_rows,
     write_rows,
 )
+from stel.checks.schema import TestResult
 from stel.config.profile import QueryLogConfig, RunLogConfig
 from stel.execution.contracts import ModelRunResult
 
@@ -183,6 +184,56 @@ def test_run_log_rows_carry_identity_and_aggregates() -> None:
     assert rows[0]["status"] == "success"
 
 
+def test_run_log_rows_leave_test_counts_null_with_no_test_results() -> None:
+    """`stel run` has no notion of tests -- null, not zero (issue #575)."""
+    rows = run_log_rows(
+        [_result()],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+    )
+
+    assert rows[0]["tests_passed"] is None
+    assert rows[0]["tests_failed"] is None
+    assert rows[0]["tests_warned"] is None
+
+
+def test_run_log_rows_count_a_models_tests_by_status() -> None:
+    """A build's per-model test outcome rides along on the same row (#575)."""
+    rows = run_log_rows(
+        [_result(model_name="notes"), _result(model_name="other")],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+        test_results=[
+            TestResult(
+                test_name="not_null", model_name="notes", column="body", status="pass"
+            ),
+            TestResult(
+                test_name="unique", model_name="notes", column="note_id", status="fail"
+            ),
+            TestResult(
+                test_name="accepted_values",
+                model_name="notes",
+                column="kind",
+                status="warn",
+            ),
+        ],
+    )
+
+    by_model = {row["model_name"]: row for row in rows}
+    assert by_model["notes"]["tests_passed"] == 1
+    assert by_model["notes"]["tests_failed"] == 1
+    assert by_model["notes"]["tests_warned"] == 1
+    # A selected model that ran no tests is zero, not null: the caller did
+    # pass test_results, it is just empty for this model.
+    assert by_model["other"]["tests_passed"] == 0
+    assert by_model["other"]["tests_failed"] == 0
+    assert by_model["other"]["tests_warned"] == 0
+
+
 def test_a_budget_exceeded_run_is_visible_after_the_fact() -> None:
     # The terminal output of the run that tripped is otherwise the only record.
     rows = run_log_rows(
@@ -283,6 +334,20 @@ def test_each_invocation_appends_a_row(tmp_path: Path) -> None:
     # ...and the second run's skips are visible as history.
     assert rows[0][3:] == (3, 0)
     assert rows[1][3:] == (0, 3)
+
+
+def test_build_project_writes_the_run_log_too(tmp_path: Path) -> None:
+    """The bug in issue #575: `write_rows(run_log)` was only reachable from
+    `run_project`, so a project driven by `stel build` -- what an orchestrator
+    uses, since it runs tests too -- never got a row."""
+    from stel.runner import build_project
+
+    project = _log_project(tmp_path, run_log=True)
+    build_project(project)
+
+    rows = _log_rows(project)
+    assert len(rows) == 1
+    assert rows[0][1] == "notes"
 
 
 def test_no_log_relation_exists_when_disabled(tmp_path: Path) -> None:

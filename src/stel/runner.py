@@ -448,6 +448,7 @@ def build_project(
     out = BuildResult()
     blocked: set[str] = set()
 
+    started_at = datetime.now(UTC).isoformat()
     with adapter:
         log.info("connected to %s warehouse", resolved.warehouse.type)
         _enforce_reprocess_guard(
@@ -532,6 +533,25 @@ def build_project(
                 )
             if any(t.is_hard_failure for t in model_tests):
                 blocked |= dag.descendants(name)
+
+        # Same contract as `run_project`: written inside the adapter context,
+        # after the models it describes, best-effort (issue #575). A build's
+        # per-model outcome includes tests, which a plain run has no notion
+        # of, so its test counts ride along on the same row.
+        write_rows(
+            adapter,
+            resolved.run_log,
+            run_log_rows(
+                out.run_results,
+                invocation_id=uuid.uuid4().hex,
+                started_at=started_at,
+                completed_at=datetime.now(UTC).isoformat(),
+                profile_target=resolved.target_name,
+                test_results=out.test_results,
+            ),
+            schema=RUN_LOG_SCHEMA,
+            what="the run log",
+        )
 
     errored = sum(1 for r in out.run_results if r.errors)
     hard_failed = {t.model_name for t in out.test_results if t.is_hard_failure}

@@ -88,6 +88,12 @@ RUN_LOG_SCHEMA: dict[str, Any] = {
     "duration_seconds": pl.Float64,
     "started_at": pl.String,
     "completed_at": pl.String,
+    # Null for `stel run`, which has no notion of tests. `stel build` fills
+    # these from its own per-model test results (issue #575) -- counts only,
+    # same "identity and aggregates" rule as everything else in this row.
+    "tests_passed": pl.Int64,
+    "tests_failed": pl.Int64,
+    "tests_warned": pl.Int64,
 }
 
 QUERY_LOG_SCHEMA: dict[str, Any] = {
@@ -280,6 +286,21 @@ def _usage(metrics: Mapping[str, Any], key: str) -> int:
     return max(int(value), 0)
 
 
+def _test_counts(
+    test_results: Sequence[Any] | None, model_name: str
+) -> dict[str, int | None]:
+    """Per-model test outcome counts, or null when the caller has no notion of
+    tests at all (`stel run`) rather than zero (`stel build` ran none)."""
+    if test_results is None:
+        return {"tests_passed": None, "tests_failed": None, "tests_warned": None}
+    model_tests = [t for t in test_results if t.model_name == model_name]
+    return {
+        "tests_passed": sum(1 for t in model_tests if t.status == "pass"),
+        "tests_failed": sum(1 for t in model_tests if t.status == "fail"),
+        "tests_warned": sum(1 for t in model_tests if t.status == "warn"),
+    }
+
+
 def run_log_rows(
     results: Sequence[Any],
     *,
@@ -287,13 +308,15 @@ def run_log_rows(
     started_at: str,
     completed_at: str,
     profile_target: str,
+    test_results: Sequence[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """One row per model per invocation (issue #306).
 
     Identity and aggregates only: which model ran, under which resolved
     provider, how much it processed and what that cost. No prompt text, no
     document text, no credential names — the artifact rules, applied to a
-    table that outlives the run.
+    table that outlives the run. `test_results` (issue #575) folds in a
+    build's per-model test outcome, which a plain run has no notion of.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -334,6 +357,7 @@ def run_log_rows(
                 "duration_seconds": result.duration_seconds,
                 "started_at": started_at,
                 "completed_at": completed_at,
+                **_test_counts(test_results, result.model_name),
             }
         )
     return rows

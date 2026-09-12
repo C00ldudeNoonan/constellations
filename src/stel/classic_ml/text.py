@@ -142,10 +142,13 @@ def _fit_vectorizer(
     if provider == "builtin.hashing":
         return _fit_hashing_vectorizer(provider, options, provider_options)
 
-    doc_tokens = [_analyze(row["text"], options) for row in rows]
+    # One document's tokens live only for the iteration that produces them
+    # (issue #584): the fully-tokenized corpus was 63 bytes/token, which put
+    # a 4.55 GiB corpus at a measured 51.4 GiB peak. `doc_freq` is the only
+    # thing this pass needs, and it grows sublinearly with corpus size.
     doc_freq: Counter[str] = Counter()
-    for tokens in doc_tokens:
-        doc_freq.update(set(tokens))
+    for row in rows:
+        doc_freq.update(set(_analyze(row["text"], options)))
 
     terms = _select_terms(doc_freq, len(rows), options)
     idf_by_term: dict[str, float] = {}
@@ -268,20 +271,24 @@ def _char_wb_ngrams(text: str, ngram_range: tuple[int, int]) -> list[str]:
 
 def _feature_rows(
     rows: list[dict[str, Any]],
-    doc_tokens: list[list[str]],
+    options: TextOptions,
     vectorizer: dict[str, Any],
     source_name: str,
 ) -> list[dict[str, Any]]:
     provider = str(vectorizer["provider"])
     if provider == "builtin.hashing":
-        return _hashed_feature_rows(rows, doc_tokens, vectorizer, source_name)
+        return _hashed_feature_rows(rows, options, vectorizer, source_name)
 
     vocabulary = [str(term) for term in vectorizer["vocabulary"]]
     term_index = {term: i for i, term in enumerate(vocabulary)}
     vocab_set = set(vocabulary)
     idf_by_term = {str(k): float(v) for k, v in vectorizer["idf"].items()}
     features: list[dict[str, Any]] = []
-    for row, tokens in zip(rows, doc_tokens, strict=True):
+    # Analyzed and discarded one document at a time (issue #584), same
+    # rationale as `_fit_vectorizer`: nothing here needs more than one
+    # document's tokens in memory at once.
+    for row in rows:
+        tokens = _analyze(row["text"], options)
         counts = Counter(t for t in tokens if t in vocab_set)
         binary = bool(vectorizer["options"]["binary"])
         total = (len(counts) if binary else sum(counts.values())) or 1
@@ -309,14 +316,15 @@ def _feature_rows(
 
 def _hashed_feature_rows(
     rows: list[dict[str, Any]],
-    doc_tokens: list[list[str]],
+    options: TextOptions,
     vectorizer: dict[str, Any],
     source_name: str,
 ) -> list[dict[str, Any]]:
-    options = vectorizer["options"]
+    hashing_options = vectorizer["options"]
     n_features = int(vectorizer["n_features"])
     features: list[dict[str, Any]] = []
-    for row, tokens in zip(rows, doc_tokens, strict=True):
+    for row in rows:
+        tokens = _analyze(row["text"], options)
         bucket_values: Counter[int] = Counter()
         for token in tokens:
             # The sign bit comes from a digest byte the bucket never sees:
@@ -325,7 +333,7 @@ def _hashed_feature_rows(
             digest = hashlib.blake2b(token.encode(), digest_size=9).digest()
             hashed = int.from_bytes(digest[:8], byteorder="big", signed=False)
             bucket = hashed % n_features
-            sign = -1 if options["alternate_sign"] and digest[8] & 1 else 1
+            sign = -1 if hashing_options["alternate_sign"] and digest[8] & 1 else 1
             bucket_values[bucket] += sign
         for bucket in sorted(bucket_values):
             value = float(bucket_values[bucket])
@@ -634,8 +642,7 @@ def _run_features(
     if ml.mode in {"fit_transform", "fit"}:
         vectorizer = _fit_vectorizer(rows, provider, options, contract.options)
 
-    doc_tokens = [_analyze(row["text"], options) for row in rows]
-    features = _feature_rows(rows, doc_tokens, vectorizer, source_name)
+    features = _feature_rows(rows, options, vectorizer, source_name)
     all_metrics = {
         "row_count": len(rows),
         "vocabulary_size": len(vectorizer["vocabulary"]),

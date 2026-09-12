@@ -15,9 +15,11 @@ from typing import Any, cast
 import polars as pl
 import pytest
 
+import stel.classic_ml.text as _text_module
 from stel.classic_ml import (
     ARTIFACT_SCHEMA_VERSION,
     IncompatibleClassicMLArtifactError,
+    _feature_rows,
     _fit_naive_bayes,
     _fit_vectorizer,
     _hashed_feature_rows,
@@ -134,6 +136,114 @@ def test_vectorizer_payload_invariant_under_permutation(provider: str) -> None:
     assert payloads[0] == payloads[1] == payloads[2]
 
 
+# ─── bounded per-document tokenization (issue #584) ─────────────────────────
+
+
+class _TrackedTokens(list[str]):
+    """A token list that reports its own death, so a test can see how many
+    documents' tokens are alive at once without measuring real memory."""
+
+    def __init__(self, tokens: list[str], counter: _LiveTokenCounter) -> None:
+        super().__init__(tokens)
+        self._counter = counter
+
+    def __del__(self) -> None:
+        self._counter.alive -= 1
+
+
+class _LiveTokenCounter:
+    def __init__(self) -> None:
+        self.alive = 0
+        self.peak = 0
+
+    def track(self, tokens: list[str]) -> _TrackedTokens:
+        self.alive += 1
+        self.peak = max(self.peak, self.alive)
+        return _TrackedTokens(tokens, self)
+
+
+def _watch_analyze(monkeypatch: pytest.MonkeyPatch) -> _LiveTokenCounter:
+    counter = _LiveTokenCounter()
+    real_analyze = _text_module._analyze
+
+    def counting_analyze(text: str, options: Any) -> _TrackedTokens:
+        return counter.track(real_analyze(text, options))
+
+    monkeypatch.setattr(_text_module, "_analyze", counting_analyze)
+    return counter
+
+
+def _corpus(n: int) -> list[dict[str, Any]]:
+    return [
+        {"row_index": i, "row_id": f"r{i}", "text": f"doc{i} shared common term"}
+        for i in range(n)
+    ]
+
+
+def test_fit_vectorizer_holds_one_documents_tokens_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A materialized `doc_tokens` list keeps every document's tokens alive
+    until fitting finishes -- measured at 51.4 GiB peak on a 4.55 GiB corpus.
+    `doc_freq` is the only thing this pass needs, and nothing here should
+    outlive the row that produced it."""
+    counter = _watch_analyze(monkeypatch)
+    options = _text_options({})
+    rows = _corpus(20)
+
+    _fit_vectorizer(rows, "builtin.tfidf", options, {})
+
+    assert counter.peak == 1, (
+        f"{counter.peak} documents' tokens were alive at once while fitting; "
+        "the corpus must be analyzed and discarded one document at a time"
+    )
+
+
+def test_feature_rows_hold_one_documents_tokens_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transform path pays the same cost a second time on `fit_transform`
+    unless it, too, analyzes and discards one document at a time."""
+    options = _text_options({})
+    rows = _corpus(20)
+    vectorizer = _fit_vectorizer(rows, "builtin.tfidf", options, dict(options))
+
+    counter = _watch_analyze(monkeypatch)
+    _feature_rows(rows, options, vectorizer, "docs")
+
+    # 2, not 1: `tokens = _analyze(...)` evaluates the new list before the
+    # loop variable is rebound, so the outgoing document's tokens overlap the
+    # incoming one's by one instruction. That is still O(1), not O(corpus).
+    assert counter.peak <= 2, (
+        f"{counter.peak} documents' tokens were alive at once during feature "
+        "extraction; the corpus must be analyzed and discarded one document "
+        "at a time"
+    )
+
+
+def test_hashed_feature_rows_hold_one_documents_tokens_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _text_options({"n_features": 64})
+    rows = _corpus(20)
+    vectorizer = {
+        "provider": "builtin.hashing",
+        "vocabulary": [],
+        "idf": {},
+        "n_features": 64,
+        "options": dict(options, stop_words=[], ngram_range=[1, 1]),
+    }
+
+    counter = _watch_analyze(monkeypatch)
+    _hashed_feature_rows(rows, options, vectorizer, "docs")
+
+    assert counter.peak <= 2, (
+        f"{counter.peak} documents' tokens were alive at once during hashed "
+        "feature extraction; the corpus must be analyzed and discarded one "
+        "document at a time"
+    )
+
+
 def test_naive_bayes_model_invariant_under_permutation() -> None:
     options = _text_options({})
     models = [
@@ -160,8 +270,7 @@ def test_hashed_features_map_to_same_rows_under_permutation() -> None:
 
     def rows_by_id(order: list[int]) -> dict[str, list[tuple[str, float]]]:
         rows = _source_rows(_frame(order), "text")
-        tokens = [row["text"].split() for row in rows]
-        features = _hashed_feature_rows(rows, tokens, vectorizer, "tickets")
+        features = _hashed_feature_rows(rows, options, vectorizer, "tickets")
         out: dict[str, list[tuple[str, float]]] = {}
         for feature in features:
             out.setdefault(feature["row_id"], []).append(
@@ -231,7 +340,7 @@ def _signs_and_buckets(n_features: int, tokens: list[str]) -> list[tuple[int, in
     pairs: list[tuple[int, int]] = []
     for token in tokens:
         rows = [{"row_index": 0, "row_id": "r", "text": token}]
-        features = _hashed_feature_rows(rows, [[token]], vectorizer, "src")
+        features = _hashed_feature_rows(rows, options, vectorizer, "src")
         (feature,) = features
         pairs.append((feature["hash_bucket"], 1 if feature["value"] > 0 else -1))
     return pairs
@@ -277,7 +386,7 @@ def test_hashing_collisions_can_cancel() -> None:
     assert opposite, "expected opposite-sign collisions in a 2-bucket space"
     a, b = opposite[0]
     rows = [{"row_index": 0, "row_id": "r", "text": f"{a} {b}"}]
-    (feature,) = _hashed_feature_rows(rows, [[a, b]], vectorizer, "src")
+    (feature,) = _hashed_feature_rows(rows, options, vectorizer, "src")
     assert feature["value"] == 0.0
 
 

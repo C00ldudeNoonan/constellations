@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### `classic_ml` text vectorizing no longer holds the whole corpus in memory (issue #584)
+
+`_fit_vectorizer` and the feature-extraction transform path in
+`classic_ml/text.py` each built a `list[list[str]]` of every document's
+tokens before doing anything with them — on a 4.55 GiB / 19,827-document
+corpus, a measured 51.4 GiB peak, which OOM-killed a 26 GiB container. Both
+call sites only ever need one document's tokens at a time (`_fit_vectorizer`
+folds each into a running `Counter`; `_feature_rows`/`_hashed_feature_rows`
+already processed one row at a time), so both now analyze and discard a
+document's tokens per iteration instead of materializing the corpus first.
+`max_features`/`min_df`/`max_df` do not bound this — pruning happens after
+the corpus would already be resident — so this was not a tunable, only a fix.
+This is the fifth incident in the #414 series, and the first in the `ml`
+model kind, which that series' audit did not reach.
+
 ### A grant can permit a range, not only a literal (issue #582)
 
 - **Date-range entitlements had no representation.** A tier was meant to select

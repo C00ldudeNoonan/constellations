@@ -2638,6 +2638,7 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
 # so a rename fails a test rather than drifting.
 _DEFAULT_GRANTS_RELATION = "stel_grants"
 _WAREHOUSE_IDENTITY = "warehouse_identity"
+_OPERATOR_BETWEEN = "between"
 
 
 @cli.group()
@@ -2682,6 +2683,12 @@ def _echo_grant_rows(report: Any) -> None:
     click.echo("grants:")
     for row in report.rows:
         marker = " (identity)" if row.attribute == _WAREHOUSE_IDENTITY else ""
+        # An interval reads as a range, not an equality: rendering
+        # `filing_date=2024-01-01/2025-12-31` invites reading it as a literal
+        # value that happens to contain a slash.
+        if row.operator == _OPERATOR_BETWEEN:
+            click.echo(f"  {row.subject_id}  {row.attribute} in {row.value}{marker}")
+            continue
         click.echo(f"  {row.subject_id}  {row.attribute}={row.value}{marker}")
 
 
@@ -2803,14 +2810,28 @@ def grants_history(
 @grants.command("grant")
 @click.argument("subject")
 @click.argument("attribute")
-@click.argument("value")
+@click.argument("value", required=False)
+@click.option(
+    "--interval",
+    default=None,
+    help=(
+        "Permit a range instead of a literal, written '<lower>/<upper>' "
+        "(e.g. 2024-01-01/2025-12-31). Use '..' for an open end. A subject "
+        "may hold one interval per attribute."
+    ),
+)
 @_grants_relation_option
 @_project_context_options
 @click.pass_context
 def grants_grant(
-    ctx: click.Context, subject: str, attribute: str, value: str, relation: str
+    ctx: click.Context,
+    subject: str,
+    attribute: str,
+    value: str | None,
+    interval: str | None,
+    relation: str,
 ) -> None:
-    """Permit one value of one policy attribute for SUBJECT.
+    """Permit one value, or one interval, of a policy attribute for SUBJECT.
 
     Idempotent: re-granting what a subject already holds writes nothing.
     """
@@ -2824,18 +2845,23 @@ def grants_grant(
             subject=subject,
             attribute=attribute,
             value=value,
+            interval=interval,
             relation=relation,
         )
     )
+    granted = value if interval is None else interval
     _echo_grants_context(report)
     _echo_grant_rows(report)
     if not report.rows_affected:
         click.echo(
-            f"'{subject}' already held {attribute}={value}; nothing was "
+            f"'{subject}' already held {attribute}={granted}; nothing was "
             "written, and nothing was recorded in the audit log."
         )
         return
-    click.echo(f"Granted {attribute}={value} to '{subject}'.")
+    if interval is not None:
+        click.echo(f"Granted '{subject}' the range {attribute} in {interval}.")
+        return
+    click.echo(f"Granted {attribute}={granted} to '{subject}'.")
 
 
 @grants.command("revoke")

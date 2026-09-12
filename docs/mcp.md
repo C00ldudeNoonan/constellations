@@ -305,16 +305,49 @@ tenant from another.
 stel mcp serve --grants-relation ops.context_grants
 ```
 
-The relation supplies three string columns:
+The relation supplies four string columns:
 
 | Column | Meaning |
 | --- | --- |
 | `subject_id` | The authenticated subject the grant belongs to. |
 | `attribute` | A policy attribute name, such as `tenant_id` or `access_group`. |
-| `value` | One value the subject is permitted for that attribute. |
+| `value` | One value the subject is permitted for that attribute, or an interval. |
+| `operator` | `eq` (the default; null means this too) or `between`. |
 
 One row per permitted value; several rows for the same attribute compile to an
-`IN` filter. With this set, `STEL_MCP_TENANT_ID`, `STEL_MCP_ACCESS_GROUPS`, and
+`IN` filter.
+
+### Ranges
+
+An ordered policy attribute — a `date`, `timestamp`, `integer` or `float` —
+can be granted as a closed interval instead of a literal, written
+`<lower>/<upper>` with `..` for an open end:
+
+```bash
+stel grants grant analyst@example.com filing_date --interval 2024-01-01/2025-12-31 --target prod
+stel grants grant analyst@example.com filing_date --interval 2024-01-01/.. --target prod
+```
+
+Both bounds are inclusive. An unbounded side contributes no filter at all,
+rather than a sentinel.
+
+**A subject holds at most one interval per attribute**, and an interval cannot
+sit beside a literal on the same attribute. Both are configuration errors
+rather than denials. The reason is that search filters are combined with
+`AND`: two intervals would narrow to their overlap rather than permit either,
+which is the opposite of how two grant rows read. Different attributes are
+unaffected.
+
+There is deliberately no one-sided `gte` grant. Two one-sided rows meant as a
+window would OR into *everything* — a total over-grant that reads like a
+narrowing — so the only range primitive is the closed interval, which cannot
+be written that way. [ADR-0011](adr/0011-an-entitlement-interval-is-one-row-and-one-attribute.md)
+records that, and what would have to change to support a union.
+
+Bounds are compared as strings, which is correct for ISO dates and timestamps.
+A numeric interval would compare lexicographically and is not yet supported —
+declare such an entitlement as a discretized attribute (a `filing_year` column
+granted with `IN`) instead. With this set, `STEL_MCP_TENANT_ID`, `STEL_MCP_ACCESS_GROUPS`, and
 `STEL_MCP_POLICY_CLAIMS` are **not consulted** — only `STEL_MCP_PRINCIPAL_ID`
 is, as the subject to look up. That is the point: the caller proves who they
 are, and you decide what that subject may read.

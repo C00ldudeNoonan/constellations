@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### The grants relation keeps a history of who changed access, and when (issue #580)
+
+- **A hard delete leaves only the present tense.** #577 made revocation a row
+  removal, which keeps the request-path grant read a plain equality scan — but
+  it also meant nothing could answer who was entitled to what last month.
+  `stel grants history` answers it, from an append-only log written beside the
+  grants relation and named off it (`stel_grants` → `stel_grants_audit`).
+- Every change that changed something is recorded: the action, subject,
+  attribute, value, rows affected, target and an actor. Changes that changed
+  nothing are not — re-granting what a subject already holds, revoking what
+  matched no rows, clearing an identity that was not set. `identity set` is
+  always recorded, because it rewrites the row every time.
+- **This log is not best-effort, and that is a deliberate break from the other
+  two.** The run log and the MCP query log may never fail the thing they
+  describe, because a log is observability. An audit trail is not: one that
+  silently drops rows has holes exactly where the warehouse was struggling,
+  and still reads as complete. `write_audit_rows` raises where `write_rows`
+  warns. It is written *after* the statement, so the error says the change was
+  applied and the two are now out of step — the operator needs both facts.
+- **No flag turns it off**, for the same reason: a switch that disables the
+  record is a switch that makes the record untrustworthy. The relation is
+  created on first write, so there is nothing to set up.
+- `STEL_GRANTS_ACTOR` names the actor; otherwise the OS user is recorded. It
+  is **advisory** and labelled as such wherever it is shown — anyone who can
+  run `stel grants` can set it, exactly as they can write the relation. It
+  distinguishes actors, it does not authenticate them.
+- `stel grants grant` now reports when a subject already held what was
+  granted, rather than reporting an idempotent no-op as a change.
+
 ### `stel grants` writes the relation the governed server authorizes from (issue #577)
 
 - **The grants relation had a reader and no writer.** `WarehouseGrantStore`

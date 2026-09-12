@@ -1,18 +1,28 @@
-"""Append-only warehouse logs (issues #306, #329).
+"""Append-only warehouse logs (issues #306, #329, #580).
 
-Two histories share one mechanism: the per-run inference usage log and the MCP
-query log. Both add rows and never rewrite them, both create their relation on
-first write, and both are off until an operator turns them on — so the module
-that writes them is one place, not two.
+Three histories share one mechanism: the per-run inference usage log, the MCP
+query log, and the grants audit log. All add rows and never rewrite them, and
+all create their relation on first write — so the module that writes them is
+one place, not three.
+
+They do **not** share one contract, and the difference is the whole reason the
+third one is called out separately below.
 
 Three rules hold for everything written here, and they are why this is a
 narrow module rather than a convenience wrapper around `append_rows`:
 
-**Never fail the thing being logged.** A log is observability, not the work. A
-warehouse that rejects the write, a permission the operator forgot, a relation
-someone renamed — none of that may turn a successful run into a failed one, or
-a served MCP answer into an error. Writes are best-effort and failures are
-logged at warning level, once, with the exception class rather than its text.
+**Never fail the thing being logged — except the audit log.** A log is
+observability, not the work. A warehouse that rejects the write, a permission
+the operator forgot, a relation someone renamed — none of that may turn a
+successful run into a failed one, or a served MCP answer into an error. Writes
+are best-effort and failures are logged at warning level, once, with the
+exception class rather than its text.
+
+The grants audit log inverts this, because it is not observability. It records
+who changed access to governed data, and a best-effort audit trail is worse
+than none: it has holes exactly where the warehouse was struggling, and it
+reads as complete. So `write_audit_rows` raises where `write_rows` warns, and
+the caller is expected to surface that rather than continue. See #580.
 
 **Resolved identity and aggregates only.** No prompt text, no document text,
 no credential values, and no credential *environment-variable names* — the
@@ -125,6 +135,42 @@ QUERY_LOG_SCHEMA: dict[str, Any] = {
 }
 
 
+# The grants audit log (issue #580). `stel grants revoke` is a hard delete, so
+# the relation holds only the present tense; this is what answers "who was
+# entitled to what, and since when".
+#
+# Explicit types for the same reason the other two logs declare them: the first
+# batch must not decide the persisted schema. `value` is null on a revoke that
+# removed every value of an attribute, so a first write of exactly that shape
+# would otherwise infer `Null` and reject every later row.
+GRANT_AUDIT_SCHEMA: dict[str, Any] = {
+    "logged_at": pl.String,
+    # grant | revoke | identity_set | identity_clear
+    "action": pl.String,
+    "subject_id": pl.String,
+    "attribute": pl.String,
+    # Null when a revoke named no value and removed every one of them.
+    "value": pl.String,
+    "rows_affected": pl.Int64,
+    # Advisory only, and labelled as such wherever it is read: whoever can run
+    # `stel grants` can set STEL_GRANTS_ACTOR, exactly as they can write the
+    # relation. It answers "which job did this" on a shared host, not "prove
+    # who did this".
+    "actor": pl.String,
+    "profile_target": pl.String,
+}
+
+# Named off the grants relation rather than configured separately: two flags
+# that must agree is a way for them to disagree, and an audit log written
+# somewhere nobody looks is the failure this exists to prevent.
+AUDIT_RELATION_SUFFIX = "_audit"
+
+
+def audit_relation_for(grants_relation: str) -> str:
+    """The audit relation paired with a grants relation."""
+    return f"{grants_relation}{AUDIT_RELATION_SUFFIX}"
+
+
 class SupportsAppend(Protocol):
     """The one adapter capability a log writer needs.
 
@@ -178,6 +224,46 @@ def write_rows(
             type(error).__name__,
         )
         return 0
+
+
+class AuditLogError(Exception):
+    """An audit row could not be written (issue #580).
+
+    Deliberately not silent, and deliberately not an `AdapterError`: the
+    caller has to be able to tell "the warehouse refused the audit write" from
+    "the warehouse refused the change", because those need opposite things
+    said to the operator. The change has already been applied by the time this
+    is raised, and the message must say so.
+    """
+
+
+def write_audit_rows(
+    adapter: SupportsAppend,
+    relation: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    """Append audit rows, raising if they cannot be written.
+
+    The inverse of `write_rows`' contract, for the reason in the module
+    docstring: an audit trail that silently drops rows under exactly the
+    conditions that make writes fail is not an audit trail. There is no
+    `enabled` flag either — a switch that turns the record off is a switch
+    that makes the record untrustworthy, and the relation is created on first
+    write, so there is nothing for an operator to set up.
+    """
+    if not rows:
+        return 0
+    try:
+        return adapter.append_rows(relation, pl.DataFrame(rows, schema=GRANT_AUDIT_SCHEMA))
+    except Exception as error:
+        # The class name, not the warehouse's text: the same rule the rest of
+        # this module follows about what reaches a log or a console.
+        raise AuditLogError(
+            f"The change was applied, but could not be recorded in the audit "
+            f"log '{relation}' [{type(error).__name__}]. The grants relation "
+            "and the audit log are now out of step; reconcile them before "
+            "relying on the audit history."
+        ) from None
 
 
 # ─── run log (issue #306) ───────────────────────────────────────────────────

@@ -375,8 +375,41 @@ the target, warehouse and relation it resolved, so a `--relation` that does
 not match the server's `--grants-relation` is visible rather than silent.
 
 Revocation is a hard delete: the row is gone, which keeps the request-path
-read a plain equality scan. Keep your own history if you need to answer who
-was entitled to what last month.
+read a plain equality scan.
+
+### The audit log
+
+Because revoke is a hard delete, the grants relation holds only the present
+tense. Every change that actually changed something is recorded in an
+append-only log beside it, named off the grants relation — `stel_grants`
+becomes `stel_grants_audit`:
+
+```bash
+stel grants history --target prod
+stel grants history --subject analyst@example.com --limit 20 --target prod
+```
+
+Each entry carries the action, subject, attribute, value, how many rows it
+affected, the target, and an actor.
+
+There is no flag to turn this off, and unlike the run log and the MCP query
+log it is **not** best-effort. A switch that turns the record off is a switch
+that makes the record untrustworthy, and an audit trail that silently drops
+rows has holes exactly where the warehouse was struggling while still reading
+as complete. So a change that cannot be recorded raises — and because the log
+is written after the statement, the error says the change *was* applied and
+the two are now out of step. Reconcile them before trusting the history.
+
+Changes that changed nothing are not recorded: re-granting what a subject
+already holds, revoking something that matched no rows, clearing an identity
+that was not set. `identity set` is always recorded, because it rewrites the
+row every time.
+
+The actor is `STEL_GRANTS_ACTOR` when set, otherwise the OS user. It is
+**advisory** — anyone who can run `stel grants` can set that variable, exactly
+as they can write the relation. It exists so a provisioning job can name
+itself rather than logging its runner's OS user. It distinguishes actors; it
+does not authenticate them.
 
 Two limits worth stating plainly. stel is still the enforcement point: grants
 make policy central and auditable, but they do not make the warehouse refuse a

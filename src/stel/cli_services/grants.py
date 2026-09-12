@@ -44,8 +44,10 @@ from typing import TYPE_CHECKING, Any
 
 from ..adapters import create_adapter
 from ..adapters.base import WarehouseCapability
+from ..append_log import audit_relation_for, write_audit_rows
 from ..config import load_project
 from ..config.identifiers import validate_node_name
+from ..env import GRANTS_ACTOR_ENV, read_env
 from ..mcp_server.grants import (
     ATTRIBUTE_COLUMN,
     SUBJECT_COLUMN,
@@ -177,6 +179,70 @@ def _ref(adapter: WarehouseAdapter, relation: str) -> str:
     return f"{adapter.schema_ref}.{adapter.quote_ident(relation)}"
 
 
+def _actor() -> str:
+    """Who to record as having made a change (issue #580).
+
+    `STEL_GRANTS_ACTOR` first, so a provisioning job can name itself rather
+    than logging whatever OS user its runner happens to use. Otherwise the OS
+    user, which `getuser` can fail to determine at all on a host with no
+    passwd entry and no environment -- unknown is a better record than a
+    crash, and a failed audit lookup must not be the thing that stops a
+    revocation.
+
+    Advisory in every case, and the docs say so: anyone who can run this
+    command can set the variable. It distinguishes actors, it does not
+    authenticate them.
+    """
+    named = read_env(GRANTS_ACTOR_ENV)
+    if named and named.strip():
+        return named.strip()
+    try:
+        import getpass
+
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def _audit(
+    adapter: WarehouseAdapter,
+    *,
+    relation: str,
+    target: str,
+    action: str,
+    subject: str,
+    attribute: str,
+    value: str | None,
+    rows_affected: int,
+) -> None:
+    """Record one applied change. Raises if it cannot be recorded.
+
+    Called *after* the statement, not before, for two reasons: `rows_affected`
+    is only knowable afterwards, and a log written first would record changes
+    that then failed to apply. The cost is the opposite failure -- a change
+    applied and not recorded -- which is why `write_audit_rows` raises instead
+    of warning, and why its message says the change did land.
+    """
+    from datetime import UTC, datetime
+
+    write_audit_rows(
+        adapter,
+        audit_relation_for(relation),
+        [
+            {
+                "logged_at": datetime.now(UTC).isoformat(),
+                "action": action,
+                "subject_id": subject,
+                "attribute": attribute,
+                "value": value,
+                "rows_affected": rows_affected,
+                "actor": _actor(),
+                "profile_target": target,
+            }
+        ],
+    )
+
+
 def _ensure_relation(adapter: WarehouseAdapter, relation: str) -> None:
     """Create the grants relation if it does not exist.
 
@@ -247,6 +313,106 @@ def list_grants(
     )
 
 
+@dataclass(frozen=True)
+class AuditEntry:
+    """One recorded change to the grants relation."""
+
+    logged_at: str
+    action: str
+    subject_id: str
+    attribute: str
+    value: str | None
+    rows_affected: int
+    actor: str
+    profile_target: str
+
+
+@dataclass(frozen=True)
+class AuditReport:
+    entries: tuple[AuditEntry, ...]
+    relation: str
+    target: str
+    warehouse: str
+    # False when no change has ever been recorded here, which is not the same
+    # as "no changes were made" -- it is also what a wrong target looks like.
+    relation_exists: bool
+
+
+_AUDIT_COLUMNS = (
+    "logged_at",
+    "action",
+    "subject_id",
+    "attribute",
+    "value",
+    "rows_affected",
+    "actor",
+    "profile_target",
+)
+
+
+def grant_history(
+    project_dir: Path,
+    *,
+    profiles_dir: Path | None,
+    target: str | None,
+    relation: str = DEFAULT_GRANTS_RELATION,
+    subject: str | None = None,
+    limit: int = 50,
+) -> AuditReport:
+    """Recorded changes, newest first (issue #580).
+
+    This is the question a hard delete costs: the grants relation holds only
+    the present tense, and `who could see this in August` is unanswerable from
+    it. A read, so it does not demand an explicit target.
+    """
+    resolved, checked = _resolve(
+        project_dir, profiles_dir=profiles_dir, target=target, relation=relation
+    )
+    audit = audit_relation_for(checked)
+    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+        adapter.require_capability(
+            WarehouseCapability.SQL_QUERIES, operation="reading the grants audit log"
+        )
+        # Not created here: the audit relation is created by the first change
+        # written to it, and creating it on a read would make "nothing has
+        # ever happened" and "this is the wrong warehouse" look identical
+        # forever after.
+        if adapter.table_column_names(audit) is None:
+            return AuditReport(
+                entries=(),
+                relation=audit,
+                target=resolved.target_name,
+                warehouse=_describe(resolved),
+                relation_exists=False,
+            )
+        sql = f"SELECT {', '.join(_AUDIT_COLUMNS)} FROM {_ref(adapter, audit)}"
+        params: list[Any] = []
+        if subject is not None:
+            sql += " WHERE subject_id = ?"
+            params.append(subject)
+        sql += f" ORDER BY logged_at DESC LIMIT {int(limit)}"
+        rows = adapter.rows(sql, params or None)
+    return AuditReport(
+        entries=tuple(
+            AuditEntry(
+                logged_at=str(row[0]),
+                action=str(row[1]),
+                subject_id=str(row[2]),
+                attribute=str(row[3]),
+                value=None if row[4] is None else str(row[4]),
+                rows_affected=int(row[5] or 0),
+                actor=str(row[6]),
+                profile_target=str(row[7]),
+            )
+            for row in rows
+        ),
+        relation=audit,
+        target=resolved.target_name,
+        warehouse=_describe(resolved),
+        relation_exists=True,
+    )
+
+
 def grant(
     project_dir: Path,
     *,
@@ -276,6 +442,16 @@ def grant(
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
         _ensure_relation(adapter, checked)
         table = _ref(adapter, checked)
+        # Asked before the insert, because the insert is conditional and
+        # cannot report whether it added anything -- DuckDB and BigQuery do
+        # not agree on what `execute` returns for a DML statement.
+        already_held = bool(
+            adapter.scalar(
+                f"SELECT COUNT(*) FROM {table} WHERE {SUBJECT_COLUMN} = ? "
+                f"AND {ATTRIBUTE_COLUMN} = ? AND {VALUE_COLUMN} = ?",
+                [subject, attribute, value],
+            )
+        )
         adapter.execute(
             f"""
             INSERT INTO {table} (
@@ -291,11 +467,28 @@ def grant(
             [subject, attribute, value, subject, attribute, value],
         )
         rows = _read_rows(adapter, checked, subject)
+        # Audited only when a row was actually written. The insert is
+        # conditional, so re-granting what a subject already holds changes
+        # nothing -- and an audit log that records non-changes stops being
+        # readable as the history of who gained access when.
+        written = 0 if already_held else 1
+        if written:
+            _audit(
+                adapter,
+                relation=checked,
+                target=resolved.target_name,
+                action="grant",
+                subject=subject,
+                attribute=attribute,
+                value=value,
+                rows_affected=written,
+            )
     return GrantsReport(
         rows=rows,
         relation=checked,
         target=resolved.target_name,
         warehouse=_describe(resolved),
+        rows_affected=written,
     )
 
 
@@ -361,6 +554,20 @@ def revoke(
         _ensure_relation(adapter, checked)
         affected = _delete(adapter, checked, subject, attribute, value)
         rows = _read_rows(adapter, checked, subject)
+        # A revoke that matched nothing removed no access, so there is nothing
+        # to record. It is still reported to the caller, because zero matches
+        # usually means a typo.
+        if affected:
+            _audit(
+                adapter,
+                relation=checked,
+                target=resolved.target_name,
+                action="revoke",
+                subject=subject,
+                attribute=attribute,
+                value=value,
+                rows_affected=affected,
+            )
     return GrantsReport(
         rows=rows,
         relation=checked,
@@ -411,6 +618,19 @@ def set_identity(
             [subject, WAREHOUSE_IDENTITY_ATTRIBUTE, principal],
         )
         rows = _read_rows(adapter, checked, subject)
+        # Always recorded, even when the principal is unchanged: unlike a
+        # grant, this rewrites the row every time, and "was it re-set during
+        # the incident" is a question the history should be able to answer.
+        _audit(
+            adapter,
+            relation=checked,
+            target=resolved.target_name,
+            action="identity_set",
+            subject=subject,
+            attribute=WAREHOUSE_IDENTITY_ATTRIBUTE,
+            value=principal,
+            rows_affected=1,
+        )
     return GrantsReport(
         rows=rows,
         relation=checked,
@@ -446,6 +666,17 @@ def clear_identity(
         _ensure_relation(adapter, checked)
         affected = _delete(adapter, checked, subject, WAREHOUSE_IDENTITY_ATTRIBUTE, None)
         rows = _read_rows(adapter, checked, subject)
+        if affected:
+            _audit(
+                adapter,
+                relation=checked,
+                target=resolved.target_name,
+                action="identity_clear",
+                subject=subject,
+                attribute=WAREHOUSE_IDENTITY_ATTRIBUTE,
+                value=None,
+                rows_affected=affected,
+            )
     return GrantsReport(
         rows=rows,
         relation=checked,

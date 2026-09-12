@@ -2744,6 +2744,62 @@ def grants_show(ctx: click.Context, subject: str, relation: str) -> None:
         )
 
 
+@grants.command("history")
+@click.option("--subject", default=None, help="Show one subject only.")
+@click.option(
+    "--limit", default=50, show_default=True, help="Most recent entries to show."
+)
+@_grants_relation_option
+@_project_context_options
+@click.pass_context
+def grants_history(
+    ctx: click.Context, subject: str | None, limit: int, relation: str
+) -> None:
+    """Show recorded changes to the grants relation, newest first.
+
+    `revoke` is a hard delete, so the grants relation holds only the present
+    tense. This is what answers who was entitled to what, and since when.
+    """
+    from .cli_services.grants import grant_history
+
+    report = _run_grants(
+        lambda: grant_history(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            relation=relation,
+            subject=subject,
+            limit=limit,
+        )
+    )
+    click.echo(f"target:    {report.target}")
+    click.echo(f"warehouse: {report.warehouse}")
+    click.echo(f"relation:  {report.relation}")
+    if not report.relation_exists:
+        click.echo(
+            "history:   (no audit relation here yet -- no change has been "
+            "recorded against this target. Check --target and --relation if "
+            "you expected some.)"
+        )
+        return
+    if not report.entries:
+        click.echo("history:   (none)")
+        return
+    click.echo("history:")
+    for entry in report.entries:
+        value = "" if entry.value is None else f"={entry.value}"
+        click.echo(
+            f"  {entry.logged_at}  {entry.action:<14} {entry.subject_id}  "
+            f"{entry.attribute}{value}  rows={entry.rows_affected}  "
+            f"by {entry.actor}"
+        )
+    click.echo(
+        "note:      'by' is advisory -- anyone who can run this command can "
+        "set STEL_GRANTS_ACTOR. It tells actors apart; it does not "
+        "authenticate them."
+    )
+
+
 @grants.command("grant")
 @click.argument("subject")
 @click.argument("attribute")
@@ -2773,6 +2829,12 @@ def grants_grant(
     )
     _echo_grants_context(report)
     _echo_grant_rows(report)
+    if not report.rows_affected:
+        click.echo(
+            f"'{subject}' already held {attribute}={value}; nothing was "
+            "written, and nothing was recorded in the audit log."
+        )
+        return
     click.echo(f"Granted {attribute}={value} to '{subject}'.")
 
 

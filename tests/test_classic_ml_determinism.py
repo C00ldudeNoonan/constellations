@@ -15,6 +15,7 @@ from typing import Any, cast
 import polars as pl
 import pytest
 
+import stel.classic_ml.classifier as _classifier_module
 from stel.classic_ml import (
     ARTIFACT_SCHEMA_VERSION,
     IncompatibleClassicMLArtifactError,
@@ -132,6 +133,78 @@ def test_vectorizer_payload_invariant_under_permutation(provider: str) -> None:
         for order in PERMUTATIONS
     ]
     assert payloads[0] == payloads[1] == payloads[2]
+
+
+# ─── bounded per-document tokenization (issue #585) ─────────────────────────
+
+
+class _TrackedTokens(list[str]):
+    """A token list that reports its own death, so a test can see how many
+    documents' tokens are alive at once without measuring real memory."""
+
+    def __init__(self, tokens: list[str], counter: _LiveTokenCounter) -> None:
+        super().__init__(tokens)
+        self._counter = counter
+
+    def __del__(self) -> None:
+        self._counter.alive -= 1
+
+
+class _LiveTokenCounter:
+    def __init__(self) -> None:
+        self.alive = 0
+        self.peak = 0
+
+    def track(self, tokens: list[str]) -> _TrackedTokens:
+        self.alive += 1
+        self.peak = max(self.peak, self.alive)
+        return _TrackedTokens(tokens, self)
+
+
+def _corpus(n: int) -> list[dict[str, Any]]:
+    labels = ["a", "b"]
+    return [
+        {
+            "row_index": i,
+            "row_id": f"r{i}",
+            "text": f"doc{i} shared common term",
+            "label": labels[i % 2],
+        }
+        for i in range(n)
+    ]
+
+
+def test_fit_naive_bayes_holds_one_documents_tokens_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_fit_naive_bayes` genuinely needs the corpus twice -- doc_freq (and so
+    vocab_set) must be known before class_token_counts can be filtered to it
+    -- but a stored `doc_tokens` list would keep every document's tokens
+    resident for the whole fit instead of just the pass that is using them
+    (issue #585, same shape #584 fixed in `_fit_vectorizer`)."""
+    counter = _LiveTokenCounter()
+    real_analyze = _classifier_module._analyze
+
+    def counting_analyze(text: str, options: Any) -> _TrackedTokens:
+        return counter.track(real_analyze(text, options))
+
+    monkeypatch.setattr(_classifier_module, "_analyze", counting_analyze)
+
+    options = _text_options({})
+    rows = _corpus(20)
+
+    _fit_naive_bayes(rows, "builtin.naive_bayes", options, {})
+
+    # <=2, not ==1: `tokens = _analyze(...)`-shaped assignment evaluates the
+    # new list before the loop variable is rebound, so the outgoing
+    # document's tokens briefly overlap the incoming one's. Still O(1), not
+    # O(corpus): a regression to a stored `doc_tokens` list shows up as a
+    # peak equal to the corpus size.
+    assert counter.peak <= 2, (
+        f"{counter.peak} documents' tokens were alive at once while fitting "
+        "naive bayes; the corpus must be analyzed and discarded one document "
+        "at a time in each pass"
+    )
 
 
 def test_naive_bayes_model_invariant_under_permutation() -> None:

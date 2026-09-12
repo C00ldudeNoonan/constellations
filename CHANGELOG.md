@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### A grant can permit a range, not only a literal (issue #582)
+
+- **Date-range entitlements had no representation.** A tier was meant to select
+  "which context models, which signal families, which date ranges"; grants
+  compiled only `EQUAL`, `IN` and `ARRAY_CONTAINS_ANY`, so the third was not
+  expressible — even though `SearchFilterOperator` already defines `lt`/`le`/
+  `gt`/`ge` and both retrieval stores compile them.
+- An ordered policy attribute can now be granted as a closed interval:
+  `stel grants grant <subject> filing_date --interval 2024-01-01/2025-12-31`.
+  `..` marks an open end. Both bounds are inclusive, and an unbounded side
+  contributes no filter rather than a sentinel.
+- **A subject holds at most one interval per attribute, and no one-sided
+  bounds exist.** Both are deliberate. Search filters are combined with `AND`,
+  so two intervals would narrow to their overlap rather than permit either;
+  and two one-sided rows meant as a window would OR into *everything* — a
+  total over-grant that reads like a narrowing. The closed interval is the
+  only range primitive because it cannot be written that way.
+  [ADR-0011](docs/adr/0011-an-entitlement-interval-is-one-row-and-one-attribute.md)
+  records the alternatives and what would have to change to support a union.
+- Intervals are validated when granted, not when queried. A typo that parsed
+  at write time and failed on the serving path would surface as a refused
+  caller with no obvious cause, hours later.
+- `can_read` applies the interval too. It is the second look that catches a
+  store ignoring a filter, so a recheck that only understood equality would
+  admit exactly the rows a range filter was meant to exclude.
+
+**Upgrading:** the grants relation gains a nullable `operator` column. A
+relation written by an earlier stel keeps working untouched — null means `eq`,
+which is what every existing row already meant — and any `stel grants` command
+widens it with an `ALTER TABLE`. Numeric intervals are not supported yet:
+bounds compare as strings, which is correct for ISO dates and timestamps but
+not for numbers.
+
 ### The grants relation keeps a history of who changed access, and when (issue #580)
 
 - **A hard delete leaves only the present tense.** #577 made revocation a row

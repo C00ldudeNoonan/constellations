@@ -398,6 +398,7 @@ stel grants list [--subject S] [--relation R]            # what the governed MCP
 stel grants show <subject>                               # one subject's grants, and what it reads as
 stel grants history [--subject S] [--limit N]            # recorded changes, newest first: who changed what, when
 stel grants grant <subject> <attribute> <value> --target T    # permit one policy value; idempotent
+stel grants grant <subject> <attribute> --interval L/U --target T  # permit a closed range (.. for an open end)
 stel grants revoke <subject> <attribute> [value] --target T   # remove one value, or every value of the attribute
 stel grants identity set <subject> <principal> --target T     # the warehouse principal the subject reads as
 stel grants identity clear <subject> --target T               # remove it; denies under --enforce-warehouse-identity

@@ -50,9 +50,14 @@ from ..config.identifiers import validate_node_name
 from ..env import GRANTS_ACTOR_ENV, read_env
 from ..mcp_server.grants import (
     ATTRIBUTE_COLUMN,
+    OPERATOR_BETWEEN,
+    OPERATOR_COLUMN,
+    OPERATOR_EQUAL,
     SUBJECT_COLUMN,
     VALUE_COLUMN,
     WAREHOUSE_IDENTITY_ATTRIBUTE,
+    GrantConfigurationError,
+    parse_interval,
 )
 from ..profile import resolve_profile
 from .context import ConfigClickError
@@ -77,6 +82,7 @@ class GrantRow:
     subject_id: str
     attribute: str
     value: str
+    operator: str = OPERATOR_EQUAL
 
 
 @dataclass(frozen=True)
@@ -260,9 +266,31 @@ def _ensure_relation(adapter: WarehouseAdapter, relation: str) -> None:
         CREATE TABLE IF NOT EXISTS {_ref(adapter, relation)} (
             {SUBJECT_COLUMN} STRING NOT NULL,
             {ATTRIBUTE_COLUMN} STRING NOT NULL,
-            {VALUE_COLUMN} STRING NOT NULL
+            {VALUE_COLUMN} STRING NOT NULL,
+            {OPERATOR_COLUMN} STRING
         )
         """
+    )
+    _ensure_operator_column(adapter, relation)
+
+
+def _ensure_operator_column(adapter: WarehouseAdapter, relation: str) -> None:
+    """Add `operator` to a relation created before issue #582.
+
+    `CREATE TABLE IF NOT EXISTS` does nothing to an existing table, so a
+    relation written by an earlier stel would otherwise fail every statement
+    naming the new column. Same shape as `_ensure_ledger_columns` in
+    `retrieval/coordination.py`, for the same reason.
+
+    Nullable, and null means `eq` -- so widening changes the meaning of
+    nothing already in the table.
+    """
+    columns = adapter.table_column_names(relation)
+    if columns is None or OPERATOR_COLUMN in columns:
+        return
+    adapter.execute(
+        f"ALTER TABLE {_ref(adapter, relation)} "
+        f"ADD COLUMN {OPERATOR_COLUMN} STRING"
     )
 
 
@@ -270,8 +298,8 @@ def _read_rows(
     adapter: WarehouseAdapter, relation: str, subject: str | None
 ) -> tuple[GrantRow, ...]:
     sql = (
-        f"SELECT {SUBJECT_COLUMN}, {ATTRIBUTE_COLUMN}, {VALUE_COLUMN} "
-        f"FROM {_ref(adapter, relation)}"
+        f"SELECT {SUBJECT_COLUMN}, {ATTRIBUTE_COLUMN}, {VALUE_COLUMN}, "
+        f"{OPERATOR_COLUMN} FROM {_ref(adapter, relation)}"
     )
     params: list[Any] = []
     if subject is not None:
@@ -279,7 +307,14 @@ def _read_rows(
         params.append(subject)
     sql += f" ORDER BY {SUBJECT_COLUMN}, {ATTRIBUTE_COLUMN}, {VALUE_COLUMN}"
     return tuple(
-        GrantRow(str(row[0]), str(row[1]), str(row[2]))
+        GrantRow(
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            # Null is how every row written before #582 reads, and it means
+            # what those rows have always meant.
+            OPERATOR_EQUAL if row[3] is None else str(row[3]),
+        )
         for row in adapter.rows(sql, params or None)
     )
 
@@ -420,20 +455,42 @@ def grant(
     target: str | None,
     subject: str,
     attribute: str,
-    value: str,
+    value: str | None = None,
+    interval: str | None = None,
     relation: str = DEFAULT_GRANTS_RELATION,
 ) -> GrantsReport:
-    """Permit one value of one policy attribute for one subject.
+    """Permit one value, or one interval, of one policy attribute.
 
     Idempotent. Re-granting what a subject already holds writes nothing rather
     than adding a duplicate row: `_granted_values` collects rows into the tuple
     a filter compiles from, so a duplicate would render as `IN ('x', 'x')` --
     harmless, but it makes `stel grants show` misreport, and it is the kind of
     drift that accumulates silently under a provisioning script.
+
+    `interval` writes a `between` grant, validated here rather than at query
+    time. An entitlement that parses at write time and fails on the serving
+    path would surface as a refused caller with no obvious cause, hours after
+    the typo (issue #582).
     """
     subject = _require_value(subject, what="subject")
     attribute = _require_value(attribute, what="attribute")
-    value = _require_value(value, what="value")
+    if (value is None) == (interval is None):
+        raise ConfigClickError(
+            "Grant exactly one of a value or an interval: a value permits one "
+            "literal, an interval permits a range, and a row cannot be both."
+        )
+    if interval is not None:
+        operator = OPERATOR_BETWEEN
+        value = _require_value(interval, what="interval")
+        # Parsed for its refusals, not its result: the stored value is the
+        # interval string, and the serving path parses it again.
+        try:
+            parse_interval(value, attribute=attribute)
+        except GrantConfigurationError as error:
+            raise ConfigClickError(str(error)) from error
+    else:
+        operator = OPERATOR_EQUAL
+        value = _require_value(value or "", what="value")
     _refuse_reserved(attribute)
     resolved, checked = _resolve(
         project_dir, profiles_dir=profiles_dir, target=target, relation=relation
@@ -445,26 +502,33 @@ def grant(
         # Asked before the insert, because the insert is conditional and
         # cannot report whether it added anything -- DuckDB and BigQuery do
         # not agree on what `execute` returns for a DML statement.
+        # `operator` is compared with IS NOT DISTINCT FROM so a row written
+        # before #582 -- null operator, meaning eq -- is recognised as the
+        # same grant as an `eq` written today, and re-granting it stays
+        # idempotent instead of writing a near-duplicate.
+        identity_clause = (
+            f"{SUBJECT_COLUMN} = ? AND {ATTRIBUTE_COLUMN} = ? "
+            f"AND {VALUE_COLUMN} = ? "
+            f"AND COALESCE({OPERATOR_COLUMN}, '{OPERATOR_EQUAL}') = ?"
+        )
         already_held = bool(
             adapter.scalar(
-                f"SELECT COUNT(*) FROM {table} WHERE {SUBJECT_COLUMN} = ? "
-                f"AND {ATTRIBUTE_COLUMN} = ? AND {VALUE_COLUMN} = ?",
-                [subject, attribute, value],
+                f"SELECT COUNT(*) FROM {table} WHERE {identity_clause}",
+                [subject, attribute, value, operator],
             )
         )
         adapter.execute(
             f"""
             INSERT INTO {table} (
-                {SUBJECT_COLUMN}, {ATTRIBUTE_COLUMN}, {VALUE_COLUMN}
+                {SUBJECT_COLUMN}, {ATTRIBUTE_COLUMN}, {VALUE_COLUMN},
+                {OPERATOR_COLUMN}
             )
-            SELECT ?, ?, ? FROM (SELECT 1) AS seed
+            SELECT ?, ?, ?, ? FROM (SELECT 1) AS seed
             WHERE NOT EXISTS (
-                SELECT 1 FROM {table}
-                WHERE {SUBJECT_COLUMN} = ? AND {ATTRIBUTE_COLUMN} = ?
-                  AND {VALUE_COLUMN} = ?
+                SELECT 1 FROM {table} WHERE {identity_clause}
             )
             """,
-            [subject, attribute, value, subject, attribute, value],
+            [subject, attribute, value, operator, subject, attribute, value, operator],
         )
         rows = _read_rows(adapter, checked, subject)
         # Audited only when a row was actually written. The insert is
@@ -477,7 +541,10 @@ def grant(
                 adapter,
                 relation=checked,
                 target=resolved.target_name,
-                action="grant",
+                # Distinguished in the history, because "granted 2024" and
+                # "granted everything from 2024 onward" are different
+                # entitlements and the value alone does not say which.
+                action="grant" if operator == OPERATOR_EQUAL else "grant_between",
                 subject=subject,
                 attribute=attribute,
                 value=value,

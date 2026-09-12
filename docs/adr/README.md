@@ -20,6 +20,7 @@ history (issue #311).
 | [0008](0008-mcp-hits-carry-declared-attributes.md) | A returnable attribute is additive within `mcp_context/v1`, not a v2 | accepted |
 | [0009](0009-serving-holds-the-warehouse-when-the-adapter-allows.md) | The serving session holds its warehouse connection only when the adapter says one may outlive a request | accepted |
 | [0010](0010-warehouse-identity-is-a-granted-attribute.md) | The warehouse identity a governed read runs as is a granted attribute, resolved per subject; missing or ambiguous is a refusal | accepted |
+| [0011](0011-an-entitlement-interval-is-one-row-and-one-attribute.md) | An entitlement interval is one row, one attribute, and never a one-sided bound | accepted |
 
 ## When to write one
 

@@ -78,11 +78,18 @@ class _AdapterRowReader:
         columns: Sequence[str] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         subject = predicates[0].value
-        names = list(columns or ())
         with create_adapter(
             self._resolved.warehouse, project_dir=self._project_dir
         ) as adapter:
             table = f"{adapter.schema_ref}.{adapter.quote_ident(relation)}"
+            # `columns=None` means every column, which is what the store asks
+            # for since #582 -- naming `operator` in a projection would break
+            # a relation written before it existed.
+            names = (
+                list(columns)
+                if columns
+                else sorted(adapter.table_column_names(relation) or ())
+            )
             rows = adapter.rows(
                 f"SELECT {', '.join(names)} FROM {table} WHERE subject_id = ?",
                 [subject],

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from stel.diagnostics import configure_diagnostics
+
 
 @pytest.fixture
 def example_project_dir() -> Path:
@@ -42,6 +44,27 @@ def _restore_stel_logging() -> Iterator[None]:
         logger.handlers[:] = handlers
         logger.setLevel(level)
         logger.propagate = propagate
+
+
+@pytest.fixture(autouse=True)
+def _restore_diagnostics_destination() -> Iterator[None]:
+    """Undo whatever a test did to the diagnostics sink (issue #518, #590).
+
+    `configure_diagnostics` sets a module-global, exactly as logging
+    configuration does and for the same reason: a CLI points the sink
+    somewhere once for the run. A test that passes `--diagnostics-file` (or
+    calls the configure function directly) would otherwise leave every later
+    test in the process writing failure records into its `tmp_path` -- which
+    pytest deletes, so the symptom is an unrelated test failing to write
+    diagnostics rather than anything naming this one.
+
+    Restored here rather than in the tests that set it, because the next test
+    to set it will not know to.
+    """
+    try:
+        yield
+    finally:
+        configure_diagnostics(None)
 
 
 @pytest.fixture(autouse=True)

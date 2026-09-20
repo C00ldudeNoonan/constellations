@@ -21,6 +21,7 @@ history (issue #311).
 | [0009](0009-serving-holds-the-warehouse-when-the-adapter-allows.md) | The serving session holds its warehouse connection only when the adapter says one may outlive a request | accepted |
 | [0010](0010-warehouse-identity-is-a-granted-attribute.md) | The warehouse identity a governed read runs as is a granted attribute, resolved per subject; missing or ambiguous is a refusal | accepted |
 | [0011](0011-an-entitlement-interval-is-one-row-and-one-attribute.md) | An entitlement interval is one row, one attribute, and never a one-sided bound | accepted |
+| [0012](0012-failure-detail-goes-to-a-path-not-a-log.md) | A failure's detail goes to a path the operator names, not to a log level | accepted |
 
 ## When to write one
 

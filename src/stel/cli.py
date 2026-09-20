@@ -39,6 +39,7 @@ from .config.source import SourceConfig
 from .credentials import CredentialReference, CredentialReferenceError
 from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
+from .diagnostics import configure_diagnostics
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
 from .logging_setup import configure_verbose_logging, resolve_verbosity
@@ -180,6 +181,20 @@ def _configure_output(
     )
 
 
+def _diagnostics_destination(
+    ctx: click.Context, param: click.Parameter, value: Path | None
+) -> Path | None:
+    """Click callback: point `stel.diagnostics` at the operator's path.
+
+    Called with None on every invocation that omits the flag, which is what
+    clears a path left behind by an earlier command in the same process (the
+    test suite, a nested invocation) rather than letting it leak forward.
+    """
+    del ctx, param
+    configure_diagnostics(value.resolve() if value is not None else None)
+    return value
+
+
 def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
     """Allow dbt-style global options after a project-aware subcommand."""
     command = click.option(
@@ -204,6 +219,21 @@ def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
         expose_value=False,
         callback=_context_override("project_dir", resolve_path=True),
         help="Path to the stel project (where stel_project.yml lives).",
+    )(command)
+    # `expose_value=False` so no command signature has to grow a parameter it
+    # never reads: the callback configures the sink at parse time, before any
+    # command body runs, which is also before anything can fail.
+    command = click.option(
+        "--diagnostics-file",
+        type=click.Path(dir_okay=False, writable=True, path_type=Path),
+        default=None,
+        expose_value=False,
+        callback=_diagnostics_destination,
+        help=(
+            "Append redacted failure diagnostics (exception types and stel "
+            "source locations, never native error text) to this file. Also "
+            "honored via STEL_DIAGNOSTICS_FILE."
+        ),
     )(command)
     return command
 

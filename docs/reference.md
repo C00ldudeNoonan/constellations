@@ -777,6 +777,33 @@ and traceback frames that the user-facing error path scrubs but a raw
 log stream would not — attach your own DEBUG handler if you need it for
 troubleshooting.
 
+Attaching a handler means being an in-process Python caller, which an
+orchestrator running `stel` as a subprocess is not. For that case, give the
+failure detail a destination instead:
+
+```bash
+stel build --target prod --diagnostics-file ./stel-diagnostics.log
+STEL_DIAGNOSTICS_FILE=/var/log/stel-diagnostics.log stel build --target prod
+```
+
+The file is appended to, created owner-only, and left untouched unless a path
+is given. Each record names the operation, step, and code its error carried,
+followed by the allowlisted diagnostics: exception type labels down the cause
+chain, `stel` source locations, and a count of external frames.
+
+```
+2026-09-20T09:14:22Z operation='index creation' on BTree index for 'context_id' after 3 attempts (code=lancedb_index_failed)
+builtins.RuntimeError
+  at stel.retrieval.lancedb:1021
+  at 4 external frame(s)
+```
+
+Native error text is never written there either — the flag chooses a
+destination, not a disclosure level, because a credential embedded in a
+presigned object-store URI survives any redaction pass that tries to match on
+values (ADR-0012). If the path cannot be written, the failure is reported
+exactly as it would have been and the sink stays silent.
+
 A LanceDB store failure is reported with the operation, the step it was on,
 and the native exception's type, for example
 `LanceDB operation 'index creation' failed on BTree index for 'category'
@@ -784,7 +811,8 @@ and the native exception's type, for example
 never reaches the CLI or `run_results.json`, because LanceDB quotes
 object-store URIs and response bodies verbatim; the error's cause chain holds
 only `Native retrieval error type: …`. The full native exception is logged at
-DEBUG on the `stel.retrieval.lancedb` logger.
+DEBUG on the `stel.retrieval.lancedb` logger, and its redacted form goes to
+`--diagnostics-file` when one is set.
 
 Under verbose, each incremental publication also emits safe telemetry
 (issue #292) — the progress reporter renders it on a TTY, the INFO log carries

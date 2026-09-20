@@ -27,6 +27,10 @@ PROFILES_DIR_ENV = "STEL_PROFILES_DIR"
 VERBOSE_ENV = "STEL_VERBOSE"
 # Truthy attaches unsanitized provider error detail to local tracebacks.
 PROVIDER_DEBUG_ENV = "STEL_DEBUG_PROVIDER_ERRORS"
+# Path a failure's redacted diagnostics are appended to. Empty or unset
+# disables the sink. Set by an orchestrator that runs stel as a subprocess and
+# therefore cannot attach a DEBUG handler; `--diagnostics-file` overrides it.
+DIAGNOSTICS_FILE_ENV = "STEL_DIAGNOSTICS_FILE"
 
 # MCP serving identity. These are security-relevant: when one stops resolving,
 # a principal is still constructed — with no tenant and no access groups — so
@@ -48,6 +52,7 @@ ENV_VARS: tuple[str, ...] = (
     PROFILES_DIR_ENV,
     VERBOSE_ENV,
     PROVIDER_DEBUG_ENV,
+    DIAGNOSTICS_FILE_ENV,
     MCP_PRINCIPAL_ID_ENV,
     MCP_TENANT_ID_ENV,
     MCP_ACCESS_GROUPS_ENV,

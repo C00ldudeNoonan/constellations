@@ -16,6 +16,7 @@ import pyarrow as pa
 from pydantic import ConfigDict, Field, field_validator
 
 from ..credentials import CredentialReference
+from ..diagnostics import record_failure
 from ..hashing import canonical_fingerprint
 from ..memory import container_memory_limit_bytes
 from ..optional_dependencies import (
@@ -1139,9 +1140,18 @@ def _operation_failed(
 
     Callers raise the result *outside* their except block so the native
     exception is not retained as `__context__` either.
+
+    The DEBUG line below is the only place the native exception goes, and
+    nothing a subprocess caller can configure will receive it (see
+    `stel.diagnostics`). `record_failure` gives that caller a destination for
+    the same detail the provider path already redacts and ships -- types and
+    stel frames, never native text -- so a failure like this one is
+    diagnosable rather than merely named.
     """
     on = f" on {step}" if step else ""
     log.debug("LanceDB operation %r failed%s", operation, on, exc_info=error)
+    summary = f"operation={operation!r}{on} (code={code})"
+    record_failure(error, summary=summary)
     failure = RetrievalError(
         f"LanceDB operation '{operation}' failed{on} "
         f"[{type(error).__name__}] (code={code})"

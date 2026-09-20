@@ -1135,7 +1135,8 @@ def _operation_failed(
     never copied. LanceDB quotes object-store URIs and response bodies
     verbatim, and this message reaches run_results.json and the CLI. The cause
     chain carries the type alone, with no traceback, and the full exception
-    goes only to the DEBUG log, which `--verbose` never enables.
+    goes only to the DEBUG log, which `--verbose` never enables and which
+    `--diagnostics-file` writes to the one file the operator named (issue #590).
 
     Callers raise the result *outside* their except block so the native
     exception is not retained as `__context__` either.

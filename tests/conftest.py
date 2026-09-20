@@ -36,12 +36,31 @@ def _restore_stel_logging() -> Iterator[None]:
     logger = logging.getLogger("stel")
     handlers = list(logger.handlers)
     level, propagate = logger.level, logger.propagate
+    # `logging_setup` remembers its own handlers as attributes on the logger so
+    # each configure call can replace rather than stack; restoring the handler
+    # list without them would leave the policy helper believing a channel is
+    # still installed (issue #590).
+    channels = {
+        name: getattr(logger, name, None) for name in _STEL_CHANNEL_ATTRS
+    }
     try:
         yield
     finally:
+        for handler in logger.handlers:
+            if handler not in handlers:
+                handler.close()
         logger.handlers[:] = handlers
         logger.setLevel(level)
         logger.propagate = propagate
+        for name, handler in channels.items():
+            setattr(logger, name, handler)
+
+
+_STEL_CHANNEL_ATTRS = (
+    "_stel_verbose_handler",
+    "_stel_diagnostics_handler",
+    "_stel_fallback_handler",
+)
 
 
 @pytest.fixture(autouse=True)

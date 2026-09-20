@@ -148,7 +148,10 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         1,
         EXCEPTION,
         "same as the classifier: feature extraction fits a vectorizer over the "
-        "whole training set",
+        "whole training set. The exception covers the rows and nothing beyond "
+        "them: #584 was a tokenized copy of that corpus at 63 bytes/token, 11x "
+        "the rows it was granted, which this audit could not see because the "
+        "read it classifies was never the problem",
     ),
     (
         "execution/eval.py",

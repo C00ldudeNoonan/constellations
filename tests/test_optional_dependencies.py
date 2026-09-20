@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from stel import chunking, optional_dependencies
 from stel.backends import html_backend, options, pdf_backend
@@ -315,7 +317,7 @@ def test_unselected_html_model_does_not_import_html_extra_during_manifest(
 
 def test_heavy_dependencies_live_only_in_extras() -> None:
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
-    project = tomllib.loads(pyproject_path.read_text())["project"]
+    project = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"]
     core = " ".join(project["dependencies"])
     extras = project["optional-dependencies"]
 
@@ -345,3 +347,40 @@ def test_heavy_dependencies_live_only_in_extras() -> None:
         "pii",
         "text",
     }
+
+
+def _requirement_key(requirement: str) -> tuple[str, frozenset[str], str]:
+    """A requirement as the three things that have to match: which package,
+    with which extras, at which versions."""
+    parsed = Requirement(requirement)
+    return (canonicalize_name(parsed.name), frozenset(parsed.extras), str(parsed.specifier))
+
+
+def test_the_all_extra_is_a_superset_of_every_other_extra() -> None:
+    """`all` is hand-maintained, so it drifts silently (issue #597).
+
+    It omitted the `mcp` extra's `pyjwt[crypto]` and `httpx` floors -- the
+    network transport's two token verifiers -- which made the everything-install
+    the one install whose authentication depended on `mcp`'s dependency graph
+    rather than on stel's own. Latent rather than live, and invisible: a user
+    reads `all` as a superset because that is what the name says.
+    """
+    pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
+    extras = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+    everything = {_requirement_key(r) for r in extras["all"]}
+
+    missing = {
+        name: sorted(r for r in requirements if _requirement_key(r) not in everything)
+        for name, requirements in extras.items()
+        if name != "all"
+    }
+    missing = {name: absent for name, absent in missing.items() if absent}
+
+    assert not missing, (
+        f"the `all` extra is missing requirements declared by other extras: {missing}. "
+        "`stel[all]` is the everything-install, so anything an extra declares it "
+        "needs, `all` needs too -- add the line rather than relying on it arriving "
+        "transitively (issue #597)."
+    )

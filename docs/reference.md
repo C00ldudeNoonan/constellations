@@ -793,8 +793,11 @@ When set, every record that carries an exception, and every warning, is
 appended to that file with its full native message and traceback; nothing
 else changes, so the CLI, `run_results.json`, the `-v` stream and any
 orchestrator's log capture stay exactly as sanitized as before. The file is
-created on the first such record, readable by its owner only, so a run that
-fails nowhere leaves nothing behind; when a `stel run` or `stel build` failure
+created on the first such record, readable by its owner only (a file that
+already exists is tightened to the same mode), so a run that fails nowhere
+leaves nothing behind; a destination that cannot be written is refused before
+the run starts, and a write that fails anyway costs one line on stderr and
+never the failure it was recording. When a `stel run` or `stel build` failure
 did write to it, the error message ends by naming the file. Treat it as the
 sensitive thing it is: it holds what every other channel exists to withhold.
 It covers the failures stel logs natively before sanitizing — store

@@ -177,28 +177,62 @@ def _carries_diagnostics(record: logging.LogRecord) -> bool:
 
 
 class _OwnerOnlyFileHandler(logging.FileHandler):
-    """Appends to a file created readable by its owner alone.
+    """Appends to a file readable by its owner alone, and fails closed.
 
     The file holds what every other channel sanitizes away -- object-store
     URIs with their query strings, provider response bodies -- so it gets the
-    owner-only storage the cache directories already get. Opened lazily, so a
+    owner-only storage the cache directories already get, including a file an
+    orchestrator pre-created with ordinary permissions. Opened lazily, so a
     run that fails nowhere leaves no file behind.
+
+    Every failure of the handler itself is contained here. The stdlib opens a
+    delayed file outside ``StreamHandler.emit``'s guard, and its
+    ``handleError`` prints the active exception chain to stderr; both run
+    while the native exception is being handled, so either would put on
+    stderr exactly the text this file exists to keep off it.
     """
 
     def __init__(self, path: Path) -> None:
         super().__init__(path, mode="a", encoding="utf-8", delay=True)
         self.records_written = 0
+        self._unusable = False
 
     def _open(self) -> Any:
-        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.baseFilename, flags, 0o600)
+        # O_CREAT's mode applies only to a file it creates; an existing one
+        # keeps whatever it had, so tighten it explicitly where the OS allows.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         return open(fd, self.mode, encoding=self.encoding)
 
     def emit(self, record: logging.LogRecord) -> None:
+        if self._unusable:
+            return
+        if self.stream is None:
+            try:
+                self.stream = self._open()
+            except OSError:
+                self.handleError(record)
+                return
         super().emit(record)
-        # A failed open leaves the stream unset, and the stdlib has already
-        # reported it through handleError; count only what reached the file.
-        if self.stream is not None:
+        if not self._unusable:
             self.records_written += 1
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """One safe line on stderr, then stop trying.
+
+        Never the stdlib report: it prints the exception being handled with
+        its ``__context__``, which here is the native failure.
+        """
+        del record
+        self._unusable = True
+        error = sys.exc_info()[1]
+        if sys.stderr is not None:
+            sys.stderr.write(
+                f"stel: diagnostics file {self.baseFilename} could not be written "
+                f"[{type(error).__name__}]; native failure detail was not recorded\n"
+            )
 
 
 def configure_diagnostics_file(path: Path | None) -> None:

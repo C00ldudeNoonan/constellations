@@ -103,6 +103,50 @@ def test_the_file_is_created_on_first_write_and_readable_by_its_owner_only(
         assert path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.name != "posix", reason="file modes are a POSIX property")
+def test_an_existing_file_with_open_permissions_is_tightened_on_first_write(
+    tmp_path: Path,
+) -> None:
+    """`O_CREAT`'s mode applies only to a file it creates. An orchestrator that
+    pre-creates the destination `0644` would otherwise get native detail
+    appended to a world-readable file (Codex review on #595)."""
+    path = tmp_path / "diagnostics.log"
+    path.write_text("", encoding="utf-8")
+    path.chmod(0o644)
+    configure_diagnostics_file(path)
+
+    logging.getLogger("stel.execution.transform").debug("boom", exc_info=_native_error())
+
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_destination_that_cannot_be_opened_costs_one_safe_line_and_not_the_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first open happens while the native exception is being handled. The
+    stdlib opens outside its emit guard and its error report prints the active
+    exception chain, so an unwritable path would put the native text on stderr
+    and replace the sanitized error with an OSError (Codex review on #595)."""
+    path = tmp_path / "missing-directory" / "diagnostics.log"
+    configure_diagnostics_file(path)
+    log = logging.getLogger("stel.retrieval.lancedb")
+
+    try:
+        raise RuntimeError(SENTINEL)
+    except RuntimeError:
+        # Neither the OSError nor anything else may escape the log call.
+        log.debug("native", exc_info=True)
+        log.debug("native again", exc_info=True)
+
+    err = capsys.readouterr().err
+    assert err.count("diagnostics file") == 1, err
+    assert "could not be written [FileNotFoundError]" in err
+    assert SENTINEL not in err
+    assert "Logging error" not in err
+    assert not path.exists()
+    assert diagnostics_file_written() is None
+
+
 @pytest.mark.parametrize("verbose_first", [True, False])
 def test_verbose_stays_capped_at_info_while_the_file_takes_debug(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], verbose_first: bool

@@ -10,7 +10,9 @@ is the traceback, which is what these tests look for in the file.
 
 from __future__ import annotations
 
+import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -91,3 +93,42 @@ def test_the_default_writes_nothing_and_the_env_var_names_the_file(
     assert result.exit_code == 1, (result.stdout, result.stderr)
     assert f"{POINTER} {path}" in result.stderr
     assert SENTINEL in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("make_target", "reason"),
+    [
+        (lambda p: p / "missing" / "diagnostics.log", "its directory does not exist"),
+        (lambda p: p, "it is a directory"),
+        pytest.param(
+            lambda p: _symlink(p),
+            "it is a symbolic link",
+            marks=pytest.mark.skipif(os.name != "posix", reason="needs symlinks"),
+        ),
+    ],
+    ids=["missing-directory", "directory", "symlink"],
+)
+def test_an_unwritable_destination_is_refused_before_the_run_starts(
+    tmp_path: Path,
+    example_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_target: Callable[[Path], Path],
+    reason: str,
+) -> None:
+    """The env var gets no Click validation, and the first write would happen
+    while a failure is being handled; refusing up front is the cheap moment."""
+    dst = _broken_project(tmp_path, example_project_dir)
+    target = make_target(tmp_path)
+    monkeypatch.setenv("STEL_DIAGNOSTICS_FILE", str(target))
+
+    result = CliRunner().invoke(cli, ["--project-dir", str(dst), "run"])
+
+    assert result.exit_code == 2, (result.stdout, result.stderr)
+    assert f"STEL_DIAGNOSTICS_FILE: cannot write {target}: {reason}." in result.stderr
+    assert "Running" not in result.stderr, "the run must not have started"
+
+
+def _symlink(root: Path) -> Path:
+    link = root / "diagnostics.log"
+    link.symlink_to(root / "elsewhere.log")
+    return link

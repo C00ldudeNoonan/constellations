@@ -77,10 +77,16 @@ An explicit call is one more thing a new sanitize site must remember.
 
 ## Consequences
 
-- The file holds what every other channel withholds. It is created `0600`
-  and documented as sensitive; an orchestrator that names it must treat the
-  path the way it treats a credential file, and the file is never a
-  stel-owned artifact that `stel clean` removes.
+- The file holds what every other channel withholds. It is created `0600`,
+  an existing file is re-moded to `0600` on open since `O_CREAT` cannot
+  change an inode's mode, and it is documented as sensitive; an orchestrator
+  that names it must treat the path the way it treats a credential file, and
+  the file is never a stel-owned artifact that `stel clean` removes.
+- The handler fails closed. Its first open and every write happen while the
+  native exception is being handled, and the stdlib's own error report prints
+  that exception's chain to stderr, so the handler contains both and writes
+  one safe line instead. An unwritable destination is refused before the run
+  starts, for the environment variable as much as the flag.
 - The `stel` logger's level and propagation are now derived from which
   handlers are installed, in `_apply_channel_policy`. The two configure
   functions may be called in either order and any number of times; a

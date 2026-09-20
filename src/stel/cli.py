@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -205,7 +206,38 @@ def _configure_output(
     configure_verbose_logging(
         verbosity, reporter=get_reporter() if bars else None
     )
-    configure_diagnostics_file(resolve_diagnostics_file(diagnostics_file))
+    path = resolve_diagnostics_file(diagnostics_file)
+    if path is not None:
+        source = (
+            "--diagnostics-file" if diagnostics_file is not None else "STEL_DIAGNOSTICS_FILE"
+        )
+        _require_writable_diagnostics_path(path, source=source)
+    configure_diagnostics_file(path)
+
+
+def _require_writable_diagnostics_path(path: Path, *, source: str) -> None:
+    """Refuse a destination that cannot be written before the run starts.
+
+    The flag is validated by Click; the environment variable is not, and the
+    first write happens while a failure is being handled, so a run that fails
+    and then cannot record why has paid twice. A symlink is refused too: the
+    handler opens without following one, and a swap between check and open
+    should fail rather than redirect the native detail.
+    """
+    if path.is_symlink():
+        reason = "it is a symbolic link"
+    elif path.is_dir():
+        reason = "it is a directory"
+    elif path.exists():
+        reason = None if os.access(path, os.W_OK) else "the file is not writable"
+    elif not path.parent.is_dir():
+        reason = "its directory does not exist"
+    elif not os.access(path.parent, os.W_OK):
+        reason = "its directory is not writable"
+    else:
+        reason = None
+    if reason is not None:
+        raise click.UsageError(f"{source}: cannot write {path}: {reason}.")
 
 
 def _run_failure(error: RunError) -> click.ClickException:

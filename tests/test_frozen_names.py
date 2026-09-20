@@ -368,6 +368,13 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
         "operator-set",
     ),
     (
+        "env.DIAGNOSTICS_FILE_ENV",
+        env_module.DIAGNOSTICS_FILE_ENV,
+        "STEL_DIAGNOSTICS_FILE",
+        "operator-set; an orchestrator names the file once in its environment "
+        "and every stel subprocess writes native failure detail there",
+    ),
+    (
         "env.MCP_PRINCIPAL_ID_ENV",
         env_module.MCP_PRINCIPAL_ID_ENV,
         "STEL_MCP_PRINCIPAL_ID",

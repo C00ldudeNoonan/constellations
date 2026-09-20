@@ -181,7 +181,7 @@ def test_fit_naive_bayes_holds_one_documents_tokens_at_a_time(
     vocab_set) must be known before class_token_counts can be filtered to it
     -- but a stored `doc_tokens` list would keep every document's tokens
     resident for the whole fit instead of just the pass that is using them
-    (issue #585, same shape #584 fixed in `_fit_vectorizer`)."""
+    (issue #585, same shape as #584, still open in `_fit_vectorizer`)."""
     counter = _LiveTokenCounter()
     real_analyze = _classifier_module._analyze
 

@@ -4,8 +4,9 @@
 
 ### `classic_ml` naive-Bayes fitting no longer holds the whole corpus in memory (issue #585)
 
-Same shape #584 fixed in `text.py`, found while fixing it: `_fit_naive_bayes`
-built a `list[list[str]]` of every document's tokens up front. Unlike
+Same shape as #584 (the text vectorizer in `text.py`, still open), found while
+investigating it: `_fit_naive_bayes` built a `list[list[str]]` of every
+document's tokens up front. Unlike
 `_fit_vectorizer`, this one genuinely needs the corpus twice — `vocab_set`
 must be known before the second pass can filter class-token counts to it —
 but each pass still only needs one document's tokens at a time. It now

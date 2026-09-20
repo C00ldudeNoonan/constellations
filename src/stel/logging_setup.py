@@ -16,14 +16,28 @@ provider code (which carry raw exception text and traceback frames that
 ``artifact_error_text`` sanitizes for the user-facing error path); AGENTS.md
 requires that sensitive exception text stay out of logs. Callers who need
 DEBUG for troubleshooting should attach their own handler.
+
+That hatch is reachable only from Python. Every orchestrated run invokes the
+CLI as a subprocess, so for the operator who actually hits a sanitized store
+failure the native cause was written to a logger nothing could receive
+(issue #590). ``--diagnostics-file PATH`` (or ``STEL_DIAGNOSTICS_FILE``) is the
+CLI-shaped version of the same hatch: :func:`configure_diagnostics_file`
+attaches a DEBUG handler that writes only the records carrying an exception,
+plus warnings, to one file the operator named. It is the sole disclosure
+surface -- nothing changes on stderr, in ``run_results.json`` or in any
+artifact, and while it is installed the ``stel`` logger stops propagating so a
+parent handler cannot receive what only the file was meant to. See ADR-0012.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
+from pathlib import Path
+from typing import Any
 
-from .env import VERBOSE_ENV, read_env
+from .env import DIAGNOSTICS_FILE_ENV, VERBOSE_ENV, read_env
 from .progress import ProgressReporter, reporter_is_active
 
 # Marks a record whose event the progress reporter also renders itself (source
@@ -46,6 +60,10 @@ def _drop_reporter_echoes(record: logging.LogRecord) -> bool:
     return not (getattr(record, REPORTER_ECHO, False) and reporter_is_active())
 
 _HANDLER_ATTR = "_stel_verbose_handler"
+_DIAGNOSTICS_ATTR = "_stel_diagnostics_handler"
+# Stands in for `logging.lastResort` while diagnostics turn propagation off and
+# `-v` has installed nothing: warnings keep reaching stderr exactly as before.
+_FALLBACK_ATTR = "_stel_fallback_handler"
 # Must stay equal to the top-level package name: a handler attached to a
 # namespace no module logs under silences `-v` without failing. Pinned in
 # tests/test_frozen_names.py.
@@ -101,7 +119,9 @@ def configure_verbose_logging(
 
     Idempotent: repeated calls replace the previous handler rather than stacking
     duplicates, so re-invocation across nested commands or tests stays clean.
-    Level is fixed at INFO — see the module docstring for why.
+    The handler's level is fixed at INFO — see the module docstring for why;
+    the logger's own level is derived by :func:`_apply_channel_policy`, since
+    the diagnostics file may need DEBUG while this handler still filters at INFO.
 
     With ``reporter``, records are routed through it so they interleave safely
     with a live progress bar (issue #403); without one they go straight to
@@ -115,9 +135,9 @@ def configure_verbose_logging(
 
     if verbosity <= 0:
         # Fully restore the default so disabling verbose leaves no lingering
-        # state — otherwise `propagate = False` (set below) would persist and
-        # silently drop `stel` records from any parent/root handler.
-        logger.propagate = True
+        # state: the policy helper turns propagation back on unless the
+        # diagnostics file still needs it off.
+        _apply_channel_policy(logger)
         return
 
     handler: logging.Handler = (
@@ -134,8 +154,154 @@ def configure_verbose_logging(
         )
     )
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    # Progress lines are for the operator, not any parent handler that may exist
-    # (e.g. a Dagster capture that reformats records).
-    logger.propagate = False
     setattr(logger, _HANDLER_ATTR, handler)
+    _apply_channel_policy(logger)
+
+
+def resolve_diagnostics_file(cli_value: Path | None) -> Path | None:
+    """The CLI option wins over ``STEL_DIAGNOSTICS_FILE``; an empty variable is unset."""
+    if cli_value is not None:
+        return cli_value
+    raw = read_env(DIAGNOSTICS_FILE_ENV, default="").strip()
+    return Path(raw) if raw else None
+
+
+def _carries_diagnostics(record: logging.LogRecord) -> bool:
+    """``logging.Filter`` callable: the records the diagnostics file exists for.
+
+    Every sanitized failure in the tree logs its native exception once, at
+    DEBUG with ``exc_info``, and nothing else in the tree does; warnings ride
+    along so a retry sequence reads in order without the stderr capture.
+    """
+    return record.exc_info is not None or record.levelno >= logging.WARNING
+
+
+class _OwnerOnlyFileHandler(logging.FileHandler):
+    """Appends to a file readable by its owner alone, and fails closed.
+
+    The file holds what every other channel sanitizes away -- object-store
+    URIs with their query strings, provider response bodies -- so it gets the
+    owner-only storage the cache directories already get, including a file an
+    orchestrator pre-created with ordinary permissions. Opened lazily, so a
+    run that fails nowhere leaves no file behind.
+
+    Every failure of the handler itself is contained here. The stdlib opens a
+    delayed file outside ``StreamHandler.emit``'s guard, and its
+    ``handleError`` prints the active exception chain to stderr; both run
+    while the native exception is being handled, so either would put on
+    stderr exactly the text this file exists to keep off it.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, mode="a", encoding="utf-8", delay=True)
+        self.records_written = 0
+        self._unusable = False
+
+    def _open(self) -> Any:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.baseFilename, flags, 0o600)
+        # O_CREAT's mode applies only to a file it creates; an existing one
+        # keeps whatever it had, so tighten it explicitly where the OS allows.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        return open(fd, self.mode, encoding=self.encoding)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._unusable:
+            return
+        if self.stream is None:
+            try:
+                self.stream = self._open()
+            except OSError:
+                self.handleError(record)
+                return
+        super().emit(record)
+        if not self._unusable:
+            self.records_written += 1
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """One safe line on stderr, then stop trying.
+
+        Never the stdlib report: it prints the exception being handled with
+        its ``__context__``, which here is the native failure.
+        """
+        del record
+        self._unusable = True
+        error = sys.exc_info()[1]
+        if sys.stderr is not None:
+            sys.stderr.write(
+                f"stel: diagnostics file {self.baseFilename} could not be written "
+                f"[{type(error).__name__}]; native failure detail was not recorded\n"
+            )
+
+
+def configure_diagnostics_file(path: Path | None) -> None:
+    """Attach, replace, or remove the DEBUG-level diagnostics file handler.
+
+    Idempotent like :func:`configure_verbose_logging`, and independent of it:
+    either can be configured first, and the logger's level and propagation are
+    recomputed from whichever handlers are present. Passing ``None`` removes
+    the handler and restores the default channel policy.
+    """
+    logger = logging.getLogger(_ROOT_LOGGER)
+    existing = getattr(logger, _DIAGNOSTICS_ATTR, None)
+    if existing is not None:
+        logger.removeHandler(existing)
+        existing.close()
+        setattr(logger, _DIAGNOSTICS_ATTR, None)
+    if path is not None:
+        handler = _OwnerOnlyFileHandler(path)
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(_carries_diagnostics)
+        handler.setFormatter(
+            logging.Formatter(fmt="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logger.addHandler(handler)
+        setattr(logger, _DIAGNOSTICS_ATTR, handler)
+    _apply_channel_policy(logger)
+
+
+def diagnostics_file_written() -> Path | None:
+    """The diagnostics file's path once at least one record has reached it.
+
+    Lets a CLI failure boundary point the operator at the detail it could not
+    print. ``None`` when no file is configured or nothing has been written.
+    """
+    handler = getattr(logging.getLogger(_ROOT_LOGGER), _DIAGNOSTICS_ATTR, None)
+    if handler is None or handler.records_written == 0:
+        return None
+    return Path(handler.baseFilename)
+
+
+def _apply_channel_policy(logger: logging.Logger) -> None:
+    """Derive level, propagation and the stderr fallback from installed handlers.
+
+    The logger's level is the lowest any handler needs: DEBUG while the
+    diagnostics file is attached, INFO under ``-v``, otherwise unset so the
+    root's default applies as before. Propagation is off whenever a handler is
+    installed -- progress lines are for the operator, not a parent handler
+    that reformats records (a Dagster capture, say), and a DEBUG record that
+    escaped to one would defeat the diagnostics file's whole point. With
+    propagation off and no ``-v`` handler, warnings would no longer reach
+    ``logging.lastResort``, so a plain WARNING stderr handler stands in for it.
+    """
+    verbose = getattr(logger, _HANDLER_ATTR, None)
+    diagnostics = getattr(logger, _DIAGNOSTICS_ATTR, None)
+    fallback = getattr(logger, _FALLBACK_ATTR, None)
+    if fallback is not None:
+        logger.removeHandler(fallback)
+        setattr(logger, _FALLBACK_ATTR, None)
+
+    if diagnostics is not None:
+        logger.setLevel(logging.DEBUG)
+    elif verbose is not None:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.NOTSET)
+    logger.propagate = verbose is None and diagnostics is None
+
+    if diagnostics is not None and verbose is None:
+        stderr_fallback = logging.StreamHandler(sys.stderr)
+        stderr_fallback.setLevel(logging.WARNING)
+        logger.addHandler(stderr_fallback)
+        setattr(logger, _FALLBACK_ATTR, stderr_fallback)

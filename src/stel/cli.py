@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -41,7 +42,13 @@ from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
 from .freshness import check_freshness
-from .logging_setup import configure_verbose_logging, resolve_verbosity
+from .logging_setup import (
+    configure_diagnostics_file,
+    configure_verbose_logging,
+    diagnostics_file_written,
+    resolve_diagnostics_file,
+    resolve_verbosity,
+)
 from .manifest import write_manifest, write_run_results
 from .optional_dependencies import OptionalDependencyError
 from .orphans import find_orphans, format_orphans
@@ -136,7 +143,24 @@ def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
     per-model start/finish lines, and a live progress bar on a TTY (non-TTY
     stderr gets plain log lines instead). Also honored via ``STEL_VERBOSE``.
     Extra ``v``s are silently capped — verbose is always INFO-level; the flag
-    intentionally does not expose DEBUG."""
+    intentionally does not expose DEBUG.
+
+    ``--diagnostics-file`` travels with it: the one place the native detail
+    behind a sanitized failure may be written, and only because the operator
+    named it (issue #590, ADR-0012). Also honored via ``STEL_DIAGNOSTICS_FILE``.
+    """
+    command = click.option(
+        "--diagnostics-file",
+        "diagnostics_file",
+        type=click.Path(dir_okay=False, writable=True, path_type=Path),
+        default=None,
+        help=(
+            "Append the native exception and traceback behind any sanitized "
+            "failure to this file, which is created owner-readable only. "
+            "Nothing else changes: the CLI, run_results.json and the logs stay "
+            "sanitized. Also honored via STEL_DIAGNOSTICS_FILE."
+        ),
+    )(command)
     return click.option(
         "-v",
         "--verbose",
@@ -151,7 +175,11 @@ def _verbose_option(command: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _configure_output(
-    verbose_count: int, *, bars_safe: bool = True, json_output: bool = False
+    verbose_count: int,
+    *,
+    diagnostics_file: Path | None,
+    bars_safe: bool = True,
+    json_output: bool = False,
 ) -> None:
     """Pick the output level for this invocation and install its channels.
 
@@ -178,6 +206,65 @@ def _configure_output(
     configure_verbose_logging(
         verbosity, reporter=get_reporter() if bars else None
     )
+    path = resolve_diagnostics_file(diagnostics_file)
+    if path is not None:
+        source = (
+            "--diagnostics-file" if diagnostics_file is not None else "STEL_DIAGNOSTICS_FILE"
+        )
+        _require_writable_diagnostics_path(path, source=source)
+    configure_diagnostics_file(path)
+
+
+def _require_writable_diagnostics_path(path: Path, *, source: str) -> None:
+    """Refuse a destination that cannot be written before the run starts.
+
+    The flag is validated by Click; the environment variable is not, and the
+    first write happens while a failure is being handled, so a run that fails
+    and then cannot record why has paid twice. A symlink is refused too: the
+    handler opens without following one, and a swap between check and open
+    should fail rather than redirect the native detail.
+    """
+    if path.is_symlink():
+        reason = "it is a symbolic link"
+    elif path.is_dir():
+        reason = "it is a directory"
+    elif path.exists():
+        reason = None if os.access(path, os.W_OK) else "the file is not writable"
+    elif not path.parent.is_dir():
+        reason = "its directory does not exist"
+    elif not os.access(path.parent, os.W_OK):
+        reason = "its directory is not writable"
+    else:
+        reason = None
+    if reason is not None:
+        raise click.UsageError(f"{source}: cannot write {path}: {reason}.")
+
+
+def _run_failure(error: RunError) -> click.ClickException:
+    """The failure as the operator sees it.
+
+    The message is already artifact-safe; when the native detail it leaves out
+    was written to the diagnostics file, say where, since the message is
+    otherwise a failure that names its own opacity and stops (issue #590).
+    """
+    message = str(error)
+    written = diagnostics_file_written()
+    if written is not None:
+        message = f"{message}\nNative error detail was written to {written}"
+    return click.ClickException(message)
+
+
+def _note_diagnostics() -> None:
+    """After a run finished, point at the diagnostics file if anything reached it.
+
+    A model that fails inside a run is recorded on its result rather than
+    raised, so the table's `ERROR:` line is as sanitized as a `RunError`
+    message and needs the same pointer. On stderr, so a `--json` run keeps
+    stdout a single payload.
+    """
+    written = diagnostics_file_written()
+    if written is not None:
+        click.echo(f"Native error detail was written to {written}", err=True)
 
 
 def _project_context_options(command: Callable[..., Any]) -> Callable[..., Any]:
@@ -535,6 +622,7 @@ def search_command(
     vector_json: str | None,
     output_format: str,
     verbose: int,
+    diagnostics_file: Path | None,
 ) -> None:
     """Query a published retrieval index without provider-specific request shapes.
 
@@ -542,7 +630,9 @@ def search_command(
     connect, lease, embed, store open, inspect, the searches themselves --
     on stderr, so it composes with `--output json` on stdout (issue #519).
     """
-    _configure_output(verbose, json_output=output_format == "json")
+    _configure_output(
+        verbose, diagnostics_file=diagnostics_file, json_output=output_format == "json"
+    )
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
@@ -932,6 +1022,7 @@ def plan(
     exclude: str | None,
     json_output: bool,
     verbose: int,
+    diagnostics_file: Path | None,
 ) -> None:
     """Report what the next run would reprocess, before it spends anything.
 
@@ -943,7 +1034,7 @@ def plan(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    _configure_output(verbose, json_output=json_output)
+    _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=json_output)
     try:
         result = plan_project(
             project_dir,
@@ -1065,6 +1156,7 @@ def run(
     read_filter: tuple[tuple[str, str, str], ...],
     json_output: bool,
     verbose: int,
+    diagnostics_file: Path | None,
 ) -> None:
     """Extract and materialize selected models into the configured warehouse."""
     project_dir: Path = ctx.obj["project_dir"]
@@ -1072,7 +1164,12 @@ def run(
     target = ctx.obj["target"]
     # `run --threads N` executes independent models concurrently, each with its
     # own progress bar on one stderr — fall back to interleave-safe log lines.
-    _configure_output(verbose, bars_safe=threads <= 1, json_output=json_output)
+    _configure_output(
+        verbose,
+        diagnostics_file=diagnostics_file,
+        bars_safe=threads <= 1,
+        json_output=json_output,
+    )
 
     if watch:
         _run_watch(
@@ -1107,8 +1204,9 @@ def run(
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
     except RunError as e:
-        raise click.ClickException(str(e)) from e
+        raise _run_failure(e) from e
     elapsed = round(time.monotonic() - start, 3)
+    _note_diagnostics()
 
     write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
     results_path = write_run_results(
@@ -1296,13 +1394,14 @@ def build(
     read_filter: tuple[tuple[str, str, str], ...],
     json_output: bool,
     verbose: int,
+    diagnostics_file: Path | None,
 ) -> None:
     """Run and test each model in dependency order; downstream models are skipped
     when an upstream model errors or fails a test."""
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    _configure_output(verbose, json_output=json_output)
+    _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=json_output)
     start = time.monotonic()
     try:
         result = build_project(
@@ -1322,8 +1421,9 @@ def build(
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
     except RunError as e:
-        raise click.ClickException(str(e)) from e
+        raise _run_failure(e) from e
     elapsed = round(time.monotonic() - start, 3)
+    _note_diagnostics()
 
     # Hard test failures don't populate ModelRunResult.errors, so feed them in
     # explicitly or a failing test on a leaf model would report success.
@@ -1499,6 +1599,7 @@ def eval_(
     baseline: str | None,
     as_json: bool,
     verbose: int,
+    diagnostics_file: Path | None,
 ) -> None:
     """Run golden-set retrieval evaluations declared as `retrieval_tests:` on
     search models (issue #137): recall/precision/hit-rate/MRR/NDCG@k against
@@ -1507,7 +1608,7 @@ def eval_(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
-    _configure_output(verbose, json_output=as_json)
+    _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=as_json)
     if compare is not None:
         if select is not None or exclude is not None:
             raise click.UsageError(
@@ -2313,6 +2414,7 @@ def concept_cloud(
     time_grain: str,
     top_n_per_period: int,
     verbose: int,
+    diagnostics_file: Path | None,
 ) -> None:
     """Render the self-contained 3D concept-cloud artifact (#255).
 
@@ -2321,7 +2423,7 @@ def concept_cloud(
     ``--demo`` for the sizable built-in example, or ``--placeholder`` for the
     minimal one.
     """
-    _configure_output(verbose)
+    _configure_output(verbose, diagnostics_file=diagnostics_file)
     if placeholder or demo:
         bundle = demo_export() if demo else placeholder_export()
         written = write_concept_cloud(bundle, output)

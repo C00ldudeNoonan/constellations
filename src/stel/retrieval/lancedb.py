@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
 from functools import partial
@@ -79,6 +79,60 @@ _LANCEDB_DEFAULT_BUDGET_MB = (6 * 1024, 1024)
 # for LanceDB's defaults it does not bind at all — a 20 GiB box allows 10 GiB
 # and the default asks for 7.
 _CEILING_CACHE_SHARE = 0.5
+
+# Ceiling on the Arrow payload handed to one `merge_insert` (issue #592).
+#
+# `merge_insert` reserves the whole payload for its join build side, out of a
+# process-wide pool fixed at 100 MB in lancedb 0.34.0 and not reachable from
+# configuration — `lancedb.Session` exposes `index_cache_size_bytes` and
+# `metadata_cache_size_bytes` and nothing else. So the page size is the only
+# lever a caller has, and `batch_size` counts *rows* against a limit
+# denominated in *bytes*.
+#
+# That mismatch killed two consecutive weekly publishes of a 3.6M-row
+# collection. Measured against it, round-tripping existing rows through the
+# same `merge_insert` the publish uses:
+#
+#     20,000 rows -> 91.8 MB -> ok
+#     25,000 rows -> 115.0 MB -> Resources exhausted, needed 111.7 MB of 100 MB
+#
+# Deliberately well under the pool rather than just beneath it. The FTS index
+# and the five BTree indices allocate from the same pool, row size varies with
+# text length so any single figure is an estimate, and a page that fails here
+# costs the whole publish — 4h55m in the 2026-09-13 run. Headroom is cheap;
+# the only cost of a smaller page is more `merge_insert` calls against a store
+# whose per-page fixed cost is object-store I/O, not this reservation.
+MERGE_PAYLOAD_LIMIT_BYTES = 64 * _MB
+
+
+def _byte_bounded_slices(payload: pa.Table, limit_bytes: int) -> Iterator[pa.Table]:
+    """Split `payload` into slices of at most `limit_bytes`, in order.
+
+    The row count for each slice is estimated from the average row size and
+    then *verified*, because the estimate is exactly what issue #592 is
+    about: row size varies with text length, so a count derived from an
+    average can still overshoot. Verifying is cheap because `Table.slice` is
+    zero-copy and its `nbytes` reports the slice rather than the parent's
+    buffers.
+
+    A single row above the limit is yielded alone rather than refused. The
+    pool is larger than this ceiling, so such a row may well succeed, and
+    turning a working publish into a hard failure to enforce our own headroom
+    would be the same class of mistake in the other direction.
+    """
+    offset = 0
+    while offset < payload.num_rows:
+        rows = payload.num_rows - offset
+        while rows > 1:
+            measured = payload.slice(offset, rows).nbytes
+            if measured <= limit_bytes:
+                break
+            # Strictly decreasing, so this terminates at one row: the scaled
+            # estimate is below `rows` because the measurement exceeded the
+            # limit, and `rows - 1` bounds the case where it rounds up.
+            rows = max(1, min(rows - 1, int(rows * limit_bytes / measured)))
+        yield payload.slice(offset, rows)
+        offset += rows
 
 
 def session_cache_budget(
@@ -766,12 +820,20 @@ class LanceDBStore(RetrievalStore):
         try:
             table = self._open_owned_table(collection)
             payload = pa.Table.from_pylist([dict(row.values) for row in rows], schema=table.schema)
-            (
-                table.merge_insert(id_field)
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute(payload)
-            )
+            # One `merge_insert` per byte-bounded slice rather than one for the
+            # whole page (issue #592). Splitting is safe under the contract the
+            # publish loop already relies on: state advances only after a write
+            # lands, so a slice that fails leaves the page's state unadvanced
+            # and the next run republishes it — and `merge_insert` keyed on the
+            # id is idempotent, which is why a whole-page retry was already
+            # correct.
+            for slice_ in _byte_bounded_slices(payload, MERGE_PAYLOAD_LIMIT_BYTES):
+                (
+                    table.merge_insert(id_field)
+                    .when_matched_update_all()
+                    .when_not_matched_insert_all()
+                    .execute(slice_)
+                )
             if table.count_rows(_id_filter(id_field, [row.record_id for row in rows])) != len(
                 rows
             ):

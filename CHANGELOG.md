@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### A merge page is bounded by bytes, so a large `batch_size` cannot exhaust LanceDB's pool (issue #592)
+
+- **A row count governed a byte limit, and killed two weekly publishes.**
+  `merge_insert` reserves its whole payload for the join build side, out of a
+  pool fixed at 100 MB in lancedb 0.34.0 and not reachable from configuration.
+  `batch_size` counts rows, and row size varies with text length. Measured
+  against the live 3.6M-row collection, 20,000 rows fit at 91.8 MB and 25,000
+  asked for 111.7 MB — one run died after writing for 4h55m, the next on its
+  first page.
+- `LanceDBStore.upsert` now splits the Arrow payload into slices of at most
+  64 MB and issues one `merge_insert` per slice. The slice size is **measured
+  rather than averaged**: a count derived from the mean row size can still
+  overshoot, which is the assumption that caused the failure.
+- **`batch_size` keeps counting rows, and keeps its meaning.** It is passed to
+  four places — the upstream snapshot, the reconciler, generation activation
+  and the store write — and three of those are BigQuery state paging where
+  rows are the right unit. Redefining it would change all four to fix one, and
+  would put a LanceDB-specific constant in user-facing config.
+  [ADR-0013](docs/adr/0013-a-merge-page-is-bounded-by-bytes-in-the-store.md)
+  records that, and why bisect-on-failure was not made the primary mechanism.
+- No new configuration. The failure was a knob calibrated in a unit the
+  operator could not observe; the fix is not another one.
+
+**Worth knowing:** a page is no longer a single Lance transaction. That is
+safe under the contract the publish loop already relied on — state advances
+only after the write lands, so a slice that fails leaves the page unadvanced
+and the next run republishes it whole, which `merge_insert` on the id absorbs.
+Page count is unchanged, so the BigQuery round trips `batch_size` was tuned
+against are unaffected.
+
 ### Dependencies
 
 - `anyio` 4.13.0 → 4.14.2 (CVE-2026-63374, CVE-2026-64847) and `soupsieve`

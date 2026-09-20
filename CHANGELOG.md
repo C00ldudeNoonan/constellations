@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Dependencies
+
+- `anyio` 4.13.0 → 4.14.2 (CVE-2026-63374, CVE-2026-64847) and `soupsieve`
+  2.8.4 → 2.9.0 (CVE-2026-85999, CVE-2026-86000), both transitive, both at
+  the fixed release and nothing else moved. `pip-audit` gates CI, so the
+  advisories publishing turned every branch red; carried in #595 because it
+  was the branch open when they landed.
+
 ### A sanitized failure's native detail can reach the operator who asked for it (issue #590)
 
 - **The cause of a store failure was written where nothing could read it.**

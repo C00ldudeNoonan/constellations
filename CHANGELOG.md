@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Dependencies
+
+- `anyio` 4.13.0 → 4.14.2 (CVE-2026-63374, CVE-2026-64847) and `soupsieve`
+  2.8.4 → 2.9.0 (CVE-2026-85999, CVE-2026-86000), both transitive, both at
+  the fixed release and nothing else moved. `pip-audit` gates CI, so the
+  advisories publishing turned every branch red; carried in #595 because it
+  was the branch open when they landed.
+
 ### `classic_ml` text vectorizing no longer holds the whole corpus in memory (issue #584)
 
 `_fit_vectorizer` and the feature-extraction transform path in
@@ -16,6 +24,32 @@ document's tokens per iteration instead of materializing the corpus first.
 the corpus would already be resident — so this was not a tunable, only a fix.
 This is the fifth incident in the #414 series, and the first in the `ml`
 model kind, which that series' audit did not reach.
+
+### A sanitized failure's native detail can reach the operator who asked for it (issue #590)
+
+- **The cause of a store failure was written where nothing could read it.**
+  `_operation_failed` keeps the operation, the step and the native exception's
+  type and drops the text, correctly: LanceDB quotes object-store URIs and
+  response bodies verbatim and the message reaches `run_results.json`. The
+  full exception went to a DEBUG record, and `-v` is capped at INFO by design.
+  The documented hatch, "attach your own handler", exists only for an
+  in-process caller; every orchestrated run is a `stel build` subprocess, so
+  two production failures of one model stopped at
+  `[RuntimeError] (code=lancedb_index_failed)` with no way to learn more.
+- `--diagnostics-file PATH` on `run`, `build`, `plan`, `eval`, `search` and
+  `concept-cloud`, or `STEL_DIAGNOSTICS_FILE=PATH` for an orchestrated run,
+  appends every record carrying an exception, and every warning, to that file
+  with its native message and traceback. Nothing else changes: the CLI,
+  `run_results.json`, the `-v` stream and any log capture stay as sanitized
+  as before, and while the file is configured the `stel` logger stops
+  propagating so a parent handler cannot receive what only the file was meant
+  to. The file is created on first write, readable by its owner only, and a
+  `run` or `build` failure that wrote to it names it in the error message.
+- Covers what stel logs natively before sanitizing: store operations and
+  index-build retries, document fetch and extraction, transform code.
+  Provider errors are sanitized before any logger sees them and keep their
+  own allowlisted hatch, `STEL_DEBUG_PROVIDER_ERRORS`. ADR-0012 records why
+  this and not a DEBUG level, a cause classifier, or the cause chain.
 
 ### A grant can permit a range, not only a literal (issue #582)
 

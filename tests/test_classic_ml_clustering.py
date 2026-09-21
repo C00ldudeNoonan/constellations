@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("numpy")
 pytest.importorskip("sklearn")
 
+import stel.classic_ml.common as common
 from stel.adapters import WarehouseAdapter
 from stel.classic_ml import run_classic_ml_model
 from stel.config.model import ModelConfig
@@ -137,6 +138,37 @@ def test_kmeans_is_deterministic(tmp_path: Path) -> None:
     second = _run(tmp_path / "b", _km3(), _features_df(_THEMES))
     assert first.df.to_dicts() == second.df.to_dicts()
     assert first.artifact_version == second.artifact_version
+
+
+def test_kmeans_artifact_version_does_not_follow_the_thread_count(
+    tmp_path: Path,
+) -> None:
+    """The fit is deterministic; the *measurement* of it was not (issue #600).
+
+    `inertia` is a reduction over the matrix, so its last bits depend on how
+    many threads the BLAS/OpenMP runtime used -- a property of the machine,
+    not of the fit. `artifact_version` hashes the metadata, so one ULP gave
+    the same clustering two identities. That is what made
+    `test_kmeans_is_deterministic` above fail under a full suite and pass on
+    its own: nothing about the test was flaky, the thread limit around it
+    moved.
+
+    Pinned with an explicit limit rather than by repetition, because a test
+    that reproduces a race by running it often enough is a test that fails
+    for whoever has the slower machine.
+    """
+    threadpoolctl = pytest.importorskip("threadpoolctl")
+
+    with threadpoolctl.threadpool_limits(limits=1):
+        single = _run(tmp_path / "t1", _km3(), _features_df(_THEMES))
+    with threadpoolctl.threadpool_limits(limits=2):
+        double = _run(tmp_path / "t2", _km3(), _features_df(_THEMES))
+
+    assert single.df.to_dicts() == double.df.to_dicts()
+    assert single.artifact_version == double.artifact_version, (
+        "the artifact version moved with the thread limit: a fitted metric is "
+        "reaching the identity hash at a precision the machine can change"
+    )
 
 
 def test_kmeans_is_invariant_to_row_order(tmp_path: Path) -> None:
@@ -323,6 +355,31 @@ def test_kmeans_predict_reuses_persisted_artifact(tmp_path: Path) -> None:
     )
     assert predicted.artifact_version == trained.artifact_version
     assert _partition(predicted.df.to_dicts()) == _partition(trained.df.to_dicts())
+
+
+def test_an_artifact_with_unrounded_metrics_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#600 rounds fitted metrics when an artifact is *written*, never when one
+    is *verified*, and that placement is the whole compatibility story.
+
+    Every artifact already on disk stores its metrics unrounded and an
+    `artifact_version` hashed from them. Verification recomputes that hash
+    from the stored metadata, so it still matches. Rounding inside the hash
+    instead -- the tidier-looking place -- would declare every existing fitted
+    model stale and force a refit of all of them.
+    """
+    monkeypatch.setattr(common, "_stable_metric", lambda value: value)
+    written = _run(tmp_path, _km3(), _features_df(_THEMES))
+    written.publish_artifact()
+    monkeypatch.undo()
+
+    loaded = _run(
+        tmp_path,
+        {"task": "cluster", "mode": "load_pretrained", "provider": "builtin.kmeans"},
+        _features_df(_THEMES),
+    )
+    assert loaded.artifact_version == written.artifact_version
 
 
 def test_nmf_predict_reuses_persisted_components(tmp_path: Path) -> None:

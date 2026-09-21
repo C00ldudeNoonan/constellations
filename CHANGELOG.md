@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### A fitted model's identity no longer depends on the machine's thread count (issue #600)
+
+- **`test_kmeans_is_deterministic` was not flaky; what it measured was.** It
+  failed under a full suite and passed alone. The clustering never changed --
+  labels, centroids and silhouette were identical run to run. `inertia` did,
+  by one ULP: it is a reduction over the matrix, and the order of that
+  reduction follows how many threads the BLAS/OpenMP runtime used. Measured
+  on the test's own fit, `0x1.da28f795400edp-3` under one thread, `...eep-3`
+  under two and `...efp-3` under four. `artifact_version` hashes the
+  metadata, so one ULP gave the same fitted model three identities.
+- Reproduced in one process by setting the thread limit with `threadpoolctl`
+  between two fits, which is how the regression test pins it rather than by
+  re-running until it fails.
+- Fitted float metrics are now kept to 12 significant digits as they enter
+  the artifact and the run result -- the same treatment the centroids have
+  always had (`round(float(v), 6)`); metrics were the gap. float64 carries
+  ~15.95 significant digits, so this removes the noise and no digit anyone
+  reads.
+- **No existing artifact is affected.** The rounding happens when an artifact
+  is written, never when one is verified, so a model fitted before this change
+  keeps its identity and loads without a refit. That placement is pinned by
+  its own test, because rounding inside the hash instead would look tidier
+  and would declare every fitted model on disk stale.
+
 ### CI runs the suite across every core and keeps per-test results (issue #603)
 
 - **CI spent 186 of its 200 seconds in a single-process pytest on a four-core

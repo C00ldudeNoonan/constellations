@@ -322,6 +322,25 @@ tests. A model a build skipped because an upstream model failed gets a row
 too, with `status: skipped` and null counts, so it is distinguishable from a
 model that was not selected. Existing run logs are widened in place.
 
+### A chunk model no longer goes silent while it scans its parent (issue #573)
+
+`sec_document_chunks` logged `starting` and then nothing for 619 seconds before
+`finished`. The `chunk` kind had no counterpart to the progress lines
+`transform` models got in #469, and the terminal progress bar is TTY-only, so
+the `--json --verbose` log an orchestrator captures never saw a pulse.
+
+- **A heartbeat covers the whole parent scan**, including while a batch read
+  blocks. It is the same watchdog `transform` uses, now shared rather than
+  copied, and it fires from elapsed time alone.
+- **Both kinds name their first phase before counting.** `classifying parent
+  rows: 0 processed` printed 21 times over 5.5 minutes before the first
+  non-zero count; the counter was right and the first batch was slow, but 21
+  identical lines read as a hang. A single line now says what the read is
+  doing while it opens.
+
+Skipping a downstream scan when its upstream wrote nothing, the other half of
+#573, is a state-contract change and is not in this release.
+
 ### A governed read can execute as a warehouse principal narrower than the operator (issue #395)
 
 Grants (#392/#396) moved authorization to an operator-owned relation, so a
@@ -359,6 +378,43 @@ identity is a granted attribute rather than a tenant: the grants store is keyed
 on subject, a subject may hold several `tenant_id` values, and the service
 already declines to name one where no single value is honest.
 
+### A concept's history, and lines that carry strength (issue #555)
+
+Two viewer changes on data the bundle already carried. No export or schema
+change.
+
+- **The detail card draws a concept's whole history.** One bar per period, the
+  selected one lit, with `first` and `peak` beneath. A period a concept was not
+  named in draws no bar rather than a minimum stub, so "named once" and "not
+  named yet" do not look alike.
+- **Lines carry strength.** `ConceptEdge.weight` was populated but dropped by
+  the viewer, so a pair named in 900 sentences drew the same hairline as a pair
+  named once. Line width is now log-scaled, and a minimum-strength filter hides
+  the faint ones. With a period selected, strength means strength in that
+  period. The filter appears only when the edges actually differ in weight.
+
+### `concept-cloud` gets a time axis (issue #553)
+
+A map of fifteen years answered "what is always here" when the question was
+usually "what is new". Building one bundle per year meant a concept jumped
+position between years, because each ran its own layout.
+
+- **`--time-field <column>`** names the column on the linking model that dates
+  each mention, and **`--time-grain year|quarter|month`** sizes the period.
+  Concepts and edges gain `by_period`, the bundle gains a `periods` axis, and
+  the viewer gains a slider with an "all" stop.
+- **Layout is computed once, over the union of periods**, and the period only
+  decides visibility, so positions do not move as the slider does.
+- **`--top-n-per-period N`** keeps the N biggest concepts within each period on
+  top of whatever `--top-n` kept, since ranking on totals trims exactly the
+  concept that dominated one period. Off by default because it grows the
+  bundle; refused without `--time-field`, before the project loads.
+- A period a concept has no mentions in is omitted from `by_period`, not
+  written as zero. An unreadable date counts toward the total and no period,
+  and an edge is periodized only when both mentions agree.
+
+`schema_version` moves **2 to 3**.
+
 ### Concepts can carry a name and a description (issue #554)
 
 A concept's node text was the first mention text the linking frame happened to
@@ -387,6 +443,20 @@ The viewer now escapes concept text where it enters markup. The JSON island
 was already breakout-proof (`<` is escaped to `<`), but the detail panel
 and the library's tooltip interpolate into HTML, and a description is longer
 and freer text than anything that reached them before.
+
+### `concept-cloud --dbt-manifest` finds the linking model in a real manifest (issue #552)
+
+It rebuilt the source id as `source.<source_name>.<table>`, but dbt writes
+`source.<dbt_project>.<source_name>.<table>`, so the lookup never matched a
+real consumer manifest. The error then made it worse: its hint printed the
+second segment of the id, which is the dbt project name, so an operator was
+told to pass `--source-name dbt_project` while the name they had passed was
+already correct.
+
+Ids are now resolved from the manifest's own `source_name` and `name` fields,
+with a positional fallback for a hand-written manifest that omits them, and the
+hint lists source names. The fixtures had used three-segment ids that dbt never
+produces, which is how the suite stayed green; they are dbt-shaped now.
 
 ## v0.18.0 - 2026-09-08
 

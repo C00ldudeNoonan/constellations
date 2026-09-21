@@ -87,8 +87,12 @@ uv run pytest -q
 
 Use targeted tests while iterating, then run the full audit/lint/type/test set
 before handing off implementation, configuration, template, or dependency
-changes. `uv run pytest -q -m "not e2e"` is the fast loop -- 2,521 tests in
-~82s against ~396s for everything -- and CI runs the whole suite regardless. Run `uv build` for packaging or release changes. The default suite must
+changes. `uv run pytest -q -m "not e2e"` is the fast loop -- 2,683 tests in
+~66s against ~248s for everything, serial on four cores -- and CI runs the
+whole suite regardless. `-n auto --dist loadfile` spreads either run across
+every core (the whole suite in ~90s on four); CI runs that way, and it is
+what to reach for when the fast tier is not enough. Run `uv build` for
+packaging or release changes. The default suite must
 not require live provider or cloud credentials; opt-in integration tests must be
 credential-gated and have deterministic unit coverage. Update `uv.lock` only
 when required by an intentional `pyproject.toml` metadata or dependency change,

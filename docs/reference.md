@@ -3089,6 +3089,17 @@ never invalidate an index: **`batch_size`**, **`index_options`**, and
 **`vector: {refine_factor: ...}`**, which changes how a query is answered
 rather than what was published.
 
+`batch_size` counts rows, and it sets the publish page: one page is one
+ledger read pair and one state MERGE, so raising it cuts warehouse round
+trips. It does **not** have to be sized against the retrieval store's own
+memory limits. A LanceDB page whose Arrow payload would exceed what a single
+`merge_insert` may reserve is split inside the store before it is sent, so a
+large `batch_size` costs more writes to object storage rather than failing
+the publish (issue #592,
+[ADR-0013](adr/0013-a-merge-page-is-bounded-by-bytes-in-the-store.md)). Page
+count, and therefore the warehouse round trips the setting is tuned against,
+is unchanged by that split.
+
 Everything that defines a row's shape or meaning is:
 
 | Change | Classification |

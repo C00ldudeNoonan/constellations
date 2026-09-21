@@ -1,4 +1,4 @@
-# ADR-0013: A debug switch owns its own destination, and marks the records it is for
+# ADR-0014: A debug switch owns its own destination, and marks the records it is for
 
 - **Status:** accepted
 - **Date:** 2026-09-20

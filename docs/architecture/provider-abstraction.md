@@ -334,7 +334,7 @@ diagnostics at the point of conversion. The variable alone is sufficient: it
 raises the `stel` logger to DEBUG itself and sends these records to the
 `--diagnostics-file` if one is configured, otherwise to a stderr channel
 scoped to them alone. Until issue #599 it emitted nothing under any
-combination of flags — see [ADR-0013](../adr/0013-a-debug-switch-owns-its-destination.md). The compatibility helper
+combination of flags — see [ADR-0014](../adr/0014-a-debug-switch-owns-its-destination.md). The compatibility helper
 `redacted_exception_text()` never emits exception messages, provider source
 paths, function names, or local values. It includes only recognized exception
 categories, trusted stel module/line locations, and an external-frame count.

@@ -427,9 +427,26 @@ def validate_retrieval_capabilities(
             RetrievalFeature.KEYED_UPSERT: "incremental publication",
             RetrievalFeature.KEYED_DELETE: "stale-record deletion",
             RetrievalFeature.DURABLE_WRITE_ACK: "receipt-gated warehouse state",
-            RetrievalFeature.ATOMIC_BATCH_MUTATION: "exact whole-batch receipts",
             RetrievalFeature.INDEX_READINESS: "post-publication index validation",
         }
+        # A trustworthy receipt has two possible proofs, and the architecture
+        # spec has always said so: exact per-ID durable outcomes, *or* an
+        # atomic batch returning an all-success receipt. Requiring only the
+        # second rejected a store that proves the first — which a store must
+        # fall back on once it has to split a payload its backend cannot take
+        # in one transaction (issue #592).
+        if not capabilities.features & {
+            RetrievalFeature.ATOMIC_BATCH_MUTATION,
+            RetrievalFeature.EXACT_MUTATION_RECEIPTS,
+        }:
+            raise _model_error(
+                model,
+                f"Incremental publication needs exact whole-batch receipts, "
+                f"which retrieval store '{config.type}' does not provide: it "
+                "proves neither atomic batch mutation nor exact per-record "
+                "mutation receipts",
+                ("search", "store"),
+            )
         if search.on_index_change == "online":
             required[RetrievalFeature.PRIVATE_GENERATION_BUILD] = (
                 "safe generation replacement for `on_index_change: online`"

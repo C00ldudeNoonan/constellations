@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.0 - 2026-09-21
+
 ### A fitted model's identity no longer depends on the machine's thread count (issue #600)
 
 - **`test_kmeans_is_deterministic` was not flaky; what it measured was.** It

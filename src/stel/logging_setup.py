@@ -27,6 +27,16 @@ plus warnings, to one file the operator named. It is the sole disclosure
 surface -- nothing changes on stderr, in ``run_results.json`` or in any
 artifact, and while it is installed the ``stel`` logger stops propagating so a
 parent handler cannot receive what only the file was meant to. See ADR-0012.
+
+``STEL_DEBUG_PROVIDER_ERRORS`` is the third channel and discloses the least:
+provider errors are sanitized before any logger sees them, so what it emits is
+``redacted_exception_text``'s allowlist -- exception types, stel frame
+locations, an external frame count -- and never native text. It had no
+destination at all until issue #599: the call sites were gated on a DEBUG
+level the CLI caps at INFO, and the records carry no ``exc_info``, so even
+with a diagnostics file attached they fired and were then filtered out. The
+switch now raises the level itself and, when no diagnostics file is
+configured, installs a stderr channel scoped to those records alone.
 """
 
 from __future__ import annotations
@@ -37,7 +47,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .env import DIAGNOSTICS_FILE_ENV, VERBOSE_ENV, read_env
+from .env import (
+    DIAGNOSTICS_FILE_ENV,
+    PROVIDER_DEBUG_ENV,
+    VERBOSE_ENV,
+    env_flag_enabled,
+    read_env,
+)
 from .progress import ProgressReporter, reporter_is_active
 
 # Marks a record whose event the progress reporter also renders itself (source
@@ -59,8 +75,28 @@ def _drop_reporter_echoes(record: logging.LogRecord) -> bool:
     """
     return not (getattr(record, REPORTER_ECHO, False) and reporter_is_active())
 
+
+# Marks the redacted provider-error diagnostics `STEL_DEBUG_PROVIDER_ERRORS`
+# opts into (issue #599). They are the one DEBUG record in the tree with no
+# `exc_info`: `redacted_exception_text` exists so that native text never rides
+# along, which is exactly what made them unroutable — `_carries_diagnostics`
+# recognizes the others by their exception and the general cap dropped these.
+# Hence a marker, the same mechanism as REPORTER_ECHO above.
+PROVIDER_DIAGNOSTICS = "stel_provider_diagnostics"
+PROVIDER_DIAGNOSTICS_EXTRA = {PROVIDER_DIAGNOSTICS: True}
+
+
+def _is_provider_diagnostics(record: logging.LogRecord) -> bool:
+    """``logging.Filter`` callable for the stderr channel the switch installs."""
+    return bool(getattr(record, PROVIDER_DIAGNOSTICS, False))
+
+
 _HANDLER_ATTR = "_stel_verbose_handler"
 _DIAGNOSTICS_ATTR = "_stel_diagnostics_handler"
+# The stderr channel for provider diagnostics when no diagnostics file is
+# configured. Scoped to marked records, so raising the logger to DEBUG for it
+# cannot put any other DEBUG record — the ones carrying native text — on stderr.
+_PROVIDER_DIAGNOSTICS_ATTR = "_stel_provider_diagnostics_handler"
 # Stands in for `logging.lastResort` while diagnostics turn propagation off and
 # `-v` has installed nothing: warnings keep reaching stderr exactly as before.
 _FALLBACK_ATTR = "_stel_fallback_handler"
@@ -172,8 +208,17 @@ def _carries_diagnostics(record: logging.LogRecord) -> bool:
     Every sanitized failure in the tree logs its native exception once, at
     DEBUG with ``exc_info``, and nothing else in the tree does; warnings ride
     along so a retry sequence reads in order without the stderr capture.
+
+    Provider errors are the exception and must be named rather than inferred:
+    they are sanitized before any logger sees them, so their diagnostics carry
+    a redacted allowlist and no ``exc_info`` at all, and would be dropped here
+    by the very property that makes them safe (issue #599).
     """
-    return record.exc_info is not None or record.levelno >= logging.WARNING
+    return (
+        record.exc_info is not None
+        or record.levelno >= logging.WARNING
+        or _is_provider_diagnostics(record)
+    )
 
 
 class _OwnerOnlyFileHandler(logging.FileHandler):
@@ -277,13 +322,25 @@ def _apply_channel_policy(logger: logging.Logger) -> None:
     """Derive level, propagation and the stderr fallback from installed handlers.
 
     The logger's level is the lowest any handler needs: DEBUG while the
-    diagnostics file is attached, INFO under ``-v``, otherwise unset so the
-    root's default applies as before. Propagation is off whenever a handler is
-    installed -- progress lines are for the operator, not a parent handler
-    that reformats records (a Dagster capture, say), and a DEBUG record that
-    escaped to one would defeat the diagnostics file's whole point. With
-    propagation off and no ``-v`` handler, warnings would no longer reach
-    ``logging.lastResort``, so a plain WARNING stderr handler stands in for it.
+    diagnostics file is attached or ``STEL_DEBUG_PROVIDER_ERRORS`` is on, INFO
+    under ``-v``, otherwise unset so the root's default applies as before.
+    Propagation is off whenever a handler is installed -- progress lines are
+    for the operator, not a parent handler that reformats records (a Dagster
+    capture, say), and a DEBUG record that escaped to one would defeat the
+    diagnostics file's whole point. With propagation off and no ``-v``
+    handler, warnings would no longer reach ``logging.lastResort``, so a plain
+    WARNING stderr handler stands in for it.
+
+    Raising the level to DEBUG for the provider switch moves where native
+    text is stopped, and that is worth being precise about. Every other DEBUG
+    site in the tree carries it, and those records now pass the logger's level
+    check; each of stel's own handlers then refuses them -- the provider
+    channel filters to marked records, ``-v`` sits at INFO, the fallback at
+    WARNING -- and propagation is off, so no parent handler sees them either.
+    The level is only ever raised alongside one of those filtering handlers.
+    What this does not cover is a handler the in-process caller attached to
+    the ``stel`` logger themselves: that one will now receive DEBUG records it
+    would previously have had to raise the level to see.
     """
     verbose = getattr(logger, _HANDLER_ATTR, None)
     diagnostics = getattr(logger, _DIAGNOSTICS_ATTR, None)
@@ -292,15 +349,32 @@ def _apply_channel_policy(logger: logging.Logger) -> None:
         logger.removeHandler(fallback)
         setattr(logger, _FALLBACK_ATTR, None)
 
-    if diagnostics is not None:
+    provider_channel = getattr(logger, _PROVIDER_DIAGNOSTICS_ATTR, None)
+    if provider_channel is not None:
+        logger.removeHandler(provider_channel)
+        setattr(logger, _PROVIDER_DIAGNOSTICS_ATTR, None)
+    # Read per call, not at import: the variable is part of the environment a
+    # test or an embedding caller changes between runs, and the answer decides
+    # both the level and the destination.
+    provider_debug = env_flag_enabled(PROVIDER_DEBUG_ENV)
+    if provider_debug and diagnostics is None:
+        channel = logging.StreamHandler(sys.stderr)
+        channel.setLevel(logging.DEBUG)
+        channel.addFilter(_is_provider_diagnostics)
+        channel.setFormatter(logging.Formatter(fmt="%(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(channel)
+        setattr(logger, _PROVIDER_DIAGNOSTICS_ATTR, channel)
+        provider_channel = channel
+
+    if diagnostics is not None or provider_debug:
         logger.setLevel(logging.DEBUG)
     elif verbose is not None:
         logger.setLevel(logging.INFO)
     else:
         logger.setLevel(logging.NOTSET)
-    logger.propagate = verbose is None and diagnostics is None
+    logger.propagate = verbose is None and diagnostics is None and provider_channel is None
 
-    if diagnostics is not None and verbose is None:
+    if not logger.propagate and verbose is None:
         stderr_fallback = logging.StreamHandler(sys.stderr)
         stderr_fallback.setLevel(logging.WARNING)
         logger.addHandler(stderr_fallback)

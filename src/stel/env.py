@@ -25,7 +25,9 @@ from typing import overload
 PROFILES_DIR_ENV = "STEL_PROFILES_DIR"
 # Truthy enables the stderr log handler and the live progress reporter.
 VERBOSE_ENV = "STEL_VERBOSE"
-# Truthy attaches unsanitized provider error detail to local tracebacks.
+# Truthy emits the redacted provider-error allowlist -- exception types, stel
+# frame locations, an external frame count, never native text -- to the
+# diagnostics file if one is configured, otherwise to stderr (issue #599).
 PROVIDER_DEBUG_ENV = "STEL_DEBUG_PROVIDER_ERRORS"
 # A path: sanitized failures also write their native exception and traceback
 # there (issue #590). The file is the only place that detail goes.
@@ -81,3 +83,14 @@ def read_env(*names: str, default: str | None = None) -> str | None:
         if value is not None:
             return value
     return default
+
+
+def env_flag_enabled(name: str) -> bool:
+    """Whether an on/off switch is set to a value a human would call enabled.
+
+    Shared rather than repeated at each reader: `logging_setup` has to agree
+    with `providers.base` about whether `STEL_DEBUG_PROVIDER_ERRORS` is on,
+    because one decides the destination and the other decides whether anything
+    is emitted, and a disagreement is silence rather than an error (#599).
+    """
+    return read_env(name, default="").strip().lower() in {"1", "true", "yes", "on"}

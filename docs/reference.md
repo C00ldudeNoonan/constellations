@@ -802,9 +802,12 @@ did write to it, the error message ends by naming the file. Treat it as the
 sensitive thing it is: it holds what every other channel exists to withhold.
 It covers the failures stel logs natively before sanitizing — store
 operations and index-build retries, document fetch and extraction, transform
-code — but not provider errors, which the provider layer sanitizes before any
-logger sees them; `STEL_DEBUG_PROVIDER_ERRORS=1` remains their separate,
-allowlisted hatch.
+code. Provider errors are sanitized before any logger sees them, so no native
+text exists for this file to carry; `STEL_DEBUG_PROVIDER_ERRORS=1` is their
+separate hatch and emits an allowlist instead — exception types, stel frame
+locations, an external frame count. Setting it is enough on its own: the
+allowlist goes to this file when one is configured and to stderr otherwise
+(issue #599). It never carries native text, whichever destination it takes.
 
 Under verbose, each incremental publication also emits safe telemetry
 (issue #292) — the progress reporter renders it on a TTY, the INFO log carries

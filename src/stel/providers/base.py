@@ -27,8 +27,9 @@ from ..credentials import (
     ProtectedCredential,
 )
 from ..endpoints import EndpointUrlError, OpenAICompatibleBaseUrl
-from ..env import PROVIDER_DEBUG_ENV, read_env
+from ..env import PROVIDER_DEBUG_ENV, env_flag_enabled
 from ..hashing import HASH_DIGEST_SIZE, canonical_fingerprint
+from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
 
 log = logging.getLogger(__name__)
 
@@ -139,9 +140,12 @@ def provider_error_debug_enabled() -> bool:
     that no redaction can anticipate, and debug logs are often shipped to
     aggregators. Diagnostics contain only exception types and stack locations;
     the switch exists for local diagnosis.
+
+    Setting it is sufficient on the CLI: `logging_setup` reads the same
+    variable and gives these records a destination, which until #599 they had
+    under no combination of flags.
     """
-    value = read_env(PROVIDER_DEBUG_ENV, default="")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return env_flag_enabled(PROVIDER_DEBUG_ENV)
 
 
 def redacted_exception_text(
@@ -1103,6 +1107,7 @@ class InferenceProvider(BaseProvider):
                         "%s sequential batch item failed:\n%s",
                         self.name(),
                         redacted_exception_text(error),
+                        extra=PROVIDER_DIAGNOSTICS_EXTRA,
                     )
                 items.append(
                     BatchInferenceItem(
@@ -1170,6 +1175,7 @@ class InferenceProvider(BaseProvider):
                         "%s batch item validation failed:\n%s",
                         self.name(),
                         redacted_exception_text(error),
+                        extra=PROVIDER_DIAGNOSTICS_EXTRA,
                     )
                 items.append(
                     BatchInferenceItem(
@@ -1265,6 +1271,7 @@ class EmbeddingProvider(BaseProvider):
                     "%s embedding failed:\n%s",
                     self.name(),
                     redacted_exception_text(error),
+                    extra=PROVIDER_DIAGNOSTICS_EXTRA,
                 )
             failure = provider_request_error(self.name(), "embedding", error)
         if failure is not None:

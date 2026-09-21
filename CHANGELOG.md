@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### `STEL_DEBUG_PROVIDER_ERRORS` now emits something (issue #599)
+
+- **The switch was inert under every combination of flags.** Its nine call
+  sites are guarded by `provider_error_debug_enabled() and
+  log.isEnabledFor(logging.DEBUG)`. The operator controls the first; the
+  second is false whenever the CLI configures logging, because `-v` is capped
+  at INFO by design and the documented hatch -- attach your own handler -- is
+  reachable only from in-process Python, while every orchestrated run is a
+  `stel build` subprocess. Setting the variable produced silence, with nothing
+  to indicate it had not taken effect.
+- **`--diagnostics-file` did not quietly cover it either**, which is the part
+  worth knowing: that file's filter takes records carrying an `exc_info`, and
+  these carry none *because* `redacted_exception_text` exists so native text
+  never rides along. With both switches set the branch fired and the record
+  was then dropped.
+- The variable is now sufficient on its own. It raises the `stel` logger to
+  DEBUG itself and installs a stderr channel scoped to these records; with a
+  diagnostics file configured they go there instead, so diagnostics stay one
+  artifact. What it discloses is unchanged -- exception types, stel frame
+  locations, an external frame count, never native text, and nothing at all
+  unless you set it. ADR-0014 records the four options and why this one;
+  ADR-0012 is amended where it said this channel was out of scope.
+
 ### CI runs the suite across every core and keeps per-test results (issue #603)
 
 - **CI spent 186 of its 200 seconds in a single-process pytest on a four-core
@@ -21,7 +44,7 @@
 
 ### `classic_ml` naive-Bayes fitting no longer holds the whole corpus in memory (issue #585)
 
-Same shape as #584 (the text vectorizer in `text.py`, still open), found while
+Same shape as #584 (the text vectorizer in `text.py`), found while
 investigating it: `_fit_naive_bayes` built a `list[list[str]]` of every
 document's tokens up front. Unlike `_fit_vectorizer`, this one genuinely needs
 the corpus twice — `vocab_set` must be known before the second pass can filter

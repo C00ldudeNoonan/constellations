@@ -1,6 +1,6 @@
 # ADR-0012: The native detail behind a sanitized failure goes to a file the operator named, never to a log level
 
-- **Status:** accepted
+- **Status:** accepted; amended by [ADR-0014](0014-a-debug-switch-owns-its-destination.md)
 - **Date:** 2026-09-20
 - **Prompted by:** #590
 
@@ -99,7 +99,11 @@ An explicit call is one more thing a new sanitize site must remember.
 - Provider errors are not in the file. The provider layer sanitizes before
   any logger sees the native exception and has its own allowlisted hatch,
   `STEL_DEBUG_PROVIDER_ERRORS`. Bringing provider detail under this file is a
-  separate decision about that layer.
+  separate decision about that layer. **Amended by ADR-0014:** that hatch
+  turned out to emit nothing at all, and its allowlist -- never native text --
+  now reaches this file when one is configured.
 - The record filter is `exc_info is not None or level >= WARNING`. A new
   sanitize site that logs the native exception without `exc_info` will not
-  reach the file; the convention is now load-bearing.
+  reach the file; the convention is now load-bearing. **Amended by ADR-0014:**
+  that is exactly how the provider hatch's records were lost, so a record may
+  now also declare itself with `PROVIDER_DIAGNOSTICS_EXTRA`.

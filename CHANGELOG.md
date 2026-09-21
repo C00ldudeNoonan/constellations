@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Tuning a search model's publish page no longer rewrites the corpus (issue #587)
+
+- **`batch_size`, `on_index_change` and `index_options` were in a `search:`
+  model's `code_version`.** The docs said they were not, and the descriptor
+  already excluded them, but the hash took the whole block. Lowering
+  `batch_size`, the fix for a publish that could not allocate its page
+  (#592), reclassified all 3,644,778 published rows of a production model as
+  changed: a five-to-six-hour full republish for a change that cannot alter
+  one stored row, charged at the exact moment the publish was already broken.
+  `refine_factor`, the field the issue was filed against, was already
+  excluded; pinned now rather than assumed.
+- A `search:` model's `code_version` is now built from the descriptor's own
+  semantic projection plus `store` and `collection`, through one function, so
+  the two cannot drift. Routing stays in deliberately: state that said
+  "published" against a collection the rows were never written to would
+  leave the new one empty. A contract test lists the fields the hash reads,
+  so adding one to `SearchConfig` is a decision with a named cost rather than
+  a surprise republish on upgrade.
+- **Upgrade note.** Every `search:` model's `code_version` changes once with
+  this release, so `stel plan` will report every published row as changed
+  and the next publish rewrites the collection. There is no way to change
+  what the hash reads without this. If you are lowering `batch_size` for
+  #592 anyway, do both in the same publish and pay once.
+
 ### `STEL_DEBUG_PROVIDER_ERRORS` now emits something (issue #599)
 
 - **The switch was inert under every combination of flags.** Its nine call

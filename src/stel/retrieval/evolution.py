@@ -128,6 +128,25 @@ def semantic_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     return projected
 
 
+def search_code_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a dumped `SearchConfig` onto what a published row's identity depends on.
+
+    The semantic projection plus routing. Routing stays in: `store` and
+    `collection` select which physical collection holds the rows, and state
+    that said "published" against a collection the rows were never written to
+    would leave the new one empty. What `semantic_search_config` drops as
+    cadence -- `batch_size`, `index_options`, `on_index_change`, and the
+    query-time `vector.refine_factor` -- stays out, because a field that
+    cannot change a stored row must not re-key every stored row (issue #587).
+    `code_version` is built from this, so the two projections cannot drift.
+    """
+    identity = semantic_search_config(dict(payload))
+    for key in sorted(ROUTING_FIELDS):
+        if key in payload:
+            identity[key] = json_safe(payload[key])
+    return identity
+
+
 def classify_changes(
     stored: dict[str, Any], current: dict[str, Any]
 ) -> list[ConfigChange]:

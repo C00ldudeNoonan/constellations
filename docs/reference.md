@@ -802,9 +802,12 @@ did write to it, the error message ends by naming the file. Treat it as the
 sensitive thing it is: it holds what every other channel exists to withhold.
 It covers the failures stel logs natively before sanitizing — store
 operations and index-build retries, document fetch and extraction, transform
-code — but not provider errors, which the provider layer sanitizes before any
-logger sees them; `STEL_DEBUG_PROVIDER_ERRORS=1` remains their separate,
-allowlisted hatch.
+code. Provider errors are sanitized before any logger sees them, so no native
+text exists for this file to carry; `STEL_DEBUG_PROVIDER_ERRORS=1` is their
+separate hatch and emits an allowlist instead — exception types, stel frame
+locations, an external frame count. Setting it is enough on its own: the
+allowlist goes to this file when one is configured and to stderr otherwise
+(issue #599). It never carries native text, whichever destination it takes.
 
 Under verbose, each incremental publication also emits safe telemetry
 (issue #292) — the progress reporter renders it on a TTY, the INFO log carries
@@ -3084,7 +3087,13 @@ Fields that only affect execution cadence are not part of the descriptor and
 never invalidate an index: **`batch_size`**, **`index_options`**, and
 `on_index_change` itself. Tuning publish pacing is free. So is
 **`vector: {refine_factor: ...}`**, which changes how a query is answered
-rather than what was published.
+rather than what was published. The same four are outside the model's
+`code_version`, so changing one does not reclassify a single published row:
+`stel plan` reports the model `unchanged`, and the next publish touches only
+rows whose input actually changed (issue #587). What *is* in `code_version`
+for a `search:` model is exactly the descriptor's semantic projection plus
+`store` and `collection`, so the two can never disagree about what a change
+costs.
 
 `batch_size` counts rows, and it sets the publish page: one page is one
 ledger read pair and one state MERGE, so raising it cuts warehouse round
@@ -4516,15 +4525,23 @@ my_project:
         flush_interval_seconds: 5.0   # default
 ```
 
-**`run_log`** (issue #306) — one row per model per invocation: `invocation_id`,
-`model_name`, `kind`, `status`, resolved `provider`/`provider_model`/
-`provider_implementation`, `rows_processed`/`rows_skipped`/`rows_written`,
-`api_calls`, `cache_hits`, `input_tokens`, `output_tokens`,
-`estimated_cost_usd` (when the profile sets `pricing:`), `duration_seconds`,
-`started_at`, `completed_at`. This is a durable sink for numbers stel already
-meters, not a second meter. A `status: budget_exceeded` row makes a tripped
-budget visible after the fact rather than only in the terminal output of the
-run that hit it.
+**`run_log`** (issue #306) — one row per model per `stel run` or `stel build`
+invocation: `invocation_id`, `model_name`, `kind`, `status`, resolved
+`provider`/`provider_model`/`provider_implementation`,
+`rows_processed`/`rows_skipped`/`rows_written`, `api_calls`, `cache_hits`,
+`input_tokens`, `output_tokens`, `estimated_cost_usd` (when the profile sets
+`pricing:`), `duration_seconds`, `started_at`, `completed_at`. This is a
+durable sink for numbers stel already meters, not a second meter. A `status:
+budget_exceeded` row makes a tripped budget visible after the fact rather than
+only in the terminal output of the run that hit it. `tests_passed`/
+`tests_failed`/`tests_warned`/`tests_skipped` (issue #575) carry a build's
+per-model test outcome. `tests_skipped` counts tests that were switched off on
+purpose, such as a disabled `embedding_canary`, so a row that ran nothing is
+not mistaken for one that had no tests. They are null on a `stel run` row,
+which has no notion of tests, and on a `skipped` row: a build writes one for
+each selected model that never ran because an upstream model errored or
+hard-failed a test, so it can be told apart from a model that was not
+selected.
 
 **`mcp_query_log`** (issues #329, #528) — one row per served tool call, for
 all four tools: `logged_at`, `tool`, `request_id`, `client_name`,

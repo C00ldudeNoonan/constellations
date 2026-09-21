@@ -60,6 +60,7 @@ _STEL_CHANNEL_ATTRS = (
     "_stel_verbose_handler",
     "_stel_diagnostics_handler",
     "_stel_fallback_handler",
+    "_stel_provider_diagnostics_handler",
 )
 
 

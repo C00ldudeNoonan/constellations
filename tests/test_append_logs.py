@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ from stel.append_log import (
     run_log_rows,
     write_rows,
 )
+from stel.checks.schema import TestResult
 from stel.config.profile import QueryLogConfig, RunLogConfig
 from stel.execution.contracts import ModelRunResult
 
@@ -174,6 +177,7 @@ def test_run_log_rows_carry_identity_and_aggregates() -> None:
         started_at="2026-08-21T00:00:00+00:00",
         completed_at="2026-08-21T00:00:05+00:00",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["invocation_id"] == "abc"
@@ -181,6 +185,84 @@ def test_run_log_rows_carry_identity_and_aggregates() -> None:
     assert rows[0]["rows_processed"] == 10
     assert rows[0]["input_tokens"] == 900
     assert rows[0]["status"] == "success"
+
+
+def test_run_log_rows_leave_test_counts_null_with_no_test_results() -> None:
+    """`stel run` has no notion of tests -- null, not zero (issue #575)."""
+    rows = run_log_rows(
+        [_result()],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+        test_results=None,
+    )
+
+    assert rows[0]["tests_passed"] is None
+    assert rows[0]["tests_failed"] is None
+    assert rows[0]["tests_warned"] is None
+
+
+def test_run_log_rows_count_a_models_tests_by_status() -> None:
+    """A build's per-model test outcome rides along on the same row (#575)."""
+    rows = run_log_rows(
+        [_result(model_name="notes"), _result(model_name="other")],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+        test_results=[
+            TestResult(
+                test_name="not_null", model_name="notes", column="body", status="pass"
+            ),
+            TestResult(
+                test_name="unique", model_name="notes", column="note_id", status="fail"
+            ),
+            TestResult(
+                test_name="accepted_values",
+                model_name="notes",
+                column="kind",
+                status="warn",
+            ),
+            # A disabled embedding_canary reports `skipped`: visible on
+            # purpose, so the row must not read as "no tests".
+            TestResult(
+                test_name="embedding_canary",
+                model_name="notes",
+                column=None,
+                status="skipped",
+            ),
+        ],
+    )
+
+    by_model = {row["model_name"]: row for row in rows}
+    assert by_model["notes"]["tests_passed"] == 1
+    assert by_model["notes"]["tests_failed"] == 1
+    assert by_model["notes"]["tests_warned"] == 1
+    assert by_model["notes"]["tests_skipped"] == 1
+    # A selected model that ran no tests is zero, not null: the caller did
+    # pass test_results, it is just empty for this model.
+    assert by_model["other"]["tests_passed"] == 0
+    assert by_model["other"]["tests_failed"] == 0
+    assert by_model["other"]["tests_warned"] == 0
+    assert by_model["other"]["tests_skipped"] == 0
+
+
+def test_run_log_rows_leave_a_skipped_models_test_counts_null() -> None:
+    """A model blocked by an upstream failure ran no tests: null, not the
+    zeros that mean "ran them, found none" (issue #575)."""
+    rows = run_log_rows(
+        [_result(model_name="downstream", status="skipped")],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+        test_results=[],
+    )
+
+    assert rows[0]["status"] == "skipped"
+    assert rows[0]["tests_passed"] is None
+    assert rows[0]["tests_skipped"] is None
 
 
 def test_a_budget_exceeded_run_is_visible_after_the_fact() -> None:
@@ -191,6 +273,7 @@ def test_a_budget_exceeded_run_is_visible_after_the_fact() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["status"] == "budget_exceeded"
@@ -209,6 +292,7 @@ def test_run_log_rows_carry_no_text_or_credentials() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     serialized = json.dumps(rows[0])
@@ -285,6 +369,139 @@ def test_each_invocation_appends_a_row(tmp_path: Path) -> None:
     assert rows[1][3:] == (0, 3)
 
 
+def test_build_project_writes_the_run_log_too(tmp_path: Path) -> None:
+    """The bug in issue #575: `write_rows(run_log)` was only reachable from
+    `run_project`, so a project driven by `stel build` -- what an orchestrator
+    uses, since it runs tests too -- never got a row."""
+    from stel.runner import build_project
+
+    project = _log_project(tmp_path, run_log=True)
+    build_project(project)
+
+    rows = _log_rows(project)
+    assert len(rows) == 1
+    assert rows[0][1] == "notes"
+
+
+def test_build_run_log_row_carries_its_test_outcome(tmp_path: Path) -> None:
+    """The run log is where an operator reads a build's per-model outcome, and
+    a build's outcome includes its tests (issue #575)."""
+    from stel.runner import build_project
+
+    project = _log_project(tmp_path, run_log=True)
+    models = project / "models" / "m.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "    tests:\n      - not_null: [note_id, body]\n"
+        "      - min_rows: 100\n        severity: warn\n",
+        encoding="utf-8",
+    )
+
+    result = build_project(project)
+
+    expected = Counter(t.status for t in result.test_results)
+    assert expected["warn"] == 1 and expected["pass"] >= 1  # the setup is real
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        row = con.execute(
+            "SELECT tests_passed, tests_failed, tests_warned FROM main.stel_run_log"
+        ).fetchall()
+    finally:
+        con.close()
+    assert row == [(expected["pass"], 0, expected["warn"])]
+
+
+def test_build_widens_a_run_log_created_before_the_test_columns(
+    tmp_path: Path,
+) -> None:
+    """The three columns arrive on a table that already holds history. Log
+    writes are best-effort, so a write that failed on the old shape would stop
+    the record at the upgrade without a word (issue #575)."""
+    from stel.runner import build_project
+
+    project = _log_project(tmp_path, run_log=True)
+    (project / "target").mkdir()
+    old_shape = pl.DataFrame(
+        schema={k: v for k, v in RUN_LOG_SCHEMA.items() if not k.startswith("tests_")}
+    )
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        con.register("old_shape", old_shape)
+        con.execute("CREATE TABLE main.stel_run_log AS SELECT * FROM old_shape")
+        con.execute(
+            "INSERT INTO main.stel_run_log (invocation_id, model_name) "
+            "VALUES ('older', 'legacy')"
+        )
+    finally:
+        con.close()
+
+    build_project(project)
+
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT model_name, tests_passed FROM main.stel_run_log "
+            "ORDER BY model_name"
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows == [("legacy", None), ("notes", 0)]
+
+
+def test_build_logs_a_model_its_upstream_blocked_as_skipped(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    """One row per selected model is the documented contract. A model that
+    never ran because an upstream failed must still appear, or an operator
+    cannot tell it from one that was not selected (issue #575)."""
+    from stel.runner import build_project
+    from stel.synth import generate_invoices
+
+    project = tmp_path / "project"
+    shutil.copytree(
+        example_project_dir,
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    generate_invoices(2, project / "data" / "invoices", seed=1)
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      run_log:\n        enabled: true\n",
+        encoding="utf-8",
+    )
+    # Chain the two transforms so a failure in the first blocks the second.
+    totals = project / "models" / "monthly_totals.yml"
+    totals.write_text(
+        totals.read_text(encoding="utf-8").replace(
+            "ref('raw_invoices')", "ref('invoice_summary')"
+        ),
+        encoding="utf-8",
+    )
+    (project / "transforms" / "summarize.py").write_text(
+        "import polars as pl\n\n\n"
+        "def run(deps: dict[str, pl.DataFrame], ctx: object = None) -> pl.DataFrame:\n"
+        '    raise RuntimeError("deliberate failure")\n',
+        encoding="utf-8",
+    )
+
+    result = build_project(project)
+
+    assert result.skipped == ["monthly_totals"]
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT model_name, status, tests_passed FROM stel.stel.stel_run_log "
+            "ORDER BY model_name"
+        ).fetchall()
+    finally:
+        con.close()
+    by_model = {name: (status, passed) for name, status, passed in rows}
+    assert by_model["monthly_totals"] == ("skipped", None)
+    assert by_model["invoice_summary"][0] == "error"
+    assert len(rows) == 3  # nothing selected went unrecorded
+
+
 def test_no_log_relation_exists_when_disabled(tmp_path: Path) -> None:
     from stel.runner import run_project
 
@@ -328,6 +545,7 @@ def test_a_first_all_null_batch_does_not_poison_the_schema(tmp_path: Path) -> No
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
     second = run_log_rows(
         [_result(provider="vertex", metrics={"api_calls": 3})],
@@ -335,6 +553,7 @@ def test_a_first_all_null_batch_does_not_poison_the_schema(tmp_path: Path) -> No
         started_at="t2",
         completed_at="t3",
         profile_target="dev",
+        test_results=None,
     )
 
     with _adapter(tmp_path) as adapter:
@@ -411,6 +630,7 @@ def test_the_estimated_cost_metric_is_the_one_extraction_publishes() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["estimated_cost_usd"] == pytest.approx(0.0421)
@@ -423,6 +643,7 @@ def test_provider_reported_cost_stands_in_when_no_estimate_exists() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["estimated_cost_usd"] == pytest.approx(0.5)

@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from ..credentials import CredentialReference
+from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
 from ..optional_dependencies import (
     OptionalDependencyError,
     import_optional_dependency,
@@ -410,6 +411,7 @@ class VertexInferenceProvider(InferenceProvider):
                 log.debug(
                     "vertex inference request failed:\n%s",
                     redacted_exception_text(error),
+                    extra=PROVIDER_DIAGNOSTICS_EXTRA,
                 )
             failure = provider_request_error(self.name(), "inference", error)
         del request

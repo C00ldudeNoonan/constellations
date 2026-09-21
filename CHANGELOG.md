@@ -21,6 +21,24 @@ at a time. It now re-analyzes per row in each pass instead of reusing a stored
   advisories publishing turned every branch red; carried in #595 because it
   was the branch open when they landed.
 
+### `stel[all]` carries the `mcp` extra's token-verifier floors (issue #597)
+
+- **The everything-install was the one that trusted someone else's dependency
+  graph.** The `mcp` extra declares `pyjwt[crypto]>=2.10` and `httpx>=0.27`
+  beside `mcp` itself — the JWT/JWKS verifier (#392) and the RFC 7662
+  introspection verifier (#464) — precisely because a feature that
+  authenticates callers should not depend on what `mcp` happens to require.
+  `all` carried `mcp` and neither floor, so `stel[all]` got its verifiers
+  transitively. Latent, not live: `mcp` 1.28.1 requires both above stel's
+  floors today. It breaks the day `mcp` drops, loosens or lowers either one,
+  and the failure lands on the path whose failure mode is a caller who should
+  have been refused.
+- `all` is hand-maintained, so it drifts silently — this gap was the proof.
+  `test_the_all_extra_is_a_superset_of_every_other_extra` now fails when any
+  extra declares a requirement `all` does not, naming the extra and the
+  missing lines. `docs/reference.md` already described `all` as "every
+  optional feature above"; the metadata now says so too.
+
 ### `classic_ml` text vectorizing no longer holds the whole corpus in memory (issue #584)
 
 `_fit_vectorizer` and the feature-extraction transform path in

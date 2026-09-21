@@ -28,6 +28,7 @@ from stel.config.profile import LLMConfig
 from stel.config.project import ExtractionDefaults, ProjectConfig
 from stel.hashing import HASH_DIGEST_SIZE
 from stel.profile import ResolvedProfile
+from stel.retrieval.evolution import search_code_identity
 from stel.versioning import (
     compute_code_version,
     compute_content_hash,
@@ -432,6 +433,124 @@ def test_search_dependency_changes_model_code_version(tmp_path: Path) -> None:
     assert compute_model_code_version(first, project, tmp_path) != (
         compute_model_code_version(second, project, tmp_path)
     )
+
+
+def _search_config(**overrides: Any) -> SearchConfig:
+    """A search model shaped like the one #587 was filed against: ANN index,
+    hybrid modes, online index changes, a large publish page."""
+    payload: dict[str, Any] = {
+        "access": "governed",
+        "store": "local",
+        "collection": "sec_chunks",
+        "id_field": "context_id",
+        "text_fields": ("text",),
+        "vector": {
+            "field": "embedding",
+            "dimensions": 8,
+            "metric": "cosine",
+            "search": "approximate",
+            "index": "ivf_pq",
+            "embedding": "inherit",
+        },
+        "full_text": {"fields": ["text"]},
+        "attributes": ({"name": "tenant_id", "data_type": "string", "filter_role": "policy"},),
+        "query": {"modes": ["vector", "text", "hybrid"]},
+        "on_index_change": "online",
+        "batch_size": 25_000,
+    }
+    vector = overrides.pop("vector", None)
+    if vector is not None:
+        payload["vector"] = {**payload["vector"], **vector}
+    payload.update(overrides)
+    return SearchConfig.model_validate(payload)
+
+
+def _search_code_version(search: SearchConfig, tmp_path: Path) -> str:
+    return compute_code_version(
+        extraction=None,
+        transform=None,
+        search=search,
+        depends_on=["sec_chunk_embeddings"],
+        project_dir=tmp_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "tuned",
+    [
+        pytest.param({"batch_size": 15_000}, id="batch_size"),
+        pytest.param({"on_index_change": "rebuild"}, id="on_index_change"),
+        pytest.param({"index_options": {"num_partitions": 512}}, id="index_options"),
+        pytest.param({"vector": {"refine_factor": 30}}, id="refine_factor"),
+    ],
+)
+def test_search_cadence_and_query_time_fields_stay_out_of_code_version(
+    tmp_path: Path, tuned: dict[str, Any]
+) -> None:
+    """A field that cannot change a stored row must not re-key every stored row
+    (issue #587). `batch_size` is the incident: lowering it was the fix for a
+    failing publish (#592), and it marked 3.6M published rows as changed. The
+    docs promised all four were outside `code_version`; only `refine_factor`
+    was."""
+    assert _search_code_version(_search_config(), tmp_path) == (
+        _search_code_version(_search_config(**tuned), tmp_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        pytest.param({"collection": "sec_chunks_v2"}, id="collection"),
+        pytest.param({"store": "other"}, id="store"),
+        pytest.param({"vector": {"index": "ivf_hnsw_flat"}}, id="vector.index"),
+        pytest.param(
+            {
+                "attributes": (
+                    {"name": "tenant_id", "data_type": "string", "filter_role": "policy"},
+                    {"name": "form_type", "data_type": "string", "returned": True},
+                )
+            },
+            id="attributes",
+        ),
+    ],
+)
+def test_search_identity_and_routing_fields_change_code_version(
+    tmp_path: Path, changed: dict[str, Any]
+) -> None:
+    """Routing stays in on purpose: state that said "published" against a
+    collection the rows were never written to would leave the new one empty."""
+    assert _search_code_version(_search_config(), tmp_path) != (
+        _search_code_version(_search_config(**changed), tmp_path)
+    )
+
+
+def test_search_code_identity_keys_are_a_decision() -> None:
+    """The fields `code_version` reads from a `search:` block, as data.
+
+    Adding a field to `SearchConfig` changes this set and therefore every
+    search model's `code_version` on upgrade, which on a large corpus is a
+    full republish. That is sometimes right (the field changes what a row is)
+    and sometimes a defect (it is cadence, and belongs in
+    `NON_SEMANTIC_FIELDS`), but it is never an accident: this test makes it a
+    decision by failing until the new key is listed here.
+    """
+    identity = search_code_identity(_search_config().model_dump(mode="python"))
+    assert set(identity) == {
+        "access",
+        "attributes",
+        "chunk_id_field",
+        "collection",
+        "display_fields",
+        "document_id_field",
+        "full_text",
+        "id_field",
+        "query",
+        "return_text_fields",
+        "store",
+        "text_fields",
+        "vector",
+    }
+    assert "refine_factor" not in identity["vector"]
 
 
 def test_provider_implementation_changes_model_code_version(

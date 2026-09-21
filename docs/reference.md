@@ -3084,7 +3084,13 @@ Fields that only affect execution cadence are not part of the descriptor and
 never invalidate an index: **`batch_size`**, **`index_options`**, and
 `on_index_change` itself. Tuning publish pacing is free. So is
 **`vector: {refine_factor: ...}`**, which changes how a query is answered
-rather than what was published.
+rather than what was published. The same four are outside the model's
+`code_version`, so changing one does not reclassify a single published row:
+`stel plan` reports the model `unchanged`, and the next publish touches only
+rows whose input actually changed (issue #587). What *is* in `code_version`
+for a `search:` model is exactly the descriptor's semantic projection plus
+`store` and `collection`, so the two can never disagree about what a change
+costs.
 
 `batch_size` counts rows, and it sets the publish page: one page is one
 ledger read pair and one state MERGE, so raising it cuts warehouse round

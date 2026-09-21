@@ -38,6 +38,7 @@ from .providers import (
     profile_options_fingerprint,
     resolve_provider_model,
 )
+from .retrieval.evolution import search_code_identity
 from .sql_models import SQL_COMPILER_CONTRACT_VERSION
 
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -164,14 +165,14 @@ def compute_code_version(
             if llm
             else None
         ),
-        # `vector.refine_factor` re-ranks an ANN index's candidates at query
-        # time (issue #520). It changes no published row, so it must not
-        # re-key the model: turning it on would otherwise reprocess the corpus
-        # to change how a query is answered.
+        # The descriptor's own notion of what defines the index, plus routing.
+        # Publish cadence (`batch_size`, `index_options`, `on_index_change`)
+        # and the query-time `vector.refine_factor` (issue #520) change no
+        # published row, so they must not re-key the model: a 3.6M-row corpus
+        # was rewritten in full for a `batch_size` change that had to be made
+        # to recover from a failing publish (issue #587).
         "search": (
-            search.model_dump(mode="python", exclude={"vector": {"refine_factor"}})
-            if search
-            else None
+            search_code_identity(search.model_dump(mode="python")) if search else None
         ),
         "agent_context": (
             agent_context.model_dump(mode="json") if agent_context else None

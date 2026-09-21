@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -223,6 +224,14 @@ def test_run_log_rows_count_a_models_tests_by_status() -> None:
                 column="kind",
                 status="warn",
             ),
+            # A disabled embedding_canary reports `skipped`: visible on
+            # purpose, so the row must not read as "no tests".
+            TestResult(
+                test_name="embedding_canary",
+                model_name="notes",
+                column=None,
+                status="skipped",
+            ),
         ],
     )
 
@@ -230,11 +239,30 @@ def test_run_log_rows_count_a_models_tests_by_status() -> None:
     assert by_model["notes"]["tests_passed"] == 1
     assert by_model["notes"]["tests_failed"] == 1
     assert by_model["notes"]["tests_warned"] == 1
+    assert by_model["notes"]["tests_skipped"] == 1
     # A selected model that ran no tests is zero, not null: the caller did
     # pass test_results, it is just empty for this model.
     assert by_model["other"]["tests_passed"] == 0
     assert by_model["other"]["tests_failed"] == 0
     assert by_model["other"]["tests_warned"] == 0
+    assert by_model["other"]["tests_skipped"] == 0
+
+
+def test_run_log_rows_leave_a_skipped_models_test_counts_null() -> None:
+    """A model blocked by an upstream failure ran no tests: null, not the
+    zeros that mean "ran them, found none" (issue #575)."""
+    rows = run_log_rows(
+        [_result(model_name="downstream", status="skipped")],
+        invocation_id="abc",
+        started_at="t0",
+        completed_at="t1",
+        profile_target="dev",
+        test_results=[],
+    )
+
+    assert rows[0]["status"] == "skipped"
+    assert rows[0]["tests_passed"] is None
+    assert rows[0]["tests_skipped"] is None
 
 
 def test_a_budget_exceeded_run_is_visible_after_the_fact() -> None:
@@ -363,9 +391,10 @@ def test_build_run_log_row_carries_its_test_outcome(tmp_path: Path) -> None:
     project = _log_project(tmp_path, run_log=True)
     models = project / "models" / "m.yml"
     models.write_text(
-        models.read_text()
+        models.read_text(encoding="utf-8")
         + "    tests:\n      - not_null: [note_id, body]\n"
-        "      - min_rows: 100\n        severity: warn\n"
+        "      - min_rows: 100\n        severity: warn\n",
+        encoding="utf-8",
     )
 
     result = build_project(project)
@@ -417,6 +446,60 @@ def test_build_widens_a_run_log_created_before_the_test_columns(
     finally:
         con.close()
     assert rows == [("legacy", None), ("notes", 0)]
+
+
+def test_build_logs_a_model_its_upstream_blocked_as_skipped(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    """One row per selected model is the documented contract. A model that
+    never ran because an upstream failed must still appear, or an operator
+    cannot tell it from one that was not selected (issue #575)."""
+    from stel.runner import build_project
+    from stel.synth import generate_invoices
+
+    project = tmp_path / "project"
+    shutil.copytree(
+        example_project_dir,
+        project,
+        ignore=shutil.ignore_patterns("data", "target", "__pycache__"),
+    )
+    generate_invoices(2, project / "data" / "invoices", seed=1)
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8")
+        + "      run_log:\n        enabled: true\n",
+        encoding="utf-8",
+    )
+    # Chain the two transforms so a failure in the first blocks the second.
+    totals = project / "models" / "monthly_totals.yml"
+    totals.write_text(
+        totals.read_text(encoding="utf-8").replace(
+            "ref('raw_invoices')", "ref('invoice_summary')"
+        ),
+        encoding="utf-8",
+    )
+    (project / "transforms" / "summarize.py").write_text(
+        "import polars as pl\n\n\n"
+        "def run(deps: dict[str, pl.DataFrame], ctx: object = None) -> pl.DataFrame:\n"
+        '    raise RuntimeError("deliberate failure")\n',
+        encoding="utf-8",
+    )
+
+    result = build_project(project)
+
+    assert result.skipped == ["monthly_totals"]
+    con = duckdb.connect(str(project / "target" / "stel.duckdb"), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT model_name, status, tests_passed FROM stel.stel.stel_run_log "
+            "ORDER BY model_name"
+        ).fetchall()
+    finally:
+        con.close()
+    by_model = {name: (status, passed) for name, status, passed in rows}
+    assert by_model["monthly_totals"] == ("skipped", None)
+    assert by_model["invoice_summary"][0] == "error"
+    assert len(rows) == 3  # nothing selected went unrecorded
 
 
 def test_no_log_relation_exists_when_disabled(tmp_path: Path) -> None:

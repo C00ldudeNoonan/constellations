@@ -449,6 +449,7 @@ def build_project(
     run_budget = _run_budget_ledger(resolved)
     out = BuildResult()
     blocked: set[str] = set()
+    skipped_results: list[ModelRunResult] = []
 
     started_at = datetime.now(UTC).isoformat()
     with adapter:
@@ -465,11 +466,22 @@ def build_project(
             accept_reprocess=accept_reprocess,
         )
         for name in selected:
+            model = models_by_name[name]
             if name in blocked:
                 out.skipped.append(name)
                 reporter.model_skipped(name, "upstream failed")
+                # Only the log gets a row: `out.run_results` also feeds
+                # `run_results.json` and the error count, which a skip is
+                # not part of.
+                skipped_results.append(
+                    ModelRunResult(
+                        model_name=name,
+                        materialization=model.materialization,
+                        kind=_model_kind_label(model),
+                        status="skipped",
+                    )
+                )
                 continue
-            model = models_by_name[name]
             try:
                 result = _run_model(
                     model=model,
@@ -544,7 +556,7 @@ def build_project(
             adapter,
             resolved.run_log,
             run_log_rows(
-                out.run_results,
+                [*out.run_results, *skipped_results],
                 invocation_id=uuid.uuid4().hex,
                 started_at=started_at,
                 completed_at=datetime.now(UTC).isoformat(),

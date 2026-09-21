@@ -243,9 +243,13 @@ a running server keeps applying a removed grant for up to
 by `stel build` — what an orchestrator uses, since it runs tests too — had the
 log enabled in its profile and never got a row. `build_project` now writes it
 with the same contract (after the models it describes, inside the adapter
-context, best-effort), and folds in each model's test outcome via three new
-`run_log` columns: `tests_passed`, `tests_failed`, `tests_warned`. They are
-null on a `stel run` row, which has no notion of tests.
+context, best-effort), and folds in each model's test outcome via four new
+`run_log` columns: `tests_passed`, `tests_failed`, `tests_warned` and
+`tests_skipped` (tests switched off on purpose, like a disabled
+`embedding_canary`). They are null on a `stel run` row, which has no notion of
+tests. A model a build skipped because an upstream model failed gets a row
+too, with `status: skipped` and null counts, so it is distinguishable from a
+model that was not selected. Existing run logs are widened in place.
 
 ### A governed read can execute as a warehouse principal narrower than the operator (issue #395)
 

@@ -4525,8 +4525,14 @@ invocation: `invocation_id`, `model_name`, `kind`, `status`, resolved
 durable sink for numbers stel already meters, not a second meter. A `status:
 budget_exceeded` row makes a tripped budget visible after the fact rather than
 only in the terminal output of the run that hit it. `tests_passed`/
-`tests_failed`/`tests_warned` (issue #575) carry a build's per-model test
-outcome — null on a `stel run` row, since a run has no notion of tests.
+`tests_failed`/`tests_warned`/`tests_skipped` (issue #575) carry a build's
+per-model test outcome. `tests_skipped` counts tests that were switched off on
+purpose, such as a disabled `embedding_canary`, so a row that ran nothing is
+not mistaken for one that had no tests. They are null on a `stel run` row,
+which has no notion of tests, and on a `skipped` row: a build writes one for
+each selected model that never ran because an upstream model errored or
+hard-failed a test, so it can be told apart from a model that was not
+selected.
 
 **`mcp_query_log`** (issues #329, #528) — one row per served tool call, for
 all four tools: `logged_at`, `tool`, `request_id`, `client_name`,

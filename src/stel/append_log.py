@@ -88,12 +88,14 @@ RUN_LOG_SCHEMA: dict[str, Any] = {
     "duration_seconds": pl.Float64,
     "started_at": pl.String,
     "completed_at": pl.String,
-    # Null for `stel run`, which has no notion of tests. `stel build` fills
-    # these from its own per-model test results (issue #575) -- counts only,
-    # same "identity and aggregates" rule as everything else in this row.
+    # Null for `stel run`, which has no notion of tests, and for a model a
+    # build skipped. `stel build` fills these from its own per-model test
+    # results (issue #575) -- counts only, same "identity and aggregates" rule
+    # as everything else in this row.
     "tests_passed": pl.Int64,
     "tests_failed": pl.Int64,
     "tests_warned": pl.Int64,
+    "tests_skipped": pl.Int64,
 }
 
 QUERY_LOG_SCHEMA: dict[str, Any] = {
@@ -286,18 +288,24 @@ def _usage(metrics: Mapping[str, Any], key: str) -> int:
     return max(int(value), 0)
 
 
+_TEST_COUNT_KEYS = ("tests_passed", "tests_failed", "tests_warned", "tests_skipped")
+
+
 def _test_counts(
-    test_results: Sequence[Any] | None, model_name: str
+    test_results: Sequence[Any] | None, result: Any
 ) -> dict[str, int | None]:
-    """Per-model test outcome counts, or null when the caller has no notion of
-    tests at all (`stel run`) rather than zero (`stel build` ran none)."""
-    if test_results is None:
-        return {"tests_passed": None, "tests_failed": None, "tests_warned": None}
-    model_tests = [t for t in test_results if t.model_name == model_name]
+    """Per-model test outcome counts, or null when no tests could have run:
+    the caller has no notion of tests at all (`stel run`), or the model was
+    skipped because an upstream failed. Null is not zero -- zero means the
+    build ran the model's tests and there were none to report."""
+    if test_results is None or result.status == "skipped":
+        return dict.fromkeys(_TEST_COUNT_KEYS)
+    model_tests = [t for t in test_results if t.model_name == result.model_name]
     return {
         "tests_passed": sum(1 for t in model_tests if t.status == "pass"),
         "tests_failed": sum(1 for t in model_tests if t.status == "fail"),
         "tests_warned": sum(1 for t in model_tests if t.status == "warn"),
+        "tests_skipped": sum(1 for t in model_tests if t.status == "skipped"),
     }
 
 
@@ -357,7 +365,7 @@ def run_log_rows(
                 "duration_seconds": result.duration_seconds,
                 "started_at": started_at,
                 "completed_at": completed_at,
-                **_test_counts(test_results, result.model_name),
+                **_test_counts(test_results, result),
             }
         )
     return rows

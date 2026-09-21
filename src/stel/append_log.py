@@ -308,7 +308,7 @@ def run_log_rows(
     started_at: str,
     completed_at: str,
     profile_target: str,
-    test_results: Sequence[Any] | None = None,
+    test_results: Sequence[Any] | None,
 ) -> list[dict[str, Any]]:
     """One row per model per invocation (issue #306).
 

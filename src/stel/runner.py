@@ -301,6 +301,8 @@ def run_project(
                 started_at=started_at,
                 completed_at=datetime.now(UTC).isoformat(),
                 profile_target=resolved.target_name,
+                # `run` has no notion of tests: null columns, not zeros.
+                test_results=None,
             ),
             schema=RUN_LOG_SCHEMA,
             what="the run log",

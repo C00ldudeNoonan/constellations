@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,7 @@ def test_run_log_rows_carry_identity_and_aggregates() -> None:
         started_at="2026-08-21T00:00:00+00:00",
         completed_at="2026-08-21T00:00:05+00:00",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["invocation_id"] == "abc"
@@ -192,6 +194,7 @@ def test_run_log_rows_leave_test_counts_null_with_no_test_results() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["tests_passed"] is None
@@ -242,6 +245,7 @@ def test_a_budget_exceeded_run_is_visible_after_the_fact() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["status"] == "budget_exceeded"
@@ -260,6 +264,7 @@ def test_run_log_rows_carry_no_text_or_credentials() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     serialized = json.dumps(rows[0])
@@ -350,6 +355,70 @@ def test_build_project_writes_the_run_log_too(tmp_path: Path) -> None:
     assert rows[0][1] == "notes"
 
 
+def test_build_run_log_row_carries_its_test_outcome(tmp_path: Path) -> None:
+    """The run log is where an operator reads a build's per-model outcome, and
+    a build's outcome includes its tests (issue #575)."""
+    from stel.runner import build_project
+
+    project = _log_project(tmp_path, run_log=True)
+    models = project / "models" / "m.yml"
+    models.write_text(
+        models.read_text()
+        + "    tests:\n      - not_null: [note_id, body]\n"
+        "      - min_rows: 100\n        severity: warn\n"
+    )
+
+    result = build_project(project)
+
+    expected = Counter(t.status for t in result.test_results)
+    assert expected["warn"] == 1 and expected["pass"] >= 1  # the setup is real
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        row = con.execute(
+            "SELECT tests_passed, tests_failed, tests_warned FROM main.stel_run_log"
+        ).fetchall()
+    finally:
+        con.close()
+    assert row == [(expected["pass"], 0, expected["warn"])]
+
+
+def test_build_widens_a_run_log_created_before_the_test_columns(
+    tmp_path: Path,
+) -> None:
+    """The three columns arrive on a table that already holds history. Log
+    writes are best-effort, so a write that failed on the old shape would stop
+    the record at the upgrade without a word (issue #575)."""
+    from stel.runner import build_project
+
+    project = _log_project(tmp_path, run_log=True)
+    (project / "target").mkdir()
+    old_shape = pl.DataFrame(
+        schema={k: v for k, v in RUN_LOG_SCHEMA.items() if not k.startswith("tests_")}
+    )
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        con.register("old_shape", old_shape)
+        con.execute("CREATE TABLE main.stel_run_log AS SELECT * FROM old_shape")
+        con.execute(
+            "INSERT INTO main.stel_run_log (invocation_id, model_name) "
+            "VALUES ('older', 'legacy')"
+        )
+    finally:
+        con.close()
+
+    build_project(project)
+
+    con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT model_name, tests_passed FROM main.stel_run_log "
+            "ORDER BY model_name"
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows == [("legacy", None), ("notes", 0)]
+
+
 def test_no_log_relation_exists_when_disabled(tmp_path: Path) -> None:
     from stel.runner import run_project
 
@@ -393,6 +462,7 @@ def test_a_first_all_null_batch_does_not_poison_the_schema(tmp_path: Path) -> No
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
     second = run_log_rows(
         [_result(provider="vertex", metrics={"api_calls": 3})],
@@ -400,6 +470,7 @@ def test_a_first_all_null_batch_does_not_poison_the_schema(tmp_path: Path) -> No
         started_at="t2",
         completed_at="t3",
         profile_target="dev",
+        test_results=None,
     )
 
     with _adapter(tmp_path) as adapter:
@@ -476,6 +547,7 @@ def test_the_estimated_cost_metric_is_the_one_extraction_publishes() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["estimated_cost_usd"] == pytest.approx(0.0421)
@@ -488,6 +560,7 @@ def test_provider_reported_cost_stands_in_when_no_estimate_exists() -> None:
         started_at="t0",
         completed_at="t1",
         profile_target="dev",
+        test_results=None,
     )
 
     assert rows[0]["estimated_cost_usd"] == pytest.approx(0.5)

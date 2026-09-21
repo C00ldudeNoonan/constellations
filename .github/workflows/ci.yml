@@ -28,5 +28,17 @@ jobs:
         run: uv run ruff check
       - name: Ty
         run: uv run ty check
+      # One worker per core, files kept together: a file's fixtures and any
+      # within-file ordering stay as they are on a serial run, and process-global
+      # state is per worker. Measured 248s -> 90s on four cores (issue #603).
       - name: Pytest
-        run: uv run pytest -q
+        run: uv run pytest -q -n auto --dist loadfile --junitxml=target/ci/junit.xml
+      # Per-test results, run over run: what turns an order-dependent or flaky
+      # test from an anecdote into a history.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ github.run_id }}
+          path: target/ci/junit.xml
+          retention-days: 30

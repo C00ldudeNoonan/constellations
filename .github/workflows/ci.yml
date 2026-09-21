@@ -39,6 +39,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ github.run_id }}
+          name: junit-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci/junit.xml
           retention-days: 30

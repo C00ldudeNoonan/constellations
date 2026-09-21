@@ -75,6 +75,18 @@ class RetrievalFeature(StrEnum):
     INDEX_READINESS = "index_readiness"
     DURABLE_WRITE_ACK = "durable_write_ack"
     ATOMIC_BATCH_MUTATION = "atomic_batch_mutation"
+    # The other half of the receipt contract, which
+    # `docs/architecture/semantic-retrieval.md` has always specified and the
+    # enum never carried: "a store must provide exact per-ID durable outcomes
+    # *or* prove ATOMIC_BATCH_MUTATION and return an all-success atomic
+    # receipt."
+    #
+    # A store proves this by confirming, after the write, that every id it was
+    # handed is durably present -- and by raising rather than returning a
+    # receipt when any is not. That is what makes a receipt trustworthy
+    # without the whole batch being one transaction, which is the case a store
+    # that has to split an oversized payload is in (issue #592).
+    EXACT_MUTATION_RECEIPTS = "exact_mutation_receipts"
     # Store-side publisher fencing proofs (issue #152). A warehouse fencing
     # token cannot stop a partitioned process from calling an independent
     # store SDK, so publication requires the store to advertise exactly how
@@ -380,6 +392,22 @@ class MutationOutcome:
 
 @dataclass(frozen=True)
 class MutationReceipt:
+    """What a store durably applied for one mutation call.
+
+    `atomic` asserts that this receipt is **complete and trustworthy**: every
+    outcome in it is durable, and none of the call's records is unaccounted
+    for. A store establishes that either by the batch being one transaction
+    (`ATOMIC_BATCH_MUTATION`) or by confirming each record landed before
+    returning (`EXACT_MUTATION_RECEIPTS`) — the two proofs the receipt
+    contract accepts. A store that can do neither raises instead of returning
+    a receipt, so core advances no state and the retry replays the batch.
+
+    It is deliberately not "the backend ran one transaction": a store may
+    have to split a payload its backend cannot take whole (issue #592), and
+    the question this field answers for the publish loop is whether the
+    receipt may be trusted, not how many transactions produced it.
+    """
+
     mutation_digest: str
     atomic: bool
     outcomes: tuple[MutationOutcome, ...]

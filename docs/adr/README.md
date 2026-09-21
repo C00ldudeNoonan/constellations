@@ -22,6 +22,7 @@ history (issue #311).
 | [0010](0010-warehouse-identity-is-a-granted-attribute.md) | The warehouse identity a governed read runs as is a granted attribute, resolved per subject; missing or ambiguous is a refusal | accepted |
 | [0011](0011-an-entitlement-interval-is-one-row-and-one-attribute.md) | An entitlement interval is one row, one attribute, and never a one-sided bound | accepted |
 | [0012](0012-native-failure-detail-goes-to-an-operator-named-file.md) | The native detail behind a sanitized failure goes to a file the operator named, never to a log level | accepted |
+| [0013](0013-a-merge-page-is-bounded-by-bytes-in-the-store.md) | A merge page is bounded by bytes, in the store, before it is sent — `batch_size` keeps counting rows | accepted |
 
 ## When to write one
 

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### CI runs the suite across every core and keeps per-test results (issue #603)
+
+- **CI spent 186 of its 200 seconds in a single-process pytest on a four-core
+  runner.** #518's tiers made the local loop fast; CI never picked up the same
+  lever. Measured serially on four cores: the fast tier 66s, the e2e tier
+  183s, the whole suite 248s. Under four workers with files kept together the
+  whole suite ran in 90s with the same result set, so nothing depends on
+  cross-file ordering.
+- CI now runs `pytest -n auto --dist loadfile` and uploads the run's JUnit
+  XML as an artifact, so an order-dependent or flaky test becomes a history
+  rather than an anecdote. `pytest-xdist` joins the dev group; AGENTS.md names
+  `-n auto` as the local option beside the fast tier and refreshes the tier
+  numbers. Nothing about which tests run changes: a per-PR selector was
+  considered and ruled out for a single-package project whose runner imports
+  nearly everything, and docs-only path filters are unsafe because tests read
+  docs as fixtures.
+
 ### `classic_ml` naive-Bayes fitting no longer holds the whole corpus in memory (issue #585)
 
 Same shape as #584 (the text vectorizer in `text.py`, still open), found while
@@ -12,6 +29,49 @@ class-token counts to it — but each pass still only needs one document's token
 at a time. It now re-analyzes per row in each pass instead of reusing a stored
 `doc_tokens` list, doubling analyzer calls (already true of the vectorizer's
 `fit`/`transform` split) but never the resident tokens.
+
+### A merge page is bounded by bytes, so a large `batch_size` cannot exhaust LanceDB's pool (issue #592)
+
+- **A row count governed a byte limit, and killed two weekly publishes.**
+  `merge_insert` reserves its whole payload for the join build side, out of a
+  pool fixed at 100 MB in lancedb 0.34.0 and not reachable from configuration.
+  `batch_size` counts rows, and row size varies with text length. Measured
+  against the live 3.6M-row collection, 20,000 rows fit at 91.8 MB and 25,000
+  asked for 111.7 MB — one run died after writing for 4h55m, the next on its
+  first page.
+- `LanceDBStore.upsert` now splits the Arrow payload into slices of at most
+  64 MB and issues one `merge_insert` per slice. The slice size is **measured
+  rather than averaged**: a count derived from the mean row size can still
+  overshoot, which is the assumption that caused the failure.
+- **`batch_size` keeps counting rows, and keeps its meaning.** It is passed to
+  four places — the upstream snapshot, the reconciler, generation activation
+  and the store write — and three of those are BigQuery state paging where
+  rows are the right unit. Redefining it would change all four to fix one, and
+  would put a LanceDB-specific constant in user-facing config.
+  [ADR-0013](docs/adr/0013-a-merge-page-is-bounded-by-bytes-in-the-store.md)
+  records that, and why bisect-on-failure was not made the primary mechanism.
+- No new configuration. The failure was a knob calibrated in a unit the
+  operator could not observe; the fix is not another one.
+
+- **The capability model now matches what the store actually proves.** A split
+  page is several Lance transactions, so LanceDB no longer claims
+  `ATOMIC_BATCH_MUTATION`; it claims the new `EXACT_MUTATION_RECEIPTS`
+  instead, which it earns by confirming every id it was handed is durably
+  present before returning a receipt. `docs/architecture/semantic-retrieval.md`
+  has always specified those as two acceptable proofs — "exact per-ID durable
+  outcomes *or* ... an all-success atomic receipt" — but the enum carried only
+  one and preflight demanded it outright. Preflight now accepts either, and a
+  store proving neither is still refused. DuckDB is unchanged and still claims
+  atomicity, because its batch really is one transaction.
+
+**Worth knowing:** a page is no longer a single Lance transaction. That is
+safe under the contract the publish loop already relied on — state advances
+only after the write lands, so a slice that fails leaves the page unadvanced
+and the next run republishes it whole, which `merge_insert` on the id absorbs.
+Page count is unchanged, so the BigQuery round trips `batch_size` was tuned
+against are unaffected. A custom retrieval store that advertised only
+`ATOMIC_BATCH_MUTATION` keeps working; one that advertised neither proof was
+already being refused.
 
 ### Dependencies
 

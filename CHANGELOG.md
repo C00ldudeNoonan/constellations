@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### `classic_ml` naive-Bayes fitting no longer holds the whole corpus in memory (issue #585)
+
+Same shape as #584 (the text vectorizer in `text.py`, still open), found while
+investigating it: `_fit_naive_bayes` built a `list[list[str]]` of every
+document's tokens up front. Unlike `_fit_vectorizer`, this one genuinely needs
+the corpus twice — `vocab_set` must be known before the second pass can filter
+class-token counts to it — but each pass still only needs one document's tokens
+at a time. It now re-analyzes per row in each pass instead of reusing a stored
+`doc_tokens` list, doubling analyzer calls (already true of the vectorizer's
+`fit`/`transform` split) but never the resident tokens.
+
 ### Dependencies
 
 - `anyio` 4.13.0 → 4.14.2 (CVE-2026-63374, CVE-2026-64847) and `soupsieve`

@@ -53,10 +53,13 @@ def _fit_naive_bayes(
     if not labeled_rows:
         raise ValueError("Classifier fitting requires at least one non-null label.")
 
-    doc_tokens = [_analyze(row["text"], options) for row in labeled_rows]
+    # Two passes, not one -- vocab_set must be known before the second pass
+    # can filter to it -- but each still needs only one document's tokens at
+    # a time (issue #585, same shape as #584). A stored `doc_tokens` list
+    # would keep every document's tokens resident for the entire fit.
     doc_freq: Counter[str] = Counter()
-    for tokens in doc_tokens:
-        doc_freq.update(set(tokens))
+    for row in labeled_rows:
+        doc_freq.update(set(_analyze(row["text"], options)))
     vocabulary = _select_terms(doc_freq, len(labeled_rows), options)
     vocab_set = set(vocabulary)
     alpha = float(raw_options.get("alpha", 1.0))
@@ -68,9 +71,9 @@ def _fit_naive_bayes(
         label: Counter() for label in sorted(class_doc_counts)
     }
     class_total_tokens: Counter[str] = Counter()
-    for row, tokens in zip(labeled_rows, doc_tokens, strict=True):
+    for row in labeled_rows:
         label = str(row["label"])
-        counts = Counter(token for token in tokens if token in vocab_set)
+        counts = Counter(t for t in _analyze(row["text"], options) if t in vocab_set)
         class_token_counts[label].update(counts)
         class_total_tokens[label] += sum(counts.values())
 

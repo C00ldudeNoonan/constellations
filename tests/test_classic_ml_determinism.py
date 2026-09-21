@@ -15,6 +15,7 @@ from typing import Any, cast
 import polars as pl
 import pytest
 
+import stel.classic_ml.classifier as _classifier_module
 import stel.classic_ml.text as _text_module
 from stel.classic_ml import (
     ARTIFACT_SCHEMA_VERSION,
@@ -162,14 +163,16 @@ class _LiveTokenCounter:
         return _TrackedTokens(tokens, self)
 
 
-def _watch_analyze(monkeypatch: pytest.MonkeyPatch) -> _LiveTokenCounter:
+def _watch_analyze(monkeypatch: pytest.MonkeyPatch, module: Any) -> _LiveTokenCounter:
+    # `module` is the one whose `_analyze` name the code under test resolves:
+    # text.py and classifier.py each import it, so patching one misses the other.
     counter = _LiveTokenCounter()
-    real_analyze = _text_module._analyze
+    real_analyze = module._analyze
 
     def counting_analyze(text: str, options: Any) -> _TrackedTokens:
         return counter.track(real_analyze(text, options))
 
-    monkeypatch.setattr(_text_module, "_analyze", counting_analyze)
+    monkeypatch.setattr(module, "_analyze", counting_analyze)
     return counter
 
 
@@ -187,7 +190,7 @@ def test_fit_vectorizer_holds_one_documents_tokens_at_a_time(
     until fitting finishes -- measured at 51.4 GiB peak on a 4.55 GiB corpus.
     `doc_freq` is the only thing this pass needs, and nothing here should
     outlive the row that produced it."""
-    counter = _watch_analyze(monkeypatch)
+    counter = _watch_analyze(monkeypatch, _text_module)
     options = _text_options({})
     rows = _corpus(20)
 
@@ -208,7 +211,7 @@ def test_feature_rows_hold_one_documents_tokens_at_a_time(
     rows = _corpus(20)
     vectorizer = _fit_vectorizer(rows, "builtin.tfidf", options, dict(options))
 
-    counter = _watch_analyze(monkeypatch)
+    counter = _watch_analyze(monkeypatch, _text_module)
     _feature_rows(rows, options, vectorizer, "docs")
 
     # 2, not 1: `tokens = _analyze(...)` evaluates the new list before the
@@ -234,13 +237,35 @@ def test_hashed_feature_rows_hold_one_documents_tokens_at_a_time(
         "options": dict(options, stop_words=[], ngram_range=[1, 1]),
     }
 
-    counter = _watch_analyze(monkeypatch)
+    counter = _watch_analyze(monkeypatch, _text_module)
     _hashed_feature_rows(rows, options, vectorizer, "docs")
 
     assert counter.peak <= 2, (
         f"{counter.peak} documents' tokens were alive at once during hashed "
         "feature extraction; the corpus must be analyzed and discarded one "
         "document at a time"
+    )
+
+
+def test_fit_naive_bayes_holds_one_documents_tokens_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_fit_naive_bayes` genuinely needs the corpus twice -- doc_freq (and so
+    vocab_set) must be known before class_token_counts can be filtered to it
+    -- but a stored `doc_tokens` list would keep every document's tokens
+    resident for the whole fit instead of just the pass that is using them
+    (issue #585, same shape as #584)."""
+    counter = _watch_analyze(monkeypatch, _classifier_module)
+    options = _text_options({})
+    rows = [dict(row, label="ab"[row["row_index"] % 2]) for row in _corpus(20)]
+
+    _fit_naive_bayes(rows, "builtin.naive_bayes", options, {})
+
+    # <=2, not ==1: see the feature-row test above for the overlap.
+    assert counter.peak <= 2, (
+        f"{counter.peak} documents' tokens were alive at once while fitting "
+        "naive bayes; the corpus must be analyzed and discarded one document "
+        "at a time in each pass"
     )
 
 

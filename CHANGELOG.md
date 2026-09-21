@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.19.0 - 2026-09-20
+## v0.19.0 - 2026-09-21
 
 ### A fitted model's identity no longer depends on the machine's thread count (issue #600)
 

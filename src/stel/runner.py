@@ -301,6 +301,8 @@ def run_project(
                 started_at=started_at,
                 completed_at=datetime.now(UTC).isoformat(),
                 profile_target=resolved.target_name,
+                # `run` has no notion of tests: null columns, not zeros.
+                test_results=None,
             ),
             schema=RUN_LOG_SCHEMA,
             what="the run log",
@@ -447,7 +449,9 @@ def build_project(
     run_budget = _run_budget_ledger(resolved)
     out = BuildResult()
     blocked: set[str] = set()
+    skipped_results: list[ModelRunResult] = []
 
+    started_at = datetime.now(UTC).isoformat()
     with adapter:
         log.info("connected to %s warehouse", resolved.warehouse.type)
         _enforce_reprocess_guard(
@@ -462,11 +466,22 @@ def build_project(
             accept_reprocess=accept_reprocess,
         )
         for name in selected:
+            model = models_by_name[name]
             if name in blocked:
                 out.skipped.append(name)
                 reporter.model_skipped(name, "upstream failed")
+                # Only the log gets a row: `out.run_results` also feeds
+                # `run_results.json` and the error count, which a skip is
+                # not part of.
+                skipped_results.append(
+                    ModelRunResult(
+                        model_name=name,
+                        materialization=model.materialization,
+                        kind=_model_kind_label(model),
+                        status="skipped",
+                    )
+                )
                 continue
-            model = models_by_name[name]
             try:
                 result = _run_model(
                     model=model,
@@ -532,6 +547,25 @@ def build_project(
                 )
             if any(t.is_hard_failure for t in model_tests):
                 blocked |= dag.descendants(name)
+
+        # Same contract as `run_project`: written inside the adapter context,
+        # after the models it describes, best-effort (issue #575). A build's
+        # per-model outcome includes tests, which a plain run has no notion
+        # of, so its test counts ride along on the same row.
+        write_rows(
+            adapter,
+            resolved.run_log,
+            run_log_rows(
+                [*out.run_results, *skipped_results],
+                invocation_id=uuid.uuid4().hex,
+                started_at=started_at,
+                completed_at=datetime.now(UTC).isoformat(),
+                profile_target=resolved.target_name,
+                test_results=out.test_results,
+            ),
+            schema=RUN_LOG_SCHEMA,
+            what="the run log",
+        )
 
     errored = sum(1 for r in out.run_results if r.errors)
     hard_failed = {t.model_name for t in out.test_results if t.is_hard_failure}

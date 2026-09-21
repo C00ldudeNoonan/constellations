@@ -19,6 +19,7 @@ from ..budget import BudgetExceededError, BudgetGuard
 from ..config.profile import DEFAULT_LLM_PROVIDER
 from ..credentials import CredentialReference, CredentialReferenceError
 from ..hashing import HASH_DIGEST_SIZE
+from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
 from ..providers import (
     PROVIDER_CONTRACT_VERSION,
     BatchInferenceItem,
@@ -775,6 +776,7 @@ def _default_call_api(
                 "provider '%s' inference failed:\n%s",
                 provider,
                 redacted_exception_text(error),
+                extra=PROVIDER_DIAGNOSTICS_EXTRA,
             )
         failure = provider_request_error(provider, "inference", error)
     if failure is not None:
@@ -892,6 +894,7 @@ def _run_message_batch(
                 "provider '%s' batch inference failed:\n%s",
                 provider,
                 redacted_exception_text(error),
+                extra=PROVIDER_DIAGNOSTICS_EXTRA,
             )
         failure = provider_request_error(provider, "batch inference", error)
     if failure is not None:

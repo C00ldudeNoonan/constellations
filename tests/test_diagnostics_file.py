@@ -17,17 +17,22 @@ from pathlib import Path
 import pytest
 
 from stel.logging_setup import (
+    PROVIDER_DIAGNOSTICS_EXTRA,
     configure_diagnostics_file,
     configure_verbose_logging,
     diagnostics_file_written,
     resolve_diagnostics_file,
 )
+from stel.providers.base import provider_error_debug_enabled
 from stel.retrieval import RetrievalError
 from stel.retrieval.lancedb import _operation_failed
 
 # Shaped like what LanceDB quotes back: an object-store URI carrying a
 # credential-looking query string. It may reach the file and nothing else.
 SENTINEL = "gs://distinctive-bucket/prefix?token=distinctive-native-secret"
+# What the provider switch discloses instead: `redacted_exception_text`'s
+# allowlist, which names types and stel frames and quotes no native text.
+ALLOWLIST = "builtins.RuntimeError\n  at stel.providers.fake:1"
 
 
 def _native_error() -> RuntimeError:
@@ -237,3 +242,98 @@ def test_a_sanitized_lancedb_failure_lands_in_the_file_and_not_in_the_error(
     text = path.read_text(encoding="utf-8")
     assert SENTINEL in text
     assert "LanceDB operation 'upsert' failed" in text
+
+
+# ─── the provider-error switch's destination (issue #599) ───────────────────
+
+
+def _provider_call_site(logger: logging.Logger) -> bool:
+    """Shaped exactly like the nine guarded sites in `providers/` and
+    `backends/llm_backend.py`. Returns whether the guard let it through."""
+    if provider_error_debug_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "provider '%s' inference failed:\n%s",
+            "fake",
+            ALLOWLIST,
+            extra=PROVIDER_DIAGNOSTICS_EXTRA,
+        )
+        return True
+    return False
+
+
+def test_the_provider_switch_alone_reaches_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`STEL_DEBUG_PROVIDER_ERRORS=1` emitted nothing under any combination of
+    flags (issue #599): the call sites are gated on a DEBUG level `-v` caps at
+    INFO, and the records carry no `exc_info`, so even the diagnostics file
+    filtered them out. Its docstring promises local diagnosis, so the variable
+    alone has to be enough."""
+    monkeypatch.setenv("STEL_DEBUG_PROVIDER_ERRORS", "1")
+    configure_verbose_logging(0)
+
+    assert _provider_call_site(logging.getLogger("stel.providers.fake")), (
+        "the guard rejected the call: the switch is on, so the logger must be "
+        "at DEBUG by the time a provider error is handled"
+    )
+    assert ALLOWLIST in capsys.readouterr().err
+
+
+def test_the_provider_switch_does_not_put_native_text_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The switch raises the `stel` logger to DEBUG, which is where every
+    native-text record in the tree lives. What keeps those off stderr is no
+    longer the logger's level but the channel's filter, so it is worth a test
+    of its own: this is the security property the level change moves."""
+    monkeypatch.setenv("STEL_DEBUG_PROVIDER_ERRORS", "1")
+    configure_verbose_logging(0)
+
+    logging.getLogger("stel.execution.transform").debug("boom", exc_info=_native_error())
+
+    assert SENTINEL not in capsys.readouterr().err
+
+
+def test_the_provider_switch_prefers_the_diagnostics_file_to_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """One destination, not two: with a file configured the allowlist goes
+    there, so an operator collecting diagnostics gets one artifact."""
+    monkeypatch.setenv("STEL_DEBUG_PROVIDER_ERRORS", "1")
+    path = tmp_path / "diagnostics.log"
+    configure_verbose_logging(0)
+    configure_diagnostics_file(path)
+
+    assert _provider_call_site(logging.getLogger("stel.providers.fake"))
+
+    assert ALLOWLIST not in capsys.readouterr().err
+    assert ALLOWLIST in path.read_text(encoding="utf-8")
+
+
+def test_the_switch_being_off_emits_nothing_even_with_a_diagnostics_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The env var still decides whether the allowlist is produced at all; the
+    file only decides where it lands. Off by default is the whole point."""
+    path = tmp_path / "diagnostics.log"
+    configure_verbose_logging(0)
+    configure_diagnostics_file(path)
+
+    assert not _provider_call_site(logging.getLogger("stel.providers.fake"))
+
+    assert ALLOWLIST not in capsys.readouterr().err
+    assert not path.exists() or ALLOWLIST not in path.read_text(encoding="utf-8")
+
+
+def test_warnings_still_reach_stderr_while_the_provider_channel_is_installed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The provider channel turns propagation off, which is what used to send
+    warnings to `logging.lastResort`. Without the fallback standing in, turning
+    on a debug switch would silence every warning in the run."""
+    monkeypatch.setenv("STEL_DEBUG_PROVIDER_ERRORS", "1")
+    configure_verbose_logging(0)
+
+    logging.getLogger("stel.runner").warning("a warning the operator needs")
+
+    assert "a warning the operator needs" in capsys.readouterr().err

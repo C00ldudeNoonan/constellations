@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from anthropic.types import ToolParam
 
+from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
 from .base import (
     BatchInferenceItem,
     BatchInferenceRequest,
@@ -69,6 +70,7 @@ class AnthropicInferenceProvider(InferenceProvider):
                 log.debug(
                     "anthropic inference request failed:\n%s",
                     redacted_exception_text(error),
+                    extra=PROVIDER_DIAGNOSTICS_EXTRA,
                 )
             failure = provider_request_error(self.name(), "inference", error)
         if failure is not None:
@@ -190,6 +192,7 @@ class AnthropicInferenceProvider(InferenceProvider):
                 "anthropic %s failed:\n%s",
                 operation,
                 redacted_exception_text(error),
+                extra=PROVIDER_DIAGNOSTICS_EXTRA,
             )
         return provider_batch_error(self.name(), operation, error)
 

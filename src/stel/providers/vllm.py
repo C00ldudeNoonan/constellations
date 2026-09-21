@@ -13,6 +13,7 @@ from ..credentials import (
     CredentialReferenceError,
     CredentialResolutionError,
 )
+from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
 from .base import (
     InferenceProvider,
     InferenceRequest,
@@ -119,6 +120,7 @@ class VLLMInferenceProvider(InferenceProvider):
                 log.debug(
                     "vllm inference request failed:\n%s",
                     redacted_exception_text(error),
+                    extra=PROVIDER_DIAGNOSTICS_EXTRA,
                 )
             failure = ProviderRequestError(
                 self.name(), "inference", code=type(error).__name__

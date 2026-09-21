@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### CI runs the suite across every core and keeps per-test results (issue #603)
+
+- **CI spent 186 of its 200 seconds in a single-process pytest on a four-core
+  runner.** #518's tiers made the local loop fast; CI never picked up the same
+  lever. Measured serially on four cores: the fast tier 66s, the e2e tier
+  183s, the whole suite 248s. Under four workers with files kept together the
+  whole suite ran in 90s with the same result set, so nothing depends on
+  cross-file ordering.
+- CI now runs `pytest -n auto --dist loadfile` and uploads the run's JUnit
+  XML as an artifact, so an order-dependent or flaky test becomes a history
+  rather than an anecdote. `pytest-xdist` joins the dev group; AGENTS.md names
+  `-n auto` as the local option beside the fast tier and refreshes the tier
+  numbers. Nothing about which tests run changes: a per-PR selector was
+  considered and ruled out for a single-package project whose runner imports
+  nearly everything, and docs-only path filters are unsafe because tests read
+  docs as fixtures.
+
 ### `classic_ml` naive-Bayes fitting no longer holds the whole corpus in memory (issue #585)
 
 Same shape as #584 (the text vectorizer in `text.py`, still open), found while

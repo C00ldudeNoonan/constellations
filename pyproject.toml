@@ -97,6 +97,9 @@ packages = ["src/stel"]
 [dependency-groups]
 dev = [
     "pytest>=8",
+    # `-n auto --dist loadfile` runs the suite across every core; CI does, and
+    # the local loop can (AGENTS.md, Development workflow).
+    "pytest-xdist>=3.6",
     "ruff>=0.5",
     "pip-audit>=2.7",
     "types-pyyaml",

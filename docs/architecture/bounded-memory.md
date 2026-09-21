@@ -63,6 +63,8 @@ correct and local:
 | #418 → #420 | BigQuery snapshot | an unpartitioned `OVER()` made the warehouse buffer the projection |
 | #423 → #425 | chunk | whole upstream registry in, every chunk row accumulated out |
 | #424 | llm input/resume | whole upstream and target reads, plus every changed input accumulated as work |
+| #584 | ml text vectorizer | the tokenized corpus, held twice on `fit_transform` — not a read, the layer after one |
+| #585 | ml naive-Bayes classifier | the tokenized corpus, held once for both fitting passes — #584's shape, in the classifier |
 
 The sequence is the argument. Local fixes did not converge on a bounded system,
 because nothing said what bounded meant.

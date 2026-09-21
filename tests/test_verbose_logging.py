@@ -293,7 +293,7 @@ def test_configure_output_tty_routes_log_through_reporter(
             return True
 
     monkeypatch.setattr("sys.stderr", _FakeTTY())
-    _configure_output(1)
+    _configure_output(1, diagnostics_file=None)
     logger = logging.getLogger("stel")
     handler = getattr(logger, "_stel_verbose_handler", None)
     assert isinstance(handler, _ReporterHandler)
@@ -311,7 +311,7 @@ def test_tty_verbose_forwards_plain_log_records_to_the_terminal(
 
     stream = _FakeTTY()
     monkeypatch.setattr("sys.stderr", stream)
-    _configure_output(1)
+    _configure_output(1, diagnostics_file=None)
     logging.getLogger("stel.providers.anthropic").info(
         "batch %s: in_progress (processing=%d)", "batch_abc", 42
     )
@@ -331,7 +331,7 @@ def test_tty_verbose_drops_records_the_reporter_already_renders(
 
     stream = _FakeTTY()
     monkeypatch.setattr("sys.stderr", stream)
-    _configure_output(1)
+    _configure_output(1, diagnostics_file=None)
     log = logging.getLogger("stel.runner")
     log.info("finished raw_invoices", extra=REPORTER_ECHO_EXTRA)
     assert "finished raw_invoices" not in stream.getvalue()
@@ -351,7 +351,7 @@ def test_reporter_echo_records_survive_when_nothing_renders_them(
     be swapped after install."""
     stream = io.StringIO()
     monkeypatch.setattr("sys.stderr", stream)
-    _configure_output(1, json_output=True)
+    _configure_output(1, diagnostics_file=None, json_output=True)
     logging.getLogger("stel.runner").info(
         "finished raw_invoices", extra=REPORTER_ECHO_EXTRA
     )
@@ -399,7 +399,7 @@ def test_configure_output_non_tty_uses_the_plain_log_handler(
     """A captured run gets the ledger and a plain stderr handler — not the
     reporter-routed one, since with no bar there is nothing to defer past."""
     monkeypatch.setattr("sys.stderr", io.StringIO())
-    _configure_output(1)
+    _configure_output(1, diagnostics_file=None)
     logger = logging.getLogger("stel")
     handler = getattr(logger, "_stel_verbose_handler", None)
     assert isinstance(handler, logging.StreamHandler)
@@ -413,7 +413,7 @@ def test_configure_output_default_installs_ledger_but_no_log_handler(
     """The default is the ledger, not silence (issue #404) and not the log
     channel — `-v` is still what buys the INFO lines."""
     monkeypatch.setattr("sys.stderr", io.StringIO())
-    _configure_output(0)
+    _configure_output(0, diagnostics_file=None)
     logger = logging.getLogger("stel")
     assert getattr(logger, "_stel_verbose_handler", None) is None
     assert isinstance(get_reporter(), _TerminalReporter)
@@ -423,7 +423,7 @@ def test_configure_output_json_is_quiet(monkeypatch: pytest.MonkeyPatch) -> None
     """`--json` is the machine path: stdout carries the payload and stderr says
     nothing, so no reporter is installed."""
     monkeypatch.setattr("sys.stderr", io.StringIO())
-    _configure_output(0, json_output=True)
+    _configure_output(0, diagnostics_file=None, json_output=True)
     assert isinstance(get_reporter(), _NullReporter)
 
 
@@ -433,7 +433,7 @@ def test_configure_output_json_with_verbose_keeps_the_log_channel(
     """`-v --json` still narrates on stderr — the quiet default is about the
     ledger, not about suppressing an explicit request for detail."""
     monkeypatch.setattr("sys.stderr", io.StringIO())
-    _configure_output(1, json_output=True)
+    _configure_output(1, diagnostics_file=None, json_output=True)
     logger = logging.getLogger("stel")
     assert getattr(logger, "_stel_verbose_handler", None) is not None
     assert isinstance(get_reporter(), _NullReporter)
@@ -450,7 +450,7 @@ def test_configure_output_bars_unsafe_forces_log_channel(
             return True
 
     monkeypatch.setattr("sys.stderr", _FakeTTY())
-    _configure_output(1, bars_safe=False)
+    _configure_output(1, diagnostics_file=None, bars_safe=False)
     logger = logging.getLogger("stel")
     handler = getattr(logger, "_stel_verbose_handler", None)
     assert isinstance(handler, logging.StreamHandler)

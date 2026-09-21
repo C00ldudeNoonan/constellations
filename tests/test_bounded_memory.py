@@ -140,7 +140,9 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         EXCEPTION,
         "scikit-learn fits one matrix; training is not incremental here, so the "
         "training set is resident by definition. Bounding this means changing "
-        "what the stage is, not how it reads",
+        "what the stage is, not how it reads. The exception covers the rows and "
+        "nothing beyond them: #585 was a tokenized copy of the corpus held "
+        "across both naive-Bayes fitting passes",
     ),
     (
         "classic_ml/text.py",
@@ -148,7 +150,10 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         1,
         EXCEPTION,
         "same as the classifier: feature extraction fits a vectorizer over the "
-        "whole training set",
+        "whole training set. The exception covers the rows and nothing beyond "
+        "them: #584 was a tokenized copy of that corpus at 63 bytes/token, 11x "
+        "the rows it was granted, which this audit could not see because the "
+        "read it classifies was never the problem",
     ),
     (
         "execution/eval.py",

@@ -382,11 +382,11 @@ stel init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh proj
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
-stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v]
+stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one golden set: deltas, and the queries that moved
-stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v]
+stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
@@ -772,10 +772,10 @@ changing the CLI invocation. `-v` is also available on `stel eval` and
 `stel concept-cloud`.
 
 The verbose flag is deliberately capped at INFO. DEBUG-level log sites
-(transform failures, provider errors) carry unsanitized exception text
-and traceback frames that the user-facing error path scrubs but a raw
-log stream would not — attach your own DEBUG handler if you need it for
-troubleshooting.
+(transform failures, store failures) carry unsanitized exception text and
+traceback frames that the user-facing error path scrubs but a raw log stream
+would not. An in-process caller who needs them can attach a DEBUG handler; an
+operator running the CLI names a file instead, below.
 
 A LanceDB store failure is reported with the operation, the step it was on,
 and the native exception's type, for example
@@ -785,6 +785,26 @@ never reaches the CLI or `run_results.json`, because LanceDB quotes
 object-store URIs and response bodies verbatim; the error's cause chain holds
 only `Native retrieval error type: …`. The full native exception is logged at
 DEBUG on the `stel.retrieval.lancedb` logger.
+
+**`--diagnostics-file PATH`** (or `STEL_DIAGNOSTICS_FILE=PATH` for a run an
+orchestrator launches) is how a CLI operator reaches that detail (issue #590,
+[ADR-0012](adr/0012-native-failure-detail-goes-to-an-operator-named-file.md)).
+When set, every record that carries an exception, and every warning, is
+appended to that file with its full native message and traceback; nothing
+else changes, so the CLI, `run_results.json`, the `-v` stream and any
+orchestrator's log capture stay exactly as sanitized as before. The file is
+created on the first such record, readable by its owner only (a file that
+already exists is tightened to the same mode), so a run that fails nowhere
+leaves nothing behind; a destination that cannot be written is refused before
+the run starts, and a write that fails anyway costs one line on stderr and
+never the failure it was recording. When a `stel run` or `stel build` failure
+did write to it, the error message ends by naming the file. Treat it as the
+sensitive thing it is: it holds what every other channel exists to withhold.
+It covers the failures stel logs natively before sanitizing — store
+operations and index-build retries, document fetch and extraction, transform
+code — but not provider errors, which the provider layer sanitizes before any
+logger sees them; `STEL_DEBUG_PROVIDER_ERRORS=1` remains their separate,
+allowlisted hatch.
 
 Under verbose, each incremental publication also emits safe telemetry
 (issue #292) — the progress reporter renders it on a TTY, the INFO log carries

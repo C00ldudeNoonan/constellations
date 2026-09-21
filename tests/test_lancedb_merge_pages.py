@@ -13,6 +13,7 @@ whole failure was an average-shaped assumption about row size.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from stel.retrieval import (
     CollectionSpec,
     IndexedRow,
     LanceDBStore,
+    RetrievalFeature,
     StoreRole,
     parse_store_config,
 )
@@ -227,6 +229,120 @@ def test_a_page_within_the_limit_is_still_one_merge(
             PHYSICAL, _rows(20, 100), id_field="chunk_id", mutation_digest="digest"
         )
         assert len(calls) == 1
+
+
+# ─── what splitting costs the capability model ──────────────────────────────
+
+
+def test_lancedb_no_longer_claims_batch_atomicity(tmp_path: Path) -> None:
+    """Splitting makes the atomicity claim false, so it is withdrawn.
+
+    A page over the ceiling becomes several Lance transactions, and a failure
+    part-way leaves the earlier ones committed. Claiming `ATOMIC_BATCH_MUTATION`
+    would be false for exactly the pages that need the split.
+    """
+    with _store(tmp_path) as store:
+        features = store.capabilities().features
+    assert RetrievalFeature.ATOMIC_BATCH_MUTATION not in features
+
+
+def test_lancedb_proves_exact_receipts_instead(tmp_path: Path) -> None:
+    """The other proof the receipt contract accepts.
+
+    `upsert` confirms every id it was handed is durably present before
+    returning, and raises otherwise — so a receipt is never ahead of the
+    store, which is what the publish loop gates state on.
+    """
+    with _store(tmp_path) as store:
+        features = store.capabilities().features
+    assert RetrievalFeature.EXACT_MUTATION_RECEIPTS in features
+
+
+def test_duckdb_still_claims_atomicity(tmp_path: Path) -> None:
+    # The withdrawal is specific to the store that had to split, not a
+    # general weakening: DuckDB's batch really is one transaction.
+    from stel.retrieval import DuckDBStore
+
+    config = parse_store_config(
+        {"type": "duckdb", "path": str(tmp_path / "retrieval.duckdb")}
+    )
+    store = DuckDBStore(
+        config,
+        project_name="demo",
+        target_name="dev",
+        alias="primary",
+        role=StoreRole.PUBLISH,
+    )
+    with store:
+        assert RetrievalFeature.ATOMIC_BATCH_MUTATION in store.capabilities().features
+
+
+def test_a_store_proving_neither_receipt_guarantee_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The requirement is "either", not "neither".
+
+    Relaxing the compiler from `ATOMIC_BATCH_MUTATION` to either proof must
+    not relax it to nothing: a store that can promise no trustworthy receipt
+    still cannot back incremental publication, because core gates state on
+    that receipt. Written because a mutation removing the check entirely was
+    caught by no existing test.
+    """
+    from stel.compiler import validate_project_contract, validate_retrieval_capabilities
+    from stel.config import ConfigError, load_project
+    from stel.profile import resolve_profile
+    from tests.support_retrieval import write_project
+
+    write_project(tmp_path)
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    original = LanceDBStore.capabilities
+
+    def without_receipts() -> Any:
+        full = original()
+        return replace(
+            full,
+            features=full.features
+            - {
+                RetrievalFeature.ATOMIC_BATCH_MUTATION,
+                RetrievalFeature.EXACT_MUTATION_RECEIPTS,
+            },
+        )
+
+    monkeypatch.setattr(LanceDBStore, "capabilities", staticmethod(without_receipts))
+    with pytest.raises(ConfigError, match="exact whole-batch receipts"):
+        validate_retrieval_capabilities(models, project, resolved)
+
+
+def test_either_receipt_guarantee_alone_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The point of the change: atomicity is sufficient but no longer
+    # necessary, so a store proving only exact receipts passes preflight.
+    from stel.compiler import validate_project_contract, validate_retrieval_capabilities
+    from stel.config import load_project
+    from stel.profile import resolve_profile
+    from tests.support_retrieval import write_project
+
+    write_project(tmp_path)
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    original = LanceDBStore.capabilities
+
+    def atomic_only() -> Any:
+        full = original()
+        return replace(
+            full,
+            features=(full.features - {RetrievalFeature.EXACT_MUTATION_RECEIPTS})
+            | {RetrievalFeature.ATOMIC_BATCH_MUTATION},
+        )
+
+    monkeypatch.setattr(LanceDBStore, "capabilities", staticmethod(atomic_only))
+    validate_retrieval_capabilities(models, project, resolved)
 
 
 def test_a_split_page_upserts_idempotently(

@@ -87,6 +87,27 @@ from that value rather than typed in by hand.
 
 ## Consequences
 
+**LanceDB stops claiming `ATOMIC_BATCH_MUTATION` and claims
+`EXACT_MUTATION_RECEIPTS` instead.** A split page is several transactions, so
+the atomicity claim would be false for exactly the pages that need splitting.
+
+`docs/architecture/semantic-retrieval.md` has always specified two proofs for
+a trustworthy receipt — "exact per-ID durable outcomes *or* prove
+`ATOMIC_BATCH_MUTATION` and return an all-success atomic receipt" — but the
+`RetrievalFeature` enum carried only the second, and the compiler required it
+outright. So the spec's "or" existed on paper and not in code. It does now:
+`EXACT_MUTATION_RECEIPTS` is a real feature, and preflight accepts either.
+
+`upsert` earns the one it claims. It confirms every id it was handed is
+durably present before returning, and raises otherwise, so a returned receipt
+is never ahead of the store — which is the only property the publish loop
+actually gates state on. `MutationReceipt.atomic` is documented to mean
+exactly that: the receipt is complete and trustworthy, not that the backend
+ran one transaction.
+
+DuckDB is untouched and still claims atomicity: its batch really is one
+transaction. The withdrawal is specific to the store that has to split.
+
 A page is no longer one Lance transaction. That is safe under a contract the
 publish loop already relied on: the store write happens, and only then does
 `upsert_state` advance state for that page. A slice that fails leaves the

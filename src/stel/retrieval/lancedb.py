@@ -470,7 +470,20 @@ class LanceDBStore(RetrievalStore):
                     RetrievalFeature.KEYED_DELETE,
                     RetrievalFeature.INDEX_READINESS,
                     RetrievalFeature.DURABLE_WRITE_ACK,
-                    RetrievalFeature.ATOMIC_BATCH_MUTATION,
+                    # Not ATOMIC_BATCH_MUTATION. A page whose Arrow payload
+                    # exceeds what one `merge_insert` may reserve is split
+                    # into several, each its own Lance transaction, so a
+                    # failure part-way leaves the earlier slices committed
+                    # (issue #592). Claiming batch atomicity would be false
+                    # for exactly the pages that need the split.
+                    #
+                    # What `upsert` does provide instead is the other proof
+                    # the receipt contract accepts: it confirms every id it
+                    # was handed is durably present before returning, and
+                    # raises otherwise — so a returned receipt is never
+                    # ahead of the store, which is what the publish loop
+                    # gates state on.
+                    RetrievalFeature.EXACT_MUTATION_RECEIPTS,
                     # DataFusion's `array_has_any` expresses set overlap
                     # against a list column (issue #397).
                     RetrievalFeature.ARRAY_CONTAINMENT_FILTERS,

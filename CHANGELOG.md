@@ -36,12 +36,25 @@ at a time. It now re-analyzes per row in each pass instead of reusing a stored
 - No new configuration. The failure was a knob calibrated in a unit the
   operator could not observe; the fix is not another one.
 
+- **The capability model now matches what the store actually proves.** A split
+  page is several Lance transactions, so LanceDB no longer claims
+  `ATOMIC_BATCH_MUTATION`; it claims the new `EXACT_MUTATION_RECEIPTS`
+  instead, which it earns by confirming every id it was handed is durably
+  present before returning a receipt. `docs/architecture/semantic-retrieval.md`
+  has always specified those as two acceptable proofs — "exact per-ID durable
+  outcomes *or* ... an all-success atomic receipt" — but the enum carried only
+  one and preflight demanded it outright. Preflight now accepts either, and a
+  store proving neither is still refused. DuckDB is unchanged and still claims
+  atomicity, because its batch really is one transaction.
+
 **Worth knowing:** a page is no longer a single Lance transaction. That is
 safe under the contract the publish loop already relied on — state advances
 only after the write lands, so a slice that fails leaves the page unadvanced
 and the next run republishes it whole, which `merge_insert` on the id absorbs.
 Page count is unchanged, so the BigQuery round trips `batch_size` was tuned
-against are unaffected.
+against are unaffected. A custom retrieval store that advertised only
+`ATOMIC_BATCH_MUTATION` keeps working; one that advertised neither proof was
+already being refused.
 
 ### Dependencies
 

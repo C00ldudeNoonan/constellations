@@ -43,17 +43,32 @@ timestamp-only signal cannot tell a deletion happened. The row count closes
 that — a same-count replace (one row removed, a different one added) is still
 caught because the replacement is a write, which does move `last_run_at`.
 
-**`table_content_fingerprint`** — the authoritative confirmation, paid only
-once the cheap signal already looks unchanged: a warehouse-side aggregate hash
-over the parent's *actual current rows* (`bit_xor(hash(t))` on DuckDB,
-`BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t)))` on BigQuery, both verified
-empirically to change under `UPDATE`, `DELETE`, and `ALTER TABLE ADD COLUMN`).
-This is what closes the gap the first attempt could not: a write that never
-touched `stel_state` at all. Running this repo's own test suite against the
-wired-up skip surfaced that this is not a rare case — at least 19 existing
-tests across `test_chunking.py`, `test_embedding.py`, and `test_embed_flush.py`
-edit a model's output table directly with raw SQL as a cheap way to simulate a
-scenario, which is exactly the channel `state_generation` cannot see.
+**`table_content_fingerprint`** — the authoritative confirmation: a
+warehouse-side aggregate hash over the parent's *actual current rows*
+(`bit_xor(hash(t))` on DuckDB, `BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t)))`
+on BigQuery, both verified empirically to change under `UPDATE`, `DELETE`, and
+`ALTER TABLE ADD COLUMN`). This is what closes the gap the first attempt
+could not: a write that never touched `stel_state` at all. Running this
+repo's own test suite against the wired-up skip surfaced that this is not a
+rare case — at least 19 existing tests across `test_chunking.py`,
+`test_embedding.py`, and `test_embed_flush.py` edit a model's output table
+directly with raw SQL as a cheap way to simulate a scenario, which is exactly
+the channel `state_generation` cannot see.
+
+It is read once per eligible model per run, before that model's own dispatch,
+in either of two situations: to confirm a skip the cheap signal alone cannot
+(the no-op case this mechanism exists for), or — whenever real work is about
+to happen for any reason, including the model's first ever run — once more,
+so that work ends with a fresh watermark recorded. The second case matters
+for a reason a review of the first cut of this wiring caught (#612): without
+it, a model never acquires its first watermark, because establishing one
+requires content read specifically in the real-work case, not only the
+skip-confirming one. Reading it exactly once, strictly before dispatch, and
+reusing that same value for the post-run write rather than ever reading it
+again afterward is also what keeps a parent mutated *during* the child's own
+run from being folded into a watermark claiming the child consumed content
+it never saw — the same review's other finding, now a regression test in
+`tests/test_unchanged_scan_skip.py`.
 
 **Neither signal alone is sufficient, so both are required.** A plain content
 hash alone would be sufficient on its own and would not need
@@ -84,13 +99,23 @@ steps.
 
 ### Content fingerprint only, no cheap pre-filter
 
-Simpler code, one signal, always authoritative. Rejected on cost: the
-mechanism exists because a full scan of a multi-million-row corpus is
-expensive, and a content fingerprint is still a full scan, just a cheaper and
-entirely server-side one. Computing it on *every* eligible run — including
-every run where something genuinely changed, which `state_generation` catches
-far more cheaply — would spend real warehouse compute (and, on BigQuery,
-real billed bytes scanned) on confirmations that were never going to matter.
+Simpler code, one signal, always authoritative. Considered more seriously
+than its cost framing alone would suggest, once wiring the skip up revealed
+that establishing a watermark after a real-work run also needs a fresh
+content read (see "Consequences") — so `state_generation` ends up read on
+every eligible model's every run regardless of outcome, the same as a
+content-only design would, except in the one case where no parent state
+exists yet to compare against at all.
+
+Kept anyway, for two reasons neither of which is cost. First, requiring two
+independently-computed signals to agree is more conservative than trusting
+one: a latent bug or collision in the content-hash path alone would need a
+second, unrelated signal to also agree before any skip could fire on it.
+Second, `state_generation` is the one signal cheap enough to run unconditionally
+as a true pre-filter if a future change makes that distinction matter again
+(a store whose `table_content_fingerprint` the operator has not enabled, or a
+cost-sensitive deployment that wants the content check to be opt-in) — a
+content-only design would have nothing to fall back to.
 
 ### Detect raw-SQL mutation some other way (a trigger, a checksum column)
 
@@ -114,12 +139,16 @@ tests convenient to write is a channel a real deployment could hit too.
 ## Consequences
 
 **The skip's net benefit is smaller than "nothing at all" for a model whose
-parent is large.** A no-op run now costs one cheap aggregate query plus,
-whenever that looks unchanged, one full server-side scan of the parent —
-still far less than today's read-into-Python-and-classify pipeline, but not
-free. This is the deliberate trade of the two-tier design: free in the
-common case the cheap signal already resolves (a real change happened
-somewhere), one scan in the case that matters most (truly nothing changed).
+parent is large.** Every eligible model's run pays one cheap aggregate query,
+and — whenever a watermark could plausibly need to change, which is both the
+no-op case being confirmed and every real-work case establishing a fresh one
+— one full server-side content scan of the parent. That second cost is still
+far less than today's read-into-Python-and-classify pipeline (no network
+transfer of row data, no per-row Python work, nothing beyond one aggregate),
+and it is marginal next to the real work a non-skip run was already about to
+do. It is not, however, free: a model whose parent is large pays a real scan
+on every run, skip or not, which is the deliberate trade of closing the
+raw-SQL-mutation gap for real rather than leaving it a documented limitation.
 
 **`search:`, `ml:`, and `eval:` models are excluded.** A search publish also
 sweeps stale retrieval generations inline, a side effect this must not

@@ -9,7 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -891,6 +891,32 @@ def _can_skip_unchanged_scan(model: ModelConfig, *, full_refresh: bool, subset_r
     )
 
 
+def _watermark_safely[T](model_name: str, operation: str, action: Callable[[], T]) -> T | None:
+    """Run one unchanged-scan-skip read or write (issue #611), never letting
+    it fail the run it was only ever meant to speed up.
+
+    This is the runner, one of the three places this codebase's exception
+    policy names as a legitimate boundary. The skip is purely an
+    optimization over an always-correct scan: a warehouse error here --
+    including the brand-new `stel_sync_watermark` table existing but the
+    caller lacking permission to create or read it, on a deployment that can
+    otherwise mutate `stel_state` fine -- must fall back to the real scan,
+    not abort an otherwise-successful model. The exception class, not its
+    text, is logged: the same reasoning the store layer already applies to
+    native warehouse errors.
+    """
+    try:
+        return action()
+    except Exception as error:
+        log.warning(
+            "%s: could not %s for the unchanged-scan skip [%s]; doing the full scan instead",
+            model_name,
+            operation,
+            type(error).__name__,
+        )
+        return None
+
+
 def _published_row_count_if_code_unchanged(
     model: ModelConfig,
     *,
@@ -946,17 +972,40 @@ def _run_model(
     # deletion -- but it is blind to a write that bypassed stel entirely (a
     # direct UPDATE/DELETE/ALTER TABLE against a model's own output table,
     # which this repo's own test suite does routinely to simulate scenarios
-    # cheaply, so it is not a hypothetical). `content` is the authoritative,
-    # real-cost confirmation: a fresh aggregate hash over the parent's actual
-    # current rows, paid only when the cheap check already looks unchanged --
-    # never on a run that was going to do the real work anyway.
+    # cheaply, so it is not a hypothetical). `content` is the authoritative
+    # confirmation: a real-cost aggregate hash over the parent's actual
+    # current rows.
+    #
+    # `content` is read exactly once whenever it is needed at all, strictly
+    # before this model's own run starts, and reused as-is for the post-run
+    # watermark write rather than ever re-read afterward (Codex review,
+    # #612): a parent mutated *during* this model's own dispatch -- by
+    # anything other than stel, since nothing stel-owned touches it while
+    # this model depends on it -- must never be folded into a watermark
+    # claiming this model is caught up with content it never actually
+    # consumed. It is read in two situations, both cheap relative to what
+    # happens next: to confirm a skip the cheap signal alone cannot (the
+    # no-op case this mechanism exists for), and -- whenever real work is
+    # about to happen for any reason (a first run, a code change, a cheap
+    # mismatch) -- once more, so that work ends with a fresh watermark
+    # established. Without the second case a model would never acquire its
+    # first watermark: the next run would find nothing to compare against
+    # either, and the skip could never engage for it at all.
     parent_name = (
         _single_data_parent(model.name, dag)
         if _can_skip_unchanged_scan(model, full_refresh=full_refresh, subset_run=subset_run)
         else None
     )
     parent_scope = StateScope(parent_name) if parent_name is not None else None
-    parent_state = adapter.state_generation(parent_scope) if parent_scope is not None else None
+    parent_state = (
+        _watermark_safely(
+            model.name,
+            "read the parent's generation",
+            lambda: adapter.state_generation(parent_scope),
+        )
+        if parent_scope is not None
+        else None
+    )
     parent_content: TableContentFingerprint | None = None
     skipped_row_count = None
     if parent_state is not None:
@@ -965,13 +1014,37 @@ def _run_model(
         )
         if skipped_row_count is not None:
             child_scope = StateScope(model.name)
-            synced = adapter.read_sync_watermark(child_scope, cast(StateScope, parent_scope))
+            synced = _watermark_safely(
+                model.name,
+                "read its sync watermark",
+                lambda: adapter.read_sync_watermark(child_scope, cast(StateScope, parent_scope)),
+            )
             if synced is None or synced.state != parent_state:
                 skipped_row_count = None
             else:
-                parent_content = adapter.table_content_fingerprint(cast(str, parent_name))
+                # The cheap signal alone looks unchanged: pay for the
+                # authoritative one now, to decide the skip for real.
+                parent_content = _watermark_safely(
+                    model.name,
+                    "fingerprint the parent's content",
+                    lambda: adapter.table_content_fingerprint(cast(str, parent_name)),
+                )
                 if parent_content is None or synced.content != parent_content:
                     skipped_row_count = None
+        if skipped_row_count is None and parent_content is None:
+            # Real work is happening regardless -- the model's own code
+            # changed, no watermark was ever recorded, or the cheap signal
+            # alone already proved a change. Reading content now, once, is
+            # marginal next to the real scan about to run, and it is the only
+            # way a watermark ever gets established for a model that has
+            # never confirmed one before (otherwise it never would: the next
+            # run would find no watermark to compare against either, and the
+            # skip could never engage for this model at all).
+            parent_content = _watermark_safely(
+                model.name,
+                "fingerprint the parent's content",
+                lambda: adapter.table_content_fingerprint(cast(str, parent_name)),
+            )
     if skipped_row_count is not None:
         # The parent published nothing since this model last synced to it (by
         # either signal), and this model's own code hasn't moved since its
@@ -1078,24 +1151,24 @@ def _run_model(
             f"Model '{model.name}' has no extraction, transform, ml, chunk, embed, "
             "llm, search, or eval block configured"
         )
-    if parent_scope is not None and parent_state is not None and not result.errors:
-        # This model just did the real scan (it was not eligible to skip, or
-        # a watermark signal did not match) and came back clean: it is now
-        # caught up with the parent, real work or not -- a scan that found
-        # nothing new is still a confirmation worth recording. `parent_content`
-        # was already paid for above when the cheap check alone looked
-        # unchanged; otherwise it is computed fresh here, once, since nothing
-        # else can have touched the parent while this model's own run was
-        # under way. Best-effort by design (issue #611): losing this write
-        # costs one missed skip next run, never a wrong one, so it is never
-        # worth failing the run over.
-        content = parent_content or adapter.table_content_fingerprint(cast(str, parent_name))
-        if content is not None:
-            adapter.write_sync_watermark(
-                StateScope(model.name),
-                parent_scope,
-                SyncWatermark(state=parent_state, content=content),
-            )
+    if parent_scope is not None and parent_content is not None and not result.errors:
+        # This model just did real work and came back clean: it is now caught
+        # up with the parent as of `parent_content`, read strictly before
+        # this run started and never re-read since (see the comment above).
+        # A model whose parent could not be read at all this round (every
+        # attempt above failed, or there is no eligible parent) writes no
+        # watermark, never one derived from content read after the fact.
+        # Best-effort (issue #611): losing this write costs one missed skip
+        # next run, never a wrong one, so it is never worth failing over.
+        assert parent_state is not None  # parent_content is only ever set inside that branch
+        watermark = SyncWatermark(state=parent_state, content=parent_content)
+        _watermark_safely(
+            model.name,
+            "record its sync watermark",
+            lambda: adapter.write_sync_watermark(
+                StateScope(model.name), parent_scope, watermark
+            ),
+        )
     result.duration_seconds = round(time.monotonic() - start, 3)
     log.info(
         "finished %s: %d row(s) in %.3fs%s",

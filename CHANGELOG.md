@@ -22,14 +22,15 @@ fresh every time rather than trusted blindly:
   change, and a real deletion (row count drops even though no surviving row's
   own timestamp moved -- the gap a timestamp-only signal would have missed,
   caught by this change's own regression suite).
-- **`table_content_fingerprint`** -- the authoritative confirmation, paid
-  only once the cheap signal already looks unchanged: a warehouse-side
-  aggregate hash over the parent's actual current rows. This is what closes
-  the gap the first attempt could not: a direct `UPDATE`/`DELETE`/
-  `ALTER TABLE` against a stel-managed table, which `stel_state` never
-  observes. The cost is real -- a full scan of the parent, computed
-  server-side rather than pulled into Python -- so it is never paid on a run
-  that was going to do the real work anyway.
+- **`table_content_fingerprint`** -- the authoritative confirmation: a
+  warehouse-side aggregate hash over the parent's actual current rows. This
+  is what closes the gap the first attempt could not: a direct
+  `UPDATE`/`DELETE`/`ALTER TABLE` against a stel-managed table, which
+  `stel_state` never observes. The cost is real -- a full scan of the
+  parent, computed server-side rather than pulled into Python, not free --
+  paid once per eligible model per run: to confirm a skip, or, whenever real
+  work happens for any reason, to record a fresh watermark afterward, since
+  a model that never records one could never engage the skip at all.
 
 Both signals must match what the model recorded as of its own last
 **successful** publish; losing a watermark write costs one missed

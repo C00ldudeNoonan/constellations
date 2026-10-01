@@ -21,7 +21,7 @@ from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Self, cast
 from uuid import uuid4
 
 import polars as pl
@@ -209,6 +209,13 @@ def validate_state_keys(record_keys: Sequence[str]) -> None:
 STATE_TABLE = "stel_state"
 LEGACY_STATE_TABLE = "dbt_ml_state"
 
+# One row per (child model, parent model) pair: the parent generation
+# (`state_max_last_run_at`) a child was caught up with as of its own last
+# *successful* publish (issue #611). Lazily created on first write, like the
+# append-only logs -- an optional optimization, not core state, so a project
+# that never benefits from it never gets an empty table for it.
+SYNC_WATERMARK_TABLE = "stel_sync_watermark"
+
 # Serving-ledger table name shared with retrieval.coordination: fenced state
 # replacement must verify a publication claim in the same warehouse that owns
 # the state rows, without adapters importing retrieval code.
@@ -260,6 +267,7 @@ INTERNAL_TABLE_NAMES = (
     STATE_TABLE,
     SERVING_LEDGER_TABLE,
     SERVING_LEASE_TABLE,
+    SYNC_WATERMARK_TABLE,
     LEGACY_STATE_TABLE,
     LEGACY_SERVING_LEDGER_TABLE,
     LEGACY_SERVING_LEASE_TABLE,
@@ -350,6 +358,57 @@ class StateScopeSummary:
     rows: int
     code_versions: int
     last_run_at: str | None
+
+
+@dataclass(frozen=True)
+class StateGeneration:
+    """A model's state scope, cheaply enough to tell whether it changed since
+    a sync watermark last recorded it (issue #611).
+
+    Both fields matter, and neither alone is enough. `last_run_at` is blind to
+    a pure deletion: removing a row touches no surviving row's own timestamp,
+    so `MAX(last_run_at)` can stay exactly where it was -- found via this
+    mechanism's own regression suite, where a parent's deleted document never
+    reached a child that read only the timestamp. `rows` is blind to a
+    same-count replace (one row removed, a different one added at the same
+    moment), which `last_run_at` catches instead. Equality on both together is
+    what "nothing a child would need to notice happened" actually requires.
+    """
+
+    rows: int
+    last_run_at: str
+
+
+@dataclass(frozen=True)
+class TableContentFingerprint:
+    """A cheap, warehouse-computed summary of a table's entire current
+    content: a row count and an order-independent hash over every column of
+    every row (issue #611).
+
+    Unlike `StateGeneration`, this reads the model's own published table, not
+    stel's bookkeeping about it -- so it is the one signal that still changes
+    when a write did not go through stel at all: a direct `UPDATE`, `DELETE`,
+    or `ALTER TABLE` against a stel-managed table. `stel_state` sees none of
+    those; this does, because it is re-derived from the table every time
+    rather than trusted from anything persisted. The cost is real -- a full
+    aggregate scan of the table, comparable to a provider-free read of it --
+    so a sync watermark only pays for this once `StateGeneration` alone
+    already looks unchanged, never as a replacement for that cheaper check.
+    """
+
+    rows: int
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class SyncWatermark:
+    """What a child recorded about one parent as of its own last successful
+    publish (issue #611): both signals, together. A skip requires both to
+    still match -- `state` alone cannot see a write that bypassed stel, and
+    `content` alone would mean paying its real cost on every single run."""
+
+    state: StateGeneration
+    content: TableContentFingerprint
 
 
 @dataclass(frozen=True)
@@ -1731,6 +1790,71 @@ to see the plan first."""
             [scope.model_name, scope.stage, scope.target_identity],
         )
         return {str(code_version): int(count) for code_version, count in found}
+
+    def state_generation(self, scope: StateScope) -> StateGeneration | None:
+        """`scope`'s row count and most recent `last_run_at`, or None when it
+        has never published a row.
+
+        The cheap signal a sync watermark (issue #611) compares against: a row
+        count and a max timestamp, together, only change when that model's
+        published state really did -- never on a run that scanned and found
+        nothing to do. One aggregate query, the same shape as
+        `state_code_version_counts`. See `StateGeneration` for why it takes
+        both fields rather than either alone.
+        """
+        if self.table_column_names(STATE_TABLE) is None:
+            return None
+        table = f"{self.schema_ref}.{self.quote_ident(STATE_TABLE)}"
+        found = self.rows(
+            f"""
+            SELECT COUNT(*), MAX(last_run_at) FROM {table}
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+            """,
+            [scope.model_name, scope.stage, scope.target_identity],
+        )
+        rows, last_run_at = found[0]
+        if not rows:
+            return None
+        return StateGeneration(
+            rows=int(rows), last_run_at=cast(str, _isoformat_or_none(last_run_at))
+        )
+
+    def table_content_fingerprint(self, table: str) -> TableContentFingerprint | None:
+        """`table`'s entire current content, cheaply but authoritatively
+        (issue #611): None when the table does not exist. See
+        `TableContentFingerprint` for what this is for and what it costs.
+        """
+        return None
+
+    def read_sync_watermark(
+        self, child: StateScope, parent: StateScope
+    ) -> SyncWatermark | None:
+        """The parent generation `child` last successfully synced to (issue
+        #611), or None.
+
+        None means either "never recorded" -- an adapter that does not
+        override this, or a child with no successful run since this mechanism
+        shipped -- and either way the safe reading is the same: do the real
+        scan. Unlike `append_rows`-backed logs, there is no `enabled:` flag an
+        operator turns on and expects to work: this purely optimizes an
+        existing, always-correct scan, so an adapter that cannot support it
+        simply never gets the skip, with no error and no configuration.
+        """
+        return None
+
+    def write_sync_watermark(
+        self, child: StateScope, parent: StateScope, synced_parent_generation: SyncWatermark
+    ) -> None:
+        """Record that `child`'s last successful run was caught up with
+        `parent` as of `synced_parent_generation` (issue #611).
+
+        Losing this write costs a missed optimization on the next run, never
+        correctness -- the skip's read side requires an exact match, and an
+        absent or stale watermark always resolves to "scan for real". That
+        makes the default no-op body here a legitimate, permanent answer for
+        an adapter that chooses not to implement this, not a placeholder.
+        """
+        return None
 
     def list_state_scopes(self) -> list[StateScopeSummary]:
         """Every state scope the warehouse holds, with its size and activity.

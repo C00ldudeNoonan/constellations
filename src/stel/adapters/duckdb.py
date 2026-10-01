@@ -4,6 +4,7 @@ import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -31,6 +32,7 @@ from .base import (
     SqlRelationColumn,
     SqlRelationSchema,
     StaleStateFenceError,
+    StateGeneration,
     StatePage,
     StatePageReader,
     StatePageRecord,
@@ -39,6 +41,8 @@ from .base import (
     StateScope,
     StateScopeFence,
     StateValue,
+    SyncWatermark,
+    TableContentFingerprint,
     TableReadRequest,
     TableReadSnapshot,
     TableSnapshotGenerationChangedError,
@@ -57,6 +61,7 @@ from .base import (
     validate_update_when_changed_columns,
 )
 from .base import STATE_TABLE as _STATE_TABLE
+from .base import SYNC_WATERMARK_TABLE as _SYNC_WATERMARK_TABLE
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -518,6 +523,121 @@ class DuckDBAdapter(WarehouseAdapter):
             )
         """
 
+    def _ensure_sync_watermark_table(self) -> None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            self.connection.execute(
+                f"""
+                CREATE TABLE {self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)} (
+                    model_name VARCHAR NOT NULL,
+                    state_scope VARCHAR NOT NULL,
+                    target_identity VARCHAR NOT NULL,
+                    parent_model_name VARCHAR NOT NULL,
+                    parent_state_scope VARCHAR NOT NULL,
+                    parent_target_identity VARCHAR NOT NULL,
+                    synced_parent_rows BIGINT NOT NULL,
+                    synced_parent_last_run_at VARCHAR NOT NULL,
+                    synced_content_rows BIGINT NOT NULL,
+                    synced_content_fingerprint VARCHAR NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY (
+                        model_name, state_scope, target_identity,
+                        parent_model_name, parent_state_scope, parent_target_identity
+                    )
+                )
+                """
+            )
+
+    def table_content_fingerprint(self, table: str) -> TableContentFingerprint | None:
+        if self.table_column_names(table) is None:
+            return None
+        # `hash(t)` coerces the row alias into a STRUCT of every column, so
+        # this needs no column list and so no schema change invalidates it by
+        # construction -- an `ALTER TABLE ADD COLUMN` changes the hash too,
+        # exactly like a row edit would (issue #611, verified empirically:
+        # DuckDB has no documented guarantee here, only an observed one).
+        # `bit_xor` makes the aggregate order-independent, since no row order
+        # is guaranteed; `COUNT(*)` is a near-free belt-and-suspenders against
+        # the vanishing chance two different row sets XOR to the same value.
+        found = self.connection.execute(
+            f"SELECT COUNT(*), bit_xor(hash(t)) FROM {self.table_ref(table)} AS t"
+        ).fetchone()
+        assert found is not None  # COUNT(*) always returns exactly one row
+        rows, fingerprint = found
+        return TableContentFingerprint(rows=int(rows), fingerprint=str(fingerprint))
+
+    def read_sync_watermark(
+        self, child: StateScope, parent: StateScope
+    ) -> SyncWatermark | None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            return None
+        table = f"{self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)}"
+        row = self.connection.execute(
+            f"""
+            SELECT synced_parent_rows, synced_parent_last_run_at,
+                   synced_content_rows, synced_content_fingerprint
+            FROM {table}
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+              AND parent_model_name = ? AND parent_state_scope = ?
+              AND parent_target_identity = ?
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+            ],
+        ).fetchone()
+        if row is None:
+            return None
+        state_rows, last_run_at, content_rows, fingerprint = row
+        return SyncWatermark(
+            state=StateGeneration(rows=int(state_rows), last_run_at=last_run_at),
+            content=TableContentFingerprint(rows=int(content_rows), fingerprint=fingerprint),
+        )
+
+    def write_sync_watermark(
+        self, child: StateScope, parent: StateScope, synced_parent_generation: SyncWatermark
+    ) -> None:
+        self._ensure_sync_watermark_table()
+        table = f"{self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)}"
+        state = synced_parent_generation.state
+        content = synced_parent_generation.content
+        self.connection.execute(
+            f"""
+            INSERT INTO {table} (
+                model_name, state_scope, target_identity,
+                parent_model_name, parent_state_scope, parent_target_identity,
+                synced_parent_rows, synced_parent_last_run_at,
+                synced_content_rows, synced_content_fingerprint, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                model_name, state_scope, target_identity,
+                parent_model_name, parent_state_scope, parent_target_identity
+            )
+            DO UPDATE SET
+                synced_parent_rows = excluded.synced_parent_rows,
+                synced_parent_last_run_at = excluded.synced_parent_last_run_at,
+                synced_content_rows = excluded.synced_content_rows,
+                synced_content_fingerprint = excluded.synced_content_fingerprint,
+                updated_at = excluded.updated_at
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+                state.rows,
+                state.last_run_at,
+                content.rows,
+                content.fingerprint,
+                datetime.now(UTC),
+            ],
+        )
+
     def _state_columns(
         self, table: str
     ) -> tuple[tuple[str, str, str], ...] | None:
@@ -583,6 +703,22 @@ class DuckDBAdapter(WarehouseAdapter):
             self.connection.execute(f"DROP TABLE {old_ref}")
             self.connection.execute(
                 f"ALTER TABLE {migration_ref} RENAME TO {self.quote_ident(_STATE_TABLE)}"
+            )
+            # A v1 state row's fingerprint was keyed on a document, not
+            # necessarily on the same grain v2's `record_key` expects (e.g. one
+            # hash per source document where a chunk model now needs one per
+            # chunk) -- carried over unchanged by this migration, verified only
+            # by row count. A sync watermark (issue #611) trusts a child's own
+            # published state without re-deriving it, so a child whose
+            # migrated fingerprints are wrong for their new grain would never
+            # be corrected if a stale watermark let it skip the one real scan
+            # that would notice. In the same transaction as the migration
+            # itself: every model must re-derive its classification at least
+            # once after any state-shape change, not just once per migration
+            # attempt that happens to also touch the warehouse successfully.
+            self.connection.execute(
+                f"DROP TABLE IF EXISTS "
+                f"{self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)}"
             )
 
     # ─── identity ────────────────────────────────────────────────────────

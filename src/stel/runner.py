@@ -9,7 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +18,9 @@ from typing import Any, cast
 from .adapters import (
     ReadPredicate,
     ReadPredicateOperator,
+    StateScope,
+    SyncWatermark,
+    TableContentFingerprint,
     WarehouseAdapter,
     create_adapter,
 )
@@ -37,7 +40,7 @@ from .config.model import (
 from .config.profile import WarehouseConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
-from .dag import ProjectDAG, is_dbt_ref
+from .dag import NodeKind, ProjectDAG, is_dbt_ref
 from .execution import ModelRunResult as ModelRunResult
 from .execution import RunError as RunError
 from .execution import chunk as _chunk_execution
@@ -63,6 +66,7 @@ from .profile import (
 from .progress import get_reporter
 from .reprocess_guard import format_refusals, guard_reprocess
 from .sources import SourceError, get_document_source
+from .versioning import compute_model_code_version
 
 log = logging.getLogger(__name__)
 
@@ -263,6 +267,7 @@ def run_project(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            dag=dag,
             threads=threads,
             run_budget=run_budget,
             subset_run=subset_run,
@@ -492,6 +497,7 @@ def build_project(
                     adapter=adapter,
                     resolved=resolved,
                     full_refresh=full_refresh,
+                    dag=dag,
                     threads=threads,
                     run_budget=run_budget,
                     subset_run=subset_run,
@@ -840,6 +846,107 @@ def _enforce_reprocess_guard(
     )
 
 
+def _single_data_parent(model_name: str, dag: ProjectDAG) -> str | None:
+    """The one upstream stel model whose content this model's classification
+    scan actually reads, or None (issue #611).
+
+    `dag.predecessors` also carries ordering-only edges -- `depends_on` noise,
+    relationship-test targets, a retrieval test's golden set -- that are not
+    data the scan reads. Rather than resolve the real one precisely per kind,
+    this requires there to be *exactly one* non-source predecessor at all:
+    over-restrictive for a model with, say, both a real data parent and an
+    unrelated relationship test pointing at another model, but that only
+    costs a missed optimization for that model, never an incorrect skip. Zero
+    predecessors (a root model reading a raw source) must always return None
+    too -- that scan, for new source documents, is exactly the one this
+    mechanism can never justify skipping.
+    """
+    model_predecessors = [
+        name
+        for name in dag.predecessors.get(model_name, set())
+        if dag.nodes[name].kind != NodeKind.SOURCE
+    ]
+    return model_predecessors[0] if len(model_predecessors) == 1 else None
+
+
+def _can_skip_unchanged_scan(model: ModelConfig, *, full_refresh: bool, subset_run: bool) -> bool:
+    """Whether this model kind and invocation are even eligible for the
+    unchanged-parent skip (issue #611), before paying for the watermark and
+    code_version checks that decide it for real.
+
+    `search:` is excluded: `run_search_model` also sweeps stale retrieval
+    generations inline, a side effect this skip must not suppress. `ml:` and
+    `eval:` are excluded because they do not fit the same incremental,
+    state-scoped-by-model-name contract the skip's state check assumes.
+    `--full-refresh` and a source-filtered/read-filtered subset run each
+    narrow or force what a normal run would do, so neither is safe to
+    second-guess with a scan that was written for the unfiltered case."""
+    return (
+        not full_refresh
+        and not subset_run
+        and model.materialization == "incremental"
+        and model.search is None
+        and model.ml is None
+        and model.eval is None
+    )
+
+
+def _watermark_safely[T](model_name: str, operation: str, action: Callable[[], T]) -> T | None:
+    """Run one unchanged-scan-skip read or write (issue #611), never letting
+    it fail the run it was only ever meant to speed up.
+
+    This is the runner, one of the three places this codebase's exception
+    policy names as a legitimate boundary. The skip is purely an
+    optimization over an always-correct scan: a warehouse error here --
+    including the brand-new `stel_sync_watermark` table existing but the
+    caller lacking permission to create or read it, on a deployment that can
+    otherwise mutate `stel_state` fine -- must fall back to the real scan,
+    not abort an otherwise-successful model. The exception class, not its
+    text, is logged: the same reasoning the store layer already applies to
+    native warehouse errors.
+    """
+    try:
+        return action()
+    except Exception as error:
+        log.warning(
+            "%s: could not %s for the unchanged-scan skip [%s]; doing the full scan instead",
+            model_name,
+            operation,
+            type(error).__name__,
+        )
+        return None
+
+
+def _published_row_count_if_code_unchanged(
+    model: ModelConfig,
+    *,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+) -> int | None:
+    """This model's published row count, when every one of those rows still
+    carries the current code_version -- one aggregate query, the same one
+    `stel plan` runs (issue #611). None (never skip) on a model with no
+    published state or with any stale row: a first run, or a real code
+    change, always has to do the real work regardless of what its parent did.
+
+    The count doubles as what a full scan would have reported as
+    `documents_skipped`: with the watermark also matching (checked
+    separately, by the caller), every one of this model's previously
+    published rows is still exactly what the parent holds.
+    """
+    counts = adapter.state_code_version_counts(StateScope(model.name))
+    state_rows = sum(counts.values())
+    if state_rows == 0:
+        return None
+    code_version = compute_model_code_version(
+        model, project, project_dir, resolved=resolved
+    )
+    stale_rows = sum(count for version, count in counts.items() if version != code_version)
+    return state_rows if stale_rows == 0 else None
+
+
 def _run_model(
     *,
     model: ModelConfig,
@@ -850,6 +957,7 @@ def _run_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    dag: ProjectDAG,
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
@@ -858,7 +966,97 @@ def _run_model(
     kind = _model_kind_label(model)
     log.info("starting %s (%s)", model.name, kind)
     start = time.monotonic()
-    if model.extraction is not None:
+    # The unchanged-scan skip (issue #611), two tiers. `state` is cheap (one
+    # aggregate query over stel's own narrow bookkeeping table) and catches
+    # every ordinary case, including a real code/cascade change and a real
+    # deletion -- but it is blind to a write that bypassed stel entirely (a
+    # direct UPDATE/DELETE/ALTER TABLE against a model's own output table,
+    # which this repo's own test suite does routinely to simulate scenarios
+    # cheaply, so it is not a hypothetical). `content` is the authoritative
+    # confirmation: a real-cost aggregate hash over the parent's actual
+    # current rows.
+    #
+    # `content` is read exactly once whenever it is needed at all, strictly
+    # before this model's own run starts, and reused as-is for the post-run
+    # watermark write rather than ever re-read afterward (Codex review,
+    # #612): a parent mutated *during* this model's own dispatch -- by
+    # anything other than stel, since nothing stel-owned touches it while
+    # this model depends on it -- must never be folded into a watermark
+    # claiming this model is caught up with content it never actually
+    # consumed. It is read in two situations, both cheap relative to what
+    # happens next: to confirm a skip the cheap signal alone cannot (the
+    # no-op case this mechanism exists for), and -- whenever real work is
+    # about to happen for any reason (a first run, a code change, a cheap
+    # mismatch) -- once more, so that work ends with a fresh watermark
+    # established. Without the second case a model would never acquire its
+    # first watermark: the next run would find nothing to compare against
+    # either, and the skip could never engage for it at all.
+    parent_name = (
+        _single_data_parent(model.name, dag)
+        if _can_skip_unchanged_scan(model, full_refresh=full_refresh, subset_run=subset_run)
+        else None
+    )
+    parent_scope = StateScope(parent_name) if parent_name is not None else None
+    parent_state = (
+        _watermark_safely(
+            model.name,
+            "read the parent's generation",
+            lambda: adapter.state_generation(parent_scope),
+        )
+        if parent_scope is not None
+        else None
+    )
+    parent_content: TableContentFingerprint | None = None
+    skipped_row_count = None
+    if parent_state is not None:
+        skipped_row_count = _published_row_count_if_code_unchanged(
+            model, project=project, project_dir=project_dir, adapter=adapter, resolved=resolved
+        )
+        if skipped_row_count is not None:
+            child_scope = StateScope(model.name)
+            synced = _watermark_safely(
+                model.name,
+                "read its sync watermark",
+                lambda: adapter.read_sync_watermark(child_scope, cast(StateScope, parent_scope)),
+            )
+            if synced is None or synced.state != parent_state:
+                skipped_row_count = None
+            else:
+                # The cheap signal alone looks unchanged: pay for the
+                # authoritative one now, to decide the skip for real.
+                parent_content = _watermark_safely(
+                    model.name,
+                    "fingerprint the parent's content",
+                    lambda: adapter.table_content_fingerprint(cast(str, parent_name)),
+                )
+                if parent_content is None or synced.content != parent_content:
+                    skipped_row_count = None
+        if skipped_row_count is None and parent_content is None:
+            # Real work is happening regardless -- the model's own code
+            # changed, no watermark was ever recorded, or the cheap signal
+            # alone already proved a change. Reading content now, once, is
+            # marginal next to the real scan about to run, and it is the only
+            # way a watermark ever gets established for a model that has
+            # never confirmed one before (otherwise it never would: the next
+            # run would find no watermark to compare against either, and the
+            # skip could never engage for this model at all).
+            parent_content = _watermark_safely(
+                model.name,
+                "fingerprint the parent's content",
+                lambda: adapter.table_content_fingerprint(cast(str, parent_name)),
+            )
+    if skipped_row_count is not None:
+        # The parent published nothing since this model last synced to it (by
+        # either signal), and this model's own code hasn't moved since its
+        # last publish -- so there is nothing for a full parent scan to find.
+        result = ModelRunResult(
+            model_name=model.name,
+            materialization=model.materialization,
+            kind=kind,
+            status="unchanged",
+            documents_skipped=skipped_row_count,
+        )
+    elif model.extraction is not None:
         result = _run_extraction_model(
             model=model,
             project=project,
@@ -952,6 +1150,24 @@ def _run_model(
         raise RunError(
             f"Model '{model.name}' has no extraction, transform, ml, chunk, embed, "
             "llm, search, or eval block configured"
+        )
+    if parent_scope is not None and parent_content is not None and not result.errors:
+        # This model just did real work and came back clean: it is now caught
+        # up with the parent as of `parent_content`, read strictly before
+        # this run started and never re-read since (see the comment above).
+        # A model whose parent could not be read at all this round (every
+        # attempt above failed, or there is no eligible parent) writes no
+        # watermark, never one derived from content read after the fact.
+        # Best-effort (issue #611): losing this write costs one missed skip
+        # next run, never a wrong one, so it is never worth failing over.
+        assert parent_state is not None  # parent_content is only ever set inside that branch
+        watermark = SyncWatermark(state=parent_state, content=parent_content)
+        _watermark_safely(
+            model.name,
+            "record its sync watermark",
+            lambda: adapter.write_sync_watermark(
+                StateScope(model.name), parent_scope, watermark
+            ),
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     log.info(

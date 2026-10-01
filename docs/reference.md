@@ -636,6 +636,14 @@ The statuses:
 | `new` | No published state. The first run processes every input. |
 | `full` | `materialization: full` rebuilds from its input every run; nothing is skipped or reprocessed incrementally. Listed so a changed upstream is still seen to reach it. |
 
+A plan's `unchanged` status is necessarily conservative: it is a state-table
+query, so it cannot know whether new or changed input is waiting upstream, and
+says so ("the run finds those itself"). The run itself knows more, once it is
+under way: a **sync watermark** (issue #573) lets a model skip that scan
+entirely when it can prove, from two signals read fresh every time rather than
+trusted blindly, that nothing it would find has changed — see `run_log`'s
+`status: unchanged`, below.
+
 `est_calls` is the provider request count those rows imply, for the kinds
 that spend money: an `embed:` model priced against its provider's own batch
 split, and one request per row for an `llm:` model or per document for
@@ -4541,7 +4549,12 @@ not mistaken for one that had no tests. They are null on a `stel run` row,
 which has no notion of tests, and on a `skipped` row: a build writes one for
 each selected model that never ran because an upstream model errored or
 hard-failed a test, so it can be told apart from a model that was not
-selected.
+selected. A `status: unchanged` row (issue #573) is a model whose sync
+watermark proved its parent published nothing it had not already seen and
+whose own `code_version` matches every row it has published: an ordinary
+incremental model that had nothing to scan for and did not. `documents_skipped`
+still reports the real published row count, matching what a full scan would
+have found.
 
 **`mcp_query_log`** (issues #329, #528) — one row per served tool call, for
 all four tools: `logged_at`, `tool`, `request_id`, `client_name`,

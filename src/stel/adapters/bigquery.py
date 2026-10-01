@@ -22,7 +22,7 @@ import os
 import re
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import quote
@@ -67,6 +67,7 @@ from .base import (
     SqlRelationColumn,
     SqlRelationSchema,
     StaleStateFenceError,
+    StateGeneration,
     StatePage,
     StatePageReader,
     StatePageRecord,
@@ -75,6 +76,8 @@ from .base import (
     StateScope,
     StateScopeFence,
     StateValue,
+    SyncWatermark,
+    TableContentFingerprint,
     TableReadRequest,
     TableReadSnapshot,
     TableSnapshotGenerationChangedError,
@@ -93,6 +96,7 @@ from .base import (
     validate_update_when_changed_columns,
 )
 from .base import STATE_TABLE as _STATE_TABLE
+from .base import SYNC_WATERMARK_TABLE as _SYNC_WATERMARK_TABLE
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -1538,6 +1542,137 @@ class BigQueryAdapter(WarehouseAdapter):
             CLUSTER BY {cluster_by}{suffix}
         """
 
+    def _ensure_sync_watermark_table(self) -> None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            self.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_ref(_SYNC_WATERMARK_TABLE)} (
+                    model_name STRING NOT NULL,
+                    state_scope STRING NOT NULL,
+                    target_identity STRING NOT NULL,
+                    parent_model_name STRING NOT NULL,
+                    parent_state_scope STRING NOT NULL,
+                    parent_target_identity STRING NOT NULL,
+                    synced_parent_rows INT64 NOT NULL,
+                    synced_parent_last_run_at STRING NOT NULL,
+                    synced_content_rows INT64 NOT NULL,
+                    synced_content_fingerprint STRING NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+
+    def table_content_fingerprint(self, table: str) -> TableContentFingerprint | None:
+        if self.table_column_names(table) is None:
+            return None
+        # TO_JSON_STRING(t) serializes the whole row regardless of schema, so
+        # this needs no column list and so no schema change invalidates it by
+        # construction -- an `ALTER TABLE ADD COLUMN` changes the fingerprint
+        # too, exactly like a row edit would (issue #611, verified
+        # empirically against a live project). BIT_XOR makes the aggregate
+        # order-independent, since no row order is guaranteed; COUNT(*) is a
+        # near-free belt-and-suspenders against the vanishing chance two
+        # different row sets fingerprint to the same value.
+        found = self.rows(
+            f"SELECT COUNT(*), BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) "
+            f"FROM {self.table_ref(table)} AS t"
+        )
+        rows, fingerprint = found[0]
+        return TableContentFingerprint(rows=int(rows), fingerprint=str(fingerprint))
+
+    def read_sync_watermark(
+        self, child: StateScope, parent: StateScope
+    ) -> SyncWatermark | None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            return None
+        found = self.rows(
+            f"""
+            SELECT synced_parent_rows, synced_parent_last_run_at,
+                   synced_content_rows, synced_content_fingerprint
+            FROM {self.table_ref(_SYNC_WATERMARK_TABLE)}
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+              AND parent_model_name = ? AND parent_state_scope = ?
+              AND parent_target_identity = ?
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+            ],
+        )
+        if not found:
+            return None
+        state_rows, last_run_at, content_rows, fingerprint = found[0]
+        return SyncWatermark(
+            state=StateGeneration(rows=int(state_rows), last_run_at=str(last_run_at)),
+            content=TableContentFingerprint(rows=int(content_rows), fingerprint=str(fingerprint)),
+        )
+
+    def write_sync_watermark(
+        self, child: StateScope, parent: StateScope, synced_parent_generation: SyncWatermark
+    ) -> None:
+        self._ensure_sync_watermark_table()
+        state = synced_parent_generation.state
+        content = synced_parent_generation.content
+        # A single-row MERGE: this table never approaches the row counts that
+        # make `stel_state`'s own writes need staging tables and batching, so
+        # the portable `self.execute` layer is the right tool here, not that
+        # machinery.
+        self.execute(
+            f"""
+            MERGE {self.table_ref(_SYNC_WATERMARK_TABLE)} AS target
+            USING (
+                SELECT ? AS model_name, ? AS state_scope, ? AS target_identity,
+                       ? AS parent_model_name, ? AS parent_state_scope,
+                       ? AS parent_target_identity,
+                       ? AS synced_parent_rows, ? AS synced_parent_last_run_at,
+                       ? AS synced_content_rows, ? AS synced_content_fingerprint,
+                       ? AS updated_at
+            ) AS source
+            ON target.model_name = source.model_name
+               AND target.state_scope = source.state_scope
+               AND target.target_identity = source.target_identity
+               AND target.parent_model_name = source.parent_model_name
+               AND target.parent_state_scope = source.parent_state_scope
+               AND target.parent_target_identity = source.parent_target_identity
+            WHEN MATCHED THEN UPDATE SET
+                synced_parent_rows = source.synced_parent_rows,
+                synced_parent_last_run_at = source.synced_parent_last_run_at,
+                synced_content_rows = source.synced_content_rows,
+                synced_content_fingerprint = source.synced_content_fingerprint,
+                updated_at = source.updated_at
+            WHEN NOT MATCHED THEN INSERT (
+                model_name, state_scope, target_identity,
+                parent_model_name, parent_state_scope, parent_target_identity,
+                synced_parent_rows, synced_parent_last_run_at,
+                synced_content_rows, synced_content_fingerprint, updated_at
+            ) VALUES (
+                source.model_name, source.state_scope, source.target_identity,
+                source.parent_model_name, source.parent_state_scope,
+                source.parent_target_identity,
+                source.synced_parent_rows, source.synced_parent_last_run_at,
+                source.synced_content_rows, source.synced_content_fingerprint,
+                source.updated_at
+            )
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+                state.rows,
+                state.last_run_at,
+                content.rows,
+                content.fingerprint,
+                datetime.now(UTC),
+            ],
+        )
+
     def _state_columns(self, table: str) -> tuple[tuple[str, str, str], ...] | None:
         try:
             bq_table = self.client.get_table(self._table_id(table))
@@ -1575,6 +1710,17 @@ class BigQueryAdapter(WarehouseAdapter):
                 "deduplicate the state table before retrying."
             )
         self._replace_state_table(source_select)
+        # A v1 state row's fingerprint was keyed on a document, not
+        # necessarily on the same grain v2's `record_key` expects (e.g. one
+        # hash per source document where a chunk model now needs one per
+        # chunk) -- carried over unchanged by this migration, verified only
+        # by row count. A sync watermark (issue #611) trusts a child's own
+        # published state without re-deriving it, so a child whose migrated
+        # fingerprints are wrong for their new grain would never be corrected
+        # if a stale watermark let it skip the one real scan that would
+        # notice. Every model must re-derive its classification at least once
+        # after any state-shape change.
+        self.execute(f"DROP TABLE IF EXISTS {self.table_ref(_SYNC_WATERMARK_TABLE)}")
 
     def _recluster_state_table(self) -> None:
         """Set stel_state's clustering columns via an in-place metadata patch.

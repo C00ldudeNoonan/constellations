@@ -3970,6 +3970,56 @@ def test_integration_append_rows_creates_accumulates_and_widens() -> None:
 @pytest.mark.skipif(
     not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
 )
+def test_integration_sync_watermark_round_trips_and_overwrites() -> None:
+    """Live cover for the unchanged-scan skip's watermark (issue #611).
+
+    `write_sync_watermark` is a BigQuery MERGE statement; the fake client
+    cannot tell you whether its `WHEN MATCHED`/`WHEN NOT MATCHED` branches are
+    actually both reachable against a real table, or whether the TIMESTAMP
+    value round-trips cleanly enough for the equality comparison the skip
+    itself runs.
+    """
+    from stel.adapters import StateRecord, StateScope
+
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            parent = StateScope("parent_model")
+            child = StateScope("child_model")
+            assert adapter.state_max_last_run_at(parent) is None
+            assert adapter.read_sync_watermark(child, parent) is None
+
+            adapter.upsert_state(parent, [StateRecord("a", "fp-a", "v1")])
+            generation = adapter.state_max_last_run_at(parent)
+            assert generation is not None
+
+            # WHEN NOT MATCHED: first write for this (child, parent) pair.
+            adapter.write_sync_watermark(child, parent, generation)
+            assert adapter.read_sync_watermark(child, parent) == generation
+
+            # WHEN MATCHED: a second write for the same pair overwrites.
+            adapter.upsert_state(parent, [StateRecord("b", "fp-b", "v1")])
+            advanced = adapter.state_max_last_run_at(parent)
+            assert advanced is not None and advanced > generation
+            adapter.write_sync_watermark(child, parent, advanced)
+            assert adapter.read_sync_watermark(child, parent) == advanced
+            assert adapter.rows(
+                f"SELECT COUNT(*) FROM {adapter.table_ref('stel_sync_watermark')} "
+                "WHERE model_name = 'child_model' "
+                "AND parent_model_name = 'parent_model'"
+            ) == [(1,)]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
 def test_integration_a_held_connection_answers_from_several_threads() -> None:
     """Live cover for the serving session's held connection (issue #523).
 
@@ -4338,7 +4388,7 @@ _UNCOVERED_BY_LIVE_TESTS = frozenset(
 # not overridden by BigQueryAdapter, so class introspection alone would miss
 # them — which is precisely how the #322/#333 additions escaped the gate.
 _EXTRA_LIVE_GATE_OPERATIONS = frozenset(
-    {"read_relation", "relation_row_count", "table_snapshot"}
+    {"read_relation", "relation_row_count", "table_snapshot", "state_max_last_run_at"}
 )
 
 

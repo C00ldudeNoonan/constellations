@@ -55,6 +55,7 @@ from stel.adapters.base import (
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
     STATE_TABLE,
+    SYNC_WATERMARK_TABLE,
     TEST_FAILURES_TABLE_PREFIX,
     staging_table_name,
 )
@@ -104,6 +105,15 @@ _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
         "stel_state",
         "holds every incremental fingerprint; a new name is an empty state table, "
         "so every model reprocesses its whole corpus at provider cost",
+    ),
+    (
+        "adapters.base.SYNC_WATERMARK_TABLE",
+        SYNC_WATERMARK_TABLE,
+        "stel_sync_watermark",
+        "holds every unchanged-scan skip's sync watermark (issue #611); a new "
+        "name strands existing watermarks, which only costs a one-time missed "
+        "skip per model -- but a collision with a name already in use would be "
+        "a real, silent conflict",
     ),
     (
         "adapters.base.LEGACY_STATE_TABLE",

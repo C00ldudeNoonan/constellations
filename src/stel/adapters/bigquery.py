@@ -22,7 +22,7 @@ import os
 import re
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import quote
@@ -93,6 +93,7 @@ from .base import (
     validate_update_when_changed_columns,
 )
 from .base import STATE_TABLE as _STATE_TABLE
+from .base import SYNC_WATERMARK_TABLE as _SYNC_WATERMARK_TABLE
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -1537,6 +1538,92 @@ class BigQueryAdapter(WarehouseAdapter):
             )
             CLUSTER BY {cluster_by}{suffix}
         """
+
+    def _ensure_sync_watermark_table(self) -> None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            self.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_ref(_SYNC_WATERMARK_TABLE)} (
+                    model_name STRING NOT NULL,
+                    state_scope STRING NOT NULL,
+                    target_identity STRING NOT NULL,
+                    parent_model_name STRING NOT NULL,
+                    parent_state_scope STRING NOT NULL,
+                    parent_target_identity STRING NOT NULL,
+                    synced_parent_generation TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+
+    def read_sync_watermark(self, child: StateScope, parent: StateScope) -> datetime | None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            return None
+        return self.scalar(
+            f"""
+            SELECT synced_parent_generation FROM {self.table_ref(_SYNC_WATERMARK_TABLE)}
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+              AND parent_model_name = ? AND parent_state_scope = ?
+              AND parent_target_identity = ?
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+            ],
+        )
+
+    def write_sync_watermark(
+        self, child: StateScope, parent: StateScope, synced_parent_generation: datetime
+    ) -> None:
+        self._ensure_sync_watermark_table()
+        # A single-row MERGE: this table never approaches the row counts that
+        # make `stel_state`'s own writes need staging tables and batching, so
+        # the portable `self.execute` layer is the right tool here, not that
+        # machinery.
+        self.execute(
+            f"""
+            MERGE {self.table_ref(_SYNC_WATERMARK_TABLE)} AS target
+            USING (
+                SELECT ? AS model_name, ? AS state_scope, ? AS target_identity,
+                       ? AS parent_model_name, ? AS parent_state_scope,
+                       ? AS parent_target_identity,
+                       ? AS synced_parent_generation, ? AS updated_at
+            ) AS source
+            ON target.model_name = source.model_name
+               AND target.state_scope = source.state_scope
+               AND target.target_identity = source.target_identity
+               AND target.parent_model_name = source.parent_model_name
+               AND target.parent_state_scope = source.parent_state_scope
+               AND target.parent_target_identity = source.parent_target_identity
+            WHEN MATCHED THEN UPDATE SET
+                synced_parent_generation = source.synced_parent_generation,
+                updated_at = source.updated_at
+            WHEN NOT MATCHED THEN INSERT (
+                model_name, state_scope, target_identity,
+                parent_model_name, parent_state_scope, parent_target_identity,
+                synced_parent_generation, updated_at
+            ) VALUES (
+                source.model_name, source.state_scope, source.target_identity,
+                source.parent_model_name, source.parent_state_scope,
+                source.parent_target_identity,
+                source.synced_parent_generation, source.updated_at
+            )
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+                synced_parent_generation,
+                datetime.now(UTC),
+            ],
+        )
 
     def _state_columns(self, table: str) -> tuple[tuple[str, str, str], ...] | None:
         try:

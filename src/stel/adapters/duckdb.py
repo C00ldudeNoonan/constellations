@@ -4,6 +4,7 @@ import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -57,6 +58,7 @@ from .base import (
     validate_update_when_changed_columns,
 )
 from .base import STATE_TABLE as _STATE_TABLE
+from .base import SYNC_WATERMARK_TABLE as _SYNC_WATERMARK_TABLE
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -517,6 +519,81 @@ class DuckDBAdapter(WarehouseAdapter):
                 )
             )
         """
+
+    def _ensure_sync_watermark_table(self) -> None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            self.connection.execute(
+                f"""
+                CREATE TABLE {self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)} (
+                    model_name VARCHAR NOT NULL,
+                    state_scope VARCHAR NOT NULL,
+                    target_identity VARCHAR NOT NULL,
+                    parent_model_name VARCHAR NOT NULL,
+                    parent_state_scope VARCHAR NOT NULL,
+                    parent_target_identity VARCHAR NOT NULL,
+                    synced_parent_generation TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY (
+                        model_name, state_scope, target_identity,
+                        parent_model_name, parent_state_scope, parent_target_identity
+                    )
+                )
+                """
+            )
+
+    def read_sync_watermark(self, child: StateScope, parent: StateScope) -> datetime | None:
+        if self.table_column_names(_SYNC_WATERMARK_TABLE) is None:
+            return None
+        table = f"{self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)}"
+        row = self.connection.execute(
+            f"""
+            SELECT synced_parent_generation FROM {table}
+            WHERE model_name = ? AND state_scope = ? AND target_identity = ?
+              AND parent_model_name = ? AND parent_state_scope = ?
+              AND parent_target_identity = ?
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+            ],
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def write_sync_watermark(
+        self, child: StateScope, parent: StateScope, synced_parent_generation: datetime
+    ) -> None:
+        self._ensure_sync_watermark_table()
+        table = f"{self.schema_ref}.{self.quote_ident(_SYNC_WATERMARK_TABLE)}"
+        self.connection.execute(
+            f"""
+            INSERT INTO {table} (
+                model_name, state_scope, target_identity,
+                parent_model_name, parent_state_scope, parent_target_identity,
+                synced_parent_generation, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                model_name, state_scope, target_identity,
+                parent_model_name, parent_state_scope, parent_target_identity
+            )
+            DO UPDATE SET
+                synced_parent_generation = excluded.synced_parent_generation,
+                updated_at = excluded.updated_at
+            """,
+            [
+                child.model_name,
+                child.stage,
+                child.target_identity,
+                parent.model_name,
+                parent.stage,
+                parent.target_identity,
+                synced_parent_generation,
+                datetime.now(UTC),
+            ],
+        )
 
     def _state_columns(
         self, table: str

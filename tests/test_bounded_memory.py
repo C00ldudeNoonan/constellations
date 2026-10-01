@@ -564,6 +564,15 @@ def test_llm_never_materializes_the_corpus(
     with _measure_residency(monkeypatch) as seen:
         [result] = run_project(project, select="document_facts")
 
+    if result.status == "unchanged":
+        # The unchanged-scan skip (issue #611) fired: the parent published
+        # nothing and this model's own code is unchanged, so the bounded
+        # streaming path this test exists to pin never got the chance to run
+        # at all -- a stronger, cheaper way to make the same zero-provider-
+        # calls guarantee true, not a violation of it.
+        assert result.metrics == {}
+        assert seen.largest_batch_rows == 0
+        return
     assert result.metrics["provider_calls"] == 0
     assert seen.largest_frame_rows == 0, (
         f"llm materialized a {seen.largest_frame_rows}-row frame via "

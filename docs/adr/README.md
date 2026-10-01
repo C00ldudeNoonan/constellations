@@ -24,6 +24,7 @@ history (issue #311).
 | [0012](0012-native-failure-detail-goes-to-an-operator-named-file.md) | The native detail behind a sanitized failure goes to a file the operator named, never to a log level | accepted; amended by [0014](0014-a-debug-switch-owns-its-destination.md) |
 | [0013](0013-a-merge-page-is-bounded-by-bytes-in-the-store.md) | A merge page is bounded by bytes, in the store, before it is sent — `batch_size` keeps counting rows | accepted |
 | [0014](0014-a-debug-switch-owns-its-destination.md) | A debug switch owns its own destination, and marks the records it is for | accepted |
+| [0015](0015-a-sync-watermark-needs-two-independent-signals.md) | A sync watermark needs two independent signals — cheap state, and an authoritative content fingerprint — not one | accepted |
 
 ## When to write one
 

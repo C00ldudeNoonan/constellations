@@ -749,12 +749,17 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
         _FakeJob(),
         _FakeJob(rows=[(2, 2)]),
         _FakeJob(),
+        _FakeJob(),
     ]
     adapter = _adapter(client)
 
     adapter._ensure_state_table()
 
-    assert len(client.queries) == 4
+    # 4 for the migration itself, plus one more: every sync watermark (issue
+    # #611) is invalidated in the same pass, since a v1 row's fingerprint was
+    # keyed on a document rather than necessarily the grain v2's `record_key`
+    # expects, carried over unchanged and verified only by row count.
+    assert len(client.queries) == 5
     duplicate_sql = client.queries[0][0]
     assert "GROUP BY model_name, document_id HAVING COUNT(*) > 1" in duplicate_sql
     stage_sql = client.queries[1][0]
@@ -783,6 +788,8 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
     assert copy_sql.startswith("CREATE OR REPLACE TABLE `proj`.`ds`.`stel_state` COPY")
     assert copy_sql.endswith(f"COPY {migration_ref}")
     assert protected_table_ids.isdisjoint(client.dropped)
+    watermark_sql = client.queries[4][0]
+    assert watermark_sql == "DROP TABLE IF EXISTS `proj`.`ds`.`stel_sync_watermark`"
 
     # The v1 migration goes through _create_state_table_sql, so the table it
     # produced is already clustered -- re-checking must find that and stay a
@@ -792,7 +799,7 @@ def test_state_table_migrates_legacy_rows_through_verified_copy() -> None:
         "clustering_fields": list(_STATE_CLUSTER_FIELDS)
     }
     adapter._ensure_state_table()
-    assert len(client.queries) == 4
+    assert len(client.queries) == 5
 
 
 def test_state_table_migration_count_mismatch_keeps_legacy_table() -> None:
@@ -3975,11 +3982,13 @@ def test_integration_sync_watermark_round_trips_and_overwrites() -> None:
 
     `write_sync_watermark` is a BigQuery MERGE statement; the fake client
     cannot tell you whether its `WHEN MATCHED`/`WHEN NOT MATCHED` branches are
-    actually both reachable against a real table, or whether the TIMESTAMP
-    value round-trips cleanly enough for the equality comparison the skip
-    itself runs.
+    actually both reachable against a real table, whether a row deleted via a
+    real DML `DELETE` is reflected in `state_generation`'s `COUNT(*)`, or
+    whether `TO_JSON_STRING`/`FARM_FINGERPRINT`/`BIT_XOR` actually change
+    `table_content_fingerprint` under a real `UPDATE`/`DELETE`/`ALTER TABLE` --
+    the exact gap `state_generation` alone cannot close.
     """
-    from stel.adapters import StateRecord, StateScope
+    from stel.adapters import StateRecord, StateScope, SyncWatermark
 
     dataset = "stel_it_" + os.urandom(3).hex()
     cfg = parse_warehouse_config(
@@ -3990,21 +3999,33 @@ def test_integration_sync_watermark_round_trips_and_overwrites() -> None:
         with adapter:
             parent = StateScope("parent_model")
             child = StateScope("child_model")
-            assert adapter.state_max_last_run_at(parent) is None
+            assert adapter.state_generation(parent) is None
             assert adapter.read_sync_watermark(child, parent) is None
+            assert adapter.table_content_fingerprint("parent_model") is None
 
             adapter.upsert_state(parent, [StateRecord("a", "fp-a", "v1")])
-            generation = adapter.state_max_last_run_at(parent)
-            assert generation is not None
+            state = adapter.state_generation(parent)
+            assert state is not None and state.rows == 1
+
+            adapter.execute(
+                "CREATE TABLE "
+                f"{adapter.table_ref('parent_model')} (a STRING, b INT64)"
+            )
+            adapter.execute(f"INSERT INTO {adapter.table_ref('parent_model')} VALUES ('x', 1)")
+            content = adapter.table_content_fingerprint("parent_model")
+            assert content is not None and content.rows == 1
 
             # WHEN NOT MATCHED: first write for this (child, parent) pair.
-            adapter.write_sync_watermark(child, parent, generation)
-            assert adapter.read_sync_watermark(child, parent) == generation
+            watermark = SyncWatermark(state=state, content=content)
+            adapter.write_sync_watermark(child, parent, watermark)
+            assert adapter.read_sync_watermark(child, parent) == watermark
 
             # WHEN MATCHED: a second write for the same pair overwrites.
             adapter.upsert_state(parent, [StateRecord("b", "fp-b", "v1")])
-            advanced = adapter.state_max_last_run_at(parent)
-            assert advanced is not None and advanced > generation
+            advanced_state = adapter.state_generation(parent)
+            assert advanced_state is not None and advanced_state.rows == 2
+            assert advanced_state != state
+            advanced = SyncWatermark(state=advanced_state, content=content)
             adapter.write_sync_watermark(child, parent, advanced)
             assert adapter.read_sync_watermark(child, parent) == advanced
             assert adapter.rows(
@@ -4012,6 +4033,24 @@ def test_integration_sync_watermark_round_trips_and_overwrites() -> None:
                 "WHERE model_name = 'child_model' "
                 "AND parent_model_name = 'parent_model'"
             ) == [(1,)]
+
+            # A pure state deletion: `rows` drops back to 1, even though no
+            # surviving row's own `last_run_at` moved -- indistinguishable
+            # from `state` above for exactly that reason (both are "row a").
+            adapter.delete_state(parent, ["b"])
+            after_delete = adapter.state_generation(parent)
+            assert after_delete == state
+
+            # The real gap: a direct write to the parent's own table, which
+            # touched no `stel_state` row at all. `state_generation` cannot
+            # see it; `table_content_fingerprint` must.
+            adapter.execute(
+                f"UPDATE {adapter.table_ref('parent_model')} SET b = 99 WHERE a = 'x'"
+            )
+            after_direct_update = adapter.table_content_fingerprint("parent_model")
+            assert after_direct_update is not None
+            assert after_direct_update.rows == content.rows
+            assert after_direct_update.fingerprint != content.fingerprint
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()
@@ -4367,10 +4406,8 @@ _UNCOVERED_BY_LIVE_TESTS = frozenset(
         "clear_state",
         "delete_rows",
         "delete_rows_and_state",
-        "delete_state",
         "drop_table",
         "dry_run_sql",
-        "execute",
         "list_all_tables",
         "materialize_full_chunks",
         "materialize_sql_full",
@@ -4388,7 +4425,7 @@ _UNCOVERED_BY_LIVE_TESTS = frozenset(
 # not overridden by BigQueryAdapter, so class introspection alone would miss
 # them — which is precisely how the #322/#333 additions escaped the gate.
 _EXTRA_LIVE_GATE_OPERATIONS = frozenset(
-    {"read_relation", "relation_row_count", "table_snapshot", "state_max_last_run_at"}
+    {"read_relation", "relation_row_count", "table_snapshot", "state_generation"}
 )
 
 

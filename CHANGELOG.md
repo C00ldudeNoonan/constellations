@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### A no-op incremental run skips the parent scan it already knows is pointless (issue #573)
+
+A nightly run whose source had not changed still cost 5m40s across 6 models,
+137s of it a search index publishing nothing: every model already knew its
+input was unchanged, but each still opened and scanned its full parent to
+rediscover that. An earlier attempt at a same-invocation signal ("my parent
+wrote 0 rows this run") was built and reverted after this repo's own test
+suite proved it unsound -- an upstream table edited directly, or a publish
+failure rolled back after its parent had already committed, both left a
+child's state stale in ways a same-run signal cannot see.
+
+A model now skips the scan only when a **sync watermark**, persisted across
+runs, proves it is caught up by two independent signals, both re-derived
+fresh every time rather than trusted blindly:
+
+- **`state_generation`** -- cheap, one aggregate query over `stel_state`: a
+  row count and the most recent `last_run_at`. Catches a real code or cascade
+  change, and a real deletion (row count drops even though no surviving row's
+  own timestamp moved -- the gap a timestamp-only signal would have missed,
+  caught by this change's own regression suite).
+- **`table_content_fingerprint`** -- the authoritative confirmation, paid
+  only once the cheap signal already looks unchanged: a warehouse-side
+  aggregate hash over the parent's actual current rows. This is what closes
+  the gap the first attempt could not: a direct `UPDATE`/`DELETE`/
+  `ALTER TABLE` against a stel-managed table, which `stel_state` never
+  observes. The cost is real -- a full scan of the parent, computed
+  server-side rather than pulled into Python -- so it is never paid on a run
+  that was going to do the real work anyway.
+
+Both signals must match what the model recorded as of its own last
+**successful** publish; losing a watermark write costs one missed
+optimization next run, never a wrong one. A state-table migration (the v1 to
+v2 shape change) invalidates every watermark in the warehouse in the same
+pass, since a migrated row's fingerprint was keyed on a different grain than
+the model that now owns it might need, and no model may trust a watermark
+recorded before its own state could have changed shape.
+
+`search:` models are excluded: a search publish also sweeps stale retrieval
+generations inline, a side effect this must not suppress. `ml:` and `eval:`
+are excluded as not fitting the same state-scoped-by-model-name contract the
+checks read. The skip records a `run_log` row like any other, `status:
+unchanged`, with `documents_skipped` reporting the real published count.
+
 ## v0.19.0 - 2026-09-21
 
 ### A fitted model's identity no longer depends on the machine's thread count (issue #600)

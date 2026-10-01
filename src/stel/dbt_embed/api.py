@@ -81,5 +81,8 @@ def materialize(
             adapter=adapter,
             resolved=resolved,
             full_refresh=True,
+            # `full_refresh=True` above already makes the unchanged-scan skip
+            # (issue #611) ineligible regardless of what `dag` would resolve.
+            dag=dag,
         )
         return adapter.captured

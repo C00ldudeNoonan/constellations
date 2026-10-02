@@ -310,3 +310,128 @@ def test_enum_descriptions_never_reach_the_provider_schema() -> None:
     schema = _input_schema(spec)
 
     assert schema["properties"]["sector"] == {"type": "string", "enum": ["financials"]}
+
+
+# ─── resolution reaches `backend: llm` extraction options too (#639 review) ──
+#
+# `extraction.options.fields` (`LLMFieldSpec`) is a second, independent enum
+# declaration a `backend: llm` extraction model's provider schema is built
+# from — never from top-level `fields:`. Resolving `values_from` there only
+# would leave this path's actual provider request unconstrained even though
+# the model's warehouse-side `accepted_values` check looked declared.
+
+
+def _llm_model_block(values_from: str = "vocab.sector") -> str:
+    return (
+        "  - name: classified\n"
+        "    extraction:\n"
+        "      backend: llm\n"
+        "      options:\n"
+        "        fields:\n"
+        "          - name: sector\n"
+        "            type: enum\n"
+        f"            values_from: {values_from}\n"
+        "    materialization: full\n"
+    )
+
+
+def test_backend_llm_extraction_options_resolve_values_from(tmp_path: Path) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: vocab_project\n" + _VOCAB_YAML, encoding="utf-8"
+    )
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.yml").write_text(
+        "version: 2\nmodels:\n" + _llm_model_block(), encoding="utf-8"
+    )
+
+    _, _, models = load_project(tmp_path)
+
+    assert models[0].extraction is not None
+    fields = models[0].extraction.options["fields"]
+    assert fields[0]["values"] == ["financials", "technology"]
+    assert "values_from" not in fields[0]
+
+
+def test_backend_llm_extraction_options_reach_the_provider_constrained(
+    tmp_path: Path,
+) -> None:
+    from stel.backends.llm_backend import _fields_spec, _input_schema
+
+    (tmp_path / "stel_project.yml").write_text(
+        "name: vocab_project\n" + _VOCAB_YAML, encoding="utf-8"
+    )
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.yml").write_text(
+        "version: 2\nmodels:\n" + _llm_model_block(), encoding="utf-8"
+    )
+
+    _, _, models = load_project(tmp_path)
+
+    assert models[0].extraction is not None
+    spec = _fields_spec(models[0].extraction.options)
+    schema = _input_schema(spec)
+
+    assert schema["properties"]["sector"] == {
+        "type": "string",
+        "enum": ["financials", "technology"],
+    }
+
+
+def test_backend_llm_extraction_options_unknown_vocabulary_fails_to_load(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "stel_project.yml").write_text("name: vocab_project\n", encoding="utf-8")
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.yml").write_text(
+        "version: 2\nmodels:\n" + _llm_model_block(), encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match=r"vocab\.sector.*not declared"):
+        load_project(tmp_path)
+
+
+def test_backend_llm_extraction_options_malformed_values_from_fails_to_load(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "stel_project.yml").write_text(
+        "name: vocab_project\n" + _VOCAB_YAML, encoding="utf-8"
+    )
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.yml").write_text(
+        "version: 2\nmodels:\n" + _llm_model_block(values_from="sector"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=r"must look like 'vocab\.<name>'"):
+        load_project(tmp_path)
+
+
+# ─── resolver-only fields never leak into a serialized artifact (#639 review) ─
+
+
+def test_values_from_is_excluded_from_serialization() -> None:
+    field = FieldConfig(name="signal", type="enum", values=["a"])
+
+    assert "values_from" not in field.model_dump()
+
+
+def test_resolved_value_descriptions_are_excluded_from_serialization() -> None:
+    field = _resolved_field(["financials"], {"financials": "Banks and insurers"})
+
+    dumped = field.model_dump()
+
+    assert "value_descriptions" not in dumped
+    assert dumped["values"] == ["financials"]
+
+
+def test_a_resolved_field_round_trips_through_model_dump() -> None:
+    # Before the exclude fix, a non-empty value_descriptions surviving into
+    # model_dump() would make the dump non-round-trippable: FieldConfig's own
+    # authoring guard rejects a directly-set value_descriptions.
+    field = _resolved_field(["financials"], {"financials": "Banks and insurers"})
+
+    FieldConfig.model_validate(field.model_dump())

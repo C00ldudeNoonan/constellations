@@ -531,6 +531,16 @@ def _resolve_declared_vocabularies(project: ProjectConfig, models: list[ModelCon
     (issue #625). An unknown vocabulary name fails here: before source
     discovery, credentials, or any provider call, which matches every other
     structural check in this function.
+
+    Covers both of stel's independent enum-declaration surfaces: a model's
+    top-level `fields:` (`FieldConfig`), and a `backend: llm` extraction
+    model's `extraction.options.fields` — still the raw dict the YAML
+    produced at this point, not yet a typed `LLMFieldSpec` — which separately
+    drives that backend's provider schema and prompt. Resolving both here, in
+    one pass, is what lets one declaration back both surfaces; resolving only
+    the first would leave a `backend: llm` model's actual provider request
+    unconstrained even though its warehouse-side `accepted_values` check
+    looked declared (#639 review).
     """
     for model in models:
         if any(field.values_from for field in model.fields):
@@ -538,6 +548,8 @@ def _resolve_declared_vocabularies(project: ProjectConfig, models: list[ModelCon
                 _resolve_field_values_from(project, model, field)
                 for field in model.fields
             ]
+        if model.extraction is not None:
+            _resolve_extraction_options_values_from(project, model)
 
 
 def _resolve_field_values_from(
@@ -545,7 +557,7 @@ def _resolve_field_values_from(
 ) -> FieldConfig:
     if field.values_from is None:
         return field
-    vocabulary = _lookup_vocabulary(project, model.name, field.name, field.values_from)
+    vocabulary = _vocabulary_for(project, model.name, field.name, field.values_from)
     return field.model_copy(
         update={
             "values": vocabulary.labels(),
@@ -555,13 +567,46 @@ def _resolve_field_values_from(
     )
 
 
-def _lookup_vocabulary(
+def _resolve_extraction_options_values_from(project: ProjectConfig, model: ModelConfig) -> None:
+    assert model.extraction is not None
+    raw_fields = model.extraction.options.get("fields")
+    if not isinstance(raw_fields, list):
+        return
+    for entry in raw_fields:
+        if not isinstance(entry, dict) or "values_from" not in entry:
+            continue
+        values_from = entry["values_from"]
+        field_name = entry.get("name", "<unnamed>")
+        if not isinstance(values_from, str):
+            raise ConfigError(
+                project.format_yaml_diagnostic(
+                    f"Model '{model.name}' extraction option field "
+                    f"'{field_name}' declares `values_from:` that is not a string"
+                )
+            )
+        vocabulary = _vocabulary_for(project, model.name, field_name, values_from)
+        # `LLMFieldSpec` (backends/options.py) has no `values_from` field and
+        # forbids unknown keys, so this must be fully resolved to a plain
+        # `values:` list before that validation ever sees it — the same
+        # requirement `FieldConfig` satisfies structurally, enforced here by
+        # hand since this is still an untyped dict. Term descriptions are not
+        # carried onto this path: `LLMFieldSpec` would need its own field to
+        # receive them, which is a bounded, separately-tracked follow-up.
+        del entry["values_from"]
+        entry["values"] = vocabulary.labels()
+
+
+def _vocabulary_for(
     project: ProjectConfig, model_name: str, field_name: str, values_from: str
 ) -> Vocabulary:
-    # FieldConfig's own validator already rejected a `values_from` that does
-    # not look like 'vocab.<name>', so the match here cannot fail.
     match = VALUES_FROM_PATTERN.match(values_from)
-    assert match is not None
+    if match is None:
+        raise ConfigError(
+            project.format_yaml_diagnostic(
+                f"Model '{model_name}' field '{field_name}' declares "
+                f"`values_from: {values_from}`, which must look like 'vocab.<name>'"
+            )
+        )
     vocab_name = match.group(1)
     vocabulary = project.vocabularies.get(vocab_name)
     if vocabulary is None:

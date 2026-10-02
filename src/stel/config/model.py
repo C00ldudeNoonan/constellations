@@ -999,11 +999,19 @@ class FieldConfig(BaseModel):
     # `stel_project.yml`'s `vocabularies:` by `load_project` before any model
     # sees this field. Resolution populates `values` (and `value_descriptions`
     # below) and clears this back to `None` — everything downstream of
-    # `load_project` reads only `values`.
-    values_from: str | None = None
+    # `load_project` reads only `values`. Excluded from serialization: it is
+    # always `None` by the time any artifact is built, and a project that
+    # declares no vocabulary at all should not gain a new, always-null key on
+    # every enum field's manifest entry (#639 review).
+    values_from: str | None = Field(default=None, exclude=True)
     # Populated by vocabulary resolution alongside `values`, from terms that
     # declare a `description:`. Derived only — never authored directly.
-    value_descriptions: dict[str, str] = Field(default_factory=dict, repr=False)
+    # Excluded from serialization for the same reason as `values_from` above,
+    # and because round-tripping a non-empty value back through this model
+    # would otherwise trip the authoring guard below.
+    value_descriptions: dict[str, str] = Field(
+        default_factory=dict, repr=False, exclude=True
+    )
 
     @field_validator("values")
     @classmethod

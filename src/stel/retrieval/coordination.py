@@ -872,6 +872,34 @@ class ServingCoordinator:
                 pinned_generation,
             ],
         )
+        held = self._adapter.rows(
+            f"SELECT 1 FROM {leases} WHERE lease_id = ?",
+            [lease_id],
+        )
+        if not held:
+            raise ServingBusyError(
+                "A publisher claimed this search index during query admission; retry"
+            )
+        # The insert's own WHERE EXISTS is what actually admits the lease,
+        # not the read above it -- so a status this stale could still be
+        # true when the fencing token and generation it checked are, if a
+        # generation-preserving publish (issue #617) moved from `publishing`
+        # to `degraded` in between. Both keep the same fencing token and
+        # active generation, so the insert would still succeed with a status
+        # this lease has not seen (Codex review, #641). Re-read after
+        # confirming admission rather than trust the pre-admission snapshot.
+        current = self._read_row(scope)
+        if (
+            current is not None
+            and int(current[0]) == fencing_token
+            and current[5] is not None
+            and str(current[5]) == pinned_generation
+        ):
+            status = str(current[1])
+            safe_error_code = (
+                str(current[6]) if status == STATUS_DEGRADED and current[6] is not None
+                else None
+            )
         lease = QueryLease(
             scope=scope,
             lease_id=lease_id,
@@ -882,14 +910,6 @@ class ServingCoordinator:
             status=status,
             safe_error_code=safe_error_code,
         )
-        held = self._adapter.rows(
-            f"SELECT 1 FROM {leases} WHERE lease_id = ?",
-            [lease_id],
-        )
-        if not held:
-            raise ServingBusyError(
-                "A publisher claimed this search index during query admission; retry"
-            )
         try:
             self.validate_query(lease, require_active=True)
         except ServingCoordinationError:

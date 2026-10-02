@@ -286,13 +286,46 @@ def test_activate_serves_a_complete_generation_whose_pointer_was_lost(tmp_path: 
     assert ledger.status().active_collection == generation
 
 
-def test_activate_refuses_a_generation_that_is_not_complete_for_the_upstream(
+def test_activate_serves_a_generation_behind_the_upstream_and_the_next_run_catches_up(
     tmp_path: Path,
 ) -> None:
-    """Row count against the upstream is the completeness check a publish
-    makes after reading every page, and the only one that costs a single
-    query here. A fourth document upstream the collection never saw is the
-    difference between a complete generation and a stranded partial one."""
+    """The upstream grows with every embedding run, so a generation is
+    "exactly complete" only for the hours between its last write and the next
+    filing. A fourth document upstream that the collection never saw is a
+    week's staleness, not damage: the index is activated, says by how much it
+    is behind, and the next incremental run publishes exactly that row."""
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    ledger.lose_the_pointer()
+    _write_doc(project, "housing", "Housing starts", "Housing starts rose sharply.", "housing")
+    run_project(project, select="+release_embeddings")
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+
+    assert result.exit_code == 0, result.output
+    assert "3 row(s)" in result.output
+    assert "pending:           1 upstream row(s) the collection does not hold yet" in (
+        result.output
+    )
+    assert ledger.status().status == STATUS_READY
+    assert _search(project)
+
+    results = run_project(project)
+    assert results[-1].rows_written == 1
+    assert ledger.status().active_collection == generation
+
+
+def test_activate_refuses_a_generation_holding_rows_the_upstream_does_not(
+    tmp_path: Path,
+) -> None:
+    """The other direction is refused: rows the upstream does not have cannot
+    be told, by a count, from another relation's collection. Refused before
+    the claim, so the ledger is exactly as it was."""
     from stel.runner import run_project
 
     project = _write_project(tmp_path)
@@ -300,21 +333,85 @@ def test_activate_refuses_a_generation_that_is_not_complete_for_the_upstream(
     ledger = _Ledger(project)
     before = ledger.status()
     collection = before.active_collection or ledger.store.physical_collection("release_search")
-    _write_doc(project, "housing", "Housing starts", "Housing starts rose sharply.", "housing")
-    run_project(project, select="+release_embeddings")
+    with ledger.adapter() as adapter:
+        key = next(iter(adapter.fetch_state(ledger.scope)))
+        adapter.execute(
+            f"DELETE FROM {adapter.table_ref('release_embeddings')} WHERE chunk_id = ?",
+            [key],
+        )
 
     result = _activate(project, collection, "--rows-verified", "--target", "dev")
 
     assert result.exit_code != 0
     assert "holds 3 row(s)" in result.output
-    assert "upstream relation has 4" in result.output
-    # Refused before the claim: the ledger is exactly as it was.
+    assert "upstream relation has only 2" in result.output
     after = ledger.status()
     assert (after.status, after.fencing_token, after.active_generation) == (
         before.status,
         before.fencing_token,
         before.active_generation,
     )
+
+
+def test_activate_serves_rows_the_state_does_not_describe_and_the_next_run_republishes_them(
+    tmp_path: Path,
+) -> None:
+    """A page whose slices committed before its state advanced leaves rows the
+    state does not know. They are in the collection and queryable; the next
+    run sees them as new upstream rows and re-upserts them, idempotently. So
+    the generation is activated, the gap is reported, and the next run writes
+    exactly that many rows."""
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    ledger.lose_the_pointer()
+    with ledger.adapter() as adapter:
+        key = next(iter(adapter.fetch_state(ledger.scope)))
+        adapter.delete_state(ledger.scope, [key])
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+
+    assert result.exit_code == 0, result.output
+    assert "2 filled from the serving scope" in result.output
+    assert "1 held row(s) its state does not describe" in result.output
+    assert ledger.status().status == STATUS_READY
+    assert len(ledger.state()) == 2
+
+    results = run_project(project)
+    assert results[-1].rows_written == 1
+    assert len(ledger.state()) == 3
+
+
+def test_activate_refuses_state_naming_more_rows_than_the_collection_holds(
+    tmp_path: Path,
+) -> None:
+    """State that vouches for a row the collection lacks would make the
+    reconciler skip that row for good. More state rows than collection rows
+    proves at least one such row without sampling, so it is refused outright."""
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    ledger.lose_the_pointer()
+    with ledger.adapter() as adapter:
+        value = next(iter(adapter.fetch_state(ledger.scope).values()))
+        adapter.upsert_state(
+            ledger.scope, [StateRecord("ghost-row", value.input_fingerprint, STALE_HASH)]
+        )
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+
+    assert result.exit_code != 0
+    assert "describes 4 row(s)" in result.output
+    assert "holds only 3" in result.output
+    assert ledger.status().status == STATUS_FAILED
 
 
 def test_activate_refuses_state_that_names_rows_the_collection_lacks(tmp_path: Path) -> None:

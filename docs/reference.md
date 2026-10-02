@@ -3465,15 +3465,25 @@ stel serving activate chunk_search --target prod \
 `--generation` names the physical collection, as `stel serving status` and
 the store list it. The command reads nothing from the upstream but its schema
 and row count. It refuses, before claiming anything, unless the collection
-exists, carries this model's configuration fingerprint, and holds exactly as
-many rows as the upstream relation. It then assembles the generation's
-publication state — its own scope's records, filled in from the serving
-scope's for keys it never recorded — re-stamps every record at the current
-`code_version`, and refuses, under its claim, unless that state describes
-exactly the collection's row count and a sample of its keys is present in the
-collection. Only then does it build any missing indices, swap the state into
-the serving scope and activate. A refusal after the claim is recorded as a
-failed publish and leaves whatever was serving still served.
+exists, carries this model's configuration fingerprint, and holds no more rows
+than the upstream relation. It then assembles the generation's publication
+state — its own scope's records, filled in from the serving scope's for keys
+it never recorded — re-stamps every record at the current `code_version`, and
+refuses, under its claim, if that state names more rows than the collection
+holds or a sample of its keys is absent from the collection. Only then does it
+build any missing indices, swap the state into the serving scope and activate.
+A refusal after the claim is recorded as a failed publish and leaves whatever
+was serving still served.
+
+Fewer rows than the upstream, or rows the state does not describe, are not
+refusals: both are what the next incremental run reconciles, and both are
+reported on a `pending:` line so the operator knows by how much the activated
+index is behind. A collection that lacks this week's filings is what every
+index is between runs; refusing it would send the operator back to a resume
+that re-reads the corpus to add them. Rows the state does not describe are
+re-upserted, idempotently, when the next run sees them as new. What is never
+tolerated is the other direction — state vouching for rows the collection does
+not hold — because the reconciler would then skip those rows for good.
 
 `--target` is required, as for `recover`. `--rows-verified` is the one claim
 the command cannot check and therefore will not make for you: that the rows in

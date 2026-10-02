@@ -3470,20 +3470,38 @@ than the upstream relation. It then assembles the generation's publication
 state — its own scope's records, filled in from the serving scope's for keys
 it never recorded — re-stamps every record at the current `code_version`, and
 refuses, under its claim, if that state names more rows than the collection
-holds or a sample of its keys is absent from the collection. Only then does it
-build any missing indices, swap the state into the serving scope and activate.
+holds or any of its keys is absent from the collection (a 1,000-key sample
+first, then the exhaustive walk of the collection's ids described below). Only
+then does it build any missing indices, swap the state into the serving scope
+and activate.
 A refusal after the claim is recorded as a failed publish and leaves whatever
 was serving still served.
 
 Fewer rows than the upstream, or rows the state does not describe, are not
 refusals: both are what the next incremental run reconciles, and both are
-reported on a `pending:` line so the operator knows by how much the activated
-index is behind. A collection that lacks this week's filings is what every
-index is between runs; refusing it would send the operator back to a resume
-that re-reads the corpus to add them. Rows the state does not describe are
-re-upserted, idempotently, when the next run sees them as new. What is never
-tolerated is the other direction — state vouching for rows the collection does
-not hold — because the reconciler would then skip those rows for good.
+reported on a `pending:` line so the operator knows the activated index is
+behind. A collection that lacks this week's filings is what every index is
+between runs; refusing it would send the operator back to a resume that
+re-reads the corpus to add them. The first figure on that line is the upstream
+row count minus the collection's — a net difference, since a deletion and an
+insertion upstream cancel in it — so it is a lower bound on the staleness,
+not a count of the rows the next run will write.
+
+Rows the state does not describe get one piece of bookkeeping, because the
+next run could not otherwise find them: stale discovery enumerates *state*
+keys that no longer exist upstream, so a row with no state whose upstream key
+was later deleted would be served for good. The command walks the collection's
+ids and records every such row under a marker fingerprint
+(`unverified-by-activation`) that no upstream row can match. The next run then
+re-upserts the row, idempotently, if its key still exists upstream, and deletes
+it as stale if not; either way the marker is gone after one run. The walk
+happens on every activation, not only when the counts differ, because it is
+also how the other direction is caught exhaustively: state vouching for rows
+the collection does not hold is never tolerated, since the reconciler would
+skip those rows for good, and a ghost key and an undescribed row cancel in a
+row count. The walk visits every id, so after it the number of rows it marked
+differs from the count shortfall by exactly the number of ghost keys, and any
+ghost is a refusal.
 
 `--target` is required, as for `recover`. `--rows-verified` is the one claim
 the command cannot check and therefore will not make for you: that the rows in

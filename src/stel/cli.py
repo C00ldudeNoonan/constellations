@@ -2730,9 +2730,14 @@ def serving_activate(
     A private generation holding every row, left behind by a publish that
     could not finish, is activated from the publication state stel recorded
     for it (issue #615): the collection must exist, match this model's
-    configuration, hold as many rows as the upstream, and hold the rows its
+    configuration, hold no more rows than the upstream, and hold the rows its
     state names; its indices are built if missing; then it becomes the served
     generation. Nothing is read from the upstream but its schema and row count.
+
+    A collection behind the upstream, or holding rows its state does not
+    describe, is activated and the gap reported; the next incremental run
+    publishes the one and re-checks the other (rows without state are marked
+    so that run re-upserts or deletes them).
 
     Requires --target, and --rows-verified to accept the one claim this cannot
     check: that the rows are what the current code would publish, which is
@@ -2772,13 +2777,16 @@ def serving_activate(
     )
     if activation.rows_behind_upstream or activation.rows_without_state:
         # Said only when there is something to say: an index activated behind
-        # the upstream is serving, and stale by exactly this much until the
-        # next incremental run, which is what reconciles both numbers.
+        # the upstream is serving, and stale until the next incremental run,
+        # which is what reconciles both numbers. The first is a net count --
+        # a deletion and an insertion upstream cancel in it -- so it is worded
+        # as the difference it is, not as the rows the run will write.
         click.echo(
             "pending:           "
-            f"{activation.rows_behind_upstream} upstream row(s) the collection "
-            f"does not hold yet, {activation.rows_without_state} held row(s) its "
-            "state does not describe; the next incremental run reconciles both"
+            f"the upstream row count exceeds the collection's by "
+            f"{activation.rows_behind_upstream} (net of deletions); "
+            f"{activation.rows_without_state} held row(s) had no state and are "
+            "marked unverified; the next incremental run reconciles both"
         )
     click.echo(f"serving:           {_describe_serving(outcome.report.entry)}")
 

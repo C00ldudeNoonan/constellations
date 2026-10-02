@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime
 from math import isfinite
@@ -912,6 +912,31 @@ class DuckDBStore(RetrievalStore):
         except Exception:
             raise RetrievalError(_failure("count present")) from None
         return int(row[0]) if row else 0
+
+    def iter_record_ids(
+        self, collection: str, *, id_field: str, page_size: int
+    ) -> Iterator[Sequence[str]]:
+        # Ownership is the gate, as for seeding: a table this store does not
+        # own is not enumerated.
+        if self.inspect_collection(collection) is None:
+            raise RetrievalError(
+                f"DuckDB cannot list ids of '{collection}': it does not exist"
+            )
+        conn = self._connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {_quote_identifier(id_field)} "
+                f"FROM {_quote_identifier(collection)}"
+            )
+            while True:
+                rows = cursor.fetchmany(page_size)
+                if not rows:
+                    return
+                yield [str(row[0]) for row in rows]
+        except RetrievalError:
+            raise
+        except Exception:
+            raise RetrievalError(_failure("list ids")) from None
 
     def _execute(
         self,

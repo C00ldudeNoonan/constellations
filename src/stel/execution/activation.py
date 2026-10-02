@@ -14,14 +14,27 @@ made with `--rows-verified`, is that the rows are what the current code would
 produce. A hash-only `code_version` change (#607) is exactly that case.
 
 What it refuses to do is activate something it cannot check: the collection
-must exist, carry this configuration's fingerprint, and hold as many rows as
-the upstream relation; the state assembled for it must describe exactly that
-many rows; and a sample of those state keys must be present in the collection.
-A generation that fails any of these is left as it was, and the serving scope
-keeps whatever it was serving. The checks are the same ones a publish applies
-before it activates, minus the one that needs the corpus read -- that the rows
-*are* the upstream's -- which is the one the flag stands in for, and which the
-next incremental run reconciles anyway.
+must exist, carry this configuration's fingerprint, and hold no more rows than
+the upstream relation; the state assembled for it must describe no more rows
+than the collection holds; and a sample of those state keys must be present in
+the collection. A generation that fails any of these is left as it was, and the
+serving scope keeps whatever it was serving. The checks are the same ones a
+publish applies before it activates, minus the one that needs the corpus read
+-- that the rows *are* the upstream's -- which is the one the flag stands in
+for, and which the next incremental run reconciles anyway.
+
+A shortfall in either count is tolerated, with one piece of bookkeeping. Rows
+the upstream has that the collection lacks are simply published by the next
+run. Rows the collection holds that its state does not describe are a hole
+the next run cannot see on its own: stale discovery enumerates *state* keys
+absent upstream, so a row with no state whose upstream key is later deleted
+would be served for good. Activation therefore walks the collection's ids and
+records every such row under a marker fingerprint that no upstream row can
+match; the next run then re-upserts the row if its key still exists upstream,
+and deletes it as stale if not. The walk runs on every activation, because it
+is also the exhaustive form of the membership check: a state key the
+collection does not hold and a collection row the state does not describe
+cancel in a row count, and only a walk that visits every id tells them apart.
 
 Shares the publish path's spec, state-copy and swap helpers from `.search` on
 purpose: an activation that built its own would be a second definition of
@@ -46,6 +59,7 @@ from ..retrieval import (
     CollectionSpec,
     PublishLease,
     RetrievalError,
+    RetrievalStore,
     ServingCoordinator,
     StoreRole,
     create_store,
@@ -69,6 +83,14 @@ log = logging.getLogger(__name__)
 # from anywhere detects and a sample from one end might not.
 ACTIVATION_SAMPLE_SIZE = 1000
 
+# The input fingerprint recorded for a collection row the assembled state did
+# not describe. Real fingerprints are hex digests, so this can never equal
+# one: the next incremental run classifies the row as changed and re-upserts
+# it, idempotently, if the key still exists upstream, and finds it among the
+# stale state keys and deletes it if not. Either way the marker is gone after
+# one run; nothing reads it back.
+UNVERIFIED_INPUT_FINGERPRINT = "unverified-by-activation"
+
 
 @dataclass(frozen=True)
 class GenerationActivation:
@@ -84,11 +106,14 @@ class GenerationActivation:
     # interrupted publish had got.
     state_rows_from_generation: int
     state_rows_from_serving: int
-    # What the next incremental run reconciles: upstream rows the collection
-    # does not hold yet, and collection rows the assembled state did not
-    # describe. Both are staleness, not damage (see `activation_refusal`), and
-    # both are reported so the operator knows the activated index is behind by
-    # exactly that much.
+    # What the next incremental run reconciles. `rows_behind_upstream` is the
+    # upstream row count minus the collection's: a *net* figure, since a
+    # deletion and an insertion upstream cancel in it, so it bounds the
+    # staleness from below rather than counting the rows the run will write.
+    # `rows_without_state` is the number of collection rows the assembled
+    # state did not describe, each now recorded under
+    # `UNVERIFIED_INPUT_FINGERPRINT` so the next run re-checks or deletes it.
+    # Both are staleness, not damage (see `activation_refusal`).
     rows_behind_upstream: int
     rows_without_state: int
     code_version: str
@@ -271,8 +296,8 @@ def activate_search_generation(
             # good: refused outright, since no sample is needed to know it.
             # Fewer is the other direction -- a page whose slices committed
             # before its state could advance (the 2026-09-20 failure died in
-            # one) -- and those rows are simply unknown: the next run sees
-            # them as new upstream rows and re-upserts them, idempotently.
+            # one) -- and those rows are recorded below under a marker the
+            # next run cannot mistake for current.
             if state_rows > existing.row_count:
                 raise RunError(
                     f"Publication state describes {state_rows} row(s) of "
@@ -282,6 +307,9 @@ def activate_search_generation(
                     "publish instead."
                 )
             rows_without_state = existing.row_count - state_rows
+            # The sample is the cheap refusal for gross mismatch (state that
+            # describes another collection); the id walk below is the
+            # exhaustive one.
             present = store.count_present(
                 physical_collection, sample, id_field=search.id_field
             )
@@ -291,6 +319,31 @@ def activate_search_generation(
                     f"{len(sample)} sampled row(s) that '{physical_collection}' "
                     "does not hold; that state describes another collection. "
                     "Resume the publish instead."
+                )
+            # Always, not only when the counts differ: a ghost state key and
+            # a row without state cancel in the arithmetic above, and an
+            # activation interrupted mid-walk can leave the counts equal with
+            # rows still unmarked. The walk is the exhaustive form of the
+            # sample check -- every collection id ends up either known or
+            # marked, so a count that disagrees with `rows_without_state` is
+            # exactly the number of state keys the collection does not hold.
+            marked = _mark_rows_without_state(
+                store,
+                adapter,
+                coordinator,
+                lease,
+                collection=physical_collection,
+                id_field=search.id_field,
+                scope=publish_scope,
+                page_size=search.batch_size,
+                code_version=code_version,
+            )
+            if marked != rows_without_state:
+                raise RunError(
+                    f"Publication state names {marked - rows_without_state} "
+                    f"row(s) that '{physical_collection}' does not hold; that "
+                    "state describes another collection. Resume the publish "
+                    "instead."
                 )
             coordinator.verify_publish(lease)
             metadata = store.ensure_indexes(spec)
@@ -336,8 +389,8 @@ def activate_search_generation(
     rows_behind_upstream = upstream_rows - existing.row_count
     log.info(
         "%s: activated %s (%d rows; state from the generation for %d, from the "
-        "serving scope for %d; %d upstream row(s) not yet held, %d held row(s) "
-        "without state) at code version %s",
+        "serving scope for %d; upstream count exceeds the collection's by %d, "
+        "%d held row(s) marked unverified) at code version %s",
         model.name,
         physical_collection,
         existing.row_count,
@@ -395,6 +448,42 @@ def _fill_state_from_serving(
                 adapter.upsert_state(publish_scope, missing)
             taken += len(missing)
     return taken
+
+
+def _mark_rows_without_state(
+    store: RetrievalStore,
+    adapter: WarehouseAdapter,
+    coordinator: ServingCoordinator,
+    lease: PublishLease,
+    *,
+    collection: str,
+    id_field: str,
+    scope: StateScope,
+    page_size: int,
+    code_version: str,
+) -> int:
+    """Record every collection row `scope` does not describe under the marker
+    fingerprint; return how many were recorded.
+
+    Walks the collection's ids, not the state: the rows being looked for are
+    exactly the ones the state cannot name. Idempotent -- a second pass finds
+    its own markers already recorded and writes nothing -- so an activation
+    interrupted here is re-entered by running it again, and the caller's
+    count check still holds on the retry because a marker counts as known.
+    """
+    marked = 0
+    for page in store.iter_record_ids(collection, id_field=id_field, page_size=page_size):
+        coordinator.verify_publish(lease)
+        known = adapter.fetch_state_subset(scope, page)
+        markers = [
+            StateRecord(record_key, UNVERIFIED_INPUT_FINGERPRINT, code_version)
+            for record_key in page
+            if record_key not in known
+        ]
+        if markers:
+            adapter.upsert_state(scope, markers)
+        marked += len(markers)
+    return marked
 
 
 def _restamp_and_sample(

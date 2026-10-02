@@ -110,9 +110,10 @@ in the shape `recover --owner-terminated` already uses for the same reason.
   The next incremental run reconciles against the upstream regardless, so the
   cost of a wrong assertion is one cycle of stale rows, not a divergence; the
   reference says so, and says when the assertion is true.
-- **`count_present` joins the store contract.** Every store must answer a
-  bounded membership probe. Both stores do it with the predicate their upsert
-  already acknowledges on.
+- **`count_present` and `iter_record_ids` join the store contract.** Every
+  store must answer a bounded membership probe and stream its ids in bounded
+  pages. Both stores do the first with the predicate their upsert already
+  acknowledges on, and the second with the projected scan seeding uses.
 - **The command re-stamps state in the generation's scope before it knows the
   activation will succeed.** An interrupted activation leaves that scope at the
   current hash with the serving scope's records copied in, which is exactly the
@@ -161,3 +162,25 @@ A shortfall in either is activated and reported on a `pending:` line, so the
 operator knows by how much the served index is behind. The consequence above
 about a grown corpus refusing activation no longer holds; it is reported
 instead.
+
+The state shortfall needed one more step, found in review of #630 after the
+first version of this addendum merged. "The next run re-upserts the rows its
+state does not know" is true only while their upstream keys exist: stale
+discovery enumerates *state* keys absent upstream, so a row with no state
+whose key is deleted before the next run is invisible to the sweep and would
+be served through every later run. Refusing the shortfall was one answer and
+would have sent the #615 operator back to the corpus read; the other, taken
+here, is for activation to walk the collection's ids and record every row the
+state does not describe under a marker fingerprint no upstream row can match.
+The next run then re-upserts the row if its key still exists and deletes it as
+stale if not, so the marker lives for exactly one run. `iter_record_ids` joins
+the store contract for it; the walk is ids only, in bounded pages, so it costs
+a few megabytes a page against the 3.6M-row collection rather than the
+vectors beside them. It runs on every activation rather than only when the
+counts differ: a ghost state key and an undescribed row cancel in a row count,
+and an activation interrupted mid-walk can leave the counts equal with rows
+still unmarked, so a walk gated on the counts could be skipped exactly when it
+was needed (review finding on #631). Visiting every id makes it the exhaustive
+form of the membership check the sample only approximates. The upstream figure on the `pending:` line is a net
+difference — a deletion and an insertion cancel in it — and is now worded as
+one.

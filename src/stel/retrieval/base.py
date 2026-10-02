@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -715,6 +715,19 @@ class RetrievalStore(ABC):
         hold would make reconciliation skip that row forever, so before the
         state is trusted a sample of its keys is checked here. Bounded by the
         caller's sample size, never by the collection."""
+
+    @abstractmethod
+    def iter_record_ids(
+        self, collection: str, *, id_field: str, page_size: int
+    ) -> Iterator[Sequence[str]]:
+        """Stream every id the collection holds, `page_size` at a time.
+
+        The complement of `count_present`, for the same command (issue #615):
+        a row the publication state does not describe is invisible to stale
+        discovery, which enumerates state keys, so activation has to find such
+        rows from the collection's side and record them. Ids only, never rows,
+        and in pages, so residency is bounded by `page_size` and not by the
+        corpus. No order is promised; each id appears exactly once."""
 
     @abstractmethod
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata: ...

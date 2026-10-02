@@ -47,6 +47,7 @@ from stel.mcp_server.service import (
 )
 from stel.search import (
     SearchFilter,
+    SearchOutcome,
     SearchProvenance,
     SearchRequest,
     SearchResult,
@@ -120,12 +121,23 @@ class FakeRepository:
 
 
 class FakeSearch(ContextSearch):
-    def __init__(self, metadata: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        metadata: Mapping[str, Any] | None = None,
+        *,
+        degraded: bool = False,
+        safe_error_code: str | None = None,
+    ) -> None:
         self.request: SearchRequest | None = None
         self.policy_filters: tuple[SearchFilter, ...] = ()
         # What `search()` resolved from the model's `returned: true`
         # declaration for the hit (issue #524).
         self.metadata = metadata
+        # The query lease's own status, set independently of the hits below
+        # so a test can exercise a degraded index that still answers fully
+        # (issue #617, ask 3).
+        self.degraded = degraded
+        self.safe_error_code = safe_error_code
 
     def execute(
         self,
@@ -133,28 +145,32 @@ class FakeSearch(ContextSearch):
         *,
         policy_filters: Sequence[SearchFilter],
         timings: PhaseTimings | None = None,
-    ) -> Sequence[SearchResult]:
+    ) -> SearchOutcome:
         self.request = request
         self.policy_filters = tuple(policy_filters)
         if timings is not None:
             # A real query records phases; the double records one, so a row
             # built from it still exercises the `phase_ms` column.
             timings.add("text_search", 0.25)
-        return (
-            _hit(
-                CONTEXT_ALLOWED_1,
-                DOC_ALLOWED,
-                CHUNK_ALLOWED_1,
-                rank=1,
-                metadata=self.metadata,
+        return SearchOutcome(
+            results=(
+                _hit(
+                    CONTEXT_ALLOWED_1,
+                    DOC_ALLOWED,
+                    CHUNK_ALLOWED_1,
+                    rank=1,
+                    metadata=self.metadata,
+                ),
+                _hit(
+                    CONTEXT_HIDDEN,
+                    DOC_HIDDEN,
+                    CHUNK_HIDDEN,
+                    rank=2,
+                    metadata=self.metadata,
+                ),
             ),
-            _hit(
-                CONTEXT_HIDDEN,
-                DOC_HIDDEN,
-                CHUNK_HIDDEN,
-                rank=2,
-                metadata=self.metadata,
-            ),
+            degraded=self.degraded,
+            safe_error_code=self.safe_error_code,
         )
 
 
@@ -907,9 +923,11 @@ class EmptySearch(FakeSearch):
         *,
         policy_filters: Sequence[SearchFilter],
         timings: PhaseTimings | None = None,
-    ) -> Sequence[SearchResult]:
+    ) -> SearchOutcome:
         del request, policy_filters, timings
-        return ()
+        return SearchOutcome(
+            results=(), degraded=self.degraded, safe_error_code=self.safe_error_code
+        )
 
 
 def test_a_zero_result_query_is_logged_as_such() -> None:
@@ -1695,6 +1713,8 @@ def test_the_log_row_carries_the_request_and_where_its_time_went() -> None:
     # Milliseconds, not seconds: the column is named for the unit it holds.
     assert json.loads(row["phase_ms"]) == {"text_search": 250.0}
     assert row["served_generation"] == "g-test"
+    assert row["served_degraded"] is False
+    assert row["served_safe_error_code"] is None
     assert row["error_code"] is None
 
 
@@ -1728,10 +1748,10 @@ def test_an_operational_failure_is_logged_with_its_code() -> None:
             *,
             policy_filters: Sequence[SearchFilter],
             timings: PhaseTimings | None = None,
-        ) -> Sequence[SearchResult]:
+        ) -> SearchOutcome:
             del request, policy_filters, timings
             time.sleep(0.3)
-            return ()
+            return SearchOutcome(results=(), degraded=False, safe_error_code=None)
 
     repository = FakeRepository(_fixture_rows())
     service, _ = _service(
@@ -1760,6 +1780,37 @@ def test_an_operational_failure_is_logged_with_its_code() -> None:
     assert row["principal_id"] is None
     assert row["served_generation"] is None
     assert set(QUERY_LOG_SCHEMA) >= set(row)
+
+
+def test_a_degraded_index_with_zero_hits_still_reports_degraded() -> None:
+    """The gap issue #617's ask 3 describes: a degraded index can answer
+    "nothing matched" exactly as a ready one does, and a reader who only
+    looks at `results` cannot tell the two apart. The signal has to come
+    from the lease's own status, not from the hits, which is exactly what
+    `EmptySearch` here exercises -- no hits at all, but still degraded.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        search=EmptySearch(degraded=True, safe_error_code="store_error"),
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search", query="inflation and employment", mode="text"
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.results == ()
+    assert response.degraded is True
+    assert response.safe_error_code == "store_error"
+    row = repository.logged[0]
+    assert row["result_count"] == 0
+    assert row["served_degraded"] is True
+    assert row["served_safe_error_code"] == "store_error"
 
 
 def test_an_authorization_refusal_still_logs_nothing() -> None:

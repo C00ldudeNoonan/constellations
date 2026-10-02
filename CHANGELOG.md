@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### A degraded search index tells its readers, not just its operator (issue #617)
+
+A failed republish keeps serving the last good generation rather than going
+dark (#624, issue #617 asks 1 and 2), but nothing told a *reader* it was
+getting a stale answer instead of a fresh one — `search_context`'s response
+and `stel search`'s output looked identical either way, and a degraded index
+with zero matching hits could not be told apart from a healthy one with none,
+since the signal lives on the query lease, not on the hits.
+
+`search()`'s return gained a `SearchOutcome` wrapper (`results`, `degraded`,
+`safe_error_code`) in place of a bare list. `search_context` carries the same
+two fields at the top level of its `mcp_context/v1` response — additive, per
+the precedent [ADR-0008](docs/adr/0008-mcp-hits-carry-declared-attributes.md)
+set for the `attributes` field, not a v2 — and `mcp_query_log` gained
+`served_degraded`/`served_safe_error_code` columns alongside the existing
+`served_generation`. `stel search` prints the same warning `stel serving
+status` already does, to stderr so `--output json` stays a plain array on
+stdout.
+
+Ask 3 of #617, the one PR #624 deliberately left open. The CLI's own
+`--output json` array shape is unchanged; only the MCP response and the
+query log gained fields.
+
 ## v0.20.0 - 2026-10-02
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)

@@ -236,6 +236,14 @@ class SearchContextResponse(BaseModel):
 
     schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION
     results: tuple[SearchContextResult, ...] = ()
+    # The pinned generation's own status, not inferred from `results`: a
+    # degraded index can answer "nothing matched" exactly as a ready one
+    # does, and without this field that reader has no way to tell a stale
+    # answer from a healthy one (issue #617, ask 3). False/None on an error
+    # response, where there is no lease to ask. Additive to `mcp_context/v1`
+    # rather than a v2, per the precedent ADR-0008 set for `attributes`.
+    degraded: bool = False
+    safe_error_code: str | None = None
     error: ToolError | None = None
 
 

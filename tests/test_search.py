@@ -164,7 +164,7 @@ def test_portable_search_api_supports_all_modes(
             mode=mode,
             limit=2,
         ),
-    )
+    ).results
 
     assert results
     assert [result.rank for result in results] == list(range(1, len(results) + 1))
@@ -233,7 +233,7 @@ def test_search_filters_are_typed_and_authorized(published_project: Path) -> Non
                 ),
             ),
         ),
-    )
+    ).results
     assert filtered
     assert {result.metadata["category"] for result in filtered} <= {
         "labor",
@@ -330,7 +330,7 @@ def test_same_request_runs_against_mocked_remote_store(
         mode=SearchMode.HYBRID,
         limit=2,
     )
-    local = search(published_project, request)
+    local = search(published_project, request).results
     project, _, _ = load_project(published_project)
     resolved = resolve_profile(project, published_project)
     assert resolved.retrieval is not None
@@ -388,7 +388,7 @@ def test_same_request_runs_against_mocked_remote_store(
     search_module = importlib.import_module("stel.search")
     monkeypatch.setattr(search_module, "create_store", lambda *_args, **_kwargs: MockRemoteStore())
 
-    remote = search(published_project, request)
+    remote = search(published_project, request).results
     assert [result.record_id for result in remote] == [
         result.record_id for result in local
     ]
@@ -465,7 +465,7 @@ def test_a_query_attributes_its_wall_clock_by_phase(published_project: Path) -> 
             limit=2,
         ),
         timings=timings,
-    )
+    ).results
 
     assert results
     recorded = timings.snapshot()
@@ -626,7 +626,7 @@ def test_a_session_compiles_once_and_holds_its_store_open(
                     limit=2,
                 ),
                 session=session,
-            )
+            ).results
             assert results
     finally:
         session.close()

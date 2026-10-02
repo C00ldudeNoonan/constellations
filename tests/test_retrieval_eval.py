@@ -17,7 +17,7 @@ from stel.retrieval_eval import (
     run_retrieval_evaluation,
 )
 from stel.runner import run_project
-from stel.search import SearchProvenance, SearchRequest, SearchResult
+from stel.search import SearchOutcome, SearchProvenance, SearchRequest, SearchResult
 
 # Runs a whole project or opens a retrieval store, so it belongs to the
 # `e2e` tier (issue #518). `test_test_tiers.py` fails if a file that
@@ -625,9 +625,13 @@ def _fake_index(
     pairs, honoring `limit`; returns the limits requested, in order."""
     limits: list[int] = []
 
-    def fake(project_dir: Path, request: SearchRequest, **kwargs: Any) -> list[SearchResult]:
+    def fake(project_dir: Path, request: SearchRequest, **kwargs: Any) -> SearchOutcome:
         limits.append(request.limit)
-        return [_hit(r, d) for r, d in records[: request.limit]]
+        return SearchOutcome(
+            results=tuple(_hit(r, d) for r, d in records[: request.limit]),
+            degraded=False,
+            safe_error_code=None,
+        )
 
     monkeypatch.setattr("stel.retrieval_eval.search", fake)
     return limits

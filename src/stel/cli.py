@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -652,7 +652,7 @@ def search_command(
             filters=filters,
             fields=fields,
         )
-        results = run_search(
+        outcome = run_search(
             project_dir,
             request,
             target=target,
@@ -663,10 +663,23 @@ def search_command(
     except SearchError as error:
         raise click.ClickException(str(error)) from error
 
+    if outcome.degraded:
+        # Stderr, like `-v`'s phase breakdown, so `--output json` on stdout
+        # stays a plain array for a script and a human still sees why an
+        # index answering fine might be answering from last week (#617).
+        click.echo(
+            f"Warning: '{model_name}' is serving a stale generation; the "
+            "last publish failed "
+            f"({outcome.safe_error_code or 'no error code recorded'})",
+            err=True,
+        )
+
     if output_format == "json":
-        click.echo(json.dumps([result.to_dict() for result in results], indent=2))
+        click.echo(
+            json.dumps([result.to_dict() for result in outcome.results], indent=2)
+        )
         return
-    _echo_search_table(results)
+    _echo_search_table(outcome.results)
 
 
 def _parse_search_vector(value: str | None) -> tuple[float, ...] | None:
@@ -706,7 +719,7 @@ def _parse_search_filter(field: str, operator: str, value: str) -> SearchFilter:
     return SearchFilter(field, resolved_operator, tuple(decoded))
 
 
-def _echo_search_table(results: list[SearchResult]) -> None:
+def _echo_search_table(results: Sequence[SearchResult]) -> None:
     if not results:
         click.echo("No results.")
         return

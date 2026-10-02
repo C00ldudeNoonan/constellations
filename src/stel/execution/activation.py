@@ -31,7 +31,10 @@ absent upstream, so a row with no state whose upstream key is later deleted
 would be served for good. Activation therefore walks the collection's ids and
 records every such row under a marker fingerprint that no upstream row can
 match; the next run then re-upserts the row if its key still exists upstream,
-and deletes it as stale if not.
+and deletes it as stale if not. The walk runs on every activation, because it
+is also the exhaustive form of the membership check: a state key the
+collection does not hold and a collection row the state does not describe
+cancel in a row count, and only a walk that visits every id tells them apart.
 
 Shares the publish path's spec, state-copy and swap helpers from `.search` on
 purpose: an activation that built its own would be a second definition of
@@ -304,6 +307,9 @@ def activate_search_generation(
                     "publish instead."
                 )
             rows_without_state = existing.row_count - state_rows
+            # The sample is the cheap refusal for gross mismatch (state that
+            # describes another collection); the id walk below is the
+            # exhaustive one.
             present = store.count_present(
                 physical_collection, sample, id_field=search.id_field
             )
@@ -314,29 +320,31 @@ def activate_search_generation(
                     "does not hold; that state describes another collection. "
                     "Resume the publish instead."
                 )
-            if rows_without_state:
-                marked = _mark_rows_without_state(
-                    store,
-                    adapter,
-                    coordinator,
-                    lease,
-                    collection=physical_collection,
-                    id_field=search.id_field,
-                    scope=publish_scope,
-                    page_size=search.batch_size,
-                    code_version=code_version,
+            # Always, not only when the counts differ: a ghost state key and
+            # a row without state cancel in the arithmetic above, and an
+            # activation interrupted mid-walk can leave the counts equal with
+            # rows still unmarked. The walk is the exhaustive form of the
+            # sample check -- every collection id ends up either known or
+            # marked, so a count that disagrees with `rows_without_state` is
+            # exactly the number of state keys the collection does not hold.
+            marked = _mark_rows_without_state(
+                store,
+                adapter,
+                coordinator,
+                lease,
+                collection=physical_collection,
+                id_field=search.id_field,
+                scope=publish_scope,
+                page_size=search.batch_size,
+                code_version=code_version,
+            )
+            if marked != rows_without_state:
+                raise RunError(
+                    f"Publication state names {marked - rows_without_state} "
+                    f"row(s) that '{physical_collection}' does not hold; that "
+                    "state describes another collection. Resume the publish "
+                    "instead."
                 )
-                # Every collection id is either in the state or was just
-                # marked, so a count that disagrees with the arithmetic above
-                # means a state key the collection does not hold -- the ghost
-                # the sample looks for, found exhaustively here.
-                if marked != rows_without_state:
-                    raise RunError(
-                        f"Publication state names {marked - rows_without_state} "
-                        f"row(s) that '{physical_collection}' does not hold; that "
-                        "state describes another collection. Resume the publish "
-                        "instead."
-                    )
             coordinator.verify_publish(lease)
             metadata = store.ensure_indexes(spec)
             if metadata.config_fingerprint != spec.config_fingerprint:
@@ -460,7 +468,8 @@ def _mark_rows_without_state(
     Walks the collection's ids, not the state: the rows being looked for are
     exactly the ones the state cannot name. Idempotent -- a second pass finds
     its own markers already recorded and writes nothing -- so an activation
-    interrupted here is re-entered by running it again.
+    interrupted here is re-entered by running it again, and the caller's
+    count check still holds on the retry because a marker counts as known.
     """
     marked = 0
     for page in store.iter_record_ids(collection, id_field=id_field, page_size=page_size):

@@ -39,8 +39,12 @@
   (review finding on #630). Activation walks the collection's ids and records
   each such row under the marker fingerprint `unverified-by-activation`; the
   next run re-upserts the row if its key still exists upstream and deletes it
-  as stale if not. The `pending:` line's upstream figure is worded as the net
-  row-count difference it is, since deletions and insertions cancel in it.
+  as stale if not. The walk runs on every activation and doubles as the
+  exhaustive membership check: a state key the collection does not hold is
+  now refused however the counts happen to balance, where the 1,000-key
+  sample alone could miss it. The `pending:` line's upstream figure is worded
+  as the net row-count difference it is, since deletions and insertions
+  cancel in it.
 - `--rows-verified` is the one assertion the command cannot check: that the
   collection's rows are what the current code would publish, so re-stamping
   their state as current is correct. True after a hash-only `code_version`

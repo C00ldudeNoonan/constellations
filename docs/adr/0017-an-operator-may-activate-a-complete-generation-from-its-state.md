@@ -176,6 +176,11 @@ The next run then re-upserts the row if its key still exists and deletes it as
 stale if not, so the marker lives for exactly one run. `iter_record_ids` joins
 the store contract for it; the walk is ids only, in bounded pages, so it costs
 a few megabytes a page against the 3.6M-row collection rather than the
-vectors beside them. The upstream figure on the `pending:` line is a net
+vectors beside them. It runs on every activation rather than only when the
+counts differ: a ghost state key and an undescribed row cancel in a row count,
+and an activation interrupted mid-walk can leave the counts equal with rows
+still unmarked, so a walk gated on the counts could be skipped exactly when it
+was needed (review finding on #631). Visiting every id makes it the exhaustive
+form of the membership check the sample only approximates. The upstream figure on the `pending:` line is a net
 difference — a deletion and an insertion cancel in it — and is now worded as
 one.

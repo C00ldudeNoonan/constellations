@@ -493,6 +493,39 @@ def test_activate_refuses_state_that_names_rows_the_collection_lacks(tmp_path: P
         _search(project)
 
 
+def test_the_id_walk_refuses_a_ghost_the_sample_missed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ghost state key and a collection row without state cancel in the row
+    count, so neither count check sees them, and a 1,000-key sample of 3.6M
+    can miss the ghost (review finding on #631). The walk of the collection's
+    ids cannot: with the sample blinded, the ghost is still refused, and the
+    serving scope is left as it was."""
+    from stel.execution import activation
+    from stel.runner import run_project
+
+    monkeypatch.setattr(activation, "ACTIVATION_SAMPLE_SIZE", 0)
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    ledger.lose_the_pointer()
+    with ledger.adapter() as adapter:
+        key, value = next(iter(adapter.fetch_state(ledger.scope).items()))
+        adapter.delete_state(ledger.scope, [key])
+        adapter.upsert_state(
+            ledger.scope, [StateRecord("ghost-row", value.input_fingerprint, STALE_HASH)]
+        )
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+
+    assert result.exit_code != 0
+    assert "names 1 row(s)" in result.output
+    assert "does not hold" in result.output
+    assert ledger.status().status == STATUS_FAILED
+
+
 def test_a_late_refusal_never_un_serves_the_current_generation(tmp_path: Path) -> None:
     """Re-activating the collection being served (to rebuild its indices,
     say) with state that fails the membership check: the activation is

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.20.0 - 2026-10-02
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)
 

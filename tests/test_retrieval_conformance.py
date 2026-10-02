@@ -239,6 +239,25 @@ def test_delete_removes_only_the_named_ids(store: RetrievalStore) -> None:
     assert metadata.row_count == len(ROWS) - 1
 
 
+def test_record_ids_stream_every_id_once_in_bounded_pages(store: RetrievalStore) -> None:
+    """Activation finds rows the publication state does not describe from the
+    collection's side (issue #615), so a store that skipped or repeated an id
+    would leave such a row unmarked and served for good, or mark one twice.
+    Pages are bounded by the requested size, never by the collection."""
+    name = _populate(store)
+
+    pages = list(store.iter_record_ids(name, id_field="id", page_size=2))
+
+    assert all(1 <= len(page) <= 2 for page in pages)
+    assert sorted(id_ for page in pages for id_ in page) == sorted(row[0] for row in ROWS)
+    assert len(ROWS) > 2
+
+
+def test_listing_ids_of_a_missing_collection_is_refused(store: RetrievalStore) -> None:
+    with pytest.raises(RetrievalError):
+        list(store.iter_record_ids("nowhere", id_field="id", page_size=10))
+
+
 def test_empty_mutations_are_accepted_as_no_ops(store: RetrievalStore) -> None:
     """Publication computes a change set that is often empty. A store that
     errored on it would make "nothing changed" an exceptional path."""

@@ -986,6 +986,26 @@ class LanceDBStore(RetrievalStore):
             failure = _operation_failed("count", "lancedb_count_failed", error)
         raise failure
 
+    def iter_record_ids(
+        self, collection: str, *, id_field: str, page_size: int
+    ) -> Iterator[Sequence[str]]:
+        if not _COLLECTION_RE.fullmatch(id_field):
+            raise RetrievalError("LanceDB ID field is invalid")
+        failure: RetrievalError | None = None
+        try:
+            table = self._open_owned_table(collection)
+            # The same streamed scan `seed_collection` uses, projected to the
+            # one column, so 3.6M ids cost a few MB a page rather than the
+            # vectors they sit beside.
+            for batch in table.search(None).select([id_field]).to_batches(page_size):
+                yield [str(value) for value in batch.column(id_field).to_pylist()]
+        except RetrievalError:
+            raise
+        except Exception as error:
+            failure = _operation_failed("list ids", "lancedb_list_ids_failed", error)
+        if failure is not None:
+            raise failure
+
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
         failure: RetrievalError | None = None
         # Tracks which index was being built when a native error surfaced.

@@ -28,18 +28,29 @@
   (new filings embedded since its last complete write), or holding rows its
   state does not describe (a page whose slices committed before its state
   advanced), is activated and the gap printed on a `pending:` line; the next
-  incremental run publishes the one and re-upserts the other. Refusing would
+  incremental run publishes the one and re-checks the other. Refusing would
   have sent the operator back to a corpus-reading resume to add a few hundred
   rows, and a growing corpus would have refused every activation attempted
   hours after the generation was written. State naming rows the collection
   does not hold is still refused outright.
+- **Rows the state does not describe are marked, not left unknown.** Stale
+  discovery enumerates state keys absent upstream, so a collection row with
+  no state whose upstream key was later deleted would never be found again
+  (review finding on #630). Activation walks the collection's ids and records
+  each such row under the marker fingerprint `unverified-by-activation`; the
+  next run re-upserts the row if its key still exists upstream and deletes it
+  as stale if not. The `pending:` line's upstream figure is worded as the net
+  row-count difference it is, since deletions and insertions cancel in it.
 - `--rows-verified` is the one assertion the command cannot check: that the
   collection's rows are what the current code would publish, so re-stamping
   their state as current is correct. True after a hash-only `code_version`
   change such as #607's; the next incremental run reconciles against the
   upstream regardless, so a wrong assertion costs one cycle of stale rows.
-- New store method `count_present(collection, record_ids, id_field)`, the
-  membership probe the sample check uses. LanceDB and DuckDB implement it.
+- New store methods `count_present(collection, record_ids, id_field)`, the
+  membership probe the sample check uses, and
+  `iter_record_ids(collection, id_field, page_size)`, the bounded id stream
+  the marker pass walks. LanceDB and DuckDB implement both; the conformance
+  suite pins that every id is streamed exactly once.
 - ADR-0017 records the decision and amends ADR-0005.
 
 ### A failed in-place publish keeps serving the generation it was updating (issue #617)

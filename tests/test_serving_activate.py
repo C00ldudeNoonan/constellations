@@ -20,6 +20,7 @@ from click.testing import CliRunner
 
 from stel.adapters import StateRecord, StateScope, create_adapter
 from stel.cli import cli
+from stel.execution.activation import UNVERIFIED_INPUT_FINGERPRINT
 from stel.execution.search import _generation_state_scope
 from stel.retrieval import ServingCoordinator, StoreRole
 from stel.retrieval.coordination import STATUS_DEGRADED, STATUS_FAILED, STATUS_READY
@@ -309,7 +310,7 @@ def test_activate_serves_a_generation_behind_the_upstream_and_the_next_run_catch
 
     assert result.exit_code == 0, result.output
     assert "3 row(s)" in result.output
-    assert "pending:           1 upstream row(s) the collection does not hold yet" in (
+    assert "pending:           the upstream row count exceeds the collection's by 1" in (
         result.output
     )
     assert ledger.status().status == STATUS_READY
@@ -357,10 +358,11 @@ def test_activate_serves_rows_the_state_does_not_describe_and_the_next_run_repub
     tmp_path: Path,
 ) -> None:
     """A page whose slices committed before its state advanced leaves rows the
-    state does not know. They are in the collection and queryable; the next
-    run sees them as new upstream rows and re-upserts them, idempotently. So
-    the generation is activated, the gap is reported, and the next run writes
-    exactly that many rows."""
+    state does not know. They are in the collection and queryable, so the
+    generation is activated and the gap reported -- and each such row is
+    recorded under a marker fingerprint no upstream row can match, so the
+    next run classifies it as changed and re-upserts it, idempotently, which
+    replaces the marker with the row's real state."""
     from stel.runner import run_project
 
     project = _write_project(tmp_path)
@@ -377,13 +379,57 @@ def test_activate_serves_rows_the_state_does_not_describe_and_the_next_run_repub
 
     assert result.exit_code == 0, result.output
     assert "2 filled from the serving scope" in result.output
-    assert "1 held row(s) its state does not describe" in result.output
+    assert "1 held row(s) had no state and are marked unverified" in result.output
     assert ledger.status().status == STATUS_READY
-    assert len(ledger.state()) == 2
+    state = ledger.state()
+    assert len(state) == 3
+    assert state[key].input_fingerprint == UNVERIFIED_INPUT_FINGERPRINT
 
     results = run_project(project)
     assert results[-1].rows_written == 1
-    assert len(ledger.state()) == 3
+    state = ledger.state()
+    assert len(state) == 3
+    assert state[key].input_fingerprint != UNVERIFIED_INPUT_FINGERPRINT
+
+
+def test_a_row_without_state_whose_key_is_deleted_upstream_is_removed_by_the_next_run(
+    tmp_path: Path,
+) -> None:
+    """The hole Codex found in #630: stale discovery enumerates *state* keys
+    absent upstream, so a collection row with no state whose upstream key is
+    then deleted would never be found again -- served for good, through every
+    later run. The marker activation writes is what puts the row where the
+    sweep can see it: after the deletion and one incremental run, the row is
+    gone from the collection and from the state."""
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    ledger.lose_the_pointer()
+    with ledger.adapter() as adapter:
+        key = next(iter(adapter.fetch_state(ledger.scope)))
+        adapter.delete_state(ledger.scope, [key])
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+    assert result.exit_code == 0, result.output
+    with ledger.store:
+        assert ledger.store.count_present(generation, [key], id_field="chunk_id") == 1
+
+    with ledger.adapter() as adapter:
+        adapter.execute(
+            f"DELETE FROM {adapter.table_ref('release_embeddings')} WHERE chunk_id = ?",
+            [key],
+        )
+    results = run_project(project, select="release_search")
+
+    assert results[-1].documents_deleted == 1
+    assert key not in ledger.state()
+    with ledger.store:
+        assert ledger.store.count_present(generation, [key], id_field="chunk_id") == 0
+    assert ledger.status().active_collection == generation
 
 
 def test_activate_refuses_state_naming_more_rows_than_the_collection_holds(

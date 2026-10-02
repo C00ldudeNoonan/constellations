@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### `serving activate` resolves state absence in the warehouse, not by re-querying it (issue #635)
+
+- **The re-stamp phase was O(batches x state slice).** Deciding which of the
+  serving scope's records the generation lacked used a per-batch
+  `record_key IN UNNEST(...)` against the generation's scope, and
+  `IN UNNEST(@array)` does not prune on the clustering #431 added -- so each
+  lookup re-scanned that whole slice. Measured in prod: ~514 MB per lookup,
+  ~2.6 GB of the ~3.4 GB a 12.5k-row batch cost, projecting to ~1 TB and
+  ~2.3 hours before the index build even started.
+- `StateScopeAbsenceProbe` lets `state_page_reader` restrict an ordered walk
+  to keys absent from **another scope** of the state table. The warehouse
+  evaluates the anti-join, so the walk yields only the records the generation
+  lacks and the per-batch lookups are gone.
+- **Not resolved in memory, deliberately.** The obvious alternative -- hold
+  one scope's keys and compare locally -- is what issue #428 moved *out* of
+  Python, and `docs/architecture/bounded-memory.md` prices a 3.6M-row key
+  domain at 370-740 MB. This is that paged anti-join, pointed at a scope
+  instead of a relation.
+- The existing relation form (`StateAbsenceProbe`, #428) is unchanged;
+  probing the state table through it would have asked "absent from the whole
+  table", so a key held under any other model or target would wrongly have
+  counted as known.
+- The probe reads the same immutable snapshot as the walk, so the records
+  activation writes into the generation as it goes cannot make later pages
+  skip the rows earlier pages just recorded.
+
+**Still open on #635:** clustering `stel_state` with `record_key` last, so the
+keyset walk itself prunes; and progress reporting for the phase, which can run
+for hours while `serving status` shows the previous publish's counts.
+
 ## v0.20.0 - 2026-10-02
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)

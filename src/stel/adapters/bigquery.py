@@ -67,6 +67,7 @@ from .base import (
     SqlRelationColumn,
     SqlRelationSchema,
     StaleStateFenceError,
+    StateAbsenceProbe,
     StateGeneration,
     StatePage,
     StatePageReader,
@@ -74,6 +75,7 @@ from .base import (
     StatePageRequest,
     StateRecord,
     StateScope,
+    StateScopeAbsenceProbe,
     StateScopeFence,
     StateValue,
     SyncWatermark,
@@ -3888,18 +3890,37 @@ class BigQueryAdapter(WarehouseAdapter):
             )
         absence_sql = ""
         probe = request.absent_from
-        if probe is not None:
+        # Bound separately rather than narrowed in place: each form compiles a
+        # different predicate, and a single variable of the union type would
+        # make every field access below conditional on a check the reader has
+        # to re-derive.
+        scope_probe = probe if isinstance(probe, StateScopeAbsenceProbe) else None
+        relation_probe = probe if isinstance(probe, StateAbsenceProbe) else None
+        if scope_probe is not None:
+            # Absence from another slice of the same table (issue #635). No
+            # CAST: both sides are `record_key`, which is always the
+            # stringified id, unlike the relation probe's typed column. Pinned
+            # to the same `snapshot_at` as the page itself, so the anti-join
+            # cannot see a key the caller's own writes added mid-walk.
+            absence_sql = (
+                " AND NOT EXISTS (SELECT 1 FROM "
+                f"{self._state_ref} AS probe FOR SYSTEM_TIME AS OF ? "
+                "WHERE probe.model_name = ? AND probe.state_scope = ? "
+                "AND probe.target_identity = ? "
+                "AND probe.record_key = state.record_key)"
+            )
+        if relation_probe is not None:
             try:
-                probe_table = self.client.get_table(self._table_id(probe.table))
+                probe_table = self.client.get_table(self._table_id(relation_probe.table))
             except Exception:
                 raise AdapterError(
                     "State absence probe relation "
-                    f"'{probe.table}.{probe.key_column}' is unavailable"
+                    f"'{relation_probe.table}.{relation_probe.key_column}' is unavailable"
                 ) from None
-            if probe.key_column not in {field.name for field in probe_table.schema}:
+            if relation_probe.key_column not in {field.name for field in probe_table.schema}:
                 raise AdapterError(
                     "State absence probe relation "
-                    f"'{probe.table}.{probe.key_column}' is unavailable"
+                    f"'{relation_probe.table}.{relation_probe.key_column}' is unavailable"
                 )
             # `record_key` is always a STRING, because state keys are the
             # stringified id. The probe column need not be -- a numeric id is
@@ -3909,8 +3930,8 @@ class BigQueryAdapter(WarehouseAdapter):
             # (issue #428).
             absence_sql = (
                 " AND NOT EXISTS (SELECT 1 FROM "
-                f"{self.table_ref(probe.table)} AS probe FOR SYSTEM_TIME AS OF ? "
-                f"WHERE CAST(probe.{self.quote_ident(probe.key_column)} AS STRING) = "
+                f"{self.table_ref(relation_probe.table)} AS probe FOR SYSTEM_TIME AS OF ? "
+                f"WHERE CAST(probe.{self.quote_ident(relation_probe.key_column)} AS STRING) = "
                 "state.record_key)"
             )
         nonce = uuid4().hex
@@ -3927,8 +3948,17 @@ class BigQueryAdapter(WarehouseAdapter):
             ]
             if last_key is not None:
                 params.append(last_key)
-            if probe is not None:
+            if relation_probe is not None:
                 params.append(snapshot_at)
+            if scope_probe is not None:
+                params.extend(
+                    [
+                        snapshot_at,
+                        scope_probe.scope.model_name,
+                        scope_probe.scope.stage,
+                        scope_probe.scope.target_identity,
+                    ]
+                )
             try:
                 rows = self.rows(
                     "SELECT state.record_key, state.input_fingerprint, "

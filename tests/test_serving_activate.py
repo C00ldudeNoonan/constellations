@@ -602,3 +602,111 @@ def test_activate_refuses_while_a_publisher_holds_the_scope(tmp_path: Path) -> N
 
     assert result.exit_code != 0
     assert "Another publisher owns this serving scope" in result.output
+
+
+# ─── the re-stamp does not re-query what it is walking (issue #635) ──────────
+
+
+def test_filling_state_from_serving_issues_no_keyed_lookups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ~75% of #635's bytes, asserted by absence.
+
+    Deciding which of the serving scope's records the generation lacked used
+    a per-batch `record_key IN UNNEST(...)` against the generation scope.
+    That lookup re-scanned the generation's whole state slice every batch --
+    ~514 MB of the ~3.4 GB a batch cost in prod -- because `IN UNNEST` does
+    not prune on the clustering #431 added.
+
+    The warehouse now evaluates the absence as part of the walk, so the fill
+    phase must issue no keyed lookup at all. Pinned by counting them rather
+    than by measuring bytes, which a test cannot see.
+    """
+    from stel.adapters.duckdb import DuckDBAdapter
+    from stel.execution import activation
+
+    project = _write_project(tmp_path)
+    run_project_module = __import__("stel.runner", fromlist=["run_project"])
+    run_project_module.run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+
+    # Split the state across both scopes so the fill phase has work: the
+    # serving scope keeps every record, the generation scope keeps none.
+    scope = _generation_state_scope("context_search", generation)
+    with create_adapter(ledger.resolved.warehouse, project_dir=project) as adapter:
+        adapter.clear_state(scope)
+
+    lookups: list[int] = []
+    original = DuckDBAdapter.fetch_state_subset
+
+    def counting(self: DuckDBAdapter, *args: Any, **kwargs: Any) -> Any:
+        lookups.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "fetch_state_subset", counting)
+
+    filled: list[int] = []
+    fill = activation._fill_state_from_serving
+
+    def watched(*args: Any, **kwargs: Any) -> int:
+        before = len(lookups)
+        taken = fill(*args, **kwargs)
+        filled.append(len(lookups) - before)
+        return taken
+
+    monkeypatch.setattr(activation, "_fill_state_from_serving", watched)
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+    assert result.exit_code == 0, result.output
+    assert filled == [0], (
+        "the fill phase must resolve absence in the warehouse, not by "
+        f"re-querying state ({filled[0] if filled else '?'} lookups)"
+    )
+
+
+def test_the_generations_own_receipts_are_not_overwritten_from_serving(
+    tmp_path: Path,
+) -> None:
+    """The semantic the probe carries, not just the byte count.
+
+    The fill phase may only take keys the generation never recorded. A row
+    the interrupted build rewrote carries the fingerprint of what it wrote;
+    the serving scope's older record for the same key would make the next
+    incremental run republish a row that is already current.
+
+    Written because a mutation that dropped the absence probe -- leaving the
+    phase to upsert every serving record over the generation's own -- was
+    caught by no existing test, including the one that counts keyed lookups.
+    """
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    keys = sorted(ledger.state())
+    kept = keys[0]
+
+    ledger.lose_the_pointer()
+    ledger.split_state_across_a_release(generation, moved_key=kept)
+    generation_scope = ledger.generation_scope(generation)
+    own_fingerprint = ledger.state(generation_scope)[kept].input_fingerprint
+
+    # The serving scope also holds a record for the key the generation owns,
+    # carrying an older fingerprint. Only the generation's may survive.
+    with ledger.adapter() as adapter:
+        adapter.upsert_state(ledger.scope, [StateRecord(kept, "stale-fp", STALE_HASH)])
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+    assert result.exit_code == 0, result.output
+
+    after = ledger.state()
+    assert after[kept].input_fingerprint == own_fingerprint, (
+        "the generation's own receipt was overwritten by the serving scope's"
+    )
+    assert after[kept].input_fingerprint != "stale-fp"
+    # And the keys only the serving scope had were still taken.
+    assert sorted(after) == keys

@@ -3380,22 +3380,40 @@ write a final log line. Check the container's OOM status externally, terminate
 the old owner before recovery, and use the surviving memory samples. Reducing
 `batch_size` bounds row payloads, not the native index builder's memory.
 
-A failed or recovered publication does not necessarily stop queries. A
-generation build writes to a collection nothing is reading, so its failure
-leaves the previously-active generation correct, and the scope is left
+A failed or recovered publication does not stop queries when the generation
+that was serving them is still sound. A generation build writes to a
+collection nothing is reading, so its failure leaves the previously-active
+generation correct. An in-place publish writes into the collection the
+activation pointer names, and on a store whose writes are each one transaction
+over an immutable prior version -- LanceDB and DuckDB both declare this, as
+`interruption_safe_mutation` -- an interrupted write leaves that collection
+readable with every row either wholly old or wholly new, so the generation is
+only staler than the publish meant it to be. In both cases the scope is left
 `degraded`: it keeps answering queries from that generation, and the recorded
 `safe_error_code` stays visible in `stel serving status` so a pipeline that
 has been broken for days does not hide behind a working endpoint. The next
-successful publish returns it to `ready` with no operator action.
+successful publish returns it to `ready` with no operator action. A failed
+republish is a staleness event, not an outage (issue #617: one failed
+incremental publish had refused every query for three weeks while the
+generation sat intact).
 
-An in-place publish is the exception. It writes into the collection the
-activation pointer names, so a failure there may have corrupted what was
-live; both pointers are cleared, the scope becomes `failed`, and queries are
-refused until a successful republish. A publisher that is *killed* rather
-than failing cleanly leaves no record of its intent, so the claim records it
-up front: an in-place claim clears the activation pointer when it is taken,
-which is what lets `stel serving recover` fail closed on a crashed in-place
-publish while still serving through a crashed rebuild.
+The exception is an in-place publish on a store that does not make that
+promise: a failure there may have corrupted what was live, so both pointers
+are cleared, the scope becomes `failed`, and queries are refused until a
+successful republish. A publisher that is *killed* rather than failing cleanly
+leaves no record of its intent, so the claim records it up front: an in-place
+claim on such a store clears the activation pointer when it is taken, which is
+what lets `stel serving recover` fail closed there while still serving through
+a crashed rebuild or a crashed in-place publish on a store that keeps its
+collections sound.
+
+While an in-place publish holds the scope its status is `publishing_in_place`
+and readers are refused with a retryable "reconciling" error, whatever the
+store; `publishing` is the private-generation build, which readers of the live
+generation run alongside. `stel serving status` and `stel serving recover`
+print a `serving:` line that says in words what a reader gets right now --
+which generation, from which collection, degraded or not -- or that they get
+nothing, and why.
 
 A generation retains the configuration fingerprint it was published under, so
 a rebuild forced by a *configuration change* leaves the old generation

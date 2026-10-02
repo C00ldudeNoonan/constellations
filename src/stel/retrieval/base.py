@@ -121,6 +121,21 @@ class RetrievalFeature(StrEnum):
     # that cannot keeps the warehouse path, which is always correct, only
     # slower.
     COLLECTION_SEEDING = "collection_seeding"
+    # An in-place mutation that stops at any point -- an error, or the process
+    # dying mid-write or mid-index-build -- leaves the collection readable,
+    # with every row either wholly as it was or wholly as the write intended
+    # (issue #617). Weaker than ATOMIC_BATCH_MUTATION, which promises the whole
+    # batch lands or none of it; this promises only that no row is ever torn
+    # and that readers can still open the collection. That is the property the
+    # serving ledger needs to keep serving a generation an in-place publish was
+    # writing into when the publish failed: without it, a failed in-place
+    # publish has to be assumed to have corrupted what was live, and the
+    # ledger fails closed (ADR-0001). A store earns this by committing each
+    # write as one transaction over an immutable prior version, and by never
+    # discarding a prior version while publishing. A store that overwrites in
+    # place, or whose index build rewrites the data it indexes, must not
+    # declare it.
+    INTERRUPTION_SAFE_MUTATION = "interruption_safe_mutation"
 
 
 PUBLISHER_FENCING_FEATURES = frozenset(

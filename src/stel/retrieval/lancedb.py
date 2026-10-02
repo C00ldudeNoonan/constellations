@@ -484,6 +484,16 @@ class LanceDBStore(RetrievalStore):
                     # ahead of the store, which is what the publish loop
                     # gates state on.
                     RetrievalFeature.EXACT_MUTATION_RECEIPTS,
+                    # Each `merge_insert` slice, `add`, `delete` and
+                    # `create_index` is one Lance transaction committing a new
+                    # table version over the previous, immutable one, and
+                    # nothing in this module compacts or cleans up old
+                    # versions while publishing. A write interrupted anywhere
+                    # -- including the index build -- leaves the prior version
+                    # readable and every row whole; the worst case is rows
+                    # the next incremental run republishes, which the
+                    # receipt-gated state already describes (issue #617).
+                    RetrievalFeature.INTERRUPTION_SAFE_MUTATION,
                     # DataFusion's `array_has_any` expresses set overlap
                     # against a list column (issue #397).
                     RetrievalFeature.ARRAY_CONTAINMENT_FILTERS,

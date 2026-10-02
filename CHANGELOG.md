@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### A failed in-place publish keeps serving the generation it was updating (issue #617)
+
+- **One failed incremental publish took a ready index offline for three
+  weeks.** `sec_chunk_search` answered every query with
+  `capability_unavailable` from 2026-09-27 while the generation that had
+  served it sat intact in the store. Each weekly incremental publish writes
+  in place into the live generation, and ADR-0001 made that path fail closed:
+  the claim cleared `active_generation` and a failure left it cleared, on the
+  reasoning that an in-place failure "may have corrupted what was live". For
+  LanceDB that was never possible -- each `merge_insert` slice, delete and
+  index build is one Lance transaction over an immutable prior version, and
+  stel never discards prior versions while publishing -- so the index was
+  refused on a precaution against damage that cannot occur, until a publish
+  succeeded, and none could.
+- A store now declares `INTERRUPTION_SAFE_MUTATION` when an interrupted
+  in-place write leaves its collection readable with every row either wholly
+  old or wholly new. LanceDB and DuckDB declare it. On such a store an
+  in-place publish keeps the activation pointer through its claim, a clean
+  failure retains it and the scope goes `degraded` rather than `failed`, and
+  `stel serving recover` after a crash serves on from it. A failed republish
+  is a staleness event: the publication state already says which rows the
+  next run republishes. A store without the declaration keeps ADR-0001's
+  fail-closed behaviour unchanged.
+- **New ledger status `publishing_in_place`.** An in-place publish still
+  excludes readers for its duration (ADR-0003), and with the pointer kept the
+  status is what records that: readers see the same retryable "reconciling"
+  refusal as before. `publishing` now means only a private-generation build,
+  which readers run alongside. Anything that pattern-matches ledger statuses
+  has a new value to handle.
+- **`stel serving status` and `stel serving recover` say what is served.** A
+  new `serving:` line names the generation and collection a reader gets, says
+  when it is degraded and by what, and says "nothing" in words -- with why --
+  where the fields alone showed two dashes.
+
 ### `concept-cloud` shows what changed between two periods (issue #555)
 
 A single frozen view of a multi-year map answers "what is always here", not

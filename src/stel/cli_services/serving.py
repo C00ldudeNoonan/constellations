@@ -181,6 +181,44 @@ def serving_recover(
         )
 
 
+def describe_serving(entry: ServingLedgerEntry) -> str:
+    """One line saying what a reader of this index gets right now.
+
+    The ledger fields answer it only to someone who knows the admission rule:
+    `active_generation: -` beside `status: failed` meant three weeks of refused
+    queries read as an idle index (issue #617). So the answer is spelled out,
+    and "nothing" is said in words rather than left as two dashes.
+    """
+    from ..retrieval.coordination import (
+        SERVABLE_STATUSES,
+        STATUS_DEGRADED,
+        STATUS_PUBLISHING_IN_PLACE,
+        STATUS_UNPUBLISHED,
+    )
+
+    if entry.status == STATUS_UNPUBLISHED:
+        return "nothing; the index has never been published"
+    if entry.status == STATUS_PUBLISHING_IN_PLACE:
+        return (
+            "nothing while an in-place publish holds the index; readers are "
+            "told to retry after it completes"
+        )
+    if entry.status not in SERVABLE_STATUSES or entry.active_generation is None:
+        return (
+            "nothing; no generation is active, and queries are refused until a "
+            "publish succeeds"
+        )
+    collection = entry.active_collection or "the default collection"
+    served = f"generation {entry.active_generation} from {collection}"
+    if entry.status == STATUS_DEGRADED:
+        return (
+            f"{served}, degraded: the last publish failed "
+            f"({entry.safe_error_code or 'no error code recorded'}), so readers "
+            "get the generation published before it"
+        )
+    return served
+
+
 def _report(
     entry: ServingLedgerEntry,
     *,

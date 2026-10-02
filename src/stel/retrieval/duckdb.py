@@ -253,6 +253,11 @@ class DuckDBStore(RetrievalStore):
                     # atomic here, unlike a remote store batching over HTTP.
                     RetrievalFeature.DURABLE_WRITE_ACK,
                     RetrievalFeature.ATOMIC_BATCH_MUTATION,
+                    # Implied by the above: an all-or-nothing transaction
+                    # cannot leave a torn row, and a rolled-back one leaves
+                    # the table as it was (issue #617). Declared rather than
+                    # inferred so the ledger reads one flag for one question.
+                    RetrievalFeature.INTERRUPTION_SAFE_MUTATION,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                     RetrievalFeature.PRIVATE_GENERATION_BUILD,
                     RetrievalFeature.COLLECTION_SEEDING,

@@ -2604,6 +2604,7 @@ def _echo_serving_context(report: Any) -> None:
 @click.pass_context
 def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
+    from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
     from .retrieval import ServingCoordinationError
 
@@ -2631,6 +2632,8 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"fencing_token:     {entry.fencing_token}")
     click.echo(f"active_generation: {entry.active_generation or '-'}")
     click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
+    # What the two lines above mean for a reader, in words (issue #617).
+    click.echo(f"serving:           {_describe_serving(entry)}")
     click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
     click.echo(f"query_leases:      {entry.query_leases}")
     click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")
@@ -2660,8 +2663,10 @@ def serving_recover(
 
     There is no timeout-based lease stealing: recovery advances the fencing
     token so any surviving process fails its next verification, clears all
-    leases, and leaves the scope failed until the next successful publish.
+    leases, and leaves the scope degraded (still serving the generation that
+    was live) or failed (serving nothing) until the next successful publish.
     """
+    from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_recover as _serving_recover
     from .retrieval import ServingCoordinationError
 
@@ -2691,6 +2696,7 @@ def serving_recover(
         f"fencing_token={report.entry.fencing_token}. "
         "Re-run `stel run` to publish."
     )
+    click.echo(f"serving:           {_describe_serving(report.entry)}")
 
 
 @serving.command("migrate-scope")

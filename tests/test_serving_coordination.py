@@ -25,6 +25,7 @@ from stel.retrieval.coordination import (
     STATUS_DEGRADED,
     STATUS_FAILED,
     STATUS_PUBLISHING,
+    STATUS_PUBLISHING_IN_PLACE,
     STATUS_READY,
     STATUS_UNPUBLISHED,
     validate_safe_error_code,
@@ -66,7 +67,8 @@ def test_exclusive_publish_claim_and_fence_progression(coordinator: Any) -> None
         scope, expected_code_version="v1", config_fingerprint="cfg1"
     )
     assert lease.fencing_token == 1
-    assert coordinator.status(scope).status == STATUS_PUBLISHING
+    # The default claim is an in-place one, and says so (issue #617).
+    assert coordinator.status(scope).status == STATUS_PUBLISHING_IN_PLACE
 
     with pytest.raises(ServingBusyError, match="Another publisher"):
         coordinator.acquire_publish(
@@ -716,6 +718,144 @@ def test_failed_publication_blocks_queries_until_republished(
     )
 
 
+def test_a_failed_incremental_publish_keeps_serving_the_previous_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #617. `sec_chunk_search` refused every query for three weeks
+    while the generation that had served it sat intact in the store. Each
+    weekly incremental publish wrote in place into that generation; the first
+    one to fail (an index build, #598) took the in-place path ADR-0001 made
+    fail closed, so one failed publish became an outage that only a successful
+    publish could end -- and none could. Every LanceDB write is a transaction
+    over an immutable prior version, so the generation was never unsound, only
+    stale. A failed republish is now a staleness event: the ledger goes
+    `degraded`, still naming the generation, and readers keep getting it.
+    """
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.runner import RunError, run_project
+    from stel.search import SearchMode, SearchRequest, search
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    before = _ledger_status(project)
+    assert before.status == STATUS_READY and before.active_generation is not None
+
+    # A changed document, so the next incremental publish has a row to write
+    # -- the in-place path, not a rebuild -- and the write fails.
+    inflation = project / "data" / "inflation.json"
+    payload = json.loads(inflation.read_text())
+    payload["body"] = "Inflation accelerated as consumer price growth picked up."
+    inflation.write_text(json.dumps(payload))
+
+    def _fail_upsert(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise RetrievalError("LanceDB operation 'upsert' failed (code=test_outage)")
+
+    monkeypatch.setattr(LanceDBStore, "upsert", _fail_upsert)
+    with pytest.raises(RunError):
+        run_project(project)
+    monkeypatch.undo()
+
+    entry = _ledger_status(project)
+    assert entry.status == STATUS_DEGRADED
+    assert entry.safe_error_code == "store_error"
+    assert entry.active_generation == before.active_generation
+    assert entry.active_collection == before.active_collection
+    # The failure is visible to the operator and invisible to the reader.
+    hits = search(
+        project,
+        SearchRequest(model="release_search", query="inflation", mode=SearchMode.TEXT),
+    )
+    assert hits
+    status = CliRunner().invoke(
+        cli, ["serving", "status", "release_search", "--project-dir", str(project)]
+    )
+    assert status.exit_code == 0, status.output
+    assert "status:            degraded" in status.output
+    assert f"serving:           generation {before.active_generation}" in status.output
+    assert "readers get the generation published before it" in status.output
+
+    # Not sticky: the next publish that works heals it, and the changed row
+    # lands.
+    results = run_project(project)
+    assert results[-1].serving_resource is not None
+    assert results[-1].serving_resource["status"] == "ready"
+    assert _ledger_status(project).status == STATUS_READY
+
+
+def test_a_killed_incremental_publish_recovers_to_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The crash half of #617, through the real publish path: the 2026-09-27
+    lease was lost to a host crash, and `recover` could carry forward only
+    what the claim had left on the row. A publish killed mid-write never
+    reaches `mark_failed`, so what survives is decided at claim time -- which
+    is why `search.py`'s claim, not only its failure handler, has to keep the
+    pointer on a store whose interrupted writes leave the collection sound.
+    """
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.runner import run_project
+    from stel.search import SearchError, SearchMode, SearchRequest, search
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    before = _ledger_status(project)
+    assert before.active_generation is not None
+
+    inflation = project / "data" / "inflation.json"
+    payload = json.loads(inflation.read_text())
+    payload["body"] = "Inflation accelerated as consumer price growth picked up."
+    inflation.write_text(json.dumps(payload))
+
+    def _killed(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Not an error the publish handles: nothing records a failure, the
+        # claim is simply abandoned, as a SIGKILL would leave it.
+        raise SystemExit(137)
+
+    monkeypatch.setattr(LanceDBStore, "upsert", _killed)
+    with pytest.raises(SystemExit):
+        run_project(project)
+    monkeypatch.undo()
+
+    stranded = _ledger_status(project)
+    assert stranded.status == STATUS_PUBLISHING_IN_PLACE
+    assert stranded.publication_id is not None
+    assert stranded.active_generation == before.active_generation
+    # Exclusive while the claim stands, even abandoned: a reader is told to
+    # retry, not handed a collection mid-write.
+    with pytest.raises(SearchError, match="reconciling"):
+        search(
+            project,
+            SearchRequest(model="release_search", query="inflation", mode=SearchMode.TEXT),
+        )
+
+    recovered = CliRunner().invoke(
+        cli,
+        [
+            "serving",
+            "recover",
+            "release_search",
+            "--owner-terminated",
+            "--target",
+            "dev",
+            "--project-dir",
+            str(project),
+        ],
+    )
+    assert recovered.exit_code == 0, recovered.output
+    assert "status=degraded" in recovered.output
+    entry = _ledger_status(project)
+    assert entry.active_generation == before.active_generation
+    assert entry.active_collection == before.active_collection
+    assert search(
+        project,
+        SearchRequest(model="release_search", query="inflation", mode=SearchMode.TEXT),
+    )
+
+
 def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
     from click.testing import CliRunner
 
@@ -727,13 +867,19 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
     project = _write_project(tmp_path)
     run_project(project)
 
-    # Simulate a crash: claim the scope and abandon the lease.
+    # Simulate a crash: claim the scope the way an in-place publish on LanceDB
+    # does -- the pointer kept, readers excluded (issue #617) -- and abandon
+    # the lease.
     project_config, _sources, _models = load_project(project)
     resolved = resolve_profile(project_config, project)
     scope = _serving_scope(project)
     with create_adapter(resolved.warehouse, project_dir=project) as adapter:
         ServingCoordinator(adapter, ensure_schema=True).acquire_publish(
-            scope, expected_code_version="crashed", config_fingerprint="crashed"
+            scope,
+            expected_code_version="crashed",
+            config_fingerprint="crashed",
+            preserves_active_generation=True,
+            excludes_readers=True,
         )
 
     with pytest.raises(RunError, match="Another publisher"):
@@ -788,12 +934,15 @@ def test_crashed_publisher_requires_explicit_recovery(tmp_path: Path) -> None:
         ],
     )
     assert recovered.exit_code == 0, recovered.output
-    # Failed, not degraded. The abandoned claim was an ordinary in-place
-    # publish, which mutates the collection the activation pointer names — its
-    # claim cleared the pointer precisely so that a crash cannot leave a
-    # half-rewritten collection being served (issue #449). Recovery has no way
-    # to prove otherwise about a publisher that is gone, so it fails closed.
-    assert "status=failed" in recovered.output
+    # Degraded, not failed. The abandoned claim was an in-place publish on a
+    # store whose interrupted writes leave the collection sound, so its claim
+    # kept the pointer and recovery serves on from it, saying so in words
+    # (issue #617). The fail-closed case -- a store that cannot promise that,
+    # whose claim clears the pointer -- is
+    # `test_recover_refuses_to_serve_after_a_crashed_in_place_publish`.
+    assert "status=degraded" in recovered.output
+    assert "serving:           generation " in recovered.output
+    assert "degraded: the last publish failed (administrative_recovery)" in recovered.output
 
     results = run_project(project)
     assert results[-1].serving_resource is not None
@@ -1438,9 +1587,11 @@ def test_a_query_lease_pins_the_collection_it_resolved(coordinator: Any) -> None
 def test_an_in_place_failure_clears_both_pointers_and_stops_serving(
     coordinator: Any,
 ) -> None:
-    """An in-place publish writes into the collection the pointer names, so a
-    failure may have corrupted what was live. Neither pointer can be trusted
-    and nothing may be served — the case `degraded` deliberately excludes."""
+    """An in-place publish writes into the collection the pointer names. On a
+    store that cannot promise an interrupted write leaves it sound -- the
+    default claim -- a failure may have corrupted what was live: neither
+    pointer can be trusted and nothing may be served, the case `degraded`
+    deliberately excludes. The store that can promise it is the next test."""
     scope = _scope()
     lease = coordinator.acquire_publish(
         scope, expected_code_version="v1", config_fingerprint="cfg1"
@@ -1463,6 +1614,107 @@ def test_an_in_place_failure_clears_both_pointers_and_stops_serving(
     assert entry.active_generation is None
     with pytest.raises(ServingNotReadyError):
         coordinator.acquire_query(scope)
+
+
+def test_an_in_place_claim_on_an_interruption_safe_store_keeps_the_pointer_and_excludes_readers(
+    coordinator: Any,
+) -> None:
+    """Issue #617: the claim `search.py` takes for an incremental publish on
+    LanceDB. Readers are still excluded for its duration (ADR-0003: it is
+    writing into the collection they would resolve to), but the pointer
+    survives the claim, so a clean failure retains it and the scope degrades
+    instead of going dark."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    # Still exclusive: a pinned reader blocks the claim...
+    reader = coordinator.acquire_query(scope)
+    with pytest.raises(ServingBusyError, match="query leases"):
+        coordinator.acquire_publish(
+            scope,
+            expected_code_version="v2",
+            config_fingerprint="cfg1",
+            preserves_active_generation=True,
+            excludes_readers=True,
+        )
+    coordinator.release_query(reader)
+
+    retry = coordinator.acquire_publish(
+        scope,
+        expected_code_version="v2",
+        config_fingerprint="cfg1",
+        preserves_active_generation=True,
+        excludes_readers=True,
+    )
+    # ...and the claim, once held, refuses new readers while keeping the
+    # pointer it would otherwise have had to clear to say so.
+    held = coordinator.status(scope)
+    assert held.status == STATUS_PUBLISHING_IN_PLACE
+    assert held.active_generation == "gen1"
+    with pytest.raises(ServingBusyError, match="reconciling"):
+        coordinator.acquire_query(scope)
+
+    coordinator.mark_failed(
+        retry,
+        safe_error_code="store_error",
+        active_collection="proj__dev__ctx__ga1b2",
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+    )
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
+    assert entry.safe_error_code == "store_error"
+    query = coordinator.acquire_query(scope)
+    assert query.pinned_generation == "gen1"
+    assert query.pinned_collection == "proj__dev__ctx__ga1b2"
+    coordinator.release_query(query)
+
+
+def test_recover_serves_on_after_a_crashed_in_place_publish_on_an_interruption_safe_store(
+    coordinator: Any,
+) -> None:
+    """The crash half of #617. The lease lost to a host crash on 2026-09-27
+    went through `recover`, which could only carry forward what the claim had
+    left on the row; an in-place claim that keeps the pointer leaves it
+    something to carry."""
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(2, 0, 0, 0),
+        active_collection="proj__dev__ctx__ga1b2",
+    )
+    coordinator.acquire_publish(
+        scope,
+        expected_code_version="v2",
+        config_fingerprint="cfg1",
+        preserves_active_generation=True,
+        excludes_readers=True,
+    )
+
+    entry = coordinator.recover(scope, owner_terminated=True)
+
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
+    assert entry.active_collection == "proj__dev__ctx__ga1b2"
+    assert entry.config_fingerprint == "cfg1"
+    query = coordinator.acquire_query(scope)
+    assert query.pinned_generation == "gen1"
+    coordinator.release_query(query)
 
 
 def test_a_rebuild_failure_keeps_serving_the_previous_generation(
@@ -1594,9 +1846,11 @@ def test_recover_refuses_to_serve_after_a_crashed_in_place_publish(
 
     A crashed publisher leaves no record of its intent, so recovery cannot ask
     it what it was doing. An in-place publish mutates the collection the
-    pointer names, so serving that generation after a crash could serve a
-    half-rewritten index. The claim clears the pointer up front, which is what
-    makes recovery fail closed here (PR #450 review).
+    pointer names; on a store that cannot promise an interrupted write leaves
+    it whole, serving that generation after a crash could serve a
+    half-rewritten index. That claim clears the pointer up front, which is
+    what makes recovery fail closed here (PR #450 review). A store that can
+    promise it keeps the pointer instead (issue #617) -- the test above.
     """
     scope = _scope()
     lease = coordinator.acquire_publish(

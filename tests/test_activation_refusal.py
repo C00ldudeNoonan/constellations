@@ -81,15 +81,27 @@ def test_another_configuration_is_refused_before_row_counts_are_compared() -> No
     assert "Republish" in reason
 
 
-@pytest.mark.parametrize(("held", "upstream"), [(1_825_000, 3_644_778), (3_644_778, 3_644_779)])
-def test_an_incomplete_generation_names_both_counts(held: int, upstream: int) -> None:
-    """Fewer rows is the stranded partial build; more rows is an upstream that
-    shrank. Both are refused with the numbers, because the remedy (resume the
-    publish) is the same and the operator should see how far off it is."""
+@pytest.mark.parametrize("held", [3_644_778 - 1, 1_825_000])
+def test_a_generation_behind_the_upstream_is_not_refused(held: int) -> None:
+    """One filing short or half the corpus short: both are rows the next
+    incremental run publishes, and refusing would send the operator to a
+    resume that re-reads the corpus to add them. The command reports the gap
+    instead; this check only has to let it through."""
+    assert (
+        activation_refusal(
+            _existing(rows=held), _spec(), upstream_rows=3_644_778, collection="c"
+        )
+        is None
+    )
+
+
+def test_a_generation_holding_rows_the_upstream_does_not_is_refused() -> None:
+    """Rows the upstream does not have cannot be told, by a count, from another
+    relation's collection, so this direction stays a refusal with both numbers."""
     reason = activation_refusal(
-        _existing(rows=held), _spec(), upstream_rows=upstream, collection="c"
+        _existing(rows=3_644_778), _spec(), upstream_rows=3_644_777, collection="c"
     )
     assert reason is not None
-    assert f"holds {held} row(s)" in reason
-    assert f"upstream relation has {upstream}" in reason
+    assert "holds 3644778 row(s)" in reason
+    assert "upstream relation has only 3644777" in reason
     assert "Resume the publish" in reason

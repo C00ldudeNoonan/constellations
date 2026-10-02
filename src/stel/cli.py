@@ -2770,6 +2770,16 @@ def serving_activate(
         f"publication, {activation.state_rows_from_serving} filled from the "
         "serving scope"
     )
+    if activation.rows_behind_upstream or activation.rows_without_state:
+        # Said only when there is something to say: an index activated behind
+        # the upstream is serving, and stale by exactly this much until the
+        # next incremental run, which is what reconciles both numbers.
+        click.echo(
+            "pending:           "
+            f"{activation.rows_behind_upstream} upstream row(s) the collection "
+            f"does not hold yet, {activation.rows_without_state} held row(s) its "
+            "state does not describe; the next incremental run reconciles both"
+        )
     click.echo(f"serving:           {_describe_serving(outcome.report.entry)}")
 
 

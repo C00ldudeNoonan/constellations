@@ -16,14 +16,23 @@
   activates a physically complete generation from the publication state stel
   recorded for its rows. It reads only the upstream's schema and row count.
   Before claiming anything it refuses a collection that is missing, carries
-  another configuration's fingerprint, or does not hold exactly the upstream's
-  row count. Under its claim it assembles the generation's state (its own
-  scope's records, filled from the serving scope for keys it never recorded),
-  re-stamps every record at the current `code_version`, and refuses unless
-  that state describes the collection's row count exactly and a 1,000-key
-  sample of it is present in the collection. Then it builds missing indices,
-  swaps the state into the serving scope and activates. A late refusal is
-  recorded as a failed publish and leaves whatever was serving still served.
+  another configuration's fingerprint, or holds more rows than the upstream.
+  Under its claim it assembles the generation's state (its own scope's
+  records, filled from the serving scope for keys it never recorded),
+  re-stamps every record at the current `code_version`, and refuses if that
+  state names more rows than the collection holds or a 1,000-key sample of it
+  is absent from the collection. Then it builds missing indices, swaps the
+  state into the serving scope and activates. A late refusal is recorded as a
+  failed publish and leaves whatever was serving still served.
+- **A shortfall is reported, not refused.** A collection behind the upstream
+  (new filings embedded since its last complete write), or holding rows its
+  state does not describe (a page whose slices committed before its state
+  advanced), is activated and the gap printed on a `pending:` line; the next
+  incremental run publishes the one and re-upserts the other. Refusing would
+  have sent the operator back to a corpus-reading resume to add a few hundred
+  rows, and a growing corpus would have refused every activation attempted
+  hours after the generation was written. State naming rows the collection
+  does not hold is still refused outright.
 - `--rows-verified` is the one assertion the command cannot check: that the
   collection's rows are what the current code would publish, so re-stamping
   their state as current is correct. True after a hash-only `code_version`

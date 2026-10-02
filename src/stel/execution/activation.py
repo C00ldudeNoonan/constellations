@@ -84,6 +84,13 @@ class GenerationActivation:
     # interrupted publish had got.
     state_rows_from_generation: int
     state_rows_from_serving: int
+    # What the next incremental run reconciles: upstream rows the collection
+    # does not hold yet, and collection rows the assembled state did not
+    # describe. Both are staleness, not damage (see `activation_refusal`), and
+    # both are reported so the operator knows the activated index is behind by
+    # exactly that much.
+    rows_behind_upstream: int
+    rows_without_state: int
     code_version: str
     fencing_token: int
 
@@ -99,6 +106,18 @@ def activation_refusal(
 
     Pure, so the refusals can be pinned without a store. Each names the two
     values that disagree: the operator's next step is different for each.
+
+    Fewer rows than the upstream is not a refusal. The rows missing are ones
+    the upstream gained after the generation's last complete write, and an
+    index that lacks this week's filings is what every index is between
+    incremental runs; the next one publishes them. Refusing would send the
+    operator to a resume that re-reads the corpus to add a few hundred rows --
+    the cost this command exists to avoid (#614) -- and a corpus that is
+    always growing would otherwise refuse every activation attempted more than
+    a few hours after the generation was written. More rows than the upstream
+    is still refused: those rows are not in the relation at all, so either the
+    upstream shrank (a resume deletes them in minutes) or this collection is
+    not this relation's, and the row count cannot tell which.
     """
     if existing is None:
         return f"Retrieval collection '{collection}' does not exist in this store"
@@ -108,12 +127,12 @@ def activation_refusal(
             "configuration than this model declares; activating it would answer "
             "queries with an index that was never built for them. Republish instead."
         )
-    if existing.row_count != upstream_rows:
+    if existing.row_count > upstream_rows:
         return (
             f"Retrieval collection '{collection}' holds {existing.row_count} row(s) "
-            f"but the upstream relation has {upstream_rows}; a generation can be "
-            "activated only when it is physically complete for the current "
-            "upstream. Resume the publish instead."
+            f"but the upstream relation has only {upstream_rows}; a generation "
+            "holding rows the upstream does not cannot be told apart from another "
+            "relation's collection by its count. Resume the publish instead."
         )
     return None
 
@@ -247,14 +266,22 @@ def activate_search_generation(
                 page_size=search.batch_size,
                 code_version=code_version,
             )
-            if state_rows != existing.row_count:
+            # State naming more rows than the collection holds vouches for
+            # rows that are not there, and the reconciler would skip them for
+            # good: refused outright, since no sample is needed to know it.
+            # Fewer is the other direction -- a page whose slices committed
+            # before its state could advance (the 2026-09-20 failure died in
+            # one) -- and those rows are simply unknown: the next run sees
+            # them as new upstream rows and re-upserts them, idempotently.
+            if state_rows > existing.row_count:
                 raise RunError(
                     f"Publication state describes {state_rows} row(s) of "
-                    f"'{physical_collection}' but the collection holds "
-                    f"{existing.row_count}; the generation cannot be activated "
-                    "from state that does not account for every row. Resume the "
+                    f"'{physical_collection}' but the collection holds only "
+                    f"{existing.row_count}; state that vouches for rows the "
+                    "collection does not hold cannot be activated. Resume the "
                     "publish instead."
                 )
+            rows_without_state = existing.row_count - state_rows
             present = store.count_present(
                 physical_collection, sample, id_field=search.id_field
             )
@@ -271,7 +298,7 @@ def activate_search_generation(
                 raise RunError(
                     "Retrieval collection failed post-publication configuration validation"
                 )
-            if metadata.row_count != state_rows:
+            if metadata.row_count != existing.row_count:
                 raise RunError(
                     "Retrieval collection failed post-publication row-count validation"
                 )
@@ -287,7 +314,7 @@ def activate_search_generation(
             lease,
             active_generation=active_generation,
             config_fingerprint=spec.config_fingerprint,
-            counts=(0, 0, state_rows, 0),
+            counts=(0, 0, existing.row_count, 0),
             active_collection=physical_collection,
         )
     except (AdapterError, RetrievalError, RunError) as error:
@@ -306,23 +333,29 @@ def activate_search_generation(
         if isinstance(error, RunError):
             raise
         raise RunError(str(error)) from None
+    rows_behind_upstream = upstream_rows - existing.row_count
     log.info(
         "%s: activated %s (%d rows; state from the generation for %d, from the "
-        "serving scope for %d) at code version %s",
+        "serving scope for %d; %d upstream row(s) not yet held, %d held row(s) "
+        "without state) at code version %s",
         model.name,
         physical_collection,
-        state_rows,
+        existing.row_count,
         state_rows - from_serving,
         from_serving,
+        rows_behind_upstream,
+        rows_without_state,
         code_version,
     )
     return GenerationActivation(
         model_name=model.name,
         physical_collection=physical_collection,
         active_generation=active_generation,
-        rows=state_rows,
+        rows=existing.row_count,
         state_rows_from_generation=state_rows - from_serving,
         state_rows_from_serving=from_serving,
+        rows_behind_upstream=rows_behind_upstream,
+        rows_without_state=rows_without_state,
         code_version=code_version,
         fencing_token=lease.fencing_token,
     )

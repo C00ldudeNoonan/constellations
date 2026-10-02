@@ -140,3 +140,24 @@ in the shape `recover --owner-terminated` already uses for the same reason.
   hash — and shows the next incremental run writing zero rows afterwards. Each
   refusal has its own test; a late refusal is shown to leave a served
   generation `degraded` and answering.
+
+## Addendum, 2026-10-02: a shortfall is tolerated
+
+Recorded as an addendum rather than an edit, because it changes the decision
+above, not only its wording. "Holds exactly as many rows as the upstream" and
+"describes exactly the collection's row count" were written as the
+completeness checks a publish makes, and they would have refused the very
+activation this record exists for. The upstream relation grows with every
+embedding run, so a generation is "exactly complete" only for the hours
+between its last write and the next filing; and a page whose slices committed
+before its state advanced (the 2026-09-20 failure died inside one) leaves rows
+the state does not describe. Both are staleness the next incremental run
+reconciles — it publishes the rows the collection lacks and re-upserts, by
+idempotent merge, the rows its state does not know — and neither is damage.
+
+Both checks now refuse only the direction that is: a collection holding rows
+the upstream does not, and state naming rows the collection does not hold.
+A shortfall in either is activated and reported on a `pending:` line, so the
+operator knows by how much the served index is behind. The consequence above
+about a grown corpus refusing activation no longer holds; it is reported
+instead.

@@ -2113,6 +2113,9 @@ class BigQueryAdapter(WarehouseAdapter):
                 except Exception:
                     pass
             job = None
+            log.debug(
+                "BigQuery table snapshot could not be opened", exc_info=error
+            )
             failure_cause = sanitized_adapter_cause(error)
             failure = AdapterError(
                 "BigQuery table snapshot could not be opened "

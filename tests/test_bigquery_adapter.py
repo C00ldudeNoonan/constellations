@@ -4653,6 +4653,51 @@ def test_a_batch_read_failure_is_sanitized_with_the_native_cause_in_the_diagnost
     assert "distinctive native storage failure" in diagnostics_text
 
 
+def test_an_open_failure_is_sanitized_with_the_native_cause_in_the_diagnostics_file(
+    tmp_path: Path,
+) -> None:
+    """The batch-read and generation-validation sites are not the only ones
+    that sanitize a native BigQuery exception -- opening the snapshot itself
+    (session creation, query startup) does too, at `bigquery.py`'s own
+    `except Exception` around `_open_table_snapshot`'s body. A failure there
+    needs the same DEBUG log, or `--diagnostics-file` stays empty for it even
+    though the docs now claim warehouse table-snapshot reads are covered
+    (issue #614, Codex review on PR #634)."""
+
+    class _FailingStorageReadClient(_FakeStorageReadClient):
+        def create_read_session(
+            self,
+            *,
+            parent: str,
+            read_session: Any,
+            max_stream_count: int,
+            timeout: Any = None,
+        ) -> Any:
+            raise RuntimeError("distinctive native session-open failure")
+
+    payload = pa.table({"chunk_id": ["a"], "embedding": [[1.0]]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "embedding"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    adapter = _adapter(client)
+    adapter._bqstorage_client = _FailingStorageReadClient()
+    adapter._bqstorage_client.payload = payload
+
+    diagnostics_path = tmp_path / "diagnostics.log"
+    configure_diagnostics_file(diagnostics_path)
+
+    with pytest.raises(AdapterError) as excinfo:
+        with adapter.table_snapshot("chunks", columns=["chunk_id", "embedding"]):
+            pass
+
+    assert str(excinfo.value).startswith("BigQuery table snapshot could not be opened")
+    assert "distinctive" not in str(excinfo.value)
+
+    diagnostics_text = diagnostics_path.read_text(encoding="utf-8")
+    assert "BigQuery table snapshot could not be opened" in diagnostics_text
+    assert "distinctive native session-open failure" in diagnostics_text
+
+
 # ─── wide-row snapshots read through the Storage API (issue #441) ───────────
 #
 # v0.15.1 moved the schema probe from max_results=1 to max_results=0 on the

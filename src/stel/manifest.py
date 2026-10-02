@@ -310,27 +310,13 @@ def _model_dict(
     project_dir: Path,
     resolved: ResolvedProfile,
 ) -> dict[str, Any]:
-    if model.extraction is not None:
-        kind = "extraction"
-    elif model.ml is not None:
-        kind = "ml"
-    elif model.transform is not None:
-        kind = "transform"
-    elif model.chunk is not None:
-        kind = "chunk"
-    elif model.embed is not None:
-        kind = "embed"
-    elif model.llm is not None:
-        kind = "llm"
-    elif model.eval is not None:
-        kind = "eval"
-    else:
-        kind = "unknown"
-
     model_dict = {
         "name": model.name,
         "description": model.description,
-        "kind": kind,
+        # The same spelling run results and `stel ls` use. A hand-kept
+        # if-chain here had no `search` branch, so every search model was
+        # "unknown" in manifest.json (issue #623).
+        "kind": model.kind_label(),
         "materialization": model.materialization,
         "tags": model.tags,
         "source": model.source,

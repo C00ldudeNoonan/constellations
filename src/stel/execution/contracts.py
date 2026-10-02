@@ -13,11 +13,24 @@ class RunError(Exception):
     operator needs attributed. Without this the runner builds a fresh result
     with empty metrics and that timing never reaches `run_results.json`
     (issue #432, PR #460 review).
+
+    `progress` carries the row counters the same way, keyed by
+    `ModelRunResult` field name (`documents_processed`, `rows_written`, ...).
+    A search publish that wrote 1.8 million rows over six hours before its
+    index build failed was logged as zero rows in zero seconds (issue #623);
+    the serving ledger had the numbers, and the run log -- the place an
+    operator looks -- did not.
     """
 
-    def __init__(self, *args: Any, metrics: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        metrics: dict[str, Any] | None = None,
+        progress: dict[str, int] | None = None,
+    ) -> None:
         super().__init__(*args)
         self.metrics: dict[str, Any] = metrics or {}
+        self.progress: dict[str, int] = progress or {}
 
 
 @dataclass
@@ -44,6 +57,13 @@ class ModelRunResult:
     rows_updated: int = 0
     rows_failed: int = 0
     duration_seconds: float = 0.0
+    # The model's own wall-clock span, ISO 8601 UTC. None only on a result the
+    # runner never started (a skipped model), where the run log falls back to
+    # the invocation's span. Before this every run-log row carried the
+    # invocation's timestamps, so a model that failed six hours in read as
+    # having started with the first model of the build (issue #623).
+    started_at: str | None = None
+    completed_at: str | None = None
     errors: list[str] = field(default_factory=list)
     # Warnings are aggregated by safe message and never change the run status.
     warnings: dict[str, int] = field(default_factory=dict)

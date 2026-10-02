@@ -106,6 +106,25 @@ so nothing already recorded changes meaning.
 when `record_key` is already the last clustering column -- which is what both
 a materialising fix and the keyset walk's own cost depend on.
 
+### A failed model's run-log row says what it did (issue #623)
+
+- **A six-hour, 1.8-million-row search publish that failed was logged as
+  `kind=unknown`, zero rows, zero seconds, with the invocation's
+  timestamps.** The run log is where an operator looks after an incident,
+  and for failures it said the model had not run. The runner now builds the
+  failure row from the configured kind, the model's own `started_at`/
+  `completed_at` and `duration_seconds`, and the counters the stage reached
+  before it raised, carried across the error boundary as
+  `RunError.progress` the way `RunError.metrics` already carried timings.
+  The search publish reports pages written and rows inserted/updated.
+- **`run_results.json` rows gain `started_at` and `completed_at`**, the
+  model's own span, and the run log's `started_at`/`completed_at` columns
+  now carry it too; a `skipped` row, which the runner never started, keeps
+  the invocation's.
+- **`manifest.json` named every search model `kind: unknown`**: the
+  manifest derived kind from a hand-kept if-chain with no `search` branch.
+  It now uses the same `kind_label()` run results and `stel ls` do.
+
 ## v0.20.0 - 2026-10-02
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)

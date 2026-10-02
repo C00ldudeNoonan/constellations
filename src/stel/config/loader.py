@@ -17,9 +17,10 @@ from .identifiers import (
     LEGACY_PROJECT_FILENAME,
     PROJECT_FILENAME,
 )
-from .model import ModelConfig, ModelKind, protect_model_llm_credential_option
+from .model import FieldConfig, ModelConfig, ModelKind, protect_model_llm_credential_option
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
+from .vocabulary import VALUES_FROM_PATTERN, Vocabulary
 from .yaml_diagnostics import (
     ConfigPath,
     YamlDocument,
@@ -516,8 +517,63 @@ def load_project(
     # the concrete variants, which is correct when transform.path itself
     # contains a ${matrix.KEY} placeholder.
     _populate_sql_depends_on(models, project_dir)
+    _resolve_declared_vocabularies(project, models)
 
     return project, sources, models
+
+
+def _resolve_declared_vocabularies(project: ProjectConfig, models: list[ModelConfig]) -> None:
+    """Replace every `values_from: vocab.<name>` with its vocabulary's labels.
+
+    Runs here, before `load_project` returns, so every caller — the compiler's
+    preflight, `stel run`, docs, manifest, dbt export — sees an ordinary
+    resolved `values:` list and needs no awareness of vocabularies at all
+    (issue #625). An unknown vocabulary name fails here: before source
+    discovery, credentials, or any provider call, which matches every other
+    structural check in this function.
+    """
+    for model in models:
+        if any(field.values_from for field in model.fields):
+            model.fields = [
+                _resolve_field_values_from(project, model, field)
+                for field in model.fields
+            ]
+
+
+def _resolve_field_values_from(
+    project: ProjectConfig, model: ModelConfig, field: FieldConfig
+) -> FieldConfig:
+    if field.values_from is None:
+        return field
+    vocabulary = _lookup_vocabulary(project, model.name, field.name, field.values_from)
+    return field.model_copy(
+        update={
+            "values": vocabulary.labels(),
+            "values_from": None,
+            "value_descriptions": vocabulary.descriptions(),
+        }
+    )
+
+
+def _lookup_vocabulary(
+    project: ProjectConfig, model_name: str, field_name: str, values_from: str
+) -> Vocabulary:
+    # FieldConfig's own validator already rejected a `values_from` that does
+    # not look like 'vocab.<name>', so the match here cannot fail.
+    match = VALUES_FROM_PATTERN.match(values_from)
+    assert match is not None
+    vocab_name = match.group(1)
+    vocabulary = project.vocabularies.get(vocab_name)
+    if vocabulary is None:
+        raise ConfigError(
+            project.format_yaml_diagnostic(
+                f"Model '{model_name}' field '{field_name}' declares "
+                f"`values_from: vocab.{vocab_name}`, which is not declared under "
+                f"`vocabularies:` in {PROJECT_FILENAME}. Available: "
+                f"{sorted(project.vocabularies) or '(none declared)'}"
+            )
+        )
+    return vocabulary
 
 
 def _populate_sql_depends_on(

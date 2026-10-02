@@ -54,8 +54,17 @@ STATUS_UNPUBLISHED = "unpublished"
 # pipeline that has been broken for days is visible in `stel serving status`
 # rather than hidden behind a working endpoint.
 STATUS_DEGRADED = "degraded"
-# Each status still requires an active generation. Publishing qualifies only
-# for private builds: an in-place claim clears that pointer atomically.
+# An in-place publisher holds the scope: it is writing into the collection the
+# activation pointer names, so no reader may be admitted until it finishes
+# (ADR-0003). Distinct from `publishing`, which is a private-generation build
+# that readers of the live generation may run alongside. The pointer itself
+# survives an in-place claim when the store promises an interrupted write
+# leaves the collection sound (`INTERRUPTION_SAFE_MUTATION`, issue #617), so
+# recovery after a crash can serve on; recording the exclusion in the status
+# rather than by clearing the pointer is what lets both facts fit one row.
+STATUS_PUBLISHING_IN_PLACE = "publishing_in_place"
+# Each status still requires an active generation. `publishing` qualifies
+# because it is the private-build claim; an in-place claim is never servable.
 SERVABLE_STATUSES = (STATUS_READY, STATUS_DEGRADED, STATUS_PUBLISHING)
 
 RECOVERY_ERROR_CODE = "administrative_recovery"
@@ -483,6 +492,7 @@ class ServingCoordinator:
         expected_code_version: str,
         config_fingerprint: str,
         preserves_active_generation: bool = False,
+        excludes_readers: bool | None = None,
         expected_fencing_token: int | None = None,
     ) -> PublishLease:
         """Claim exclusive publication authority with a fresh fencing token.
@@ -491,24 +501,37 @@ class ServingCoordinator:
         owns the scope. In-place writes also require no query leases. IDs are
         random, so a successful claim is proven by reading back our own ID.
 
-        `preserves_active_generation` says whether this publish writes
-        somewhere nothing is reading (a private generation build) or into the
-        collection the activation pointer names (an in-place publish). An
-        in-place claim clears `active_generation` immediately, which is what
-        lets `recover()` tell the two apart after a crash: a publisher that
-        died leaves no record of its intent, so the claim has to leave one.
-        With the pointer cleared, a crashed in-place publish recovers to
-        `failed` and serves nothing, rather than serving a collection it may
-        have half-rewritten (issue #449 review).
+        Two facts about the publish are recorded on the row, because a
+        publisher that dies leaves no other record of its intent and
+        `recover()` cannot ask it.
 
-        Private builds admit readers of the untouched generation, including
-        leases acquired before this claim. Its configuration stays in the
-        ledger until activation; the lease carries the pending configuration.
+        `preserves_active_generation` says whether the generation serving
+        queries before this claim is still sound if this publisher stops at
+        any point. True for a private generation build, which writes where
+        nothing is reading, and for an in-place publish on a store that
+        promises an interrupted write leaves its collection whole
+        (`INTERRUPTION_SAFE_MUTATION`, issue #617). False clears
+        `active_generation` immediately, so a crash recovers to `failed` and
+        serves nothing rather than serving a collection the dead publisher
+        may have half-rewritten (issue #449 review).
+
+        `excludes_readers` says whether readers are refused for the claim's
+        duration, and the claim refused while any are pinned: true for every
+        in-place publish, which mutates the collection readers would resolve
+        to (ADR-0003); false for a private build, whose readers keep the
+        untouched generation, including leases acquired before this claim. It
+        defaults to the complement of `preserves_active_generation`, which is
+        the coupling every caller had before #617; an in-place publish on an
+        interruption-safe store is the one combination that has to say both.
+        A private build's configuration stays in the ledger until activation;
+        the lease carries the pending configuration.
 
         The default is the fail-closed one. A caller that says nothing gets
-        in-place semantics, so forgetting this argument gives up availability
-        rather than serving something corrupt.
+        in-place semantics on an untrusted store, so forgetting these
+        arguments gives up availability rather than serving something corrupt.
         """
+        if excludes_readers is None:
+            excludes_readers = not preserves_active_generation
         self._ensure_row(scope)
         publication_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
@@ -517,13 +540,14 @@ class ServingCoordinator:
             "" if preserves_active_generation else ", active_generation = NULL"
         )
         query_guard = (
-            "" if preserves_active_generation else f"""
+            f"""
                 AND NOT EXISTS (
                     SELECT 1 FROM {leases}
                     WHERE model_name = ? AND stage = ? AND target_identity = ?
                 )"""
+            if excludes_readers else ""
         )
-        query_params = [] if preserves_active_generation else self._scope_params(scope)
+        query_params = self._scope_params(scope) if excludes_readers else []
         planning_guard = "" if expected_fencing_token is None else "AND fencing_token = ?"
         planning_params = [] if expected_fencing_token is None else [expected_fencing_token]
         fingerprint_assignment = (
@@ -549,7 +573,7 @@ class ServingCoordinator:
             """,
             [
                 publication_id,
-                STATUS_PUBLISHING,
+                STATUS_PUBLISHING_IN_PLACE if excludes_readers else STATUS_PUBLISHING,
                 expected_code_version,
                 config_fingerprint,
                 *self._scope_params(scope),
@@ -697,22 +721,28 @@ class ServingCoordinator:
         config_fingerprint: str | None = None,
     ) -> None:
         """Record a failed publication, retaining the previous generation when
-        the failure cannot have touched it.
+        the failure cannot have left it unsound.
 
         Both pointers carry the same asymmetry, for the same reason (issues
-        #355, #449). An in-place publish writes into the collection the
-        pointer names, so a failure there may have corrupted what was live:
-        both pointers must go, and the scope becomes unavailable to queries —
-        the default. A private generation build writes where nothing is
+        #355, #449). A private generation build writes where nothing is
         reading, so a failure leaves the previously-active generation
-        untouched and still correct; that path passes both existing pointers
-        back, and the scope stays servable as `degraded`.
+        untouched and still correct. An in-place publish writes into the
+        collection the pointer names; on a store that promises an interrupted
+        write leaves every row whole and the collection readable
+        (`INTERRUPTION_SAFE_MUTATION`, issue #617), the generation is still
+        sound, only staler than the publish meant it to be, and the publication
+        state already says which rows. Both of those paths pass both existing
+        pointers back, and the scope stays servable as `degraded`. On any other
+        store an in-place failure may have corrupted what was live: both
+        pointers must go, and the scope becomes unavailable to queries — the
+        default.
 
-        Clearing them on a rebuild would drop a healthy generation out of
-        resolution and force a full re-embed — the cost #355 exists to avoid —
-        and, because queries admit only on a named generation, would also take
-        a working index offline until the next successful publish, which on a
-        large corpus is hours away (#449).
+        Clearing them when the generation is sound would drop a healthy
+        generation out of resolution and force a full re-embed — the cost #355
+        exists to avoid — and, because queries admit only on a named
+        generation, would also take a working index offline until the next
+        successful publish, which on a large corpus is hours away (#449) and,
+        when no publish can currently finish, indefinitely (#617).
 
         Retaining a generation requires `config_fingerprint` — the one that
         generation was published under. The claim overwrote the ledger's with
@@ -782,7 +812,10 @@ class ServingCoordinator:
             raise ServingNotReadyError(
                 "This search index has not been published; run `stel run`"
             )
-        if row[2] is not None and row[5] is None:
+        # A publisher holds the scope and readers may not join it: an in-place
+        # publish by its status, whichever store it runs on (issue #617), or a
+        # first publish with no generation to serve yet.
+        if row[2] is not None and (row[1] == STATUS_PUBLISHING_IN_PLACE or row[5] is None):
             raise ServingBusyError(
                 "A publisher is reconciling this search index; retry after it completes"
             )
@@ -897,7 +930,11 @@ class ServingCoordinator:
         The scope is left `degraded` rather than `failed` when a previously
         active generation survives, so queries keep being served from it while
         the recorded failure stays visible (issue #449). Only a scope with no
-        servable generation is left `failed`.
+        servable generation is left `failed`: one whose claim cleared the
+        pointer because the store could not promise an interrupted in-place
+        write leaves the collection sound, or one that never had a generation.
+        A crashed in-place publish on an interruption-safe store kept its
+        pointer at claim time and serves on from here (issue #617).
         """
         if not owner_terminated:
             raise ServingCoordinationError(
@@ -944,7 +981,7 @@ class ServingCoordinator:
             active_collection = None if pointer[0][1] is None else str(pointer[0][1])
             config_fingerprint: str | None = str(pointer[0][2])
         else:
-            # No servable generation survives -- an in-place publish's failure
+            # No servable generation survives -- a fail-closed in-place claim
             # already cleared it, or the scope never had one. Fall back to any
             # surviving collection pointer so a republish and the retirement
             # sweep still know what is out there.

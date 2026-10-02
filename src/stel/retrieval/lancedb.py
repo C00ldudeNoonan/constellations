@@ -484,6 +484,16 @@ class LanceDBStore(RetrievalStore):
                     # ahead of the store, which is what the publish loop
                     # gates state on.
                     RetrievalFeature.EXACT_MUTATION_RECEIPTS,
+                    # Each `merge_insert` slice, `add`, `delete` and
+                    # `create_index` is one Lance transaction committing a new
+                    # table version over the previous, immutable one, and
+                    # nothing in this module compacts or cleans up old
+                    # versions while publishing. A write interrupted anywhere
+                    # -- including the index build -- leaves the prior version
+                    # readable and every row whole; the worst case is rows
+                    # the next incremental run republishes, which the
+                    # receipt-gated state already describes (issue #617).
+                    RetrievalFeature.INTERRUPTION_SAFE_MUTATION,
                     # DataFusion's `array_has_any` expresses set overlap
                     # against a list column (issue #397).
                     RetrievalFeature.ARRAY_CONTAINMENT_FILTERS,
@@ -958,6 +968,23 @@ class LanceDBStore(RetrievalStore):
                 log.debug("LanceDB index build retry cause", exc_info=error)
             _sleep(delay)
             delay *= 2
+
+    def count_present(
+        self, collection: str, record_ids: Sequence[str], *, id_field: str
+    ) -> int:
+        if not record_ids:
+            return 0
+        failure: RetrievalError | None = None
+        try:
+            table = self._open_owned_table(collection)
+            # The same predicate `upsert` acknowledges its writes with, over
+            # the BTree the merge key carries (issue #475).
+            return int(table.count_rows(_id_filter(id_field, record_ids)))
+        except RetrievalError:
+            raise
+        except Exception as error:
+            failure = _operation_failed("count", "lancedb_count_failed", error)
+        raise failure
 
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
         failure: RetrievalError | None = None

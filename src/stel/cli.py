@@ -2604,6 +2604,7 @@ def _echo_serving_context(report: Any) -> None:
 @click.pass_context
 def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
+    from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
     from .retrieval import ServingCoordinationError
 
@@ -2631,6 +2632,8 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"fencing_token:     {entry.fencing_token}")
     click.echo(f"active_generation: {entry.active_generation or '-'}")
     click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
+    # What the two lines above mean for a reader, in words (issue #617).
+    click.echo(f"serving:           {_describe_serving(entry)}")
     click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
     click.echo(f"query_leases:      {entry.query_leases}")
     click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")
@@ -2660,8 +2663,10 @@ def serving_recover(
 
     There is no timeout-based lease stealing: recovery advances the fencing
     token so any surviving process fails its next verification, clears all
-    leases, and leaves the scope failed until the next successful publish.
+    leases, and leaves the scope degraded (still serving the generation that
+    was live) or failed (serving nothing) until the next successful publish.
     """
+    from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_recover as _serving_recover
     from .retrieval import ServingCoordinationError
 
@@ -2691,6 +2696,81 @@ def serving_recover(
         f"fencing_token={report.entry.fencing_token}. "
         "Re-run `stel run` to publish."
     )
+    click.echo(f"serving:           {_describe_serving(report.entry)}")
+
+
+@serving.command("activate")
+@click.argument("model_name")
+@click.option(
+    "--generation",
+    "generation",
+    required=True,
+    help=(
+        "The physical collection to serve, as `stel serving status` and the "
+        "store name it (for example `...__g12fbc89e3823`, or the unsuffixed "
+        "default collection)."
+    ),
+)
+@click.option(
+    "--rows-verified",
+    is_flag=True,
+    help=(
+        "Confirm the collection's rows are the current corpus, so its "
+        "publication state may be re-stamped at the current code version. "
+        "Activation is refused without this confirmation."
+    ),
+)
+@_project_context_options
+@click.pass_context
+def serving_activate(
+    ctx: click.Context, model_name: str, generation: str, rows_verified: bool
+) -> None:
+    """Serve a physically complete generation without re-reading the corpus.
+
+    A private generation holding every row, left behind by a publish that
+    could not finish, is activated from the publication state stel recorded
+    for it (issue #615): the collection must exist, match this model's
+    configuration, hold as many rows as the upstream, and hold the rows its
+    state names; its indices are built if missing; then it becomes the served
+    generation. Nothing is read from the upstream but its schema and row count.
+
+    Requires --target, and --rows-verified to accept the one claim this cannot
+    check: that the rows are what the current code would publish, which is
+    true after a release that changed only what the code_version hash reads.
+    """
+    from .cli_services.serving import describe_serving as _describe_serving
+    from .cli_services.serving import serving_activate as _serving_activate
+    from .execution.contracts import RunError
+    from .retrieval import ServingCoordinationError
+
+    try:
+        outcome = _serving_activate(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+            generation=generation,
+            rows_verified=rows_verified,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, ServingCoordinationError, RunError) as e:
+        raise click.ClickException(str(e)) from e
+    _echo_serving_context(outcome.report)
+    activation = outcome.activation
+    click.echo(
+        f"Activated '{activation.physical_collection}' for '{model_name}' on "
+        f"target '{outcome.report.target}': {activation.rows} row(s), "
+        f"fencing_token={activation.fencing_token}, "
+        f"code_version={activation.code_version}."
+    )
+    click.echo(
+        "state:             "
+        f"{activation.state_rows_from_generation} row(s) from the generation's own "
+        f"publication, {activation.state_rows_from_serving} filled from the "
+        "serving scope"
+    )
+    click.echo(f"serving:           {_describe_serving(outcome.report.entry)}")
 
 
 @serving.command("migrate-scope")

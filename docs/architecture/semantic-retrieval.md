@@ -1007,6 +1007,10 @@ class RetrievalFeature(StrEnum):
     DURABLE_WRITE_ACK = "durable_write_ack"
     EXACT_MUTATION_RECEIPTS = "exact_mutation_receipts"
     ATOMIC_BATCH_MUTATION = "atomic_batch_mutation"
+    # An interrupted in-place write leaves the collection readable and every
+    # row whole, so the serving ledger keeps serving a generation a failed or
+    # killed in-place publish was writing into (issue #617, ADR-0016).
+    INTERRUPTION_SAFE_MUTATION = "interruption_safe_mutation"
 
 
 class RetrievalCapabilities(BaseModel):

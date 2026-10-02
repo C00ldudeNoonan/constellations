@@ -1,6 +1,11 @@
 # ADR-0003: Reader-safe online publication uses independent generations
 
 - **Status:** accepted
+- **Amended by:** [ADR-0004](0004-seed-private-generation-from-store.md);
+  [ADR-0016](0016-an-interrupted-in-place-write-keeps-its-generation-when-the-store-says-so.md)
+  — "a failed in-place write cannot safely" retain the old generation holds
+  only for a store without `INTERRUPTION_SAFE_MUTATION`. In-place exclusivity
+  is unchanged.
 - **Date:** 2026-09-03
 - **Prompted by:** #473
 

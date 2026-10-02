@@ -121,6 +121,21 @@ class RetrievalFeature(StrEnum):
     # that cannot keeps the warehouse path, which is always correct, only
     # slower.
     COLLECTION_SEEDING = "collection_seeding"
+    # An in-place mutation that stops at any point -- an error, or the process
+    # dying mid-write or mid-index-build -- leaves the collection readable,
+    # with every row either wholly as it was or wholly as the write intended
+    # (issue #617). Weaker than ATOMIC_BATCH_MUTATION, which promises the whole
+    # batch lands or none of it; this promises only that no row is ever torn
+    # and that readers can still open the collection. That is the property the
+    # serving ledger needs to keep serving a generation an in-place publish was
+    # writing into when the publish failed: without it, a failed in-place
+    # publish has to be assumed to have corrupted what was live, and the
+    # ledger fails closed (ADR-0001). A store earns this by committing each
+    # write as one transaction over an immutable prior version, and by never
+    # discarding a prior version while publishing. A store that overwrites in
+    # place, or whose index build rewrites the data it indexes, must not
+    # declare it.
+    INTERRUPTION_SAFE_MUTATION = "interruption_safe_mutation"
 
 
 PUBLISHER_FENCING_FEATURES = frozenset(
@@ -688,6 +703,18 @@ class RetrievalStore(ABC):
         id_field: str,
         mutation_digest: str,
     ) -> MutationReceipt: ...
+
+    @abstractmethod
+    def count_present(
+        self, collection: str, record_ids: Sequence[str], *, id_field: str
+    ) -> int:
+        """How many of `record_ids` the collection holds a row for.
+
+        A membership probe for activating a generation from its publication
+        state (issue #615): state that vouches for a row the store does not
+        hold would make reconciliation skip that row forever, so before the
+        state is trusted a sample of its keys is checked here. Bounded by the
+        caller's sample size, never by the collection."""
 
     @abstractmethod
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata: ...

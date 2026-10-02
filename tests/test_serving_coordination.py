@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -1510,9 +1512,10 @@ def test_a_ledger_predating_generations_gains_the_activation_column(
 
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
 
-        assert "active_collection" in (
-            adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
-        )
+        columns = adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
+        assert "active_collection" in columns
+        # And the publisher identity columns (issue #621), added the same way.
+        assert {"publisher_host", "publisher_pid", "publisher_heartbeat_epoch"} <= columns
         # And the upgraded ledger is usable end to end.
         scope = _scope()
         lease = coordinator.acquire_publish(
@@ -1525,6 +1528,192 @@ def test_a_ledger_predating_generations_gains_the_activation_column(
             counts=(1, 0, 0, 0),
         )
         assert coordinator.status(scope).active_collection is None
+
+
+# ─── who holds the claim (issue #621) ───────────────────────────────────────
+
+
+def test_a_claim_records_who_holds_it_and_finishing_clears_it(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row used to say `active` and nothing else about a holder. Now it
+    names the process, with the operator's label, and the claim itself is the
+    first heartbeat. A finished publish clears all of it: there is no holder."""
+    import os
+    import socket
+
+    from stel.retrieval.publisher_identity import PUBLISHER_LABEL_ENV
+
+    monkeypatch.setenv(PUBLISHER_LABEL_ENV, "dagster-run-7f3a")
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    held = coordinator.status(scope)
+    assert held.publisher is not None
+    assert held.publisher.host == socket.gethostname()
+    assert held.publisher.pid == os.getpid()
+    assert held.publisher.label == "dagster-run-7f3a"
+    assert held.publisher_heartbeat_epoch is not None
+
+    coordinator.mark_ready(
+        lease, active_generation="gen1", config_fingerprint="cfg1", counts=(1, 0, 0, 0)
+    )
+    finished = coordinator.status(scope)
+    assert finished.publisher is None
+    assert finished.publisher_heartbeat_epoch is None
+
+
+def test_a_heartbeat_advances_the_row_and_is_fenced(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One per page, so the age on `serving status` means something; and a
+    conditional write on the claim, so a fenced-out publisher learns here
+    that authority moved, as it would from `verify_publish`."""
+    from stel.retrieval import coordination
+
+    clock = iter([1_000, 1_600, 2_200])
+    monkeypatch.setattr(coordination.time, "time", lambda: next(clock))
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    assert coordinator.status(scope).publisher_heartbeat_epoch == 1_000
+    coordinator.heartbeat(lease)
+    assert coordinator.status(scope).publisher_heartbeat_epoch == 1_600
+
+    coordinator.recover(scope, owner_terminated=True)
+    with pytest.raises(StaleServingLeaseError):
+        coordinator.heartbeat(lease)
+
+
+def test_recover_without_confirmation_names_the_live_owner(coordinator: Any) -> None:
+    """The refusal is the informed one the issue asks for: it says which
+    process holds the claim and how long since it was heard from, so the
+    five-step hunt starts from the ledger instead of from nothing. The owner
+    here is this test process, which is alive, so recovery is refused."""
+    import os
+    import socket
+
+    scope = _scope()
+    coordinator.acquire_publish(scope, expected_code_version="v1", config_fingerprint="cfg1")
+    with pytest.raises(ServingCoordinationError) as refusal:
+        coordinator.recover(scope, owner_terminated=False)
+    message = str(refusal.value)
+    assert "terminating the previous owner" in message
+    assert f"host={socket.gethostname()} pid={os.getpid()}" in message
+    assert "last heartbeat" in message
+    assert coordinator.status(scope).publication_id is not None
+
+
+def test_recover_without_confirmation_refuses_an_owner_on_another_host(
+    coordinator: Any,
+) -> None:
+    """A container's hostname is not the host's, so a build inside one is
+    unknown from outside even on the same kernel; unknown keeps the
+    confirmation required."""
+    from stel.retrieval.publisher_identity import PublisherIdentity
+
+    scope = _scope()
+    coordinator.acquire_publish(
+        scope,
+        expected_code_version="v1",
+        config_fingerprint="cfg1",
+        publisher=PublisherIdentity(host="dagster_user_code", pid=1, started_epoch=5, label=None),
+    )
+    with pytest.raises(ServingCoordinationError, match="host=dagster_user_code pid=1"):
+        coordinator.recover(scope, owner_terminated=False)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="liveness needs /proc")
+def test_recover_proceeds_without_confirmation_when_the_local_owner_is_provably_dead(
+    coordinator: Any,
+) -> None:
+    """The one provable case, and the common one: an orchestrator-launched
+    build on this host whose process is gone. No PID with that start time
+    exists, so recovery needs no operator assertion -- and still advances the
+    fence and leaves the row degraded or failed exactly as a confirmed one."""
+    import socket
+    import subprocess
+
+    from stel.retrieval.publisher_identity import PublisherIdentity, process_started_epoch
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    scope = _scope()
+    coordinator.acquire_publish(
+        scope,
+        expected_code_version="v1",
+        config_fingerprint="cfg1",
+        publisher=PublisherIdentity(
+            host=socket.gethostname(),
+            pid=child.pid,
+            started_epoch=process_started_epoch(os.getpid()),
+            label="crashed-build",
+        ),
+    )
+    before = coordinator.status(scope).fencing_token
+
+    entry = coordinator.recover(scope, owner_terminated=False)
+
+    assert entry.publication_id is None
+    assert entry.fencing_token == before + 1
+    assert entry.status == STATUS_FAILED
+    assert entry.publisher is None
+
+
+def test_a_publish_beats_once_per_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The page loop is where the heartbeat lives; a read-only page beats too.
+    Pinned through a real publish, because a heartbeat nobody calls is a
+    column that is always NULL and a status line that always says so."""
+    from stel.runner import run_project
+
+    beats: list[int] = []
+    original = ServingCoordinator.heartbeat
+
+    def spy(self: Any, lease: Any) -> None:
+        beats.append(lease.fencing_token)
+        original(self, lease)
+
+    monkeypatch.setattr(ServingCoordinator, "heartbeat", spy)
+    project = _write_project(tmp_path)
+    run_project(project)
+    assert len(beats) >= 1
+    assert _ledger_status(project).publisher is None
+
+
+def test_serving_status_names_the_publisher_that_holds_the_claim(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+    from stel.config import load_project
+    from stel.profile import resolve_profile
+    from stel.retrieval.publisher_identity import PublisherIdentity
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project)
+    project_config, _sources, _models = load_project(project)
+    resolved = resolve_profile(project_config, project)
+    with create_adapter(resolved.warehouse, project_dir=project) as adapter:
+        ServingCoordinator(adapter, ensure_schema=True).acquire_publish(
+            _serving_scope(project),
+            expected_code_version="crashed",
+            config_fingerprint="crashed",
+            preserves_active_generation=True,
+            excludes_readers=True,
+            publisher=PublisherIdentity(
+                host="dagster_user_code", pid=4242, started_epoch=1_700_000_000, label="run-7f3a"
+            ),
+        )
+
+    result = CliRunner().invoke(
+        cli, ["serving", "status", "release_search", "--project-dir", str(project)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "publisher:         active: host=dagster_user_code pid=4242" in result.output
+    assert "label=run-7f3a" in result.output
+    assert "last heartbeat " in result.output
 
 
 def test_mark_ready_records_the_activation_pointer(coordinator: Any) -> None:

@@ -3343,6 +3343,28 @@ stel serving status chunk_search     # ledger status, fence, counts, leases
 stel serving recover chunk_search --target prod --owner-terminated
 ```
 
+The claim records who holds it (issue #621): the publisher's host, PID,
+process start time and a label, plus a heartbeat the page loop touches once a
+page. `status` prints them as the `publisher:` line:
+
+```
+publisher:         active: host=dagster_user_code pid=4242, started=2026-10-01T16:02:11Z, label=run-7f3a, last heartbeat 40m00s ago (2026-10-01T16:46:03Z)
+```
+
+Set `STEL_PUBLISHER_LABEL` in the publisher's environment to tag the claim --
+an orchestrator's run id is the intended value. It is written to the ledger
+and printed here, so it is a name, never a secret. A silent heartbeat is not
+proof of death: the index build after the last page is one long call with no
+page to beat on, so `recover` displays the age and never acts on it.
+
+`recover` proceeds without `--owner-terminated` in one case only: the row
+names a publisher on *this* host, and no process with that PID and start time
+exists, which is provable (Linux, via `/proc`). Every other case is refused,
+and the refusal says what the ledger knows about the owner -- host, PID,
+label, last heartbeat -- so the confirmation is informed. A build inside a
+container records the container's hostname, so from the host it reads as
+unknown and the confirmation stays required (ADR-0019).
+
 **Both commands name what they resolved**, because the ledger alone does not
 identify it:
 

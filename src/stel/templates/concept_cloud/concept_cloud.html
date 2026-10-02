@@ -72,6 +72,28 @@
     .spark i { flex: 1 1 0; min-width: 2px; background: var(--accent);
       opacity: .62; border-radius: 1px 1px 0 0; transition: opacity .15s; }
     .spark i.now { opacity: 1; }
+    /* "What changed" between two periods (#555 item 6). */
+    /* No `display: none` here: the element's own inline `style` attribute
+       carries the initial hidden state, same as #period-ctl and the other
+       filter controls, because the toggle handler clears that inline
+       attribute to reveal it -- a stylesheet rule at the same specificity
+       would survive that and keep it hidden. */
+    #diffpanel { position: fixed; top: 56px; right: 16px; z-index: 10;
+      max-width: 270px; max-height: 68vh; overflow-y: auto;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 12px 14px; backdrop-filter: blur(12px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .35); }
+    #diffpanel h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--muted); margin: 12px 0 6px; }
+    #diffpanel h3:first-child { margin-top: 0; }
+    #diffpanel .row { display: flex; justify-content: space-between; gap: 10px;
+      padding: 3px 0; cursor: pointer; font-size: 13px; }
+    #diffpanel .row:hover { color: var(--accent); }
+    #diffpanel .row .d { color: var(--muted); font-variant-numeric: tabular-nums;
+      flex: none; }
+    #diffpanel .empty { color: var(--muted); font-size: 12px; }
+    #diff-periods select { background: rgba(5, 8, 16, .6); border: 1px solid var(--line);
+      color: var(--fg); border-radius: 6px; padding: 3px 6px; margin-left: 4px; }
     footer { position: fixed; bottom: 10px; right: 14px; z-index: 10;
       color: var(--muted); font-size: 11px; letter-spacing: .04em; }
     a { color: var(--accent); }
@@ -102,9 +124,17 @@
         Period: <span class="val" id="period-val">all</span>
         <input type="range" id="period" min="0" max="0" value="0">
       </label>
+      <label class="ctl" id="diff-ctl" style="display:none">
+        <input type="checkbox" id="diff-toggle"> Compare periods
+      </label>
+      <div id="diff-periods" style="display:none">
+        <label class="ctl">From<select id="diff-from"></select></label>
+        <label class="ctl">To<select id="diff-to"></select></label>
+      </div>
     </div>
   </aside>
   <aside id="detail"></aside>
+  <aside id="diffpanel" style="display:none"></aside>
   <div id="graph"></div>
   <footer>drag to orbit · scroll to zoom · click a star · lineage mode traces beams</footer>
 
@@ -307,11 +337,82 @@
           if (selected) showDetail(nodeById.get(selected));
         });
       }
+      buildDiffPanel();
+    }
+
+    // "What changed" between two periods (#555 item 6): a ranked list beside
+    // the map, entirely from `by_period` counts the bundle already carries --
+    // no export or schema change. Independent of the period slider above:
+    // that one picks a single moment to look at; this picks two, to ask what
+    // moved between them, and works even before the 3d-force-graph library
+    // loads (or if it never does), since it only reads `DATA.concepts`.
+    function buildDiffPanel() {
+      if (PERIODS.length < 2) return;
+      const ctl = document.getElementById("diff-ctl");
+      const toggle = document.getElementById("diff-toggle");
+      const periodsBox = document.getElementById("diff-periods");
+      const fromSelect = document.getElementById("diff-from");
+      const toSelect = document.getElementById("diff-to");
+      const panel = document.getElementById("diffpanel");
+      ctl.style.display = "";
+      PERIODS.forEach(p => {
+        fromSelect.appendChild(new Option(p, p));
+        toSelect.appendChild(new Option(p, p));
+      });
+      // Defaults to the two most recent periods: "what just changed" is the
+      // question this exists to answer first.
+      fromSelect.value = PERIODS[PERIODS.length - 2];
+      toSelect.value = PERIODS[PERIODS.length - 1];
+      toggle.addEventListener("change", () => {
+        const on = toggle.checked;
+        periodsBox.style.display = on ? "" : "none";
+        panel.style.display = on ? "" : "none";
+        if (on) renderDiff();
+      });
+      [fromSelect, toSelect].forEach(select =>
+        select.addEventListener("change", renderDiff));
+
+      function renderDiff() {
+        const from = fromSelect.value, to = toSelect.value;
+        // Three buckets, all from the same pair of counts: absent-then-present,
+        // present-then-absent, and present-in-both-but-different. A concept
+        // missing from `by_period` entirely reads as 0, same rule the
+        // sparkline and the period filter already use.
+        const entered = [], left = [], moved = [];
+        DATA.concepts.forEach(c => {
+          const a = (c.by_period || {})[from] || 0;
+          const b = (c.by_period || {})[to] || 0;
+          if (a === 0 && b > 0) entered.push({ c, delta: b });
+          else if (a > 0 && b === 0) left.push({ c, delta: a });
+          else if (a > 0 && b > 0 && a !== b) moved.push({ c, delta: b - a });
+        });
+        entered.sort((x, y) => y.delta - x.delta);
+        left.sort((x, y) => y.delta - x.delta);
+        moved.sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
+        const TOP_N = 10;
+        const section = (title, rows, fmt) => rows.length === 0 ? "" :
+          `<h3>${title}</h3>` + rows.slice(0, TOP_N).map(({ c, delta }) =>
+            `<div class="row" data-id="${esc(c.canonical_id)}">` +
+            `<span>${esc(c.display)}</span><span class="d">${fmt(delta)}</span></div>`
+          ).join("");
+        const html =
+          section(`Entered · ${esc(to)}`, entered, d => `+${d}`) +
+          section(`Left since · ${esc(from)}`, left, d => `−${d}`) +
+          section("Biggest moves", moved, d => (d > 0 ? "+" : "−") + Math.abs(d));
+        panel.innerHTML = html ||
+          `<span class="empty">No change between ${esc(from)} and ${esc(to)}.</span>`;
+        panel.querySelectorAll(".row").forEach(row =>
+          row.addEventListener("click", () => selectConceptById(row.dataset.id)));
+      }
     }
 
     // Set once buildGraph runs; refreshes both the library-driven accessors
     // and the sprite tints the library does not know about.
     let fullRefresh = () => {};
+    // Set once buildGraph runs. A no-op until then, which is what a diff-panel
+    // click or a search hit does before the library loads: nothing, rather
+    // than throwing -- the library-independent UI renders first on purpose.
+    let selectConceptById = () => {};
 
     // Concept names and descriptions are warehouse text an operator wrote, and
     // both the panel and the library's tooltip render as HTML. Escape at the
@@ -728,6 +829,17 @@
         }
       };
 
+      // Shared by the search box and the diff panel: select a concept by id,
+      // show its card, and fly the camera to it when it has a position.
+      selectConceptById = id => {
+        const node = nodeById.get(id);
+        if (!node) return;
+        selected = node.id; recomputeTouching(); showDetail(node);
+        const x = node.fx ?? node.x, y = node.fy ?? node.y, z = node.fz ?? node.z;
+        if (x !== undefined) Graph.cameraPosition({ x, y: y + 30, z: z + 80 }, node, 600);
+        fullRefresh();
+      };
+
       // 3d-force-graph sizes its canvas from the container once at init; if the
       // container hasn't laid out yet the canvas is 0×0 and nothing draws. Pin it
       // to the viewport and keep it in sync on resize.
@@ -764,13 +876,7 @@
         if (!q) { selected = null; recomputeTouching(); showDetail(null); fullRefresh(); return; }
         const hit = nodes.find(n => n.kind === "concept" &&
           (n.name.toLowerCase().includes(q) || n.id.toLowerCase().includes(q)));
-        if (hit) {
-          selected = hit.id; recomputeTouching(); showDetail(hit);
-          const x = hit.fx ?? hit.x, y = hit.fy ?? hit.y, z = hit.fz ?? hit.z;
-          if (x !== undefined)
-            Graph.cameraPosition({ x, y: y + 30, z: z + 80 }, hit, 600);
-          fullRefresh();
-        }
+        if (hit) selectConceptById(hit.id);
       });
     }
   </script>

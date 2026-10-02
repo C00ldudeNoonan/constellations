@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### `concept-cloud` shows what changed between two periods (issue #555)
+
+A single frozen view of a multi-year map answers "what is always here", not
+"what is new" — and for a risk-factor map built from 10-Ks, the arrival and
+departure of concepts across filing years is usually the actual finding
+(Ukraine and inflation entering in 2022, COVID-19 fading by 2024). A
+**"Compare periods"** control, shown whenever a bundle carries two or more
+periods, picks any two and ranks what moved between them: concepts that
+entered, concepts that left, and the biggest movers by mention count.
+Clicking a row opens that concept's card and moves the camera to it, reusing
+the same selection path the search box already uses (now shared between the
+two rather than duplicated).
+
+Viewer-only: the ranking reads `by_period` counts the bundle has carried
+since the time axis shipped (#553), so there is no export or schema change.
+Independent of the existing period slider, which still picks one moment to
+look at rather than two to compare.
+
 ### A no-op incremental run skips the parent scan it already knows is pointless (issue #573)
 
 A nightly run whose source had not changed still cost 5m40s across 6 models,

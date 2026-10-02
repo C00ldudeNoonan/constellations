@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)
+
+- **A generation holding every row sat unserved for three weeks, with no
+  command able to activate it.** A 3,644,778-row private generation was in
+  the store, an index refresh away from serving; the ledger named nothing;
+  and the only path to activation was a publish that re-read all 146 pages
+  from BigQuery, which could not finish inside the six-hour read session
+  (#614). ADR-0005 had declined an activate command in favour of automatic
+  resume, on the grounds that resume activates only what validates. Resume
+  is right whenever it can finish; this is the case where it cannot.
+- `stel serving activate <model> --generation <collection> --rows-verified`
+  activates a physically complete generation from the publication state stel
+  recorded for its rows. It reads only the upstream's schema and row count.
+  Before claiming anything it refuses a collection that is missing, carries
+  another configuration's fingerprint, or does not hold exactly the upstream's
+  row count. Under its claim it assembles the generation's state (its own
+  scope's records, filled from the serving scope for keys it never recorded),
+  re-stamps every record at the current `code_version`, and refuses unless
+  that state describes the collection's row count exactly and a 1,000-key
+  sample of it is present in the collection. Then it builds missing indices,
+  swaps the state into the serving scope and activates. A late refusal is
+  recorded as a failed publish and leaves whatever was serving still served.
+- `--rows-verified` is the one assertion the command cannot check: that the
+  collection's rows are what the current code would publish, so re-stamping
+  their state as current is correct. True after a hash-only `code_version`
+  change such as #607's; the next incremental run reconciles against the
+  upstream regardless, so a wrong assertion costs one cycle of stale rows.
+- New store method `count_present(collection, record_ids, id_field)`, the
+  membership probe the sample check uses. LanceDB and DuckDB implement it.
+- ADR-0016 records the decision and amends ADR-0005.
+
 ### A failed in-place publish keeps serving the generation it was updating (issue #617)
 
 - **One failed incremental publish took a ready index offline for three

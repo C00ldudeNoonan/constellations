@@ -705,6 +705,18 @@ class RetrievalStore(ABC):
     ) -> MutationReceipt: ...
 
     @abstractmethod
+    def count_present(
+        self, collection: str, record_ids: Sequence[str], *, id_field: str
+    ) -> int:
+        """How many of `record_ids` the collection holds a row for.
+
+        A membership probe for activating a generation from its publication
+        state (issue #615): state that vouches for a row the store does not
+        hold would make reconciliation skip that row forever, so before the
+        state is trusted a sample of its keys is checked here. Bounded by the
+        caller's sample size, never by the collection."""
+
+    @abstractmethod
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata: ...
 
     @abstractmethod

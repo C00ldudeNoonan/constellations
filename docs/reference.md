@@ -3447,6 +3447,44 @@ refused while query leases are outstanding (let readers finish, or run
 `stel serving recover`), and refused if the destination scope already holds a
 published ledger row rather than picking a winner between two publications.
 
+#### Activating a complete generation without re-reading the corpus
+
+A publish that writes every row and then cannot finish — an index build that
+fails, a process killed before activation, a read session that ends before
+the last page (issue #614) — leaves a private generation in the store that
+holds the whole corpus and that nothing serves. The next `stel run` resumes
+it (ADR-0005), which is right whenever that run can finish; when the resume
+itself cannot finish, the generation stays unserved indefinitely (issue
+#615). `stel serving activate` is the operator's way out:
+
+```bash
+stel serving activate chunk_search --target prod \
+    --generation myproj__prod__chunk_search__g12fbc89e3823 --rows-verified
+```
+
+`--generation` names the physical collection, as `stel serving status` and
+the store list it. The command reads nothing from the upstream but its schema
+and row count. It refuses, before claiming anything, unless the collection
+exists, carries this model's configuration fingerprint, and holds exactly as
+many rows as the upstream relation. It then assembles the generation's
+publication state — its own scope's records, filled in from the serving
+scope's for keys it never recorded — re-stamps every record at the current
+`code_version`, and refuses, under its claim, unless that state describes
+exactly the collection's row count and a sample of its keys is present in the
+collection. Only then does it build any missing indices, swap the state into
+the serving scope and activate. A refusal after the claim is recorded as a
+failed publish and leaves whatever was serving still served.
+
+`--target` is required, as for `recover`. `--rows-verified` is the one claim
+the command cannot check and therefore will not make for you: that the rows in
+the collection are what the current code would publish, so re-stamping their
+state as current is correct. That is true after a release that changed only
+what the `code_version` hash reads (the upgrade note under #587 is one), and
+false after a change to how rows are embedded or chunked, where the next
+incremental run would otherwise have rewritten them. Whatever the state says,
+the next incremental run still reconciles against the upstream, so a wrong
+assertion costs one cycle of serving stale rows, not a permanent divergence.
+
 Governed indexes (`access: governed`) are supported on stores that declare
 strong read-after-write consistency and metadata filtering. Changed governed
 records are deleted before their replacement is upserted, so a failed policy

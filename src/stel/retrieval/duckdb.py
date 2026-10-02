@@ -896,6 +896,23 @@ class DuckDBStore(RetrievalStore):
         except Exception:
             raise RetrievalError(_failure(operation)) from None
 
+    def count_present(
+        self, collection: str, record_ids: Sequence[str], *, id_field: str
+    ) -> int:
+        if not record_ids:
+            return 0
+        conn = self._connection()
+        placeholders = ", ".join("?" for _ in record_ids)
+        try:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_identifier(collection)} "
+                f"WHERE {_quote_identifier(id_field)} IN ({placeholders})",
+                list(record_ids),
+            ).fetchone()
+        except Exception:
+            raise RetrievalError(_failure("count present")) from None
+        return int(row[0]) if row else 0
+
     def _execute(
         self,
         conn: Any,

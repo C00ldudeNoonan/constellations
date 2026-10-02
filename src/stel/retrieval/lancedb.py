@@ -969,6 +969,23 @@ class LanceDBStore(RetrievalStore):
             _sleep(delay)
             delay *= 2
 
+    def count_present(
+        self, collection: str, record_ids: Sequence[str], *, id_field: str
+    ) -> int:
+        if not record_ids:
+            return 0
+        failure: RetrievalError | None = None
+        try:
+            table = self._open_owned_table(collection)
+            # The same predicate `upsert` acknowledges its writes with, over
+            # the BTree the merge key carries (issue #475).
+            return int(table.count_rows(_id_filter(id_field, record_ids)))
+        except RetrievalError:
+            raise
+        except Exception as error:
+            failure = _operation_failed("count", "lancedb_count_failed", error)
+        raise failure
+
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata:
         failure: RetrievalError | None = None
         # Tracks which index was being built when a native error surfaced.

@@ -516,6 +516,30 @@ def _run_search_model(
                     )
                     _validate_collection_schema(existing.schema, spec)
 
+                # A resumed generation arrives carrying whatever indices its
+                # earlier attempt built, and then every page pays to maintain
+                # them. A fresh generation never does: `ensure_indexes` runs
+                # after this loop, so its pages merge into an unindexed table.
+                # Dropping here is how a resume gets that shape back --
+                # measured at 3.6-4.1x per-page growth with indices present
+                # against a flat 1.1x without, and 37% slower overall than
+                # dropping and rebuilding once (issue #616, ADR-0016).
+                #
+                # Skipped when there is nothing left to write: a complete
+                # resume goes straight to `ensure_indexes`, and dropping
+                # first would turn a metadata check into a full rebuild.
+                if resumed and not complete_resume:
+                    with timings.phase("index_reconcile"):
+                        dropped = store.drop_indexes(physical)
+                    if dropped:
+                        log.info(
+                            "%s: dropped %d index(es) from the resumed "
+                            "generation; they are rebuilt once after the "
+                            "last page rather than maintained by every one",
+                            model.name,
+                            dropped,
+                        )
+
                 batches: Iterator[pa.RecordBatch] = (
                     iter([]) if complete_resume else iter(snapshot)
                 )

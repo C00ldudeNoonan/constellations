@@ -25,6 +25,7 @@ history (issue #311).
 | [0013](0013-a-merge-page-is-bounded-by-bytes-in-the-store.md) | A merge page is bounded by bytes, in the store, before it is sent — `batch_size` keeps counting rows | accepted |
 | [0014](0014-a-debug-switch-owns-its-destination.md) | A debug switch owns its own destination, and marks the records it is for | accepted |
 | [0015](0015-a-sync-watermark-needs-two-independent-signals.md) | A sync watermark needs two independent signals — cheap state, and an authoritative content fingerprint — not one | accepted |
+| [0016](0016-a-resume-drops-its-indices-and-rebuilds-once.md) | A resumed generation drops its indices and rebuilds them once, as a fresh build already does | accepted |
 
 ## When to write one
 

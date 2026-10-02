@@ -651,6 +651,54 @@ class DuckDBStore(RetrievalStore):
             raise RetrievalError("DuckDB collection disappeared while indexing")
         return metadata
 
+    def drop_indexes(self, collection: str) -> int:
+        """Drop a private generation's indices before it is written (#616).
+
+        Both kinds are removed unconditionally and idempotently: `DROP INDEX
+        IF EXISTS` for the ANN structure, and `PRAGMA drop_fts_index` guarded
+        by the schema the extension creates, since the pragma has no
+        `IF EXISTS` of its own and raises on a table that was never indexed.
+
+        The count is "kinds removed", not individual structures -- DuckDB's
+        FTS index is a schema of several tables, and the number is for a log
+        line, not for arithmetic.
+        """
+        conn = self._connection()
+        dropped = 0
+        hnsw = _index_name(collection, "hnsw")
+        # Asked before dropping, because `DROP INDEX IF EXISTS` cannot report
+        # whether there was anything to drop and the count is used in a log
+        # line an operator reads.
+        if self._query(
+            conn,
+            "SELECT 1 FROM duckdb_indexes() WHERE index_name = ?",
+            parameters=[hnsw],
+            operation="drop indexes",
+        ):
+            self._execute(
+                conn,
+                f"DROP INDEX IF EXISTS {_quote_identifier(hnsw)}",
+                operation="drop indexes",
+            )
+            dropped += 1
+        # `fts_main_<table>` is where the extension puts its structures, so
+        # its presence is the only portable way to ask whether the pragma has
+        # anything to drop -- it has no `IF EXISTS` and raises on a table that
+        # was never indexed.
+        if self._query(
+            conn,
+            "SELECT 1 FROM duckdb_schemas() WHERE schema_name = ?",
+            parameters=[f"fts_main_{collection}"],
+            operation="drop indexes",
+        ):
+            self._execute(
+                conn,
+                f"PRAGMA drop_fts_index({_sql_string(collection)})",
+                operation="drop indexes",
+            )
+            dropped += 1
+        return dropped
+
     def _drop_hnsw_index(self, conn: Any, spec: CollectionSpec) -> None:
         """Remove an ANN index left by a previous `approximate` publish.
 

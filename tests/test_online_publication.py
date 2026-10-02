@@ -776,3 +776,100 @@ def test_a_resumed_generation_reconciles_deletions(
     ) as store:
         served = store.inspect_collection(entry.active_collection)
     assert served is not None and served.row_count == 1
+
+
+# ─── a resume does not pay index maintenance per page (issue #616) ───────────
+
+
+def _spy_on_index_drops(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record which collections had their indices dropped, in order."""
+    dropped: list[str] = []
+    original = LanceDBStore.drop_indexes
+
+    def spy(self: LanceDBStore, collection: str) -> int:
+        dropped.append(collection)
+        return original(self, collection)
+
+    monkeypatch.setattr(LanceDBStore, "drop_indexes", spy)
+    return dropped
+
+
+def test_a_resume_with_rows_to_write_drops_its_indices_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed generation arrives indexed, and every page would maintain them.
+
+    A fresh build never pays that: `ensure_indexes` runs after the page loop,
+    so its pages merge into an unindexed table. Measured at 3.6-4.1x per-page
+    growth with indices present against a flat 1.1x without, and 37% slower
+    overall than dropping and rebuilding once (issue #616). Dropping on resume
+    is how the resume gets the fresh shape back.
+    """
+    prepare_online_switch(tmp_path)
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+    # A row changes, so the retry has pages to write rather than going
+    # straight to the index build.
+    materialize_upstream(tmp_path, sample_rows().head(1))
+
+    dropped = _spy_on_index_drops(monkeypatch)
+    [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.status != "error"
+    assert dropped, "a resume with rows to write must drop its indices first"
+
+
+def test_a_fresh_build_never_drops_indices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # There is nothing to drop and nothing to gain: a fresh generation is
+    # created empty and unindexed, so a drop would be a pointless store round
+    # trip on the publish path.
+    prepare_online_switch(tmp_path)
+    dropped = _spy_on_index_drops(monkeypatch)
+    [first] = run_project(tmp_path, select="context_search")
+
+    assert first.status != "error"
+    assert dropped == []
+
+
+def test_a_complete_resume_does_not_drop_its_indices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #508 case must stay cheap.
+
+    Rows complete, nothing to write, only the index build left. Dropping
+    first would turn that metadata check into a full rebuild — making the
+    cheapest resume the most expensive one.
+    """
+    prepare_online_switch(tmp_path)
+    _pin_upstream_generation(monkeypatch, "A")
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+
+    dropped = _spy_on_index_drops(monkeypatch)
+    [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.rows_written == 0
+    assert dropped == []
+
+
+def test_an_unpinned_resume_with_nothing_to_write_does_not_drop_its_indices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The adapter-independent half of the #508 case.
+
+    DuckDB cannot report a generation before the read, so `complete_resume`
+    is always False here -- unlike the test above, which pins one to get it.
+    This resume therefore reads every page like any other, but the upstream
+    truly did not change: every row comes back unchanged and there is
+    nothing stale. Dropping indices on sight (the regression a Codex review
+    of #633 caught) would turn that into a full rebuild for a run that was
+    never going to write anything.
+    """
+    prepare_online_switch(tmp_path)
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+
+    dropped = _spy_on_index_drops(monkeypatch)
+    [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.rows_written == 0
+    assert dropped == []

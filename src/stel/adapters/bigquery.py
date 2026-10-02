@@ -2009,6 +2009,17 @@ class BigQueryAdapter(WarehouseAdapter):
                     raise
                 except Exception as error:
                     projected = None
+                    # The message below and its cause chain (type name only)
+                    # are all that reach run_results.json or the CLI. The
+                    # native exception -- which would show a read-session
+                    # expiry distinctly from any other mid-read failure --
+                    # goes only to the DEBUG log, which `--diagnostics-file`
+                    # writes to the one file the operator named (issue #614,
+                    # following the convention at lancedb.py's
+                    # `_operation_failed`).
+                    log.debug(
+                        "BigQuery table snapshot batch read failed", exc_info=error
+                    )
                     batch_failure = AdapterError(
                         "BigQuery table snapshot batch read failed"
                     )
@@ -2031,6 +2042,10 @@ class BigQueryAdapter(WarehouseAdapter):
                 except AdapterError:
                     raise
                 except Exception as error:
+                    log.debug(
+                        "BigQuery table snapshot generation could not be validated",
+                        exc_info=error,
+                    )
                     validation_failure = AdapterError(
                         "BigQuery table snapshot generation could not be validated"
                     )
@@ -2098,6 +2113,9 @@ class BigQueryAdapter(WarehouseAdapter):
                 except Exception:
                     pass
             job = None
+            log.debug(
+                "BigQuery table snapshot could not be opened", exc_info=error
+            )
             failure_cause = sanitized_adapter_cause(error)
             failure = AdapterError(
                 "BigQuery table snapshot could not be opened "

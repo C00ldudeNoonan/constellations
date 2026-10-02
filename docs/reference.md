@@ -809,8 +809,9 @@ never the failure it was recording. When a `stel run` or `stel build` failure
 did write to it, the error message ends by naming the file. Treat it as the
 sensitive thing it is: it holds what every other channel exists to withhold.
 It covers the failures stel logs natively before sanitizing — store
-operations and index-build retries, document fetch and extraction, transform
-code. Provider errors are sanitized before any logger sees them, so no native
+operations and index-build retries, warehouse table-snapshot reads, document
+fetch and extraction, transform code. Provider errors are sanitized before
+any logger sees them, so no native
 text exists for this file to carry; `STEL_DEBUG_PROVIDER_ERRORS=1` is their
 separate hatch and emits an allowlist instead — exception types, stel frame
 locations, an external frame count. Setting it is enough on its own: the

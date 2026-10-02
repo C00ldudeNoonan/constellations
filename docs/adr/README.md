@@ -27,6 +27,7 @@ history (issue #311).
 | [0015](0015-a-sync-watermark-needs-two-independent-signals.md) | A sync watermark needs two independent signals — cheap state, and an authoritative content fingerprint — not one | accepted |
 | [0016](0016-an-interrupted-in-place-write-keeps-its-generation-when-the-store-says-so.md) | A failed in-place publish keeps its generation when the store promises interrupted writes leave it sound; readers stay excluded by status | accepted |
 | [0017](0017-an-operator-may-activate-a-complete-generation-from-its-state.md) | An operator may activate a physically complete generation from its recorded state, re-stamped, without re-reading the corpus | accepted |
+| [0018](0018-a-resume-drops-its-indices-and-rebuilds-once.md) | A resumed generation drops its indices and rebuilds them once, as a fresh build already does | accepted |
 
 ## When to write one
 

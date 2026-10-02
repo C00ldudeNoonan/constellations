@@ -63,6 +63,7 @@ from stel.adapters.bigquery import (
 from stel.adapters.serialized import SerializedAdapter
 from stel.config.identifiers import LEGACY_SCHEMA_NAME
 from stel.credentials import ProtectedCredential
+from stel.logging_setup import configure_diagnostics_file
 from stel.timing import PhaseTimings
 
 # ─── config ─────────────────────────────────────────────────────────────────
@@ -4603,6 +4604,98 @@ def test_an_unkeyed_snapshot_runs_one_query_and_no_validation() -> None:
         assert [batch.num_rows for batch in snapshot] == [2]
     assert len(client.queries) == 1
     assert "COUNT(DISTINCT" not in client.queries[0][0]
+
+
+def test_a_batch_read_failure_is_sanitized_with_the_native_cause_in_the_diagnostics_file(
+    tmp_path: Path,
+) -> None:
+    """A mid-read failure -- the shape a BigQuery read session hitting its
+    6-hour wall takes -- reaches the caller only as the sanitized message; a
+    resumed search publish that fails the same way on every leg could not
+    otherwise tell a session expiry from any other warehouse error
+    (issue #614). The native exception still reaches an operator who asked
+    for it, through the same `--diagnostics-file` channel `_operation_failed`
+    already uses for LanceDB (issue #590)."""
+
+    class _FailingStorageReadClient(_FakeStorageReadClient):
+        def read_rows(self, name: str, timeout: Any = None) -> Any:
+            self.read_streams.append(name)
+
+            def _pages() -> Any:
+                raise RuntimeError("distinctive native storage failure")
+                yield  # pragma: no cover -- makes this a generator function
+
+            return SimpleNamespace(
+                rows=lambda: SimpleNamespace(pages=_pages()), cancel=lambda: None
+            )
+
+    payload = pa.table({"chunk_id": ["a"]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    client.query_results = [_FakeSnapshotJob(payload)]
+    adapter = _adapter(client)
+    adapter._bqstorage_client = _FailingStorageReadClient()
+    adapter._bqstorage_client.payload = payload
+
+    diagnostics_path = tmp_path / "diagnostics.log"
+    configure_diagnostics_file(diagnostics_path)
+
+    with pytest.raises(AdapterError) as excinfo:
+        with adapter.table_snapshot("chunks") as snapshot:
+            list(snapshot)
+
+    assert str(excinfo.value) == "BigQuery table snapshot batch read failed"
+    assert "distinctive" not in str(excinfo.value)
+
+    diagnostics_text = diagnostics_path.read_text(encoding="utf-8")
+    assert "BigQuery table snapshot batch read failed" in diagnostics_text
+    assert "distinctive native storage failure" in diagnostics_text
+
+
+def test_an_open_failure_is_sanitized_with_the_native_cause_in_the_diagnostics_file(
+    tmp_path: Path,
+) -> None:
+    """The batch-read and generation-validation sites are not the only ones
+    that sanitize a native BigQuery exception -- opening the snapshot itself
+    (session creation, query startup) does too, at `bigquery.py`'s own
+    `except Exception` around `_open_table_snapshot`'s body. A failure there
+    needs the same DEBUG log, or `--diagnostics-file` stays empty for it even
+    though the docs now claim warehouse table-snapshot reads are covered
+    (issue #614, Codex review on PR #634)."""
+
+    class _FailingStorageReadClient(_FakeStorageReadClient):
+        def create_read_session(
+            self,
+            *,
+            parent: str,
+            read_session: Any,
+            max_stream_count: int,
+            timeout: Any = None,
+        ) -> Any:
+            raise RuntimeError("distinctive native session-open failure")
+
+    payload = pa.table({"chunk_id": ["a"], "embedding": [[1.0]]})
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id", "embedding"]
+    client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": 1}
+    adapter = _adapter(client)
+    adapter._bqstorage_client = _FailingStorageReadClient()
+    adapter._bqstorage_client.payload = payload
+
+    diagnostics_path = tmp_path / "diagnostics.log"
+    configure_diagnostics_file(diagnostics_path)
+
+    with pytest.raises(AdapterError) as excinfo:
+        with adapter.table_snapshot("chunks", columns=["chunk_id", "embedding"]):
+            pass
+
+    assert str(excinfo.value).startswith("BigQuery table snapshot could not be opened")
+    assert "distinctive" not in str(excinfo.value)
+
+    diagnostics_text = diagnostics_path.read_text(encoding="utf-8")
+    assert "BigQuery table snapshot could not be opened" in diagnostics_text
+    assert "distinctive native session-open failure" in diagnostics_text
 
 
 # ─── wide-row snapshots read through the Storage API (issue #441) ───────────

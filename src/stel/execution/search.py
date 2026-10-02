@@ -532,6 +532,43 @@ def _run_search_model(
                     )
                     _validate_collection_schema(existing.schema, spec)
 
+                # A resumed generation arrives carrying whatever indices its
+                # earlier attempt built, and then every page pays to maintain
+                # them. A fresh generation never does: `ensure_indexes` runs
+                # after this loop, so its pages merge into an unindexed table.
+                # Dropping here is how a resume gets that shape back --
+                # measured at 3.6-4.1x per-page growth with indices present
+                # against a flat 1.1x without, and 37% slower overall than
+                # dropping and rebuilding once (issue #616, ADR-0018).
+                #
+                # Deferred to the first actual write rather than done eagerly
+                # here: an adapter that cannot report its generation before a
+                # read (DuckDB) can never set `complete_resume`, so every
+                # resume would reach this point whether or not the upstream
+                # actually changed. Dropping on sight would turn the
+                # zero-write resume this same issue's #611 made cheap back
+                # into a full index rebuild for nothing (Codex review, #633).
+                # `ensure_indexes` is a metadata check when nothing was ever
+                # dropped, so a resume that turns out to have nothing to
+                # write never pays either cost.
+                indices_dropped = False
+
+                def _drop_indices_before_first_write() -> None:
+                    nonlocal indices_dropped
+                    if indices_dropped or not resumed or complete_resume:
+                        return
+                    indices_dropped = True
+                    with timings.phase("index_reconcile"):
+                        dropped = store.drop_indexes(physical)
+                    if dropped:
+                        log.info(
+                            "%s: dropped %d index(es) from the resumed "
+                            "generation; they are rebuilt once after the "
+                            "last page rather than maintained by every one",
+                            model.name,
+                            dropped,
+                        )
+
                 batches: Iterator[pa.RecordBatch] = (
                     iter([]) if complete_resume else iter(snapshot)
                 )
@@ -624,6 +661,7 @@ def _run_search_model(
                     pending_updated = len(outcome.changed)
                     if not pending:
                         continue
+                    _drop_indices_before_first_write()
                     coordinator.verify_publish(publish_lease)
                     if not collection_exists:
                         store.create_collection(spec)
@@ -759,6 +797,9 @@ def _run_search_model(
                 try:
                     for ordinal, stale_page in enumerate(stale_pages):
                         record_ids = [record.record_key for record in stale_page]
+                        if not record_ids:
+                            continue
+                        _drop_indices_before_first_write()
                         coordinator.verify_publish(publish_lease)
                         digest = canonical_fingerprint(
                             {

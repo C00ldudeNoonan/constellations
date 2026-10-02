@@ -91,6 +91,55 @@
   when it is degraded and by what, and says "nothing" in words -- with why --
   where the fields alone showed two dashes.
 
+### A resumed search publish no longer pays index maintenance on every page (issue #616)
+
+- **Only resumes decayed, and the reason was an order nobody chose.** A fresh
+  private generation builds its indices once after the page loop, so its pages
+  merge into an unindexed table. A resumed generation arrived carrying the
+  indices its earlier attempt had built, and nothing dropped them — so every
+  page then maintained them, for the rest of the run. #616 measured per-page
+  cost roughly doubling by page 73 of 146 in prod, with memory flat.
+- A probe separated the three candidate causes. Over 29 pages, per-page merge
+  cost grew **3.60–4.14x with indices present** and **1.09–1.17x without**,
+  with table version count rising identically in both — which rules out
+  fragment accumulation as the driver. Removing the acknowledgement scan moved
+  the ratio 4.14x to 3.60x, so it is a term and not the cause.
+- A resume now drops its indices before the page loop and lets
+  `ensure_indexes` rebuild them after the last page. Measured 37% faster over
+  29 pages, widening with page count: maintenance is per page, the rebuild is
+  once.
+- **A complete resume does not drop.** With rows already complete and only the
+  index build left (#508), dropping first would turn a metadata check into a
+  full rebuild — making the cheapest resume the most expensive one.
+- `RetrievalStore.drop_indexes` is the new seam, implemented by both in-tree
+  stores and abstract rather than defaulted: a store that silently skipped it
+  would show the decay with nothing in the code to point at.
+  [ADR-0018](docs/adr/0018-a-resume-drops-its-indices-and-rebuilds-once.md)
+  records why compaction every N pages was not the answer.
+
+**Worth knowing:** a resumed generation is briefly unindexed, between the drop
+and the rebuild. It is always private and never the active one, so nothing
+serves reads from it; a run that dies in that window leaves an unindexed
+generation that the next resume adopts, drops as a no-op, and rebuilds.
+Publication state advances per page and is unaffected.
+
+
+### A BigQuery table-snapshot read failure's native cause now reaches `--diagnostics-file` (issue #614)
+
+A BigQuery Storage Read API session has a 6-hour maximum lifetime; a search
+publish's page-reading loop held one open for its entire run and failed once
+a corpus pushed past that wall. The failure was already reported safely --
+sanitized to `BigQuery table snapshot batch read failed`, retried from the
+same resumable generation -- but nothing told an operator *why* it failed, so
+every retry restarted the page loop for no better reason than the last one.
+The native exception now reaches `--diagnostics-file`/`STEL_DIAGNOSTICS_FILE`
+(ADR-0012), the same channel LanceDB operation failures already use, letting
+an operator tell a read-session expiry from any other mid-read failure
+without any native text reaching `run_results.json` or the CLI. The deeper
+fix -- not re-reading pages a resume already covered, or reopening the
+session per page against a pinned snapshot -- needs its own design pass and
+is not part of this change.
+
 ### `concept-cloud` shows what changed between two periods (issue #555)
 
 A single frozen view of a multi-year map answers "what is always here", not

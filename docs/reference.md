@@ -4436,6 +4436,15 @@ stub, on the same terms as the omission above: "named once" and "not named
 yet" have to look different, because on a risk-factor map the difference is
 usually the finding.
 
+With two or more periods, a **"Compare periods"** control (issue #555 item 6)
+shows what changed between any two of them: concepts that entered, concepts
+that left, and the biggest movers by mention count, ranked and clickable —
+selecting a row opens that concept's own card and flies the camera to it, the
+same path the search box uses. Entirely viewer-only, from the same per-period
+counts the history strip already reads; no export or schema change. For a
+risk-factor map this is usually the headline a single frozen view hides most
+completely: Ukraine and inflation entering in 2022, COVID-19 fading by 2024.
+
 **`--top-n-per-period N` keeps what mattered *within* a period.** `--top-n`
 ranks on total frequency across the corpus, which trims exactly what a time
 axis exists to show: a risk that enters, dominates one period, and is

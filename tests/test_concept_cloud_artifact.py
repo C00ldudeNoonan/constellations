@@ -449,3 +449,61 @@ def test_the_strength_filter_stays_hidden_when_every_edge_is_equal() -> None:
 
     # The filter and the period test are the same test one notch up.
     assert "if (l.kind === \"concept\" && periodWeight(l) < minWeight) return false;" in shown
+
+
+# ─── "what changed" between two periods (issue #555 item 6) ─────────────────
+
+
+def test_the_diff_control_is_wired_to_two_periods() -> None:
+    """A ranked diff between two periods, viewer-only against `by_period`
+    counts the bundle already carries -- no export or schema change."""
+    html = render_concept_cloud(_timed_export())
+
+    assert 'id="diff-ctl"' in html and 'id="diff-toggle"' in html
+    assert 'id="diff-from"' in html and 'id="diff-to"' in html
+    assert 'id="diffpanel"' in html
+    assert "function buildDiffPanel()" in html
+    # Reached from the control build, not defined and orphaned.
+    assert "buildDiffPanel();" in html
+    # Defaults to the two most recent periods: "what just changed" first.
+    assert "fromSelect.value = PERIODS[PERIODS.length - 2];" in html
+    assert "toSelect.value = PERIODS[PERIODS.length - 1];" in html
+
+
+def test_the_diff_control_stays_hidden_with_fewer_than_two_periods() -> None:
+    """A single period has nothing to compare; a bundle with no axis at all
+    must not grow the control over nothing, same rule as the period slider."""
+    html = render_concept_cloud(placeholder_export())
+
+    assert 'id="diff-ctl" style="display:none"' in html
+    assert "if (PERIODS.length < 2) return;" in html
+
+
+def test_the_diff_panel_buckets_entered_left_and_moved() -> None:
+    """Three buckets from one pair of counts, read the same way the sparkline
+    and the period filter already read `by_period`: absent is 0, not missing."""
+    html = render_concept_cloud(_timed_export())
+
+    assert "if (a === 0 && b > 0) entered.push({ c, delta: b });" in html
+    assert "else if (a > 0 && b === 0) left.push({ c, delta: a });" in html
+    assert "else if (a > 0 && b > 0 && a !== b) moved.push({ c, delta: b - a });" in html
+    # Ranked, not just bucketed.
+    assert "entered.sort((x, y) => y.delta - x.delta);" in html
+    assert "moved.sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));" in html
+
+
+def test_a_diff_row_selects_its_concept_on_the_map() -> None:
+    """The panel is a way *in* to the map, not a separate report -- clicking a
+    row reuses the same selection path the search box does."""
+    html = render_concept_cloud(_timed_export())
+
+    assert "selectConceptById = id => {" in html
+    # The search box was refactored onto the same shared path, not duplicated.
+    assert "if (hit) selectConceptById(hit.id);" in html
+    assert 'row.addEventListener("click", () => selectConceptById(row.dataset.id)));' in html
+
+
+def test_an_unchanged_pair_of_periods_says_so_rather_than_an_empty_panel() -> None:
+    html = render_concept_cloud(_timed_export())
+
+    assert '<span class="empty">No change between ${esc(from)} and ${esc(to)}.</span>' in html

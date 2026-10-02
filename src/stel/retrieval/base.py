@@ -733,6 +733,32 @@ class RetrievalStore(ABC):
     def ensure_indexes(self, spec: CollectionSpec) -> CollectionMetadata: ...
 
     @abstractmethod
+    def drop_indexes(self, collection: str) -> int:
+        """Remove every index from `collection`, returning how many went.
+
+        For a *private generation about to be written*, and nothing else.
+        `ensure_indexes` rebuilds whatever this removes once the writes are
+        done, which is the order a fresh build already follows: the page loop
+        runs against an unindexed table and the indices are built once at the
+        end (`execution/search.py`).
+
+        Resuming broke that order. An adopted generation arrives carrying the
+        indices its earlier attempt built, so every page then paid to maintain
+        them — measured at 3.6-4.1x per-page growth over 29 pages against a
+        flat 1.1x unindexed, and 37% slower overall than dropping and
+        rebuilding once (issue #616). This is how a resume gets the fresh
+        path's shape back.
+
+        Must be idempotent, and a collection with no indices is not an error:
+        the caller cannot know what an earlier attempt got as far as building.
+
+        Never call this on a collection serving reads. It is safe where it is
+        used because a resumable generation is always private and never the
+        active one, which `resumable_generation` guarantees by excluding the
+        active collection from its candidates.
+        """
+
+    @abstractmethod
     def vector_search(
         self,
         collection: str,

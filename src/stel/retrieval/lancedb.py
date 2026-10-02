@@ -873,6 +873,31 @@ class LanceDBStore(RetrievalStore):
             tuple(MutationOutcome("applied") for _ in rows),
         )
 
+    def drop_indexes(self, collection: str) -> int:
+        """Drop every index on a private generation (issue #616).
+
+        Listed and dropped by name rather than reconstructed from a spec: the
+        caller is resuming, so what the earlier attempt managed to build is
+        exactly what is not knowable from configuration. An empty list is the
+        normal case for a generation that died before its index step.
+        """
+        failure: RetrievalError | None = None
+        dropped = 0
+        try:
+            table = self._open_owned_table(collection)
+            for name in [index.name for index in table.list_indices()]:
+                table.drop_index(name)
+                dropped += 1
+        except RetrievalError:
+            raise
+        except Exception as error:
+            failure = _operation_failed(
+                "index drop", "lancedb_index_drop_failed", error
+            )
+        if failure is not None:
+            raise failure
+        return dropped
+
     def append(
         self,
         collection: str,

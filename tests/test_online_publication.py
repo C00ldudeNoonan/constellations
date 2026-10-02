@@ -850,3 +850,26 @@ def test_a_complete_resume_does_not_drop_its_indices(
 
     assert retry.rows_written == 0
     assert dropped == []
+
+
+def test_an_unpinned_resume_with_nothing_to_write_does_not_drop_its_indices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The adapter-independent half of the #508 case.
+
+    DuckDB cannot report a generation before the read, so `complete_resume`
+    is always False here -- unlike the test above, which pins one to get it.
+    This resume therefore reads every page like any other, but the upstream
+    truly did not change: every row comes back unchanged and there is
+    nothing stale. Dropping indices on sight (the regression a Codex review
+    of #633 caught) would turn that into a full rebuild for a run that was
+    never going to write anything.
+    """
+    prepare_online_switch(tmp_path)
+    _fail_the_index_build_once(tmp_path, monkeypatch)
+
+    dropped = _spy_on_index_drops(monkeypatch)
+    [retry] = run_project(tmp_path, select="context_search")
+
+    assert retry.rows_written == 0
+    assert dropped == []

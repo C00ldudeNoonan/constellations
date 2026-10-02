@@ -3358,12 +3358,14 @@ proof of death: the index build after the last page is one long call with no
 page to beat on, so `recover` displays the age and never acts on it.
 
 `recover` proceeds without `--owner-terminated` in one case only: the row
-names a publisher on *this* host, and no process with that PID and start time
-exists, which is provable (Linux, via `/proc`). Every other case is refused,
-and the refusal says what the ledger knows about the owner -- host, PID,
-label, last heartbeat -- so the confirmation is informed. A build inside a
-container records the container's hostname, so from the host it reads as
-unknown and the confirmation stays required (ADR-0019).
+names a publisher in *this* PID namespace on *this* kernel boot, and no
+process with that PID and start time exists, which is provable (Linux, via
+`/proc`). Every other case is refused, and the refusal says what the ledger
+knows about the owner -- host, PID, label, last heartbeat -- so the
+confirmation is informed. A matching hostname is not enough on its own, since
+two containers can be configured with one; a build inside a container is in
+its own PID namespace, so from the host it reads as unknown and the
+confirmation stays required (ADR-0019).
 
 **Both commands name what they resolved**, because the ledger alone does not
 identify it:

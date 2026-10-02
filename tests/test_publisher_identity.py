@@ -22,6 +22,7 @@ from stel.retrieval.publisher_identity import (
     PublisherIdentity,
     describe_publisher,
     local_liveness,
+    process_namespace,
     process_started_epoch,
     publisher_label,
 )
@@ -37,6 +38,7 @@ def test_the_current_identity_is_this_process(monkeypatch: pytest.MonkeyPatch) -
     assert identity.host == socket.gethostname()
     assert identity.pid == os.getpid()
     assert identity.label == "dagster run abc123"
+    assert identity.namespace == process_namespace()
 
 
 @pytest.mark.parametrize(
@@ -76,6 +78,7 @@ def test_liveness_is_alive_for_this_process_and_dead_for_a_reaped_one() -> None:
         pid=child.pid,
         started_epoch=process_started_epoch(os.getpid()),
         label=None,
+        namespace=process_namespace(),
     )
     assert local_liveness(dead) is Liveness.DEAD
 
@@ -88,9 +91,34 @@ def test_a_reused_pid_with_another_start_time_is_dead() -> None:
     mine = PublisherIdentity.current()
     assert mine.started_epoch is not None
     earlier = PublisherIdentity(
-        host=mine.host, pid=mine.pid, started_epoch=mine.started_epoch - 3600, label=None
+        host=mine.host,
+        pid=mine.pid,
+        started_epoch=mine.started_epoch - 3600,
+        label=None,
+        namespace=mine.namespace,
     )
     assert local_liveness(earlier) is Liveness.DEAD
+
+
+@linux_only
+def test_the_same_hostname_in_another_pid_namespace_is_unknown() -> None:
+    """A hostname proves nothing about locality: two containers can be
+    configured with the same one, and the PID that is gone here may be alive
+    there. Only a matching boot id and PID namespace make the lookup valid;
+    anything else keeps the confirmation required (review finding on #637)."""
+    mine = PublisherIdentity.current()
+    elsewhere = PublisherIdentity(
+        host=mine.host,
+        pid=mine.pid,
+        started_epoch=mine.started_epoch,
+        label=None,
+        namespace="other-boot/pid:[4026531836]",
+    )
+    assert local_liveness(elsewhere) is Liveness.UNKNOWN
+    unrecorded = PublisherIdentity(
+        host=mine.host, pid=mine.pid, started_epoch=mine.started_epoch, label=None, namespace=None
+    )
+    assert local_liveness(unrecorded) is Liveness.UNKNOWN
 
 
 def test_liveness_is_unknown_for_another_host_or_without_a_start_marker() -> None:
@@ -98,11 +126,19 @@ def test_liveness_is_unknown_for_another_host_or_without_a_start_marker() -> Non
     unknown to the host even when both share a kernel; and without a start
     marker a PID match proves nothing. Both keep the confirmation required."""
     elsewhere = PublisherIdentity(
-        host="some-other-host", pid=os.getpid(), started_epoch=1, label=None
+        host="some-other-host",
+        pid=os.getpid(),
+        started_epoch=1,
+        label=None,
+        namespace="other-boot/pid:[1]",
     )
     assert local_liveness(elsewhere) is Liveness.UNKNOWN
     unmarked = PublisherIdentity(
-        host=socket.gethostname(), pid=os.getpid(), started_epoch=None, label=None
+        host=socket.gethostname(),
+        pid=os.getpid(),
+        started_epoch=None,
+        label=None,
+        namespace=process_namespace(),
     )
     assert local_liveness(unmarked) is Liveness.UNKNOWN
 
@@ -116,7 +152,11 @@ def test_an_active_publisher_names_host_pid_label_and_heartbeat_age() -> None:
     where, and how long since the last page. The 2026-10-01 row would have
     read `last heartbeat 40m00s ago` instead of `active`."""
     identity = PublisherIdentity(
-        host="dagster-user-code", pid=4242, started_epoch=1_700_000_000, label="run-abc"
+        host="dagster-user-code",
+        pid=4242,
+        started_epoch=1_700_000_000,
+        label="run-abc",
+        namespace="boot/pid:[1]",
     )
     line = describe_publisher(
         identity, heartbeat_epoch=1_700_003_600, now_epoch=1_700_003_600 + 40 * 60
@@ -128,7 +168,9 @@ def test_an_active_publisher_names_host_pid_label_and_heartbeat_age() -> None:
 
 
 def test_a_publisher_without_a_start_marker_or_label_says_so_only_by_omission() -> None:
-    identity = PublisherIdentity(host="laptop", pid=7, started_epoch=None, label=None)
+    identity = PublisherIdentity(
+        host="laptop", pid=7, started_epoch=None, label=None, namespace=None
+    )
     line = describe_publisher(identity, heartbeat_epoch=None, now_epoch=10)
     assert line == "active: host=laptop pid=7, no heartbeat recorded"
 
@@ -138,6 +180,6 @@ def test_a_publisher_without_a_start_marker_or_label_says_so_only_by_omission() 
     [(0, "0s"), (59, "59s"), (60, "1m00s"), (3599, "59m59s"), (3600, "1h00m"), (7_260, "2h01m")],
 )
 def test_heartbeat_age_reads_in_the_unit_that_matters(age: int, rendered: str) -> None:
-    identity = PublisherIdentity(host="h", pid=1, started_epoch=None, label=None)
+    identity = PublisherIdentity(host="h", pid=1, started_epoch=None, label=None, namespace=None)
     line = describe_publisher(identity, heartbeat_epoch=1000, now_epoch=1000 + age)
     assert f"last heartbeat {rendered} ago" in line

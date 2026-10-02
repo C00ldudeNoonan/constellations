@@ -147,7 +147,11 @@ def test_the_publisher_line_names_who_holds_the_claim_and_their_last_heartbeat()
         STATUS_PUBLISHING_IN_PLACE,
         publication_id="p1",
         publisher=PublisherIdentity(
-            host="dagster-user-code", pid=4242, started_epoch=1_700_000_000, label="run-abc"
+            host="dagster-user-code",
+            pid=4242,
+            started_epoch=1_700_000_000,
+            label="run-abc",
+            namespace="boot/pid:[1]",
         ),
         publisher_heartbeat_epoch=1_700_000_600,
     )

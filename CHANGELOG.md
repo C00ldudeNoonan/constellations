@@ -14,12 +14,13 @@
   prints them as the `publisher:` line with the heartbeat's age, and
   `recover`'s refusal names them.
 - **`recover` may proceed without `--owner-terminated` in exactly one case:**
-  the row names a publisher on this host whose PID and start time match no
-  running process, which is provable from `/proc`. Everywhere else the
+  the row names a publisher in this PID namespace on this kernel boot whose
+  PID and start time match no running process, which is provable from
+  `/proc`. A matching hostname is not enough: two containers can share one. Everywhere else the
   confirmation stays required and the refusal is informed. Heartbeat age is
   shown and never acted on: the index build after the last page has no page
   to beat on and is not dead. ADR-0019 records the alternatives.
-- Five nullable columns join the serving ledger, added to an older ledger the
+- Six nullable columns join the serving ledger, added to an older ledger the
   way `active_collection` was. One DML per page on the publish path; it
   doubles as the fence check.
 

@@ -1515,7 +1515,12 @@ def test_a_ledger_predating_generations_gains_the_activation_column(
         columns = adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
         assert "active_collection" in columns
         # And the publisher identity columns (issue #621), added the same way.
-        assert {"publisher_host", "publisher_pid", "publisher_heartbeat_epoch"} <= columns
+        assert {
+            "publisher_host",
+            "publisher_pid",
+            "publisher_heartbeat_epoch",
+            "publisher_namespace",
+        } <= columns
         # And the upgraded ledger is usable end to end.
         scope = _scope()
         lease = coordinator.acquire_publish(
@@ -1619,7 +1624,13 @@ def test_recover_without_confirmation_refuses_an_owner_on_another_host(
         scope,
         expected_code_version="v1",
         config_fingerprint="cfg1",
-        publisher=PublisherIdentity(host="dagster_user_code", pid=1, started_epoch=5, label=None),
+        publisher=PublisherIdentity(
+            host="dagster_user_code",
+            pid=1,
+            started_epoch=5,
+            label=None,
+            namespace="other-boot/pid:[4026531836]",
+        ),
     )
     with pytest.raises(ServingCoordinationError, match="host=dagster_user_code pid=1"):
         coordinator.recover(scope, owner_terminated=False)
@@ -1636,7 +1647,11 @@ def test_recover_proceeds_without_confirmation_when_the_local_owner_is_provably_
     import socket
     import subprocess
 
-    from stel.retrieval.publisher_identity import PublisherIdentity, process_started_epoch
+    from stel.retrieval.publisher_identity import (
+        PublisherIdentity,
+        process_namespace,
+        process_started_epoch,
+    )
 
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
@@ -1650,6 +1665,7 @@ def test_recover_proceeds_without_confirmation_when_the_local_owner_is_provably_
             pid=child.pid,
             started_epoch=process_started_epoch(os.getpid()),
             label="crashed-build",
+            namespace=process_namespace(),
         ),
     )
     before = coordinator.status(scope).fencing_token
@@ -1703,7 +1719,11 @@ def test_serving_status_names_the_publisher_that_holds_the_claim(tmp_path: Path)
             preserves_active_generation=True,
             excludes_readers=True,
             publisher=PublisherIdentity(
-                host="dagster_user_code", pid=4242, started_epoch=1_700_000_000, label="run-7f3a"
+                host="dagster_user_code",
+                pid=4242,
+                started_epoch=1_700_000_000,
+                label="run-7f3a",
+                namespace="boot/pid:[1]",
             ),
         )
 

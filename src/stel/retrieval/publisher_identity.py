@@ -20,7 +20,11 @@ exists) it lets `recover` proceed without the confirmation.
 
 Process start times come from `/proc` and are therefore Linux-only. Elsewhere
 the identity records host and PID, and liveness is unknown: the confirmation
-stays required there. A dependency on `psutil` for the other platforms was
+stays required there. A hostname is not proof of locality either -- two
+containers can be configured with the same one, and a container can carry its
+host's -- so the identity also records the kernel boot id and the PID
+namespace it was recorded in, and a PID is looked up only when both match.
+A dependency on `psutil` for the other platforms was
 considered and declined; the core installation stays lean, and the provable
 case is the orchestrator-launched build on the same Linux host as the operator.
 """
@@ -67,6 +71,12 @@ class PublisherIdentity:
     # means the same thing on every warehouse and in every session time zone.
     started_epoch: int | None
     label: str | None
+    # Where the PID means something: the kernel boot id and the PID namespace
+    # the claim was made in. A PID is only ever looked up by a process that
+    # shares both, because the same number in another namespace -- another
+    # container on this kernel, or another host that happens to share the
+    # hostname -- is another process. None where the platform cannot say.
+    namespace: str | None
 
     @classmethod
     def current(cls) -> PublisherIdentity:
@@ -76,6 +86,7 @@ class PublisherIdentity:
             pid=pid,
             started_epoch=process_started_epoch(pid),
             label=publisher_label(os.environ.get(PUBLISHER_LABEL_ENV)),
+            namespace=process_namespace(),
         )
 
 
@@ -115,17 +126,39 @@ def process_started_epoch(pid: int) -> int | None:
     return btime + ticks // os.sysconf("SC_CLK_TCK")
 
 
-def local_liveness(identity: PublisherIdentity) -> Liveness:
-    """Whether the recorded publisher is provably alive or dead on this host.
+def process_namespace() -> str | None:
+    """The kernel boot id and PID namespace this process runs in, or None.
 
-    Provable only for a publisher that recorded a start marker on *this* host:
-    the PID is looked up the same way it recorded itself, and a different
-    start time means the PID has been reused by another process. A publisher
-    on another host, or one that could not record a start marker, is unknown
-    -- a container's hostname is the container's, so a build inside one is
-    unknown to the host even when both share a kernel.
+    The pair is what makes a PID meaningful: the boot id tells one kernel from
+    another (two hosts with the same hostname, or the same host rebooted), and
+    the PID namespace inode tells one container from another on the same
+    kernel. Two processes that share both see the same `/proc`.
     """
-    if identity.host != socket.gethostname() or identity.started_epoch is None:
+    boot_id = Path("/proc/sys/kernel/random/boot_id")
+    pid_ns = Path("/proc/self/ns/pid")
+    if not boot_id.exists() or not pid_ns.exists():
+        return None
+    try:
+        return f"{boot_id.read_text(encoding='utf-8').strip()}/{os.readlink(pid_ns)}"
+    except OSError:
+        return None
+
+
+def local_liveness(identity: PublisherIdentity) -> Liveness:
+    """Whether the recorded publisher is provably alive or dead from here.
+
+    Provable only for a publisher that recorded a start marker in *this* PID
+    namespace on *this* kernel boot: the PID is looked up the same way it
+    recorded itself, and a different start time means the PID has been reused
+    by another process. Anything else is unknown -- another host, another
+    container on this kernel, a platform without `/proc`, or a row written
+    before the namespace was recorded. A matching hostname proves none of
+    those away: two containers can be configured with the same one, so the
+    hostname is kept for the operator to read and never relied on here.
+    """
+    if identity.started_epoch is None or identity.namespace is None:
+        return Liveness.UNKNOWN
+    if identity.namespace != process_namespace():
         return Liveness.UNKNOWN
     if process_started_epoch(os.getpid()) is None:
         return Liveness.UNKNOWN

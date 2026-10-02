@@ -24,15 +24,17 @@ carrying it changes the rule.
 
 ## Decision
 
-The claim records its holder: hostname, PID, process start time and an
-operator-supplied label (`STEL_PUBLISHER_LABEL`, for the orchestrator run id).
-The page loop touches a heartbeat once per page. `stel serving status` prints
-all of it as the `publisher:` line, with the heartbeat's age.
+The claim records its holder: hostname, PID, process start time, the kernel
+boot id and PID namespace the PID is meaningful in, and an operator-supplied
+label (`STEL_PUBLISHER_LABEL`, for the orchestrator run id). The page loop
+touches a heartbeat once per page. `stel serving status` prints the readable
+parts as the `publisher:` line, with the heartbeat's age.
 
 `recover` without `--owner-terminated` proceeds in exactly one case: the row
-names a publisher on *this* host, and no process with that PID and that start
-time exists. Everything else is refused, and the refusal states what the
-ledger knows about the owner, so the operator's confirmation is informed.
+names a publisher in *this* PID namespace on *this* kernel boot, and no
+process with that PID and that start time exists. Everything else is refused,
+and the refusal states what the ledger knows about the owner, so the
+operator's confirmation is informed.
 
 Heartbeat age is displayed and never acted on.
 
@@ -60,6 +62,16 @@ Heartbeat age is displayed and never acted on.
   `publication_id`, and the identity describes that claim. Splitting them
   would make "who holds the claim" a join, and `recover` already rebuilds the
   row from the highest fence.
+- **Hostname as the locality test.** The first version of this change looked
+  the PID up whenever the recorded hostname matched this one. Review caught
+  that a hostname proves nothing: two containers can be configured with the
+  same one, a container can carry its host's, and the PID that is gone here
+  may be alive there -- so a dead verdict would have skipped the confirmation
+  under a live publisher, the exact corruption the confirmation exists to
+  prevent. The identity therefore records the kernel boot id and PID
+  namespace (`/proc/sys/kernel/random/boot_id`, `/proc/self/ns/pid`), and a
+  PID is looked up only by a process that shares both. The hostname stays,
+  for the operator to read.
 - **TIMESTAMP columns.** `started_at` and `completed_at` are TIMESTAMPs written
   with `CURRENT_TIMESTAMP`, and nothing computes an age from them. DuckDB
   resolves `CURRENT_TIMESTAMP` through the session time zone and BigQuery does
@@ -69,7 +81,7 @@ Heartbeat age is displayed and never acted on.
 
 ## Consequences
 
-- **Five new nullable ledger columns**, added by `_ensure_ledger_columns` to a
+- **Six new nullable ledger columns**, added by `_ensure_ledger_columns` to a
   ledger that predates them, the same way `active_collection` was.
 - **One DML per page**, about a second on BigQuery against pages that take
   minutes. It doubles as the fence check `verify_publish` already made.

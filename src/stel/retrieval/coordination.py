@@ -90,6 +90,7 @@ _LEDGER_COLUMNS_ADDED_LATER: tuple[tuple[str, str], ...] = (
     ("publisher_started_epoch", "BIGINT"),
     ("publisher_label", "STRING"),
     ("publisher_heartbeat_epoch", "BIGINT"),
+    ("publisher_namespace", "STRING"),
 )
 
 
@@ -233,7 +234,8 @@ class ServingCoordinator:
                 publisher_pid BIGINT,
                 publisher_started_epoch BIGINT,
                 publisher_label STRING,
-                publisher_heartbeat_epoch BIGINT
+                publisher_heartbeat_epoch BIGINT,
+                publisher_namespace STRING
             )
             """
         )
@@ -404,7 +406,7 @@ class ServingCoordinator:
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
-                   publisher_heartbeat_epoch
+                   publisher_heartbeat_epoch, publisher_namespace
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -437,7 +439,7 @@ class ServingCoordinator:
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
-                   publisher_heartbeat_epoch,
+                   publisher_heartbeat_epoch, publisher_namespace,
                    (
                        SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
                        WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -614,7 +616,7 @@ class ServingCoordinator:
                 completed_at = NULL{retain_generation},
                 publisher_host = ?, publisher_pid = ?,
                 publisher_started_epoch = ?, publisher_label = ?,
-                publisher_heartbeat_epoch = ?
+                publisher_heartbeat_epoch = ?, publisher_namespace = ?
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id IS NULL
               {planning_guard}
@@ -634,6 +636,7 @@ class ServingCoordinator:
                 publisher.started_epoch,
                 publisher.label,
                 int(time.time()),
+                publisher.namespace,
                 *self._scope_params(scope),
                 *planning_params,
                 *query_params,
@@ -735,7 +738,7 @@ class ServingCoordinator:
                 completed_at = CURRENT_TIMESTAMP{restore_fingerprint},
                 publisher_host = NULL, publisher_pid = NULL,
                 publisher_started_epoch = NULL, publisher_label = NULL,
-                publisher_heartbeat_epoch = NULL
+                publisher_heartbeat_epoch = NULL, publisher_namespace = NULL
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id = ? AND fencing_token = ?
             """,
@@ -1029,8 +1032,9 @@ class ServingCoordinator:
         pointer at claim time and serves on from here (issue #617).
 
         Without `owner_terminated`, recovery proceeds in exactly one case: the
-        row names a publisher on *this* host whose PID and process start time
-        no longer match any running process (issue #621). That is provable
+        row names a publisher in *this* PID namespace on *this* kernel boot
+        whose PID and process start time no longer match any running process
+        (issue #621). That is provable
         from here, and it is the common case -- an orchestrator-launched build
         on the same host as the operator. Every other case is refused, and the
         refusal names what the ledger knows about the owner, so the operator's
@@ -1152,7 +1156,7 @@ class ServingCoordinator:
         if owner is not None and local_liveness(owner) is Liveness.DEAD:
             log.info(
                 "%s: recovering without confirmation; the recorded publisher "
-                "(host=%s pid=%d) is provably not running on this host",
+                "(host=%s pid=%d) is provably not running in this PID namespace",
                 scope.model_name,
                 owner.host,
                 owner.pid,
@@ -1187,4 +1191,5 @@ def _publisher_from_row(row: tuple[Any, ...]) -> PublisherIdentity | None:
         pid=int(row[13]),
         started_epoch=None if row[14] is None else int(row[14]),
         label=None if row[15] is None else str(row[15]),
+        namespace=None if row[17] is None else str(row[17]),
     )

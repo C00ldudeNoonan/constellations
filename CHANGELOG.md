@@ -1,6 +1,95 @@
 # Changelog
 
-## Unreleased
+## v0.20.0 - 2026-10-02
+
+### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)
+
+- **A generation holding every row sat unserved for three weeks, with no
+  command able to activate it.** A 3,644,778-row private generation was in
+  the store, an index refresh away from serving; the ledger named nothing;
+  and the only path to activation was a publish that re-read all 146 pages
+  from BigQuery, which could not finish inside the six-hour read session
+  (#614). ADR-0005 had declined an activate command in favour of automatic
+  resume, on the grounds that resume activates only what validates. Resume
+  is right whenever it can finish; this is the case where it cannot.
+- `stel serving activate <model> --generation <collection> --rows-verified`
+  activates a physically complete generation from the publication state stel
+  recorded for its rows. It reads only the upstream's schema and row count.
+  Before claiming anything it refuses a collection that is missing, carries
+  another configuration's fingerprint, or holds more rows than the upstream.
+  Under its claim it assembles the generation's state (its own scope's
+  records, filled from the serving scope for keys it never recorded),
+  re-stamps every record at the current `code_version`, and refuses if that
+  state names more rows than the collection holds or a 1,000-key sample of it
+  is absent from the collection. Then it builds missing indices, swaps the
+  state into the serving scope and activates. A late refusal is recorded as a
+  failed publish and leaves whatever was serving still served.
+- **A shortfall is reported, not refused.** A collection behind the upstream
+  (new filings embedded since its last complete write), or holding rows its
+  state does not describe (a page whose slices committed before its state
+  advanced), is activated and the gap printed on a `pending:` line; the next
+  incremental run publishes the one and re-checks the other. Refusing would
+  have sent the operator back to a corpus-reading resume to add a few hundred
+  rows, and a growing corpus would have refused every activation attempted
+  hours after the generation was written. State naming rows the collection
+  does not hold is still refused outright.
+- **Rows the state does not describe are marked, not left unknown.** Stale
+  discovery enumerates state keys absent upstream, so a collection row with
+  no state whose upstream key was later deleted would never be found again
+  (review finding on #630). Activation walks the collection's ids and records
+  each such row under the marker fingerprint `unverified-by-activation`; the
+  next run re-upserts the row if its key still exists upstream and deletes it
+  as stale if not. The walk runs on every activation and doubles as the
+  exhaustive membership check: a state key the collection does not hold is
+  now refused however the counts happen to balance, where the 1,000-key
+  sample alone could miss it. The `pending:` line's upstream figure is worded
+  as the net row-count difference it is, since deletions and insertions
+  cancel in it.
+- `--rows-verified` is the one assertion the command cannot check: that the
+  collection's rows are what the current code would publish, so re-stamping
+  their state as current is correct. True after a hash-only `code_version`
+  change such as #607's; the next incremental run reconciles against the
+  upstream regardless, so a wrong assertion costs one cycle of stale rows.
+- New store methods `count_present(collection, record_ids, id_field)`, the
+  membership probe the sample check uses, and
+  `iter_record_ids(collection, id_field, page_size)`, the bounded id stream
+  the marker pass walks. LanceDB and DuckDB implement both; the conformance
+  suite pins that every id is streamed exactly once.
+- ADR-0017 records the decision and amends ADR-0005.
+
+### A failed in-place publish keeps serving the generation it was updating (issue #617)
+
+- **One failed incremental publish took a ready index offline for three
+  weeks.** `sec_chunk_search` answered every query with
+  `capability_unavailable` from 2026-09-27 while the generation that had
+  served it sat intact in the store. Each weekly incremental publish writes
+  in place into the live generation, and ADR-0001 made that path fail closed:
+  the claim cleared `active_generation` and a failure left it cleared, on the
+  reasoning that an in-place failure "may have corrupted what was live". For
+  LanceDB that was never possible -- each `merge_insert` slice, delete and
+  index build is one Lance transaction over an immutable prior version, and
+  stel never discards prior versions while publishing -- so the index was
+  refused on a precaution against damage that cannot occur, until a publish
+  succeeded, and none could.
+- A store now declares `INTERRUPTION_SAFE_MUTATION` when an interrupted
+  in-place write leaves its collection readable with every row either wholly
+  old or wholly new. LanceDB and DuckDB declare it. On such a store an
+  in-place publish keeps the activation pointer through its claim, a clean
+  failure retains it and the scope goes `degraded` rather than `failed`, and
+  `stel serving recover` after a crash serves on from it. A failed republish
+  is a staleness event: the publication state already says which rows the
+  next run republishes. A store without the declaration keeps ADR-0001's
+  fail-closed behaviour unchanged.
+- **New ledger status `publishing_in_place`.** An in-place publish still
+  excludes readers for its duration (ADR-0003), and with the pointer kept the
+  status is what records that: readers see the same retryable "reconciling"
+  refusal as before. `publishing` now means only a private-generation build,
+  which readers run alongside. Anything that pattern-matches ledger statuses
+  has a new value to handle.
+- **`stel serving status` and `stel serving recover` say what is served.** A
+  new `serving:` line names the generation and collection a reader gets, says
+  when it is degraded and by what, and says "nothing" in words -- with why --
+  where the fields alone showed two dashes.
 
 ### A resumed search publish no longer pays index maintenance on every page (issue #616)
 
@@ -25,7 +114,7 @@
 - `RetrievalStore.drop_indexes` is the new seam, implemented by both in-tree
   stores and abstract rather than defaulted: a store that silently skipped it
   would show the decay with nothing in the code to point at.
-  [ADR-0016](docs/adr/0016-a-resume-drops-its-indices-and-rebuilds-once.md)
+  [ADR-0018](docs/adr/0018-a-resume-drops-its-indices-and-rebuilds-once.md)
   records why compaction every N pages was not the answer.
 
 **Worth knowing:** a resumed generation is briefly unindexed, between the drop

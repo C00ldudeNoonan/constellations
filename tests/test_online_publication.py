@@ -401,7 +401,10 @@ def test_online_publish_recovers_a_scope_left_failed_with_no_generation(tmp_path
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         before = coordinator.status(scope)
         assert before.config_fingerprint is not None
-        # A stranded in-place publisher: the claim clears the pointer, then dies.
+        # A stranded in-place publisher on a store that cannot promise an
+        # interrupted write leaves the collection sound: that claim clears the
+        # pointer, then dies. (On LanceDB the claim keeps it and the scope
+        # degrades instead -- issue #617; this is the fail-closed shape.)
         coordinator.acquire_publish(
             scope, expected_code_version="dead", config_fingerprint=before.config_fingerprint
         )

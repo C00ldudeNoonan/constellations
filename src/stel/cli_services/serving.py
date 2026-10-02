@@ -181,6 +181,117 @@ def serving_recover(
         )
 
 
+@dataclass(frozen=True)
+class ActivationReport:
+    """What `serving activate` did, plus the ledger it left behind."""
+
+    report: ServingReport
+    # Deferred import target; typed loosely so this module stays importable
+    # without the execution stack.
+    activation: Any
+
+
+def serving_activate(
+    project_dir: Path,
+    *,
+    profiles_dir: Path | None,
+    target: str | None,
+    model_name: str,
+    generation: str,
+    rows_verified: bool,
+) -> ActivationReport:
+    """Make a physically complete generation the served one (issue #615).
+
+    Refused without an explicit target, for the same reason `recover` is: it
+    changes what a store serves, and a defaulted target is how that lands on
+    the wrong one (#511). Refused without `rows_verified`, because re-stamping
+    the generation's state at the current code version is an assertion about
+    its rows that only the operator can make.
+    """
+    from ..execution.activation import activate_search_generation
+    from ..retrieval import ServingCoordinator
+
+    scope, _legacy, resolved, context = _resolve_serving_scopes(
+        project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
+    )
+    if target is None:
+        raise ConfigClickError(
+            "'stel serving activate' requires an explicit --target: it changes "
+            "which generation a store serves, so it must not act on a target "
+            f"nobody named. This profile would have used '{resolved.target_name}' "
+            f"(store {context[0]}: {context[1]} {context[2]}). Re-run with "
+            f"--target {resolved.target_name} to confirm that is the one you mean."
+        )
+    if not rows_verified:
+        raise ConfigClickError(
+            "'stel serving activate' re-stamps the generation's rows as current "
+            "under this code version, which it cannot verify. Confirm with "
+            "--rows-verified that the collection's rows are the current corpus "
+            "-- for example, after a release that changed only what the "
+            "code_version hash reads."
+        )
+    project_config, sources, models = load_project(project_dir)
+    validate_project_contract(project_config, sources, models, project_dir)
+    model = next(item for item in models if item.name == model_name)
+    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+        activation = activate_search_generation(
+            model=model,
+            models_by_name={item.name: item for item in models},
+            project=project_config,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            physical_collection=generation,
+            rows_verified=rows_verified,
+        )
+        coordinator = ServingCoordinator(adapter, ensure_schema=False)
+        report = _report(
+            coordinator.status(scope),
+            resolved=resolved,
+            context=context,
+            had_ledger_row=True,
+        )
+    return ActivationReport(report=report, activation=activation)
+
+
+def describe_serving(entry: ServingLedgerEntry) -> str:
+    """One line saying what a reader of this index gets right now.
+
+    The ledger fields answer it only to someone who knows the admission rule:
+    `active_generation: -` beside `status: failed` meant three weeks of refused
+    queries read as an idle index (issue #617). So the answer is spelled out,
+    and "nothing" is said in words rather than left as two dashes.
+    """
+    from ..retrieval.coordination import (
+        SERVABLE_STATUSES,
+        STATUS_DEGRADED,
+        STATUS_PUBLISHING_IN_PLACE,
+        STATUS_UNPUBLISHED,
+    )
+
+    if entry.status == STATUS_UNPUBLISHED:
+        return "nothing; the index has never been published"
+    if entry.status == STATUS_PUBLISHING_IN_PLACE:
+        return (
+            "nothing while an in-place publish holds the index; readers are "
+            "told to retry after it completes"
+        )
+    if entry.status not in SERVABLE_STATUSES or entry.active_generation is None:
+        return (
+            "nothing; no generation is active, and queries are refused until a "
+            "publish succeeds"
+        )
+    collection = entry.active_collection or "the default collection"
+    served = f"generation {entry.active_generation} from {collection}"
+    if entry.status == STATUS_DEGRADED:
+        return (
+            f"{served}, degraded: the last publish failed "
+            f"({entry.safe_error_code or 'no error code recorded'}), so readers "
+            "get the generation published before it"
+        )
+    return served
+
+
 def _report(
     entry: ServingLedgerEntry,
     *,

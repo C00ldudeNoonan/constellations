@@ -3380,22 +3380,40 @@ write a final log line. Check the container's OOM status externally, terminate
 the old owner before recovery, and use the surviving memory samples. Reducing
 `batch_size` bounds row payloads, not the native index builder's memory.
 
-A failed or recovered publication does not necessarily stop queries. A
-generation build writes to a collection nothing is reading, so its failure
-leaves the previously-active generation correct, and the scope is left
+A failed or recovered publication does not stop queries when the generation
+that was serving them is still sound. A generation build writes to a
+collection nothing is reading, so its failure leaves the previously-active
+generation correct. An in-place publish writes into the collection the
+activation pointer names, and on a store whose writes are each one transaction
+over an immutable prior version -- LanceDB and DuckDB both declare this, as
+`interruption_safe_mutation` -- an interrupted write leaves that collection
+readable with every row either wholly old or wholly new, so the generation is
+only staler than the publish meant it to be. In both cases the scope is left
 `degraded`: it keeps answering queries from that generation, and the recorded
 `safe_error_code` stays visible in `stel serving status` so a pipeline that
 has been broken for days does not hide behind a working endpoint. The next
-successful publish returns it to `ready` with no operator action.
+successful publish returns it to `ready` with no operator action. A failed
+republish is a staleness event, not an outage (issue #617: one failed
+incremental publish had refused every query for three weeks while the
+generation sat intact).
 
-An in-place publish is the exception. It writes into the collection the
-activation pointer names, so a failure there may have corrupted what was
-live; both pointers are cleared, the scope becomes `failed`, and queries are
-refused until a successful republish. A publisher that is *killed* rather
-than failing cleanly leaves no record of its intent, so the claim records it
-up front: an in-place claim clears the activation pointer when it is taken,
-which is what lets `stel serving recover` fail closed on a crashed in-place
-publish while still serving through a crashed rebuild.
+The exception is an in-place publish on a store that does not make that
+promise: a failure there may have corrupted what was live, so both pointers
+are cleared, the scope becomes `failed`, and queries are refused until a
+successful republish. A publisher that is *killed* rather than failing cleanly
+leaves no record of its intent, so the claim records it up front: an in-place
+claim on such a store clears the activation pointer when it is taken, which is
+what lets `stel serving recover` fail closed there while still serving through
+a crashed rebuild or a crashed in-place publish on a store that keeps its
+collections sound.
+
+While an in-place publish holds the scope its status is `publishing_in_place`
+and readers are refused with a retryable "reconciling" error, whatever the
+store; `publishing` is the private-generation build, which readers of the live
+generation run alongside. `stel serving status` and `stel serving recover`
+print a `serving:` line that says in words what a reader gets right now --
+which generation, from which collection, degraded or not -- or that they get
+nothing, and why.
 
 A generation retains the configuration fingerprint it was published under, so
 a rebuild forced by a *configuration change* leaves the old generation
@@ -3428,6 +3446,72 @@ The command is idempotent; a second run reports nothing to migrate. It is
 refused while query leases are outstanding (let readers finish, or run
 `stel serving recover`), and refused if the destination scope already holds a
 published ledger row rather than picking a winner between two publications.
+
+#### Activating a complete generation without re-reading the corpus
+
+A publish that writes every row and then cannot finish — an index build that
+fails, a process killed before activation, a read session that ends before
+the last page (issue #614) — leaves a private generation in the store that
+holds the whole corpus and that nothing serves. The next `stel run` resumes
+it (ADR-0005), which is right whenever that run can finish; when the resume
+itself cannot finish, the generation stays unserved indefinitely (issue
+#615). `stel serving activate` is the operator's way out:
+
+```bash
+stel serving activate chunk_search --target prod \
+    --generation myproj__prod__chunk_search__g12fbc89e3823 --rows-verified
+```
+
+`--generation` names the physical collection, as `stel serving status` and
+the store list it. The command reads nothing from the upstream but its schema
+and row count. It refuses, before claiming anything, unless the collection
+exists, carries this model's configuration fingerprint, and holds no more rows
+than the upstream relation. It then assembles the generation's publication
+state — its own scope's records, filled in from the serving scope's for keys
+it never recorded — re-stamps every record at the current `code_version`, and
+refuses, under its claim, if that state names more rows than the collection
+holds or any of its keys is absent from the collection (a 1,000-key sample
+first, then the exhaustive walk of the collection's ids described below). Only
+then does it build any missing indices, swap the state into the serving scope
+and activate.
+A refusal after the claim is recorded as a failed publish and leaves whatever
+was serving still served.
+
+Fewer rows than the upstream, or rows the state does not describe, are not
+refusals: both are what the next incremental run reconciles, and both are
+reported on a `pending:` line so the operator knows the activated index is
+behind. A collection that lacks this week's filings is what every index is
+between runs; refusing it would send the operator back to a resume that
+re-reads the corpus to add them. The first figure on that line is the upstream
+row count minus the collection's — a net difference, since a deletion and an
+insertion upstream cancel in it — so it is a lower bound on the staleness,
+not a count of the rows the next run will write.
+
+Rows the state does not describe get one piece of bookkeeping, because the
+next run could not otherwise find them: stale discovery enumerates *state*
+keys that no longer exist upstream, so a row with no state whose upstream key
+was later deleted would be served for good. The command walks the collection's
+ids and records every such row under a marker fingerprint
+(`unverified-by-activation`) that no upstream row can match. The next run then
+re-upserts the row, idempotently, if its key still exists upstream, and deletes
+it as stale if not; either way the marker is gone after one run. The walk
+happens on every activation, not only when the counts differ, because it is
+also how the other direction is caught exhaustively: state vouching for rows
+the collection does not hold is never tolerated, since the reconciler would
+skip those rows for good, and a ghost key and an undescribed row cancel in a
+row count. The walk visits every id, so after it the number of rows it marked
+differs from the count shortfall by exactly the number of ghost keys, and any
+ghost is a refusal.
+
+`--target` is required, as for `recover`. `--rows-verified` is the one claim
+the command cannot check and therefore will not make for you: that the rows in
+the collection are what the current code would publish, so re-stamping their
+state as current is correct. That is true after a release that changed only
+what the `code_version` hash reads (the upgrade note under #587 is one), and
+false after a change to how rows are embedded or chunked, where the next
+incremental run would otherwise have rewritten them. Whatever the state says,
+the next incremental run still reconciles against the upstream, so a wrong
+assertion costs one cycle of serving stale rows, not a permanent divergence.
 
 Governed indexes (`access: governed`) are supported on stores that declare
 strong read-after-write consistency and metadata filtering. Changed governed

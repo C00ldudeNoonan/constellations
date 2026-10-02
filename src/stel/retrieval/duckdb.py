@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime
 from math import isfinite
@@ -253,6 +253,11 @@ class DuckDBStore(RetrievalStore):
                     # atomic here, unlike a remote store batching over HTTP.
                     RetrievalFeature.DURABLE_WRITE_ACK,
                     RetrievalFeature.ATOMIC_BATCH_MUTATION,
+                    # Implied by the above: an all-or-nothing transaction
+                    # cannot leave a torn row, and a rolled-back one leaves
+                    # the table as it was (issue #617). Declared rather than
+                    # inferred so the ledger reads one flag for one question.
+                    RetrievalFeature.INTERRUPTION_SAFE_MUTATION,
                     RetrievalFeature.SINGLE_HOST_PUBLISHER_LOCK,
                     RetrievalFeature.PRIVATE_GENERATION_BUILD,
                     RetrievalFeature.COLLECTION_SEEDING,
@@ -938,6 +943,48 @@ class DuckDBStore(RetrievalStore):
             return conn.execute(statement, list(parameters or ())).to_arrow_table()
         except Exception:
             raise RetrievalError(_failure(operation)) from None
+
+    def count_present(
+        self, collection: str, record_ids: Sequence[str], *, id_field: str
+    ) -> int:
+        if not record_ids:
+            return 0
+        conn = self._connection()
+        placeholders = ", ".join("?" for _ in record_ids)
+        try:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_identifier(collection)} "
+                f"WHERE {_quote_identifier(id_field)} IN ({placeholders})",
+                list(record_ids),
+            ).fetchone()
+        except Exception:
+            raise RetrievalError(_failure("count present")) from None
+        return int(row[0]) if row else 0
+
+    def iter_record_ids(
+        self, collection: str, *, id_field: str, page_size: int
+    ) -> Iterator[Sequence[str]]:
+        # Ownership is the gate, as for seeding: a table this store does not
+        # own is not enumerated.
+        if self.inspect_collection(collection) is None:
+            raise RetrievalError(
+                f"DuckDB cannot list ids of '{collection}': it does not exist"
+            )
+        conn = self._connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT {_quote_identifier(id_field)} "
+                f"FROM {_quote_identifier(collection)}"
+            )
+            while True:
+                rows = cursor.fetchmany(page_size)
+                if not rows:
+                    return
+                yield [str(row[0]) for row in rows]
+        except RetrievalError:
+            raise
+        except Exception:
+            raise RetrievalError(_failure("list ids")) from None
 
     def _execute(
         self,

@@ -195,13 +195,21 @@ def _run_search_model(
                 )
             active_collection = serving_entry.active_collection
             # The generation serving queries before this publish, and the
-            # configuration it was published under. A rebuild that fails hands
-            # both back so the index keeps answering from it (issue #449); an
+            # configuration it was published under. A publish that fails hands
+            # both back so the index keeps answering from it (issue #449)
+            # whenever that generation is still sound: always for a rebuild,
+            # which wrote elsewhere, and for an in-place publish when the
+            # store promises an interrupted write leaves every row whole and
+            # the collection readable (issue #617). On any other store an
             # in-place publish must not, having written into what it names.
-            # The fingerprint travels with the generation; a private claim
+            # The fingerprint travels with the generation; a preserving claim
             # retains this pair until activation replaces both together.
             previous_generation = serving_entry.active_generation
             previous_fingerprint = serving_entry.config_fingerprint
+            interruption_safe = (
+                RetrievalFeature.INTERRUPTION_SAFE_MUTATION
+                in store.capabilities().features
+            )
             default_collection = store.physical_collection(logical_collection)
             requested = _rebuild_requested(model, full_refresh=full_refresh)
             plan = _config_change_forces_rebuild(
@@ -233,11 +241,14 @@ def _run_search_model(
                 # later private build failed and this one was retained) or the
                 # default in-place one (which sets a generation but no
                 # `active_collection`). A scope left `failed` by a stranded
-                # in-place publisher has no active generation and may sit on a
-                # half-rewritten collection; copying that forward would launder
-                # the damage into a generation that then activates as sound.
-                # That state rebuilds from the warehouse, retaining nothing
-                # (#473).
+                # in-place publisher on a store that could not promise a sound
+                # collection has no active generation and may sit on a
+                # half-rewritten one; copying that forward would launder the
+                # damage into a generation that then activates as sound. That
+                # state rebuilds from the warehouse, retaining nothing (#473).
+                # On an interruption-safe store the same crash leaves the
+                # pointer in place and the scope `degraded`, and the collection
+                # it names is sound by the store's promise (#617).
                 (active_collection or default_collection)
                 if plan.rows_unchanged
                 and not requested
@@ -322,11 +333,16 @@ def _run_search_model(
                 config_fingerprint=spec.config_fingerprint,
                 expected_fencing_token=serving_entry.fencing_token,
                 # A rebuild writes to a private generation, so the live one
-                # stays servable if this publisher dies; an in-place publish
-                # mutates what is live, and the claim clears the pointer so a
-                # crash recovers to `failed` rather than serving a half-
-                # rewritten collection (issue #449).
-                preserves_active_generation=rebuild,
+                # stays servable if this publisher dies. An in-place publish
+                # mutates what is live: on a store whose interrupted writes
+                # leave the collection sound the pointer survives too, so a
+                # crash recovers to `degraded` and keeps serving (issue #617);
+                # on any other store the claim clears it, so a crash recovers
+                # to `failed` rather than serving a half-rewritten collection
+                # (issue #449). Either way an in-place publish excludes
+                # readers for its duration (ADR-0003).
+                preserves_active_generation=rebuild or interruption_safe,
+                excludes_readers=not rebuild,
             )
             with store.publisher_fence(physical), store:
                 if rebuild:
@@ -523,7 +539,7 @@ def _run_search_model(
                 # Dropping here is how a resume gets that shape back --
                 # measured at 3.6-4.1x per-page growth with indices present
                 # against a flat 1.1x without, and 37% slower overall than
-                # dropping and rebuilding once (issue #616, ADR-0016).
+                # dropping and rebuilding once (issue #616, ADR-0018).
                 #
                 # Skipped when there is nothing left to write: a complete
                 # resume goes straight to `ensure_indexes`, and dropping
@@ -921,7 +937,9 @@ def _run_search_model(
             # A claim exists, so the pre-publish read of the serving entry ran
             # and both of these are bound.
             retain_previous = bool(
-                rebuild and previous_generation and previous_fingerprint
+                (rebuild or interruption_safe)
+                and previous_generation
+                and previous_fingerprint
             )
             _mark_search_publication_failed(
                 coordinator,
@@ -931,9 +949,13 @@ def _run_search_model(
                 # A rebuild builds where nothing is reading, so a failure
                 # leaves the previous generation intact and still correct --
                 # both pointers survive, and the scope stays servable from
-                # that generation (issues #355, #449). An in-place publish may
-                # have corrupted what it wrote into, so neither pointer may be
-                # trusted and the scope goes unavailable.
+                # that generation (issues #355, #449). So does an in-place
+                # publish on a store whose interrupted writes leave every row
+                # whole: what it wrote into is sound, only partly updated, and
+                # the publication state says which rows (issue #617). On any
+                # other store an in-place publish may have corrupted what it
+                # wrote into, so neither pointer may be trusted and the scope
+                # goes unavailable.
                 # Retained only when the previous generation's own
                 # configuration is known: a generation advertised under the
                 # configuration this run was building for would be handed to

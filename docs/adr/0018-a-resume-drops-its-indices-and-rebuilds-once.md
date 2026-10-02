@@ -1,4 +1,4 @@
-# ADR-0016: A resumed generation drops its indices and rebuilds them once
+# ADR-0018: A resumed generation drops its indices and rebuilds them once
 
 - **Status:** accepted
 - **Date:** 2026-10-02

@@ -31,7 +31,7 @@
   upstream regardless, so a wrong assertion costs one cycle of stale rows.
 - New store method `count_present(collection, record_ids, id_field)`, the
   membership probe the sample check uses. LanceDB and DuckDB implement it.
-- ADR-0016 records the decision and amends ADR-0005.
+- ADR-0017 records the decision and amends ADR-0005.
 
 ### A failed in-place publish keeps serving the generation it was updating (issue #617)
 

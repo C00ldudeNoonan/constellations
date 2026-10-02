@@ -1009,7 +1009,7 @@ class RetrievalFeature(StrEnum):
     ATOMIC_BATCH_MUTATION = "atomic_batch_mutation"
     # An interrupted in-place write leaves the collection readable and every
     # row whole, so the serving ledger keeps serving a generation a failed or
-    # killed in-place publish was writing into (issue #617, ADR-0015).
+    # killed in-place publish was writing into (issue #617, ADR-0016).
     INTERRUPTION_SAFE_MUTATION = "interruption_safe_mutation"
 
 

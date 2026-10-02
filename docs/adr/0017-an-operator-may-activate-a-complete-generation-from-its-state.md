@@ -1,4 +1,4 @@
-# ADR-0016: An operator may activate a physically complete generation from its recorded state
+# ADR-0017: An operator may activate a physically complete generation from its recorded state
 
 - **Status:** accepted
 - **Amends:** [ADR-0005](0005-re-entry-unit-is-the-existing-checkpoint.md) — its

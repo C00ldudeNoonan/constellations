@@ -9,11 +9,11 @@ history (issue #311).
 
 | ADR | Decision | Status |
 |---|---|---|
-| [0001](0001-degraded-serving-and-fail-closed-recovery.md) | A failed publish keeps serving its live generation; recovery fails closed | accepted; amended by 0003, 0015 |
+| [0001](0001-degraded-serving-and-fail-closed-recovery.md) | A failed publish keeps serving its live generation; recovery fails closed | accepted; amended by 0003, 0016 |
 | [0002](0002-vector-search-mode-is-an-index-build.md) | Switching `exact` <-> `approximate` is an index build, not a whole-index invalidation | accepted; amended by 0003 |
-| [0003](0003-reader-safe-online-publication.md) | Online changes use private generations, append writes, and reader-aware retirement | accepted; amended by 0004, 0015 |
+| [0003](0003-reader-safe-online-publication.md) | Online changes use private generations, append writes, and reader-aware retirement | accepted; amended by 0004, 0016 |
 | [0004](0004-seed-private-generation-from-store.md) | An index-only change fills its private generation from the store, not the warehouse | accepted |
-| [0005](0005-re-entry-unit-is-the-existing-checkpoint.md) | Re-entry resumes from each step's existing checkpoint; no phase ledger, no activate command | accepted; amended by 0016 |
+| [0005](0005-re-entry-unit-is-the-existing-checkpoint.md) | Re-entry resumes from each step's existing checkpoint; no phase ledger, no activate command | accepted; amended by 0017 |
 | [0006](0006-saas-context-is-landed-then-rendered.md) | SaaS context is landed by an EL tool and rendered by stel; no first-party connectors | accepted |
 | [0007](0007-native-drive-files-carry-a-change-token.md) | Native Drive files carry a change token named as such, never a fake content hash | accepted |
 | [0008](0008-reprocess-guard-defaults-to-fail.md) | Paid models refuse an unannounced reprocess by default; the guard reads the plan, not per-stage state | accepted |
@@ -24,9 +24,9 @@ history (issue #311).
 | [0012](0012-native-failure-detail-goes-to-an-operator-named-file.md) | The native detail behind a sanitized failure goes to a file the operator named, never to a log level | accepted; amended by [0014](0014-a-debug-switch-owns-its-destination.md) |
 | [0013](0013-a-merge-page-is-bounded-by-bytes-in-the-store.md) | A merge page is bounded by bytes, in the store, before it is sent — `batch_size` keeps counting rows | accepted |
 | [0014](0014-a-debug-switch-owns-its-destination.md) | A debug switch owns its own destination, and marks the records it is for | accepted |
-| [0015](0015-an-interrupted-in-place-write-keeps-its-generation-when-the-store-says-so.md) | A failed in-place publish keeps its generation when the store promises interrupted writes leave it sound; readers stay excluded by status | accepted |
-| [0016](0016-an-operator-may-activate-a-complete-generation-from-its-state.md) | An operator may activate a physically complete generation from its recorded state, re-stamped, without re-reading the corpus | accepted |
 | [0015](0015-a-sync-watermark-needs-two-independent-signals.md) | A sync watermark needs two independent signals — cheap state, and an authoritative content fingerprint — not one | accepted |
+| [0016](0016-an-interrupted-in-place-write-keeps-its-generation-when-the-store-says-so.md) | A failed in-place publish keeps its generation when the store promises interrupted writes leave it sound; readers stay excluded by status | accepted |
+| [0017](0017-an-operator-may-activate-a-complete-generation-from-its-state.md) | An operator may activate a physically complete generation from its recorded state, re-stamped, without re-reading the corpus | accepted |
 
 ## When to write one
 

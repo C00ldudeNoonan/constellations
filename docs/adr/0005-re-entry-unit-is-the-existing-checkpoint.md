@@ -1,7 +1,7 @@
 # ADR-0005: The unit of re-entry is each step's existing checkpoint, not a phase ledger
 
 - **Status:** accepted
-- **Amended by:** [ADR-0016](0016-an-operator-may-activate-a-complete-generation-from-its-state.md)
+- **Amended by:** [ADR-0017](0017-an-operator-may-activate-a-complete-generation-from-its-state.md)
   — `stel serving activate` exists for the case automatic resume cannot
   reach: a complete generation whose resume cannot finish its read. The unit
   of re-entry is unchanged.

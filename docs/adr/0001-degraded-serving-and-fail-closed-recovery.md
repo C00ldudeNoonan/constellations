@@ -4,7 +4,7 @@
 - **Amended by:** [ADR-0003](0003-reader-safe-online-publication.md) — the assumption
   that every publisher excludes readers. The decision here (a failed publish
   keeps serving its live generation; recovery fails closed) stands.
-  [ADR-0015](0015-an-interrupted-in-place-write-keeps-its-generation-when-the-store-says-so.md)
+  [ADR-0016](0016-an-interrupted-in-place-write-keeps-its-generation-when-the-store-says-so.md)
   — the in-place half of the asymmetry now applies only to a store that does
   not declare `INTERRUPTION_SAFE_MUTATION`; on one that does, an in-place
   claim keeps the pointer and a failure degrades rather than fails.

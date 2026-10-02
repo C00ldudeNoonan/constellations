@@ -1,4 +1,4 @@
-# ADR-0015: A failed in-place publish keeps its generation when the store promises interrupted writes leave it sound
+# ADR-0016: A failed in-place publish keeps its generation when the store promises interrupted writes leave it sound
 
 - **Status:** accepted
 - **Amends:** [ADR-0001](0001-degraded-serving-and-fail-closed-recovery.md) — the

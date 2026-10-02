@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### A BigQuery table-snapshot read failure's native cause now reaches `--diagnostics-file` (issue #614)
+
+A BigQuery Storage Read API session has a 6-hour maximum lifetime; a search
+publish's page-reading loop held one open for its entire run and failed once
+a corpus pushed past that wall. The failure was already reported safely --
+sanitized to `BigQuery table snapshot batch read failed`, retried from the
+same resumable generation -- but nothing told an operator *why* it failed, so
+every retry restarted the page loop for no better reason than the last one.
+The native exception now reaches `--diagnostics-file`/`STEL_DIAGNOSTICS_FILE`
+(ADR-0012), the same channel LanceDB operation failures already use, letting
+an operator tell a read-session expiry from any other mid-read failure
+without any native text reaching `run_results.json` or the CLI. The deeper
+fix -- not re-reading pages a resume already covered, or reopening the
+session per page against a pinned snapshot -- needs its own design pass and
+is not part of this change.
+
 ### `concept-cloud` shows what changed between two periods (issue #555)
 
 A single frozen view of a multi-year map answers "what is always here", not

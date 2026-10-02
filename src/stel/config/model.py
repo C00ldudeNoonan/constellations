@@ -24,6 +24,7 @@ from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 from ..agent_context import AgentContextGrain
 from ..credentials import CredentialReference, CredentialReferenceError
 from .identifiers import validate_node_name
+from .vocabulary import VALUES_FROM_PATTERN
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 _STRICT_CONFIG = ConfigDict(extra="forbid")
@@ -992,6 +993,25 @@ class FieldConfig(BaseModel):
     # output cannot carry an enum — the rendered prompt. A label list written
     # out in several places is a list that drifts.
     values: list[str] = Field(default_factory=list)
+    # A project-declared vocabulary in place of an inline `values:` (issue
+    # #625), so two fields classifying into the same set share one
+    # declaration instead of repeating it: `vocab.<name>`, resolved against
+    # `stel_project.yml`'s `vocabularies:` by `load_project` before any model
+    # sees this field. Resolution populates `values` (and `value_descriptions`
+    # below) and clears this back to `None` — everything downstream of
+    # `load_project` reads only `values`. Excluded from serialization: it is
+    # always `None` by the time any artifact is built, and a project that
+    # declares no vocabulary at all should not gain a new, always-null key on
+    # every enum field's manifest entry (#639 review).
+    values_from: str | None = Field(default=None, exclude=True)
+    # Populated by vocabulary resolution alongside `values`, from terms that
+    # declare a `description:`. Derived only — never authored directly.
+    # Excluded from serialization for the same reason as `values_from` above,
+    # and because round-tripping a non-empty value back through this model
+    # would otherwise trip the authoring guard below.
+    value_descriptions: dict[str, str] = Field(
+        default_factory=dict, repr=False, exclude=True
+    )
 
     @field_validator("values")
     @classmethod
@@ -1005,16 +1025,39 @@ class FieldConfig(BaseModel):
             seen.add(value)
         return v
 
+    @field_validator("values_from")
+    @classmethod
+    def _validate_values_from(cls, v: str | None) -> str | None:
+        if v is not None and not VALUES_FROM_PATTERN.match(v):
+            raise ValueError(f"values_from {v!r} must look like 'vocab.<name>'")
+        return v
+
+    @field_validator("value_descriptions")
+    @classmethod
+    def _reject_authored_value_descriptions(cls, v: dict[str, str]) -> dict[str, str]:
+        if v:
+            raise ValueError(
+                "`value_descriptions` is derived from `values_from:` by vocabulary "
+                "resolution and must not be set directly"
+            )
+        return v
+
     @model_validator(mode="after")
     def _validate_enum(self) -> FieldConfig:
-        if self.data_type == "enum" and not self.values:
+        if self.values and self.values_from:
             raise ValueError(
-                f"Field '{self.name}' is `type: enum` but declares no `values:`; "
-                "an enum with no closed set constrains nothing"
+                f"Field '{self.name}' declares both `values:` and `values_from:`; "
+                "use exactly one"
             )
-        if self.values and self.data_type != "enum":
+        if self.data_type == "enum" and not self.values and not self.values_from:
             raise ValueError(
-                f"Field '{self.name}' declares `values:` but is "
+                f"Field '{self.name}' is `type: enum` but declares no `values:` or "
+                "`values_from:`; an enum with no closed set constrains nothing"
+            )
+        if (self.values or self.values_from) and self.data_type != "enum":
+            declared = "values_from:" if self.values_from else "values:"
+            raise ValueError(
+                f"Field '{self.name}' declares `{declared}` but is "
                 f"`type: {self.data_type or 'string'}`; use `type: enum`"
             )
         return self

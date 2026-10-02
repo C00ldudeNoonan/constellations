@@ -118,6 +118,11 @@ def _build_field_spec(field: FieldConfig) -> dict[str, Any]:
         spec["description"] = field.description
     if field.values:
         spec["enum"] = list(field.values)
+        # A vocabulary term's `description:` (issue #625), carried only as
+        # far as the prompt fallback below — `_input_schema` does not copy
+        # this key, so it never reaches a provider's structured-output schema.
+        if field.value_descriptions:
+            spec["enum_descriptions"] = dict(field.value_descriptions)
     return spec
 
 

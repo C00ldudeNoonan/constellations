@@ -21,8 +21,11 @@ in general.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
+from .paths import resolve_module_file
 from .text.relations import (
     ModelAssertionExtractorOptions,
     RelationRule,
@@ -46,9 +49,14 @@ class RelationContractError(ValueError):
 
 
 def validate_relation_project_contracts(
-    models: list[ModelConfig], project: ProjectConfig
+    models: list[ModelConfig], project: ProjectConfig, project_dir: Path
 ) -> None:
     if not project.classes and not project.relations:
+        return
+    # A project file at the same dotted path wins over the built-in module
+    # (`_load_transform_module`), so its own `validate_options` owns the options
+    # shape and the built-in parser must not be applied to them (Codex on #649).
+    if resolve_module_file(RELATION_TRANSFORM_MODULE, project_dir).exists():
         return
     allowed_pairs: _AllowedPairs = {}
     for relation in project.relations:

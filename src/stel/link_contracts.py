@@ -9,8 +9,11 @@ time, before source discovery or any provider call.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
+from .paths import resolve_module_file
 from .text.linking import (
     AliasTableResolverOptions,
     parse_entity_link_options,
@@ -30,8 +33,13 @@ class LinkContractError(ValueError):
 
 
 def validate_link_project_contracts(
-    models: list[ModelConfig], project: ProjectConfig
+    models: list[ModelConfig], project: ProjectConfig, project_dir: Path
 ) -> None:
+    # A project file at the same dotted path wins over the built-in module
+    # (`_load_transform_module`), so its own `validate_options` owns the options
+    # shape and the built-in parser must not be applied to them.
+    if resolve_module_file(LINK_TRANSFORM_MODULE, project_dir).exists():
+        return
     for model in models:
         if (
             model.transform is None
@@ -39,14 +47,14 @@ def validate_link_project_contracts(
             or model.transform.module != LINK_TRANSFORM_MODULE
         ):
             continue
-        try:
-            options = parse_entity_link_options(model.transform.options)
-        except Exception:
-            # Malformed options are reported by the transform's own
-            # validate_options hook with a better, options-shape-specific
-            # message; this check only adds a constraint on top of options
-            # that already parse.
-            continue
+        # Not a second validation pass: `validate_project_contract` has already
+        # run `validate_options` -> `parse_entity_link_options` on this exact
+        # `model.transform.options` for every model, earlier in the same
+        # preflight, and raised on any that didn't parse. Reaching here with
+        # options that fail to parse again would mean the two calls disagree,
+        # a bug in this check rather than malformed project input, so it is
+        # left to raise, not swallowed (the #642 review finding, same pattern).
+        options = parse_entity_link_options(model.transform.options)
         if not isinstance(options, AliasTableResolverOptions):
             continue
         vocab_name = parse_vocabulary_alias_source(options.aliases)

@@ -1,6 +1,6 @@
 # ADR-0012: The native detail behind a sanitized failure goes to a file the operator named, never to a log level
 
-- **Status:** accepted; amended by [ADR-0014](0014-a-debug-switch-owns-its-destination.md)
+- **Status:** accepted; amended by [ADR-0014](0014-a-debug-switch-owns-its-destination.md), [ADR-0020](0020-a-native-panics-stderr-write-is-documented-not-intercepted.md)
 - **Date:** 2026-09-20
 - **Prompted by:** #590
 
@@ -107,3 +107,7 @@ An explicit call is one more thing a new sanitize site must remember.
   reach the file; the convention is now load-bearing. **Amended by ADR-0014:**
   that is exactly how the provider hatch's records were lost, so a record may
   now also declare itself with `PROVIDER_DIAGNOSTICS_EXTRA`.
+- "Every artifact stays as sanitized as before" covers what Python emits.
+  **Amended by ADR-0020:** a Rust panic inside the native extension writes to
+  stderr before the error reaches Python, outside this file and the
+  sanitizer; documented there, not intercepted.

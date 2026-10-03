@@ -36,6 +36,7 @@ from .providers import (
     get_embedding_provider,
     get_inference_provider,
 )
+from .relation_contracts import RelationContractError, validate_relation_project_contracts
 from .retrieval import (
     PUBLISHER_FENCING_FEATURES,
     RetrievalCapabilityError,
@@ -219,6 +220,17 @@ def validate_project_contract(
     try:
         validate_ml_project_contracts(models, project, project_dir)
     except MLContractError as e:
+        implicated = next(
+            (model for model in models if model.name == e.model_name),
+            None,
+        )
+        if implicated is None:
+            raise ConfigError(str(e)) from e
+        raise _model_error(implicated, str(e), e.path) from e
+
+    try:
+        validate_relation_project_contracts(models, project)
+    except RelationContractError as e:
         implicated = next(
             (model for model in models if model.name == e.model_name),
             None,

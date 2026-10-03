@@ -33,6 +33,7 @@ from ..search import (
     SearchFilter,
     SearchFilterOperator,
     SearchMode,
+    SearchOutcome,
     SearchRequest,
     SearchResult,
     SearchSession,
@@ -221,7 +222,7 @@ class ContextSearch(Protocol):
         *,
         policy_filters: Sequence[SearchFilter],
         timings: PhaseTimings | None = None,
-    ) -> Sequence[SearchResult]:
+    ) -> SearchOutcome:
         """`timings`, when given, collects the query's per-phase wall clock.
 
         Optional so a search that measures nothing still satisfies the
@@ -255,7 +256,7 @@ class PortableContextSearch:
         *,
         policy_filters: Sequence[SearchFilter],
         timings: PhaseTimings | None = None,
-    ) -> Sequence[SearchResult]:
+    ) -> SearchOutcome:
         return search(
             self._session.project_dir,
             request,
@@ -658,6 +659,8 @@ class ContextService:
             "returned_chunk_ids": [],
             "top_score": None,
             "served_generation": None,
+            "served_degraded": None,
+            "served_safe_error_code": None,
             "phase_ms": None,
             "elapsed_ms": None,
             "error_code": None,
@@ -1065,7 +1068,7 @@ class ContextService:
             self._business_filter(resource, item) for item in request.filters
         )
         timings = PhaseTimings()
-        hits = self._search.execute(
+        outcome = self._search.execute(
             SearchRequest(
                 model=resource.name,
                 query=request.query,
@@ -1077,6 +1080,7 @@ class ContextService:
             policy_filters=authorized.policy_filters,
             timings=timings,
         )
+        hits = outcome.results
         chunk_rows = self._chunks_for_hits(
             resource, hits, identity=authorized.warehouse_identity
         )
@@ -1124,9 +1128,14 @@ class ContextService:
                     caller=caller,
                     timings=timings,
                     hits=hits,
+                    outcome=outcome,
                 )
             )
-        return SearchContextResponse(results=results)
+        return SearchContextResponse(
+            results=results,
+            degraded=outcome.degraded,
+            safe_error_code=outcome.safe_error_code,
+        )
 
     def _query_log_row(
         self,
@@ -1140,6 +1149,7 @@ class ContextService:
         caller: CallerInfo | None,
         timings: PhaseTimings,
         hits: Sequence[SearchResult],
+        outcome: SearchOutcome,
     ) -> Mapping[str, Any]:
         """Build one served query's log row.
 
@@ -1192,6 +1202,12 @@ class ContextService:
             # Which index build answered, so latency and recall attach to a
             # generation rather than to a model name that outlives it.
             "served_generation": hits[0].provenance.generation if hits else None,
+            # The lease's own status, not inferred from whether any hit came
+            # back: a degraded index answers "nothing matched" exactly as a
+            # ready one does, and `hits[0]` above is already blind to that
+            # for the same reason (issue #617, ask 3).
+            "served_degraded": outcome.degraded,
+            "served_safe_error_code": outcome.safe_error_code,
             "error_code": None,
         }
 

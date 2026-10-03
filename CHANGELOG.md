@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### The serving ledger says who holds a publish claim, and how long since they were heard from (issue #621)
+
+- **`publisher: active` was all `stel serving status` could say about a
+  process dead for forty minutes.** After a host crash killed a publish, the
+  claim recorded only when it was acquired, so deciding whether `recover
+  --owner-terminated` was safe took a five-step hunt entirely outside stel.
+  The claim now records the publisher's host, PID, process start time and an
+  operator-supplied label (`STEL_PUBLISHER_LABEL`, for an orchestrator run
+  id), and the page loop touches a heartbeat once per page. `serving status`
+  prints them as the `publisher:` line with the heartbeat's age, and
+  `recover`'s refusal names them.
+- **`recover` may proceed without `--owner-terminated` in exactly one case:**
+  the row names a publisher in this PID namespace on this kernel boot whose
+  PID and start time match no running process, which is provable from
+  `/proc`. A matching hostname is not enough: two containers can share one. Everywhere else the
+  confirmation stays required and the refusal is informed. Heartbeat age is
+  shown and never acted on: the index build after the last page has no page
+  to beat on and is not dead. ADR-0019 records the alternatives.
+- Six nullable columns join the serving ledger, added to an older ledger the
+  way `active_collection` was. One DML per page on the publish path; it
+  doubles as the fence check.
+
+### A degraded search index tells its readers, not just its operator (issue #617)
+
+A failed republish keeps serving the last good generation rather than going
+dark (#624, issue #617 asks 1 and 2), but nothing told a *reader* it was
+getting a stale answer instead of a fresh one — `search_context`'s response
+and `stel search`'s output looked identical either way, and a degraded index
+with zero matching hits could not be told apart from a healthy one with none,
+since the signal lives on the query lease, not on the hits.
+
+`search()`'s return gained a `SearchOutcome` wrapper (`results`, `degraded`,
+`safe_error_code`) in place of a bare list. `search_context` carries the same
+two fields at the top level of its `mcp_context/v1` response — additive, per
+the precedent [ADR-0008](docs/adr/0008-mcp-hits-carry-declared-attributes.md)
+set for the `attributes` field, not a v2 — and `mcp_query_log` gained
+`served_degraded`/`served_safe_error_code` columns alongside the existing
+`served_generation`. `stel search` prints the same warning `stel serving
+status` already does, to stderr so `--output json` stays a plain array on
+stdout.
+
+Ask 3 of #617, the one PR #624 deliberately left open. The CLI's own
+`--output json` array shape is unchanged; only the MCP response and the
+query log gained fields.
+
 ### A long publication phase reports progress another process can read (issue #635)
 
 - **`serving activate`'s re-stamp phase ran for ~2.3 hours with nothing to
@@ -26,6 +71,40 @@
 **Upgrading:** the `progress_note` column is added to an existing ledger by
 the same `ALTER TABLE` path that added `active_collection` for #355. Nullable,
 so nothing already recorded changes meaning.
+
+### An absence probe that names a scope, for the activate re-stamp (issue #635)
+
+- **This does not reduce the phase's BigQuery bytes.** It was first described
+  as removing ~75% of them; that was wrong, and the description is corrected
+  here rather than left standing. Deciding which of the serving scope's
+  records the generation lacked used a per-batch
+  `record_key IN UNNEST(...)` over the generation slice (~514 MB) beside the
+  walk's own page query over the serving slice (~453 MB). The anti-join is now
+  inside the page query -- which is submitted *per page* -- so both slices are
+  still scanned per batch, and `LIMIT` does not reduce bytes processed. What
+  it removes is one query *job* per batch, which is round-trip overhead.
+- `StateScopeAbsenceProbe` lets `state_page_reader` restrict an ordered walk
+  to keys absent from **another scope** of the state table, with the warehouse
+  evaluating the anti-join. The existing relation form (`StateAbsenceProbe`,
+  #428) is unchanged: probing the state table through it would have asked
+  "absent from the whole table", so a key held under any other model or target
+  would wrongly have counted as known.
+- **Absence is still resolved in the warehouse, not in memory.** Holding one
+  scope's keys and comparing locally is what #428 moved *out* of Python, and
+  `docs/architecture/bounded-memory.md` prices a 3.6M-row key domain at
+  370-740 MB against the bounded-residency invariant (#153).
+- The probe reads the same immutable snapshot as the walk, so records
+  activation writes into the generation as it goes cannot make later pages
+  skip rows earlier pages just recorded.
+- **A correctness fix that was never about cost:** the fill phase may only
+  take keys the generation never recorded. A row the interrupted build
+  rewrote carries its own newer fingerprint, and the serving scope's older
+  record would have made the next incremental run republish a row that was
+  already current. Nothing pinned that before.
+
+**Still open on #635:** why a trailing-column range predicate does not prune
+when `record_key` is already the last clustering column -- which is what both
+a materialising fix and the keyset walk's own cost depend on.
 
 ## v0.20.0 - 2026-10-02
 

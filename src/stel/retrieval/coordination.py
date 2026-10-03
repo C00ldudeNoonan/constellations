@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..adapters.base import SERVING_LEASE_TABLE, SERVING_LEDGER_TABLE
 from .base import RetrievalError
+from .publisher_identity import Liveness, PublisherIdentity, describe_publisher, local_liveness
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +76,27 @@ RECOVERY_ERROR_CODE = "administrative_recovery"
 
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
+log = logging.getLogger(__name__)
+
+# Ledger columns added after the table first shipped, with the type each was
+# added as. `_ensure_tables` is CREATE TABLE IF NOT EXISTS, which leaves an
+# existing table alone, so every one of these is also an ALTER on a ledger
+# written by an earlier version (issues #355, #621).
+_LEDGER_COLUMNS_ADDED_LATER: tuple[tuple[str, str], ...] = (
+    ("active_collection", "STRING"),
+    # Who holds the publish claim, and when they were last heard from (issue
+    # #621). Epoch seconds rather than TIMESTAMP, so an age computed from
+    # them does not depend on a warehouse session's time zone.
+    ("publisher_host", "STRING"),
+    ("publisher_pid", "BIGINT"),
+    ("publisher_started_epoch", "BIGINT"),
+    ("publisher_label", "STRING"),
+    ("publisher_heartbeat_epoch", "BIGINT"),
+    ("publisher_namespace", "STRING"),
+    # What a long publication phase has done so far (issue #635).
+    ("progress_note", "STRING"),
+)
+
 
 class ServingCoordinationError(RetrievalError):
     """Artifact-safe serving coordination failure."""
@@ -117,6 +140,11 @@ class ServingLedgerEntry:
     rows_skipped: int
     rows_deleted: int
     query_leases: int
+    # The process holding `publication_id`, when one does (issue #621); None
+    # otherwise. Not part of any artifact: `serving_resource` does not carry
+    # it, and `stel serving status` is where it is read.
+    publisher: PublisherIdentity | None
+    publisher_heartbeat_epoch: int | None
 
 
 @dataclass(frozen=True)
@@ -141,6 +169,17 @@ class QueryLease:
     # lease pinned even if activation moves the pointer underneath it.
     pinned_collection: str | None
     config_fingerprint: str
+    # `STATUS_READY`, `STATUS_DEGRADED` or `STATUS_PUBLISHING` -- the only
+    # statuses `acquire_query` admits. A caller that only reads
+    # `pinned_generation` cannot tell a normal answer from one served because
+    # the next publish failed (issue #617, ask 3): `stel serving status`
+    # already says this in words, and a programmatic reader deserves the same
+    # signal to decide whether to degrade instead of trusting a silent pin.
+    status: str
+    # Set only when `status == STATUS_DEGRADED`, mirroring the same ledger
+    # column `stel serving status` reads to explain *why* -- a consumer that
+    # wants to decide how to degrade needs more than "stale".
+    safe_error_code: str | None
 
 
 def validate_safe_error_code(code: str) -> str:
@@ -212,7 +251,13 @@ class ServingCoordinator:
                 rows_skipped BIGINT NOT NULL,
                 rows_deleted BIGINT NOT NULL,
                 started_at TIMESTAMP,
-                completed_at TIMESTAMP
+                completed_at TIMESTAMP,
+                publisher_host STRING,
+                publisher_pid BIGINT,
+                publisher_started_epoch BIGINT,
+                publisher_label STRING,
+                publisher_heartbeat_epoch BIGINT,
+                publisher_namespace STRING
             )
             """
         )
@@ -232,25 +277,24 @@ class ServingCoordinator:
         )
 
     def _ensure_ledger_columns(self) -> None:
-        """Add columns to a ledger created before they existed.
+        """Add every column a ledger created by an earlier version lacks.
 
         `_ensure_tables` uses CREATE TABLE IF NOT EXISTS, which does nothing
         to an existing table, so a ledger written by an earlier version would
-        otherwise fail every statement naming a new column.
+        otherwise fail every statement naming a newer column.
 
-        `active_collection` predates issue #355, `progress_note` predates
-        #635. Both nullable, so widening changes the meaning of nothing
-        already recorded.
+        `active_collection` predates issue #355, the publisher columns #621,
+        `progress_note` #635. All nullable, so widening changes the meaning
+        of nothing already recorded.
         """
         columns = self._adapter.table_column_names(LEDGER_TABLE)
         if columns is None:
             return
-        for column in ("active_collection", "progress_note"):
-            if column in columns:
+        for name, column_type in _LEDGER_COLUMNS_ADDED_LATER:
+            if name in columns:
                 continue
             self._adapter.execute(
-                f"ALTER TABLE {self._ref(LEDGER_TABLE)} "
-                f"ADD COLUMN {column} STRING"
+                f"ALTER TABLE {self._ref(LEDGER_TABLE)} ADD COLUMN {name} {column_type}"
             )
 
     def _ensure_row(self, scope: StateScope) -> None:
@@ -386,7 +430,9 @@ class ServingCoordinator:
             SELECT fencing_token, status, publication_id, expected_code_version,
                    config_fingerprint, active_generation, safe_error_code,
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
-                   active_collection, progress_note
+                   active_collection, publisher_host, publisher_pid,
+                   publisher_started_epoch, publisher_label,
+                   publisher_heartbeat_epoch, publisher_namespace, progress_note
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -417,7 +463,9 @@ class ServingCoordinator:
             SELECT fencing_token, status, publication_id, expected_code_version,
                    config_fingerprint, active_generation, safe_error_code,
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
-                   active_collection,
+                   active_collection, publisher_host, publisher_pid,
+                   publisher_started_epoch, publisher_label,
+                   publisher_heartbeat_epoch, publisher_namespace, progress_note,
                    (
                        SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
                        WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -485,6 +533,8 @@ class ServingCoordinator:
                 rows_skipped=0,
                 rows_deleted=0,
                 query_leases=0,
+                publisher=None,
+                publisher_heartbeat_epoch=None,
             )
         return ServingLedgerEntry(
             status=str(row[1]),
@@ -495,12 +545,14 @@ class ServingCoordinator:
             active_generation=None if row[5] is None else str(row[5]),
             active_collection=None if row[11] is None else str(row[11]),
             safe_error_code=None if row[6] is None else str(row[6]),
-            progress_note=None if row[12] is None else str(row[12]),
+            progress_note=None if row[18] is None else str(row[18]),
             rows_inserted=int(row[7]),
             rows_updated=int(row[8]),
             rows_skipped=int(row[9]),
             rows_deleted=int(row[10]),
             query_leases=self._lease_count(scope),
+            publisher=_publisher_from_row(row),
+            publisher_heartbeat_epoch=None if row[16] is None else int(row[16]),
         )
 
     # ─── publication claims ───────────────────────────────────────────────
@@ -514,6 +566,7 @@ class ServingCoordinator:
         preserves_active_generation: bool = False,
         excludes_readers: bool | None = None,
         expected_fencing_token: int | None = None,
+        publisher: PublisherIdentity | None = None,
     ) -> PublishLease:
         """Claim exclusive publication authority with a fresh fencing token.
 
@@ -549,9 +602,16 @@ class ServingCoordinator:
         The default is the fail-closed one. A caller that says nothing gets
         in-place semantics on an untrusted store, so forgetting these
         arguments gives up availability rather than serving something corrupt.
+
+        `publisher` is who is making the claim, recorded on the row so that a
+        publisher that dies can still be identified (issue #621). It defaults
+        to the calling process, which is right for every caller but a test
+        standing in for one; the first heartbeat is the claim itself.
         """
         if excludes_readers is None:
             excludes_readers = not preserves_active_generation
+        if publisher is None:
+            publisher = PublisherIdentity.current()
         self._ensure_row(scope)
         publication_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
@@ -581,7 +641,10 @@ class ServingCoordinator:
                 status = ?, expected_code_version = ?,
                 config_fingerprint = {fingerprint_assignment},
                 safe_error_code = NULL, started_at = CURRENT_TIMESTAMP,
-                completed_at = NULL{retain_generation}
+                completed_at = NULL{retain_generation},
+                publisher_host = ?, publisher_pid = ?,
+                publisher_started_epoch = ?, publisher_label = ?,
+                publisher_heartbeat_epoch = ?, publisher_namespace = ?
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id IS NULL
               {planning_guard}
@@ -596,6 +659,12 @@ class ServingCoordinator:
                 STATUS_PUBLISHING_IN_PLACE if excludes_readers else STATUS_PUBLISHING,
                 expected_code_version,
                 config_fingerprint,
+                publisher.host,
+                publisher.pid,
+                publisher.started_epoch,
+                publisher.label,
+                int(time.time()),
+                publisher.namespace,
                 *self._scope_params(scope),
                 *planning_params,
                 *query_params,
@@ -638,6 +707,37 @@ class ServingCoordinator:
                 "further store I/O"
             )
 
+    def heartbeat(self, lease: PublishLease) -> None:
+        """Record that this publisher is still working, fenced like every write.
+
+        The page loop calls it once per page (issue #621), so `stel serving
+        status` can show how long since the holder was heard from, and an
+        operator can tell a publisher dead for forty minutes from one mid-way
+        through a page. It is a conditional update on the claim, so a fenced-out
+        publisher learns here that authority moved, exactly as `verify_publish`
+        would tell it. One DML per page: on BigQuery that is about a second
+        against a page that takes minutes, and it is what the question costs.
+
+        A silent stretch is not proof of death: the index build after the last
+        page is one long call with no page to beat on, and so is a resumed
+        build's index drop. `recover` therefore never acts on heartbeat age.
+        """
+        self._adapter.execute(
+            f"""
+            UPDATE {self._ref(LEDGER_TABLE)}
+            SET publisher_heartbeat_epoch = ?
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND publication_id = ? AND fencing_token = ?
+            """,
+            [
+                int(time.time()),
+                *self._scope_params(lease.scope),
+                lease.publication_id,
+                lease.fencing_token,
+            ],
+        )
+        self.verify_publish(lease)
+
     def _finish(
         self,
         lease: PublishLease,
@@ -664,7 +764,10 @@ class ServingCoordinator:
                 rows_inserted = ?, rows_updated = ?, rows_skipped = ?,
                 rows_deleted = ?, publication_id = NULL,
                 progress_note = NULL,
-                completed_at = CURRENT_TIMESTAMP{restore_fingerprint}
+                completed_at = CURRENT_TIMESTAMP{restore_fingerprint},
+                publisher_host = NULL, publisher_pid = NULL,
+                publisher_started_epoch = NULL, publisher_label = NULL,
+                publisher_heartbeat_epoch = NULL, publisher_namespace = NULL
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id = ? AND fencing_token = ?
             """,
@@ -890,9 +993,13 @@ class ServingCoordinator:
                 "and resolve any recorded failure first"
             )
         fencing_token = int(row[0])
+        status = str(row[1])
         pinned_generation = str(row[5])
         pinned_collection = None if row[11] is None else str(row[11])
         config_fingerprint = "" if row[4] is None else str(row[4])
+        safe_error_code = (
+            str(row[6]) if status == STATUS_DEGRADED and row[6] is not None else None
+        )
         lease_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
         leases = self._ref(LEASE_TABLE)
@@ -922,14 +1029,6 @@ class ServingCoordinator:
                 pinned_generation,
             ],
         )
-        lease = QueryLease(
-            scope=scope,
-            lease_id=lease_id,
-            fencing_token=fencing_token,
-            pinned_generation=pinned_generation,
-            pinned_collection=pinned_collection,
-            config_fingerprint=config_fingerprint,
-        )
         held = self._adapter.rows(
             f"SELECT 1 FROM {leases} WHERE lease_id = ?",
             [lease_id],
@@ -938,6 +1037,36 @@ class ServingCoordinator:
             raise ServingBusyError(
                 "A publisher claimed this search index during query admission; retry"
             )
+        # The insert's own WHERE EXISTS is what actually admits the lease,
+        # not the read above it -- so a status this stale could still be
+        # true when the fencing token and generation it checked are, if a
+        # generation-preserving publish (issue #617) moved from `publishing`
+        # to `degraded` in between. Both keep the same fencing token and
+        # active generation, so the insert would still succeed with a status
+        # this lease has not seen (Codex review, #641). Re-read after
+        # confirming admission rather than trust the pre-admission snapshot.
+        current = self._read_row(scope)
+        if (
+            current is not None
+            and int(current[0]) == fencing_token
+            and current[5] is not None
+            and str(current[5]) == pinned_generation
+        ):
+            status = str(current[1])
+            safe_error_code = (
+                str(current[6]) if status == STATUS_DEGRADED and current[6] is not None
+                else None
+            )
+        lease = QueryLease(
+            scope=scope,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+            pinned_generation=pinned_generation,
+            pinned_collection=pinned_collection,
+            config_fingerprint=config_fingerprint,
+            status=status,
+            safe_error_code=safe_error_code,
+        )
         try:
             self.validate_query(lease, require_active=True)
         except ServingCoordinationError:
@@ -1000,12 +1129,20 @@ class ServingCoordinator:
         write leaves the collection sound, or one that never had a generation.
         A crashed in-place publish on an interruption-safe store kept its
         pointer at claim time and serves on from here (issue #617).
+
+        Without `owner_terminated`, recovery proceeds in exactly one case: the
+        row names a publisher in *this* PID namespace on *this* kernel boot
+        whose PID and process start time no longer match any running process
+        (issue #621). That is provable
+        from here, and it is the common case -- an orchestrator-launched build
+        on the same host as the operator. Every other case is refused, and the
+        refusal names what the ledger knows about the owner, so the operator's
+        confirmation is informed rather than a guess. Heartbeat age is shown
+        but never acted on: a publisher inside an index build has no page to
+        beat on and is not dead.
         """
         if not owner_terminated:
-            raise ServingCoordinationError(
-                "Serving recovery requires terminating the previous owner first; "
-                "re-run with the owner-terminated confirmation"
-            )
+            self._refuse_unless_owner_provably_dead(scope)
         ledger = self._ref(LEDGER_TABLE)
         # Recovery rebuilds the row, so the activation pointers have to be
         # read before it is deleted and carried across (issues #355, #449).
@@ -1110,3 +1247,48 @@ class ServingCoordinator:
             ],
         )
         return self.status(scope)
+
+    def _refuse_unless_owner_provably_dead(self, scope: StateScope) -> None:
+        """Let recovery through without confirmation only for a dead local owner."""
+        entry = self.status(scope)
+        owner = entry.publisher
+        if owner is not None and local_liveness(owner) is Liveness.DEAD:
+            log.info(
+                "%s: recovering without confirmation; the recorded publisher "
+                "(host=%s pid=%d) is provably not running in this PID namespace",
+                scope.model_name,
+                owner.host,
+                owner.pid,
+            )
+            return
+        recorded = (
+            describe_publisher(
+                owner, heartbeat_epoch=entry.publisher_heartbeat_epoch, now_epoch=int(time.time())
+            )
+            if owner is not None
+            else "no publisher is recorded on the row"
+        )
+        raise ServingCoordinationError(
+            "Serving recovery requires terminating the previous owner first; "
+            f"the ledger records the publisher as {recorded}. Confirm it is "
+            "gone everywhere it could be running, then re-run with the "
+            "owner-terminated confirmation"
+        )
+
+
+def _publisher_from_row(row: tuple[Any, ...]) -> PublisherIdentity | None:
+    """The publisher the row records, or None when no claim is held.
+
+    Keyed on `publication_id` rather than on the identity columns: a finished
+    publish clears both, but a row written by a version that predates the
+    identity columns can hold a claim with nothing recorded about its holder.
+    """
+    if row[2] is None or row[12] is None or row[13] is None:
+        return None
+    return PublisherIdentity(
+        host=str(row[12]),
+        pid=int(row[13]),
+        started_epoch=None if row[14] is None else int(row[14]),
+        label=None if row[15] is None else str(row[15]),
+        namespace=None if row[17] is None else str(row[17]),
+    )

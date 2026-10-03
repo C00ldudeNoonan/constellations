@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from stel.cli_services.serving import describe_serving
+from stel.cli_services.serving import describe_publisher_claim, describe_serving
 from stel.retrieval.coordination import (
     RECOVERY_ERROR_CODE,
     STATUS_DEGRADED,
@@ -21,6 +21,7 @@ from stel.retrieval.coordination import (
     STATUS_UNPUBLISHED,
     ServingLedgerEntry,
 )
+from stel.retrieval.publisher_identity import PublisherIdentity
 
 
 def _entry(
@@ -31,6 +32,8 @@ def _entry(
     safe_error_code: str | None = None,
     publication_id: str | None = None,
     progress_note: str | None = None,
+    publisher: PublisherIdentity | None = None,
+    publisher_heartbeat_epoch: int | None = None,
 ) -> ServingLedgerEntry:
     return ServingLedgerEntry(
         status=status,
@@ -47,6 +50,8 @@ def _entry(
         rows_skipped=0,
         rows_deleted=0,
         query_leases=0,
+        publisher=publisher,
+        publisher_heartbeat_epoch=publisher_heartbeat_epoch,
     )
 
 
@@ -134,3 +139,29 @@ def test_a_private_build_keeps_serving_the_live_generation() -> None:
         _entry(STATUS_PUBLISHING, active_generation="g17b61b4a", publication_id="p1")
     )
     assert line == "generation g17b61b4a from the default collection"
+
+
+def test_the_publisher_line_names_who_holds_the_claim_and_their_last_heartbeat() -> None:
+    """`publisher: active` was all the row could say about a process dead for
+    forty minutes (issue #621). The line now says which process, where, and
+    how long since its last page."""
+    entry = _entry(
+        STATUS_PUBLISHING_IN_PLACE,
+        publication_id="p1",
+        publisher=PublisherIdentity(
+            host="dagster-user-code",
+            pid=4242,
+            started_epoch=1_700_000_000,
+            label="run-abc",
+            namespace="boot/pid:[1]",
+        ),
+        publisher_heartbeat_epoch=1_700_000_600,
+    )
+    line = describe_publisher_claim(entry, now_epoch=1_700_003_000)
+    assert line.startswith("active: host=dagster-user-code pid=4242")
+    assert "label=run-abc" in line
+    assert "last heartbeat 40m00s ago" in line
+
+
+def test_no_claim_is_a_dash_on_the_publisher_line() -> None:
+    assert describe_publisher_claim(_entry(STATUS_READY), now_epoch=0) == "-"

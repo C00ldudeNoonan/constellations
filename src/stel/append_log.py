@@ -136,6 +136,11 @@ QUERY_LOG_SCHEMA: dict[str, Any] = {
     "filters": pl.String,
     "phase_ms": pl.String,
     "served_generation": pl.String,
+    # Whether the pinned generation was the ready one or the last good one
+    # kept alive after a failed republish, and why, when it was the latter
+    # (issue #617, ask 3). Null for a refused call: there is no lease to ask.
+    "served_degraded": pl.Boolean,
+    "served_safe_error_code": pl.String,
     # Null on a served answer; the contract code on a refused one. A refused
     # request used to log nothing at all, which made the log silent about
     # exactly the traffic an operator most wants to see.

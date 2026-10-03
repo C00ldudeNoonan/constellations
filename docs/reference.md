@@ -3391,6 +3391,30 @@ stel serving status chunk_search     # ledger status, fence, counts, leases
 stel serving recover chunk_search --target prod --owner-terminated
 ```
 
+The claim records who holds it (issue #621): the publisher's host, PID,
+process start time and a label, plus a heartbeat the page loop touches once a
+page. `status` prints them as the `publisher:` line:
+
+```
+publisher:         active: host=dagster_user_code pid=4242, started=2026-10-01T16:02:11Z, label=run-7f3a, last heartbeat 40m00s ago (2026-10-01T16:46:03Z)
+```
+
+Set `STEL_PUBLISHER_LABEL` in the publisher's environment to tag the claim --
+an orchestrator's run id is the intended value. It is written to the ledger
+and printed here, so it is a name, never a secret. A silent heartbeat is not
+proof of death: the index build after the last page is one long call with no
+page to beat on, so `recover` displays the age and never acts on it.
+
+`recover` proceeds without `--owner-terminated` in one case only: the row
+names a publisher in *this* PID namespace on *this* kernel boot, and no
+process with that PID and start time exists, which is provable (Linux, via
+`/proc`). Every other case is refused, and the refusal says what the ledger
+knows about the owner -- host, PID, label, last heartbeat -- so the
+confirmation is informed. A matching hostname is not enough on its own, since
+two containers can be configured with one; a build inside a container is in
+its own PID namespace, so from the host it reads as unknown and the
+confirmation stays required (ADR-0019).
+
 **Both commands name what they resolved**, because the ledger alone does not
 identify it:
 
@@ -3863,6 +3887,39 @@ artifacts.
 Relations materialize incrementally on the same one-to-many path as the other
 child tables: a changed document re-derives exactly its relation rows. See
 `examples/economic_nlp/` for runnable co-occurrence and rule pipelines.
+
+#### Checking relation types against a declaration
+
+`relation_type` is otherwise a free string: nothing stops two rules in one
+project from asserting `owns` and `owned_by` for the same fact, or a
+`model_assertion` model's `relation_types` from naming something no other
+model agrees on (issue #626).
+
+A project's `classes:`/`relations:` block — alongside `vocabularies:` — opts
+a project into checking its `rule` and `model_assertion` models against a
+declared domain/range:
+
+```yaml
+# stel_project.yml
+classes: [company, country]
+relations:
+  - name: located_in
+    subject_class: company
+    object_class: country
+```
+
+At compile time, a `rule` extractor's `relation_type` and
+`subject_label`/`object_label` pairing must match a declared relation exactly;
+a `model_assertion` model's `relation_types` must each be a declared relation
+name. Either failure names the model and the declared alternatives. The same
+`name` may repeat with a different pairing — `located_in` can hold for both
+`company -> country` and `person -> country` — so a relation type is not
+required to be monomorphic.
+
+A project that declares neither `classes:` nor `relations:` is unaffected:
+this adds a constraint only where one exists, never a new requirement, and
+the `co_occurrence` extractor (whose `relation_type` is a single operator
+label, not a typed pairing) is never checked against it.
 
 That path classifies parents from a **streamed** read of the parent table,
 keeping one digest per row rather than the row, and then reads back only the
@@ -4735,8 +4792,9 @@ all four tools: `logged_at`, `tool`, `request_id`, `client_name`,
 `client_version`, `transport`, `principal_id`, `tenant_id`, `model_name`,
 `target_id`, `mode`, `query_fingerprint`, `requested_limit`,
 `candidate_limit`, `filters`, `result_count`, `zero_results`,
-`returned_chunk_ids`, `top_score`, `served_generation`, `phase_ms`,
-`elapsed_ms`, `error_code`. Written **after** authorization and policy
+`returned_chunk_ids`, `top_score`, `served_generation`, `served_degraded`,
+`served_safe_error_code`, `phase_ms`, `elapsed_ms`, `error_code`. Written
+**after** authorization and policy
 filtering, so a row reflects what the caller was allowed to see — a log of
 pre-filter hits would leak the existence of documents the principal cannot
 read — and a denied request logs nothing.
@@ -4777,7 +4835,15 @@ the same opt-in. Field and operator are not: they name the index's own
 declared attributes, already public in the catalog, and they are what answers
 "how often do agents filter, and on which fields". `served_generation` names the
 index build that answered, so latency and recall attach to a generation rather
-than to a model name that outlives it.
+than to a model name that outlives it. `served_degraded` is true when that
+generation is the last one that served readers before a republish failed,
+rather than the ready one — read from the query lease itself, not inferred
+from `result_count`: a degraded index answers "nothing matched" exactly as a
+ready one does, and a reader looking only at the results could not otherwise
+tell a stale answer from a healthy one (issue #617, ask 3).
+`served_safe_error_code` names why, mirroring the code `stel serving status`
+already shows an operator. Both are null on a refused call, where there is no
+lease to ask, and on every non-search tool.
 
 `error_code` is null on a served answer and carries the contract code on a
 refused one — a timeout, a size cap, an internal failure. A search that

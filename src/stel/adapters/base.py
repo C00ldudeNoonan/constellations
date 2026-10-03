@@ -333,6 +333,36 @@ class StateAbsenceProbe:
 
 
 @dataclass(frozen=True)
+class StateScopeAbsenceProbe:
+    """Restrict ordered state iteration to keys absent from another *scope*.
+
+    The sibling of `StateAbsenceProbe`, for the case where the thing to be
+    absent from is a slice of the state table rather than a separate relation.
+    Probing `stel_state` through the relation form would ask "absent from the
+    whole table", which is a different and wrong question: a key present under
+    some other model or target would wrongly count as known.
+
+    Why this exists rather than the caller resolving absence itself: activation
+    decided which of a serving scope's records a generation lacked by fetching
+    the generation's keys per batch, which re-scanned that whole slice every
+    time -- about 514 MB per batch, 2.6 GB of the 3.4 GB a batch cost in total
+    (issue #635). The obvious alternative, holding one scope's key domain in
+    memory and comparing locally, is what issue #428 deliberately moved *out*
+    of Python: `docs/architecture/bounded-memory.md` puts a 3.6M-row key
+    domain at 370-740 MB and records the warehouse-side paged anti-join as the
+    fix. This is that anti-join, pointed at a scope.
+    """
+
+    scope: StateScope
+
+    def __post_init__(self) -> None:
+        # `StateScope.__post_init__` already rejects an empty triple, so there
+        # is nothing to add -- declared so the dataclass reads like its
+        # sibling and a later field cannot be added without validation.
+        return None
+
+
+@dataclass(frozen=True)
 class StatePageRecord:
     """Projected state row surfaced by ordered paged iteration."""
 
@@ -427,7 +457,7 @@ class StatePage:
 class StatePageRequest:
     scope: StateScope
     page_size: int
-    absent_from: StateAbsenceProbe | None
+    absent_from: StateAbsenceProbe | StateScopeAbsenceProbe | None
 
     def __post_init__(self) -> None:
         if not 1 <= self.page_size <= _MAX_STATE_PAGE_SIZE:
@@ -1924,7 +1954,7 @@ to see the plan first."""
         scope: StateScope,
         *,
         page_size: int,
-        absent_from: StateAbsenceProbe | None = None,
+        absent_from: StateAbsenceProbe | StateScopeAbsenceProbe | None = None,
     ) -> Iterator[StatePageReader]:
         """Open ordered, snapshot-consistent paged iteration over `scope`.
 

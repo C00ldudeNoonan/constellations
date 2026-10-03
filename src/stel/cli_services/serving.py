@@ -292,6 +292,21 @@ def describe_serving(entry: ServingLedgerEntry) -> str:
     return served
 
 
+def describe_publisher_claim(entry: ServingLedgerEntry, *, now_epoch: int) -> str:
+    """One line saying who holds the publish claim and when they were last
+    heard from, or "-" when nobody does (issue #621).
+
+    `publisher: active` beside a process dead for forty minutes was what the
+    line used to say; the ledger now records enough to say which process, on
+    which host, and how long since its last page.
+    """
+    from ..retrieval.publisher_identity import describe_publisher
+
+    return describe_publisher(
+        entry.publisher, heartbeat_epoch=entry.publisher_heartbeat_epoch, now_epoch=now_epoch
+    )
+
+
 def _report(
     entry: ServingLedgerEntry,
     *,

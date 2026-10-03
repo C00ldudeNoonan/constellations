@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -652,7 +652,7 @@ def search_command(
             filters=filters,
             fields=fields,
         )
-        results = run_search(
+        outcome = run_search(
             project_dir,
             request,
             target=target,
@@ -663,10 +663,23 @@ def search_command(
     except SearchError as error:
         raise click.ClickException(str(error)) from error
 
+    if outcome.degraded:
+        # Stderr, like `-v`'s phase breakdown, so `--output json` on stdout
+        # stays a plain array for a script and a human still sees why an
+        # index answering fine might be answering from last week (#617).
+        click.echo(
+            f"Warning: '{model_name}' is serving a stale generation; the "
+            "last publish failed "
+            f"({outcome.safe_error_code or 'no error code recorded'})",
+            err=True,
+        )
+
     if output_format == "json":
-        click.echo(json.dumps([result.to_dict() for result in results], indent=2))
+        click.echo(
+            json.dumps([result.to_dict() for result in outcome.results], indent=2)
+        )
         return
-    _echo_search_table(results)
+    _echo_search_table(outcome.results)
 
 
 def _parse_search_vector(value: str | None) -> tuple[float, ...] | None:
@@ -706,7 +719,7 @@ def _parse_search_filter(field: str, operator: str, value: str) -> SearchFilter:
     return SearchFilter(field, resolved_operator, tuple(decoded))
 
 
-def _echo_search_table(results: list[SearchResult]) -> None:
+def _echo_search_table(results: Sequence[SearchResult]) -> None:
     if not results:
         click.echo("No results.")
         return
@@ -2604,6 +2617,9 @@ def _echo_serving_context(report: Any) -> None:
 @click.pass_context
 def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
+    import time
+
+    from .cli_services.serving import describe_publisher_claim as _describe_publisher
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
     from .retrieval import ServingCoordinationError
@@ -2634,7 +2650,9 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
     # What the two lines above mean for a reader, in words (issue #617).
     click.echo(f"serving:           {_describe_serving(entry)}")
-    click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
+    # Who holds the claim and how long since they were heard from (issue
+    # #621), where `active` used to stand in for both.
+    click.echo(f"publisher:         {_describe_publisher(entry, now_epoch=int(time.time()))}")
     click.echo(f"query_leases:      {entry.query_leases}")
     click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")
     click.echo(
@@ -2673,6 +2691,13 @@ def serving_recover(
     token so any surviving process fails its next verification, clears all
     leases, and leaves the scope degraded (still serving the generation that
     was live) or failed (serving nothing) until the next successful publish.
+
+    --owner-terminated is the operator's confirmation that every old owner is
+    gone. It may be omitted in one case: the ledger names a publisher on this
+    host whose PID and start time no longer match a running process, which is
+    provable here (issue #621). Otherwise the refusal says what the ledger
+    knows about the owner -- host, PID, label, last heartbeat -- so the
+    confirmation is informed.
     """
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_recover as _serving_recover

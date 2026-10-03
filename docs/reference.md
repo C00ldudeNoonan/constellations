@@ -2802,6 +2802,31 @@ the gap when nothing has decided, and never overrules a value you set, which
 may be sized for a larger job in the same process. Left unset with no
 environment variable, stel changes nothing and Lance uses its own default.
 
+**An index only behind on rows is extended, not retrained.** An incremental
+publish adds rows to a collection whose indices already exist, and
+`create_index` replaces -- so the index was rebuilt over the whole corpus
+every time, and a monthly increment of tens of thousands of rows into
+millions paid for the millions. stel now asks Lance to add the new rows to
+the indices it already has, which is what the engine is built for: measured
+8-14x cheaper for a 10,000-row increment onto bases of 50,000 to 200,000
+rows, with nothing left unindexed either way. The same call prunes table
+versions older than Lance's own default window, which is the only pruning
+stel does at all -- a publish never used to clean up after itself, and one
+generation was found holding 395 versions.
+
+An index that has to change *shape* is still built from scratch, because an
+extension cannot change one: a newly declared `index:` type, or a switch to
+`search: exact`, which is implemented by the *absence* of an ANN index. Both
+arrive as a configuration change, so they land in a private generation and
+train there. Extension is skipped where nothing is behind, which leaves an
+unchanged rerun the metadata check it has always been.
+
+The trade-off worth knowing: an extension assigns new vectors to centroids an
+earlier build trained, so an approximate index that is only ever extended
+drifts as the corpus moves away from that training sample. `--full-refresh`
+retrains it from empty. There is no in-place retrain, because Lance
+deprecated the `retrain` flag its `optimize()` once took.
+
 ### DuckDB-native search
 
 When the warehouse is already DuckDB, a separate retrieval system is an extra
@@ -3039,10 +3064,10 @@ more than 75% of it — the same share the DuckDB adapter reserves for the same
 reason: the ceiling also holds the Python process, and the build lands on top
 of whatever the publish already has resident. It speaks only where a build is
 certain: on a change that lands in a private generation, before the run spends
-its time; on a first publish, the moment the streamed row count crosses the
-line; on an in-place incremental, at its first write — a write leaves rows
-unindexed, and LanceDB then rebuilds the whole index. An unchanged rerun of an
-indexed collection writes nothing, builds nothing, and is told nothing. It
+its time; and on a first publish, the moment the streamed row count crosses
+the line. An in-place incremental is not warned, because it no longer builds:
+its writes are absorbed by extending the existing index. An unchanged rerun of
+an indexed collection writes nothing, builds nothing, and is told nothing. It
 names the
 type, the estimate, the ceiling, and the remedy (`index: ivf_pq`, or a larger
 container when that is already the type). It is a warning, not a refusal: the

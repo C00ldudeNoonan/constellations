@@ -217,7 +217,7 @@ def _run_one(
                     target=target,
                     profiles_dir=profiles_dir,
                     policy_filters=_policy,
-                )
+                ).results
             except SearchError as e:
                 raise RetrievalEvalError(
                     f"Retrieval test '{test.name}' query '{_query_id}' failed: {e}"

@@ -33,6 +33,8 @@ from ..adapters.base import SERVING_LEASE_TABLE, SERVING_LEDGER_TABLE
 from .base import RetrievalError
 from .publisher_identity import Liveness, PublisherIdentity, describe_publisher, local_liveness
 
+log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from ..adapters.base import StateScope, WarehouseAdapter
 
@@ -91,6 +93,8 @@ _LEDGER_COLUMNS_ADDED_LATER: tuple[tuple[str, str], ...] = (
     ("publisher_label", "STRING"),
     ("publisher_heartbeat_epoch", "BIGINT"),
     ("publisher_namespace", "STRING"),
+    # What a long publication phase has done so far (issue #635).
+    ("progress_note", "STRING"),
 )
 
 
@@ -125,6 +129,12 @@ class ServingLedgerEntry:
     # written before generations existed means.
     active_collection: str | None
     safe_error_code: str | None
+    # A free-text note a long publication phase writes so another
+    # process can see it is alive and how far along (issue #635).
+    # Diagnostic only: nothing reads it back to make a decision, and
+    # the completion write clears it, so a stale note cannot outlive
+    # the publication that wrote it.
+    progress_note: str | None
     rows_inserted: int
     rows_updated: int
     rows_skipped: int
@@ -159,6 +169,17 @@ class QueryLease:
     # lease pinned even if activation moves the pointer underneath it.
     pinned_collection: str | None
     config_fingerprint: str
+    # `STATUS_READY`, `STATUS_DEGRADED` or `STATUS_PUBLISHING` -- the only
+    # statuses `acquire_query` admits. A caller that only reads
+    # `pinned_generation` cannot tell a normal answer from one served because
+    # the next publish failed (issue #617, ask 3): `stel serving status`
+    # already says this in words, and a programmatic reader deserves the same
+    # signal to decide whether to degrade instead of trusting a silent pin.
+    status: str
+    # Set only when `status == STATUS_DEGRADED`, mirroring the same ledger
+    # column `stel serving status` reads to explain *why* -- a consumer that
+    # wants to decide how to degrade needs more than "stale".
+    safe_error_code: str | None
 
 
 def validate_safe_error_code(code: str) -> str:
@@ -224,6 +245,7 @@ class ServingCoordinator:
                 active_generation STRING,
                 active_collection STRING,
                 safe_error_code STRING,
+                progress_note STRING,
                 rows_inserted BIGINT NOT NULL,
                 rows_updated BIGINT NOT NULL,
                 rows_skipped BIGINT NOT NULL,
@@ -260,6 +282,10 @@ class ServingCoordinator:
         `_ensure_tables` uses CREATE TABLE IF NOT EXISTS, which does nothing
         to an existing table, so a ledger written by an earlier version would
         otherwise fail every statement naming a newer column.
+
+        `active_collection` predates issue #355, the publisher columns #621,
+        `progress_note` #635. All nullable, so widening changes the meaning
+        of nothing already recorded.
         """
         columns = self._adapter.table_column_names(LEDGER_TABLE)
         if columns is None:
@@ -406,7 +432,7 @@ class ServingCoordinator:
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
-                   publisher_heartbeat_epoch, publisher_namespace
+                   publisher_heartbeat_epoch, publisher_namespace, progress_note
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -439,7 +465,7 @@ class ServingCoordinator:
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
-                   publisher_heartbeat_epoch, publisher_namespace,
+                   publisher_heartbeat_epoch, publisher_namespace, progress_note,
                    (
                        SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
                        WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -501,6 +527,7 @@ class ServingCoordinator:
                 active_generation=None,
                 active_collection=None,
                 safe_error_code=None,
+                progress_note=None,
                 rows_inserted=0,
                 rows_updated=0,
                 rows_skipped=0,
@@ -518,6 +545,7 @@ class ServingCoordinator:
             active_generation=None if row[5] is None else str(row[5]),
             active_collection=None if row[11] is None else str(row[11]),
             safe_error_code=None if row[6] is None else str(row[6]),
+            progress_note=None if row[18] is None else str(row[18]),
             rows_inserted=int(row[7]),
             rows_updated=int(row[8]),
             rows_skipped=int(row[9]),
@@ -735,6 +763,7 @@ class ServingCoordinator:
                 safe_error_code = ?,
                 rows_inserted = ?, rows_updated = ?, rows_skipped = ?,
                 rows_deleted = ?, publication_id = NULL,
+                progress_note = NULL,
                 completed_at = CURRENT_TIMESTAMP{restore_fingerprint},
                 publisher_host = NULL, publisher_pid = NULL,
                 publisher_started_epoch = NULL, publisher_label = NULL,
@@ -766,6 +795,50 @@ class ServingCoordinator:
         ):
             raise StaleServingLeaseError(
                 "Serving publication authority was reassigned before completion"
+            )
+
+    def record_progress(self, lease: PublishLease, note: str) -> None:
+        """Publish a progress note for this scope, for another process to read.
+
+        `serving activate`'s re-stamp phase can run for hours, and for all of
+        it `serving status` showed the *previous* publish's counts and
+        `status: publishing` — so the only way to tell the command was alive
+        was `INFORMATION_SCHEMA.JOBS` (issue #635). This is the line that
+        answers "is it stuck?" from another terminal.
+
+        Fenced like every other ledger write: a publisher whose authority was
+        reassigned must not keep narrating progress over the one that replaced
+        it. Unlike the other writes it does **not** raise when the fence has
+        moved — a lost fence is discovered by the next `verify_publish`, which
+        is the call that is allowed to stop the work, and failing here would
+        turn a diagnostic into a new way for a publish to die.
+
+        Best-effort in the same spirit as the append-only logs: the note is
+        observability, and a warehouse that rejects it must not fail the
+        publication it describes.
+        """
+        try:
+            self._adapter.execute(
+                f"""
+                UPDATE {self._ref(LEDGER_TABLE)}
+                SET progress_note = ?
+                WHERE model_name = ? AND stage = ? AND target_identity = ?
+                  AND publication_id = ? AND fencing_token = ?
+                """,
+                [
+                    note,
+                    *self._scope_params(lease.scope),
+                    lease.publication_id,
+                    lease.fencing_token,
+                ],
+            )
+        except Exception as error:
+            # The class name only, like the rest of this module: warehouse
+            # text may carry SQL and must not reach logs or artifacts.
+            log.warning(
+                "Could not record publication progress [%s]; the publication "
+                "is unaffected",
+                type(error).__name__,
             )
 
     def mark_ready(
@@ -920,9 +993,13 @@ class ServingCoordinator:
                 "and resolve any recorded failure first"
             )
         fencing_token = int(row[0])
+        status = str(row[1])
         pinned_generation = str(row[5])
         pinned_collection = None if row[11] is None else str(row[11])
         config_fingerprint = "" if row[4] is None else str(row[4])
+        safe_error_code = (
+            str(row[6]) if status == STATUS_DEGRADED and row[6] is not None else None
+        )
         lease_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
         leases = self._ref(LEASE_TABLE)
@@ -952,14 +1029,6 @@ class ServingCoordinator:
                 pinned_generation,
             ],
         )
-        lease = QueryLease(
-            scope=scope,
-            lease_id=lease_id,
-            fencing_token=fencing_token,
-            pinned_generation=pinned_generation,
-            pinned_collection=pinned_collection,
-            config_fingerprint=config_fingerprint,
-        )
         held = self._adapter.rows(
             f"SELECT 1 FROM {leases} WHERE lease_id = ?",
             [lease_id],
@@ -968,6 +1037,36 @@ class ServingCoordinator:
             raise ServingBusyError(
                 "A publisher claimed this search index during query admission; retry"
             )
+        # The insert's own WHERE EXISTS is what actually admits the lease,
+        # not the read above it -- so a status this stale could still be
+        # true when the fencing token and generation it checked are, if a
+        # generation-preserving publish (issue #617) moved from `publishing`
+        # to `degraded` in between. Both keep the same fencing token and
+        # active generation, so the insert would still succeed with a status
+        # this lease has not seen (Codex review, #641). Re-read after
+        # confirming admission rather than trust the pre-admission snapshot.
+        current = self._read_row(scope)
+        if (
+            current is not None
+            and int(current[0]) == fencing_token
+            and current[5] is not None
+            and str(current[5]) == pinned_generation
+        ):
+            status = str(current[1])
+            safe_error_code = (
+                str(current[6]) if status == STATUS_DEGRADED and current[6] is not None
+                else None
+            )
+        lease = QueryLease(
+            scope=scope,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+            pinned_generation=pinned_generation,
+            pinned_collection=pinned_collection,
+            config_fingerprint=config_fingerprint,
+            status=status,
+            safe_error_code=safe_error_code,
+        )
         try:
             self.validate_query(lease, require_active=True)
         except ServingCoordinationError:

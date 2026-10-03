@@ -1869,6 +1869,54 @@ it would constrain nothing. The column materializes as a string; `enum` is
 stel's declaration, not a warehouse column type, and `emit-dbt-sources`
 exports it as `string`.
 
+#### Shared vocabularies: declare the set once, use it on several fields
+
+`type: enum` solves drift within one field's three consumers. It does not
+stop two *fields* — in the same model or different ones — from independently
+declaring the same label set and drifting from each other, which is the same
+problem one level up (issue #625).
+
+A project-level `vocabularies:` block declares a label set once:
+
+```yaml
+# stel_project.yml
+vocabularies:
+  sector:
+    terms:
+      - label: financials
+        description: Banks, insurers, and other financial firms
+      - label: technology
+      - label: energy
+```
+
+A field points at it instead of listing `values:` inline:
+
+```yaml
+fields:
+  - name: sector
+    type: enum
+    values_from: vocab.sector
+```
+
+This is resolved when the project loads — before source discovery,
+credentials, or any provider call — into the same `values:` a field would
+have declared inline, so every consumer downstream of `#304` (the provider
+schema, the `accepted_values` test, the prompt fallback) sees an ordinary
+enum field and needs no awareness of vocabularies. `values:` and
+`values_from:` are mutually exclusive; an unknown vocabulary name fails to
+load.
+
+A term's `description:` reaches the prompt fallback too, as a line of its
+own, so a provider without schema-level enum support sees what a label means,
+not only its name. A term may also declare `aliases:` (alternative names) and
+`broader:` (another term's `label`, for a hierarchy); both are validated —
+duplicate or dangling references and cyclic `broader` chains are rejected —
+but neither affects extraction yet. Aliases exist for entity linking, not
+classification: they never widen the set a field may output. Classes,
+relation types, and reading this declaration from entity linking and the
+concept cloud are separate, larger pieces of work (issues #626-#629) that
+build on this declaration rather than this one growing to anticipate them.
+
 Structure-preserving options for document parsing:
 
 ```yaml
@@ -4679,8 +4727,9 @@ all four tools: `logged_at`, `tool`, `request_id`, `client_name`,
 `client_version`, `transport`, `principal_id`, `tenant_id`, `model_name`,
 `target_id`, `mode`, `query_fingerprint`, `requested_limit`,
 `candidate_limit`, `filters`, `result_count`, `zero_results`,
-`returned_chunk_ids`, `top_score`, `served_generation`, `phase_ms`,
-`elapsed_ms`, `error_code`. Written **after** authorization and policy
+`returned_chunk_ids`, `top_score`, `served_generation`, `served_degraded`,
+`served_safe_error_code`, `phase_ms`, `elapsed_ms`, `error_code`. Written
+**after** authorization and policy
 filtering, so a row reflects what the caller was allowed to see — a log of
 pre-filter hits would leak the existence of documents the principal cannot
 read — and a denied request logs nothing.
@@ -4721,7 +4770,15 @@ the same opt-in. Field and operator are not: they name the index's own
 declared attributes, already public in the catalog, and they are what answers
 "how often do agents filter, and on which fields". `served_generation` names the
 index build that answered, so latency and recall attach to a generation rather
-than to a model name that outlives it.
+than to a model name that outlives it. `served_degraded` is true when that
+generation is the last one that served readers before a republish failed,
+rather than the ready one — read from the query lease itself, not inferred
+from `result_count`: a degraded index answers "nothing matched" exactly as a
+ready one does, and a reader looking only at the results could not otherwise
+tell a stale answer from a healthy one (issue #617, ask 3).
+`served_safe_error_code` names why, mirroring the code `stel serving status`
+already shows an operator. Both are null on a refused call, where there is no
+lease to ask, and on every non-search tool.
 
 `error_code` is null on a served answer and carries the contract code on a
 refused one — a timeout, a size cap, an internal failure. A search that

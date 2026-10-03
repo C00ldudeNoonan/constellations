@@ -49,7 +49,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..adapters import AdapterError, StateRecord, StateScope, WarehouseAdapter
+from ..adapters import (
+    AdapterError,
+    StateRecord,
+    StateScope,
+    StateScopeAbsenceProbe,
+    WarehouseAdapter,
+)
 from ..config.model import ModelConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -66,6 +72,7 @@ from ..retrieval import (
 )
 from ..versioning import compute_model_code_version
 from .contracts import RunError
+from .heartbeat import Heartbeat
 from .search import (
     _activate_generation,
     _generation_state_scope,
@@ -290,6 +297,13 @@ def activate_search_generation(
                 scope=publish_scope,
                 page_size=search.batch_size,
                 code_version=code_version,
+                model_name=model.name,
+                # The collection's row count, not the scope's: it is already
+                # known, and it is the number the state is about to be checked
+                # against anyway. The scope's own count would cost an extra
+                # aggregate over the slice this phase exists to stop
+                # re-scanning.
+                total=existing.row_count,
             )
             # State naming more rows than the collection holds vouches for
             # rows that are not there, and the reconciler would skip them for
@@ -433,20 +447,33 @@ def _fill_state_from_serving(
     scope, re-stamped to this code version. Returns how many were taken.
     """
     taken = 0
-    with adapter.state_page_reader(serving_scope, page_size=page_size) as reader:
+    # The warehouse evaluates the absence, so every record the walk yields is
+    # already one the generation lacks (issue #635). Before this, the walk
+    # yielded the whole serving scope and a per-batch `record_key IN UNNEST`
+    # asked the generation scope which of them it had -- a lookup that
+    # re-scanned that entire slice every batch, ~514 MB of the ~3.4 GB a batch
+    # cost. `record_key IN UNNEST(@array)` does not prune on the clustering
+    # #431 added, so the cost was the slice and not the keys.
+    #
+    # Resolving it locally instead -- holding one scope's keys and comparing
+    # in Python -- is what #428 moved out of Python and what
+    # `docs/architecture/bounded-memory.md` prices at 370-740 MB for 3.6M
+    # rows. The anti-join is the bounded form of the same question.
+    with adapter.state_page_reader(
+        serving_scope,
+        page_size=page_size,
+        absent_from=StateScopeAbsenceProbe(publish_scope),
+    ) as reader:
         for batch in _state_batches(reader):
             coordinator.verify_publish(lease)
-            known = adapter.fetch_state_subset(
-                publish_scope, [record.record_key for record in batch]
+            adapter.upsert_state(
+                publish_scope,
+                [
+                    StateRecord(record.record_key, record.input_fingerprint, code_version)
+                    for record in batch
+                ],
             )
-            missing = [
-                StateRecord(record.record_key, record.input_fingerprint, code_version)
-                for record in batch
-                if record.record_key not in known
-            ]
-            if missing:
-                adapter.upsert_state(publish_scope, missing)
-            taken += len(missing)
+            taken += len(batch)
     return taken
 
 
@@ -494,6 +521,8 @@ def _restamp_and_sample(
     scope: StateScope,
     page_size: int,
     code_version: str,
+    model_name: str,
+    total: int,
 ) -> tuple[int, list[str]]:
     """Re-stamp every record in `scope` at `code_version`; return the count and
     a reservoir sample of its keys for the membership check.
@@ -506,7 +535,26 @@ def _restamp_and_sample(
     rng = random.Random(code_version)
     sample: list[str] = []
     seen = 0
-    with adapter.state_page_reader(scope, page_size=page_size) as reader:
+    # This phase ran for hours in prod with nothing to watch: `serving status`
+    # showed the previous publish's counts and `status: publishing`, so the
+    # only way to tell the command was alive was INFORMATION_SCHEMA (issue
+    # #635). The note goes on the ledger, which is what another terminal can
+    # read; the log line is for whoever launched it.
+    heartbeat = Heartbeat()
+
+    def _log_heartbeat(count: int, elapsed: float) -> None:
+        log.info(
+            "%s: re-stamping publication state: %d of %d records (%.1fs elapsed)",
+            model_name,
+            count,
+            total,
+            elapsed,
+        )
+
+    with (
+        heartbeat.watch(_log_heartbeat),
+        adapter.state_page_reader(scope, page_size=page_size) as reader,
+    ):
         for batch in _state_batches(reader):
             coordinator.verify_publish(lease)
             adapter.upsert_state(
@@ -524,4 +572,9 @@ def _restamp_and_sample(
                     slot = rng.randrange(seen)
                     if slot < ACTIVATION_SAMPLE_SIZE:
                         sample[slot] = record.record_key
+            # Per batch, not per heartbeat: the ledger note is what another
+            # process reads, and a batch is already ~28s in prod, so the
+            # write is noise against the MERGE it follows.
+            coordinator.record_progress(lease, f"re-stamped {seen} of {total} records")
+            heartbeat.update(seen)
     return seen, sample

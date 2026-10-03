@@ -53,7 +53,7 @@ def _search(project: Path, target: str, mode: SearchMode) -> list[str]:
             SearchFilter("tenant_id", SearchFilterOperator.EQUAL, TENANT)
         ],
     )
-    return [result.record_id for result in results]
+    return [result.record_id for result in results.results]
 
 
 @pytest.fixture(scope="module")
@@ -146,7 +146,7 @@ def test_policy_filter_is_enforced_on_the_duckdb_target(
         ],
     )
 
-    assert [result.record_id for result in results] == []
+    assert [result.record_id for result in results.results] == []
 
 
 # ─── republication ──────────────────────────────────────────────────────────

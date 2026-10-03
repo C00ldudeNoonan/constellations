@@ -678,7 +678,7 @@ def test_publication_marks_scope_ready_and_serves_queries(tmp_path: Path) -> Non
     hits = search(
         project,
         SearchRequest(model="release_search", query="inflation", mode=SearchMode.TEXT),
-    )
+    ).results
     assert hits
     assert _ledger_status(project).query_leases == 0
 
@@ -717,7 +717,7 @@ def test_failed_publication_blocks_queries_until_republished(
     assert search(
         project,
         SearchRequest(model="release_search", query="inflation", mode=SearchMode.TEXT),
-    )
+    ).results
 
 
 def test_a_failed_incremental_publish_keeps_serving_the_previous_generation(
@@ -764,12 +764,17 @@ def test_a_failed_incremental_publish_keeps_serving_the_previous_generation(
     assert entry.safe_error_code == "store_error"
     assert entry.active_generation == before.active_generation
     assert entry.active_collection == before.active_collection
-    # The failure is visible to the operator and invisible to the reader.
-    hits = search(
+    # Visible to the operator through `serving status` below, and now to the
+    # reader too: the outcome names the same status and error code rather
+    # than answering exactly as a fully ready index would (issue #617, ask 3).
+    outcome = search(
         project,
         SearchRequest(model="release_search", query="inflation", mode=SearchMode.TEXT),
     )
+    hits = outcome.results
     assert hits
+    assert outcome.degraded
+    assert outcome.safe_error_code == "store_error"
     status = CliRunner().invoke(
         cli, ["serving", "status", "release_search", "--project-dir", str(project)]
     )
@@ -777,6 +782,28 @@ def test_a_failed_incremental_publish_keeps_serving_the_previous_generation(
     assert "status:            degraded" in status.output
     assert f"serving:           generation {before.active_generation}" in status.output
     assert "readers get the generation published before it" in status.output
+
+    # The same signal reaches an interactive `stel search` too, on stderr so
+    # `--output json` keeps a plain array on stdout for a script (issue #617).
+    # CliRunner merges the streams by default, as the `-v` phase-breakdown
+    # tests already rely on (test_search.py).
+    cli_result = CliRunner().invoke(
+        cli,
+        [
+            "search",
+            "--project-dir",
+            str(project),
+            "--model",
+            "release_search",
+            "--query",
+            "inflation",
+            "--mode",
+            "text",
+        ],
+    )
+    assert cli_result.exit_code == 0, cli_result.output
+    assert "serving a stale generation" in cli_result.output
+    assert "store_error" in cli_result.output
 
     # Not sticky: the next publish that works heals it, and the changed row
     # lands.
@@ -1163,7 +1190,7 @@ def test_governed_queries_fail_closed_without_policy(tmp_path: Path) -> None:
         search(project, request)
 
     policy = (SearchFilter("tenant", SearchFilterOperator.EQUAL, "research"),)
-    hits = search(project, request, policy_filters=policy)
+    hits = search(project, request, policy_filters=policy).results
     assert hits
     assert all(hit.metadata.get("tenant") == "research" for hit in hits)
 
@@ -1173,7 +1200,7 @@ def test_governed_queries_fail_closed_without_policy(tmp_path: Path) -> None:
         policy_filters=(
             SearchFilter("tenant", SearchFilterOperator.EQUAL, "research"),
         ),
-    )
+    ).results
     assert all(hit.metadata.get("tenant") == "research" for hit in restricted)
 
 

@@ -51,6 +51,7 @@ from .retrieval import (
     collection_config_fingerprint,
     create_store,
 )
+from .retrieval.coordination import STATUS_DEGRADED
 from .timing import PhaseTimings
 
 log = logging.getLogger(__name__)
@@ -262,6 +263,22 @@ class SearchResult:
             "contributing_ranks": dict(self.contributing_ranks),
             "provenance": self.provenance.to_dict(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SearchOutcome:
+    """Ranked results plus the generation-pinned lease's serving status.
+
+    Zero hits carry this too: a degraded index answers "nothing matched"
+    exactly as a ready one does, and without this a reader has no way to
+    tell a stale answer from a healthy one -- the gap issue #617's ask 3
+    describes. `safe_error_code` is set only when `degraded` is, mirroring
+    the same ledger column `stel serving status` already explains in words.
+    """
+
+    results: tuple[SearchResult, ...]
+    degraded: bool
+    safe_error_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,7 +665,7 @@ def search(
     policy_filters: Sequence[SearchFilter] = (),
     timings: PhaseTimings | None = None,
     session: SearchSession | None = None,
-) -> list[SearchResult]:
+) -> SearchOutcome:
     """Query a published search index through a generation-pinned read lease.
 
     `policy_filters` is the trusted authorization context for governed
@@ -658,8 +675,8 @@ def search(
     without them fails closed. Public indexes reject the argument.
 
     `timings` collects per-phase wall clock for one query (issue #519).
-    Passed in rather than returned because the result list is the contract
-    and callers read the phases differently: the CLI prints them, a server
+    Passed in rather than returned because the outcome is the contract and
+    callers read the phases differently: the CLI prints them, a server
     would export them. Omitted, one is created and only logged.
 
     `session` supplies the reusable half of that setup (issue #523). Omitted,
@@ -694,7 +711,7 @@ def _search(
     policy_filters: Sequence[SearchFilter],
     timings: PhaseTimings,
     started: float,
-) -> list[SearchResult]:
+) -> SearchOutcome:
     context = session.resolve(timings)
     project_config = context.project_config
     resolved = context.profile
@@ -889,16 +906,20 @@ def _search(
         )
         or "no phases recorded",
     )
-    return [
-        _to_result(
-            model,
-            item,
-            rank=rank,
-            included_fields=included_fields,
-            provenance=provenance,
-        )
-        for rank, item in enumerate(ranked[: request.limit], 1)
-    ]
+    return SearchOutcome(
+        results=tuple(
+            _to_result(
+                model,
+                item,
+                rank=rank,
+                included_fields=included_fields,
+                provenance=provenance,
+            )
+            for rank, item in enumerate(ranked[: request.limit], 1)
+        ),
+        degraded=lease.status == STATUS_DEGRADED,
+        safe_error_code=lease.safe_error_code,
+    )
 
 
 def _validate_capabilities(

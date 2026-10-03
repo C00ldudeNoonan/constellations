@@ -32,6 +32,7 @@ from .base import (
     SqlRelationColumn,
     SqlRelationSchema,
     StaleStateFenceError,
+    StateAbsenceProbe,
     StateGeneration,
     StatePage,
     StatePageReader,
@@ -39,6 +40,7 @@ from .base import (
     StatePageRequest,
     StateRecord,
     StateScope,
+    StateScopeAbsenceProbe,
     StateScopeFence,
     StateValue,
     SyncWatermark,
@@ -1666,16 +1668,38 @@ class DuckDBAdapter(WarehouseAdapter):
             transaction_open = True
             state_ref = f"{self.schema_ref}.{self.quote_ident(_STATE_TABLE)}"
             absence_sql = ""
-            if request.absent_from is not None:
-                probe_ref = self.table_ref(request.absent_from.table)
-                probe_key = self.quote_ident(request.absent_from.key_column)
+            # Bound separately rather than narrowed in place: each form
+            # compiles a different predicate.
+            scope_probe = (
+                request.absent_from
+                if isinstance(request.absent_from, StateScopeAbsenceProbe)
+                else None
+            )
+            relation_probe = (
+                request.absent_from
+                if isinstance(request.absent_from, StateAbsenceProbe)
+                else None
+            )
+            if scope_probe is not None:
+                # Absence from another slice of the same table (issue #635).
+                # No CAST: both sides are `record_key`. The snapshot is the
+                # enclosing transaction, which already covers the probe.
+                absence_sql = (
+                    f" AND NOT EXISTS (SELECT 1 FROM {state_ref} AS probe "
+                    "WHERE probe.model_name = ? AND probe.state_scope = ? "
+                    "AND probe.target_identity = ? "
+                    "AND probe.record_key = state.record_key)"
+                )
+            elif relation_probe is not None:
+                probe_ref = self.table_ref(relation_probe.table)
+                probe_key = self.quote_ident(relation_probe.key_column)
                 try:
                     cursor_conn.execute(f"SELECT {probe_key} FROM {probe_ref} LIMIT 0")
                 except duckdb.Error:
                     raise AdapterError(
                         "State absence probe relation "
-                        f"'{request.absent_from.table}."
-                        f"{request.absent_from.key_column}' is unavailable"
+                        f"'{relation_probe.table}."
+                        f"{relation_probe.key_column}' is unavailable"
                     ) from None
                 # `record_key` is always a VARCHAR, because state keys are the
                 # stringified id. The probe column need not be -- a numeric id
@@ -1699,6 +1723,14 @@ class DuckDBAdapter(WarehouseAdapter):
                 ]
                 if last_key is not None:
                     params.append(last_key)
+                if scope_probe is not None:
+                    params.extend(
+                        [
+                            scope_probe.scope.model_name,
+                            scope_probe.scope.stage,
+                            scope_probe.scope.target_identity,
+                        ]
+                    )
                 try:
                     rows = cursor_conn.execute(
                         "SELECT state.record_key, state.input_fingerprint, "

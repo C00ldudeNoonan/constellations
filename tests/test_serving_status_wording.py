@@ -31,6 +31,7 @@ def _entry(
     active_collection: str | None = None,
     safe_error_code: str | None = None,
     publication_id: str | None = None,
+    progress_note: str | None = None,
     publisher: PublisherIdentity | None = None,
     publisher_heartbeat_epoch: int | None = None,
 ) -> ServingLedgerEntry:
@@ -43,6 +44,7 @@ def _entry(
         active_generation=active_generation,
         active_collection=active_collection,
         safe_error_code=safe_error_code,
+        progress_note=progress_note,
         rows_inserted=0,
         rows_updated=0,
         rows_skipped=0,

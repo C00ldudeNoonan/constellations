@@ -4860,7 +4860,12 @@ all four tools: `logged_at`, `tool`, `request_id`, `client_name`,
 **after** authorization and policy
 filtering, so a row reflects what the caller was allowed to see — a log of
 pre-filter hits would leak the existence of documents the principal cannot
-read — and a denied request logs nothing.
+read — and a denied request logs nothing. A refused request that is logged
+(a timeout, an index that is not serving, a bad argument, an internal
+failure) carries the `principal_id` identity resolved to, so the log can say
+who was turned away (issue #622); its `tenant_id` stays null, because the
+tenant comes from the policy filters authorization compiles and a refusal
+compiled none.
 
 `zero_results` is the cheapest retrieval-quality signal there is: a question
 the index cannot answer is what a chunking or metadata gap looks like from

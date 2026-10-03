@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### A refused `search_context` call logs who was turned away (issue #622)
+
+- **Every refusal in `stel_mcp_query_log` had `principal_id` NULL**, while a
+  served call from the same client seconds earlier carried its principal: all
+  61 `capability_unavailable` rows from the `sec_chunk_search` outage said
+  "someone". Identity is not authorization: the row now records the subject
+  identity resolved to, for every tool's refusal rows, and claims nothing
+  about what they may read -- `tenant_id` stays null, because it comes from
+  the policy filters a refusal never compiled. A request refused *because*
+  identity did not resolve is `missing_principal`, which was never logged, so
+  a null principal on a logged refusal now means the resolver had no answer.
+
 ### Concept-cloud nodes say what a declared vocabulary states they are (issue #629)
 
 - **A concept's node can now carry its declared class, definition and broader
@@ -44,7 +56,6 @@ succeeded there), so that ceiling is unaffected.
 left physically unsound by a build that died mid-index. On this evidence the
 build never allocated at all, so it committed nothing -- the adoption check
 #598 asks for may still be worth having, but this was the incident behind it.
-
 
 ### The serving ledger says who holds a publish claim, and how long since they were heard from (issue #621)
 

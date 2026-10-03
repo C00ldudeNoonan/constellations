@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import json
+import logging
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -143,6 +144,8 @@ class ContextServerSettings(BaseModel):
 # probe which models exist. Every other code describes what the *server* did
 # -- a deadline, a size cap, a failure -- and says nothing about what the
 # caller was or was not allowed to see.
+log = logging.getLogger(__name__)
+
 _UNLOGGED_ERROR_CODES = frozenset(
     {MCPErrorCode.MISSING_PRINCIPAL, MCPErrorCode.NOT_FOUND_OR_DENIED}
 )
@@ -644,7 +647,13 @@ class ContextService:
             "client_name": caller.client_name,
             "client_version": caller.client_version,
             "transport": caller.transport,
-            "principal_id": None,
+            # Who called, whether or not they were served. Identity is not
+            # authorization: a refused row naming its principal says who was
+            # turned away, which is the one row an audit most wants to
+            # attribute, and it claims nothing about what they may read --
+            # `tenant_id` comes only from compiled policy filters. Every
+            # refusal used to log null here (issue #622).
+            "principal_id": self._resolved_subject_id(),
             "tenant_id": None,
             "model_name": None,
             "target_id": None,
@@ -730,10 +739,12 @@ class ContextService:
     ) -> Mapping[str, Any]:
         """One refused query's log row.
 
-        Principal and tenant are null rather than best-guess: a request can
-        be refused *because* identity did not resolve, and a row that named
-        a principal the service never authorized would be worse than one that
-        admits it does not know.
+        The principal is whoever identity resolved to (issue #622); the tenant
+        stays null rather than best-guess, because it comes from the policy
+        filters authorization compiles, and a refusal compiled none. A request
+        refused *because* identity did not resolve is MISSING_PRINCIPAL, which
+        is never logged, so a null principal on a logged refusal means the
+        resolver had no answer, not that the service declined to say.
         """
         return self._base_log_row("search_context", caller) | {
             # Caller-supplied, and deliberately not checked against what
@@ -874,9 +885,33 @@ class ContextService:
         """
         if self._settings.max_requests_per_minute_per_principal is None:
             return None
+        return self._resolved_subject_id()
+
+    def _resolved_subject_id(self) -> str | None:
+        """The caller's subject id if identity resolves, else None.
+
+        Never raises: the rate limiter and the query log both need an answer
+        for a caller the operation is about to refuse, and the log row is
+        built after `_respond` has already turned the operation's failure into
+        a structured error, outside that boundary. The resolver is pluggable,
+        so this is the "third-party call with no alternative" case: anything
+        it raises here would turn a sanitized `internal` into an escaped
+        exception (Codex on #646). Only the class name is logged; the
+        operation that failed on the same resolver has already answered the
+        caller without its text. Both resolvers stel ships are O(1) reads of
+        a contextvar or a header, so resolving here as well as in the
+        operation costs nothing.
+        """
         try:
             principal = self._principal_resolver.resolve()
         except AuthorizationError:
+            return None
+        except Exception as exc:  # pluggable resolver, outside the error boundary
+            log.warning(
+                "principal resolver failed while building a log row [%s]; "
+                "recording no principal",
+                type(exc).__name__,
+            )
             return None
         return principal.subject_id if principal is not None else None
 

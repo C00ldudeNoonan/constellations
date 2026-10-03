@@ -634,6 +634,11 @@ def _run_search_model(
                         rows_seen,
                     )
                     log_publication_memory(log, model.name, phase="batch", batch=ordinal + 1)
+                    # Once a page, write side or not: a read-only resume page
+                    # is still a minute and a half of this publisher being
+                    # alive, and the ledger is where an operator looks for
+                    # that (issue #621).
+                    coordinator.heartbeat(publish_lease)
                     upstream_records = [
                         UpstreamRecord(row.record_id, row.input_fingerprint)
                         for row in indexed

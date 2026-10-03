@@ -2617,6 +2617,9 @@ def _echo_serving_context(report: Any) -> None:
 @click.pass_context
 def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
+    import time
+
+    from .cli_services.serving import describe_publisher_claim as _describe_publisher
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
     from .retrieval import ServingCoordinationError
@@ -2647,7 +2650,9 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
     # What the two lines above mean for a reader, in words (issue #617).
     click.echo(f"serving:           {_describe_serving(entry)}")
-    click.echo(f"publisher:         {'active' if entry.publication_id else '-'}")
+    # Who holds the claim and how long since they were heard from (issue
+    # #621), where `active` used to stand in for both.
+    click.echo(f"publisher:         {_describe_publisher(entry, now_epoch=int(time.time()))}")
     click.echo(f"query_leases:      {entry.query_leases}")
     click.echo(f"safe_error_code:   {entry.safe_error_code or '-'}")
     click.echo(
@@ -2686,6 +2691,13 @@ def serving_recover(
     token so any surviving process fails its next verification, clears all
     leases, and leaves the scope degraded (still serving the generation that
     was live) or failed (serving nothing) until the next successful publish.
+
+    --owner-terminated is the operator's confirmation that every old owner is
+    gone. It may be omitted in one case: the ledger names a publisher on this
+    host whose PID and start time no longer match a running process, which is
+    provable here (issue #621). Otherwise the refusal says what the ledger
+    knows about the owner -- host, PID, label, last heartbeat -- so the
+    confirmation is informed.
     """
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_recover as _serving_recover

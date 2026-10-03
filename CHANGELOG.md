@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### The serving ledger says who holds a publish claim, and how long since they were heard from (issue #621)
+
+- **`publisher: active` was all `stel serving status` could say about a
+  process dead for forty minutes.** After a host crash killed a publish, the
+  claim recorded only when it was acquired, so deciding whether `recover
+  --owner-terminated` was safe took a five-step hunt entirely outside stel.
+  The claim now records the publisher's host, PID, process start time and an
+  operator-supplied label (`STEL_PUBLISHER_LABEL`, for an orchestrator run
+  id), and the page loop touches a heartbeat once per page. `serving status`
+  prints them as the `publisher:` line with the heartbeat's age, and
+  `recover`'s refusal names them.
+- **`recover` may proceed without `--owner-terminated` in exactly one case:**
+  the row names a publisher in this PID namespace on this kernel boot whose
+  PID and start time match no running process, which is provable from
+  `/proc`. A matching hostname is not enough: two containers can share one. Everywhere else the
+  confirmation stays required and the refusal is informed. Heartbeat age is
+  shown and never acted on: the index build after the last page has no page
+  to beat on and is not dead. ADR-0019 records the alternatives.
+- Six nullable columns join the serving ledger, added to an older ledger the
+  way `active_collection` was. One DML per page on the publish path; it
+  doubles as the fence check.
+
 ### A degraded search index tells its readers, not just its operator (issue #617)
 
 A failed republish keeps serving the last good generation rather than going
@@ -83,6 +105,8 @@ so nothing already recorded changes meaning.
 **Still open on #635:** why a trailing-column range predicate does not prune
 when `record_key` is already the last clustering column -- which is what both
 a materialising fix and the keyset walk's own cost depend on.
+
+## v0.20.0 - 2026-10-02
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)
 

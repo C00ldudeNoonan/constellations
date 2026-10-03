@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### A long publication phase reports progress another process can read (issue #635)
+
+- **`serving activate`'s re-stamp phase ran for ~2.3 hours with nothing to
+  watch.** `serving status` showed the *previous* publish's `rows:` counts and
+  `status: publishing` for all of it, so the only way to tell the command was
+  alive, or how far along, was `region-us.INFORMATION_SCHEMA.JOBS`.
+- The ledger gains a nullable `progress_note`, written per batch by the
+  re-stamp phase and rendered by `stel serving status` as
+  `progress: re-stamped N of M records`. The ledger rather than a log line
+  because the question was being asked from a second terminal.
+- A per-batch log line comes with it, through the same `Heartbeat` the chunk
+  and SQL paths use (#469, #573), for whoever launched the command.
+- **The note cannot outlive its publication.** The one shared completion write
+  clears it, so a note on a `ready` scope is impossible rather than merely
+  unlikely, and `serving status` prints the line only when one is present.
+- Writing it is best-effort and fenced: a publisher whose authority was
+  reassigned cannot narrate over the one that replaced it, and a warehouse
+  that rejects the note logs a warning rather than failing the publication it
+  describes. Losing the fence is still discovered by the next
+  `verify_publish`, which is the call allowed to stop the work.
+
+**Upgrading:** the `progress_note` column is added to an existing ledger by
+the same `ALTER TABLE` path that added `active_collection` for #355. Nullable,
+so nothing already recorded changes meaning.
+
 ## v0.20.0 - 2026-10-02
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)

@@ -602,3 +602,75 @@ def test_activate_refuses_while_a_publisher_holds_the_scope(tmp_path: Path) -> N
 
     assert result.exit_code != 0
     assert "Another publisher owns this serving scope" in result.output
+
+
+# ─── progress is visible from another process (issue #635) ───────────────────
+
+
+def test_the_restamp_phase_publishes_progress_other_processes_can_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap that sent an operator to INFORMATION_SCHEMA.
+
+    The re-stamp phase ran for ~2.3 hours in prod while `serving status`
+    showed the *previous* publish's counts and `status: publishing`, so
+    nothing said whether the command was alive or how far along. The note
+    goes on the ledger because that is what a second terminal can read.
+
+    Observed mid-phase, since the completion write clears it.
+    """
+    from stel.execution import activation
+    from stel.runner import run_project
+
+    project = _write_project(tmp_path)
+    run_project(project, full_refresh=True)
+    ledger = _Ledger(project)
+    generation = ledger.status().active_collection
+    assert generation is not None
+    keys = sorted(ledger.state())
+    ledger.lose_the_pointer()
+    ledger.split_state_across_a_release(generation, moved_key=keys[0])
+
+    # What another process would see while the phase is running -- including
+    # the `stel serving status` CLI output itself, not just the ledger row
+    # a test can read directly but an operator cannot (Codex review, #640).
+    observed: list[str | None] = []
+    cli_outputs: list[str] = []
+    original = activation._restamp_and_sample
+
+    def watched(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        observed.append(ledger.status().progress_note)
+        cli_outputs.append(
+            CliRunner()
+            .invoke(
+                cli,
+                [
+                    "serving",
+                    "status",
+                    "release_search",
+                    "--project-dir",
+                    str(project),
+                ],
+            )
+            .output
+        )
+        return result
+
+    monkeypatch.setattr(activation, "_restamp_and_sample", watched)
+
+    result = _activate(project, generation, "--rows-verified", "--target", "dev")
+    assert result.exit_code == 0, result.output
+
+    assert observed and observed[0] is not None, (
+        "the re-stamp phase published no progress for another process to read"
+    )
+    assert "re-stamped" in observed[0]
+    assert "of" in observed[0]
+    assert cli_outputs and f"progress:          {observed[0]}" in cli_outputs[0]
+    # And it does not outlive the publication that wrote it: a note surviving
+    # completion would read as a phase still running on a scope that is ready,
+    # which is worse than no note at all.
+    after = ledger.status()
+    assert after.status == STATUS_READY
+    assert after.progress_note is None

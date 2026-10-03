@@ -323,42 +323,29 @@ def test_an_unchanged_rerun_of_a_large_indexed_collection_says_nothing(
     assert "peaks at roughly" not in caplog.text
 
 
-def test_an_in_place_write_is_warned_about_before_the_build(
+def test_an_in_place_write_is_not_warned_about_because_it_extends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The complement: an in-place run that does write leaves rows unindexed,
-    so LanceDB rebuilds the whole index. The first write is the moment the
-    build becomes certain, and the warning must land there -- before the
-    build, once."""
+    """An in-place write is no longer a whole-collection build (issue #619).
+
+    This used to be the complement of the test above: a write left rows
+    unindexed, LanceDB retrained the index over everything, and the first
+    write was the moment that became certain. The write is absorbed by
+    extending the existing index now, so the advisory would be describing a
+    build that does not happen -- the same false alarm, on the run that *does*
+    write. The two cases that still build from scratch, a private generation
+    and a first publish, keep their advisories above.
+    """
     from stel.execution import search as search_module
-    from stel.retrieval import LanceDBStore
     from stel.runner import run_project
 
     prepare_online_switch(tmp_path)
     run_project(tmp_path, select="context_search")
     materialize_upstream(tmp_path, sample_rows().with_columns(pl.lit("changed").alias("title")))
     monkeypatch.setattr(search_module, "container_memory_limit_bytes", lambda: 60)
-    order: list[str] = []
-    real_ensure = LanceDBStore.ensure_indexes
 
-    def ensure(self: Any, spec: Any) -> Any:
-        order.append("build")
-        return real_ensure(self, spec)
-
-    monkeypatch.setattr(LanceDBStore, "ensure_indexes", ensure)
-
-    class _Mark(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            if "peaks at roughly" in record.getMessage():
-                order.append("warn")
-
-    logging.getLogger("stel.execution.search").addHandler(handler := _Mark())
-    try:
-        with caplog.at_level(logging.WARNING, logger="stel.execution.search"):
-            [result] = run_project(tmp_path, select="context_search")
-    finally:
-        logging.getLogger("stel.execution.search").removeHandler(handler)
+    with caplog.at_level(logging.WARNING, logger="stel.execution.search"):
+        [result] = run_project(tmp_path, select="context_search")
 
     assert result.rows_written == 2
-    assert order.count("warn") == 1
-    assert order.index("warn") < order.index("build")
+    assert "peaks at roughly" not in caplog.text

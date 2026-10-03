@@ -756,19 +756,17 @@ def _run_search_model(
                     inserted += pending_inserted
                     updated += pending_updated
                     rows_written += len(pending)
-                    if not warned_build and existing is not None:
-                        # The first in-place write settles it: rows are now
-                        # unindexed, so `ensure_indexes` will rebuild the index
-                        # over the whole collection (LanceDB rebuilds with
-                        # replace=True, not incrementally). The collection's
-                        # count is the floor of what that build spans.
-                        warned_build = _warn_on_index_build_memory(
-                            model,
-                            spec,
-                            max(existing.row_count, rows_seen),
-                            limit_bytes=build_limit,
-                            store_type=store_config.type,
-                        )
+                    # No build advisory here any more. It used to fire on
+                    # the first in-place write, because leaving rows unindexed
+                    # meant `ensure_indexes` would retrain the index over the
+                    # whole collection. It extends the existing index over the
+                    # new rows instead (issue #619), so the build this warned
+                    # about does not happen, and warning anyway would be the
+                    # false alarm #480's review already objected to. An
+                    # in-place collection always has its declared indices --
+                    # activation gates on `ensure_indexes` succeeding -- and a
+                    # shape change is a private generation, which is warned
+                    # before the run spends its time.
 
                 # Stale discovery streams state pages whose keys no longer
                 # exist upstream, in ascending key order — complete even for

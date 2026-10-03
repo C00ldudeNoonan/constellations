@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### An incremental publish extends its indices instead of retraining them (issue #619)
+
+- **An index merely behind on rows was rebuilt over the whole collection.**
+  LanceDB's `create_index` replaces, so a monthly increment of tens of
+  thousands of rows into a 3.64M-row corpus retrained over the 3.64M -- and
+  that retrain is the operation that exhausts Lance's memory pool (#636).
+  `ensure_indexes` now asks Lance to add the new rows to the indices that
+  already exist: measured 8-14x cheaper for a 10,000-row increment onto bases
+  of 50,000 to 200,000 rows, with nothing left unindexed either way.
+- An index that has to change **shape** still builds from scratch -- a newly
+  declared `index:` type, or `search: exact`, which is the absence of an ANN
+  index (#461). Nothing is extended where nothing is behind, so an unchanged
+  rerun stays the metadata check it was. An extension that fails falls back to
+  the rebuild; one that exhausts the memory pool is refused, because the
+  rebuild sorts strictly more rows through the same pool.
+- **stel prunes table versions for the first time.** The same call collects
+  versions older than Lance's default window: a publish never cleaned up after
+  itself, and one generation was found holding 395 of them.
+- **The in-place build advisory is gone**, because the build it predicted no
+  longer happens. The two cases that do build from scratch -- a private
+  generation, and a first publish -- still warn before the run spends its time.
+- Trade-off, in `docs/adr/0021`: an approximate index that is only ever
+  extended drifts from the sample its centroids were trained on, and
+  `--full-refresh` is the only retrain. Lance deprecated the `retrain` flag.
+
+**What #619 also asked for, and did not get.** Compacting during the page loop
+was declined on measurement: it bounded the table (21 fragments and versions
+became 2) but per-page merge cost was identical across a four-fold difference
+in fragment count -- 0.04s rising to 0.06s either way -- while adding 2.3x to
+the local page wall. #616's per-page decay was already isolated to index
+maintenance on a resumed generation (ADR-0018), which explains that curve
+better. Serving the unindexed tail was declined as already true: no code gates
+serving on `num_unindexed_rows`, readiness is the serving ledger, and the
+whole-corpus cost is the read (#614).
+
 ### A refused `search_context` call logs who was turned away (issue #622)
 
 - **Every refusal in `stel_mcp_query_log` had `principal_id` NULL**, while a

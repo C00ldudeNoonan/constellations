@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import json
+import logging
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -143,6 +144,8 @@ class ContextServerSettings(BaseModel):
 # probe which models exist. Every other code describes what the *server* did
 # -- a deadline, a size cap, a failure -- and says nothing about what the
 # caller was or was not allowed to see.
+log = logging.getLogger(__name__)
+
 _UNLOGGED_ERROR_CODES = frozenset(
     {MCPErrorCode.MISSING_PRINCIPAL, MCPErrorCode.NOT_FOUND_OR_DENIED}
 )
@@ -888,13 +891,27 @@ class ContextService:
         """The caller's subject id if identity resolves, else None.
 
         Never raises: the rate limiter and the query log both need an answer
-        for a caller the operation is about to refuse. Both resolvers this can
-        reach are O(1) reads of a contextvar or a header, so resolving here as
-        well as in the operation costs nothing.
+        for a caller the operation is about to refuse, and the log row is
+        built after `_respond` has already turned the operation's failure into
+        a structured error, outside that boundary. The resolver is pluggable,
+        so this is the "third-party call with no alternative" case: anything
+        it raises here would turn a sanitized `internal` into an escaped
+        exception (Codex on #646). Only the class name is logged; the
+        operation that failed on the same resolver has already answered the
+        caller without its text. Both resolvers stel ships are O(1) reads of
+        a contextvar or a header, so resolving here as well as in the
+        operation costs nothing.
         """
         try:
             principal = self._principal_resolver.resolve()
         except AuthorizationError:
+            return None
+        except Exception as exc:  # pluggable resolver, outside the error boundary
+            log.warning(
+                "principal resolver failed while building a log row [%s]; "
+                "recording no principal",
+                type(exc).__name__,
+            )
             return None
         return principal.subject_id if principal is not None else None
 

@@ -1821,6 +1821,43 @@ def test_a_refused_search_logs_the_principal_who_was_turned_away() -> None:
     assert row["model_name"] == "context_search"
 
 
+def test_a_resolver_that_fails_cannot_escape_through_the_log_row() -> None:
+    """Codex on #646. The refusal row is built after `_respond` has already
+    turned the operation's failure into a structured error, outside that
+    boundary. A pluggable resolver that raises something other than
+    `AuthorizationError` while the row resolves the principal must not turn
+    that structured error into an escaped exception: the row records no
+    principal and the caller still gets the sanitized `internal`."""
+
+    class FailingResolver:
+        def resolve(self) -> Principal | None:
+            raise RuntimeError("identity backend unreachable")
+
+    repository = FakeRepository(_fixture_rows())
+    service = ContextService(
+        catalog=_artifact_catalog(),
+        repository=repository,
+        context_search=FakeSearch(None),
+        principal_resolver=FailingResolver(),
+        authorization=ClaimAuthorizationProvider(),
+        warehouse_identity=None,
+        settings=None,
+    )
+    try:
+        response = service.search_context(
+            SearchContextRequest(model="context_search", query="inflation", mode="text")
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INTERNAL
+    assert "unreachable" not in response.error.message
+    (row,) = repository.logged
+    assert row["error_code"] == "internal"
+    assert row["principal_id"] is None
+
+
 def test_a_refused_document_fetch_logs_the_principal_too() -> None:
     """Issue #622, the other tools: the principal lives on the base row every
     tool's refusal is built from, so a document fetch refused for a bad

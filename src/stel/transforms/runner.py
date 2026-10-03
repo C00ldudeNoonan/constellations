@@ -14,6 +14,7 @@ import polars as pl
 
 from ..budget import BudgetLedger
 from ..config.profile import LLMConfig, WarehouseConfig
+from ..config.vocabulary import Vocabulary
 from ..versioning import resolve_module_file
 
 
@@ -35,6 +36,11 @@ class TransformContext:
     # The invocation-wide LLM budget ledger, threaded so a `uses_llm` transform
     # charges and enforces `llm.budget` like the native `llm:` kind (issue #240).
     run_budget: BudgetLedger | None = None
+    # The project's declared vocabularies (issue #625), keyed by name. Lets a
+    # built-in transform read one directly — the entity-linking driver's
+    # `alias_table` resolver does, for an `aliases: vocab.<name>` source
+    # (issue #627) — without re-loading the project from `project_dir`.
+    vocabularies: Mapping[str, Vocabulary] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

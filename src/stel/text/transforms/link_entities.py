@@ -19,7 +19,7 @@ def validate_options(options: Mapping[str, Any]) -> None:
     validate_link_options(options)
 
 
-def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
+def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
     return declared_link_dependencies(options)
 
 

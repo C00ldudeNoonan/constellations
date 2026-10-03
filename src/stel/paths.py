@@ -44,3 +44,22 @@ def resolve_within_project(
 
 def is_within_project(path: Path, project_dir: Path) -> bool:
     return path.resolve().is_relative_to(project_dir.resolve())
+
+
+def resolve_module_file(module: str, project_dir: Path) -> Path:
+    """Resolve a dotted module path (e.g. 'transforms.summarize') to a .py file
+    relative to the project directory.
+
+    Lives here, not in `versioning.py` where it originated, so both
+    `versioning.py` and `transforms/runner.py` can import it without a cycle:
+    `transforms/runner.py` already depended on it, and `versioning.py` needs
+    to call into `transforms` to fold a built-in transform's own version
+    identity (e.g. an entity-linking resolver's version) into `code_version`
+    (issue #627 review) — this module has no dependency on either."""
+    parts = module.split(".")
+    relative_path = Path(*parts).with_suffix(".py")
+    return resolve_within_project(
+        relative_path,
+        project_dir,
+        surface=f"Python module '{module}'",
+    )

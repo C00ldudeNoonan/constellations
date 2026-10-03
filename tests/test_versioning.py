@@ -27,6 +27,7 @@ from stel.config.model import (
 from stel.config.profile import LLMConfig
 from stel.config.project import ExtractionDefaults, ProjectConfig
 from stel.hashing import HASH_DIGEST_SIZE
+from stel.paths import resolve_module_file
 from stel.profile import ResolvedProfile
 from stel.retrieval.evolution import search_code_identity
 from stel.versioning import (
@@ -35,7 +36,6 @@ from stel.versioning import (
     compute_document_id,
     compute_model_code_version,
     describe_model_inference,
-    resolve_module_file,
 )
 
 

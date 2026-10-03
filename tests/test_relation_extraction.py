@@ -241,6 +241,43 @@ def test_declared_dependencies_and_incremental_contract() -> None:
     contract.validate_against(["m"])
 
 
+def test_code_version_identity_reports_the_active_extractor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A built-in transform module has no project-local file, so
+    `compute_model_code_version`'s file hash alone cannot see which internal
+    extractor a model selected or that extractor's own version (issue #627
+    review, which found the identical gap for `link_entities`'s resolver)."""
+    assert extract_relations.code_version_identity({"mentions": "m"}) == {
+        "extractor": "co_occurrence",
+        "extractor_version": CO_OCCURRENCE_EXTRACTOR_VERSION,
+    }
+
+    from stel import versioning
+    from stel.config.model import ModelConfig, TransformConfig
+    from stel.config.project import ExtractionDefaults, ProjectConfig
+    from stel.text import relations
+
+    project = ProjectConfig(
+        name="p", extraction=ExtractionDefaults(default_backend="json")
+    )
+    model = ModelConfig(
+        name="document_relations",
+        depends_on=["ref('m')"],
+        transform=TransformConfig(
+            type="python",
+            module="stel.text.transforms.extract_relations",
+            options={"mentions": "m"},
+        ),
+        materialization="incremental",
+    )
+    before = versioning.compute_model_code_version(model, project, tmp_path)
+    monkeypatch.setattr(relations.CoOccurrenceExtractor, "version", "999")
+    after = versioning.compute_model_code_version(model, project, tmp_path)
+
+    assert before != after
+
+
 @pytest.mark.parametrize(
     ("options", "message"),
     [

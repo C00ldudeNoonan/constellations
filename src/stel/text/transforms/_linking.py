@@ -86,6 +86,21 @@ def declared_link_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
     return (parsed.mentions, parsed.aliases)
 
 
+def declared_link_code_version_identity(options: Mapping[str, Any]) -> dict[str, str]:
+    """The active resolver's name and version.
+
+    A built-in transform module has no project-local file, so
+    `compute_model_code_version`'s file hash cannot see which internal
+    resolver implementation it selected, or that resolver's own version
+    constant — reported here instead (issue #627 review), so e.g. an
+    `ALIAS_RESOLVER_VERSION` bump invalidates an already-materialized
+    incremental model's rows the same way a project-local transform file
+    edit would.
+    """
+    resolver = get_resolver(parse_entity_link_options(options).resolver)
+    return {"resolver": resolver.name, "resolver_version": resolver.version}
+
+
 def declared_link_incremental_contract(options: Mapping[str, Any]) -> IncrementalContract:
     """Parents are documents in the `mentions` model. The `aliases` model, when
     `aliases` names one, is a whole-table reference input, so an alias/reference
@@ -194,6 +209,11 @@ def _dep_frames(
                 f"`aliases: vocab.{vocab_name}` is not declared under "
                 f"`vocabularies:`. Available: {sorted(ctx.vocabularies) or '(none declared)'}"
             )
+        # `vocabulary_alias_rows` always uses these three names; rename to
+        # whatever `build_reference` is actually configured to read
+        # (`alias_text_field`/`namespace_field`/`canonical_id_field`), which
+        # may be overridden the same as for a table-backed alias source
+        # (#643 review — these were previously silently ignored here).
         aliases_frame = pl.DataFrame(
             vocabulary_alias_rows(vocab_name, vocabulary),
             schema={
@@ -201,6 +221,12 @@ def _dep_frames(
                 "entity_namespace": pl.String,
                 "canonical_id": pl.String,
             },
+        ).rename(
+            {
+                "alias": options.alias_text_field,
+                "entity_namespace": options.namespace_field,
+                "canonical_id": options.canonical_id_field,
+            }
         )
         return deps[options.mentions], aliases_frame
     expected = {options.mentions, options.aliases}

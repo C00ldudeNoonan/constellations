@@ -124,11 +124,67 @@ def test_vocab_sourced_alias_table_classifies_identically_to_a_hand_table() -> N
     ).sort("mention_id").to_dicts()
 
 
-def test_vocab_sourced_resolver_version_differs_from_a_table_backed_one() -> None:
-    # Pinned so a future bump of ALIAS_RESOLVER_VERSION is a deliberate,
-    # visible change to this test, not a silent one (issue #627's "cached
-    # results do not silently cross the change" acceptance bullet).
-    assert ALIAS_RESOLVER_VERSION == "2"
+def test_vocab_sourced_alias_table_honors_configured_column_names() -> None:
+    # #643 review: the synthesized frame previously always used the three
+    # default column names, so a configured override made `build_reference`
+    # raise a missing-columns error even though compilation succeeded.
+    result = link_entities.run(
+        {"mentions": _MENTIONS},
+        _ctx(
+            options={
+                "alias_text_field": "surface",
+                "namespace_field": "ns",
+                "canonical_id_field": "id",
+            }
+        ),
+    )
+
+    by_mention = {row["mention_id"]: row for row in result.to_dicts()}
+    assert by_mention["m-fed"]["status"] == "matched"
+    assert by_mention["m-fed"]["canonical_id"] == "Federal Reserve"
+
+
+def test_resolver_version_is_reported_for_code_version_identity() -> None:
+    assert link_entities.code_version_identity(
+        {"mentions": "mentions", "aliases": "vocab.sector"}
+    ) == {"resolver": "alias_table", "resolver_version": ALIAS_RESOLVER_VERSION}
+
+
+def test_alias_resolver_version_bump_invalidates_incremental_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The regression #643 review asked for: a resolver-version bump must
+    change `compute_model_code_version` for a `link_entities` model, or an
+    already-materialized incremental model's rows silently stay at the old
+    version forever (`transform_code_hash` is always "missing" for this
+    built-in, installed module — it has no project-local file to hash)."""
+    from stel import versioning
+    from stel.config.model import ModelConfig, TransformConfig
+    from stel.config.project import ExtractionDefaults, ProjectConfig
+    from stel.text import linking
+
+    project = ProjectConfig(
+        name="p", extraction=ExtractionDefaults(default_backend="json")
+    )
+    model = ModelConfig(
+        name="entity_links",
+        depends_on=["ref('mentions')", "ref('aliases')"],
+        transform=TransformConfig(
+            type="python",
+            module="stel.text.transforms.link_entities",
+            options={"mentions": "mentions", "aliases": "aliases"},
+        ),
+        materialization="incremental",
+    )
+
+    before = versioning.compute_model_code_version(model, project, tmp_path)
+    # Simulates a stel upgrade that bumps ALIAS_RESOLVER_VERSION: the
+    # registry's already-constructed instance reads the version as a class
+    # attribute, so patching the class is what an actual version bump does.
+    monkeypatch.setattr(linking.AliasTableResolver, "version", "999")
+    after = versioning.compute_model_code_version(model, project, tmp_path)
+
+    assert before != after
 
 
 def test_unknown_vocabulary_fails_at_run_time_with_a_clear_message() -> None:

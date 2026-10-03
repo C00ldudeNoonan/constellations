@@ -8,6 +8,7 @@ import polars as pl
 
 from ...transforms import IncrementalContract, TransformContext
 from ._linking import (
+    declared_link_code_version_identity,
     declared_link_dependencies,
     declared_link_incremental_contract,
     run_links,
@@ -21,6 +22,10 @@ def validate_options(options: Mapping[str, Any]) -> None:
 
 def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
     return declared_link_dependencies(options)
+
+
+def code_version_identity(options: Mapping[str, Any]) -> dict[str, str]:
+    return declared_link_code_version_identity(options)
 
 
 def declared_incremental_contract(options: Mapping[str, Any]) -> IncrementalContract:

@@ -29,6 +29,16 @@ def requires_llm(options: Mapping[str, Any]) -> bool:
     ).requires_inference()
 
 
+def code_version_identity(options: Mapping[str, Any]) -> dict[str, str]:
+    """The active extractor's name and version: this built-in transform
+    module has no project-local file, so `compute_model_code_version`'s file
+    hash cannot see which internal extractor implementation it selected, or
+    that extractor's own version constant (same reason `link_entities`
+    reports its resolver's — issue #627 review)."""
+    extractor = get_relation_extractor(parse_relation_options(options).extractor)
+    return {"extractor": extractor.name, "extractor_version": extractor.version}
+
+
 def declared_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
     return declared_relation_dependencies(options)
 

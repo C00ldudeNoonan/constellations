@@ -15,7 +15,7 @@ import polars as pl
 from ..budget import BudgetLedger
 from ..config.profile import LLMConfig, WarehouseConfig
 from ..config.vocabulary import Vocabulary
-from ..versioning import resolve_module_file
+from ..paths import resolve_module_file
 
 
 @dataclass(frozen=True)
@@ -307,6 +307,48 @@ def transform_requires_llm(
             f"Transform '{module_path}' `requires_llm` must be callable"
         )
     return bool(hook(dict(options)))
+
+
+def transform_code_version_identity(
+    module_path: str,
+    project_dir: Path,
+    options: Mapping[str, Any],
+) -> Any:
+    """A transform's optional ``code_version_identity(options)`` hook: a
+    JSON-serializable extra identity `compute_model_code_version` folds in,
+    for a transform whose own selected behavior carries a version a file hash
+    cannot see.
+
+    `transform_code_hash` identifies a *project-local* `.py` file; a built-in
+    stel transform (``stel.text.transforms.*``) has none; `resolve_module_file`
+    cannot find it under `project_dir`, so its hash is always ``"missing"``
+    regardless of which internal implementation it selects or that
+    implementation's own version constant (issue #627 review — bumping
+    `ALIAS_RESOLVER_VERSION` alone did not invalidate an incremental model's
+    already-materialized rows). A transform that selects between versioned
+    internal implementations by option (`extract_relations`'s `extractor:`,
+    `link_entities`'s `resolver:`) defines this hook to report which one and
+    at what version; absent hook → ``None``, folding in nothing, same as
+    before this hook existed.
+
+    A module neither found as a project file nor importable folds in nothing
+    either, the same tolerance `transform_code_hash` already has for a
+    missing project file (it hashes nothing and records ``"missing"`` rather
+    than raising) — a genuinely broken module reference still fails loudly,
+    earlier in preflight, through `load_transform`/`validate_transform_contract`,
+    which this function is never the first to see it through."""
+    try:
+        module = _load_transform_module(module_path, project_dir)
+    except FileNotFoundError:
+        return None
+    hook = getattr(module, "code_version_identity", None)
+    if hook is None:
+        return None
+    if not callable(hook):
+        raise AttributeError(
+            f"Transform '{module_path}' `code_version_identity` must be callable"
+        )
+    return hook(dict(options))
 
 
 def _incremental_contract_hook(

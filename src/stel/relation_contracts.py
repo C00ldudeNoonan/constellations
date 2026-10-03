@@ -63,14 +63,15 @@ def validate_relation_project_contracts(
             or model.transform.module != RELATION_TRANSFORM_MODULE
         ):
             continue
-        try:
-            options = parse_relation_options(model.transform.options)
-        except Exception:
-            # Malformed options are reported by the transform's own
-            # validate_options hook with a better, options-shape-specific
-            # message; this check only adds a constraint on top of options
-            # that already parse.
-            continue
+        # Not a second validation pass: `validate_project_contract` has
+        # already run `_validate_transform` -> `validate_options` ->
+        # `parse_relation_options` on this exact `model.transform.options`
+        # for every model, earlier in the same preflight, and raised on any
+        # that didn't parse. Reaching here with options that fail to parse
+        # again would mean the two calls disagree — a bug in this check, not
+        # malformed project input — so it is left to raise, not swallowed
+        # (#642 review).
+        options = parse_relation_options(model.transform.options)
         if isinstance(options, RuleExtractorOptions):
             for index, rule in enumerate(options.rules):
                 _validate_rule(model, index, rule, allowed_pairs)

@@ -14,6 +14,49 @@
   identity did not resolve is `missing_principal`, which was never logged, so
   a null principal on a logged refusal now means the resolver had no answer.
 
+### Concept-cloud nodes say what a declared vocabulary states they are (issue #629)
+
+- **A concept's node can now carry its declared class, definition and broader
+  term.** A vocabulary term may declare `class:`, validated against the
+  project's `classes:`; a concept whose canonical id is that term gets the
+  class, the term's `description:` as its definition, and its `broader` term.
+  Nothing undeclared is inferred, and a concept two vocabularies describe
+  differently carries none of the three.
+- **The bundle is schema version 4.** Version 3 bundles are refused rather than
+  read as current. The new keys are absent from undeclared concepts, not null.
+
+### An index build that cannot allocate is not retried, and the pool is sizable (issue #636)
+
+- **A BTree build over 3.64M keys failed deterministically and stel retried it
+  three times.** Lance sorts the whole key column through a DataFusion memory
+  pool, which is neither of the caches `lancedb.Session` exposes. Exhausting
+  it raises `Resources exhausted` -- as a plain `RuntimeError`, like every
+  other Lance failure -- so three fast retries with backoff looked reasonable
+  from outside while being unable to succeed. It cost a publish on 2026-09-13
+  and a `serving activate` on 2026-10-02.
+- `Resources exhausted` from that pool is now classified and surfaced on the
+  **first** attempt, with a message naming the pool, `LANCE_MEM_POOL_SIZE` and
+  the new store setting. Anything that is not a pool refusal keeps the #491
+  retry budget.
+- `memory_pool_size_mb` on the `lancedb` store sets `LANCE_MEM_POOL_SIZE` for
+  the process, which is the only lever the library offers. An operator's own
+  value is never overwritten, and leaving it unset changes nothing.
+- The native text is read to classify and still never copied into the failure
+  or a log, which is the `_operation_failed` contract (#490).
+
+**Two corrections to #592's comments, now that the pool is understood.** It is
+not "fixed at 100 MB": 100 MB is what the *merge* path reported, while an index
+build on the same container and library version reported ~33 MB, so the figure
+is per-operation. And it is not "unreachable from configuration" -- the
+environment variable above reaches it. `MERGE_PAYLOAD_LIMIT_BYTES` stays at
+64 MB, which #592 measured directly against the merge path (a 91.8 MB payload
+succeeded there), so that ceiling is unaffected.
+
+**Also worth revisiting:** #598 reads the 2026-09-13 failure as a generation
+left physically unsound by a build that died mid-index. On this evidence the
+build never allocated at all, so it committed nothing -- the adoption check
+#598 asks for may still be worth having, but this was the incident behind it.
+
 ### The serving ledger says who holds a publish claim, and how long since they were heard from (issue #621)
 
 - **`publisher: active` was all `stel serving status` could say about a

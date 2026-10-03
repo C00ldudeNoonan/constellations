@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -82,12 +83,19 @@ _CEILING_CACHE_SHARE = 0.5
 
 # Ceiling on the Arrow payload handed to one `merge_insert` (issue #592).
 #
-# `merge_insert` reserves the whole payload for its join build side, out of a
-# process-wide pool fixed at 100 MB in lancedb 0.34.0 and not reachable from
-# configuration — `lancedb.Session` exposes `index_cache_size_bytes` and
-# `metadata_cache_size_bytes` and nothing else. So the page size is the only
-# lever a caller has, and `batch_size` counts *rows* against a limit
+# `merge_insert` reserves the whole payload for its join build side, out of
+# Lance's DataFusion memory pool. `lancedb.Session` exposes only
+# `index_cache_size_bytes` and `metadata_cache_size_bytes`, so page size is the
+# lever a caller has over this, and `batch_size` counts *rows* against a limit
 # denominated in *bytes*.
+#
+# Two corrections to what this comment originally said (issue #636). The pool
+# is **not** fixed at 100 MB: 100 MB is what the merge path reported in the
+# measurement below, while an index build on the same container and library
+# version reported ~33 MB — so the figure is per-operation rather than a
+# constant, and the ceiling here is calibrated against the merge path only.
+# And it **is** reachable from configuration, through `MEM_POOL_ENV` below;
+# `memory_pool_size_mb` now sets it.
 #
 # That mismatch killed two consecutive weekly publishes of a 3.6M-row
 # collection. Measured against it, round-tripping existing rows through the
@@ -103,6 +111,37 @@ _CEILING_CACHE_SHARE = 0.5
 # the only cost of a smaller page is more `merge_insert` calls against a store
 # whose per-page fixed cost is object-store I/O, not this reservation.
 MERGE_PAYLOAD_LIMIT_BYTES = 64 * _MB
+
+# The environment variable that sizes Lance's DataFusion memory pool.
+# Confirmed read by the native extension (`lancedb/_lancedb.pyd` carries
+# the name); `lancedb.Session` does not expose it, so the environment is
+# the only lever (issue #636).
+MEM_POOL_ENV = "LANCE_MEM_POOL_SIZE"
+
+# `Resources exhausted` from that pool is **deterministic for a given pool
+# size**: the same build fails the same way however often it is retried.
+# A BTree over 3.64M string keys exhausted a ~33 MB pool in 2.7s and
+# succeeded in 40s once the pool was raised (issue #636).
+#
+# Matched on the native text rather than the exception type because
+# `lance` raises `RuntimeError` for everything -- a transient object-store
+# error, a permission problem and this all arrive identically, which is
+# exactly what made three fast retries look reasonable from outside. The
+# text is read to classify and never copied into the failure.
+_POOL_EXHAUSTED = re.compile(
+    r"resources exhausted|remain available for the total pool",
+    re.IGNORECASE,
+)
+
+
+def _is_pool_exhausted(error: Exception) -> bool:
+    """Whether this native error is the DataFusion pool refusing to grow.
+
+    Reading the native text is deliberate and is the one thing done with
+    it: the message itself is still never copied into the failure or a
+    log, which is what `_operation_failed` exists to guarantee.
+    """
+    return bool(_POOL_EXHAUSTED.search(str(error)))
 
 
 def _byte_bounded_slices(payload: pa.Table, limit_bytes: int) -> Iterator[pa.Table]:
@@ -290,6 +329,18 @@ class LanceDBConfig(RetrievalStoreConfig):
     # descriptor, so changing one cannot reclassify a published collection.
     index_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
     metadata_cache_size_mb: int | None = Field(default=None, ge=1, le=1_048_576)
+    # Lance's DataFusion memory pool, which is *not* either cache above and
+    # is not reachable through `lancedb.Session` -- the environment is the
+    # only lever the library offers (issue #636). An index build sorts the
+    # whole key column through this pool, so the default is too small for a
+    # multi-million-row collection: a BTree over 3.64M keys exhausted a
+    # ~33 MB pool in 2.7s, and the same build took 40s with the pool raised.
+    #
+    # Unset leaves whatever the environment already says, including nothing,
+    # so this adds a lever without changing what an existing deployment
+    # does. Execution setting, not identity: it reaches neither
+    # `routing_options()` nor the safe descriptor.
+    memory_pool_size_mb: int | None = Field(default=None, ge=16, le=1_048_576)
     # Bounded retry for each index build (issue #491). The build is the last
     # step of a publish that may have written rows for hours, and one
     # transient object-store error there used to discard the whole run.
@@ -412,6 +463,16 @@ _PQ_MINIMUM_ROWS = 256
 _sleep = time.sleep
 
 
+class _IndexBuildPoolExhausted(Exception):
+    """The index build could not allocate from Lance's memory pool.
+
+    Separate from `_IndexBuildExhausted` because it is not exhaustion of
+    *attempts* -- it is a deterministic refusal that no number of attempts
+    would have survived, and the operator's next step is a pool size
+    rather than a retry (issue #636).
+    """
+
+
 class _IndexBuildExhausted(Exception):
     """Every attempt at one index build failed; carries the last native error."""
 
@@ -526,6 +587,19 @@ class LanceDBStore(RetrievalStore):
                 connect_kwargs["storage_options"] = storage_options
         else:
             self._config.local_data_path().mkdir(parents=True, exist_ok=True)
+        pool_mb = self._config.memory_pool_size_mb
+        if pool_mb is not None and MEM_POOL_ENV not in os.environ:
+            # Process-wide, because Lance gives no per-connection seam for
+            # it. Deliberately never overwriting a value the operator set
+            # themselves: they may be sizing it for a bigger job in the
+            # same process, and silently replacing that would be the
+            # opposite of what a store-level default is for.
+            os.environ[MEM_POOL_ENV] = str(pool_mb * _MB)
+            log.info(
+                "LanceDB memory pool set to %d MB for this process (%s)",
+                pool_mb,
+                MEM_POOL_ENV,
+            )
         budget = session_cache_budget(self._config, self.role)
         if budget is not None:
             # Without a Session, LanceDB takes its own defaults (~6 GB index +
@@ -977,6 +1051,11 @@ class LanceDBStore(RetrievalStore):
             except RetrievalError:
                 raise
             except Exception as error:
+                if _is_pool_exhausted(error):
+                    # Deterministic: two more attempts would fail the same
+                    # way, ~5s and ~10s later, and the operator would see
+                    # only `[RuntimeError]` for the wait (issue #636).
+                    raise _IndexBuildPoolExhausted(step) from None
                 if attempt == attempts:
                     if attempts == 1:
                         raise
@@ -1163,6 +1242,19 @@ class LanceDBStore(RetrievalStore):
         except RetrievalError:
             # A deliberate refusal keeps its own code, as in `upsert`/`delete`.
             raise
+        except _IndexBuildPoolExhausted as refused:
+            # Not routed through `_operation_failed`: there is no native
+            # text worth keeping here, and the actionable part is the pool
+            # size, which stel knows without being told.
+            failure = RetrievalError(
+                f"LanceDB could not build {refused.args[0]}: its DataFusion "
+                "memory pool is too small for this collection, and the "
+                "failure is deterministic rather than transient "
+                "(code=lancedb_index_pool_exhausted). Raise it with the "
+                f"{MEM_POOL_ENV} environment variable -- a few hundred "
+                "MB covers millions of rows -- or set "
+                "`memory_pool_size_mb` on the retrieval store."
+            )
         except _IndexBuildExhausted as exhausted:
             failure = _operation_failed(
                 "index creation",

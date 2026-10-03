@@ -11,6 +11,7 @@ text through the retry warning.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -332,3 +333,140 @@ def test_retry_settings_do_not_enter_the_store_identity(tmp_path: Path) -> None:
     tuned = _store(tmp_path, index_build_attempts=8, index_build_retry_seconds=30)
     assert tuned.safe_descriptor() == plain.safe_descriptor()
     assert tuned.state_descriptor("context") == plain.state_descriptor("context")
+
+
+# ─── a pool refusal is not transient (issue #636) ───────────────────────────
+
+# What `lance` actually raises when the DataFusion pool will not grow. Carries
+# byte counts and a struct name -- no URI, no credential -- but is still only
+# ever read to classify, never copied into the failure.
+POOL_ERROR = (
+    "lance error: LanceError(IO): Resources exhausted: Failed to allocate "
+    "additional 352.0 KB for ExternalSorterMerge[0] with 32.5 MB already "
+    "allocated for this reservation - 281.1 KB remain available for the "
+    "total pool, lance-datafusion-8.0.0/src/chunker.rs:49:46"
+)
+
+
+class _PoolExhaustedTable:
+    """A real table whose `create_index` always refuses for want of pool."""
+
+    def __init__(self, table: Any) -> None:
+        self._table = table
+        self.calls: list[dict[str, Any]] = []
+
+    def create_index(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        raise RuntimeError(POOL_ERROR)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._table, name)
+
+
+def _pool_exhausted(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    original = LanceDBStore._open_owned_table
+    seen: dict[str, Any] = {}
+
+    def open_refusing(self: LanceDBStore, name: str) -> Any:
+        if "table" not in seen:
+            seen["table"] = _PoolExhaustedTable(original(self, name))
+        return seen["table"]
+
+    monkeypatch.setattr(LanceDBStore, "_open_owned_table", open_refusing)
+    return seen
+
+
+def test_a_pool_refusal_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three attempts cannot survive a deterministic refusal.
+
+    `Resources exhausted` from the DataFusion pool depends on the pool size,
+    not on timing: a BTree over 3.64M keys failed in 2.7s and kept failing,
+    while the operator saw only `[RuntimeError]` for the two backoffs
+    (issue #636). Retrying it spends 15s to reach the same place.
+    """
+    sleeps = _record_sleeps(monkeypatch)
+    spec = _spec()
+    with _store(tmp_path) as store:
+        _publish(store, spec)
+        seen = _pool_exhausted(monkeypatch)
+        with pytest.raises(RetrievalError) as exc_info:
+            store.ensure_indexes(spec)
+
+    assert len(seen["table"].calls) == 1, "a pool refusal must not be retried"
+    assert sleeps == [], "no backoff should be spent on a deterministic failure"
+    assert "deterministic rather than transient" in str(exc_info.value)
+
+
+def test_the_pool_refusal_names_the_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The operator's next step is a pool size, and before this the message
+    # gave them `[RuntimeError]` and nothing else.
+    _record_sleeps(monkeypatch)
+    spec = _spec()
+    with _store(tmp_path) as store:
+        _publish(store, spec)
+        _pool_exhausted(monkeypatch)
+        with pytest.raises(RetrievalError) as exc_info:
+            store.ensure_indexes(spec)
+
+    message = str(exc_info.value)
+    assert lancedb_store.MEM_POOL_ENV in message
+    assert "memory_pool_size_mb" in message
+    assert "lancedb_index_pool_exhausted" in message
+    # Classified from the native text, never quoting it.
+    assert "ExternalSorterMerge" not in message
+    assert "chunker.rs" not in message
+
+
+def test_a_transient_failure_is_still_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The #491 policy must survive the #636 classification: anything that is
+    # not a pool refusal keeps its retry budget.
+    sleeps = _record_sleeps(monkeypatch)
+    spec = _spec()
+    with _store(tmp_path) as store:
+        _publish(store, spec)
+        seen = _flaky(monkeypatch, failures=2)
+        store.ensure_indexes(spec)
+
+    assert len(seen["table"].calls) == 3
+    assert sleeps == [5.0, 10.0]
+
+
+# ─── sizing the pool ────────────────────────────────────────────────────────
+
+
+def test_the_configured_pool_size_is_exported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Lance offers no per-connection seam for this, so the store sets the
+    # process environment -- and says so.
+    monkeypatch.delenv(lancedb_store.MEM_POOL_ENV, raising=False)
+    with _store(tmp_path, memory_pool_size_mb=512):
+        assert os.environ[lancedb_store.MEM_POOL_ENV] == str(512 * 1024 * 1024)
+
+
+def test_an_operator_set_pool_size_is_never_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Their value may be sized for a larger job in the same process.
+
+    A store-level default exists to fill a gap, not to overrule someone who
+    has already made the decision.
+    """
+    monkeypatch.setenv(lancedb_store.MEM_POOL_ENV, "123456789")
+    with _store(tmp_path, memory_pool_size_mb=512):
+        assert os.environ[lancedb_store.MEM_POOL_ENV] == "123456789"
+
+
+def test_an_unset_pool_size_touches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default must change nothing for an existing deployment.
+    monkeypatch.delenv(lancedb_store.MEM_POOL_ENV, raising=False)
+    with _store(tmp_path):
+        assert lancedb_store.MEM_POOL_ENV not in os.environ

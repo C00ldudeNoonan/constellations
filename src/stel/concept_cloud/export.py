@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, cast
@@ -24,6 +26,7 @@ from typing import Any, Literal, NamedTuple, cast
 import polars as pl
 
 from ..config import load_project
+from ..config.vocabulary import Vocabulary
 from ..manifest import MANIFEST_FILENAME, write_manifest
 from .schema import (
     Concept,
@@ -144,6 +147,7 @@ def build_concept_cloud(
     time_field: str | None = None,
     time_grain: TimeGrain = "year",
     top_n_per_period: int = 0,
+    vocabularies: Mapping[str, Vocabulary] | None = None,
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -151,6 +155,11 @@ def build_concept_cloud(
     null canonical id, are dropped); the cloud is capped to the `top_n` most
     frequent concepts for readability. Relation rows are canonicalized through the
     mention→canonical map into typed concept edges.
+
+    `vocabularies` are the project's declared vocabularies (issue #629). A concept
+    takes its class, definition and broader term from the declared term whose
+    label is its canonical id, in a vocabulary that its linked rows name as their
+    namespace; a concept nothing declares carries none of them.
     """
     generated_at = generated_at or datetime.now(UTC).isoformat()
     node_ids = {node.id for node in dag_plane.nodes}
@@ -162,6 +171,7 @@ def build_concept_cloud(
         names=concept_names(names) if names is not None else {},
         time_field=time_field, time_grain=time_grain,
         top_n_per_period=top_n_per_period,
+        declared=_declared_by_term(vocabularies or {}),
     )
     kept = {c.canonical_id for c in concepts}
     concept_edges = _aggregate_edges(relations, canonical_of, kept, period_of)
@@ -268,6 +278,50 @@ def _format_period(year: int, month: int, grain: TimeGrain) -> str:
     return f"{year:04d}-{month:02d}"
 
 
+@dataclass(frozen=True)
+class _Declared:
+    """What a vocabulary term declares about a concept (issue #629)."""
+
+    entity_class: str | None = None
+    definition: str | None = None
+    broader: str | None = None
+
+
+def _declared_by_term(
+    vocabularies: Mapping[str, Vocabulary],
+) -> dict[tuple[str, str], _Declared]:
+    """Declared fields keyed by (vocabulary name, term label). A vocabulary's
+    name is the `entity_namespace` its alias rows carry (issue #627), and a
+    term's label is the canonical id those rows link to."""
+    return {
+        (vocab_name, term.label): _Declared(
+            entity_class=term.entity_class,
+            definition=term.description,
+            broader=term.broader,
+        )
+        for vocab_name, vocabulary in vocabularies.items()
+        for term in vocabulary.terms
+    }
+
+
+def _declared_for(
+    canonical_id: str,
+    rows: list[dict[str, object]],
+    declared: dict[tuple[str, str], _Declared],
+) -> _Declared:
+    """The declaration a concept's linked rows name, when they agree.
+
+    Two vocabularies can declare the same label differently; asserting either
+    one would be a guess about which the operator meant, so such a concept is
+    left undeclared instead."""
+    found = {
+        declared[key]
+        for r in rows
+        if (key := (str(r.get("entity_namespace")), canonical_id)) in declared
+    }
+    return found.pop() if len(found) == 1 else _Declared()
+
+
 def _aggregate_concepts(
     links: pl.DataFrame,
     *,
@@ -280,6 +334,7 @@ def _aggregate_concepts(
     time_field: str | None,
     time_grain: TimeGrain,
     top_n_per_period: int,
+    declared: dict[tuple[str, str], _Declared],
 ) -> tuple[list[Concept], dict[str, str], dict[str, str]]:
     if "canonical_id" not in links.columns or "mention_id" not in links.columns:
         raise ConceptCloudExportError(
@@ -347,10 +402,14 @@ def _aggregate_concepts(
             period for r in rows
             if (period := period_of.get(str(r["mention_id"]))) is not None
         )
+        declared_here = _declared_for(cid, rows, declared)
         concepts.append(Concept(
             canonical_id=cid,
             display=str(display),
             description=name.description if name else None,
+            entity_class=declared_here.entity_class,
+            definition=declared_here.definition,
+            broader=declared_here.broader,
             label=str(label) if label is not None else None,
             frequency=len(rows),
             link_status="ambiguous" if ambiguous else "matched",
@@ -871,4 +930,5 @@ def export_concept_cloud(
         time_field=time_field,
         time_grain=time_grain,
         top_n_per_period=top_n_per_period,
+        vocabularies=project.vocabularies,
     )

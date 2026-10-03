@@ -1912,10 +1912,27 @@ not only its name. A term may also declare `aliases:` (alternative names) and
 `broader:` (another term's `label`, for a hierarchy); both are validated —
 duplicate or dangling references and cyclic `broader` chains are rejected —
 but neither affects extraction yet. Aliases exist for entity linking, not
-classification: they never widen the set a field may output. Classes,
-relation types, and reading this declaration from entity linking and the
-concept cloud are separate, larger pieces of work (issues #626-#629) that
-build on this declaration rather than this one growing to anticipate them.
+classification: they never widen the set a field may output.
+
+A term may also declare `class:`, naming an entity class from the project's
+`classes:` list. The concept cloud reports it on that concept's node (issue
+#629); the value must be declared, so a typo is a load error, not a node that
+quietly belongs to nothing.
+
+```yaml
+classes: [institution]
+vocabularies:
+  central_banks:
+    terms:
+      - label: Federal Reserve
+        description: The United States central bank
+        class: institution
+```
+
+Relation types between classes, and reading this declaration from entity
+linking and the concept cloud, are covered in the entity-linking and
+relation-extraction sections; those are the separate pieces of work (issues
+#626-#629) that build on this declaration.
 
 Structure-preserving options for document parsing:
 
@@ -4710,6 +4727,22 @@ Proximity then means how the corpus uses a concept. Only coordinates enter the
 bundle — never vectors or text — and concepts stay pinned to their positions
 in the viewer, because position *is* the meaning. Without the flag, layout
 falls back to the force simulation.
+
+**Declared class, definition and broader term** (issue #629). A concept whose
+canonical id is a term in one of the project's `vocabularies:` carries what
+that term declares: its `class` (a name from `classes:`), its `definition` (the
+term's `description:`), and its `broader` term (another term's label). These
+come only from the declaration, never from document text, and they are
+separate from the `description` above, which comes from the names relation the
+operator maintains. A concept nothing declares, or one that two vocabularies
+declare differently, carries none of the three: the keys are absent from the
+bundle, not null, because an absent key is the signal. The bundle is schema
+version 4; a version 3 bundle is refused by the artifact rather than read as
+current.
+
+Scope: this carries what a declaration states about each concept. It does not
+lay concepts out by class or by hierarchy (issue #345), and it does not add a
+time-varying history of a concept's definition (issue #555).
 
 **Names and descriptions** (`--names-model <model>`, issue #554). Without it a
 concept is named by its **most frequent** mention text, ties broken lexically —

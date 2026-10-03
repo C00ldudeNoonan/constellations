@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 # Bumped when the bundle shape changes so the artifact and the export job can
 # evolve independently; the artifact refuses a bundle it does not understand.
@@ -19,7 +27,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # v3 (issue #553): per-period counts on concepts and edges, plus the bundle's
 # period axis, so one artifact can be stepped through time instead of one
 # artifact per period.
-CONCEPT_CLOUD_SCHEMA_VERSION = "3"
+# v4 (issue #629): per-concept declared class, definition and broader term,
+# sourced from the project's vocabularies and omitted when undeclared.
+CONCEPT_CLOUD_SCHEMA_VERSION = "4"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -165,12 +175,22 @@ class Concept(_Frozen):
     entity-linking output; `display` is human-readable only when the operator
     opted into mention/entity text, else it falls back to the id or label."""
 
+    # populate_by_name: `class` is a Python keyword, so the attribute is
+    # `entity_class` and the bundle key is `class` (issue #629).
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
     canonical_id: str
     display: str
     # What this concept *is*, in the operator's words (#554). A map of tickers
     # and acronyms is unreadable without it, and no pipeline table knows it —
     # it comes from the names relation the operator maintains, never inferred.
     description: str | None = None
+    # Declared, not inferred (issue #629): the class, definition and broader
+    # term a project's vocabulary states for this concept. Definitions come
+    # only from the declaration's term description, never from document text.
+    entity_class: str | None = Field(default=None, alias="class")
+    definition: str | None = None
+    broader: str | None = None
     label: str | None = None
     namespace: str | None = None
     # COUNT of mentions for this canonical id; drives node size. >= 1.
@@ -196,12 +216,24 @@ class Concept(_Frozen):
     def _non_empty(cls, value: str) -> str:
         return _require_non_empty(value)
 
-    @field_validator("description")
+    @field_validator("description", "definition", "broader", "entity_class")
     @classmethod
-    def _blank_description_is_absent(cls, value: str | None) -> str | None:
-        # A names relation with an empty cell means "no description", not a
-        # concept whose description is whitespace.
+    def _blank_is_absent(cls, value: str | None) -> str | None:
+        # An empty cell or an empty declaration means "not declared", not a
+        # value that is whitespace.
         return value.strip() or None if value is not None else None
+
+    @model_serializer(mode="wrap")
+    def _omit_undeclared_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # A concept no declaration describes carries none of these keys at all:
+        # an absent key is the signal, and a null or "" would read as a declared
+        # empty value (issue #629). `description` predates this and keeps its
+        # existing null shape.
+        data = handler(self)
+        for key in ("class", "class_", "definition", "broader"):
+            if key in data and data[key] is None:
+                del data[key]
+        return data
 
     @field_validator("match_score")
     @classmethod
@@ -264,7 +296,7 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["3"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["4"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane

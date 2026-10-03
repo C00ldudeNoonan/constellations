@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Concept-cloud nodes say what a declared vocabulary states they are (issue #629)
+
+- **A concept's node can now carry its declared class, definition and broader
+  term.** A vocabulary term may declare `class:`, validated against the
+  project's `classes:`; a concept whose canonical id is that term gets the
+  class, the term's `description:` as its definition, and its `broader` term.
+  Nothing undeclared is inferred, and a concept two vocabularies describe
+  differently carries none of the three.
+- **The bundle is schema version 4.** Version 3 bundles are refused rather than
+  read as current. The new keys are absent from undeclared concepts, not null.
+
 ### An index build that cannot allocate is not retried, and the pool is sizable (issue #636)
 
 - **A BTree build over 3.64M keys failed deterministically and stel retried it
@@ -34,7 +45,6 @@ left physically unsound by a build that died mid-index. On this evidence the
 build never allocated at all, so it committed nothing -- the adoption check
 #598 asks for may still be worth having, but this was the incident behind it.
 
-## Unreleased
 
 ### The serving ledger says who holds a publish claim, and how long since they were heard from (issue #621)
 

@@ -361,4 +361,25 @@ def test_link_contract_does_not_swallow_options_that_fail_to_parse(
     project, _sources, models = load_project(project_dir)
 
     with pytest.raises(ValueError, match=r"no_such_resolver|resolver"):
-        validate_link_project_contracts(models, project)
+        validate_link_project_contracts(models, project, project_dir)
+
+
+def test_a_project_local_link_module_is_not_checked_against_the_builtin_parser(
+    tmp_path: Path,
+) -> None:
+    # `_load_transform_module` prefers a project file at the same dotted path, so
+    # the built-in options shape does not apply to it (Codex on #649).
+    project_dir = _copy_example(tmp_path)
+    _append_vocabulary(project_dir)
+    override = project_dir / "stel" / "text" / "transforms" / "link_entities.py"
+    override.parent.mkdir(parents=True)
+    override.write_text("def validate_options(options):\n    pass\n", encoding="utf-8")
+    custom = _VOCAB_MODEL_YAML.replace(
+        "        aliases: vocab.sector\n",
+        "        aliases: vocab.sector\n        custom: true\n",
+    )
+    (project_dir / "models" / "entity_links_vocab.yml").write_text(custom, encoding="utf-8")
+
+    project, _sources, models = load_project(project_dir)
+
+    validate_link_project_contracts(models, project, project_dir)

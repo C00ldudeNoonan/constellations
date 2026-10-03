@@ -9,8 +9,11 @@ time, before source discovery or any provider call.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
+from .paths import resolve_module_file
 from .text.linking import (
     AliasTableResolverOptions,
     parse_entity_link_options,
@@ -30,8 +33,13 @@ class LinkContractError(ValueError):
 
 
 def validate_link_project_contracts(
-    models: list[ModelConfig], project: ProjectConfig
+    models: list[ModelConfig], project: ProjectConfig, project_dir: Path
 ) -> None:
+    # A project file at the same dotted path wins over the built-in module
+    # (`_load_transform_module`), so its own `validate_options` owns the options
+    # shape and the built-in parser must not be applied to them.
+    if resolve_module_file(LINK_TRANSFORM_MODULE, project_dir).exists():
+        return
     for model in models:
         if (
             model.transform is None

@@ -35,12 +35,16 @@ class VocabularyTerm(BaseModel):
     `broader` references cycles back on itself.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     label: str
     description: str | None = None
     aliases: list[str] = Field(default_factory=list)
     broader: str | None = None
+    # The entity class this term is an instance of (issue #629). Authored as
+    # `class:`; a keyword in Python, so the attribute is `entity_class`. Must
+    # name a class declared under `classes:` (checked by ProjectConfig).
+    entity_class: str | None = Field(default=None, alias="class")
 
     @field_validator("label")
     @classmethod
@@ -48,6 +52,15 @@ class VocabularyTerm(BaseModel):
         if not v.strip():
             raise ValueError("vocabulary term label must not be empty")
         return v
+
+    @field_validator("entity_class")
+    @classmethod
+    def _validate_entity_class(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("vocabulary term class must not be empty")
+        return v.strip()
 
     @field_validator("aliases")
     @classmethod

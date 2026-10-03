@@ -839,7 +839,7 @@ def test_a_time_field_gives_each_concept_its_periods() -> None:
         time_field="filing_year",
     )
 
-    assert export.schema_version == "3"
+    assert export.schema_version == "4"
     assert export.periods == ("2019", "2021")
     by_id = {c.canonical_id: c for c in export.concepts}
     assert by_id["FERC"].by_period == {"2019": 2, "2021": 1}

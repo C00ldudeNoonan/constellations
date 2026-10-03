@@ -85,6 +85,23 @@ class ProjectConfig(BaseModel):
         return normalized
 
     @model_validator(mode="after")
+    def _validate_term_classes(self) -> ProjectConfig:
+        # A term's `class:` is a membership claim against the same declaration
+        # relations are checked against (issue #629). Undeclared, it would
+        # attach a class no relation or agent-facing list knows about.
+        for vocab_name, vocabulary in self.vocabularies.items():
+            for term in vocabulary.terms:
+                if term.entity_class is None:
+                    continue
+                if term.entity_class not in self.classes:
+                    raise ValueError(
+                        f"vocabulary '{vocab_name}' term '{term.label}' declares "
+                        f"`class: {term.entity_class}`, which is not declared under "
+                        f"`classes:`. Declared: {sorted(self.classes) or '(none)'}"
+                    )
+        return self
+
+    @model_validator(mode="after")
     def _validate_relations(self) -> ProjectConfig:
         if not self.relations:
             return self

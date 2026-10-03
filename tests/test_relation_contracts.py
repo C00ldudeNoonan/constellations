@@ -19,6 +19,7 @@ from stel.config import load_project
 from stel.config.loader import ConfigError
 from stel.config.project import ProjectConfig
 from stel.config.vocabulary import RelationTypeDef
+from stel.relation_contracts import validate_relation_project_contracts
 
 # ─── the project-level declaration ──────────────────────────────────────────
 
@@ -243,3 +244,31 @@ def test_model_assertion_relation_types_must_be_declared(tmp_path: Path) -> None
     assert "document_relations_llm" in message
     assert "invented_relation" in message
     assert "`relations:` does not declare" in message
+
+
+
+def test_a_project_local_relation_module_is_not_checked_against_the_builtin_parser(
+    tmp_path: Path,
+) -> None:
+    # Same backwards declaration as test_disallowed_class_pair_fails_at_compile,
+    # but a project file at the built-in module path owns the options shape, so
+    # the built-in rule check must not run against it (Codex on #649).
+    project_dir = _copy_example(tmp_path)
+    _append_declaration(
+        project_dir,
+        "\nclasses: [ORG, GPE, MONEY]\n"
+        "relations:\n"
+        "  - name: references_geography\n"
+        "    subject_class: GPE\n"
+        "    object_class: ORG\n"
+        "  - name: references_amount\n"
+        "    subject_class: ORG\n"
+        "    object_class: MONEY\n",
+    )
+    override = project_dir / "stel" / "text" / "transforms" / "extract_relations.py"
+    override.parent.mkdir(parents=True)
+    override.write_text("def validate_options(options):\n    pass\n", encoding="utf-8")
+
+    project, _sources, models = load_project(project_dir)
+
+    validate_relation_project_contracts(models, project, project_dir)

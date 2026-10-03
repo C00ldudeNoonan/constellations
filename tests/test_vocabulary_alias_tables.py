@@ -21,6 +21,7 @@ from stel.compiler import validate_project_contract
 from stel.config import load_project
 from stel.config.loader import ConfigError
 from stel.config.vocabulary import Vocabulary, VocabularyTerm
+from stel.link_contracts import validate_link_project_contracts
 from stel.text.linking import (
     ALIAS_RESOLVER_VERSION,
     parse_vocabulary_alias_source,
@@ -340,3 +341,45 @@ def test_economic_entity_links_example_is_unaffected() -> None:
     # before #627 exists.
     project, sources, models = load_project(_example_dir())
     validate_project_contract(project, sources, models, _example_dir())
+
+
+def test_link_contract_does_not_swallow_options_that_fail_to_parse(
+    tmp_path: Path,
+) -> None:
+    # Reached only if `validate_options` and this check disagree about the same
+    # options. The check must raise rather than skip the model (#642 review).
+    project_dir = _copy_example(tmp_path)
+    _append_vocabulary(project_dir)
+    malformed = _VOCAB_MODEL_YAML.replace(
+        "        aliases: vocab.sector\n",
+        "        aliases: vocab.sector\n        resolver: no_such_resolver\n",
+    )
+    (project_dir / "models" / "entity_links_vocab.yml").write_text(
+        malformed, encoding="utf-8"
+    )
+
+    project, _sources, models = load_project(project_dir)
+
+    with pytest.raises(ValueError, match=r"no_such_resolver|resolver"):
+        validate_link_project_contracts(models, project, project_dir)
+
+
+def test_a_project_local_link_module_is_not_checked_against_the_builtin_parser(
+    tmp_path: Path,
+) -> None:
+    # `_load_transform_module` prefers a project file at the same dotted path, so
+    # the built-in options shape does not apply to it (Codex on #649).
+    project_dir = _copy_example(tmp_path)
+    _append_vocabulary(project_dir)
+    override = project_dir / "stel" / "text" / "transforms" / "link_entities.py"
+    override.parent.mkdir(parents=True)
+    override.write_text("def validate_options(options):\n    pass\n", encoding="utf-8")
+    custom = _VOCAB_MODEL_YAML.replace(
+        "        aliases: vocab.sector\n",
+        "        aliases: vocab.sector\n        custom: true\n",
+    )
+    (project_dir / "models" / "entity_links_vocab.yml").write_text(custom, encoding="utf-8")
+
+    project, _sources, models = load_project(project_dir)
+
+    validate_link_project_contracts(models, project, project_dir)

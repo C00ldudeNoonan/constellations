@@ -229,7 +229,7 @@ def validate_project_contract(
         raise _model_error(implicated, str(e), e.path) from e
 
     try:
-        validate_relation_project_contracts(models, project)
+        validate_relation_project_contracts(models, project, project_dir)
     except RelationContractError as e:
         implicated = next(
             (model for model in models if model.name == e.model_name),

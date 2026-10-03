@@ -123,3 +123,28 @@ class Vocabulary(BaseModel):
         return {
             term.label: term.description for term in self.terms if term.description
         }
+
+
+class RelationTypeDef(BaseModel):
+    """One allowed (subject_class, object_class) pairing for a named relation
+    type (issue #626) — a domain/range constraint for `RelationRule.relation_type`
+    and `ModelAssertionExtractorOptions.relation_types` to be checked against.
+
+    The same `name` may repeat with a different pairing: a relation can be
+    polymorphic, e.g. `located_in` holding between both (company, country) and
+    (person, country), so declared pairings are a set per name, not one each.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    subject_class: str
+    object_class: str
+
+    @field_validator("name", "subject_class", "object_class")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        normalized = v.strip()
+        if not normalized:
+            raise ValueError("must not be empty")
+        return normalized

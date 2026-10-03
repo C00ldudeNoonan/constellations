@@ -1,7 +1,7 @@
 """Typed relation extraction over the NLP entity-mention child table (issue #220).
 
-A *relation* connects two entity mentions in the same document. The design
-keeps three kinds of relationship strictly distinguishable so a consumer never
+A *relation* connects two entity mentions in the same document. Three
+extractors ship here, kept strictly distinguishable so a consumer never
 mistakes proximity for a semantic assertion:
 
 - **co-occurrence** — the deterministic, offline built-in. Two mentions
@@ -9,17 +9,20 @@ mistakes proximity for a semantic assertion:
   character window (``scope: window``). This asserts nothing beyond "these
   mentions appeared together"; every row is labelled ``method = "co_occurrence"``
   and is symmetric (``directed = false``).
-- **rule-derived** — a future deterministic extractor that asserts a typed,
-  directed relation from explicit rules. It slots into the same registry with
-  ``method = "rule"``.
-- **model assertion** — a learned or LLM extractor, deferred behind this
-  registry (``method = "model_assertion"``); the generic structured-LLM path
-  (#144) remains the way to run one today.
+- **rule-derived** (issue #217) — a deterministic extractor that asserts a
+  typed, directed relation from explicit ``RelationRule`` entries
+  (``method = "rule"``).
+- **model assertion** (issue #240) — a governed inference provider decides
+  which of a schema-controlled set of relation types holds between each
+  candidate pair (``method = "model_assertion"``).
 
-Only the co-occurrence extractor ships here. The grain, the ``method`` column,
-and the extractor registry are shaped so the other two plug in without touching
-transform execution — the same sequencing used for entity-linking resolvers
-(#217). Raw mention text is kept out of the output unless explicitly opted in.
+The grain, the ``method`` column, and the extractor registry let a consumer
+filter "proximity only" without knowing which concrete extractor produced a
+row. A project's `classes:`/`relations:` declaration (issue #626) checks a
+rule's relation type and subject/object labels, and a model-assertion
+extractor's allowed relation types, against a declared domain/range — see
+`relation_contracts.py`. Raw mention text is kept out of the output unless
+explicitly opted in.
 """
 from __future__ import annotations
 

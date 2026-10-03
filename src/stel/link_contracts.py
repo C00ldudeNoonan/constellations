@@ -39,14 +39,14 @@ def validate_link_project_contracts(
             or model.transform.module != LINK_TRANSFORM_MODULE
         ):
             continue
-        try:
-            options = parse_entity_link_options(model.transform.options)
-        except Exception:
-            # Malformed options are reported by the transform's own
-            # validate_options hook with a better, options-shape-specific
-            # message; this check only adds a constraint on top of options
-            # that already parse.
-            continue
+        # Not a second validation pass: `validate_project_contract` has already
+        # run `validate_options` -> `parse_entity_link_options` on this exact
+        # `model.transform.options` for every model, earlier in the same
+        # preflight, and raised on any that didn't parse. Reaching here with
+        # options that fail to parse again would mean the two calls disagree,
+        # a bug in this check rather than malformed project input, so it is
+        # left to raise, not swallowed (the #642 review finding, same pattern).
+        options = parse_entity_link_options(model.transform.options)
         if not isinstance(options, AliasTableResolverOptions):
             continue
         vocab_name = parse_vocabulary_alias_source(options.aliases)

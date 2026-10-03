@@ -3716,6 +3716,38 @@ follows the same allow-list rules as the NLP transforms. The `mentions:` and
 stale reference is rejected during `stel compile`, before any model is
 materialized. See `examples/economic_entity_links/` for a runnable pipeline.
 
+#### Sourcing the alias table from a declared vocabulary
+
+`aliases: vocab.<name>` reads a project-declared vocabulary (issue #627)
+instead of an upstream model — a preferred label becomes the canonical ID,
+and both the label itself and every declared alternative label become
+matchable alias text:
+
+```yaml
+- name: entity_links
+  depends_on: [ref('document_entities')]   # no aliases model to depend on
+  transform:
+    type: python
+    module: stel.text.transforms.link_entities
+    options:
+      mentions: document_entities
+      aliases: vocab.sector
+```
+
+This is an additional source, not a replacement: a plain model name keeps
+working exactly as before, and only `resolver: alias_table` accepts the
+`vocab.` syntax — `vector_similarity` and `fuzzy` need vectors or free alias
+text a vocabulary's closed term list cannot supply. The vocabulary's own name
+becomes every row's `entity_namespace` (a `Vocabulary` has no namespace
+concept of its own), and an unknown vocabulary name is rejected during `stel
+compile`, the same as a misspelled model reference. Because a vocabulary is
+project config rather than a warehouse table, there is no reference table to
+detect an edit against: changing a vocabulary's terms requires
+`--full-refresh` to re-link, where a hand-maintained alias table's edit is
+picked up incrementally. `ALIAS_RESOLVER_VERSION` changed when this shipped,
+so link rows already materialized against a hand-maintained table are
+recomputed once regardless of which source a model uses.
+
 The resolver is selected by the `resolver:` option, defaulting to `alias_table`
 (above). Set `resolver: vector_similarity` to link by embedding similarity
 instead: `mention_vector_field` and `alias_vector_field` name precomputed vector

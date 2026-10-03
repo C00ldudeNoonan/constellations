@@ -18,8 +18,8 @@ from types import MappingProxyType, ModuleType
 from typing import Any, Protocol
 
 from .backends import ExtractionResult
+from .paths import resolve_module_file
 from .sources import DocumentRef
-from .versioning import resolve_module_file
 
 
 class PostExtractFn(Protocol):

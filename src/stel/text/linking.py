@@ -1,16 +1,22 @@
 """Entity-linking resolver contracts, registry, and the built-in resolvers.
 
-Two resolvers ship today, both deterministic and offline:
+Three resolvers ship today, all deterministic and offline:
 
-- ``alias_table`` joins mention text to an operator-owned alias dimension with
-  exact and normalized text matching. It never guesses: every mention outcome is
-  an explicit ``matched``, ``ambiguous``, or ``unmatched`` status, and ambiguous
-  candidates are preserved as separate rows.
+- ``alias_table`` joins mention text to an alias dimension with exact and
+  normalized text matching. It never guesses: every mention outcome is an
+  explicit ``matched``, ``ambiguous``, or ``unmatched`` status, and ambiguous
+  candidates are preserved as separate rows. The alias dimension is either an
+  operator-owned upstream model, or — for ``aliases: vocab.<name>`` — a
+  project-declared vocabulary's preferred labels and alternative labels
+  (issue #627), read directly: no table to materialize or keep in sync.
 - ``vector_similarity`` matches precomputed mention embeddings against
   precomputed alias embeddings by cosine/dot/euclidean similarity above a
   threshold. Both vectors are produced upstream by the ``embed`` model kind, so
   credentials, provider batching, and versioned embedding identity stay in that
   executor and this resolver remains a pure offline transform over frame data.
+- ``fuzzy`` matches alias text past exact/normalized matching — character-trigram
+  Dice or whitespace-token Jaccard — for spelling variants, legal suffixes, and
+  typos ``alias_table`` would miss.
 """
 from __future__ import annotations
 
@@ -32,13 +38,19 @@ from pydantic import (
     model_validator,
 )
 
+from ..config.vocabulary import VALUES_FROM_PATTERN, Vocabulary
 from ..hashing import canonical_fingerprint
 
 # Bumped whenever a resolver's matching semantics change (normalization rules,
 # method precedence, status assignment, similarity math) so downstream consumers
 # can invalidate rows produced by an older resolver even though the package
 # version moved for unrelated reasons.
-ALIAS_RESOLVER_VERSION = "1"
+#
+# 2: `alias_table`'s `aliases:` option may source its alias rows from a
+# declared vocabulary (`vocab.<name>`) instead of an upstream model (issue
+# #627) — a new input shape, so existing cached/materialized rows must not be
+# read as produced under it.
+ALIAS_RESOLVER_VERSION = "2"
 VECTOR_SIMILARITY_RESOLVER_VERSION = "1"
 FUZZY_RESOLVER_VERSION = "1"
 
@@ -396,6 +408,37 @@ class EntityResolver(ABC):
 
 
 # --- Alias-table resolver ----------------------------------------------------
+
+
+def parse_vocabulary_alias_source(aliases: str) -> str | None:
+    """The vocabulary name in an `aliases: vocab.<name>` reference, or `None`
+    when `aliases` names an upstream model instead (issue #627). Reuses
+    `values_from`'s exact syntax — the two are the same kind of reference, a
+    project-declared vocabulary instead of a materialized table."""
+    match = VALUES_FROM_PATTERN.match(aliases)
+    return match.group(1) if match else None
+
+
+def vocabulary_alias_rows(vocab_name: str, vocabulary: Vocabulary) -> list[dict[str, str]]:
+    """Alias-table rows for every term in a declared vocabulary.
+
+    One `entity_namespace` per vocabulary — its own name — since `Vocabulary`
+    has no separate namespace concept. Each term's own `label` is a row too,
+    alongside its `aliases`, so a mention of the canonical name still matches:
+    `labels()` keeps aliases out of what a classifier may *output*, but here
+    the preferred label is exactly another string a mention may *say*.
+    """
+    rows: list[dict[str, str]] = []
+    for term in vocabulary.terms:
+        for alias in (term.label, *term.aliases):
+            rows.append(
+                {
+                    "alias": alias,
+                    "entity_namespace": vocab_name,
+                    "canonical_id": term.label,
+                }
+            )
+    return rows
 
 
 def normalize_alias_text(value: str) -> str:

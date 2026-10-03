@@ -230,6 +230,7 @@ def run_transform_model(
         llm=resolved.llm,
         options=dict(model.transform.options),
         run_budget=run_budget,
+        vocabularies=project.vocabularies,
     )
 
     result = ModelRunResult(

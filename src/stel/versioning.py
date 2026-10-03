@@ -27,7 +27,7 @@ from .dag import parse_ref
 from .embedding import EmbeddingIdentity
 from .hashing import HASH_DIGEST_SIZE, canonical_json
 from .llm_map import LLMMapError, resolve_llm_runtime
-from .paths import resolve_within_project
+from .paths import resolve_module_file, resolve_within_project
 from .profile import (
     ResolvedProfile,
     resolve_embedding_options,
@@ -40,6 +40,7 @@ from .providers import (
 )
 from .retrieval.evolution import search_code_identity
 from .sql_models import SQL_COMPILER_CONTRACT_VERSION
+from .transforms import transform_code_version_identity
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
@@ -190,6 +191,19 @@ def compute_code_version(
             payload["transform_code_hash"] = _hash_file(module_file)
         else:
             payload["transform_code_hash"] = "missing"
+        # A built-in stel transform (`stel.text.transforms.*`) has no
+        # project-local file, so the hash above is always "missing" — it
+        # cannot see which internal implementation the transform selected or
+        # that implementation's own version (issue #627 review: bumping
+        # `ALIAS_RESOLVER_VERSION` alone left an already-materialized
+        # incremental model's rows at the old version indefinitely). A
+        # transform that selects between versioned internal implementations
+        # by option reports it through this optional hook instead.
+        code_version_identity = transform_code_version_identity(
+            transform.module, project_dir, transform.options
+        )
+        if code_version_identity is not None:
+            payload["transform_code_version_identity"] = code_version_identity
 
     if extraction and extraction.post_extract:
         hook = extraction.post_extract
@@ -495,18 +509,6 @@ def _provider_descriptor(
     if options_fingerprint is not None:
         descriptor["provider_options_identity"] = options_fingerprint
     return descriptor
-
-
-def resolve_module_file(module: str, project_dir: Path) -> Path:
-    """Resolve a dotted module path (e.g. 'transforms.summarize') to a .py file
-    relative to the project directory."""
-    parts = module.split(".")
-    relative_path = Path(*parts).with_suffix(".py")
-    return resolve_within_project(
-        relative_path,
-        project_dir,
-        surface=f"Python module '{module}'",
-    )
 
 
 def _hash_file(path: Path) -> str:

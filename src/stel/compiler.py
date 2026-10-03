@@ -24,6 +24,7 @@ from .config.source import SourceConfig
 from .config.yaml_diagnostics import ConfigPath
 from .dag import DAGError, ProjectDAG, is_dbt_ref, parse_dbt_ref, parse_ref
 from .embedding import resolve_search_embedding_identity
+from .link_contracts import LinkContractError, validate_link_project_contracts
 from .ml_contracts import MLContractError, validate_ml_project_contracts
 from .paths import resolve_within_project
 from .post_extract import validate_post_extract_contract
@@ -230,6 +231,17 @@ def validate_project_contract(
     try:
         validate_relation_project_contracts(models, project)
     except RelationContractError as e:
+        implicated = next(
+            (model for model in models if model.name == e.model_name),
+            None,
+        )
+        if implicated is None:
+            raise ConfigError(str(e)) from e
+        raise _model_error(implicated, str(e), e.path) from e
+
+    try:
+        validate_link_project_contracts(models, project)
+    except LinkContractError as e:
         implicated = next(
             (model for model in models if model.name == e.model_name),
             None,

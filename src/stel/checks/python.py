@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ..adapters import WarehouseAdapter
-from ..versioning import resolve_module_file
+from ..paths import resolve_module_file
 
 
 class CustomTestError(Exception):

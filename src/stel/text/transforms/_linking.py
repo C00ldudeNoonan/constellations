@@ -15,11 +15,14 @@ import polars as pl
 
 from ...transforms import IncrementalContract, TransformContext
 from ..linking import (
+    AliasTableResolverOptions,
     EntityResolver,
     LinkStatus,
     entity_link_id,
     get_resolver,
     parse_entity_link_options,
+    parse_vocabulary_alias_source,
+    vocabulary_alias_rows,
 )
 
 _LINK_SCHEMA: dict[str, pl.DataType] = {
@@ -50,29 +53,70 @@ class _Mention:
 
 
 def validate_link_options(options: Mapping[str, Any]) -> None:
-    parse_entity_link_options(options)
-
-
-def declared_link_dependencies(options: Mapping[str, Any]) -> tuple[str, str]:
-    """The mentions and alias models these options require. `_dep_frames`
-    enforces the same pair at runtime; declaring it lets the compiler reject a
-    misspelled or stale `depends_on` before any model is materialized."""
     parsed = parse_entity_link_options(options)
+    vocab_name = parse_vocabulary_alias_source(parsed.aliases)
+    if vocab_name is not None and not isinstance(parsed, AliasTableResolverOptions):
+        raise ValueError(
+            f"`aliases: vocab.{vocab_name}` is only supported for "
+            f"`resolver: alias_table`; `resolver: {parsed.resolver}` requires "
+            "`aliases` to name an upstream model"
+        )
+
+
+def _vocab_aliases(options: Any) -> str | None:
+    """The vocabulary name when `options.aliases` is `vocab.<name>` and the
+    resolver is `alias_table` — the only resolver issue #627 covers — else
+    `None`. `validate_link_options` has already rejected the syntax on any
+    other resolver, so this only needs to recognize the one case that matters
+    here."""
+    if not isinstance(options, AliasTableResolverOptions):
+        return None
+    return parse_vocabulary_alias_source(options.aliases)
+
+
+def declared_link_dependencies(options: Mapping[str, Any]) -> tuple[str, ...]:
+    """The mentions model, and the alias model when `aliases` names one — a
+    declared vocabulary (issue #627) is project config, not a DAG dependency.
+    `_dep_frames` enforces the same set at runtime; declaring it lets the
+    compiler reject a misspelled or stale `depends_on` before any model is
+    materialized."""
+    parsed = parse_entity_link_options(options)
+    if _vocab_aliases(parsed) is not None:
+        return (parsed.mentions,)
     return (parsed.mentions, parsed.aliases)
 
 
+def declared_link_code_version_identity(options: Mapping[str, Any]) -> dict[str, str]:
+    """The active resolver's name and version.
+
+    A built-in transform module has no project-local file, so
+    `compute_model_code_version`'s file hash cannot see which internal
+    resolver implementation it selected, or that resolver's own version
+    constant — reported here instead (issue #627 review), so e.g. an
+    `ALIAS_RESOLVER_VERSION` bump invalidates an already-materialized
+    incremental model's rows the same way a project-local transform file
+    edit would.
+    """
+    resolver = get_resolver(parse_entity_link_options(options).resolver)
+    return {"resolver": resolver.name, "resolver_version": resolver.version}
+
+
 def declared_link_incremental_contract(options: Mapping[str, Any]) -> IncrementalContract:
-    """Parents are documents in the `mentions` model; the `aliases` model is a
-    whole-table reference input, so an alias/reference edit re-links every
-    document (issue #218). Child rows are keyed by `entity_link_id`. This holds
-    for every resolver, since the shared driver fixes those output columns."""
+    """Parents are documents in the `mentions` model. The `aliases` model, when
+    `aliases` names one, is a whole-table reference input, so an alias/reference
+    edit re-links every document (issue #218); a declared vocabulary is
+    project config instead, with no reference table to track, so an edit to it
+    requires `--full-refresh` like any other config change (issue #627). Child
+    rows are keyed by `entity_link_id`. This holds for every resolver, since
+    the shared driver fixes those output columns."""
     parsed = parse_entity_link_options(options)
+    vocab_name = _vocab_aliases(parsed)
     return IncrementalContract(
         parent_key="document_id",
         child_key="entity_link_id",
         parent_source=parsed.mentions,
         parent_source_key=parsed.document_id_field,
-        reference_deps=(parsed.aliases,),
+        reference_deps=() if vocab_name is not None else (parsed.aliases,),
     )
 
 
@@ -82,7 +126,7 @@ def run_links(
 ) -> pl.DataFrame:
     options = parse_entity_link_options(ctx.options)
     resolver = get_resolver(options.resolver)
-    mentions_frame, aliases_frame = _dep_frames(deps, options)
+    mentions_frame, aliases_frame = _dep_frames(deps, options, ctx)
     resolver.validate_frames(mentions_frame, aliases_frame, options)
     mentions, schema = _input_mentions(mentions_frame, options, resolver)
     if not mentions:
@@ -146,7 +190,45 @@ def run_links(
 def _dep_frames(
     deps: dict[str, pl.DataFrame],
     options: Any,
+    ctx: TransformContext,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    vocab_name = _vocab_aliases(options)
+    if vocab_name is not None:
+        expected = {options.mentions}
+        if set(deps) != expected:
+            raise ValueError(
+                "Entity linking expects a dependency named by the `mentions` "
+                f"option ({sorted(expected)}); got: {sorted(deps)}"
+            )
+        # The compiler's preflight (`link_contracts.validate_link_project_contracts`)
+        # already rejected an undeclared vocabulary name before any model ran;
+        # this is a defensive backstop for a caller that built `ctx` directly.
+        vocabulary = ctx.vocabularies.get(vocab_name)
+        if vocabulary is None:
+            raise ValueError(
+                f"`aliases: vocab.{vocab_name}` is not declared under "
+                f"`vocabularies:`. Available: {sorted(ctx.vocabularies) or '(none declared)'}"
+            )
+        # `vocabulary_alias_rows` always uses these three names; rename to
+        # whatever `build_reference` is actually configured to read
+        # (`alias_text_field`/`namespace_field`/`canonical_id_field`), which
+        # may be overridden the same as for a table-backed alias source
+        # (#643 review — these were previously silently ignored here).
+        aliases_frame = pl.DataFrame(
+            vocabulary_alias_rows(vocab_name, vocabulary),
+            schema={
+                "alias": pl.String,
+                "entity_namespace": pl.String,
+                "canonical_id": pl.String,
+            },
+        ).rename(
+            {
+                "alias": options.alias_text_field,
+                "entity_namespace": options.namespace_field,
+                "canonical_id": options.canonical_id_field,
+            }
+        )
+        return deps[options.mentions], aliases_frame
     expected = {options.mentions, options.aliases}
     if set(deps) != expected:
         raise ValueError(

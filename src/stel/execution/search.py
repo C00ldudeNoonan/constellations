@@ -986,14 +986,29 @@ def _run_search_model(
                 active_generation=previous_generation if retain_previous else None,
                 config_fingerprint=previous_fingerprint if retain_previous else None,
             )
+        # What the publish managed before it failed, for the run-results row
+        # the runner builds in its place (issue #623). The ledger row written
+        # above already has these counts; the run log is where an operator
+        # looks, and it said zero rows in zero seconds for a 1.8M-row failure.
+        progress = {
+            "documents_processed": inserted + updated,
+            "documents_skipped": skipped,
+            "documents_deleted": deleted,
+            "rows_written": inserted + updated,
+            "rows_inserted": inserted,
+            "rows_updated": updated,
+        }
         if isinstance(error, RunError):
+            error.progress = {**progress, **error.progress}
             raise
         if isinstance(error, MemoryError):
             raise RunError(
                 "Search publication exhausted process memory; inspect the last "
-                "publication memory sample and reduce batch_size or increase memory"
+                "publication memory sample and reduce batch_size or increase memory",
+                metrics=timings.as_metrics(),
+                progress=progress,
             ) from None
-        raise RunError(str(error)) from None
+        raise RunError(str(error), metrics=timings.as_metrics(), progress=progress) from None
 
     assert spec is not None
     safe_target = store.safe_descriptor()

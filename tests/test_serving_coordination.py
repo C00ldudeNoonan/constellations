@@ -720,6 +720,90 @@ def test_failed_publication_blocks_queries_until_republished(
     ).results
 
 
+def test_a_failed_search_publish_is_logged_with_its_kind_span_and_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #623. A `sec_chunk_search` publish wrote 1.8 million rows over six
+    hours before its index build failed, and the run log recorded it as
+    `kind=unknown`, zero rows, zero seconds, with the invocation's timestamps:
+    the row an operator most wants after an incident said the model had not
+    run. The failure row now carries the configured kind, the model's own
+    span, and the counters the publish reached before it failed.
+    """
+    from stel.runner import build_project, run_project
+
+    project = _write_project(tmp_path)
+    profiles = project / "profiles.yml"
+    profiles.write_text(
+        profiles.read_text(encoding="utf-8") + "      run_log:\n        enabled: true\n",
+        encoding="utf-8",
+    )
+    # One row per page, so the publish has written a page when the next fails.
+    search_yaml = project / "models" / "search.yml"
+    search_yaml.write_text(
+        search_yaml.read_text(encoding="utf-8").replace(
+            "    search:\n", "    search:\n      batch_size: 1\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    assert _ledger_status(project).status == STATUS_READY
+
+    # Two changed documents: two single-row pages on the incremental publish.
+    for name, body in {
+        "inflation.json": "Inflation accelerated as consumer price growth picked up.",
+        "labor.json": "Payroll employment fell and unemployment rose.",
+    }.items():
+        path = project / "data" / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["body"] = body
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    original_upsert = LanceDBStore.upsert
+    upserts = {"count": 0}
+
+    def _fail_second_upsert(self: Any, *args: Any, **kwargs: Any) -> Any:
+        upserts["count"] += 1
+        if upserts["count"] == 2:
+            raise RetrievalError("LanceDB operation 'upsert' failed (code=test_outage)")
+        return original_upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(LanceDBStore, "upsert", _fail_second_upsert)
+    outcome = build_project(project)
+    monkeypatch.undo()
+    assert upserts["count"] == 2
+
+    by_model = {result.model_name: result for result in outcome.run_results}
+    failed = by_model["release_search"]
+    assert failed.errors and failed.kind == "search"
+    assert failed.duration_seconds > 0
+    assert failed.started_at is not None and failed.completed_at is not None
+    assert failed.started_at <= failed.completed_at
+    # The page that landed before the failure, not zeros.
+    assert failed.documents_processed == 1
+    assert failed.rows_written == 1
+    assert failed.rows_inserted + failed.rows_updated == 1
+    # Its own span, after the model before it finished -- not the build's.
+    embeddings = by_model["release_embeddings"]
+    assert embeddings.completed_at is not None
+    assert failed.started_at >= embeddings.completed_at
+
+    import duckdb
+
+    con = duckdb.connect(str(project / "target" / "data.duckdb"), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT model_name, kind, status, rows_written, duration_seconds, started_at "
+            "FROM analytics.stel_run_log ORDER BY started_at"
+        ).fetchall()
+    finally:
+        con.close()
+    logged = {row[0]: row for row in rows if row[0] in by_model}
+    assert logged["release_search"][1:4] == ("search", "error", 1)
+    assert logged["release_search"][4] > 0
+    assert logged["release_search"][5] > logged["release_embeddings"][5]
+
+
 def test_a_failed_incremental_publish_keeps_serving_the_previous_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

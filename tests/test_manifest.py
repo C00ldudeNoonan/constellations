@@ -272,6 +272,85 @@ def test_manifest_emits_ml_models(tmp_path: Path) -> None:
     assert isinstance(model["code_version"], str)
 
 
+def test_manifest_names_a_search_models_kind(tmp_path: Path) -> None:
+    """Issue #623. The manifest derived `kind` from a hand-kept if-chain with
+    no `search` branch, so every search model was "unknown" in manifest.json
+    while run results and `stel ls` called it "search". One spelling now."""
+    (tmp_path / "stel_project.yml").write_text(
+        "name: search_manifest\nversion: '0.1.0'\nprofile: search_manifest\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "profiles.yml").write_text(
+        "search_manifest:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      warehouse:\n"
+        "        type: duckdb\n"
+        "        path: target/data.duckdb\n"
+        "        schema: analytics\n"
+        "      retrieval:\n"
+        "        default: local\n"
+        "        allow_public_indexes: true\n"
+        "        stores:\n"
+        "          local:\n"
+        "            type: lancedb\n"
+        "            path: target/lancedb\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "documents.yml").write_text(
+        "version: 2\nsources:\n  - name: releases\n    path: data\n    file_pattern: '*.json'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "search.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: release_documents\n"
+        "    source: ref('releases')\n"
+        "    extraction:\n"
+        "      backend: json\n"
+        "      options:\n"
+        "        fields: [title, body]\n"
+        "  - name: release_embeddings\n"
+        "    depends_on: [ref('release_documents')]\n"
+        "    embed:\n"
+        "      provider: deterministic\n"
+        "      model: manifest-demo-v1\n"
+        "      text_field: body\n"
+        "      id_field: document_id\n"
+        "      vector_field: embedding\n"
+        "      dimensions: 8\n"
+        "  - name: release_search\n"
+        "    depends_on: [ref('release_embeddings')]\n"
+        "    materialization: incremental\n"
+        "    search:\n"
+        "      access: public\n"
+        "      id_field: document_id\n"
+        "      document_id_field: document_id\n"
+        "      text_fields: [body]\n"
+        "      vector:\n"
+        "        field: embedding\n"
+        "        dimensions: 8\n"
+        "        metric: cosine\n"
+        "        search: exact\n"
+        "        embedding: inherit\n"
+        "      query:\n"
+        "        modes: [vector]\n",
+        encoding="utf-8",
+    )
+
+    manifest = build_manifest(tmp_path)
+
+    kinds = {model["name"]: model["kind"] for model in manifest["models"]}
+    assert kinds == {
+        "release_documents": "extraction",
+        "release_embeddings": "embed",
+        "release_search": "search",
+    }
+
+
 def test_write_manifest_creates_file(fresh_project: Path) -> None:
     path = write_manifest(fresh_project)
     assert path.exists()

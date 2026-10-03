@@ -187,6 +187,35 @@ def test_run_log_rows_carry_identity_and_aggregates() -> None:
     assert rows[0]["status"] == "success"
 
 
+def test_run_log_rows_carry_each_models_own_span_and_fall_back_to_the_invocations() -> None:
+    """Issue #623. Every row carried the invocation's `started_at` and
+    `completed_at`, so a search model that failed six hours into a build read
+    as having started with the build's first model. The runner now stamps
+    each result it started; a row it never started (a skipped model) has no
+    span of its own and keeps the invocation's."""
+    rows = run_log_rows(
+        [
+            _result(
+                model_name="ran",
+                started_at="2026-10-01T19:54:05+00:00",
+                completed_at="2026-10-02T02:01:46+00:00",
+            ),
+            _result(model_name="skipped", status="skipped"),
+        ],
+        invocation_id="abc",
+        started_at="2026-10-01T19:27:11+00:00",
+        completed_at="2026-10-02T02:01:50+00:00",
+        profile_target="dev",
+        test_results=None,
+    )
+
+    by_model = {row["model_name"]: row for row in rows}
+    assert by_model["ran"]["started_at"] == "2026-10-01T19:54:05+00:00"
+    assert by_model["ran"]["completed_at"] == "2026-10-02T02:01:46+00:00"
+    assert by_model["skipped"]["started_at"] == "2026-10-01T19:27:11+00:00"
+    assert by_model["skipped"]["completed_at"] == "2026-10-02T02:01:50+00:00"
+
+
 def test_run_log_rows_leave_test_counts_null_with_no_test_results() -> None:
     """`stel run` has no notion of tests -- null, not zero (issue #575)."""
     rows = run_log_rows(

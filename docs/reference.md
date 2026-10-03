@@ -4738,7 +4738,13 @@ invocation: `invocation_id`, `model_name`, `kind`, `status`, resolved
 `rows_processed`/`rows_skipped`/`rows_written`, `api_calls`, `cache_hits`,
 `input_tokens`, `output_tokens`, `estimated_cost_usd` (when the profile sets
 `pricing:`), `duration_seconds`, `started_at`, `completed_at`. This is a
-durable sink for numbers stel already meters, not a second meter. A `status:
+durable sink for numbers stel already meters, not a second meter.
+`started_at`/`completed_at` are the model's own span; a `skipped` row, which
+the runner never started, carries the invocation's. A model that failed is
+logged under its configured `kind` with the duration it actually spent and
+the rows it had processed before the failure (issue #623) -- a search
+publish that wrote 73 pages over six hours before its index build failed
+shows six hours and 1.8 million rows, not zero of each. A `status:
 budget_exceeded` row makes a tripped budget visible after the fact rather than
 only in the terminal output of the run that hit it. `tests_passed`/
 `tests_failed`/`tests_warned`/`tests_skipped` (issue #575) carry a build's
@@ -5066,8 +5072,14 @@ run results under `target-path`:
   model, DAG nodes+edges+execution order. Re-generated each run.
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed, and `sources_considered`) plus per-model documents
-  processed/skipped, rows written, duration, warnings, errors, `status`, and
-  the fully-qualified output `relation`. LLM extraction models also carry
+  processed/skipped, rows written, duration, the model's own `started_at` and
+  `completed_at` (null on a `skipped` row, which never started), warnings,
+  errors, `status`, and the fully-qualified output `relation`. A model that
+  failed keeps its configured `kind`, its real duration and the counters it
+  reached before failing (issue #623). The payload's `dbt_ml_version` names
+  the release that produced it; new row keys such as these two are added
+  under that version, as `prompt_name`/`prompt_version` were, so a consumer
+  reads the keys it knows. LLM extraction models also carry
   token accounting in `metrics` (API calls, cache hits, input/output/cache
   tokens, and `estimated_cost_usd` when the profile sets `pricing:`).
   `run`/`build` also accept `--json` to print this payload to stdout.

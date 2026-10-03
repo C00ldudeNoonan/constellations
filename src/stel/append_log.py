@@ -368,8 +368,13 @@ def run_log_rows(
                     else None
                 ),
                 "duration_seconds": result.duration_seconds,
-                "started_at": started_at,
-                "completed_at": completed_at,
+                # The model's own span where the runner recorded one; the
+                # invocation's for a row the runner never started (a skipped
+                # model). Every row used to carry the invocation's, so a model
+                # that failed six hours in read as having started with the
+                # first model of the build (issue #623).
+                "started_at": result.started_at or started_at,
+                "completed_at": result.completed_at or completed_at,
                 **_test_counts(test_results, result),
             }
         )

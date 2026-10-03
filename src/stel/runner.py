@@ -487,6 +487,11 @@ def build_project(
                     )
                 )
                 continue
+            # Taken here rather than inside `_run_model`, which cannot report
+            # them once it has raised: the failure row below carries the
+            # model's own span, not the invocation's (issue #623).
+            model_started_at = datetime.now(UTC).isoformat()
+            model_start = time.monotonic()
             try:
                 result = _run_model(
                     model=model,
@@ -504,23 +509,22 @@ def build_project(
                     read_predicates=read_predicates,
                 )
             except RunError as e:
-                out.run_results.append(
-                    ModelRunResult(
-                        model_name=name,
-                        materialization=model.materialization,
-                        kind="unknown",
-                        errors=[_artifact_error_text(e)],
-                        # Whatever the stage managed to attribute before it
-                        # failed. A slow failure is the one worth diagnosing,
-                        # and dropping its timings here would discard exactly
-                        # the number that explains it.
-                        metrics=getattr(e, "metrics", {}) or {},
-                    )
+                failed = _failed_model_result(
+                    model,
+                    e,
+                    started_at=model_started_at,
+                    duration_seconds=round(time.monotonic() - model_start, 3),
                 )
+                out.run_results.append(failed)
                 # _run_model raised before reaching its own model_finished, so
                 # the ledger would skip this model entirely without this.
                 reporter.model_finished(
-                    name, _model_kind_label(model), 0, 0.0, None, failed=True
+                    name,
+                    failed.kind,
+                    failed.rows_written,
+                    failed.duration_seconds,
+                    None,
+                    failed=True,
                 )
                 blocked |= dag.descendants(name)
                 continue
@@ -965,6 +969,7 @@ def _run_model(
 ) -> ModelRunResult:
     kind = _model_kind_label(model)
     log.info("starting %s (%s)", model.name, kind)
+    started_at = datetime.now(UTC).isoformat()
     start = time.monotonic()
     # The unchanged-scan skip (issue #611), two tiers. `state` is cheap (one
     # aggregate query over stel's own narrow bookkeeping table) and catches
@@ -1170,6 +1175,8 @@ def _run_model(
             ),
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
+    result.started_at = started_at
+    result.completed_at = datetime.now(UTC).isoformat()
     log.info(
         "finished %s: %d row(s) in %.3fs%s",
         model.name,
@@ -1187,6 +1194,52 @@ def _run_model(
         failed=bool(result.errors),
     )
     return result
+
+
+def _failed_model_result(
+    model: ModelConfig,
+    error: RunError,
+    *,
+    started_at: str,
+    duration_seconds: float,
+) -> ModelRunResult:
+    """The run-results row for a model whose stage raised (issue #623).
+
+    The configured kind, the model's own span, and whatever the stage managed
+    to attribute before it failed. A slow failure is the one worth diagnosing,
+    and a row that says "unknown, zero rows, zero seconds" for a six-hour
+    search publish is the run log being wrong exactly where an operator reads
+    it. The counters come from `RunError.progress` and are filtered to the
+    fields the result has, so a stage cannot smuggle an unknown key into
+    `run_results.json`.
+    """
+    result = ModelRunResult(
+        model_name=model.name,
+        materialization=model.materialization,
+        kind=_model_kind_label(model),
+        errors=[_artifact_error_text(error)],
+        duration_seconds=duration_seconds,
+        started_at=started_at,
+        completed_at=datetime.now(UTC).isoformat(),
+        metrics=error.metrics,
+    )
+    for name, value in error.progress.items():
+        if name in _PROGRESS_FIELDS and isinstance(value, int) and not isinstance(value, bool):
+            setattr(result, name, value)
+    return result
+
+
+_PROGRESS_FIELDS = frozenset(
+    {
+        "documents_processed",
+        "documents_skipped",
+        "documents_deleted",
+        "rows_written",
+        "rows_inserted",
+        "rows_updated",
+        "rows_failed",
+    }
+)
 
 
 def _model_kind_label(model: ModelConfig) -> str:

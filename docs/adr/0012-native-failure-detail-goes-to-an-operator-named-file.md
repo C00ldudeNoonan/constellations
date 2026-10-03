@@ -1,6 +1,6 @@
 # ADR-0012: The native detail behind a sanitized failure goes to a file the operator named, never to a log level
 
-- **Status:** accepted; amended by [ADR-0014](0014-a-debug-switch-owns-its-destination.md)
+- **Status:** accepted; amended by [ADR-0014](0014-a-debug-switch-owns-its-destination.md), [ADR-0020](0020-a-native-panics-stderr-write-is-documented-not-intercepted.md)
 - **Date:** 2026-09-20
 - **Prompted by:** #590
 
@@ -107,13 +107,7 @@ An explicit call is one more thing a new sanitize site must remember.
   reach the file; the convention is now load-bearing. **Amended by ADR-0014:**
   that is exactly how the provider hatch's records were lost, so a record may
   now also declare itself with `PROVIDER_DIAGNOSTICS_EXTRA`.
-- **Known gap (issue #648).** A Rust panic inside LanceDB's native extension
-  prints to the process's stderr through Rust's default panic hook before the
-  error reaches Python, so neither this file nor the sanitizer sees that
-  write. Reproduced on lancedb 0.34.0 by corrupting a data file's bytes: the
-  worker thread's panic (thread name, crate source location, panic message)
-  landed on stderr while Python received a `RuntimeError` the store
-  sanitized as usual. The observed text named no store path, but stel cannot
-  promise that; an orchestrator capturing stderr should treat it as native
-  output. Redirecting file descriptor 2 around store calls, or an upstream
-  panic hook, are the options if it is ever worth closing.
+- "Every artifact stays as sanitized as before" covers what Python emits.
+  **Amended by ADR-0020:** a Rust panic inside the native extension writes to
+  stderr before the error reaches Python, outside this file and the
+  sanitizer; documented there, not intercepted.

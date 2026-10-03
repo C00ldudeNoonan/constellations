@@ -323,7 +323,7 @@ def test_a_native_panic_is_sanitized_for_python_and_documented_as_reaching_stder
 
     The half stel does not own: Rust's default panic hook writes the panic to
     the process's stderr before any Python handler runs, outside the
-    sanitizer, and AGENTS.md, the `--diagnostics-file` reference and ADR-0012
+    sanitizer, and AGENTS.md, the `--diagnostics-file` reference and ADR-0020
     now say so. `capfd` captures at the file-descriptor level, which is the
     only way to see that write. If this second assertion ever fails, lancedb
     has changed what it does on a panic and those three notes need revisiting,

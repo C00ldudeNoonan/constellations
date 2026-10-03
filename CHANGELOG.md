@@ -11,9 +11,9 @@
   receives is sanitized as before. Reproduced by corrupting a Lance data
   file: the observed text carries the thread name, the crate's source
   location and the panic message, not the store path. Recorded in AGENTS.md,
-  the `--diagnostics-file` reference and ADR-0012 so the gap is known rather
-  than rediscovered; a pin asserts the store still sanitizes a panic-born
-  error.
+  the `--diagnostics-file` reference and ADR-0020 (which amends ADR-0012) so
+  the gap is known rather than rediscovered; a pin asserts the store still
+  sanitizes a panic-born error.
 
 ### A refused `search_context` call logs who was turned away (issue #622)
 

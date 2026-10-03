@@ -808,9 +808,10 @@ the run starts, and a write that fails anyway costs one line on stderr and
 never the failure it was recording. When a `stel run` or `stel build` failure
 did write to it, the error message ends by naming the file. Treat it as the
 sensitive thing it is: it holds what every other channel exists to withhold.
-One channel sits outside all of this (issue #648): a Rust panic inside
-LanceDB's native extension prints to the process's **stderr** through Rust's
-default panic hook before any Python handler runs. The exception Python then
+One channel sits outside all of this (issue #648,
+[ADR-0020](adr/0020-a-native-panics-stderr-write-is-documented-not-intercepted.md)):
+a Rust panic inside LanceDB's native extension prints to the process's
+**stderr** through Rust's default panic hook before any Python handler runs. The exception Python then
 receives is sanitized as usual, and the panic text observed so far names the
 thread, the crate's source location and the panic message rather than the
 store path, but stel does not intercept that write, so an orchestrator that

@@ -141,6 +141,17 @@ class QueryLease:
     # lease pinned even if activation moves the pointer underneath it.
     pinned_collection: str | None
     config_fingerprint: str
+    # `STATUS_READY`, `STATUS_DEGRADED` or `STATUS_PUBLISHING` -- the only
+    # statuses `acquire_query` admits. A caller that only reads
+    # `pinned_generation` cannot tell a normal answer from one served because
+    # the next publish failed (issue #617, ask 3): `stel serving status`
+    # already says this in words, and a programmatic reader deserves the same
+    # signal to decide whether to degrade instead of trusting a silent pin.
+    status: str
+    # Set only when `status == STATUS_DEGRADED`, mirroring the same ledger
+    # column `stel serving status` reads to explain *why* -- a consumer that
+    # wants to decide how to degrade needs more than "stale".
+    safe_error_code: str | None
 
 
 def validate_safe_error_code(code: str) -> str:
@@ -890,9 +901,13 @@ class ServingCoordinator:
                 "and resolve any recorded failure first"
             )
         fencing_token = int(row[0])
+        status = str(row[1])
         pinned_generation = str(row[5])
         pinned_collection = None if row[11] is None else str(row[11])
         config_fingerprint = "" if row[4] is None else str(row[4])
+        safe_error_code = (
+            str(row[6]) if status == STATUS_DEGRADED and row[6] is not None else None
+        )
         lease_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
         leases = self._ref(LEASE_TABLE)
@@ -922,14 +937,6 @@ class ServingCoordinator:
                 pinned_generation,
             ],
         )
-        lease = QueryLease(
-            scope=scope,
-            lease_id=lease_id,
-            fencing_token=fencing_token,
-            pinned_generation=pinned_generation,
-            pinned_collection=pinned_collection,
-            config_fingerprint=config_fingerprint,
-        )
         held = self._adapter.rows(
             f"SELECT 1 FROM {leases} WHERE lease_id = ?",
             [lease_id],
@@ -938,6 +945,36 @@ class ServingCoordinator:
             raise ServingBusyError(
                 "A publisher claimed this search index during query admission; retry"
             )
+        # The insert's own WHERE EXISTS is what actually admits the lease,
+        # not the read above it -- so a status this stale could still be
+        # true when the fencing token and generation it checked are, if a
+        # generation-preserving publish (issue #617) moved from `publishing`
+        # to `degraded` in between. Both keep the same fencing token and
+        # active generation, so the insert would still succeed with a status
+        # this lease has not seen (Codex review, #641). Re-read after
+        # confirming admission rather than trust the pre-admission snapshot.
+        current = self._read_row(scope)
+        if (
+            current is not None
+            and int(current[0]) == fencing_token
+            and current[5] is not None
+            and str(current[5]) == pinned_generation
+        ):
+            status = str(current[1])
+            safe_error_code = (
+                str(current[6]) if status == STATUS_DEGRADED and current[6] is not None
+                else None
+            )
+        lease = QueryLease(
+            scope=scope,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+            pinned_generation=pinned_generation,
+            pinned_collection=pinned_collection,
+            config_fingerprint=config_fingerprint,
+            status=status,
+            safe_error_code=safe_error_code,
+        )
         try:
             self.validate_query(lease, require_active=True)
         except ServingCoordinationError:

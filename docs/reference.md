@@ -4703,8 +4703,9 @@ all four tools: `logged_at`, `tool`, `request_id`, `client_name`,
 `client_version`, `transport`, `principal_id`, `tenant_id`, `model_name`,
 `target_id`, `mode`, `query_fingerprint`, `requested_limit`,
 `candidate_limit`, `filters`, `result_count`, `zero_results`,
-`returned_chunk_ids`, `top_score`, `served_generation`, `phase_ms`,
-`elapsed_ms`, `error_code`. Written **after** authorization and policy
+`returned_chunk_ids`, `top_score`, `served_generation`, `served_degraded`,
+`served_safe_error_code`, `phase_ms`, `elapsed_ms`, `error_code`. Written
+**after** authorization and policy
 filtering, so a row reflects what the caller was allowed to see — a log of
 pre-filter hits would leak the existence of documents the principal cannot
 read — and a denied request logs nothing.
@@ -4745,7 +4746,15 @@ the same opt-in. Field and operator are not: they name the index's own
 declared attributes, already public in the catalog, and they are what answers
 "how often do agents filter, and on which fields". `served_generation` names the
 index build that answered, so latency and recall attach to a generation rather
-than to a model name that outlives it.
+than to a model name that outlives it. `served_degraded` is true when that
+generation is the last one that served readers before a republish failed,
+rather than the ready one — read from the query lease itself, not inferred
+from `result_count`: a degraded index answers "nothing matched" exactly as a
+ready one does, and a reader looking only at the results could not otherwise
+tell a stale answer from a healthy one (issue #617, ask 3).
+`served_safe_error_code` names why, mirroring the code `stel serving status`
+already shows an operator. Both are null on a refused call, where there is no
+lease to ask, and on every non-search tool.
 
 `error_code` is null on a served answer and carries the contract code on a
 refused one — a timeout, a size cap, an internal failure. A search that

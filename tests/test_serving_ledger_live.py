@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -158,6 +159,70 @@ def test_the_ledger_protocol_on_bigquery() -> None:
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()
+
+
+def test_a_claim_failing_during_admission_is_not_served_as_healthy(
+    tmp_path: Path,
+) -> None:
+    """Codex review, #641.
+
+    `acquire_query`'s first read can see `publishing` for an in-place,
+    interruption-safe claim that does not exclude readers (issue #617) --
+    and if that claim fails and the row moves to `degraded` before the
+    lease insert runs, the insert still admits: `mark_failed` changes
+    neither the fencing token nor the active generation the insert's own
+    `WHERE EXISTS` checks, only the status and error code. A lease built
+    from the pre-admission snapshot would carry a status this race made
+    stale on arrival.
+    """
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "race.duckdb"), "schema": "main"}
+    )
+    with create_adapter(config) as adapter:
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
+        scope = _scope("race")
+        first = coordinator.acquire_publish(
+            scope, expected_code_version="v1", config_fingerprint="cfg1"
+        )
+        coordinator.mark_ready(
+            first,
+            active_generation="gen1",
+            config_fingerprint="cfg1",
+            counts=(1, 0, 0, 0),
+            active_collection="race__g1",
+        )
+        claim = coordinator.acquire_publish(
+            scope,
+            expected_code_version="v2",
+            config_fingerprint="cfg1",
+            preserves_active_generation=True,
+            excludes_readers=False,
+        )
+
+        real_read_row = ServingCoordinator._read_row
+        calls = {"n": 0}
+
+        def racy_read_row(self: ServingCoordinator, read_scope: Any) -> Any:
+            calls["n"] += 1
+            snapshot = real_read_row(self, read_scope)
+            if calls["n"] == 1:
+                # The race: the claim fails -- status to `degraded`, same
+                # fencing token and generation -- between this read and the
+                # insert the caller is about to run.
+                coordinator.mark_failed(
+                    claim,
+                    safe_error_code="warehouse_error",
+                    active_generation="gen1",
+                    active_collection="race__g1",
+                    config_fingerprint="cfg1",
+                )
+            return snapshot
+
+        with patch.object(ServingCoordinator, "_read_row", racy_read_row):
+            lease = coordinator.acquire_query(scope)
+
+        assert lease.status == STATUS_DEGRADED
+        assert lease.safe_error_code == "warehouse_error"
 
 
 # ─── the state half of a seeded generation (issues #495, #505) ───────────────

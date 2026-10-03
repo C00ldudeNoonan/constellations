@@ -5072,8 +5072,14 @@ run results under `target-path`:
   model, DAG nodes+edges+execution order. Re-generated each run.
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed, and `sources_considered`) plus per-model documents
-  processed/skipped, rows written, duration, warnings, errors, `status`, and
-  the fully-qualified output `relation`. LLM extraction models also carry
+  processed/skipped, rows written, duration, the model's own `started_at` and
+  `completed_at` (null on a `skipped` row, which never started), warnings,
+  errors, `status`, and the fully-qualified output `relation`. A model that
+  failed keeps its configured `kind`, its real duration and the counters it
+  reached before failing (issue #623). The payload's `dbt_ml_version` names
+  the release that produced it; new row keys such as these two are added
+  under that version, as `prompt_name`/`prompt_version` were, so a consumer
+  reads the keys it knows. LLM extraction models also carry
   token accounting in `metrics` (API calls, cache hits, input/output/cache
   tokens, and `estimated_cost_usd` when the profile sets `pricing:`).
   `run`/`build` also accept `--json` to print this payload to stdout.

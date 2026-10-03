@@ -2753,6 +2753,30 @@ stel raises itself (an `ivf_pq` corpus below the training floor, an unowned
 collection) is never retried. Like the cache budgets, these are execution
 settings and do not enter the store's identity.
 
+One native failure is also never retried, because retrying it cannot work.
+Lance sorts the whole key column through a DataFusion memory pool when it
+builds a scalar index, and that pool is neither of the caches above: a BTree
+over 3.64 million keys exhausted it in under three seconds, and the same
+build finished in forty once it was raised. `Resources exhausted` from that
+pool depends on the pool size and not on timing, so stel surfaces it on the
+first attempt with a message naming the fix rather than spending two
+backoffs reaching the same place.
+
+```yaml
+          local:
+            type: lancedb
+            path: gs://bucket/prefix
+            memory_pool_size_mb: 512       # 16+; Lance's DataFusion pool
+```
+
+`memory_pool_size_mb` sets `LANCE_MEM_POOL_SIZE` for the process, which is
+the only lever the library exposes — `lancedb.Session` covers the index and
+metadata caches and not this. A few hundred MB covers a corpus of several
+million rows. Setting `LANCE_MEM_POOL_SIZE` yourself always wins: stel fills
+the gap when nothing has decided, and never overrules a value you set, which
+may be sized for a larger job in the same process. Left unset with no
+environment variable, stel changes nothing and Lance uses its own default.
+
 ### DuckDB-native search
 
 When the warehouse is already DuckDB, a separate retrieval system is an extra

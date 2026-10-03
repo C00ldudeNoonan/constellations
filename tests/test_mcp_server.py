@@ -1776,10 +1776,76 @@ def test_an_operational_failure_is_logged_with_its_code() -> None:
     # Null, not True: a timeout is not a question the index could not answer,
     # and counting it as one would inflate the retrieval-quality signal.
     assert row["zero_results"] is None
-    # No authorization happened for this row, and it does not pretend one did.
-    assert row["principal_id"] is None
+    # Identity resolved, so the row says who timed out (issue #622); no
+    # authorization happened, and the tenant, which only authorization can
+    # supply, does not pretend it did.
+    assert row["principal_id"] == "local-user"
+    assert row["tenant_id"] is None
     assert row["served_generation"] is None
     assert set(QUERY_LOG_SCHEMA) >= set(row)
+
+
+def test_a_refused_search_logs_the_principal_who_was_turned_away() -> None:
+    """Issue #622. All 61 `capability_unavailable` rows from the
+    `sec_chunk_search` outage had `principal_id` NULL while the served calls
+    beside them carried one, so the audit log could say an index refused
+    queries but not whose. A refusal's row now records the identity that
+    resolved; the tenant stays null because no policy filters were compiled
+    for a call that was never authorized to read anything."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(repository=repository)
+    try:
+        response = service.search_context(
+            SearchContextRequest(
+                model="context_search",
+                query="inflation",
+                mode="text",
+                filters=(
+                    BusinessFilter(
+                        field="tenant_id",
+                        operator=FilterOperator.EQUAL,
+                        value="restricted",
+                    ),
+                ),
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.CAPABILITY_UNAVAILABLE
+    (row,) = repository.logged
+    assert row["error_code"] == "capability_unavailable"
+    assert row["principal_id"] == "local-user"
+    assert row["tenant_id"] is None
+    assert row["model_name"] == "context_search"
+
+
+def test_a_refused_document_fetch_logs_the_principal_too() -> None:
+    """Issue #622, the other tools: the principal lives on the base row every
+    tool's refusal is built from, so a document fetch refused for a bad
+    argument names its caller as a search refusal does."""
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository, settings=ContextServerSettings(max_document_chunks=5)
+    )
+    try:
+        response = service.get_document(
+            GetDocumentRequest(
+                model="context_search",
+                document_id=DOC_ALLOWED,
+                document_version_id=VERSION_ALLOWED,
+                limit=50,
+            )
+        )
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INVALID_REQUEST
+    (row,) = repository.logged
+    assert row["tool"] == "get_document"
+    assert row["principal_id"] == "local-user"
 
 
 def test_a_degraded_index_with_zero_hits_still_reports_degraded() -> None:

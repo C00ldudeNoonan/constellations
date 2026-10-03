@@ -65,6 +65,12 @@ Use these maintained references rather than copying volatile feature lists:
   contain intended
   outputs; configured prompts and cached values can be sensitive, so minimize
   and document artifact-visible fields and preserve owner-only cache storage.
+  Known gap (issue #648): a Rust panic inside a native extension (LanceDB)
+  prints to the process's stderr through Rust's default panic hook before any
+  Python handler runs, so stderr is outside this guarantee; the store's
+  sanitizer still governs what Python sees. Observed panic text carries the
+  thread name, the crate's source location and the panic message, not the
+  store path, but no handler of stel's can promise that.
 - Validate incremental keys before mutation. Use each adapter's declared
   publication guarantees, and advance state only after successful publication;
   do not assume cross-operation transactions where the adapter lacks them.

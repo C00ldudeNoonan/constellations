@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### A Lance panic's stderr output is documented as outside the sanitizer (issue #648)
+
+- **Documentation only.** A Rust panic inside LanceDB's native extension
+  prints to the process's stderr through Rust's default panic hook before
+  any Python handler runs, so that one write sits outside the "native text
+  never reaches logs or artifacts" invariant; the exception Python then
+  receives is sanitized as before. Reproduced by corrupting a Lance data
+  file: the observed text carries the thread name, the crate's source
+  location and the panic message, not the store path. Recorded in AGENTS.md,
+  the `--diagnostics-file` reference and ADR-0020 (which amends ADR-0012) so
+  the gap is known rather than rediscovered; a pin asserts the store still
+  sanitizes a panic-born error.
+
 ### A refused `search_context` call logs who was turned away (issue #622)
 
 - **Every refusal in `stel_mcp_query_log` had `principal_id` NULL**, while a

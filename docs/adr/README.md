@@ -21,7 +21,7 @@ history (issue #311).
 | [0009](0009-serving-holds-the-warehouse-when-the-adapter-allows.md) | The serving session holds its warehouse connection only when the adapter says one may outlive a request | accepted |
 | [0010](0010-warehouse-identity-is-a-granted-attribute.md) | The warehouse identity a governed read runs as is a granted attribute, resolved per subject; missing or ambiguous is a refusal | accepted |
 | [0011](0011-an-entitlement-interval-is-one-row-and-one-attribute.md) | An entitlement interval is one row, one attribute, and never a one-sided bound | accepted |
-| [0012](0012-native-failure-detail-goes-to-an-operator-named-file.md) | The native detail behind a sanitized failure goes to a file the operator named, never to a log level | accepted; amended by [0014](0014-a-debug-switch-owns-its-destination.md) |
+| [0012](0012-native-failure-detail-goes-to-an-operator-named-file.md) | The native detail behind a sanitized failure goes to a file the operator named, never to a log level | accepted; amended by [0014](0014-a-debug-switch-owns-its-destination.md), [0020](0020-a-native-panics-stderr-write-is-documented-not-intercepted.md) |
 | [0013](0013-a-merge-page-is-bounded-by-bytes-in-the-store.md) | A merge page is bounded by bytes, in the store, before it is sent — `batch_size` keeps counting rows | accepted |
 | [0014](0014-a-debug-switch-owns-its-destination.md) | A debug switch owns its own destination, and marks the records it is for | accepted |
 | [0015](0015-a-sync-watermark-needs-two-independent-signals.md) | A sync watermark needs two independent signals — cheap state, and an authoritative content fingerprint — not one | accepted |
@@ -29,6 +29,7 @@ history (issue #311).
 | [0017](0017-an-operator-may-activate-a-complete-generation-from-its-state.md) | An operator may activate a physically complete generation from its recorded state, re-stamped, without re-reading the corpus | accepted |
 | [0018](0018-a-resume-drops-its-indices-and-rebuilds-once.md) | A resumed generation drops its indices and rebuilds them once, as a fresh build already does | accepted |
 | [0019](0019-recovery-skips-confirmation-only-for-a-provably-dead-local-owner.md) | The publish claim records its holder and a heartbeat; recovery skips the confirmation only for a provably dead owner on this host, and never acts on heartbeat age | accepted |
+| [0020](0020-a-native-panics-stderr-write-is-documented-not-intercepted.md) | A native panic's stderr write is outside the sanitizer and is documented, not intercepted; the store still sanitizes what Python sees | accepted; amends 0012 |
 
 ## When to write one
 

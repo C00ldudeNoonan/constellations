@@ -292,3 +292,68 @@ def test_connect_failure_reports_native_type_without_native_text(
         "LanceDB operation 'connect' failed [RuntimeError] (code=lancedb_connect_failed)"
     )
     _assert_sanitized(exc_info.value, caplog)
+
+
+def _rows_many(count: int) -> list[IndexedRow]:
+    return [
+        IndexedRow(
+            f"c{i}",
+            {
+                "chunk_id": f"c{i}",
+                "text": "x" * 200,
+                "category": "a" if i % 2 else "b",
+                "embedding": [0.1, 0.9],
+            },
+            f"f{i}",
+        )
+        for i in range(count)
+    ]
+
+
+def test_a_native_panic_is_sanitized_for_python_and_documented_as_reaching_stderr(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #648. Two halves of one documented fact.
+
+    The half stel owns: a Lance *panic* arrives in Python as a `RuntimeError`
+    like any other native failure, so `_operation_failed` must sanitize it the
+    same way -- operation, step, type, no native text. Reproduced by
+    overwriting the head of a data file with deterministic garbage, which
+    lancedb 0.34.0 decodes into a worker-thread panic rather than an I/O error.
+
+    The half stel does not own: Rust's default panic hook writes the panic to
+    the process's stderr before any Python handler runs, outside the
+    sanitizer, and AGENTS.md, the `--diagnostics-file` reference and ADR-0020
+    now say so. `capfd` captures at the file-descriptor level, which is the
+    only way to see that write. If this second assertion ever fails, lancedb
+    has changed what it does on a panic and those three notes need revisiting,
+    not this test weakening.
+    """
+    caplog.set_level(logging.DEBUG, logger="stel.retrieval.lancedb")
+    store = _store(tmp_path)
+    with store:
+        store.create_collection(_spec(scalar_index_fields=(), full_text_fields=()))
+        store.upsert(PHYSICAL, _rows_many(5000), id_field="chunk_id", mutation_digest="digest")
+    (data_file,) = sorted((tmp_path / "lance" / f"{PHYSICAL}.lance" / "data").glob("*.lance"))
+    garbage = bytes((i * 7919 + 13) % 256 for i in range(4096))
+    with data_file.open("r+b") as handle:
+        handle.write(garbage)
+    capfd.readouterr()  # discard anything emitted while publishing
+
+    with store, pytest.raises(RetrievalError) as exc_info:
+        list(store.iter_record_ids(PHYSICAL, id_field="chunk_id", page_size=1000))
+
+    error = exc_info.value
+    assert "(code=lancedb_list_ids_failed)" in str(error)
+    assert "[RuntimeError]" in str(error)
+    assert "panicked" not in str(error) and "panicked" not in repr(error)
+    cause = error.__cause__
+    assert isinstance(cause, RetrievalError)
+    assert str(cause) == "Native retrieval error type: RuntimeError"
+    for record in caplog.records:
+        if record.levelno >= logging.INFO:
+            assert "panicked" not in record.getMessage()
+
+    stderr = capfd.readouterr().err
+    assert "panicked at" in stderr, stderr
+    assert str(tmp_path) not in stderr

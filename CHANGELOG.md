@@ -50,7 +50,39 @@ query log gained fields.
 the same `ALTER TABLE` path that added `active_collection` for #355. Nullable,
 so nothing already recorded changes meaning.
 
-## v0.20.0 - 2026-10-02
+### An absence probe that names a scope, for the activate re-stamp (issue #635)
+
+- **This does not reduce the phase's BigQuery bytes.** It was first described
+  as removing ~75% of them; that was wrong, and the description is corrected
+  here rather than left standing. Deciding which of the serving scope's
+  records the generation lacked used a per-batch
+  `record_key IN UNNEST(...)` over the generation slice (~514 MB) beside the
+  walk's own page query over the serving slice (~453 MB). The anti-join is now
+  inside the page query -- which is submitted *per page* -- so both slices are
+  still scanned per batch, and `LIMIT` does not reduce bytes processed. What
+  it removes is one query *job* per batch, which is round-trip overhead.
+- `StateScopeAbsenceProbe` lets `state_page_reader` restrict an ordered walk
+  to keys absent from **another scope** of the state table, with the warehouse
+  evaluating the anti-join. The existing relation form (`StateAbsenceProbe`,
+  #428) is unchanged: probing the state table through it would have asked
+  "absent from the whole table", so a key held under any other model or target
+  would wrongly have counted as known.
+- **Absence is still resolved in the warehouse, not in memory.** Holding one
+  scope's keys and comparing locally is what #428 moved *out* of Python, and
+  `docs/architecture/bounded-memory.md` prices a 3.6M-row key domain at
+  370-740 MB against the bounded-residency invariant (#153).
+- The probe reads the same immutable snapshot as the walk, so records
+  activation writes into the generation as it goes cannot make later pages
+  skip rows earlier pages just recorded.
+- **A correctness fix that was never about cost:** the fill phase may only
+  take keys the generation never recorded. A row the interrupted build
+  rewrote carries its own newer fingerprint, and the serving scope's older
+  record would have made the next incremental run republish a row that was
+  already current. Nothing pinned that before.
+
+**Still open on #635:** why a trailing-column range predicate does not prune
+when `record_key` is already the last clustering column -- which is what both
+a materialising fix and the keyset walk's own cost depend on.
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)
 

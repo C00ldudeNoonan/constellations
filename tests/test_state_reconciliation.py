@@ -23,6 +23,7 @@ from stel.adapters import (
     StatePageRecord,
     StateRecord,
     StateScope,
+    StateScopeAbsenceProbe,
     StateScopeFence,
     StateValue,
     WarehouseCapability,
@@ -543,3 +544,105 @@ def test_operations_require_their_capabilities(tmp_path: Path) -> None:
             pass
     with pytest.raises(AdapterCapabilityError, match="atomic_state_scope_replace"):
         adapter.replace_state_scope(SCOPE, iter([]))
+
+
+# ─── absence from another scope, not a relation (issue #635) ─────────────────
+
+
+def _drain(reader: StatePageReader) -> list[str]:
+    keys: list[str] = []
+    cursor = None
+    while True:
+        page = reader.fetch_page(cursor)
+        keys.extend(record.record_key for record in page.records)
+        cursor = page.next_cursor
+        if cursor is None:
+            return keys
+
+
+def test_a_scope_probe_yields_only_keys_the_other_scope_lacks(
+    tmp_path: Path,
+) -> None:
+    """The anti-join activation needs, evaluated in the warehouse.
+
+    Probing `stel_state` through the *relation* form would ask "absent from
+    the whole table", so a key present under any other model or target would
+    wrongly count as known. The scope form carries the slice predicate.
+    """
+    other = StateScope("generation")
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, ["a", "b", "c", "d"])
+        adapter.upsert_state(
+            other, [StateRecord("b", "fp-b", "v1"), StateRecord("d", "fp-d", "v1")]
+        )
+
+        with adapter.state_page_reader(
+            SCOPE, page_size=2, absent_from=StateScopeAbsenceProbe(other)
+        ) as reader:
+            assert _drain(reader) == ["a", "c"]
+
+
+def test_a_scope_probe_is_not_confused_by_a_third_scope(tmp_path: Path) -> None:
+    # The whole reason the relation form will not do: a key held under some
+    # unrelated model must not count as known.
+    other = StateScope("generation")
+    unrelated = StateScope("someone_else")
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, ["a", "b"])
+        adapter.upsert_state(unrelated, [StateRecord("a", "fp-a", "v1")])
+
+        with adapter.state_page_reader(
+            SCOPE, page_size=10, absent_from=StateScopeAbsenceProbe(other)
+        ) as reader:
+            assert _drain(reader) == ["a", "b"]
+
+
+def test_the_probe_snapshot_does_not_see_the_callers_own_writes(
+    tmp_path: Path,
+) -> None:
+    """The property the activation path depends on.
+
+    Activation walks the serving scope for keys the generation lacks and
+    writes each batch into the generation as it goes. If the anti-join saw
+    those writes, later pages would start skipping the very records the
+    earlier pages had just created state for, and the walk would under-report.
+    """
+    other = StateScope("generation")
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, ["a", "b", "c", "d"])
+
+        with adapter.state_page_reader(
+            SCOPE, page_size=1, absent_from=StateScopeAbsenceProbe(other)
+        ) as reader:
+            seen: list[str] = []
+            cursor = None
+            while True:
+                page = reader.fetch_page(cursor)
+                for record in page.records:
+                    seen.append(record.record_key)
+                    # Exactly what activation does between pages.
+                    adapter.upsert_state(
+                        other, [StateRecord(record.record_key, record.input_fingerprint, "v2")]
+                    )
+                cursor = page.next_cursor
+                if cursor is None:
+                    break
+        assert seen == ["a", "b", "c", "d"]
+
+
+def test_a_relation_probe_still_works_beside_the_scope_form(tmp_path: Path) -> None:
+    # Adding the scope form must not disturb the #428 relation form, which is
+    # what removal detection uses.
+    with _open_adapter(tmp_path) as adapter:
+        _seed(adapter, ["a", "b"])
+        adapter.execute(
+            f"CREATE TABLE {adapter.schema_ref}.chunks (chunk_id VARCHAR)"
+        )
+        adapter.execute(f"INSERT INTO {adapter.schema_ref}.chunks VALUES ('a')")
+
+        with adapter.state_page_reader(
+            SCOPE,
+            page_size=10,
+            absent_from=StateAbsenceProbe(table="chunks", key_column="chunk_id"),
+        ) as reader:
+            assert _drain(reader) == ["b"]

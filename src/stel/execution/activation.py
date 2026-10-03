@@ -49,7 +49,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..adapters import AdapterError, StateRecord, StateScope, WarehouseAdapter
+from ..adapters import (
+    AdapterError,
+    StateRecord,
+    StateScope,
+    StateScopeAbsenceProbe,
+    WarehouseAdapter,
+)
 from ..config.model import ModelConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -441,20 +447,33 @@ def _fill_state_from_serving(
     scope, re-stamped to this code version. Returns how many were taken.
     """
     taken = 0
-    with adapter.state_page_reader(serving_scope, page_size=page_size) as reader:
+    # The warehouse evaluates the absence, so every record the walk yields is
+    # already one the generation lacks (issue #635). Before this, the walk
+    # yielded the whole serving scope and a per-batch `record_key IN UNNEST`
+    # asked the generation scope which of them it had -- a lookup that
+    # re-scanned that entire slice every batch, ~514 MB of the ~3.4 GB a batch
+    # cost. `record_key IN UNNEST(@array)` does not prune on the clustering
+    # #431 added, so the cost was the slice and not the keys.
+    #
+    # Resolving it locally instead -- holding one scope's keys and comparing
+    # in Python -- is what #428 moved out of Python and what
+    # `docs/architecture/bounded-memory.md` prices at 370-740 MB for 3.6M
+    # rows. The anti-join is the bounded form of the same question.
+    with adapter.state_page_reader(
+        serving_scope,
+        page_size=page_size,
+        absent_from=StateScopeAbsenceProbe(publish_scope),
+    ) as reader:
         for batch in _state_batches(reader):
             coordinator.verify_publish(lease)
-            known = adapter.fetch_state_subset(
-                publish_scope, [record.record_key for record in batch]
+            adapter.upsert_state(
+                publish_scope,
+                [
+                    StateRecord(record.record_key, record.input_fingerprint, code_version)
+                    for record in batch
+                ],
             )
-            missing = [
-                StateRecord(record.record_key, record.input_fingerprint, code_version)
-                for record in batch
-                if record.record_key not in known
-            ]
-            if missing:
-                adapter.upsert_state(publish_scope, missing)
-            taken += len(missing)
+            taken += len(batch)
     return taken
 
 

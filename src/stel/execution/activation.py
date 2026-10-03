@@ -72,6 +72,7 @@ from ..retrieval import (
 )
 from ..versioning import compute_model_code_version
 from .contracts import RunError
+from .heartbeat import Heartbeat
 from .search import (
     _activate_generation,
     _generation_state_scope,
@@ -296,6 +297,13 @@ def activate_search_generation(
                 scope=publish_scope,
                 page_size=search.batch_size,
                 code_version=code_version,
+                model_name=model.name,
+                # The collection's row count, not the scope's: it is already
+                # known, and it is the number the state is about to be checked
+                # against anyway. The scope's own count would cost an extra
+                # aggregate over the slice this phase exists to stop
+                # re-scanning.
+                total=existing.row_count,
             )
             # State naming more rows than the collection holds vouches for
             # rows that are not there, and the reconciler would skip them for
@@ -513,6 +521,8 @@ def _restamp_and_sample(
     scope: StateScope,
     page_size: int,
     code_version: str,
+    model_name: str,
+    total: int,
 ) -> tuple[int, list[str]]:
     """Re-stamp every record in `scope` at `code_version`; return the count and
     a reservoir sample of its keys for the membership check.
@@ -525,7 +535,26 @@ def _restamp_and_sample(
     rng = random.Random(code_version)
     sample: list[str] = []
     seen = 0
-    with adapter.state_page_reader(scope, page_size=page_size) as reader:
+    # This phase ran for hours in prod with nothing to watch: `serving status`
+    # showed the previous publish's counts and `status: publishing`, so the
+    # only way to tell the command was alive was INFORMATION_SCHEMA (issue
+    # #635). The note goes on the ledger, which is what another terminal can
+    # read; the log line is for whoever launched it.
+    heartbeat = Heartbeat()
+
+    def _log_heartbeat(count: int, elapsed: float) -> None:
+        log.info(
+            "%s: re-stamping publication state: %d of %d records (%.1fs elapsed)",
+            model_name,
+            count,
+            total,
+            elapsed,
+        )
+
+    with (
+        heartbeat.watch(_log_heartbeat),
+        adapter.state_page_reader(scope, page_size=page_size) as reader,
+    ):
         for batch in _state_batches(reader):
             coordinator.verify_publish(lease)
             adapter.upsert_state(
@@ -543,4 +572,9 @@ def _restamp_and_sample(
                     slot = rng.randrange(seen)
                     if slot < ACTIVATION_SAMPLE_SIZE:
                         sample[slot] = record.record_key
+            # Per batch, not per heartbeat: the ledger note is what another
+            # process reads, and a batch is already ~28s in prod, so the
+            # write is noise against the MERGE it follows.
+            coordinator.record_progress(lease, f"re-stamped {seen} of {total} records")
+            heartbeat.update(seen)
     return seen, sample

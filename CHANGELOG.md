@@ -2,37 +2,64 @@
 
 ## Unreleased
 
-### `serving activate` resolves state absence in the warehouse, not by re-querying it (issue #635)
+### A long publication phase reports progress another process can read (issue #635)
 
-- **The re-stamp phase was O(batches x state slice).** Deciding which of the
-  serving scope's records the generation lacked used a per-batch
-  `record_key IN UNNEST(...)` against the generation's scope, and
-  `IN UNNEST(@array)` does not prune on the clustering #431 added -- so each
-  lookup re-scanned that whole slice. Measured in prod: ~514 MB per lookup,
-  ~2.6 GB of the ~3.4 GB a 12.5k-row batch cost, projecting to ~1 TB and
-  ~2.3 hours before the index build even started.
+- **`serving activate`'s re-stamp phase ran for ~2.3 hours with nothing to
+  watch.** `serving status` showed the *previous* publish's `rows:` counts and
+  `status: publishing` for all of it, so the only way to tell the command was
+  alive, or how far along, was `region-us.INFORMATION_SCHEMA.JOBS`.
+- The ledger gains a nullable `progress_note`, written per batch by the
+  re-stamp phase and rendered by `stel serving status` as
+  `progress: re-stamped N of M records`. The ledger rather than a log line
+  because the question was being asked from a second terminal.
+- A per-batch log line comes with it, through the same `Heartbeat` the chunk
+  and SQL paths use (#469, #573), for whoever launched the command.
+- **The note cannot outlive its publication.** The one shared completion write
+  clears it, so a note on a `ready` scope is impossible rather than merely
+  unlikely, and `serving status` prints the line only when one is present.
+- Writing it is best-effort and fenced: a publisher whose authority was
+  reassigned cannot narrate over the one that replaced it, and a warehouse
+  that rejects the note logs a warning rather than failing the publication it
+  describes. Losing the fence is still discovered by the next
+  `verify_publish`, which is the call allowed to stop the work.
+
+**Upgrading:** the `progress_note` column is added to an existing ledger by
+the same `ALTER TABLE` path that added `active_collection` for #355. Nullable,
+so nothing already recorded changes meaning.
+
+### An absence probe that names a scope, for the activate re-stamp (issue #635)
+
+- **This does not reduce the phase's BigQuery bytes.** It was first described
+  as removing ~75% of them; that was wrong, and the description is corrected
+  here rather than left standing. Deciding which of the serving scope's
+  records the generation lacked used a per-batch
+  `record_key IN UNNEST(...)` over the generation slice (~514 MB) beside the
+  walk's own page query over the serving slice (~453 MB). The anti-join is now
+  inside the page query -- which is submitted *per page* -- so both slices are
+  still scanned per batch, and `LIMIT` does not reduce bytes processed. What
+  it removes is one query *job* per batch, which is round-trip overhead.
 - `StateScopeAbsenceProbe` lets `state_page_reader` restrict an ordered walk
-  to keys absent from **another scope** of the state table. The warehouse
-  evaluates the anti-join, so the walk yields only the records the generation
-  lacks and the per-batch lookups are gone.
-- **Not resolved in memory, deliberately.** The obvious alternative -- hold
-  one scope's keys and compare locally -- is what issue #428 moved *out* of
-  Python, and `docs/architecture/bounded-memory.md` prices a 3.6M-row key
-  domain at 370-740 MB. This is that paged anti-join, pointed at a scope
-  instead of a relation.
-- The existing relation form (`StateAbsenceProbe`, #428) is unchanged;
-  probing the state table through it would have asked "absent from the whole
-  table", so a key held under any other model or target would wrongly have
-  counted as known.
-- The probe reads the same immutable snapshot as the walk, so the records
+  to keys absent from **another scope** of the state table, with the warehouse
+  evaluating the anti-join. The existing relation form (`StateAbsenceProbe`,
+  #428) is unchanged: probing the state table through it would have asked
+  "absent from the whole table", so a key held under any other model or target
+  would wrongly have counted as known.
+- **Absence is still resolved in the warehouse, not in memory.** Holding one
+  scope's keys and comparing locally is what #428 moved *out* of Python, and
+  `docs/architecture/bounded-memory.md` prices a 3.6M-row key domain at
+  370-740 MB against the bounded-residency invariant (#153).
+- The probe reads the same immutable snapshot as the walk, so records
   activation writes into the generation as it goes cannot make later pages
-  skip the rows earlier pages just recorded.
+  skip rows earlier pages just recorded.
+- **A correctness fix that was never about cost:** the fill phase may only
+  take keys the generation never recorded. A row the interrupted build
+  rewrote carries its own newer fingerprint, and the serving scope's older
+  record would have made the next incremental run republish a row that was
+  already current. Nothing pinned that before.
 
-**Still open on #635:** clustering `stel_state` with `record_key` last, so the
-keyset walk itself prunes; and progress reporting for the phase, which can run
-for hours while `serving status` shows the previous publish's counts.
-
-## v0.20.0 - 2026-10-02
+**Still open on #635:** why a trailing-column range predicate does not prune
+when `record_key` is already the last clustering column -- which is what both
+a materialising fix and the keyset walk's own cost depend on.
 
 ### `stel serving activate` serves a complete generation without re-reading the corpus (issue #615)
 

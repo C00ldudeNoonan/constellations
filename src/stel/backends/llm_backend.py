@@ -1096,15 +1096,32 @@ def _apply_enum_portability(
     if not constrained:
         return fields_spec, system
     stripped = [
-        {key: value for key, value in spec.items() if key != "enum"}
+        {
+            key: value
+            for key, value in spec.items()
+            if key not in ("enum", "enum_descriptions")
+        }
         for spec in fields_spec
     ]
-    lines = "\n".join(
-        f"- {spec['name']}: use exactly one of "
-        + ", ".join(str(value) for value in spec["enum"])
-        for spec in constrained
-    )
+    lines = "\n".join(_enum_portability_line(spec) for spec in constrained)
     return stripped, f"{system}\n\nAllowed values:\n{lines}"
+
+
+def _enum_portability_line(spec: dict[str, Any]) -> str:
+    # A vocabulary term's `description:` (issue #625) renders as its own
+    # line so a provider without schema enums still sees what a label means,
+    # not only its name. A field with no described values keeps the original
+    # one-line form unchanged.
+    descriptions: dict[str, str] = spec.get("enum_descriptions") or {}
+    if not descriptions:
+        return f"- {spec['name']}: use exactly one of " + ", ".join(
+            str(value) for value in spec["enum"]
+        )
+    value_lines = "\n".join(
+        f"  - {value}: {descriptions[value]}" if value in descriptions else f"  - {value}"
+        for value in spec["enum"]
+    )
+    return f"- {spec['name']}: use exactly one of\n{value_lines}"
 
 
 def _hash_schema(

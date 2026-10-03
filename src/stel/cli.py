@@ -2642,6 +2642,14 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
         f"inserted={entry.rows_inserted} updated={entry.rows_updated} "
         f"skipped={entry.rows_skipped} deleted={entry.rows_deleted}"
     )
+    # Printed only while a publication holds the scope, which is the only time
+    # it means anything: the completion write clears it, so a note here is a
+    # live phase reporting itself (issue #635). Before this, a multi-hour
+    # re-stamp left `rows:` showing the *previous* publish's counts and
+    # nothing else moving, so "is it stuck?" could only be answered from
+    # INFORMATION_SCHEMA.
+    if entry.progress_note:
+        click.echo(f"progress:          {entry.progress_note}")
 
 
 @serving.command("recover")

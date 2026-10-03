@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
-from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME
+from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME, validate_node_name
+from .vocabulary import Vocabulary
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 
@@ -48,6 +49,17 @@ class ProjectConfig(BaseModel):
         default_factory=lambda: [Path("transforms")], alias="transform-paths"
     )
     target_path: Path = Field(default=Path("target"), alias="target-path")
+    # Declared domain vocabularies (issue #625): a closed, ordered label set
+    # a `type: enum` field can point at with `values_from: vocab.<name>`
+    # instead of repeating `values:` inline. Keyed by the name used there.
+    vocabularies: dict[str, Vocabulary] = Field(default_factory=dict)
+
+    @field_validator("vocabularies")
+    @classmethod
+    def _validate_vocabulary_names(cls, v: dict[str, Vocabulary]) -> dict[str, Vocabulary]:
+        for name in v:
+            validate_node_name(name, kind="Vocabulary")
+        return v
 
     @property
     def yaml_provenance(self) -> YamlProvenance | None:

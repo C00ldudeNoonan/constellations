@@ -17,9 +17,10 @@ from .identifiers import (
     LEGACY_PROJECT_FILENAME,
     PROJECT_FILENAME,
 )
-from .model import ModelConfig, ModelKind, protect_model_llm_credential_option
+from .model import FieldConfig, ModelConfig, ModelKind, protect_model_llm_credential_option
 from .project import ProjectConfig
 from .source import SourceConfig, SourceFile
+from .vocabulary import VALUES_FROM_PATTERN, Vocabulary
 from .yaml_diagnostics import (
     ConfigPath,
     YamlDocument,
@@ -516,8 +517,108 @@ def load_project(
     # the concrete variants, which is correct when transform.path itself
     # contains a ${matrix.KEY} placeholder.
     _populate_sql_depends_on(models, project_dir)
+    _resolve_declared_vocabularies(project, models)
 
     return project, sources, models
+
+
+def _resolve_declared_vocabularies(project: ProjectConfig, models: list[ModelConfig]) -> None:
+    """Replace every `values_from: vocab.<name>` with its vocabulary's labels.
+
+    Runs here, before `load_project` returns, so every caller — the compiler's
+    preflight, `stel run`, docs, manifest, dbt export — sees an ordinary
+    resolved `values:` list and needs no awareness of vocabularies at all
+    (issue #625). An unknown vocabulary name fails here: before source
+    discovery, credentials, or any provider call, which matches every other
+    structural check in this function.
+
+    Covers both of stel's independent enum-declaration surfaces: a model's
+    top-level `fields:` (`FieldConfig`), and a `backend: llm` extraction
+    model's `extraction.options.fields` — still the raw dict the YAML
+    produced at this point, not yet a typed `LLMFieldSpec` — which separately
+    drives that backend's provider schema and prompt. Resolving both here, in
+    one pass, is what lets one declaration back both surfaces; resolving only
+    the first would leave a `backend: llm` model's actual provider request
+    unconstrained even though its warehouse-side `accepted_values` check
+    looked declared (#639 review).
+    """
+    for model in models:
+        if any(field.values_from for field in model.fields):
+            model.fields = [
+                _resolve_field_values_from(project, model, field)
+                for field in model.fields
+            ]
+        if model.extraction is not None:
+            _resolve_extraction_options_values_from(project, model)
+
+
+def _resolve_field_values_from(
+    project: ProjectConfig, model: ModelConfig, field: FieldConfig
+) -> FieldConfig:
+    if field.values_from is None:
+        return field
+    vocabulary = _vocabulary_for(project, model.name, field.name, field.values_from)
+    return field.model_copy(
+        update={
+            "values": vocabulary.labels(),
+            "values_from": None,
+            "value_descriptions": vocabulary.descriptions(),
+        }
+    )
+
+
+def _resolve_extraction_options_values_from(project: ProjectConfig, model: ModelConfig) -> None:
+    assert model.extraction is not None
+    raw_fields = model.extraction.options.get("fields")
+    if not isinstance(raw_fields, list):
+        return
+    for entry in raw_fields:
+        if not isinstance(entry, dict) or "values_from" not in entry:
+            continue
+        values_from = entry["values_from"]
+        field_name = entry.get("name", "<unnamed>")
+        if not isinstance(values_from, str):
+            raise ConfigError(
+                project.format_yaml_diagnostic(
+                    f"Model '{model.name}' extraction option field "
+                    f"'{field_name}' declares `values_from:` that is not a string"
+                )
+            )
+        vocabulary = _vocabulary_for(project, model.name, field_name, values_from)
+        # `LLMFieldSpec` (backends/options.py) has no `values_from` field and
+        # forbids unknown keys, so this must be fully resolved to a plain
+        # `values:` list before that validation ever sees it — the same
+        # requirement `FieldConfig` satisfies structurally, enforced here by
+        # hand since this is still an untyped dict. Term descriptions are not
+        # carried onto this path: `LLMFieldSpec` would need its own field to
+        # receive them, which is a bounded, separately-tracked follow-up.
+        del entry["values_from"]
+        entry["values"] = vocabulary.labels()
+
+
+def _vocabulary_for(
+    project: ProjectConfig, model_name: str, field_name: str, values_from: str
+) -> Vocabulary:
+    match = VALUES_FROM_PATTERN.match(values_from)
+    if match is None:
+        raise ConfigError(
+            project.format_yaml_diagnostic(
+                f"Model '{model_name}' field '{field_name}' declares "
+                f"`values_from: {values_from}`, which must look like 'vocab.<name>'"
+            )
+        )
+    vocab_name = match.group(1)
+    vocabulary = project.vocabularies.get(vocab_name)
+    if vocabulary is None:
+        raise ConfigError(
+            project.format_yaml_diagnostic(
+                f"Model '{model_name}' field '{field_name}' declares "
+                f"`values_from: vocab.{vocab_name}`, which is not declared under "
+                f"`vocabularies:` in {PROJECT_FILENAME}. Available: "
+                f"{sorted(project.vocabularies) or '(none declared)'}"
+            )
+        )
+    return vocabulary
 
 
 def _populate_sql_depends_on(

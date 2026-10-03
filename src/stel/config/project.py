@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME, validate_node_name
-from .vocabulary import Vocabulary
+from .vocabulary import RelationTypeDef, Vocabulary
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 
@@ -53,6 +60,12 @@ class ProjectConfig(BaseModel):
     # a `type: enum` field can point at with `values_from: vocab.<name>`
     # instead of repeating `values:` inline. Keyed by the name used there.
     vocabularies: dict[str, Vocabulary] = Field(default_factory=dict)
+    # Entity classes and the relation types allowed between them (issue
+    # #626), checked against `RelationRule`/`ModelAssertionExtractorOptions`
+    # at compile time. Declaring neither adds no constraint — only a project
+    # that opts in gets one.
+    classes: tuple[str, ...] = Field(default_factory=tuple)
+    relations: tuple[RelationTypeDef, ...] = Field(default_factory=tuple)
 
     @field_validator("vocabularies")
     @classmethod
@@ -60,6 +73,41 @@ class ProjectConfig(BaseModel):
         for name in v:
             validate_node_name(name, kind="Vocabulary")
         return v
+
+    @field_validator("classes")
+    @classmethod
+    def _validate_classes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in v)
+        for name in normalized:
+            validate_node_name(name, kind="Class")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("classes must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_relations(self) -> ProjectConfig:
+        if not self.relations:
+            return self
+        declared_classes = set(self.classes)
+        seen: set[tuple[str, str, str]] = set()
+        for relation in self.relations:
+            for class_name, role in (
+                (relation.subject_class, "subject_class"),
+                (relation.object_class, "object_class"),
+            ):
+                if class_name not in declared_classes:
+                    raise ValueError(
+                        f"relation '{relation.name}' declares `{role}: {class_name}`, "
+                        "which is not declared under `classes:`"
+                    )
+            key = (relation.name, relation.subject_class, relation.object_class)
+            if key in seen:
+                raise ValueError(
+                    f"relation '{relation.name}' ({relation.subject_class} -> "
+                    f"{relation.object_class}) declared twice"
+                )
+            seen.add(key)
+        return self
 
     @property
     def yaml_provenance(self) -> YamlProvenance | None:

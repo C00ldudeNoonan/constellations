@@ -3832,6 +3832,39 @@ Relations materialize incrementally on the same one-to-many path as the other
 child tables: a changed document re-derives exactly its relation rows. See
 `examples/economic_nlp/` for runnable co-occurrence and rule pipelines.
 
+#### Checking relation types against a declaration
+
+`relation_type` is otherwise a free string: nothing stops two rules in one
+project from asserting `owns` and `owned_by` for the same fact, or a
+`model_assertion` model's `relation_types` from naming something no other
+model agrees on (issue #626).
+
+A project's `classes:`/`relations:` block — alongside `vocabularies:` — opts
+a project into checking its `rule` and `model_assertion` models against a
+declared domain/range:
+
+```yaml
+# stel_project.yml
+classes: [company, country]
+relations:
+  - name: located_in
+    subject_class: company
+    object_class: country
+```
+
+At compile time, a `rule` extractor's `relation_type` and
+`subject_label`/`object_label` pairing must match a declared relation exactly;
+a `model_assertion` model's `relation_types` must each be a declared relation
+name. Either failure names the model and the declared alternatives. The same
+`name` may repeat with a different pairing — `located_in` can hold for both
+`company -> country` and `person -> country` — so a relation type is not
+required to be monomorphic.
+
+A project that declares neither `classes:` nor `relations:` is unaffected:
+this adds a constraint only where one exists, never a new requirement, and
+the `co_occurrence` extractor (whose `relation_type` is a single operator
+label, not a typed pairing) is never checked against it.
+
 That path classifies parents from a **streamed** read of the parent table,
 keeping one digest per row rather than the row, and then reads back only the
 parents that changed (issue #385). Peak memory therefore follows the change

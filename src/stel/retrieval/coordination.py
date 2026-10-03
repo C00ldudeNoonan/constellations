@@ -22,6 +22,7 @@ warehouse-side coordination only.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -29,6 +30,8 @@ from uuid import uuid4
 
 from ..adapters.base import SERVING_LEASE_TABLE, SERVING_LEDGER_TABLE
 from .base import RetrievalError
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..adapters.base import StateScope, WarehouseAdapter
@@ -103,6 +106,12 @@ class ServingLedgerEntry:
     # written before generations existed means.
     active_collection: str | None
     safe_error_code: str | None
+    # A free-text note a long publication phase writes so another
+    # process can see it is alive and how far along (issue #635).
+    # Diagnostic only: nothing reads it back to make a decision, and
+    # the completion write clears it, so a stale note cannot outlive
+    # the publication that wrote it.
+    progress_note: str | None
     rows_inserted: int
     rows_updated: int
     rows_skipped: int
@@ -208,6 +217,7 @@ class ServingCoordinator:
                 active_generation STRING,
                 active_collection STRING,
                 safe_error_code STRING,
+                progress_note STRING,
                 rows_inserted BIGINT NOT NULL,
                 rows_updated BIGINT NOT NULL,
                 rows_skipped BIGINT NOT NULL,
@@ -233,18 +243,26 @@ class ServingCoordinator:
         )
 
     def _ensure_ledger_columns(self) -> None:
-        """Add `active_collection` to a ledger created before issue #355.
+        """Add columns to a ledger created before they existed.
 
         `_ensure_tables` uses CREATE TABLE IF NOT EXISTS, which does nothing
         to an existing table, so a ledger written by an earlier version would
-        otherwise fail every statement naming the new column.
+        otherwise fail every statement naming a new column.
+
+        `active_collection` predates issue #355, `progress_note` predates
+        #635. Both nullable, so widening changes the meaning of nothing
+        already recorded.
         """
         columns = self._adapter.table_column_names(LEDGER_TABLE)
-        if columns is None or "active_collection" in columns:
+        if columns is None:
             return
-        self._adapter.execute(
-            f"ALTER TABLE {self._ref(LEDGER_TABLE)} ADD COLUMN active_collection STRING"
-        )
+        for column in ("active_collection", "progress_note"):
+            if column in columns:
+                continue
+            self._adapter.execute(
+                f"ALTER TABLE {self._ref(LEDGER_TABLE)} "
+                f"ADD COLUMN {column} STRING"
+            )
 
     def _ensure_row(self, scope: StateScope) -> None:
         """Create the scope's ledger row, healing benign creation races.
@@ -379,7 +397,7 @@ class ServingCoordinator:
             SELECT fencing_token, status, publication_id, expected_code_version,
                    config_fingerprint, active_generation, safe_error_code,
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
-                   active_collection
+                   active_collection, progress_note
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -472,6 +490,7 @@ class ServingCoordinator:
                 active_generation=None,
                 active_collection=None,
                 safe_error_code=None,
+                progress_note=None,
                 rows_inserted=0,
                 rows_updated=0,
                 rows_skipped=0,
@@ -487,6 +506,7 @@ class ServingCoordinator:
             active_generation=None if row[5] is None else str(row[5]),
             active_collection=None if row[11] is None else str(row[11]),
             safe_error_code=None if row[6] is None else str(row[6]),
+            progress_note=None if row[12] is None else str(row[12]),
             rows_inserted=int(row[7]),
             rows_updated=int(row[8]),
             rows_skipped=int(row[9]),
@@ -654,6 +674,7 @@ class ServingCoordinator:
                 safe_error_code = ?,
                 rows_inserted = ?, rows_updated = ?, rows_skipped = ?,
                 rows_deleted = ?, publication_id = NULL,
+                progress_note = NULL,
                 completed_at = CURRENT_TIMESTAMP{restore_fingerprint}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id = ? AND fencing_token = ?
@@ -682,6 +703,50 @@ class ServingCoordinator:
         ):
             raise StaleServingLeaseError(
                 "Serving publication authority was reassigned before completion"
+            )
+
+    def record_progress(self, lease: PublishLease, note: str) -> None:
+        """Publish a progress note for this scope, for another process to read.
+
+        `serving activate`'s re-stamp phase can run for hours, and for all of
+        it `serving status` showed the *previous* publish's counts and
+        `status: publishing` — so the only way to tell the command was alive
+        was `INFORMATION_SCHEMA.JOBS` (issue #635). This is the line that
+        answers "is it stuck?" from another terminal.
+
+        Fenced like every other ledger write: a publisher whose authority was
+        reassigned must not keep narrating progress over the one that replaced
+        it. Unlike the other writes it does **not** raise when the fence has
+        moved — a lost fence is discovered by the next `verify_publish`, which
+        is the call that is allowed to stop the work, and failing here would
+        turn a diagnostic into a new way for a publish to die.
+
+        Best-effort in the same spirit as the append-only logs: the note is
+        observability, and a warehouse that rejects it must not fail the
+        publication it describes.
+        """
+        try:
+            self._adapter.execute(
+                f"""
+                UPDATE {self._ref(LEDGER_TABLE)}
+                SET progress_note = ?
+                WHERE model_name = ? AND stage = ? AND target_identity = ?
+                  AND publication_id = ? AND fencing_token = ?
+                """,
+                [
+                    note,
+                    *self._scope_params(lease.scope),
+                    lease.publication_id,
+                    lease.fencing_token,
+                ],
+            )
+        except Exception as error:
+            # The class name only, like the rest of this module: warehouse
+            # text may carry SQL and must not reach logs or artifacts.
+            log.warning(
+                "Could not record publication progress [%s]; the publication "
+                "is unaffected",
+                type(error).__name__,
             )
 
     def mark_ready(

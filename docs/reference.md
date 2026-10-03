@@ -1869,6 +1869,54 @@ it would constrain nothing. The column materializes as a string; `enum` is
 stel's declaration, not a warehouse column type, and `emit-dbt-sources`
 exports it as `string`.
 
+#### Shared vocabularies: declare the set once, use it on several fields
+
+`type: enum` solves drift within one field's three consumers. It does not
+stop two *fields* — in the same model or different ones — from independently
+declaring the same label set and drifting from each other, which is the same
+problem one level up (issue #625).
+
+A project-level `vocabularies:` block declares a label set once:
+
+```yaml
+# stel_project.yml
+vocabularies:
+  sector:
+    terms:
+      - label: financials
+        description: Banks, insurers, and other financial firms
+      - label: technology
+      - label: energy
+```
+
+A field points at it instead of listing `values:` inline:
+
+```yaml
+fields:
+  - name: sector
+    type: enum
+    values_from: vocab.sector
+```
+
+This is resolved when the project loads — before source discovery,
+credentials, or any provider call — into the same `values:` a field would
+have declared inline, so every consumer downstream of `#304` (the provider
+schema, the `accepted_values` test, the prompt fallback) sees an ordinary
+enum field and needs no awareness of vocabularies. `values:` and
+`values_from:` are mutually exclusive; an unknown vocabulary name fails to
+load.
+
+A term's `description:` reaches the prompt fallback too, as a line of its
+own, so a provider without schema-level enum support sees what a label means,
+not only its name. A term may also declare `aliases:` (alternative names) and
+`broader:` (another term's `label`, for a hierarchy); both are validated —
+duplicate or dangling references and cyclic `broader` chains are rejected —
+but neither affects extraction yet. Aliases exist for entity linking, not
+classification: they never widen the set a field may output. Classes,
+relation types, and reading this declaration from entity linking and the
+concept cloud are separate, larger pieces of work (issues #626-#629) that
+build on this declaration rather than this one growing to anticipate them.
+
 Structure-preserving options for document parsing:
 
 ```yaml

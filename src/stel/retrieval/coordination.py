@@ -643,7 +643,7 @@ class ServingCoordinator:
                 safe_error_code = NULL, started_at = CURRENT_TIMESTAMP,
                 completed_at = NULL{retain_generation},
                 publisher_host = ?, publisher_pid = ?,
-                publisher_started_epoch = ?, publisher_label = ?,
+                publisher_started_epoch = CAST(? AS INT64), publisher_label = ?,
                 publisher_heartbeat_epoch = ?, publisher_namespace = ?
             WHERE model_name = ? AND stage = ? AND target_identity = ?
               AND publication_id IS NULL

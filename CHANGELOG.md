@@ -58,6 +58,13 @@ Publication state advances per page and is unaffected.
   validation. It now raises. A project-local module at the built-in path is
   also no longer held to the built-in options shape, the same for relations.
 
+### A publish claim from a host without `/proc` is accepted by BigQuery (found by the v0.21.0 live smoke test)
+
+- **Claiming a publish failed on BigQuery from Windows and macOS.** A host
+  without `/proc` cannot report its process start time, so the claim bound a
+  null where an integer belongs, and BigQuery refused the STRING-typed null.
+  The claim now casts the value, so a null stores as a null.
+
 ### A BigQuery snapshot read failure's native cause reaches the diagnostics file (issue #634)
 
 - The CLI keeps its generic message for a failed table-snapshot read. The

@@ -3310,6 +3310,17 @@ and a DuckDB resume reads as before. Any upstream change, a subset run, or a
 generation whose row loop never finished takes the full read, which is always
 correct.
 
+**A BigQuery read of a keyed table survives the six-hour session limit.** An
+unfiltered read of a table whose `key_column` is an `INTEGER` or `STRING` is
+cut into segments of 250,000 rows by key, and each segment is its own Storage
+Read session. Every session
+reads the table as of one instant, so the segments are one relation. Each
+completed segment is recorded on the collection along with that instant. A
+retry that adopts the collection continues from the first unfinished segment,
+provided the instant is within 48 hours (time travel keeps 2 to 7 days,
+depending on the table). Past that the read starts over. Predicated reads, and
+keyless reads, keep the single-session path, so they still end at six hours.
+
 The limits are deliberate:
 
 - **It applies only to compatible changes.** A changed vector dimension,

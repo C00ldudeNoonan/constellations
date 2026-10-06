@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -528,6 +529,26 @@ class _FakeAggregateRow:
         return self._values
 
 
+def _bigquery_type(arrow_type: pa.DataType) -> str:
+    """The BigQuery type name a fixture column reports, as a SchemaField does."""
+    if pa.types.is_string(arrow_type):
+        return "STRING"
+    if pa.types.is_integer(arrow_type):
+        return "INTEGER"
+    return "FLOAT"
+
+
+class _FakeScalarJob:
+    """A statement whose result is one row of scalars, or no rows at all."""
+
+    def __init__(self, values: tuple[Any, ...] | None) -> None:
+        self._rows = [] if values is None else [_FakeAggregateRow(values)]
+        self.job_id = "safe-scalar-job-id"
+
+    def result(self, **_kwargs: Any) -> list[_FakeAggregateRow]:
+        return list(self._rows)
+
+
 class _FakeAggregateJob:
     """The key-domain aggregate: one row of scalars, no Arrow payload."""
 
@@ -567,7 +588,10 @@ class _FakeBigQueryClient:
     def get_table(self, _table_id: str) -> Any:
         index = min(self.get_table_calls, len(self.generations) - 1)
         self.get_table_calls += 1
-        schema = [SimpleNamespace(name=name) for name in self.data]
+        schema = [
+            SimpleNamespace(name=name, field_type=_bigquery_type(array.type))
+            for name, array in self.data.items()
+        ]
         return SimpleNamespace(
             schema=schema,
             etag=self.generations[index],
@@ -577,6 +601,12 @@ class _FakeBigQueryClient:
 
     def query(self, sql: str, job_config: Any = None, **_kwargs: Any) -> Any:
         self.queries.append((sql, job_config))
+        if "CURRENT_TIMESTAMP()" in sql:
+            # The snapshot clock a segmented read pins its time to (issue #614).
+            return _FakeScalarJob((datetime.now(UTC),))
+        if "ROW_NUMBER()" in sql:
+            # Segment boundaries. These fixtures fit one segment, so there are none.
+            return _FakeScalarJob(None)
         if "COUNT(DISTINCT" in sql:
             # The key-domain aggregate is its own statement since #418; it
             # returns one row of scalars, not the payload.

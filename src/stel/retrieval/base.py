@@ -383,6 +383,11 @@ class CollectionSpec:
     # and sit last so the dataclass stays valid.
     source_generation: str | None = None
     source_rows: int | None = None
+    # How far a segmented warehouse read got before its attempt stopped, as a
+    # `SnapshotResumePoint` stamp (issue #614). Set only while the row loop is
+    # running and cleared once the generation is stamped complete, so a stamp
+    # present here means a read that can be continued, not one that finished.
+    source_progress: str | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -455,6 +460,7 @@ class CollectionMetadata:
     # loop, or was stamped before this existed.
     source_generation: str | None = None
     source_rows: int | None = None
+    source_progress: str | None = None
 
 
 class StoreRole(StrEnum):

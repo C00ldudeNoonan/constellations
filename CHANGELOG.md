@@ -1,6 +1,69 @@
 # Changelog
 
-## Unreleased
+## v0.21.0 - 2026-10-06
+
+### A resumed search publish no longer pays index maintenance on every page (issue #616)
+
+- **Only resumes decayed, and the reason was an order nobody chose.** A fresh
+  private generation builds its indices once after the page loop, so its pages
+  merge into an unindexed table. A resumed generation arrived carrying the
+  indices its earlier attempt had built, and nothing dropped them — so every
+  page then maintained them, for the rest of the run. #616 measured per-page
+  cost roughly doubling by page 73 of 146 in prod, with memory flat.
+- A probe separated the three candidate causes. Over 29 pages, per-page merge
+  cost grew **3.60–4.14x with indices present** and **1.09–1.17x without**,
+  with table version count rising identically in both — which rules out
+  fragment accumulation as the driver. Removing the acknowledgement scan moved
+  the ratio 4.14x to 3.60x, so it is a term and not the cause.
+- A resume now drops its indices before the page loop and lets
+  `ensure_indexes` rebuild them after the last page. Measured 37% faster over
+  29 pages, widening with page count: maintenance is per page, the rebuild is
+  once.
+- **A complete resume does not drop.** With rows already complete and only the
+  index build left (#508), dropping first would turn a metadata check into a
+  full rebuild — making the cheapest resume the most expensive one.
+- `RetrievalStore.drop_indexes` is the new seam, implemented by both in-tree
+  stores and abstract rather than defaulted: a store that silently skipped it
+  would show the decay with nothing in the code to point at.
+  [ADR-0018](docs/adr/0018-a-resume-drops-its-indices-and-rebuilds-once.md)
+  records why compaction every N pages was not the answer.
+
+**Worth knowing:** a resumed generation is briefly unindexed, between the drop
+and the rebuild. It is always private and never the active one, so nothing
+serves reads from it; a run that dies in that window leaves an unindexed
+generation that the next resume adopts, drops as a no-op, and rebuilds.
+Publication state advances per page and is unaffected.
+
+
+### Declared domain vocabularies, relation checks and alias tables (issues #625, #626, #627)
+
+- **A label set is declared once.** A `vocabularies:` block names a closed,
+  ordered set of terms, each with an optional definition, alternative labels,
+  a broader term and a class. A `type: enum` field points at one with
+  `values_from: vocab.<name>` instead of repeating `values:`, and the schema,
+  the `accepted_values` test and the prompt all read the same list.
+- **Relations are checked against a declared pairing.** `classes:` and
+  `relations:` declare the entity classes and the (subject, object) classes each
+  relation type may hold. A `RelationRule` or `model_assertion` relation type
+  that is not declared, or pairs classes it does not allow, fails at compile
+  time. A project that declares neither is unaffected.
+- **An alias table can be generated from a vocabulary.** An `alias_table` entity
+  link takes `aliases: vocab.<name>` and matches each term's label and its
+  alternative labels, instead of a hand-maintained table.
+
+### A link option that fails to parse cannot pass compile (issue #649)
+
+- **A malformed `link_entities` option was skipped by the compile-time check.**
+  The check caught any parse error and moved on, so a second failure passed
+  validation. It now raises. A project-local module at the built-in path is
+  also no longer held to the built-in options shape, the same for relations.
+
+### A BigQuery snapshot read failure's native cause reaches the diagnostics file (issue #634)
+
+- The CLI keeps its generic message for a failed table-snapshot read. The
+  native cause now goes to `--diagnostics-file`, so an operator can see what
+  failed without the raw warehouse text reaching run results.
+
 
 ### A schema probe is never answered from a cache (issue #653)
 
@@ -366,39 +429,6 @@ a materialising fix and the keyset walk's own cost depend on.
   new `serving:` line names the generation and collection a reader gets, says
   when it is degraded and by what, and says "nothing" in words -- with why --
   where the fields alone showed two dashes.
-
-### A resumed search publish no longer pays index maintenance on every page (issue #616)
-
-- **Only resumes decayed, and the reason was an order nobody chose.** A fresh
-  private generation builds its indices once after the page loop, so its pages
-  merge into an unindexed table. A resumed generation arrived carrying the
-  indices its earlier attempt had built, and nothing dropped them — so every
-  page then maintained them, for the rest of the run. #616 measured per-page
-  cost roughly doubling by page 73 of 146 in prod, with memory flat.
-- A probe separated the three candidate causes. Over 29 pages, per-page merge
-  cost grew **3.60–4.14x with indices present** and **1.09–1.17x without**,
-  with table version count rising identically in both — which rules out
-  fragment accumulation as the driver. Removing the acknowledgement scan moved
-  the ratio 4.14x to 3.60x, so it is a term and not the cause.
-- A resume now drops its indices before the page loop and lets
-  `ensure_indexes` rebuild them after the last page. Measured 37% faster over
-  29 pages, widening with page count: maintenance is per page, the rebuild is
-  once.
-- **A complete resume does not drop.** With rows already complete and only the
-  index build left (#508), dropping first would turn a metadata check into a
-  full rebuild — making the cheapest resume the most expensive one.
-- `RetrievalStore.drop_indexes` is the new seam, implemented by both in-tree
-  stores and abstract rather than defaulted: a store that silently skipped it
-  would show the decay with nothing in the code to point at.
-  [ADR-0018](docs/adr/0018-a-resume-drops-its-indices-and-rebuilds-once.md)
-  records why compaction every N pages was not the answer.
-
-**Worth knowing:** a resumed generation is briefly unindexed, between the drop
-and the rebuild. It is always private and never the active one, so nothing
-serves reads from it; a run that dies in that window leaves an unindexed
-generation that the next resume adopts, drops as a no-op, and rebuilds.
-Publication state advances per page and is unaffected.
-
 
 ### A BigQuery table-snapshot read failure's native cause now reaches `--diagnostics-file` (issue #614)
 

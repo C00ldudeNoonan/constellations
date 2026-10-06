@@ -36,6 +36,20 @@
   Reasoning in `docs/adr/0022`, including why the schema is not widened
   mid-run and why the unchanged-parent skip's content fingerprint is left
   cached.
+### A search publish over a large BigQuery table resumes instead of re-reading it (issue #614)
+
+- **A publish longer than six hours could never finish.** The whole read ran in
+  one BigQuery Storage session, which BigQuery ends at six hours, so a 3.64M-row
+  publish died about halfway every time and each retry re-read from the start.
+  A keyed, unfiltered BigQuery read is now cut into segments of 250,000 rows by
+  key. Each segment is its own session, and every session reads as of the same
+  instant, so the segments are one relation however long the publish runs.
+- **A retry continues from the last published segment.** Once a segment's rows
+  are all written, the collection records how far the read got, along with the
+  instant it pinned. A later run continues from there, reading only the
+  remaining segments, if that instant is within 48 hours. Past that the read
+  starts over, since time travel may no longer reach it. Predicated reads and
+  keyless reads keep the single-session path.
 
 ### An incremental publish extends its indices instead of retraining them (issue #619)
 

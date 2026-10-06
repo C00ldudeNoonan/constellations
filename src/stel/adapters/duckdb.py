@@ -1680,6 +1680,12 @@ class DuckDBAdapter(WarehouseAdapter):
                 if isinstance(request.absent_from, StateAbsenceProbe)
                 else None
             )
+            if relation_probe is not None and relation_probe.as_of is not None:
+                # DuckDB has no time travel, so it cannot judge absence against a
+                # pinned instant. Refusing beats silently judging the live table.
+                raise AdapterError(
+                    "DuckDB cannot judge state absence as of a pinned snapshot"
+                )
             if scope_probe is not None:
                 # Absence from another slice of the same table (issue #635).
                 # No CAST: both sides are `record_key`. The snapshot is the

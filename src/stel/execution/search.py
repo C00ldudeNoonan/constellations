@@ -30,6 +30,7 @@ from ..adapters import (
     WarehouseAdapter,
     WarehouseCapability,
 )
+from ..adapters.base import SnapshotResumePoint, TableReadSnapshot
 from ..config.model import ModelConfig, SearchConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -446,6 +447,35 @@ def _run_search_model(
                     )
                 else:
                     spec = _resolve_row_fingerprint(spec, existing)
+                # A resumed generation an unfinished segmented read left behind
+                # carries where that read got to (issue #614). The snapshot is
+                # re-planned onto that point, which only works before any row is
+                # read, and discovery has read none. A point that cannot be
+                # followed is dropped before any row is written, since the stamp
+                # would otherwise name a snapshot this read is not following.
+                if (
+                    resumed
+                    and existing is not None
+                    and existing.source_progress is not None
+                ):
+                    stored = SnapshotResumePoint.from_stamp(existing.source_progress)
+                    if stored is not None and snapshot.resume_from(stored):
+                        # The completed segments are in the collection but this read
+                        # does not revisit them, so the count starts from them. The
+                        # validation after the publish compares against the whole
+                        # relation, not just the rows this run reads.
+                        rows_seen = stored.rows
+                        log.info(
+                            "%s: continuing the segmented read after %d of %d "
+                            "segment(s) an earlier attempt published, from the "
+                            "snapshot it pinned",
+                            model.name,
+                            stored.completed,
+                            len(stored.boundaries) + 1,
+                        )
+                    else:
+                        spec = replace(spec, source_progress=None)
+                        store.restamp_collection(spec)
                 # A resumed generation whose rows were complete for the very
                 # upstream generation this run sees has nothing to read: no
                 # row can have changed or gone, so the page loop and stale
@@ -573,6 +603,9 @@ def _run_search_model(
                     iter([]) if complete_resume else iter(snapshot)
                 )
                 ordinal = -1
+                # The last segment count persisted, so each completed segment is
+                # recorded once (issue #614).
+                persisted_segments = -1
                 while True:
                     # Only the pull is credited to `read`: the row shaping
                     # below is stel's own CPU. Publishing this corpus was
@@ -587,6 +620,20 @@ def _run_search_model(
                         timings.merge(snapshot.timings)
                         break
                     ordinal += 1
+                    # A segment is complete once every row of it has been yielded,
+                    # and the caller has written each page before asking for the
+                    # next one. So at this pull, every segment the snapshot now
+                    # reports is fully written, and recording it is safe (issue
+                    # #614). A resume reads from exactly this point.
+                    segment_progress = snapshot.resume_point
+                    if (
+                        segment_progress is not None
+                        and segment_progress.completed != persisted_segments
+                    ):
+                        persisted_segments = segment_progress.completed
+                        spec = replace(spec, source_progress=segment_progress.to_stamp())
+                        coordinator.verify_publish(publish_lease)
+                        store.restamp_collection(spec)
                     indexed = _indexed_rows(
                         batch,
                         model,
@@ -791,6 +838,10 @@ def _run_search_model(
                     reconciler.iter_stale_pages(
                         upstream_table=upstream,
                         key_column=search.id_field,
+                        # A segmented read is judged against the instant it pinned,
+                        # so a row the snapshot holds is never called stale because
+                        # the live table has since dropped it (issue #614).
+                        as_of=_pinned_instant(snapshot),
                     )
                     if (not rebuild or seed_from is not None or resumed)
                     and not subset_run
@@ -857,6 +908,9 @@ def _run_search_model(
                         spec,
                         source_generation=snapshot.generation_fingerprint,
                         source_rows=rows_seen,
+                        # Every segment is published, so the progress has
+                        # nothing left to say and must not outlive the stamp.
+                        source_progress=None,
                     )
                     coordinator.verify_publish(publish_lease)
                     store.restamp_collection(spec)
@@ -1174,6 +1228,13 @@ def _state_batches(reader: Any) -> Iterator[Sequence[StateRecord]]:
         if page.next_cursor is None:
             return
         cursor = page.next_cursor
+
+
+def _pinned_instant(snapshot: TableReadSnapshot) -> datetime | None:
+    """The instant a segmented read pinned, or None for a read that is not
+    pinned (issue #614)."""
+    point = snapshot.resume_point
+    return None if point is None else datetime.fromisoformat(point.snapshot_time)
 
 
 def _rebuild_requested(model: ModelConfig, *, full_refresh: bool) -> bool:

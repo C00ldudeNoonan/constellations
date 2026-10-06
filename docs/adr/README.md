@@ -32,6 +32,7 @@ history (issue #311).
 | [0020](0020-a-native-panics-stderr-write-is-documented-not-intercepted.md) | A native panic's stderr write is outside the sanitizer and is documented, not intercepted; the store still sanitizes what Python sees | accepted; amends 0012 |
 | [0021](0021-an-index-behind-on-rows-is-extended-not-retrained.md) | An index behind on rows is extended over the new rows; a rebuild is for an index that has to change shape | accepted |
 | [0022](0022-a-schema-probe-is-never-cached-and-a-missed-column-fails-the-run.md) | A schema probe is never answered from a cache, and a column it missed fails the run instead of being dropped | accepted |
+| [0023](0023-a-keyed-warehouse-read-is-segmented-and-pinned-to-one-instant.md) | A keyed warehouse read is segmented and pinned to one instant, and resumes from its last completed segment | accepted |
 
 ## When to write one
 

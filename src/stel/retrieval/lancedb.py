@@ -265,6 +265,9 @@ _ROW_FINGERPRINT_KEY = b"stel.row_fingerprint"
 # reads back as absent.
 _SOURCE_GENERATION_KEY = b"stel.source_generation"
 _SOURCE_ROWS_KEY = b"stel.source_rows"
+# The segmented read position an unfinished publish left (issue #614). Cleared
+# the same way: an empty value reads back as absent.
+_SOURCE_PROGRESS_KEY = b"stel.source_progress"
 # Rows per batch when seeding a generation from another collection. Chosen so
 # one batch of 768-dim float32 vectors is tens of MB rather than gigabytes;
 # the point is bounded residency, not throughput (issue #495).
@@ -812,6 +815,7 @@ class LanceDBStore(RetrievalStore):
                 row_fingerprint=_read_field_value(schema, _ROW_FINGERPRINT_KEY),
                 source_generation=_read_field_value(schema, _SOURCE_GENERATION_KEY),
                 source_rows=_read_int_field_value(schema, _SOURCE_ROWS_KEY),
+                source_progress=_read_field_value(schema, _SOURCE_PROGRESS_KEY),
             )
         except RetrievalError:
             raise
@@ -888,6 +892,7 @@ class LanceDBStore(RetrievalStore):
                         _SOURCE_ROWS_KEY.decode(): (
                             "" if spec.source_rows is None else str(spec.source_rows)
                         ),
+                        _SOURCE_PROGRESS_KEY.decode(): spec.source_progress or "",
                     },
                 }
             )
@@ -1487,6 +1492,7 @@ def _with_descriptor(schema: pa.Schema, spec: CollectionSpec) -> pa.Schema:
     metadata[_SOURCE_ROWS_KEY] = (
         b"" if spec.source_rows is None else str(spec.source_rows).encode()
     )
+    metadata[_SOURCE_PROGRESS_KEY] = (spec.source_progress or "").encode()
     return schema.set(index, field.with_metadata(metadata))
 
 

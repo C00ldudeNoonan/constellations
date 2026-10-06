@@ -9,7 +9,7 @@ import logging
 import os
 import pickle
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3391,6 +3391,27 @@ def test_state_page_reader_absence_probe_time_travels_both_relations() -> None:
     assert "CAST(probe.`chunk_id` AS STRING) = state.record_key" in sql
 
 
+def test_a_pinned_absence_probe_judges_the_relation_at_its_own_instant() -> None:
+    # A publish reading a pinned snapshot judges absence as of that snapshot, not
+    # as of the page, so rows it holds are not called stale (issue #614).
+    page_instant = datetime.now(UTC)
+    pinned = page_instant - timedelta(hours=7)
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.query_results = [_FakeJob(rows=[(page_instant,)]), _FakeJob(rows=[])]
+    adapter = _adapter(client)
+    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id", as_of=pinned)
+    with adapter.state_page_reader(
+        StateScope("m"), page_size=5, absent_from=probe
+    ) as reader:
+        reader.fetch_page(None)
+    _sql, job_config = client.queries[1]
+    values = [parameter.value for parameter in job_config.query_parameters]
+    assert pinned in values
+    # The page's own state read is still judged at the page instant, once.
+    assert values.count(page_instant) == 1
+
+
 def test_state_page_reader_missing_probe_relation_fails() -> None:
     ts = datetime.now(UTC)
     client = _FakeClient()
@@ -4640,7 +4661,10 @@ class _FakeSnapshotJob:
 
 
 def _snapshot_adapter(rows: dict[str, list[Any]], *, nulls: int = 0, dupes: int = 0):
-    """An adapter whose client answers a key-domain aggregate, then a payload."""
+    """An adapter whose client answers a keyed read's three statements in order:
+    the snapshot clock, the key-domain aggregate as of that instant, and the
+    segment boundaries (none, since these rows fit one segment). The payload is
+    read through a storage session, not a query job (issue #614)."""
     client = _FakeClient()
     client.tables["proj.ds.chunks"] = list(rows)
     client.table_meta["proj.ds.chunks"] = {"etag": "etag-1", "num_rows": len(
@@ -4648,8 +4672,9 @@ def _snapshot_adapter(rows: dict[str, list[Any]], *, nulls: int = 0, dupes: int 
     )}
     payload = pa.table(rows)
     client.query_results = [
+        _FakeJob(rows=[(datetime.now(UTC),)]),  # the snapshot clock
         _FakeJob(rows=[(nulls, dupes)]),  # the key-domain aggregate
-        _FakeSnapshotJob(payload),  # the payload read
+        _FakeJob(rows=[]),  # segment boundaries
     ]
     adapter = _adapter(client)
     adapter._bqstorage_client.payload = payload
@@ -4666,11 +4691,18 @@ def test_a_keyed_snapshot_keeps_analytic_functions_out_of_the_payload() -> None:
         collected = [batch.num_rows for batch in snapshot]
 
     assert collected == [2]
-    validation_sql, payload_sql = (sql for sql, _cfg in client.queries)
-    assert "OVER()" not in payload_sql
-    assert "OVER (" not in payload_sql
-    assert "stel_read_source" not in payload_sql
+    # The payload is read through a storage session, so no query carries it.
+    # The only analytic function left is the segment boundary window, and it
+    # orders the key column alone, never the payload's embedding column.
+    statements = [sql for sql, _cfg in client.queries]
+    assert not any("embedding" in sql for sql in statements)
+    assert not any("OVER()" in sql for sql in statements)
+    assert all(
+        "OVER (ORDER BY `chunk_id`)" in sql for sql in statements if "OVER (" in sql
+    )
+    assert not any("stel_read_source" in sql for sql in statements)
     # The key domain is still checked — over the key column alone.
+    validation_sql = next(sql for sql in statements if "COUNT(DISTINCT" in sql)
     assert "COUNT(DISTINCT `chunk_id`)" in validation_sql
     assert "embedding" not in validation_sql
 
@@ -4696,7 +4728,9 @@ def test_key_validation_is_refused_before_the_payload_query_runs() -> None:
     with pytest.raises(AdapterError, match="key domain is invalid"):
         with adapter.table_snapshot("chunks", key_column="chunk_id"):
             pass
-    assert len(client.queries) == 1
+    # The clock and the aggregate ran; no read session was ever opened.
+    assert len(client.queries) == 2
+    assert adapter._bqstorage_client.sessions == []
 
 
 def test_an_unkeyed_snapshot_runs_one_query_and_no_validation() -> None:
@@ -5232,6 +5266,13 @@ def test_key_validation_carries_the_read_predicates() -> None:
     adapter, client = _snapshot_adapter(
         {"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]}
     )
+    # A predicated read keeps the query path, so it takes the key-domain
+    # aggregate and then the payload job, not the segmented read's statements.
+    payload = pa.table({"chunk_id": ["a", "b"], "symbol": ["AAPL", "AAPL"]})
+    client.query_results = [
+        _FakeJob(rows=[(0, 0)]),
+        _FakeSnapshotJob(payload),
+    ]
     predicate = ReadPredicate("symbol", ReadPredicateOperator.EQUAL, "AAPL")
     with adapter.table_snapshot(
         "chunks", key_column="chunk_id", predicate=predicate

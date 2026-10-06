@@ -18,6 +18,7 @@ Two rules keep it honest as stores are added:
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -185,6 +186,25 @@ def test_create_then_inspect_round_trips_the_stamp(store: RetrievalStore) -> Non
     assert metadata.physical_name == name
     assert metadata.config_fingerprint == "cfg1"
     assert metadata.row_count == len(ROWS)
+
+
+def test_a_segmented_read_position_round_trips_and_clears_through_the_stamp(
+    store: RetrievalStore,
+) -> None:
+    # The position an interrupted segmented read left (issue #614) is stamped on
+    # the collection, and the stamp reads back exactly as written and clears.
+    name = _populate(store)
+    spec = replace(_spec(store, name), source_progress='{"completed":1}')
+
+    store.restamp_collection(spec)
+    stamped = store.inspect_collection(name)
+    assert stamped is not None
+    assert stamped.source_progress == '{"completed":1}'
+
+    store.restamp_collection(replace(spec, source_progress=None))
+    cleared = store.inspect_collection(name)
+    assert cleared is not None
+    assert cleared.source_progress is None
 
 
 def test_inspecting_a_missing_collection_returns_none(store: RetrievalStore) -> None:

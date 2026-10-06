@@ -144,7 +144,10 @@ def _run_embed_model(
     # matter what #401 did downstream of it: a 7.3GB chunk table climbed for
     # six minutes with no flush committed and no provider call made. Column
     # names and dtypes are all this needs, and both survive a limit-0 read.
-    schema_probe = adapter.read_table(upstream, limit=0)
+    # `read_table_schema` rather than a bare limit-0 read because this frame's
+    # schema becomes the output schema below, so an answer describing the
+    # upstream as it used to be silently drops a column (issue #653).
+    schema_probe = adapter.read_table_schema(upstream)
     missing = sorted({config.id_field, config.text_field} - set(schema_probe.columns))
     if missing:
         raise RunError(
@@ -342,6 +345,12 @@ def _run_embed_model(
             batch_size=_INPUT_BATCH_ROWS,
             predicate=list(read_predicates),
         ) as snapshot:
+            _refuse_dropped_upstream_columns(
+                snapshot.schema.names,
+                output_schema,
+                model_name=model.name,
+                upstream=upstream,
+            )
             batches = iter(snapshot)
             while True:
                 # Only the pull is credited to `read`. The row shaping below
@@ -790,7 +799,7 @@ class _EmbeddingReuseReader:
         # unexhausted Arrow reader, and that reader pins the database file.
         # Every other snapshot consumer iterates to exhaustion, which is why
         # the leak stayed invisible until a probe that never iterates.
-        names = set(self._adapter.read_table(self._table, limit=0).columns)
+        names = set(self._adapter.read_table_schema(self._table).columns)
         if not set(self._columns).issubset(names):
             # A pre-embed table (or an older contract) has nothing to reuse;
             # the old whole-table loader answered {} here too.
@@ -957,6 +966,42 @@ def _embedding_row(
         }
     )
     return row
+
+
+def _refuse_dropped_upstream_columns(
+    read_columns: Sequence[str],
+    output_schema: Mapping[str, Any],
+    *,
+    model_name: str,
+    upstream: str,
+) -> None:
+    """Refuse a publish that would drop a column rather than write it (#653).
+
+    `output_schema` is fixed from a zero-row probe taken before this read, and
+    every flush frame is built with it -- `pl.DataFrame(rows, schema=...)`
+    keeps the keys the schema names and discards the rest without a word. An
+    upstream column the probe did not see is therefore published as though it
+    did not exist, while state advances for every row and the sync watermark
+    records the model as caught up. The failure is silent, it does not
+    recover, and it surfaces only downstream: a search model reading the
+    table fails on the missing column on every subsequent run, and the
+    documented way out (`--full-refresh`) also turns off vector reuse, so one
+    string column costs a whole corpus of provider calls to restore.
+
+    Checked at snapshot open rather than at the publish that would drop the
+    column, because snapshot open is before the first provider call -- a run
+    that cannot write what it is reading should not be paid for first.
+    """
+    dropped = sorted(set(read_columns) - set(output_schema))
+    if not dropped:
+        return
+    raise RunError(
+        f"Embed model '{model_name}': upstream '{upstream}' has column(s) "
+        f"{', '.join(dropped)} that this run's output schema does not "
+        "describe, so publishing would drop them and still record the model "
+        "as caught up. The schema is probed once before the read, and the "
+        "upstream gained the column(s) after that; re-run to pick them up."
+    )
 
 
 def _embedding_output_schema(

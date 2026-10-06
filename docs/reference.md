@@ -2207,6 +2207,21 @@ first flush is compared against the existing table — heterogeneous corpora
 whose early documents lack a column can fail where a whole-run union carried
 it; use `append_new_columns` there.
 
+An embed model's output columns are its upstream's columns plus the generated
+embedding fields, read once from a zero-row schema probe at the start of the
+run and fixed for the whole run. That probe is never served from a query cache.
+BigQuery does not evict a cached zero-row read when the table gains a column,
+and stel built an output schema from a stale one: the run published every row
+without the new column, reported success, and recorded itself caught up, so
+every rerun skipped the model and the search model downstream failed on the
+missing column (issue #653).
+
+If the upstream gains a column *after* the probe anyway — a writer landing
+between the probe and the read — the run fails and names the column instead of
+publishing without it. Re-running picks it up, and the failure lands at
+snapshot open, before the first provider call, so nothing is paid for a run
+that cannot write what it reads.
+
 ### Bounded warehouse snapshots
 
 Warehouse consumers that publish to a serving sink can use the adapter's

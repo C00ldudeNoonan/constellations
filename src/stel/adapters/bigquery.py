@@ -1896,9 +1896,15 @@ class BigQueryAdapter(WarehouseAdapter):
         params: list[Any] | None = None,
         *,
         job_labels: dict[str, str] | None = None,
+        use_query_cache: bool | None = None,
     ) -> Any:
+        # `use_query_cache` mirrors `_start_query`'s own parameter rather than
+        # introducing a policy here: None leaves the client default alone, so
+        # every existing caller is unchanged.
         cfg = self._cfg
-        job = self._start_query(sql, params, job_labels=job_labels)
+        job = self._start_query(
+            sql, params, job_labels=job_labels, use_query_cache=use_query_cache
+        )
         job.result(timeout=cfg.job_execution_timeout_seconds)
         return job
 
@@ -2141,6 +2147,34 @@ class BigQueryAdapter(WarehouseAdapter):
 
     def query_df(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame:
         arrow = self._run_query(sql, params).to_arrow()
+        return cast(pl.DataFrame, pl.from_arrow(arrow))
+
+    def read_table_schema(self, table: str) -> pl.DataFrame:
+        return self._schema_probe_df(self.table_ref(table))
+
+    def _schema_probe_df(self, ref: str) -> pl.DataFrame:
+        """A zero-row read that must describe `ref` as it is *now* (issue #653).
+
+        BigQuery does not evict a cached `SELECT * ... LIMIT 0` when the table
+        gains a column. Measured on a live dataset: the cached probe reported
+        51 columns while `get_table()` reported 52 at the same moment, and the
+        entry outlived the table's modification by at least seven minutes and
+        survived an uncached run of the same query. A zero-row, zero-byte
+        result evidently does not carry the table dependency that invalidates
+        a cached result over data.
+
+        Still the same query through the same Arrow path, only not from the
+        cache, rather than reading the schema from `get_table()` as
+        `_state_columns` does. That would need a BigQuery-to-polars dtype
+        mapping of its own, and these dtypes *become* an embed model's output
+        column types -- a mapping that disagreed with the Arrow path on one
+        type would quietly change what every embed model writes. `LIMIT 0`
+        bills no bytes, so what the cache was saving here is a job's latency,
+        not scan cost.
+        """
+        arrow = self._run_query(
+            f"SELECT * FROM {ref} LIMIT 0", use_query_cache=False
+        ).to_arrow()
         return cast(pl.DataFrame, pl.from_arrow(arrow))
 
     def list_all_tables(self, schema: str | None = None) -> list[str]:
@@ -2595,7 +2629,7 @@ class BigQueryAdapter(WarehouseAdapter):
                     f"SQL model materialization for '{table}' failed "
                     f"[{type(e).__name__}]"
                 ) from e
-            schema_df = self.query_df(f"SELECT * FROM {staging_ref} LIMIT 0")
+            schema_df = self._schema_probe_df(staging_ref)
             # Build (and dtype-validate) the CREATE before dropping the target, so
             # an unsupported Iceberg column type never destroys the last good table.
             create_sql = self._iceberg_create_sql(table, schema_df, layout)
@@ -3127,9 +3161,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 # Iceberg cannot CREATE OR REPLACE or be renamed into; build the
                 # explicit-schema target from the staged rows and INSERT them.
                 # Non-atomic like the single-frame Iceberg full path.
-                schema_df = self.query_df(
-                    f"SELECT * FROM {self.table_ref(staging)} LIMIT 0"
-                )
+                schema_df = self._schema_probe_df(self.table_ref(staging))
                 create_sql = self._iceberg_create_sql(table, schema_df, layout)
                 self.drop_table(table)
                 self._run_query(create_sql, job_labels=job_labels)

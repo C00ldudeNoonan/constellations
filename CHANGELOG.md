@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### A schema probe is never answered from a cache (issue #653)
+
+- **An embed model published without a column its upstream had gained, and
+  recorded itself caught up.** The output schema is read once from a zero-row
+  probe, and BigQuery served that probe from its query cache from before the
+  column existed -- 51 columns against `get_table()`'s 52 at the same moment,
+  seven minutes after the change. `pl.DataFrame(rows, schema=...)` drops keys
+  the schema does not name, so every row lost the column in silence while
+  state advanced for all of them. The search model downstream then failed on
+  the missing column on every rerun, because both skip tiers matched.
+- **A freshness-critical probe is now its own adapter operation**,
+  `read_table_schema`, and BigQuery answers it with the cache off. The five
+  contract probes in chunk, embed and llm use it. Payload reads are untouched:
+  the cache is right for a query about the same rows, and disabling it
+  wholesale would have made every re-read billable.
+- Two probes **inside** the BigQuery adapter had the same bug with a worse
+  outcome: the Iceberg paths probe a deterministically named staging table and
+  feed the answer to an explicit `CREATE TABLE`, so a cached answer from a
+  previous run built the target with the wrong schema.
+- **An embed run now refuses to drop a column rather than publishing without
+  it**, naming it, at snapshot open -- before the first provider call -- for
+  the case where the upstream changes between the probe and the read.
+- Not fixed, and tracked separately: there is still no cheap way out of a state
+  poisoned by the old behaviour. `--full-refresh` also turns off vector reuse,
+  so restoring one string column costs a whole corpus of provider calls.
+  Reasoning in `docs/adr/0022`, including why the schema is not widened
+  mid-run and why the unchanged-parent skip's content fingerprint is left
+  cached.
+
 ### An incremental publish extends its indices instead of retraining them (issue #619)
 
 - **An index merely behind on rows was rebuilt over the whole collection.**

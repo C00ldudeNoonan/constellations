@@ -2069,6 +2069,11 @@ def test_full_chunks_iceberg_inserts_from_staging() -> None:
         "INSERT INTO `proj`.`ds`.`docs` SELECT * FROM `proj`.`ds`.`stel_staging__docs__"
     )
     assert "proj.ds.docs" in client.dropped
+    # The staging name is deterministic, so a cached probe answers about a
+    # previous run's staging table -- and that schema drives the CREATE below,
+    # so the target itself would be built wrong (issue #653).
+    probe = next(q for q in client.queries if q[0].endswith("LIMIT 0"))
+    assert probe[1].use_query_cache is False
 
 
 def test_materialize_sql_full_iceberg_stages_creates_and_inserts() -> None:
@@ -2108,6 +2113,9 @@ def test_materialize_sql_full_iceberg_stages_creates_and_inserts() -> None:
     assert "proj.ds.docs" in client.dropped
     assert any("stel_staging__docs__" in d for d in client.dropped)
     assert result.rows_written == 1
+    # As above: the schema this CREATE was built from may not be cached (#653).
+    probe = next(q for q in client.queries if q[0].endswith("LIMIT 0"))
+    assert probe[1].use_query_cache is False
 
 
 def test_materialize_sql_full_standard_still_uses_create_or_replace() -> None:
@@ -2121,6 +2129,64 @@ def test_materialize_sql_full_standard_still_uses_create_or_replace() -> None:
         "CREATE OR REPLACE TABLE `proj`.`ds`.`docs`"
     )
     assert not any("table_format = 'ICEBERG'" in q[0] for q in client.queries)
+
+
+# ─── a schema probe must describe the table now (issue #653) ───────────────
+
+
+def test_read_table_schema_refuses_the_query_cache() -> None:
+    """The probe's answer decides a contract, so it may not be a cached one.
+
+    BigQuery served a `SELECT * ... LIMIT 0` from its query cache after the
+    table gained a column -- 51 columns against `get_table()`'s 52 at the same
+    moment, seven minutes after the modification. The embed downstream built
+    its output schema from that answer, published every row without the new
+    column, reported success, and recorded itself caught up (issue #653).
+    """
+    client = _FakeClient()
+    schema_df = pl.DataFrame(schema={"chunk_id": pl.String, "section_topic": pl.String})
+
+    class _ArrowJob(_FakeJob):
+        def to_arrow(self) -> Any:
+            return schema_df.to_arrow()
+
+    client.query_results.append(_ArrowJob())
+    adapter = _adapter(client)
+
+    probe = adapter.read_table_schema("chunks")
+
+    # Columns and dtypes, no rows -- the contract, not the corpus.
+    assert probe.columns == ["chunk_id", "section_topic"]
+    assert probe.height == 0
+    [(sql, job_config)] = client.queries
+    assert sql == "SELECT * FROM `proj`.`ds`.`chunks` LIMIT 0"
+    assert job_config.use_query_cache is False
+
+
+def test_an_ordinary_table_read_still_uses_the_query_cache() -> None:
+    """The fix is scoped to the probe, not to caching.
+
+    A payload read asks a different question: a cached answer there is an
+    answer about the same rows, and the cache saves real bytes on a repeated
+    one. Disabling it wholesale would have made every re-read billable to fix
+    a metadata staleness bug (issue #653).
+    """
+    client = _FakeClient()
+    rows = pl.DataFrame({"chunk_id": ["a"]})
+
+    class _ArrowJob(_FakeJob):
+        def to_arrow(self) -> Any:
+            return rows.to_arrow()
+
+    client.query_results.append(_ArrowJob())
+    adapter = _adapter(client)
+
+    assert adapter.read_table("chunks").height == 1
+
+    [(sql, job_config)] = client.queries
+    assert sql == "SELECT * FROM `proj`.`ds`.`chunks`"
+    # No job config at all: nothing here overrides the client's own default.
+    assert job_config is None
 
 
 # ─── optional integration (needs real GCP credentials) ─────────────────────
@@ -3970,6 +4036,47 @@ def test_integration_append_rows_creates_accumulates_and_widens() -> None:
                 f"SELECT invocation_id FROM {adapter.table_ref('run_log')} "
                 "ORDER BY invocation_id"
             ) == [("i1",), ("i2",), ("i3",)]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_schema_probe_sees_a_column_added_since_the_last_probe() -> None:
+    """Live cover for the bug in #653, which no fake client can show.
+
+    Whether BigQuery evicts a cached `SELECT * ... LIMIT 0` when the table
+    gains a column is a property of BigQuery, not of stel -- and it does not:
+    the cached probe reported 51 columns while `get_table()` reported 52 at the
+    same moment. This is that shape, same principal and same session, with an
+    `ALTER TABLE ADD COLUMN` between two probes of one table. It is the
+    sequence that published 11,897 embedding rows without their new column
+    and then recorded the model as caught up.
+    """
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset}
+    )
+    adapter = create_adapter(cfg)
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "chunks", pl.DataFrame({"chunk_id": ["c1"], "body": ["text"]})
+            )
+            before = adapter.read_table_schema("chunks")
+            assert before.columns == ["chunk_id", "body"]
+            assert before.height == 0
+
+            adapter.execute(
+                f"ALTER TABLE {adapter.table_ref('chunks')} "
+                "ADD COLUMN section_topic STRING"
+            )
+
+            after = adapter.read_table_schema("chunks")
+            assert "section_topic" in after.columns
+            assert after.height == 0
     finally:
         assert isinstance(adapter, BigQueryAdapter)
         adapter._reset_storage_for_test()

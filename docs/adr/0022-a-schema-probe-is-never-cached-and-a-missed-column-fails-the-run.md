@@ -45,9 +45,11 @@ must override it with one that cannot be, as BigQuery now does by passing
 `use_query_cache=False` on the same `LIMIT 0` query. The two Iceberg staging
 probes go through the same helper.
 
-Independently, an embed model refuses to publish rows carrying a column its
-output schema does not describe. The check runs at snapshot open — before the
-first provider call — and names the columns.
+Independently, an embed model refuses to publish rows carrying a column the
+probe did not see. The check runs at snapshot open — before the first provider
+call — and names the columns. A column whose name collides with a generated
+field is refused as a collision, by the same check the run already makes
+against the probe, run a second time against the columns actually read.
 
 ## Alternatives considered
 
@@ -87,6 +89,18 @@ passthrough column that happens to be all-NULL in the first flush infers as
 Null, the target column is created from that, and a later flush carrying real
 values fails on conversion *after* its provider calls are paid. Widening
 mid-run puts that failure mode back.
+
+### Compare the read's columns against the output schema
+
+What the first implementation did, and it has a hole, found by Codex reviewing
+#654. The output schema is the probed columns *plus* the generated fields, so a
+late column carrying a generated field's name is already in it: the subtraction
+reports nothing dropped, `_embedding_row` writes the generated value over the
+upstream one, and the row publishes with state advanced — precisely the silent
+loss the check exists to break. The comparison is against the probed columns
+instead, which reports that column, and the collision check runs again against
+what was read so the message matches the fault: the two refusals give opposite
+advice, and "re-run to pick them up" would send a collision round a loop.
 
 ### Refuse at publish instead of at snapshot open
 
@@ -134,6 +148,17 @@ known, and it is before the first call.
   `section_topic` published on all 11,897 rows with 0 provider calls and 11,897
   cache hits, every vector, `embedding_input_hash` and `embedded_at` unchanged,
   and the search model republished in place.
+- **The generated-field collision was reachable late.** With the output schema
+  as the comparison, an upstream that gained an `embedding_model` column
+  between the probe and the read published 2 rows, reported success and
+  advanced state, with the upstream's values replaced by the generated ones:
+  `test_a_late_generated_column_collision_is_refused_not_overwritten` fails
+  that way against the pre-review code. Its sibling,
+  `test_embed_rejects_generated_columns_case_insensitively`, turned out to
+  pass even with a case-sensitive collision check — via a duplicate-column
+  error from DuckDB at publish, after the id scan and the provider calls the
+  early refusal exists to avoid — so both now pin the message rather than the
+  column name.
 - **polars drops silently.** `pl.DataFrame([{"a": 1, "b": 2}], {"a": pl.Int64})`
   returns `columns == ["a"]` with `height == 2` — no error, no warning.
   Checked 2026-10-06 against polars 1.40.1, google-cloud-bigquery 3.42.1.

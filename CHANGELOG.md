@@ -23,7 +23,13 @@
   previous run built the target with the wrong schema.
 - **An embed run now refuses to drop a column rather than publishing without
   it**, naming it, at snapshot open -- before the first provider call -- for
-  the case where the upstream changes between the probe and the read.
+  the case where the upstream changes between the probe and the read. A late
+  column whose name collides with a generated field (the vector field or an
+  `embedding_*` / `embedded_at` column) is refused as a collision rather than
+  as a drop, because a re-run cannot fix that one: the generated field is
+  written over the upstream value, so the upstream column has to be renamed.
+  The collision check the run already made against the probe is made again
+  against the columns actually read.
 - Not fixed, and tracked separately: there is still no cheap way out of a state
   poisoned by the old behaviour. `--full-refresh` also turns off vector reuse,
   so restoring one string column costs a whole corpus of provider calls.

@@ -166,17 +166,12 @@ def _run_embed_model(
             f"Available: {sorted(schema_probe.columns)}"
         )
     generated = set(EMBED_METADATA_FIELDS) | {config.vector_field}
-    generated_names = {name.casefold() for name in generated}
-    collisions = sorted(
-        column
-        for column in schema_probe.columns
-        if column.casefold() in generated_names
+    _refuse_generated_column_collisions(
+        schema_probe.columns,
+        generated=generated,
+        model_name=model.name,
+        upstream=upstream,
     )
-    if collisions:
-        raise RunError(
-            f"Embed model '{model.name}': upstream '{upstream}' already contains "
-            f"generated embedding column(s): {', '.join(collisions)}"
-        )
 
     # One projected pass over the id column, before any spend. Kept ahead of
     # the embedding loop rather than folded into it so a NULL, empty, or
@@ -345,9 +340,10 @@ def _run_embed_model(
             batch_size=_INPUT_BATCH_ROWS,
             predicate=list(read_predicates),
         ) as snapshot:
-            _refuse_dropped_upstream_columns(
+            _refuse_unpublishable_upstream_columns(
                 snapshot.schema.names,
-                output_schema,
+                probed=schema_probe.columns,
+                generated=generated,
                 model_name=model.name,
                 upstream=upstream,
             )
@@ -968,17 +964,50 @@ def _embedding_row(
     return row
 
 
-def _refuse_dropped_upstream_columns(
-    read_columns: Sequence[str],
-    output_schema: Mapping[str, Any],
+def _refuse_generated_column_collisions(
+    columns: Sequence[str],
     *,
+    generated: set[str],
     model_name: str,
     upstream: str,
 ) -> None:
-    """Refuse a publish that would drop a column rather than write it (#653).
+    """Refuse an upstream that already holds a column stel generates.
 
-    `output_schema` is fixed from a zero-row probe taken before this read, and
-    every flush frame is built with it -- `pl.DataFrame(rows, schema=...)`
+    Case-insensitive because the collision is stel's to lose either way: the
+    output row is built from the upstream record and then has every generated
+    field written over it, so an upstream `Embedding_Model` is discarded just
+    as surely as an `embedding_model` would be.
+
+    Called twice (issue #653, PR #654 review). Once against the zero-row
+    probe, before the run spends anything, and once against the columns the
+    read actually returned -- a collision that arrives between the two is
+    invisible to the first call, and `_refuse_unpublishable_upstream_columns`
+    cannot see it either, because the name is in the output schema as the
+    field stel generates.
+    """
+    generated_names = {name.casefold() for name in generated}
+    collisions = sorted(
+        column for column in columns if column.casefold() in generated_names
+    )
+    if collisions:
+        raise RunError(
+            f"Embed model '{model_name}': upstream '{upstream}' already contains "
+            f"generated embedding column(s): {', '.join(collisions)}"
+        )
+
+
+def _refuse_unpublishable_upstream_columns(
+    read_columns: Sequence[str],
+    *,
+    probed: Sequence[str],
+    generated: set[str],
+    model_name: str,
+    upstream: str,
+) -> None:
+    """Refuse a publish that would lose a column rather than write it (#653).
+
+    The output schema is fixed from a zero-row probe taken before this read,
+    and every flush frame is built with it -- `pl.DataFrame(rows, schema=...)`
     keeps the keys the schema names and discards the rest without a word. An
     upstream column the probe did not see is therefore published as though it
     did not exist, while state advances for every row and the sync watermark
@@ -988,11 +1017,22 @@ def _refuse_dropped_upstream_columns(
     documented way out (`--full-refresh`) also turns off vector reuse, so one
     string column costs a whole corpus of provider calls to restore.
 
-    Checked at snapshot open rather than at the publish that would drop the
+    Compared against the **probed** columns rather than against the output
+    schema, and preceded by the collision check. The output schema is the
+    probed columns plus the generated fields, so subtracting it would hide a
+    late column that happens to carry a generated field's name: present in
+    the schema, overwritten in the row, published and state-advanced (PR #654
+    review). Those two are different faults with different fixes -- rename
+    the upstream column, or re-run -- so they keep their own messages.
+
+    Checked at snapshot open rather than at the publish that would lose the
     column, because snapshot open is before the first provider call -- a run
     that cannot write what it is reading should not be paid for first.
     """
-    dropped = sorted(set(read_columns) - set(output_schema))
+    _refuse_generated_column_collisions(
+        read_columns, generated=generated, model_name=model_name, upstream=upstream
+    )
+    dropped = sorted(set(read_columns) - set(probed))
     if not dropped:
         return
     raise RunError(

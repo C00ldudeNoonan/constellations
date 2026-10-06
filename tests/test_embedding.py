@@ -320,7 +320,13 @@ def test_embed_rejects_generated_columns_case_insensitively(tmp_path: Path) -> N
         [],
     )
 
-    with pytest.raises(RunError, match="Embedding_Model"):
+    # The message, not just the column name: `Embedding_Model` also appears
+    # in the duplicate-column error DuckDB raises at publish, so matching the
+    # name alone passed even with a case-sensitive collision check -- after a
+    # full id scan and the provider calls the early refusal exists to avoid.
+    with pytest.raises(
+        RunError, match=r"already contains generated embedding column.*Embedding_Model"
+    ):
         run_project(project, select="document_embeddings")
 
 
@@ -487,6 +493,66 @@ def test_a_stale_schema_probe_refuses_to_publish_rather_than_drop_a_column(
         project,
         'SELECT DISTINCT tenant FROM "db".docs.document_embeddings',
     ) == [("economic-data-project",)]
+
+
+def test_a_late_generated_column_collision_is_refused_not_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hole in the drop guard above, found by Codex on PR #654.
+
+    `output_schema` is the probed upstream columns *plus* the generated
+    embedding fields, so subtracting it from the read's columns cannot see an
+    upstream column that arrived late carrying a generated field's name --
+    it is in the schema, as the field stel generates. The run would then
+    publish `_embedding_row`'s overwrite of that column, advance state for
+    every row, and lose the upstream's values in exactly the silence this
+    guard exists to break.
+
+    The collision check at the top of the run cannot catch it either: that
+    reads the probe, which by hypothesis does not show the column. So the
+    check has to run again against what was actually read.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    _query(
+        project,
+        'ALTER TABLE "db".docs.document_chunks ADD COLUMN embedding_model VARCHAR',
+        [],
+    )
+    _query(
+        project,
+        'UPDATE "db".docs.document_chunks SET embedding_model = ?, text = ?',
+        ["upstream-value", "revised text"],
+    )
+
+    real_probe = WarehouseAdapter.read_table_schema
+
+    def stale(self: Any, table: str) -> pl.DataFrame:
+        frame = real_probe(self, table)
+        return (
+            frame.drop("embedding_model")
+            if "embedding_model" in frame.columns
+            else frame
+        )
+
+    monkeypatch.setattr(WarehouseAdapter, "read_table_schema", stale)
+
+    # The collision refusal, specifically. Comparing the read against the
+    # *probed* columns already reports this column as dropped, so matching the
+    # name alone cannot tell the two refusals apart -- and they give opposite
+    # advice. "Re-run to pick them up" would be a loop here: the next run's
+    # probe sees the column and refuses it as a collision, correctly.
+    with pytest.raises(
+        RunError, match=r"already contains generated embedding column.*embedding_model"
+    ):
+        run_project(project, select="document_embeddings")
+
+    # The upstream's values were never silently replaced by the generated ones.
+    assert _query(
+        project,
+        'SELECT DISTINCT embedding_model FROM "db".docs.document_embeddings',
+    ) == [("contract-v1",)]
 
 
 # ─── removal detection is an anti-join, not a set difference (issue #428) ───

@@ -2218,9 +2218,13 @@ missing column (issue #653).
 
 If the upstream gains a column *after* the probe anyway — a writer landing
 between the probe and the read — the run fails and names the column instead of
-publishing without it. Re-running picks it up, and the failure lands at
-snapshot open, before the first provider call, so nothing is paid for a run
-that cannot write what it reads.
+publishing without it, at snapshot open, before the first provider call, so
+nothing is paid for a run that cannot write what it reads. Re-running picks the
+column up — unless its name is one an embed model generates (the vector field,
+or one of the `embedding_*` / `embedded_at` columns). That is reported as a
+collision instead, and re-running refuses it again, because a generated field
+is written over whatever the upstream put there: the upstream column has to be
+renamed.
 
 ### Bounded warehouse snapshots
 

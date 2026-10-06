@@ -89,6 +89,8 @@ _ROW_FINGERPRINT_KEY = "row_fingerprint"
 # then (issue #508); null when not known complete for any generation.
 _SOURCE_GENERATION_KEY = "source_generation"
 _SOURCE_ROWS_KEY = "source_rows"
+# The segmented read position an unfinished publish left (issue #614).
+_SOURCE_PROGRESS_KEY = "source_progress"
 
 _DISTANCE_FUNCTIONS = {
     "cosine": "array_cosine_distance",
@@ -471,6 +473,7 @@ class DuckDBStore(RetrievalStore):
                 if isinstance(stamp.get(_SOURCE_ROWS_KEY), int)
                 else None
             ),
+            source_progress=stamp.get(_SOURCE_PROGRESS_KEY) or None,
             physical_generation=generation,
             row_count=row_count,
             schema=schema,
@@ -551,6 +554,7 @@ class DuckDBStore(RetrievalStore):
             _ROW_FINGERPRINT_KEY: spec.row_fingerprint,
             _SOURCE_GENERATION_KEY: spec.source_generation,
             _SOURCE_ROWS_KEY: spec.source_rows,
+            _SOURCE_PROGRESS_KEY: spec.source_progress,
         }
         payload = json.dumps(stamp, sort_keys=True, separators=(",", ":"))
         self._execute(

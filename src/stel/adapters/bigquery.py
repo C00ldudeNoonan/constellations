@@ -22,7 +22,8 @@ import os
 import re
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import quote
@@ -63,6 +64,7 @@ from .base import (
     AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
+    SnapshotResumePoint,
     SqlMaterializationResult,
     SqlRelationColumn,
     SqlRelationSchema,
@@ -231,6 +233,76 @@ def _bigquery() -> Any:
 # Resolved by name at call time because the enum lives on the lazily imported
 # storage module, which a core-only install does not have (issue #454).
 _ARROW_BUFFER_COMPRESSION = {"lz4": "LZ4_FRAME", "zstd": "ZSTD"}
+
+# A segmented snapshot read (issue #614) is cut into segments of this many rows
+# by key. Each segment is its own read session, so it has to finish inside
+# BigQuery's six-hour session limit on its own: at the slowest page rate the
+# incident measured, 250k rows is about ten pages, well inside that.
+_SEGMENT_ROWS = 250_000
+# Time travel keeps 2 to 7 days, depending on the table's setting. A resume point
+# older than this may already be gone, so a resume past it starts over with a
+# fresh point rather than failing partway through a publish.
+_RESUME_SNAPSHOT_MAX_AGE = timedelta(hours=48)
+# Key columns a segment boundary can be written as a literal for, and the
+# BigQuery type each one is reported as.
+_SEGMENT_KEY_TYPES = {"INTEGER": "INT64", "INT64": "INT64", "STRING": "STRING"}
+_UNQUOTED_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _segment_literal(value: str, key_type: str) -> str:
+    """A boundary value as a row-restriction literal.
+
+    Callers have already refused any value this cannot write safely, so this
+    only renders: integers as numbers, strings with their quote and backslash
+    escaped.
+    """
+    if key_type == "INT64":
+        return str(int(value))
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def _segment_restriction(
+    key_column: str, key_type: str, boundaries: tuple[str, ...], index: int
+) -> str | None:
+    """The row restriction selecting segment `index`, or None for the only segment
+    of an unpartitioned read. Segment `i` holds keys in [boundaries[i-1], boundaries[i])
+    with the first segment open below and the last open above."""
+    clauses: list[str] = []
+    if index > 0:
+        lower = _segment_literal(boundaries[index - 1], key_type)
+        clauses.append(f"{key_column} >= {lower}")
+    if index < len(boundaries):
+        upper = _segment_literal(boundaries[index], key_type)
+        clauses.append(f"{key_column} < {upper}")
+    return " AND ".join(clauses) or None
+
+
+def _snapshot_point_is_recent(snapshot_time: str) -> bool:
+    """Whether a segmented read's instant is young enough to still be reachable
+    by time travel, and parses at all."""
+    try:
+        taken = datetime.fromisoformat(snapshot_time)
+    except ValueError:
+        return False
+    if taken.tzinfo is None:
+        return False
+    return datetime.now(UTC) - taken <= _RESUME_SNAPSHOT_MAX_AGE
+
+
+def _boundaries_are_writable(boundaries: list[str], key_type: str) -> bool:
+    """Whether every boundary can be written as a restriction literal and the
+    list is strictly ascending, so the segments partition the key domain with
+    no gap and no overlap."""
+    if key_type == "INT64":
+        try:
+            values = [int(value) for value in boundaries]
+        except ValueError:
+            return False
+        return all(a < b for a, b in pairwise(values))
+    if any(ord(char) < 32 for value in boundaries for char in value):
+        return False
+    return all(a < b for a, b in pairwise(boundaries))
 
 
 def _bigquery_storage() -> Any:
@@ -953,6 +1025,23 @@ def _read_session_arrow_schema(session: Any) -> pa.Schema:
     )
 
 
+def _projected_indices(session: Any, output_names: Sequence[str]) -> list[int]:
+    """Positions of the output columns in this session's own batches, read from
+    the session's schema (see `_read_session_arrow_schema`)."""
+    query_schema = _read_session_arrow_schema(session)
+    indices = [query_schema.get_field_index(name) for name in output_names]
+    if any(index < 0 for index in indices):
+        raise AdapterError("BigQuery snapshot returned an unexpected projected schema")
+    return indices
+
+
+def _projected_schema(session: Any, output_names: Sequence[str]) -> pa.Schema:
+    query_schema = _read_session_arrow_schema(session)
+    return pa.schema(
+        [query_schema.field(index) for index in _projected_indices(session, output_names)]
+    )
+
+
 def _storage_read_batches(
     read_client: Any,
     session: Any,
@@ -1003,20 +1092,26 @@ def _storage_read_batches(
 
 
 def _table_read_options(
-    storage: Any, *, selected_fields: list[str] | None, compression: str
+    storage: Any,
+    *,
+    selected_fields: list[str] | None,
+    compression: str,
+    row_restriction: str | None = None,
 ) -> Any:
-    """Read options for one session, or None when neither setting is in play.
+    """Read options for one session, or None when no setting is in play.
 
-    One place because the two settings compose onto the same message: a
-    projected read that also compresses needs both set, and a session with
-    neither must send no options at all, so an unconfigured read stays exactly
-    the request it was before issue #454.
+    One place because the settings compose onto the same message: a projected
+    read that also compresses (or is restricted to a segment) needs them all
+    set, and a session with none of them must send no options at all, so an
+    unconfigured read stays exactly the request it was before issue #454.
     """
-    if selected_fields is None and compression == "none":
+    if selected_fields is None and compression == "none" and row_restriction is None:
         return None
     options = storage.types.ReadSession.TableReadOptions()
     if selected_fields is not None:
         options.selected_fields = selected_fields
+    if row_restriction is not None:
+        options.row_restriction = row_restriction
     if compression != "none":
         options.arrow_serialization_options = storage.types.ArrowSerializationOptions(
             buffer_compression=getattr(
@@ -1436,8 +1531,261 @@ class BigQueryAdapter(WarehouseAdapter):
         table_path = f"projects/{project}/datasets/{dataset}/tables/{table}"
         return self._create_read_session(table_path, selected_fields=selected_fields)
 
+    def _segmented_key(
+        self, request: TableReadRequest, initial_table: Any
+    ) -> tuple[str, str] | None:
+        """The (column, BigQuery key type) a read can be cut into segments on.
+
+        None keeps the single-session path. That path is correct, just not
+        resumable past BigQuery's six-hour session limit, which is the only
+        thing segmenting buys.
+        """
+        key = request.key_column
+        if key is None or not _UNQUOTED_IDENTIFIER.match(key):
+            return None
+        for field in initial_table.schema:
+            if str(field.name) == key:
+                key_type = _SEGMENT_KEY_TYPES.get(str(field.field_type).upper())
+                return None if key_type is None else (key, key_type)
+        return None
+
+    def _plan_segments(
+        self,
+        request: TableReadRequest,
+        table_id: str,
+        key: str,
+        key_type: str,
+        generation: str,
+    ) -> SnapshotResumePoint | None:
+        """The segments for a fresh read.
+
+        The time comes from BigQuery's own clock, then the key domain is checked
+        and the boundaries cut at that same instant, so no row written after it
+        can slip into the boundaries or past the domain check. None when the
+        boundaries cannot be written safely.
+        """
+        taken = self._snapshot_clock()
+        table_ref = self.table_ref(request.table)
+        as_of = f"FOR SYSTEM_TIME AS OF TIMESTAMP('{taken.isoformat()}')"
+        self._refuse_invalid_key_domain_as_of(table_ref, as_of, key)
+        boundaries = self._segment_boundaries(table_ref, as_of, key)
+        if not _boundaries_are_writable(boundaries, key_type):
+            return None
+        return SnapshotResumePoint(
+            snapshot_time=taken.isoformat(),
+            key_type=key_type,
+            boundaries=tuple(boundaries),
+            completed=0,
+            rows=0,
+            generation=generation,
+        )
+
+    def _snapshot_clock(self) -> datetime:
+        job = self._start_query("SELECT CURRENT_TIMESTAMP()", use_query_cache=False)
+        value = next(iter(job.result())).values()[0]
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value
+
+    def _refuse_invalid_key_domain_as_of(
+        self, table_ref: str, as_of: str, key: str
+    ) -> None:
+        """The NULL and duplicate check, pinned to the snapshot instant.
+
+        `_validate_read_key_domain` checks the live table, which a row written
+        between that check and the snapshot would slip past. A segmented read
+        cannot afford that gap: a NULL key matches no segment's restriction and
+        would be dropped without a sound.
+        """
+        ident = self.quote_ident(key)
+        job = self._start_query(
+            f"SELECT COUNTIF({ident} IS NULL), "
+            f"COUNT({ident}) - COUNT(DISTINCT {ident}) "
+            f"FROM {table_ref} {as_of}",
+            use_query_cache=False,
+        )
+        rows = [tuple(row.values()) for row in job.result()]
+        null_count = int(rows[0][0]) if rows else 0
+        duplicate_count = int(rows[0][1]) if rows else 0
+        if null_count or duplicate_count:
+            raise AdapterError(
+                "Table snapshot key domain is invalid: "
+                f"{null_count} NULL and {duplicate_count} duplicate value(s)"
+            )
+
+    def _segment_boundaries(self, table_ref: str, as_of: str, key: str) -> list[str]:
+        """The key at the start of each segment after the first, in key order.
+
+        Exact rather than approximate, so segments hold `_SEGMENT_ROWS` rows
+        apart from the last. The window sorts the key column in one place; the
+        key alone is narrow enough that this is the cheap part of the read.
+        """
+        ident = self.quote_ident(key)
+        job = self._start_query(
+            f"SELECT {ident} FROM (SELECT {ident}, "
+            f"ROW_NUMBER() OVER (ORDER BY {ident}) AS rn "
+            f"FROM {table_ref} {as_of}) "
+            f"WHERE rn > 1 AND MOD(rn - 1, {_SEGMENT_ROWS}) = 0 ORDER BY rn",
+            use_query_cache=False,
+        )
+        return [str(row.values()[0]) for row in job.result()]
+
+    def _open_segmented_snapshot(
+        self,
+        request: TableReadRequest,
+        table_id: str,
+        point: SnapshotResumePoint,
+        key: str,
+        output_names: Sequence[str],
+    ) -> TableReadSnapshot:
+        """Read the remaining segments one session at a time, each as of the
+        point's snapshot instant (issue #614).
+
+        One session per segment keeps every session inside BigQuery's six-hour
+        limit, however long the publish runs. Pinning every session to the same
+        instant keeps the segments one relation, so a table rewritten mid-publish
+        does not split the read. The point's `completed` count records how many
+        leading segments are fully yielded; a later attempt starts there.
+        """
+        project, dataset, table = table_id.split(".", 2)
+        table_path = f"projects/{project}/datasets/{dataset}/tables/{table}"
+        selected_fields = list(request.columns) if request.columns is not None else None
+        taken = datetime.fromisoformat(point.snapshot_time)
+        segment_count = len(point.boundaries) + 1
+
+        def open_segment(index: int) -> Any:
+            return self._create_read_session(
+                table_path,
+                selected_fields=selected_fields,
+                snapshot_time=taken,
+                row_restriction=_segment_restriction(
+                    key, point.key_type, point.boundaries, index
+                ),
+            )
+
+        # The output schema has to be known before the first pull, so the first
+        # segment still to read is opened now and reused for its reads. A point
+        # with nothing left to read still needs a typed snapshot, so it opens
+        # the last segment for its schema and reads nothing.
+        schema_index = min(point.completed, segment_count - 1)
+        opened: dict[int, Any] = {schema_index: open_segment(schema_index)}
+        output_schema = _projected_schema(opened[schema_index], output_names)
+
+        completed = point.completed
+        # Rows the completed segments hold, carried in from the point so a resumed
+        # read reports the whole relation, not just the segments it reads.
+        completed_rows = point.rows
+        read_timings = PhaseTimings()
+        read_client = self._ensure_bqstorage_client()
+        timeout = self._cfg.job_execution_timeout_seconds
+
+        def batches() -> Iterator[pa.RecordBatch]:
+            nonlocal completed, completed_rows
+            for index in range(point.completed, segment_count):
+                session = opened.pop(index) if index in opened else open_segment(index)
+                arrow_batches = _storage_read_batches(
+                    read_client, session, timeout=timeout, timings=read_timings
+                )
+                segment_rows = 0
+                try:
+                    output_indices = _projected_indices(session, output_names)
+                    for projected in _coalesced_batches(
+                        arrow_batches,
+                        output_indices,
+                        request.batch_size,
+                        read_timings,
+                    ):
+                        segment_rows += projected.num_rows
+                        yield projected
+                except AdapterError:
+                    raise
+                except Exception as error:
+                    # The native error, which would name a session expiry, goes
+                    # only to the DEBUG log, as in the single-session read.
+                    log.debug(
+                        "BigQuery table snapshot batch read failed", exc_info=error
+                    )
+                    cause = sanitized_adapter_cause(error)
+                    raise AdapterError(
+                        "BigQuery table snapshot batch read failed"
+                    ) from cause
+                finally:
+                    close_batches = getattr(arrow_batches, "close", None)
+                    if callable(close_batches):
+                        close_batches()
+                # Only now, with every batch of this segment yielded, is it
+                # complete. The caller has written each of them before pulling
+                # the next one, which is what makes the point safe to persist.
+                completed = index + 1
+                completed_rows += segment_rows
+
+        def resume(candidate: SnapshotResumePoint) -> TableReadSnapshot | None:
+            # Only a point for this same key type, taken recently enough that time
+            # travel still reaches it, can be continued. Anything else reads fresh.
+            if candidate.key_type != point.key_type:
+                return None
+            if not _snapshot_point_is_recent(candidate.snapshot_time):
+                return None
+            return self._open_segmented_snapshot(
+                request, table_id, candidate, key, output_names
+            )
+
+        def progress() -> SnapshotResumePoint:
+            return SnapshotResumePoint(
+                snapshot_time=point.snapshot_time,
+                key_type=point.key_type,
+                boundaries=point.boundaries,
+                completed=completed,
+                rows=completed_rows,
+                generation=point.generation,
+            )
+
+        def validate_unchanged() -> None:
+            # A point-in-time read cannot change under itself, so the live table
+            # moving during the publish is expected and is not a failure here.
+            return None
+
+        def close() -> None:
+            # Sessions expire on their own, and an unfinished read has nothing
+            # else to cancel.
+            return None
+
+        payload = request._fingerprint_payload()
+        return TableReadSnapshot(
+            schema=output_schema,
+            fingerprint=canonical_fingerprint(
+                {
+                    "adapter": self.adapter_type(),
+                    "snapshot_time": point.snapshot_time,
+                    "segments": list(point.boundaries),
+                    "request": payload,
+                },
+                domain="dbt-ml-warehouse-table-snapshot",
+                version=1,
+            ),
+            batches=batches(),
+            validate_unchanged=validate_unchanged,
+            close=close,
+            # The same identity the single-session read reports for this table
+            # generation, so a retry over an unchanged table matches the stamp
+            # (issue #508) whichever read path wrote it.
+            generation_fingerprint=canonical_fingerprint(
+                {"generation": point.generation, "request": payload},
+                domain="dbt-ml-warehouse-table-generation",
+                version=1,
+            ),
+            timings=read_timings,
+            progress=progress,
+            resume=resume,
+        )
+
     def _create_read_session(
-        self, table_path: str, *, selected_fields: list[str] | None = None
+        self,
+        table_path: str,
+        *,
+        selected_fields: list[str] | None = None,
+        snapshot_time: datetime | None = None,
+        row_restriction: str | None = None,
     ) -> Any:
         storage = _bigquery_storage()
         cfg = self._cfg
@@ -1445,7 +1793,19 @@ class BigQueryAdapter(WarehouseAdapter):
             storage,
             selected_fields=selected_fields,
             compression=cfg.storage_read_compression,
+            row_restriction=row_restriction,
         )
+        session_fields: dict[str, Any] = {
+            "table": table_path,
+            "data_format": storage.types.DataFormat.ARROW,
+            "read_options": read_options,
+        }
+        if snapshot_time is not None:
+            # Reads the table as it was at this instant, so a session opened
+            # hours later still sees the same rows as the first one did.
+            session_fields["table_modifiers"] = storage.types.ReadSession.TableModifiers(
+                snapshot_time=snapshot_time
+            )
         return self._ensure_bqstorage_client().create_read_session(
             # The session is billed to, and authorized against, the project
             # the query client itself runs in -- which is execution_project
@@ -1453,11 +1813,7 @@ class BigQueryAdapter(WarehouseAdapter):
             # project here would demand bigquery.readsessions on it, against
             # the split-project IAM the reference documents.
             parent=f"projects/{cfg.execution_project or cfg.project}",
-            read_session=storage.types.ReadSession(
-                table=table_path,
-                data_format=storage.types.DataFormat.ARROW,
-                read_options=read_options,
-            ),
+            read_session=storage.types.ReadSession(**session_fields),
             # One stream, matching the one-queued-page bound the snapshot
             # contract already promises: this payload is deliberately read
             # in bounded memory, not fanned out.
@@ -1929,6 +2285,21 @@ class BigQueryAdapter(WarehouseAdapter):
                 else ", ".join(self.quote_ident(column) for column in request.columns)
             )
             output_names = request.columns or available_names
+            # A keyed, unfiltered read is cut into resumable segments pinned to
+            # one instant (issue #614). It runs its own key-domain check as of
+            # that instant, so it returns before the live-table check below.
+            segmented_key = (
+                self._segmented_key(request, initial_table) if not where_sql else None
+            )
+            if segmented_key is not None:
+                key, key_type = segmented_key
+                point = self._plan_segments(
+                    request, table_id, key, key_type, initial_generation
+                )
+                if point is not None:
+                    return self._open_segmented_snapshot(
+                        request, table_id, point, key, output_names
+                    )
             if request.key_column is not None:
                 self._validate_read_key_domain(request, where_sql, params)
             sql = (
@@ -3949,7 +4320,13 @@ class BigQueryAdapter(WarehouseAdapter):
             if last_key is not None:
                 params.append(last_key)
             if relation_probe is not None:
-                params.append(snapshot_at)
+                # A pinned probe reads the relation as of the snapshot it is
+                # judged against, which can be hours older than this page.
+                params.append(
+                    relation_probe.as_of
+                    if relation_probe.as_of is not None
+                    else snapshot_at
+                )
             if scope_probe is not None:
                 params.extend(
                     [

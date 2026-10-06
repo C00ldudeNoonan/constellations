@@ -11,6 +11,7 @@ Vector stores such as LanceDB are a separate role and do not emulate this API.
 """
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -320,16 +321,24 @@ class StateAbsenceProbe:
 
     The probe relation lives in the same warehouse as the state table, so the
     adapter can evaluate absence without materializing either key domain.
+
+    `as_of` judges absence against the relation as it was at that instant,
+    rather than as it is at the page. A publish that read a pinned snapshot must
+    use the same instant, or it removes rows that snapshot contains and keeps
+    rows it does not (issue #614).
     """
 
     table: str
     key_column: str
+    as_of: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.table:
             raise AdapterError("State absence probe table must not be empty")
         if not self.key_column:
             raise AdapterError("State absence probe key_column must not be empty")
+        if self.as_of is not None and self.as_of.tzinfo is None:
+            raise AdapterError("State absence probe as_of must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -684,6 +693,79 @@ def _is_read_scalar(value: Any) -> bool:
 
 
 @dataclass(frozen=True)
+class SnapshotResumePoint:
+    """Where a segmented snapshot read stands, persisted so a later attempt can
+    continue it instead of re-reading from the start (issue #614).
+
+    Every segment reads as of `snapshot_time`, so the segments are one
+    relation however long the publish takes. `boundaries` are the ascending
+    lower bounds of segments 1..n, as text, and `completed` counts the leading
+    segments that were fully published. The adapter decides whether a stored
+    point is still usable; this type only records it.
+    """
+
+    snapshot_time: str
+    key_type: str
+    boundaries: tuple[str, ...]
+    completed: int
+    # Rows the completed segments yielded. A resumed read starts its own count
+    # here, so the row-count validation still sees the whole relation.
+    rows: int
+    # The table generation the snapshot was planned against, as the adapter
+    # reports it. A resumed read reports this one, not the current table's, since
+    # its rows are the content as of `snapshot_time`.
+    generation: str
+
+    def __post_init__(self) -> None:
+        if not self.snapshot_time:
+            raise AdapterError("Snapshot resume point needs a snapshot_time")
+        # One more segment than boundaries: segment 0 starts unbounded below.
+        if not 0 <= self.completed <= len(self.boundaries) + 1:
+            raise AdapterError("Snapshot resume point completed count is out of range")
+        if self.rows < 0:
+            raise AdapterError("Snapshot resume point row count is negative")
+        if not self.generation:
+            raise AdapterError("Snapshot resume point needs a generation")
+
+    def to_stamp(self) -> str:
+        return json.dumps(
+            {
+                "snapshot_time": self.snapshot_time,
+                "key_type": self.key_type,
+                "boundaries": list(self.boundaries),
+                "completed": self.completed,
+                "rows": self.rows,
+                "generation": self.generation,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_stamp(cls, text: str | None) -> SnapshotResumePoint | None:
+        """The stored point, or None when there is none or it is unreadable.
+
+        Unreadable means a fresh read, never a failed publish: the resume point
+        is an optimization over re-reading, and the row reconciliation is what
+        keeps the result correct either way.
+        """
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+            return cls(
+                snapshot_time=str(payload["snapshot_time"]),
+                key_type=str(payload["key_type"]),
+                boundaries=tuple(str(value) for value in payload["boundaries"]),
+                completed=int(payload["completed"]),
+                rows=int(payload["rows"]),
+                generation=str(payload["generation"]),
+            )
+        except (ValueError, KeyError, TypeError, AdapterError):
+            return None
+
+
+@dataclass(frozen=True)
 class TableReadRequest:
     table: str
     columns: tuple[str, ...] | None
@@ -755,10 +837,14 @@ class TableReadSnapshot:
         ordering: ReadOrdering = ReadOrdering.UNSPECIFIED,
         generation_fingerprint: str | None = None,
         timings: PhaseTimings | None = None,
+        progress: Callable[[], SnapshotResumePoint | None] | None = None,
+        resume: Callable[[SnapshotResumePoint], TableReadSnapshot | None] | None = None,
     ) -> None:
         _validate_read_fingerprint(fingerprint)
         if generation_fingerprint is not None:
             _validate_read_fingerprint(generation_fingerprint)
+        self._progress = progress
+        self._resume = resume
         self.schema = schema
         # Adapter-side attribution of the read, when the adapter can separate
         # its phases (issue #454). A caller timing `next(batches)` measures
@@ -781,6 +867,38 @@ class TableReadSnapshot:
     @property
     def exhausted(self) -> bool:
         return self._exhausted
+
+    @property
+    def resume_point(self) -> SnapshotResumePoint | None:
+        """Where this read stands, for a caller to persist; None when the
+        adapter cannot resume a read and so reports no progress.
+
+        Only segments whose rows have all been yielded count as complete, so a
+        point read here is safe to resume from: every row it covers has already
+        been handed to the caller.
+        """
+        return self._progress() if self._progress is not None else None
+
+    def resume_from(self, point: SnapshotResumePoint) -> bool:
+        """Re-plan this unread snapshot to continue from `point` (issue #614).
+
+        Possible only before the first batch is pulled: a read that has begun
+        cannot change which rows it covers. Returns False and leaves the
+        snapshot as it was when the adapter cannot resume or the point is not
+        usable; the caller then reads from the start, which is always correct.
+        """
+        if self._resume is None or self._started or self._closed:
+            return False
+        resumed = self._resume(point)
+        if resumed is None or not resumed.schema.equals(self.schema, check_metadata=False):
+            return False
+        self._batches = resumed._batches
+        self._progress = resumed._progress
+        self._validate_callback = resumed._validate_callback
+        self._close_callback = resumed._close_callback
+        self.fingerprint = resumed.fingerprint
+        self._generation_fingerprint = resumed._generation_fingerprint
+        return True
 
     @property
     def closed(self) -> bool:

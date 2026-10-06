@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from .adapters.base import (
     AdapterError,
@@ -151,12 +152,21 @@ class BoundedReconciler:
         )
 
     def iter_stale_pages(
-        self, *, upstream_table: str, key_column: str
+        self,
+        *,
+        upstream_table: str,
+        key_column: str,
+        as_of: datetime | None = None,
     ) -> Generator[tuple[StatePageRecord, ...], None, None]:
         """Stream state records whose keys are absent from the upstream
         relation, in deterministic ascending key order. Complete even when
-        the upstream relation is empty: every scoped state row is stale."""
-        probe = StateAbsenceProbe(table=upstream_table, key_column=key_column)
+        the upstream relation is empty: every scoped state row is stale.
+
+        `as_of` judges absence against the relation at that instant, which a
+        publish reading a pinned snapshot must do (issue #614)."""
+        probe = StateAbsenceProbe(
+            table=upstream_table, key_column=key_column, as_of=as_of
+        )
         with self._adapter.state_page_reader(
             self._scope, page_size=self._page_size, absent_from=probe
         ) as reader:

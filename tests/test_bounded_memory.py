@@ -24,6 +24,17 @@ scan underneath fails when a new one appears unclassified — the point being
 that a new whole-table read has to be an argued decision rather than the
 default that four incidents made it.
 
+A *schema* probe is no longer one of those call sites. Reading a relation's
+shape goes through `adapter.read_table_schema()`, which is zero-row by
+construction rather than by each caller remembering `limit=0` — #653 turned a
+probe served from BigQuery's query cache into a column dropped from every
+published row, so the probe became its own named operation. Five rows left the
+table below when those five probes converted, and one row replaced them: the
+base implementation, which is where `limit=0` now lives. Their residency
+coverage did not move — that implementation delegates to `read_table`, so
+`_measure_residency` still sees every probe, and `largest_frame_rows == 0` is
+what proves they stayed bounded.
+
 Not a substitute for measuring: `_read_table_sites` sees only what the source
 says. #418 was corpus-sized buffering inside BigQuery, from an unpartitioned
 `OVER()` attached to a read that was streamed on stel's side — the same
@@ -78,6 +89,16 @@ GAP = "gap"
 # (module, qualname, call_count, verdict, why)
 _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
     (
+        "adapters/base.py",
+        "WarehouseAdapter.read_table_schema",
+        1,
+        BOUNDED,
+        "the schema-probe primitive: `limit=0` is hardcoded here instead of "
+        "passed by each caller, so the contract probes in chunk, embed and llm "
+        "cannot forget it and a cache cannot answer it stale. This row is the "
+        "one place that bound can now be broken (issue #653)",
+    ),
+    (
         "cli.py",
         "show",
         1,
@@ -86,52 +107,12 @@ _READ_TABLE_SITES: tuple[tuple[str, str, int, str, str], ...] = (
         "operator's `--limit`, not by the relation",
     ),
     (
-        "execution/embed.py",
-        "_run_embed_model",
-        1,
-        BOUNDED,
-        "a zero-row probe for column names and dtypes; the rows stream in "
-        "batches to fill each flush window (issue #410)",
-    ),
-    (
-        "execution/embed.py",
-        "_EmbeddingReuseReader._load_keys",
-        1,
-        BOUNDED,
-        "a zero-row probe for the reuse-column contract; the id column streams "
-        "projected and reuse candidates are fetched a window at a time (#407)",
-    ),
-    (
         "retrieval_eval.py",
         "_run_one",
         1,
         BOUNDED,
         "a golden set is a hand-curated list of labeled queries, bounded by "
         "what a human wrote rather than by the corpus it evaluates",
-    ),
-    (
-        "execution/chunk.py",
-        "run_chunk_model",
-        1,
-        BOUNDED,
-        "a zero-row probe for the column contract; documents stream in batches "
-        "and chunks publish every `flush_every` documents (issue #423)",
-    ),
-    (
-        "execution/llm.py",
-        "run_llm_model",
-        1,
-        BOUNDED,
-        "a zero-row probe for the column contract; projected input rows stream "
-        "in fixed-size batches and only one flush window is retained (#424)",
-    ),
-    (
-        "execution/llm.py",
-        "_existing_llm_id_values",
-        1,
-        BOUNDED,
-        "a zero-row probe for the target id contract; the typed id column "
-        "streams projected without generated text columns (#424)",
     ),
     (
         "classic_ml/classifier.py",

@@ -78,7 +78,7 @@ def run_chunk_model(
     # to pull the whole upstream registry into one frame before splitting
     # anything — the #410 hole one stage earlier, and worse placed, since chunk
     # feeds embed and its input is the document registry.
-    schema_probe = adapter.read_table(upstream, limit=0)
+    schema_probe = adapter.read_table_schema(upstream)
     frame = schema_probe
     if chunk_config.text_field not in frame.columns:
         raise RunError(

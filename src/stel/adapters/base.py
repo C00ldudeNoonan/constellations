@@ -1641,6 +1641,23 @@ to see the plan first."""
         suffix = f" LIMIT {limit}" if limit is not None else ""
         return self.query_df(f"SELECT * FROM {self.table_ref(table)}{suffix}")
 
+    def read_table_schema(self, table: str) -> pl.DataFrame:
+        """A zero-row frame carrying `table`'s columns and dtypes *as they are*.
+
+        Named apart from `read_table(table, limit=0)` because the answer
+        decides a contract rather than speeding one up. Callers ask which
+        columns exist, and an embed model's entire output schema is this
+        frame's schema plus its generated fields -- so an answer describing
+        the table as it used to be is not a stale optimization, it is a wrong
+        decision taken silently. BigQuery served exactly that from its query
+        cache: an embed published without a column its upstream had gained,
+        reported success, and recorded itself caught up (issue #653).
+
+        SQL adapters inherit this. An adapter whose reads may be answered
+        from a cache of any kind must override it with one that cannot be.
+        """
+        return self.read_table(table, limit=0)
+
     def relation_ref(self, qualified: str) -> str:
         """Validated, quoted reference for a relation outside stel's schema.
 

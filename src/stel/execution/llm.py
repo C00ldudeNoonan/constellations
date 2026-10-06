@@ -185,7 +185,7 @@ def _existing_llm_id_values(
 ) -> dict[str, Any]:
     # Probe without opening an unconsumed DuckDB Arrow reader; rows then stream
     # as the one narrow column deletion reconciliation actually needs (#424).
-    if id_field not in adapter.read_table(table, limit=0).columns:
+    if id_field not in adapter.read_table_schema(table).columns:
         return {}
     mapping: dict[str, Any] = {}
     with adapter.table_snapshot(
@@ -356,7 +356,7 @@ def run_llm_model(
     # Contract-only probe. Both input passes below project the two columns they
     # need and consume bounded Arrow batches instead of materializing the
     # upstream relation (#424).
-    schema_probe = adapter.read_table(upstream, limit=0)
+    schema_probe = adapter.read_table_schema(upstream)
     missing = sorted(
         {config.id_field, config.input_field} - set(schema_probe.columns)
     )

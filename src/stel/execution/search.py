@@ -30,7 +30,7 @@ from ..adapters import (
     WarehouseAdapter,
     WarehouseCapability,
 )
-from ..adapters.base import SnapshotResumePoint
+from ..adapters.base import SnapshotResumePoint, TableReadSnapshot
 from ..config.model import ModelConfig, SearchConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -460,6 +460,11 @@ def _run_search_model(
                 ):
                     stored = SnapshotResumePoint.from_stamp(existing.source_progress)
                     if stored is not None and snapshot.resume_from(stored):
+                        # The completed segments are in the collection but this read
+                        # does not revisit them, so the count starts from them. The
+                        # validation after the publish compares against the whole
+                        # relation, not just the rows this run reads.
+                        rows_seen = stored.rows
                         log.info(
                             "%s: continuing the segmented read after %d of %d "
                             "segment(s) an earlier attempt published, from the "
@@ -833,6 +838,10 @@ def _run_search_model(
                     reconciler.iter_stale_pages(
                         upstream_table=upstream,
                         key_column=search.id_field,
+                        # A segmented read is judged against the instant it pinned,
+                        # so a row the snapshot holds is never called stale because
+                        # the live table has since dropped it (issue #614).
+                        as_of=_pinned_instant(snapshot),
                     )
                     if (not rebuild or seed_from is not None or resumed)
                     and not subset_run
@@ -1219,6 +1228,13 @@ def _state_batches(reader: Any) -> Iterator[Sequence[StateRecord]]:
         if page.next_cursor is None:
             return
         cursor = page.next_cursor
+
+
+def _pinned_instant(snapshot: TableReadSnapshot) -> datetime | None:
+    """The instant a segmented read pinned, or None for a read that is not
+    pinned (issue #614)."""
+    point = snapshot.resume_point
+    return None if point is None else datetime.fromisoformat(point.snapshot_time)
 
 
 def _rebuild_requested(model: ModelConfig, *, full_refresh: bool) -> bool:

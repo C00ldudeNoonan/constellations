@@ -119,6 +119,9 @@ class _Client:
     def __init__(self, keys: list[str]) -> None:
         self.keys = sorted(keys)
         self.clock = _CLOCK
+        # The table's etag. It changes only when the table does, so it is the
+        # generation identity a retry compares against (issue #508).
+        self.etag = 'etag-1'
         self.statements: list[str] = []
 
     def get_table(self, _table_id: str) -> Any:
@@ -127,7 +130,7 @@ class _Client:
                 SimpleNamespace(name="chunk_id", field_type="STRING"),
                 SimpleNamespace(name="value", field_type="INTEGER"),
             ],
-            etag="etag-1",
+            etag=self.etag,
             modified=None,
             num_rows=len(self.keys),
         )
@@ -235,12 +238,58 @@ def test_a_read_continues_from_a_recorded_point_without_rereading_its_segments(
 
     assert keys == ["c", "d", "e"]
     assert final_progress is not None and final_progress.completed == 3
+    # The recorded point counted the two rows it published; the resumed read
+    # carries that count forward, so the total is the whole relation.
+    assert recorded.rows == 2
+    assert final_progress.rows == len(_KEYS)
     pinned_restrictions = [
         session.restriction
         for session in later_storage.sessions
         if session.as_of == pinned
     ]
     assert pinned_restrictions == ["chunk_id >= 'c' AND chunk_id < 'e'", "chunk_id >= 'e'"]
+
+
+def test_the_generation_is_the_table_version_so_a_retry_over_an_unchanged_table_matches(
+    segments: None,
+) -> None:
+    # The generation identity must not move with the read instant: a retry over an
+    # unchanged table has to match the stamp a finished publish wrote (issue #508).
+    first_adapter, _ = _adapter(_Client(_KEYS))
+    later_client = _Client(_KEYS)
+    later_client.clock = _CLOCK + timedelta(hours=1)
+    later_adapter, _ = _adapter(later_client)
+    with first_adapter.table_snapshot("chunks", key_column="chunk_id") as first:
+        first_generation = first.generation_fingerprint
+    with later_adapter.table_snapshot("chunks", key_column="chunk_id") as later:
+        assert later.generation_fingerprint == first_generation
+
+
+def test_a_resumed_read_keeps_the_generation_it_was_planned_against(
+    segments: None,
+) -> None:
+    # Its rows are the table as of the recorded instant, so it must not claim
+    # the table's current version. A retry would otherwise skip a read it needs.
+    planned_client = _Client(_KEYS)
+    planned_adapter, _ = _adapter(planned_client)
+    with planned_adapter.table_snapshot(
+        "chunks", key_column="chunk_id", batch_size=100
+    ) as planned:
+        batches = iter(planned)
+        next(batches)
+        next(batches)
+        recorded = planned.resume_point
+        planned_generation = planned.generation_fingerprint
+    assert recorded is not None
+
+    moved_client = _Client(_KEYS)
+    moved_client.etag = "etag-2"
+    moved_adapter, _ = _adapter(moved_client)
+    with moved_adapter.table_snapshot(
+        "chunks", key_column="chunk_id", batch_size=100
+    ) as moved:
+        assert moved.resume_from(recorded)
+        assert moved.generation_fingerprint == planned_generation
 
 
 def test_a_point_too_old_to_time_travel_to_is_not_resumed(segments: None) -> None:
@@ -250,6 +299,8 @@ def test_a_point_too_old_to_time_travel_to_is_not_resumed(segments: None) -> Non
         key_type="STRING",
         boundaries=("c", "e"),
         completed=1,
+        rows=250_000,
+        generation="generation-a",
     )
 
     with adapter.table_snapshot("chunks", key_column="chunk_id", batch_size=100) as snapshot:
@@ -270,6 +321,8 @@ def test_a_read_already_under_way_is_not_re_planned(segments: None) -> None:
             key_type="STRING",
             boundaries=("c", "e"),
             completed=2,
+            rows=500_000,
+            generation="generation-a",
         )
         assert not snapshot.resume_from(point)
 
@@ -280,6 +333,8 @@ def test_a_resume_point_survives_its_stamp_and_an_unreadable_one_reads_fresh() -
         key_type="INT64",
         boundaries=("10", "20"),
         completed=2,
+        rows=500_000,
+        generation="generation-a",
     )
 
     assert SnapshotResumePoint.from_stamp(point.to_stamp()) == point

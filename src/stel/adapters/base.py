@@ -321,16 +321,24 @@ class StateAbsenceProbe:
 
     The probe relation lives in the same warehouse as the state table, so the
     adapter can evaluate absence without materializing either key domain.
+
+    `as_of` judges absence against the relation as it was at that instant,
+    rather than as it is at the page. A publish that read a pinned snapshot must
+    use the same instant, or it removes rows that snapshot contains and keeps
+    rows it does not (issue #614).
     """
 
     table: str
     key_column: str
+    as_of: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.table:
             raise AdapterError("State absence probe table must not be empty")
         if not self.key_column:
             raise AdapterError("State absence probe key_column must not be empty")
+        if self.as_of is not None and self.as_of.tzinfo is None:
+            raise AdapterError("State absence probe as_of must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -700,6 +708,13 @@ class SnapshotResumePoint:
     key_type: str
     boundaries: tuple[str, ...]
     completed: int
+    # Rows the completed segments yielded. A resumed read starts its own count
+    # here, so the row-count validation still sees the whole relation.
+    rows: int
+    # The table generation the snapshot was planned against, as the adapter
+    # reports it. A resumed read reports this one, not the current table's, since
+    # its rows are the content as of `snapshot_time`.
+    generation: str
 
     def __post_init__(self) -> None:
         if not self.snapshot_time:
@@ -707,6 +722,10 @@ class SnapshotResumePoint:
         # One more segment than boundaries: segment 0 starts unbounded below.
         if not 0 <= self.completed <= len(self.boundaries) + 1:
             raise AdapterError("Snapshot resume point completed count is out of range")
+        if self.rows < 0:
+            raise AdapterError("Snapshot resume point row count is negative")
+        if not self.generation:
+            raise AdapterError("Snapshot resume point needs a generation")
 
     def to_stamp(self) -> str:
         return json.dumps(
@@ -715,6 +734,8 @@ class SnapshotResumePoint:
                 "key_type": self.key_type,
                 "boundaries": list(self.boundaries),
                 "completed": self.completed,
+                "rows": self.rows,
+                "generation": self.generation,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -737,6 +758,8 @@ class SnapshotResumePoint:
                 key_type=str(payload["key_type"]),
                 boundaries=tuple(str(value) for value in payload["boundaries"]),
                 completed=int(payload["completed"]),
+                rows=int(payload["rows"]),
+                generation=str(payload["generation"]),
             )
         except (ValueError, KeyError, TypeError, AdapterError):
             return None

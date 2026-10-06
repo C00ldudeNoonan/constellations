@@ -9,7 +9,7 @@ import logging
 import os
 import pickle
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3323,6 +3323,27 @@ def test_state_page_reader_absence_probe_time_travels_both_relations() -> None:
     # column need not be, and BigQuery refuses STRING = INT64 rather than
     # coercing -- so a numeric id would fail removal detection (issue #428).
     assert "CAST(probe.`chunk_id` AS STRING) = state.record_key" in sql
+
+
+def test_a_pinned_absence_probe_judges_the_relation_at_its_own_instant() -> None:
+    # A publish reading a pinned snapshot judges absence as of that snapshot, not
+    # as of the page, so rows it holds are not called stale (issue #614).
+    page_instant = datetime.now(UTC)
+    pinned = page_instant - timedelta(hours=7)
+    client = _FakeClient()
+    client.tables["proj.ds.chunks"] = ["chunk_id"]
+    client.query_results = [_FakeJob(rows=[(page_instant,)]), _FakeJob(rows=[])]
+    adapter = _adapter(client)
+    probe = StateAbsenceProbe(table="chunks", key_column="chunk_id", as_of=pinned)
+    with adapter.state_page_reader(
+        StateScope("m"), page_size=5, absent_from=probe
+    ) as reader:
+        reader.fetch_page(None)
+    _sql, job_config = client.queries[1]
+    values = [parameter.value for parameter in job_config.query_parameters]
+    assert pinned in values
+    # The page's own state read is still judged at the page instant, once.
+    assert values.count(page_instant) == 1
 
 
 def test_state_page_reader_missing_probe_relation_fails() -> None:

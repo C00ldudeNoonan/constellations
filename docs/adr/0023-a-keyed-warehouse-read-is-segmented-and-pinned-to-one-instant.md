@@ -33,6 +33,15 @@ The completed count advances only once every row of a segment has been
 yielded, and the caller has written each page before asking for the next one.
 So a recorded position always describes rows that are already published.
 
+The pinned instant governs everything the publish judges against the upstream,
+not only the reads. Stale-key discovery probes the upstream `AS OF` the same
+instant, so a row the snapshot holds is never removed because the live table
+has since dropped it. A resumed read carries the row count of the segments it
+skips, so the post-publish row-count check compares against the whole relation.
+The generation identity stays the table's version, as the single-session read
+reports it, so a retry over an unchanged table still matches the stamp; a
+resumed read reports the version it was planned against, not the current one.
+
 ## Alternatives considered
 
 ### Reopen one session per N pages, reading from the start each time

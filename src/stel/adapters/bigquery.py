@@ -1550,7 +1550,12 @@ class BigQueryAdapter(WarehouseAdapter):
         return None
 
     def _plan_segments(
-        self, request: TableReadRequest, table_id: str, key: str, key_type: str
+        self,
+        request: TableReadRequest,
+        table_id: str,
+        key: str,
+        key_type: str,
+        generation: str,
     ) -> SnapshotResumePoint | None:
         """The segments for a fresh read.
 
@@ -1571,6 +1576,8 @@ class BigQueryAdapter(WarehouseAdapter):
             key_type=key_type,
             boundaries=tuple(boundaries),
             completed=0,
+            rows=0,
+            generation=generation,
         )
 
     def _snapshot_clock(self) -> datetime:
@@ -1665,25 +1672,31 @@ class BigQueryAdapter(WarehouseAdapter):
         output_schema = _projected_schema(opened[schema_index], output_names)
 
         completed = point.completed
+        # Rows the completed segments hold, carried in from the point so a resumed
+        # read reports the whole relation, not just the segments it reads.
+        completed_rows = point.rows
         read_timings = PhaseTimings()
         read_client = self._ensure_bqstorage_client()
         timeout = self._cfg.job_execution_timeout_seconds
 
         def batches() -> Iterator[pa.RecordBatch]:
-            nonlocal completed
+            nonlocal completed, completed_rows
             for index in range(point.completed, segment_count):
                 session = opened.pop(index) if index in opened else open_segment(index)
                 arrow_batches = _storage_read_batches(
                     read_client, session, timeout=timeout, timings=read_timings
                 )
+                segment_rows = 0
                 try:
                     output_indices = _projected_indices(session, output_names)
-                    yield from _coalesced_batches(
+                    for projected in _coalesced_batches(
                         arrow_batches,
                         output_indices,
                         request.batch_size,
                         read_timings,
-                    )
+                    ):
+                        segment_rows += projected.num_rows
+                        yield projected
                 except AdapterError:
                     raise
                 except Exception as error:
@@ -1704,6 +1717,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 # complete. The caller has written each of them before pulling
                 # the next one, which is what makes the point safe to persist.
                 completed = index + 1
+                completed_rows += segment_rows
 
         def resume(candidate: SnapshotResumePoint) -> TableReadSnapshot | None:
             # Only a point for this same key type, taken recently enough that time
@@ -1722,6 +1736,8 @@ class BigQueryAdapter(WarehouseAdapter):
                 key_type=point.key_type,
                 boundaries=point.boundaries,
                 completed=completed,
+                rows=completed_rows,
+                generation=point.generation,
             )
 
         def validate_unchanged() -> None:
@@ -1750,9 +1766,12 @@ class BigQueryAdapter(WarehouseAdapter):
             batches=batches(),
             validate_unchanged=validate_unchanged,
             close=close,
+            # The same identity the single-session read reports for this table
+            # generation, so a retry over an unchanged table matches the stamp
+            # (issue #508) whichever read path wrote it.
             generation_fingerprint=canonical_fingerprint(
-                {"snapshot_time": point.snapshot_time, "request": payload},
-                domain="dbt-ml-warehouse-table-point-in-time",
+                {"generation": point.generation, "request": payload},
+                domain="dbt-ml-warehouse-table-generation",
                 version=1,
             ),
             timings=read_timings,
@@ -2274,7 +2293,9 @@ class BigQueryAdapter(WarehouseAdapter):
             )
             if segmented_key is not None:
                 key, key_type = segmented_key
-                point = self._plan_segments(request, table_id, key, key_type)
+                point = self._plan_segments(
+                    request, table_id, key, key_type, initial_generation
+                )
                 if point is not None:
                     return self._open_segmented_snapshot(
                         request, table_id, point, key, output_names
@@ -4299,7 +4320,13 @@ class BigQueryAdapter(WarehouseAdapter):
             if last_key is not None:
                 params.append(last_key)
             if relation_probe is not None:
-                params.append(snapshot_at)
+                # A pinned probe reads the relation as of the snapshot it is
+                # judged against, which can be hours older than this page.
+                params.append(
+                    relation_probe.as_of
+                    if relation_probe.as_of is not None
+                    else snapshot_at
+                )
             if scope_probe is not None:
                 params.extend(
                     [

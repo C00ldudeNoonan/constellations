@@ -19,6 +19,16 @@
   interrupted run leaves the baseline for the next ordinary one. No watermark
   is cleared or forged either -- the unchanged-parent skip simply declines
   itself under the flag.
+- **It clears the publish-side filter too, not just the record-side skip.**
+  `update_when_changed` normally spares a matched row from being rewritten
+  when none of its listed columns moved. A column corrupted by a bad publish
+  is outside that fingerprint by construction, so under a forced reprocess the
+  filter would discard exactly the row being repaired, and the corruption
+  would outlive a run reporting it processed.
+- **A `search:` model is unaffected, and `stel plan` says so.** Its publish
+  chooses between rebuilding an index and extending it rather than skipping
+  per record, so there is nothing for the flag to decline; `--full-refresh`
+  remains how an index is rebuilt.
 - **The reprocess guard releases an embed model and still refuses an llm
   one.** Reusing a vector costs nothing, so there is nothing left for the
   guard to protect; llm output has no warehouse-side reuse at all, so

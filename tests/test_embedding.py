@@ -328,6 +328,50 @@ def test_reprocess_all_still_reconciles_a_removal(tmp_path: Path) -> None:
     ]
 
 
+def test_reprocess_all_overrides_an_update_when_changed_filter(
+    tmp_path: Path,
+) -> None:
+    """A forced reprocess has to turn off the publish-side filter too, not
+    just the record-side skip (found by Codex reviewing PR #660).
+
+    `update_when_changed` rewrites a matched row only when one of the listed
+    columns differs. A column corrupted by a bad publish lies *outside* that
+    fingerprint by construction -- a fingerprint names the columns that decide
+    identity, and the corruption is in a payload column -- so every listed
+    column matches, the MERGE discards the row, and the corruption outlives a
+    run that reports each row processed and reused. Which is the exact
+    recovery this flag is advertised for.
+    """
+    project = _embedding_project(tmp_path)
+    models = project / "models" / "documents.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "      dimensions: 4\n      batch_size: 1\n"
+            "    materialization: incremental\n",
+            "      dimensions: 4\n      batch_size: 1\n"
+            "    materialization: incremental\n"
+            "    update_when_changed: [embedding_input_hash]\n",
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    # A bad publish, after the fact: the vector and its input hash are intact,
+    # so every column the fingerprint names still matches.
+    _query(
+        project,
+        'UPDATE "db".docs.document_embeddings SET title = ? WHERE title = ?',
+        ["corrupted", "Release A"],
+    )
+
+    [result] = run_project(project, select="document_embeddings", reprocess_all=True)
+
+    assert result.documents_processed == 2
+    assert result.metrics["provider_calls"] == 0
+    assert sorted(
+        _query(project, 'SELECT title FROM "db".docs.document_embeddings')
+    ) == [("Release A",), ("Release B",)]
+
+
 def test_reprocess_all_is_refused_with_full_refresh(tmp_path: Path) -> None:
     """The one combination that would cost money to accept (issue #655).
 

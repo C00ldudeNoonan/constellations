@@ -296,7 +296,14 @@ def _classify(
         status = "new"
         rows, upper_bound = 0, False
         reason = "no published state: the first run processes every input"
-    elif reprocess_all:
+    elif reprocess_all and model.search is None:
+        # A `search:` model is excluded, as it is from the unchanged-parent
+        # skip: the runner does not pass the flag to `run_search_model`,
+        # whose own choice is rebuild-vs-extend rather than a per-record
+        # skip, and `--full-refresh` is the documented way to rebuild an
+        # index. Classifying its rows as reprocessing here would promise a
+        # run that cannot happen (PR #660 review).
+        #
         # Not an upper bound: every published row reprocesses, which is the
         # whole request (issue #655). Reported as `changed` so the reprocess
         # guard -- reading these same plans -- sees the real number for a

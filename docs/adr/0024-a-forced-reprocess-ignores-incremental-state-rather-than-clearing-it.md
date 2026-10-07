@@ -79,6 +79,24 @@ The same reasoning rules out the smaller variant — a `stel state clear`
 command that leaves the next ordinary run to do the work. Non-destructive
 behaviour is only reachable from inside the run.
 
+### Turn off only the record-side skip
+
+What the first cut did, and Codex reviewing #660 found the hole. There are
+*two* optimizations keyed off two different things: per-record state decides
+whether a row is recomputed, and `update_when_changed` (issue #281) decides
+whether a recomputed row is written — a matched row is rewritten only when one
+of its listed fingerprint columns differs.
+
+A column corrupted by a bad publish is outside that fingerprint by
+construction, because a fingerprint names the columns that decide identity and
+the damage is in a payload column. So with only the record-side skip turned
+off, the row is recomputed, every listed column matches, the MERGE discards
+it, and the corruption outlives a run reporting every row processed and
+reused. `update_filter_for_publish` empties the fingerprint under the flag for
+the three stages that pass one (extraction, embed, llm). `eval:` passes one too
+and is left alone — the flag does not reach it, as it does not reach the
+unchanged-parent skip either.
+
 ### A flag that only affects embed models
 
 The spend is all in embed, so scoping it there is tempting. But a flag whose
@@ -110,6 +128,21 @@ target and replaces it (`use_full`), which is incompatible with reusing what
 the target holds. The modifier would have to switch off most of what the flag
 means.
 
+### Force a search model's rows through as well
+
+A `search:` model has published state, so `plan --reprocess-all` was happy to
+classify its rows as reprocessing — while the runner never passed the flag to
+`run_search_model`, which would then write nothing. Plan and run disagreeing
+is worse than either answer, and the reviewer offered both ways out.
+
+Excluded rather than forced, for the same reason `_can_skip_unchanged_scan`
+already excludes the kind: a search publish's own decision is rebuild versus
+extend, not a per-record skip, so there is nothing for the flag to decline.
+Forcing every row through would mean an index rebuild — which `--full-refresh`
+already does, and which #619 and #651 spent effort making avoidable. The plan
+now excludes search models from the flag's branch, so it no longer promises a
+run that cannot happen.
+
 ## Consequences
 
 - One documented way to reprocess an embed model's whole corpus at no provider
@@ -125,6 +158,11 @@ means.
 - The flag does nothing for a SQL transform, and that is documented rather
   than warned about. If this bites, a preflight warning for a selection the
   flag cannot affect is the next step, not a change in meaning.
+- **Two optimizations, not one.** `state_for_skipping` and
+  `update_filter_for_publish` are both required for the flag to mean what it
+  says. A third skip added later — anything that decides whether a row is
+  recomputed or written — has to join them, and the pairing in
+  `execution/contracts.py` is where to look.
 - **This does not make a poisoned state detectable**, only cheap to leave.
   Finding out that a column is missing is still the operator's job, and
   ADR-0022's refusal is what keeps a *new* one from happening.
@@ -151,6 +189,12 @@ means.
   runs under the flag alone, `chunk_facts` still refuses and names
   `--accept-reprocess`. Both are on the default `on_code_change: fail` with
   `reprocess_limit: 0`.
+- **The review's P1 was a real defect, and its test fails against the code as
+  first written**: an embed model with `update_when_changed:
+  [embedding_input_hash]` and a corrupted `title` keeps the corruption through
+  a `--reprocess-all` run that reports 2 rows processed and 0 provider calls
+  (`test_reprocess_all_overrides_an_update_when_changed_filter`). Both review
+  fixes are mutation-checked, 2 for 2.
 - 7 of 8 mutations caught on the first pass. The miss was the mutation itself
   being unreachable: it swapped the mapping passed to the removal path, which
   the warehouse anti-join never reads. Re-run against the real counterfactual

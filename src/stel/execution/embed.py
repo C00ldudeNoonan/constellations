@@ -46,7 +46,12 @@ from ..state_reconciliation import iter_validated_state_pages
 from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
-from .contracts import ModelRunResult, RunError, state_for_skipping
+from .contracts import (
+    ModelRunResult,
+    RunError,
+    state_for_skipping,
+    update_filter_for_publish,
+)
 from .errors import artifact_error_text
 from .usage import add_provider_usage
 from .values import scalarize, warehouse_key_cast_matches_python
@@ -485,7 +490,9 @@ def _run_embed_model(
                         else "append_new_columns"
                     ),
                     options=warehouse_opts,
-                    update_when_changed=model.update_when_changed,
+                    update_when_changed=update_filter_for_publish(
+                        model.update_when_changed, reprocess_all=reprocess_all
+                    ),
                 ),
                 state_records=[
                     StateRecord(item.record_id, item.input_fingerprint, code_version)

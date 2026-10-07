@@ -170,7 +170,7 @@ def run_transform_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool = False,
-    reprocess_all: bool = False,
+    reprocess_all: bool,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),

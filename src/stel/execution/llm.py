@@ -42,7 +42,12 @@ from ..progress import get_reporter
 from ..providers import get_inference_provider
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
-from .contracts import ModelRunResult, RunError, state_for_skipping
+from .contracts import (
+    ModelRunResult,
+    RunError,
+    state_for_skipping,
+    update_filter_for_publish,
+)
 from .cost import budget_cost_estimator
 from .errors import artifact_error_text
 from .extraction import EXTRACTION_FIELD_DTYPES  # shared declared-data_type contract
@@ -535,7 +540,9 @@ def run_llm_model(
                         else "append_new_columns"
                     ),
                     options=warehouse_opts,
-                    update_when_changed=model.update_when_changed,
+                    update_when_changed=update_filter_for_publish(
+                        model.update_when_changed, reprocess_all=reprocess_all
+                    ),
                 )
                 if window_rows
                 else 0

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -114,3 +114,26 @@ def state_for_skipping(
     the first.
     """
     return {} if reprocess_all else state
+
+
+def update_filter_for_publish(
+    columns: Sequence[str], *, reprocess_all: bool
+) -> Sequence[str]:
+    """The `update_when_changed` fingerprint a publish may filter on -- which
+    `--reprocess-all` empties.
+
+    `update_when_changed` (issue #281) is a *publication* optimization: a
+    matched row is rewritten only when one of the listed columns differs, so
+    re-publishing an unchanged row does not rewrite its large payload
+    columns. Under a forced reprocess that is precisely backwards. A column
+    corrupted by a bad publish -- the case the flag exists for -- sits
+    *outside* the declared fingerprint by construction, since a fingerprint
+    names the columns that decide identity: every listed column matches, the
+    MERGE filters the row out, and the corruption survives while the run
+    reports every row processed and reused (PR #660 review).
+
+    Skipping a *record* and skipping its *write* are two different
+    optimizations keyed off two different things, and a forced reprocess has
+    to turn off both. `state_for_skipping` is the other one.
+    """
+    return () if reprocess_all else columns

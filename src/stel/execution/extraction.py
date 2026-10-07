@@ -53,7 +53,12 @@ from ..progress import get_reporter
 from ..providers import InferenceProvider, get_inference_provider
 from ..sources import DocumentRef, DocumentSource
 from ..versioning import compute_model_code_version
-from .contracts import ModelRunResult, RunError, state_for_skipping
+from .contracts import (
+    ModelRunResult,
+    RunError,
+    state_for_skipping,
+    update_filter_for_publish,
+)
 from .cost import budget_cost_estimator, estimate_cost
 from .errors import artifact_error_text
 from .values import scalarize
@@ -702,7 +707,10 @@ def run_extraction_model(
                                 else "append_new_columns"
                             ),
                             options=warehouse_opts,
-                            update_when_changed=model.update_when_changed,
+                            update_when_changed=update_filter_for_publish(
+                                model.update_when_changed,
+                                reprocess_all=reprocess_all,
+                            ),
                         )
                     except AdapterError as e:
                         # RunError so `build` fails this model and blocks

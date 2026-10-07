@@ -127,6 +127,25 @@ def test_reprocess_all_plans_every_published_row(invoice_project: Path) -> None:
     assert "--reprocess-all" in raw.reason
 
 
+def test_reprocess_all_does_not_promise_a_search_model_a_reprocess(
+    rag_project: Path,
+) -> None:
+    """Plan and run have to agree about `search:` (found by Codex on PR #660).
+
+    The runner does not hand the flag to `run_search_model` -- whose own
+    decision is rebuild-vs-extend, not a per-record skip, and whose rebuild is
+    what `--full-refresh` is for. Classifying its published rows as
+    reprocessing would promise a run that never happens. The same exclusion
+    `_can_skip_unchanged_scan` already makes for this kind.
+    """
+    run_project(rag_project)
+
+    plans = _by_name(rag_project, reprocess_all=True)
+
+    assert "--reprocess-all" in plans["chunk_embeddings"].reason
+    assert "--reprocess-all" not in plans["chunk_search"].reason
+
+
 def test_config_change_counts_stale_rows_and_reaches_downstream(
     invoice_project: Path,
 ) -> None:

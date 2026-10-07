@@ -744,6 +744,14 @@ What it does, and does not do:
 - **Both skip tiers are declined**: per-record state, and the unchanged-parent
   skip that would otherwise not enter the stage at all. No watermark is
   touched.
+- **`update_when_changed` is ignored too.** That fingerprint normally spares a
+  matched row from being rewritten when none of its listed columns moved, so
+  re-publishing does not rewrite large payloads. Under a forced reprocess it
+  would do the opposite of what you asked: a column corrupted by a bad publish
+  is outside the fingerprint by construction, so every listed column matches,
+  the row is filtered out of the write, and the corruption survives a run that
+  reports it processed. Skipping a record and skipping its write are two
+  optimizations, and this turns off both.
 - **An embed model pays nothing** while its inputs are unchanged — vectors
   come back out of its own target by `embedding_input_hash`, reported as
   `cache_hits` with `provider_calls: 0`.
@@ -754,6 +762,11 @@ What it does, and does not do:
 - **A SQL transform is unaffected.** It keeps no per-record state — its skip
   is the `is_incremental()` branch in its own SQL, and turning that off is
   `--full-refresh`.
+- **A `search:` model is unaffected**, and `stel plan --reprocess-all` says so
+  rather than claiming otherwise. A search publish chooses between rebuilding
+  an index and extending it; it has no per-record skip for this flag to
+  decline, and `--full-refresh` is how you force the rebuild
+  (`stel run --select chunk_search --full-refresh`).
 - **Refused with `--full-refresh`**, which does not fetch state and drops the
   target, so there would be nothing to reuse and the flag would silently cost
   a full corpus. Refused with `--watch`, which would reprocess everything on

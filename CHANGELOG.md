@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### A context model's entity types come from the declaration (issue #628)
+
+- **`entity_types` was discovered by scanning, and could fail outright.** The
+  governed MCP server read every entity-link row for a model, then every chunk
+  those rows named, filtered by what the caller could read -- and refused past
+  `max_scan_rows`, so on a large corpus `list_context_models` failed instead of
+  answering. A project that declares `vocabularies:` now gets the declared
+  labels in constant time, with no scan; one that declares none keeps the
+  scanned behaviour unchanged.
+- **The field changes meaning where a declaration exists**, deliberately: it
+  becomes what the project declares it is about (operator-authored schema, like
+  `schema_fields`) rather than what is in the rows a given caller may read. An
+  agent can no longer probe corpus contents through it, and a caller
+  authorized for nothing still sees the vocabulary.
+- **No manifest or contract change.** `ArtifactCatalog.load` already read the
+  project to find `target_path` and discarded the rest; it now keeps the
+  declaration. `context_entity_links` is untouched, so `agent_context/v1`
+  does not move.
+- **A declared hierarchy can now be walked.** `broader` was authored and
+  validated (cycles rejected) but nothing could read it. `broader_chain()`
+  walks up, `narrower_labels()` inverts it transitively, and
+  `labels_in_class()` lists a class's terms -- the groundwork for class
+  filtering and hierarchy expansion in `search_context`, which #628 tracks
+  separately.
+- One rule for reading a link row's declaration, shared by the concept cloud
+  and the MCP server (`declared_terms()`), rather than a second copy that
+  could drift from the first (issue #661).
+
 ### The star map can focus on one concept's constellation (issue #555)
 
 - **"Focus on its constellation"** on a selected concept's card hides every
@@ -125,7 +153,6 @@ serves reads from it; a run that dies in that window leaves an unindexed
 generation that the next resume adopts, drops as a no-op, and rebuilds.
 Publication state advances per page and is unaffected.
 
-
 ### Declared domain vocabularies, relation checks and alias tables (issues #625, #626, #627)
 
 - **A label set is declared once.** A `vocabularies:` block names a closed,
@@ -161,7 +188,6 @@ Publication state advances per page and is unaffected.
 - The CLI keeps its generic message for a failed table-snapshot read. The
   native cause now goes to `--diagnostics-file`, so an operator can see what
   failed without the raw warehouse text reaching run results.
-
 
 ### A schema probe is never answered from a cache (issue #653)
 
@@ -2234,7 +2260,6 @@ from an attack.
 - A per-principal cap set above the global one now reports as the usual exit-2
   configuration error, rather than a bare traceback (Codex review).
 
-
 ### `search: exact` no longer publishes an index nothing can query (issue #461)
 
 `search: exact` builds no vector index, so every query reads the whole vector
@@ -2282,7 +2307,6 @@ arrive after every row had been republished and the serving pointer cleared.
 
 The reasoning, and the two alternatives that lost, are in
 [ADR-0002](docs/adr/0002-vector-search-mode-is-an-index-build.md).
-
 
 ### Runs report where their wall clock went (issue #432)
 
@@ -2980,7 +3004,6 @@ publish.
 - DuckDB table snapshots close their Arrow reader on close, so an
   unexhausted snapshot no longer pins the database file (#408).
 
-
 ## v0.12.0 - 2026-08-26
 
 ### Upgrading: one reprocess, paid once (issues #363, #385)
@@ -3513,7 +3536,6 @@ indices rather than by materializing every partition up front.
   caching would hold a resolved credential in a long-lived object), and vLLM
   issues stateless `urllib` requests with nothing to cache.
 
-
 ### Fixed: date and timestamp search filters (issue #337)
 
 - **A `data_type: date` or `timestamp` search attribute accepted filters that
@@ -3530,7 +3552,6 @@ indices rather than by materializing every partition up front.
   `data_type` against a real LanceDB store, plus a compiler-level test that
   executes temporal predicates against real `date32`/timestamp columns —
   asserting on the generated SQL text alone would not have caught this.
-
 
 ### Versioned prompts (issue #303)
 
@@ -3575,7 +3596,6 @@ indices rather than by materializing every partition up front.
   an edit. A lock whose format version is unrecognized fails closed rather than
   reporting success on a schema it does not understand.
 
-
 ### Append-only logs: run history and MCP query history (issues #306, #329)
 
 - **`run_log:`** on a profile target records one row per model per invocation —
@@ -3603,7 +3623,6 @@ indices rather than by materializing every partition up front.
   inferred from the first batch, so a first run with nulls in optional columns
   cannot fix them as the wrong type and strand every later append.
 
-
 ### Warehouse-table sources: start a pipeline from a table (issue #322)
 
 - **`path: warehouse://<relation>`** on a source treats each row of a
@@ -3628,7 +3647,6 @@ indices rather than by materializing every partition up front.
 - Adapters grew `relation_ref`/`read_relation`/`relation_row_count` for
   validated, quoted cross-schema reads; relation names from project YAML are
   validated per part at config load and again at the adapter.
-
 
 ### Classification eval models (issue #309)
 
@@ -3664,7 +3682,6 @@ indices rather than by materializing every partition up front.
   current version stopped reporting. An incremental re-run of the same
   predictions version fully replaces that version's metric set — a removed
   label's rows are deleted, not left behind with an old `code_version`.
-
 
 ### Enum fields: declare the label set once (issue #304)
 
@@ -3951,7 +3968,6 @@ indices rather than by materializing every partition up front.
 - To upgrade an existing target: run `stel migrate` once. If your profile never
   named a schema, add `schema: dbt_ml` first (or move the objects yourself and
   keep the new default).
-
 
 ## v0.8.0 - 2026-08-11
 

@@ -1528,6 +1528,48 @@ class ContextService:
             for context_id, entities in grouped.items()
         }
 
+    def _declared_entity_types(self) -> tuple[str, ...] | None:
+        """The labels a project's declaration offers, or None when it declares
+        no vocabulary (issue #628).
+
+        Two things change when a project has one, and both are the point:
+
+        - **No scan.** The scanned answer below reads every entity-link row and
+          then every chunk those rows name, and raises
+          `ContextRepositoryLimitError` past `max_scan_rows` -- so on a large
+          corpus a descriptor call fails outright. A declaration answers in
+          constant time.
+        - **Schema, not corpus.** The scanned answer is the entity names
+          present in chunks *this caller* may read, which makes the descriptor
+          a channel for learning what is in the corpus. The declared answer is
+          what the operator wrote in `stel_project.yml`: the same kind of
+          operator-authored schema as `schema_fields`, which this descriptor
+          already publishes to every caller, and it says nothing about which
+          documents exist. A caller can no longer use `entity_types` to find
+          out what the corpus actually contains, which is a capability removed
+          deliberately.
+
+        Project-wide rather than per-model: `entity_namespace` is set by the
+        `link_entities` transform's options per row, not declared per model, so
+        there is nothing in the manifest that says which vocabulary a given
+        context model links against. Narrowing it would mean reinstating the
+        scan this exists to remove, for precision no reader has asked for -- a
+        declaration describes the domain, and every context model in a project
+        shares that domain.
+        """
+        vocabularies = self._catalog.vocabularies
+        if not vocabularies:
+            return None
+        return tuple(
+            sorted(
+                {
+                    term.label
+                    for vocabulary in vocabularies.values()
+                    for term in vocabulary.terms
+                }
+            )
+        )
+
     def _entity_types(
         self,
         resource: ContextResource,
@@ -1535,6 +1577,9 @@ class ContextService:
         *,
         identity: WarehouseIdentity,
     ) -> tuple[str, ...]:
+        declared = self._declared_entity_types()
+        if declared is not None:
+            return declared
         links: list[Mapping[str, Any]] = []
         for relation in resource.entity_relations:
             links.extend(

@@ -20,6 +20,7 @@ from stel.adapters.base import (
 )
 from stel.agent_context import AgentContextGrain, contract_descriptor
 from stel.append_log import QUERY_LOG_SCHEMA
+from stel.config.vocabulary import Vocabulary, VocabularyTerm
 from stel.mcp_server.authorization import (
     AuthorizationError,
     ClaimAuthorizationProvider,
@@ -186,7 +187,11 @@ def _matches(row: Mapping[str, Any], predicate: ReadPredicate) -> bool:
     raise AssertionError(f"unsupported fixture predicate {predicate.operator}")
 
 
-def _artifact_catalog(*, with_public_model: bool = False) -> ArtifactCatalog:
+def _artifact_catalog(
+    *,
+    with_public_model: bool = False,
+    vocabularies: Mapping[str, Vocabulary] | None = None,
+) -> ArtifactCatalog:
     registry_id = "model.context_demo.document_registry"
     chunks_id = "model.context_demo.document_chunks"
     links_id = "model.context_demo.context_entity_links"
@@ -305,7 +310,9 @@ def _artifact_catalog(*, with_public_model: bool = False) -> ArtifactCatalog:
         "metadata": {"generated_at": "2026-07-20T12:00:00+00:00"},
         "results": results,
     }
-    return ArtifactCatalog.from_payloads(manifest, run_results=run_results)
+    return ArtifactCatalog.from_payloads(
+        manifest, run_results=run_results, vocabularies=vocabularies
+    )
 
 
 def _context_model(
@@ -541,10 +548,13 @@ def _service(
     search: FakeSearch | None = None,
     warehouse_identity: WarehouseIdentityResolver | None = None,
     with_public_model: bool = False,
+    vocabularies: Mapping[str, Vocabulary] | None = None,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
-        catalog=_artifact_catalog(with_public_model=with_public_model),
+        catalog=_artifact_catalog(
+            with_public_model=with_public_model, vocabularies=vocabularies
+        ),
         repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
         principal_resolver=StaticPrincipalResolver(
@@ -580,6 +590,47 @@ def test_context_models_are_artifact_backed_and_principal_scoped() -> None:
     assert model.retrieval.modes == ("hybrid", "text", "vector")
     assert [field.field for field in model.retrieval.filter_fields] == ["category"]
     assert model.entity_types == ("series",)
+
+
+def test_entity_types_come_from_the_declaration_without_scanning() -> None:
+    """Derived from the declaration, not discovered by scanning (issue #628).
+
+    The scanned answer -- which the test above still pins, because a project
+    with no `vocabularies:` keeps it -- reads every entity-link row and then
+    every chunk those rows name, and raises past `max_scan_rows`, so a
+    descriptor call fails outright on a large corpus. It is also per-caller,
+    which makes `entity_types` a way to learn what the corpus holds.
+
+    So this asserts both halves: the value comes from the declaration, and
+    the entity-link relation is never read at all. The declared labels are
+    deliberately disjoint from the fixture's entity names (`series`), so a
+    scan that still ran would show up in the value too.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        vocabularies={
+            "indicators": Vocabulary(
+                terms=[
+                    VocabularyTerm(label="Unemployment rate"),
+                    VocabularyTerm(label="Headline inflation"),
+                ]
+            ),
+            "institutions": Vocabulary(terms=[VocabularyTerm(label="Federal Reserve")]),
+        },
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.models[0].entity_types == (
+        "Federal Reserve",
+        "Headline inflation",
+        "Unemployment rate",
+    )
+    assert not [relation for relation, _ in repository.calls if "entity" in relation]
 
 
 def test_missing_principal_fails_closed_before_discovery() -> None:

@@ -2005,6 +2005,25 @@ linking and the concept cloud, are covered in the entity-linking and
 relation-extraction sections; those are the separate pieces of work (issues
 #626-#629) that build on this declaration.
 
+**The governed MCP server reads it too.** A context model's descriptor
+(`list_context_models`) reports `entity_types`, the entity names an agent may
+ask about. With no `vocabularies:` block that list is discovered by scanning —
+every entity-link row, then every chunk those rows name, filtered to what the
+calling principal may read, and refused past `max_scan_rows`, so on a large
+corpus the descriptor call fails rather than answering. When a project
+declares a vocabulary, the list is the declared labels instead: constant time,
+no scan, and the same answer for every caller.
+
+That is a deliberate change of meaning, worth knowing if you read the field.
+It becomes *schema* — what the project declares it is about, the same kind of
+operator-authored fact as `schema_fields`, which the descriptor already
+publishes to everyone — rather than *data*, what happens to be in the rows you
+can see. An agent can no longer use `entity_types` to find out what the corpus
+actually contains, and a caller authorized for nothing still sees the
+vocabulary. In exchange the descriptor stops being a way to probe corpus
+contents, and stops failing on a large one. A project with no declaration
+keeps the scanned behaviour exactly.
+
 Structure-preserving options for document parsing:
 
 ```yaml

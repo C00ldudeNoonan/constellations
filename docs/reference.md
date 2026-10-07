@@ -4815,7 +4815,12 @@ lexically. A concept with no such mention falls back to the mention's own
 `label` column, then to the spaCy label on the entity table: a free-text NER
 tag, which disagrees with itself across mentions of the same real-world thing
 (a company tagged `PRODUCT` on one mention and `PERSON` on another) far more
-often than an operator-declared namespace does.
+often than an operator-declared namespace does. `entity_namespace` is on every
+`link_entities` output row regardless of resolver (issue #627) — a
+hand-maintained alias table or a fuzzy/vector-similarity match carries one
+too, an identifier namespace like `ticker` or `cik`, never a type — so a
+namespace counts here only when it, and the concept's own id, are a term this
+project's `vocabularies:` actually declares.
 
 **Names and descriptions** (`--names-model <model>`, issue #554). Without it a
 concept is named by its **most frequent** mention text, ties broken lexically —

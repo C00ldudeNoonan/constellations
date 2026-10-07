@@ -24,6 +24,7 @@ from stel.concept_cloud import (
     render_concept_cloud,
 )
 from stel.config import load_project
+from stel.config.vocabulary import Vocabulary, VocabularyTerm
 from stel.dbt_export import default_dbt_source_name
 from stel.profile import resolve_profile
 
@@ -91,10 +92,14 @@ def test_build_aggregates_concepts_and_drops_unmatched() -> None:
     assert all(e.dag_node == _LINKING_NODE for e in export.cross_layer_edges)
 
 
-def test_the_alias_tables_namespace_names_the_type_over_spacys_label() -> None:
+def _companies_vocabulary() -> dict[str, Vocabulary]:
+    return {"companies": Vocabulary(terms=[VocabularyTerm(label="org:acme")])}
+
+
+def test_the_declared_vocabularys_name_tops_the_type_over_spacys_label() -> None:
     # spaCy tagged this company PRODUCT on one mention and ORG on the other --
-    # exactly the disagreement issue #555 found in prod. The alias table both
-    # mentions linked through states a single namespace.
+    # exactly the disagreement issue #555 found in prod. Both mentions linked
+    # through the alias table of a declared `vocabularies:` block naming it.
     links = pl.DataFrame(
         {
             "mention_id": ["m1", "m2"],
@@ -110,9 +115,40 @@ def test_the_alias_tables_namespace_names_the_type_over_spacys_label() -> None:
     export = build_concept_cloud(
         project="p", links=links, dag_plane=_plane(),
         linking_node_id=_LINKING_NODE, linking_model="link_entities",
+        vocabularies=_companies_vocabulary(),
     )
     concept = next(c for c in export.concepts if c.canonical_id == "org:acme")
     assert concept.label == "companies"
+
+
+def test_an_undeclared_namespace_is_not_mistaken_for_a_type() -> None:
+    # `entity_namespace` is on every link_entities output row regardless of
+    # resolver (issue #627): a hand-maintained alias table, or a fuzzy or
+    # vector-similarity match, carries one too -- an identifier namespace like
+    # `cik`, never a type. Naming it here without checking it against a
+    # declared vocabulary was the bug Codex caught reviewing #661: it would
+    # have overwritten a concept's spaCy label with its CIK namespace.
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1"],
+            "canonical_id": ["org:acme"],
+            "document_id": ["d1"],
+            "status": ["matched"],
+            "match_score": [None],
+            "label": ["ORG"],
+            "entity_namespace": ["cik"],
+            "mention_text": ["Acme"],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=_plane(),
+        linking_node_id=_LINKING_NODE, linking_model="link_entities",
+        # No `vocabularies:` names "cik", so it must not be read as a type --
+        # whether or not a project declares any vocabulary at all.
+        vocabularies=_companies_vocabulary(),
+    )
+    concept = next(c for c in export.concepts if c.canonical_id == "org:acme")
+    assert concept.label == "ORG"
 
 
 def test_spacys_label_is_kept_when_no_row_carries_a_namespace() -> None:

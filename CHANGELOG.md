@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### A concept's type comes from its alias table's namespace, not spaCy's label (issue #555)
+
+- **spaCy tagged the same company three different ways.** On the SEC star
+  map, AbbVie was PRODUCT, Autodesk was PERSON and Europe was LOC — a free-text
+  NER tag, not a declared type. A concept linked through an `alias_table`
+  resolver sourced from a declared vocabulary (`aliases: vocab.<name>`) now
+  takes its "type" from that vocabulary's name instead, the most frequent
+  namespace across its mentions. A concept no vocabulary named falls back to
+  the mention's own label, then the entity table's spaCy label, exactly as
+  before.
+
 ### A segmented search publish into a new collection no longer fails on its first page (issue #658)
 
 - **Every first build and every private generation failed in 0.21.0** when the

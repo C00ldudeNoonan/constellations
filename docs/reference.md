@@ -4768,6 +4768,16 @@ stel --project-dir path/to/stel_project concept-cloud \
   -o cloud.html
 ```
 
+**`--title`** and **`--subtitle`** set the page heading and browser-tab title,
+and the text after it, in place of the hardcoded "stel star map" and its
+computed "· `<project>` · N concepts" — that pair names the tool, not the
+map it renders:
+
+```bash
+stel concept-cloud --demo -o cloud.html \
+  --title "Risk factors" --subtitle "2010-2024, SEC 10-Ks"
+```
+
 The export job is a three-way join over artifacts stel already produces: the
 entity-linking output supplies canonical concepts (sized by mention frequency,
 colored by entity type) and the mention→canonical map; the relation grain

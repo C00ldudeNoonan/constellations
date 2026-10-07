@@ -88,6 +88,30 @@ def test_render_escapes_angle_brackets_to_prevent_script_breakout() -> None:
     assert island["concepts"][0]["display"] == "</script><script>alert(1)</script>"
 
 
+def test_the_title_and_subtitle_default_to_the_hardcoded_header() -> None:
+    export = placeholder_export()
+    html = render_concept_cloud(export)
+    assert html.count("stel star map") == 2  # <title> and the <h1>
+    assert "SUBTITLE_OVERRIDE = null" in html
+    assert "__CONCEPT_CLOUD_TITLE__" not in html
+    assert "__CONCEPT_CLOUD_SUBTITLE__" not in html
+
+
+def test_an_operator_title_and_subtitle_replace_the_default() -> None:
+    export = placeholder_export()
+    html = render_concept_cloud(export, title="Risk factors", subtitle="2010-2024")
+    assert "stel star map" not in html
+    assert "<title>Risk factors</title>" in html
+    assert "Risk factors <small" in html
+    assert 'SUBTITLE_OVERRIDE = "2010-2024"' in html
+
+
+def test_the_title_is_escaped_to_prevent_markup_breakout() -> None:
+    html = render_concept_cloud(placeholder_export(), title="</title><script>alert(1)</script>")
+    assert "<script>alert(1)" not in html
+    assert "&lt;/title&gt;&lt;script&gt;" in html
+
+
 def test_write_concept_cloud_creates_the_file(tmp_path: Path) -> None:
     out = tmp_path / "nested" / "cloud.html"
     written = write_concept_cloud(placeholder_export(), out)
@@ -107,6 +131,31 @@ def test_cli_concept_cloud_placeholder_writes_artifact(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert out.exists()
     assert "invoice_pipeline" in _extract_data_island(out.read_text(encoding="utf-8"))["project"]
+
+
+def test_cli_concept_cloud_threads_title_and_subtitle(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    out = tmp_path / "cloud.html"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "concept-cloud",
+            "--placeholder",
+            "--output",
+            str(out),
+            "--title",
+            "Risk factors",
+            "--subtitle",
+            "2010-2024",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    html = out.read_text(encoding="utf-8")
+    assert "<title>Risk factors</title>" in html
+    assert 'SUBTITLE_OVERRIDE = "2010-2024"' in html
 
 
 def test_cli_concept_cloud_requires_a_source() -> None:

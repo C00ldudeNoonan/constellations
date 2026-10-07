@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### The concept-cloud page heading is operator-settable (issue #555)
+
+- **`stel concept-cloud` gains `--title` / `--subtitle`.** The page heading and
+  browser-tab title were hardcoded to "stel star map", and the subtitle after
+  it was always the computed "· `<project>` · N concepts" — that pair names
+  the tool, not the map being viewed. Both default to the prior behavior when
+  omitted.
+
 ### A concept's type comes from its alias table's namespace, not spaCy's label (issue #555)
 
 - **spaCy tagged the same company three different ways.** On the SEC star

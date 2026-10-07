@@ -207,6 +207,18 @@ def test_a_segmented_read_position_round_trips_and_clears_through_the_stamp(
     assert cleared.source_progress is None
 
 
+def test_restamping_a_missing_collection_is_refused_without_native_text(
+    store: RetrievalStore,
+) -> None:
+    # The call #658's publish made before its collection existed: LanceDB's
+    # "Table '...' was not found" reached the CLI unwrapped. A store refuses
+    # with its own sanitized error, never the native one.
+    name = store.physical_collection("nowhere")
+    with pytest.raises(RetrievalError) as refused:
+        store.restamp_collection(_spec(store, name))
+    assert "was not found" not in str(refused.value)
+
+
 def test_inspecting_a_missing_collection_returns_none(store: RetrievalStore) -> None:
     assert store.inspect_collection(store.physical_collection("ctx")) is None
 

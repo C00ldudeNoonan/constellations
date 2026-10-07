@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### A segmented search publish into a new collection no longer fails on its first page (issue #658)
+
+- **Every first build and every private generation failed in 0.21.0** when the
+  snapshot was a segmented BigQuery read (#614, shipped in #656). The read
+  reports its progress at the first page. The publish recorded that progress
+  on the collection straight away, but the collection is only created by the
+  first write, a few lines later, so the store was asked to restamp a
+  collection it had never created. On LanceDB that failed with
+  `Table '...' was not found`. An in-place publish over a collection that
+  already existed was unaffected.
+- The progress now travels in the collection spec until the collection
+  exists, and `create_collection` stamps it, so a run that dies after its
+  first write still leaves the point a retry resumes from.
+- LanceDB's `restamp_collection` opened its table outside the sanitizer, so
+  the native "not found" text reached the CLI unwrapped. It now opens inside
+  it, like every other store operation, and fails as a `RetrievalError`.
+- The bundled DuckDB adapter reports no read progress, which is why the suite
+  never exercised this path. `tests/test_segmented_publish.py` gives its
+  snapshot a progress report shaped like BigQuery's.
 ### Reprocess every row without re-paying for it: `--reprocess-all` (issue #655)
 
 - **`--full-refresh` was the only way to force a reprocess, and it drops

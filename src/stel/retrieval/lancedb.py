@@ -878,9 +878,12 @@ class LanceDBStore(RetrievalStore):
         return created
 
     def restamp_collection(self, spec: CollectionSpec) -> None:
-        table = self._open_owned_table(spec.physical_name)
         failure: RetrievalError | None = None
         try:
+            # Opened inside the sanitizer like every other operation here:
+            # LanceDB's "not found" quotes the table name verbatim, and it
+            # reached the CLI unwrapped when this ran first (issue #658).
+            table = self._open_owned_table(spec.physical_name)
             table.update_field_metadata(
                 {
                     "path": spec.id_field,
@@ -896,6 +899,8 @@ class LanceDBStore(RetrievalStore):
                     },
                 }
             )
+        except RetrievalError:
+            raise
         except Exception as error:
             failure = _operation_failed("restamp", "lancedb_restamp_failed", error)
         if failure is not None:

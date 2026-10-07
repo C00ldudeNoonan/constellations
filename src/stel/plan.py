@@ -139,6 +139,7 @@ def plan_project(
     exclude: str | None = None,
     target: str | None = None,
     profiles_dir: Path | None = None,
+    reprocess_all: bool = False,
 ) -> ProjectPlan:
     """Classify every selected model against its published state.
 
@@ -163,6 +164,7 @@ def plan_project(
             project_dir=project_dir,
             adapter=adapter,
             resolved=resolved,
+            reprocess_all=reprocess_all,
         )
     warehouse = resolved.warehouse
     return ProjectPlan(
@@ -196,6 +198,7 @@ def plan_models(
     project_dir: Path,
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
+    reprocess_all: bool = False,
 ) -> list[ModelPlan]:
     """Plan `planned` (in execution order) against an open adapter.
 
@@ -223,6 +226,7 @@ def plan_models(
             resolved=resolved,
             project=project,
             project_dir=project_dir,
+            reprocess_all=reprocess_all,
         )
         if plan.status == "changed":
             roots.add(model.name)
@@ -275,6 +279,7 @@ def _classify(
     resolved: ResolvedProfile,
     project: ProjectConfig,
     project_dir: Path,
+    reprocess_all: bool,
 ) -> ModelPlan:
     state_rows = sum(counts.values())
     stale_rows = sum(
@@ -291,6 +296,19 @@ def _classify(
         status = "new"
         rows, upper_bound = 0, False
         reason = "no published state: the first run processes every input"
+    elif reprocess_all:
+        # Not an upper bound: every published row reprocesses, which is the
+        # whole request (issue #655). Reported as `changed` so the reprocess
+        # guard -- reading these same plans -- sees the real number for a
+        # paid model the flag does not release.
+        status = "changed"
+        rows, upper_bound = state_rows, False
+        reason = (
+            "--reprocess-all: every published row reprocesses, whatever its "
+            "code_version"
+        )
+        if caused_by:
+            reason += f"; upstream {upstream} changed as well"
     elif stale_rows > 0:
         status = "changed"
         rows, upper_bound = (state_rows, True) if caused_by else (stale_rows, False)

@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Reprocess every row without re-paying for it: `--reprocess-all` (issue #655)
+
+- **`--full-refresh` was the only way to force a reprocess, and it drops
+  vector reuse.** Recovering from a bad embed publish therefore cost the whole
+  corpus again at provider prices -- about 28k Vertex requests on a 3.6M-row
+  corpus -- which is why the only affordable fix for the dropped column in
+  #653 was editing `stel_state` by hand. `--reprocess-all` on `run` and
+  `build` puts every published row back through the stage and keeps what the
+  target already holds: an embed model re-reads its own vectors by input hash
+  and calls no provider when its inputs have not changed.
+- **It ignores incremental state rather than clearing it**, which is what
+  keeps the rest working: removals still reconcile (both the warehouse
+  anti-join and the Python fallback read the published state), a transform
+  stays incremental instead of silently becoming a full replace, and an
+  interrupted run leaves the baseline for the next ordinary one. No watermark
+  is cleared or forged either -- the unchanged-parent skip simply declines
+  itself under the flag.
+- **The reprocess guard releases an embed model and still refuses an llm
+  one.** Reusing a vector costs nothing, so there is nothing left for the
+  guard to protect; llm output has no warehouse-side reuse at all, so
+  `--accept-reprocess` is still required there.
+- **`stel plan --reprocess-all`** prices it first, reporting `changed` with
+  every published row instead of the `unchanged`/0 an ordinary plan reports
+  for a model whose `code_version` has not moved.
+- Refused with `--full-refresh` (nothing to reuse, so the flag would silently
+  cost a full corpus) and with `--watch` (every saved file would reprocess
+  everything). A SQL transform is unaffected, since it keeps no per-record
+  state.
+
 ## v0.21.0 - 2026-10-06
 
 ### A resumed search publish no longer pays index maintenance on every page (issue #616)

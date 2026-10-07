@@ -54,6 +54,29 @@ def test_a_second_untouched_run_skips_every_downstream_scan(rag_project: Path) -
     assert results["chunk_embeddings"].status == "unchanged"
 
 
+def test_reprocess_all_declines_the_unchanged_parent_skip(
+    rag_project: Path,
+) -> None:
+    """The outer of the two skip tiers `--reprocess-all` has to clear (#655).
+
+    This tier decides whether the stage is entered at all, by asking whether
+    the parent published anything since this model last synced to it. The
+    answer is irrelevant under the flag -- and if it were not, the flag would
+    be a silent no-op in precisely the case it exists for, an upstream that
+    has not changed since the run that poisoned the target.
+
+    Declining the skip here is also why nothing has to clear or forge a row
+    in `stel_sync_watermark`.
+    """
+    run_project(rag_project)
+
+    [control] = run_project(rag_project, select="chunk_embeddings")
+    assert control.status == "unchanged"
+
+    [result] = run_project(rag_project, select="chunk_embeddings", reprocess_all=True)
+    assert result.status != "unchanged"
+
+
 def test_a_new_document_still_reaches_every_child(rag_project: Path) -> None:
     run_project(rag_project)
     (rag_project / "documents" / "new.html").write_text(

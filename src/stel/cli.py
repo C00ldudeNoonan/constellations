@@ -1021,6 +1021,14 @@ def _model_kind(model: ModelConfig) -> str:
 )
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
 @click.option(
+    "--reprocess-all",
+    is_flag=True,
+    help=(
+        "Report what `run --reprocess-all` would reprocess: every published "
+        "row, rather than only the rows whose code_version moved."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1033,6 +1041,7 @@ def plan(
     ctx: click.Context,
     select: str | None,
     exclude: str | None,
+    reprocess_all: bool,
     json_output: bool,
     verbose: int,
     diagnostics_file: Path | None,
@@ -1055,6 +1064,7 @@ def plan(
             exclude=exclude,
             target=target,
             profiles_dir=profiles_dir,
+            reprocess_all=reprocess_all,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1087,6 +1097,16 @@ def plan(
 @cli.command()
 @click.option(
     "--full-refresh", is_flag=True, help="Ignore incremental state and reprocess everything."
+)
+@click.option(
+    "--reprocess-all",
+    is_flag=True,
+    help=(
+        "Reprocess every published row while keeping what the target already "
+        "holds: an embed model re-reads its own vectors by input hash, so a "
+        "re-run whose inputs have not changed costs no provider calls. Unlike "
+        "--full-refresh, incremental state is kept and removals still reconcile."
+    ),
 )
 @click.option(
     "--accept-reprocess",
@@ -1159,6 +1179,7 @@ def plan(
 def run(
     ctx: click.Context,
     full_refresh: bool,
+    reprocess_all: bool,
     accept_reprocess: bool,
     select: str | None,
     exclude: str | None,
@@ -1185,6 +1206,12 @@ def run(
     )
 
     if watch:
+        if reprocess_all:
+            raise click.UsageError(
+                "--reprocess-all cannot be combined with --watch: a watch loop "
+                "would reprocess every published row on every file change. Run "
+                "it once by hand instead."
+            )
         _run_watch(
             project_dir,
             profiles_dir=profiles_dir,
@@ -1204,6 +1231,7 @@ def run(
         results = run_project(
             project_dir,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             select=select,
             exclude=exclude,
             target=target,
@@ -1337,6 +1365,16 @@ def _usage_summary(
     "--full-refresh", is_flag=True, help="Ignore incremental state and reprocess everything."
 )
 @click.option(
+    "--reprocess-all",
+    is_flag=True,
+    help=(
+        "Reprocess every published row while keeping what the target already "
+        "holds: an embed model re-reads its own vectors by input hash, so a "
+        "re-run whose inputs have not changed costs no provider calls. Unlike "
+        "--full-refresh, incremental state is kept and removals still reconcile."
+    ),
+)
+@click.option(
     "--accept-reprocess",
     is_flag=True,
     help=(
@@ -1397,6 +1435,7 @@ def _usage_summary(
 def build(
     ctx: click.Context,
     full_refresh: bool,
+    reprocess_all: bool,
     accept_reprocess: bool,
     select: str | None,
     exclude: str | None,
@@ -1420,6 +1459,7 @@ def build(
         result = build_project(
             project_dir,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             select=select,
             exclude=exclude,
             target=target,

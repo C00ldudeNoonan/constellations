@@ -43,7 +43,7 @@ from ..transforms import (
     transform_call_arity,
 )
 from ..versioning import compute_model_code_version
-from .contracts import ModelRunResult, RunError
+from .contracts import ModelRunResult, RunError, state_for_skipping
 from .errors import artifact_error_text
 from .heartbeat import Heartbeat
 from .warehouse import warehouse_options
@@ -170,6 +170,7 @@ def run_transform_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool = False,
+    reprocess_all: bool = False,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
@@ -256,6 +257,7 @@ def run_transform_model(
             contract=contract,
             parent_source=parent_source,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             result=result,
             subset_run=subset_run,
             read_predicates=read_predicates,
@@ -363,6 +365,7 @@ def _run_incremental_transform(
     contract: IncrementalContract,
     parent_source: str,
     full_refresh: bool,
+    reprocess_all: bool,
     result: ModelRunResult,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
@@ -381,6 +384,7 @@ def _run_incremental_transform(
     _reject_unsupported_incremental_strategy(options, model)
     is_incremental = not full_refresh
     prior_state = adapter.fetch_state(state_scope) if is_incremental else {}
+    skip_state = state_for_skipping(prior_state, reprocess_all=reprocess_all)
 
     # No state baseline but a pre-existing target — e.g. a table switched from
     # `materialization: full`, or an interrupted first run. Its rows are not
@@ -437,7 +441,7 @@ def _run_incremental_transform(
             parent_key, row_digests, reference_fingerprints
         )
         if is_incremental:
-            prior = prior_state.get(parent_key)
+            prior = skip_state.get(parent_key)
             if prior == StateValue(fingerprint, code_version):
                 skipped += 1
                 continue

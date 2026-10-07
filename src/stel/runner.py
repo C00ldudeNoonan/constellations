@@ -132,6 +132,7 @@ def run_project(
     project_dir: Path,
     *,
     full_refresh: bool = False,
+    reprocess_all: bool = False,
     select: str | None = None,
     exclude: str | None = None,
     target: str | None = None,
@@ -142,6 +143,9 @@ def run_project(
     read_filter: Sequence[tuple[str, str, str]] = (),
     accept_reprocess: bool = False,
 ) -> list[ModelRunResult]:
+    _reject_conflicting_reprocess_flags(
+        full_refresh=full_refresh, reprocess_all=reprocess_all
+    )
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     # Validate --source-filter before resolving the profile: it is a deterministic
@@ -267,6 +271,7 @@ def run_project(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             dag=dag,
             threads=threads,
             run_budget=run_budget,
@@ -286,6 +291,7 @@ def run_project(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             accept_reprocess=accept_reprocess,
         )
         if threads > 1 and len(selected) > 1:
@@ -322,6 +328,7 @@ def build_project(
     project_dir: Path,
     *,
     full_refresh: bool = False,
+    reprocess_all: bool = False,
     select: str | None = None,
     exclude: str | None = None,
     target: str | None = None,
@@ -336,6 +343,9 @@ def build_project(
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
     skipped (dbt `build` semantics)."""
+    _reject_conflicting_reprocess_flags(
+        full_refresh=full_refresh, reprocess_all=reprocess_all
+    )
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     # Validate --source-filter before resolving the profile: it is a deterministic
@@ -468,6 +478,7 @@ def build_project(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             accept_reprocess=accept_reprocess,
         )
         for name in selected:
@@ -502,6 +513,7 @@ def build_project(
                     adapter=adapter,
                     resolved=resolved,
                     full_refresh=full_refresh,
+                    reprocess_all=reprocess_all,
                     dag=dag,
                     threads=threads,
                     run_budget=run_budget,
@@ -655,6 +667,29 @@ def _discover_sources(
         reporter.source_discovered(source.name, len(refs))
         out[source.name] = DiscoveredSource(backend=backend, refs=refs)
     return out
+
+
+def _reject_conflicting_reprocess_flags(
+    *, full_refresh: bool, reprocess_all: bool
+) -> None:
+    """`--full-refresh` and `--reprocess-all` are not a redundant pair (#655).
+
+    They disagree about the one thing that costs money. A full refresh does
+    not fetch state and drops the target's rows, so there is nothing for an
+    embed model to reuse and every row is re-embedded at provider prices. The
+    whole point of `--reprocess-all` is the opposite: reprocess every row and
+    keep what is already paid for. Accepting both would resolve silently in
+    favour of the expensive one, since `is_incremental` is false and the flag
+    then has nothing left to act on.
+    """
+    if full_refresh and reprocess_all:
+        raise RunError(
+            "--reprocess-all cannot be combined with --full-refresh: a full "
+            "refresh rebuilds the target from scratch, so there is nothing to "
+            "reuse and every row is reprocessed at provider cost. Use "
+            "--reprocess-all alone to reprocess every row while reusing what "
+            "the target already holds, or --full-refresh alone to rebuild."
+        )
 
 
 def _prepare_subset_run(
@@ -811,6 +846,7 @@ def _enforce_reprocess_guard(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    reprocess_all: bool,
     accept_reprocess: bool,
 ) -> None:
     """Stop before the first model runs if a paid model would reprocess
@@ -821,14 +857,29 @@ def _enforce_reprocess_guard(
     cascade an embed model pays for starts at a chunk model above it -- and
     any `on_code_change: fail` model over its limit refuses the run. The plan
     is one aggregate query per selected model; a selection with nothing under
-    the guard skips it entirely."""
+    the guard skips it entirely.
+
+    `--reprocess-all` releases an *embed* model and not an *llm* one (issue
+    #655). The guard exists to stop unannounced provider *spend*, and the two
+    kinds answer that differently: an embed model reads its existing vectors
+    back out of its own target by input hash, so an announced reprocess whose
+    inputs have not changed costs nothing, and requiring a second flag to say
+    so would put two flags in front of the one recovery this exists for. An
+    llm model has no warehouse-side reuse at all -- only the optional local
+    `llm_cache.duckdb`, which a clean or another machine does not have -- so
+    announcing the reprocess does not make it free, and it stays guarded.
+    `--accept-reprocess` remains the way to say yes to that one."""
     if full_refresh or accept_reprocess:
         return
     planned = [models_by_name[name] for name in selected]
     guarded = [
         model
         for model in planned
-        if (model.embed is not None and model.embed.on_code_change == "fail")
+        if (
+            model.embed is not None
+            and model.embed.on_code_change == "fail"
+            and not reprocess_all
+        )
         or (model.llm is not None and model.llm.on_code_change == "fail")
     ]
     if not guarded:
@@ -840,6 +891,7 @@ def _enforce_reprocess_guard(
         project_dir=project_dir,
         adapter=adapter,
         resolved=resolved,
+        reprocess_all=reprocess_all,
     )
     refusals = guard_reprocess(plans)
     if refusals:
@@ -873,7 +925,9 @@ def _single_data_parent(model_name: str, dag: ProjectDAG) -> str | None:
     return model_predecessors[0] if len(model_predecessors) == 1 else None
 
 
-def _can_skip_unchanged_scan(model: ModelConfig, *, full_refresh: bool, subset_run: bool) -> bool:
+def _can_skip_unchanged_scan(
+    model: ModelConfig, *, full_refresh: bool, reprocess_all: bool, subset_run: bool
+) -> bool:
     """Whether this model kind and invocation are even eligible for the
     unchanged-parent skip (issue #611), before paying for the watermark and
     code_version checks that decide it for real.
@@ -884,9 +938,18 @@ def _can_skip_unchanged_scan(model: ModelConfig, *, full_refresh: bool, subset_r
     state-scoped-by-model-name contract the skip's state check assumes.
     `--full-refresh` and a source-filtered/read-filtered subset run each
     narrow or force what a normal run would do, so neither is safe to
-    second-guess with a scan that was written for the unfiltered case."""
+    second-guess with a scan that was written for the unfiltered case.
+
+    `--reprocess-all` is the second of the two skip tiers it has to clear
+    (issue #655). This one is the outer: it decides whether the stage is
+    entered at all, by asking whether the parent published anything since
+    this model last synced to it. Under the flag the answer is irrelevant --
+    the operator is asking for every published row to be reprocessed whether
+    or not the parent moved -- so the skip is not eligible. Declining it here
+    is why nothing has to clear or forge `stel_sync_watermark`."""
     return (
         not full_refresh
+        and not reprocess_all
         and not subset_run
         and model.materialization == "incremental"
         and model.search is None
@@ -961,6 +1024,7 @@ def _run_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    reprocess_all: bool,
     dag: ProjectDAG,
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
@@ -998,7 +1062,12 @@ def _run_model(
     # either, and the skip could never engage for it at all.
     parent_name = (
         _single_data_parent(model.name, dag)
-        if _can_skip_unchanged_scan(model, full_refresh=full_refresh, subset_run=subset_run)
+        if _can_skip_unchanged_scan(
+            model,
+            full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
+            subset_run=subset_run,
+        )
         else None
     )
     parent_scope = StateScope(parent_name) if parent_name is not None else None
@@ -1070,6 +1139,7 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             threads=threads,
             run_budget=run_budget,
             subset_run=subset_run,
@@ -1098,6 +1168,7 @@ def _run_model(
                 adapter=adapter,
                 resolved=resolved,
                 full_refresh=full_refresh,
+                reprocess_all=reprocess_all,
                 run_budget=run_budget,
                 subset_run=subset_run,
                 read_predicates=read_predicates,
@@ -1108,6 +1179,7 @@ def _run_model(
             project_dir=project_dir,
             adapter=adapter,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             subset_run=subset_run,
         )
     elif model.embed is not None:
@@ -1118,6 +1190,7 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             run_budget=run_budget,
             subset_run=subset_run,
             read_predicates=read_predicates,
@@ -1130,6 +1203,7 @@ def _run_model(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             run_budget=run_budget,
         )
     elif model.search is not None:

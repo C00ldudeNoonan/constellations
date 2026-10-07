@@ -82,7 +82,11 @@ def materialize(
             resolved=resolved,
             full_refresh=True,
             # `full_refresh=True` above already makes the unchanged-scan skip
-            # (issue #611) ineligible regardless of what `dag` would resolve.
+            # (issue #611) ineligible regardless of what `dag` would resolve,
+            # and leaves `--reprocess-all` nothing to act on: an embedded
+            # build rebuilds its captured frame every time, so there is no
+            # published state to reprocess against (issue #655).
+            reprocess_all=False,
             dag=dag,
         )
         return adapter.captured

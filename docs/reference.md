@@ -382,13 +382,13 @@ stel init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh proj
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
-stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
+stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one golden set: deltas, and the queries that moved
-stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
+stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
-stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
+stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -695,6 +695,11 @@ no model table was touched, no provider was called. The ways forward:
   is the flag for "yes, I changed the embedding model on purpose".
 - **`--full-refresh`** rebuilds, and was always an explicit request to
   reprocess everything, so the guard never applies to it.
+- **`--reprocess-all`** reprocesses every published row while keeping what the
+  target holds, and the guard never applies to it *for an embed model* —
+  reusing a vector costs nothing, so there is nothing left to refuse. An llm
+  model is still guarded under it, because nothing gives an llm model its old
+  answers back. See below.
 - **`on_code_change: reprocess`** on the model restores the old behaviour for
   that model. **`reprocess_limit: N`** keeps `fail` but tolerates up to `N`
   rows, which is what a small model or a resume of an interrupted, already
@@ -714,6 +719,64 @@ The policy fields are not part of `code_version`, for the same reason
 `on_index_change` is not: relaxing a guard must never itself be a reprocess.
 ADR [0008](adr/0008-reprocess-guard-defaults-to-fail.md) records why `fail` is
 the default rather than a warning.
+
+### Reprocessing without re-paying: `--reprocess-all`
+
+`--full-refresh` is not the only reason to put every published row back
+through a stage. After a bad publish — a column that went missing, a
+transform that wrote the wrong thing — what you want is every row
+reprocessed and every vector *kept*, because the vectors were never the
+problem and re-computing them is what costs money. On a 3.6M-row corpus
+`--full-refresh` of an embed model is about 28k provider requests.
+
+```bash
+stel plan --select chunk_embeddings --reprocess-all   # price it first
+stel run  --select chunk_embeddings --reprocess-all
+```
+
+What it does, and does not do:
+
+- **Nothing is cleared.** Incremental state is read as usual and simply not
+  skipped on, so removals still reconcile, a transform stays incremental, and
+  an interrupted run leaves the baseline intact for the next ordinary one.
+  This is why there is no `stel state clear`: the useful behaviour is only
+  reachable from inside a run.
+- **Both skip tiers are declined**: per-record state, and the unchanged-parent
+  skip that would otherwise not enter the stage at all. No watermark is
+  touched.
+- **`update_when_changed` is ignored too.** That fingerprint normally spares a
+  matched row from being rewritten when none of its listed columns moved, so
+  re-publishing does not rewrite large payloads. Under a forced reprocess it
+  would do the opposite of what you asked: a column corrupted by a bad publish
+  is outside the fingerprint by construction, so every listed column matches,
+  the row is filtered out of the write, and the corruption survives a run that
+  reports it processed. Skipping a record and skipping its write are two
+  optimizations, and this turns off both.
+- **An embed model pays nothing** while its inputs are unchanged — vectors
+  come back out of its own target by `embedding_input_hash`, reported as
+  `cache_hits` with `provider_calls: 0`.
+- **An llm model pays in full.** There is no warehouse-side reuse for llm
+  output; the only cache is the optional local `llm_cache.duckdb`, which a
+  clean or a different machine does not have. The reprocess guard still
+  refuses it, and `--accept-reprocess` is how you say yes.
+- **A SQL transform is unaffected.** It keeps no per-record state — its skip
+  is the `is_incremental()` branch in its own SQL, and turning that off is
+  `--full-refresh`.
+- **A `search:` model is unaffected**, and `stel plan --reprocess-all` says so
+  rather than claiming otherwise. A search publish chooses between rebuilding
+  an index and extending it; it has no per-record skip for this flag to
+  decline, and `--full-refresh` is how you force the rebuild
+  (`stel run --select chunk_search --full-refresh`).
+- **Refused with `--full-refresh`**, which does not fetch state and drops the
+  target, so there would be nothing to reuse and the flag would silently cost
+  a full corpus. Refused with `--watch`, which would reprocess everything on
+  every saved file.
+
+`stel plan --reprocess-all` reports `changed` with every published row, rather
+than the `unchanged`/0 that an ordinary plan reports for a model whose
+`code_version` has not moved. ADR
+[0024](adr/0024-a-forced-reprocess-ignores-incremental-state-rather-than-clearing-it.md)
+records why ignoring state beat clearing it.
 
 ## Progress output
 

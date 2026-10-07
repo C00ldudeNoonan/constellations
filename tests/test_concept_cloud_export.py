@@ -91,6 +91,55 @@ def test_build_aggregates_concepts_and_drops_unmatched() -> None:
     assert all(e.dag_node == _LINKING_NODE for e in export.cross_layer_edges)
 
 
+def test_the_alias_tables_namespace_names_the_type_over_spacys_label() -> None:
+    # spaCy tagged this company PRODUCT on one mention and ORG on the other --
+    # exactly the disagreement issue #555 found in prod. The alias table both
+    # mentions linked through states a single namespace.
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1", "m2"],
+            "canonical_id": ["org:acme", "org:acme"],
+            "document_id": ["d1", "d1"],
+            "status": ["matched", "matched"],
+            "match_score": [None, None],
+            "label": ["PRODUCT", "ORG"],
+            "entity_namespace": ["companies", "companies"],
+            "mention_text": ["Acme", "Acme Corp"],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=_plane(),
+        linking_node_id=_LINKING_NODE, linking_model="link_entities",
+    )
+    concept = next(c for c in export.concepts if c.canonical_id == "org:acme")
+    assert concept.label == "companies"
+
+
+def test_spacys_label_is_kept_when_no_row_carries_a_namespace() -> None:
+    # The `entity_namespace` column is on every link_entities output (issue
+    # #627), but it is blank for a mention no vocabulary sourced -- a fuzzy or
+    # vector-similarity match, say. That row must fall back exactly as it did
+    # before #555.
+    links = pl.DataFrame(
+        {
+            "mention_id": ["m1"],
+            "canonical_id": ["org:acme"],
+            "document_id": ["d1"],
+            "status": ["matched"],
+            "match_score": [None],
+            "label": ["ORG"],
+            "entity_namespace": [""],
+            "mention_text": ["Acme"],
+        }
+    )
+    export = build_concept_cloud(
+        project="p", links=links, dag_plane=_plane(),
+        linking_node_id=_LINKING_NODE, linking_model="link_entities",
+    )
+    concept = next(c for c in export.concepts if c.canonical_id == "org:acme")
+    assert concept.label == "ORG"
+
+
 def test_build_canonicalizes_and_collapses_undirected_edges() -> None:
     export = build_concept_cloud(
         project="p", links=_links(), relations=_relations(), dag_plane=_plane(),

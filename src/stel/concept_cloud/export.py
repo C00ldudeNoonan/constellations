@@ -375,7 +375,15 @@ def _aggregate_concepts(
         documents = {
             r.get("document_id") for r in rows if r.get("document_id") is not None
         }
-        label = _first(
+        # The alias table's own namespace, when a row was linked through one,
+        # names the type better than spaCy's label ever can: spaCy tagged
+        # AbbVie PRODUCT, Autodesk PERSON and Europe LOC on a two-type alias
+        # table, which is spaCy guessing at something the table already
+        # states (issue #555). Falls back to the pre-#555 behavior -- the
+        # row's own label, then the entity table's -- when no row carries a
+        # namespace, which is every non-`link_entities` linking model and a
+        # resolver that was not sourced from a vocabulary.
+        label = _most_common([r.get("entity_namespace") for r in rows]) or _first(
             [r.get("label") for r in rows]
             + [label_by_mention.get(str(r["mention_id"])) for r in rows]
         )

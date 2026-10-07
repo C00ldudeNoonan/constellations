@@ -4807,6 +4807,16 @@ Scope: this carries what a declaration states about each concept. It does not
 lay concepts out by class or by hierarchy (issue #345), and it does not add a
 time-varying history of a concept's definition (issue #555).
 
+**Entity type prefers the alias table's namespace** (issue #555). When a
+concept was linked through an `alias_table` resolver sourced from a declared
+vocabulary (`aliases: vocab.<name>`), the viewer's "type" is that vocabulary's
+name — the most frequent namespace across the concept's mentions, ties broken
+lexically. A concept with no such mention falls back to the mention's own
+`label` column, then to the spaCy label on the entity table: a free-text NER
+tag, which disagrees with itself across mentions of the same real-world thing
+(a company tagged `PRODUCT` on one mention and `PERSON` on another) far more
+often than an operator-declared namespace does.
+
 **Names and descriptions** (`--names-model <model>`, issue #554). Without it a
 concept is named by its **most frequent** mention text, ties broken lexically —
 deterministic, but still whatever the corpus happens to call the thing, so a

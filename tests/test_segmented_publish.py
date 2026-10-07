@@ -148,30 +148,29 @@ def test_a_private_generation_through_a_segmented_read_publishes(
 def test_progress_from_before_the_collection_existed_is_stamped_for_a_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Deferring the record must not lose it: a rebuild that dies on its second
-    page leaves a generation stamped with the progress its pages reached, which
-    is what a retry resumes from (issue #614)."""
+    """Deferring the record must not lose it: the first write creates the
+    generation from a spec already carrying page one's progress, so a rebuild
+    that dies on that very write leaves the snapshot instant and boundaries a
+    retry re-plans onto (issue #614). Failing a later page would not pin this:
+    that page's own restamp would overwrite whatever creation stamped."""
     _project(tmp_path)
     run_project(tmp_path, select="context_search")
     _report_segment_progress(monkeypatch)
     writes = {"count": 0}
-    real_append = LanceDBStore.append
 
-    def append_once(self: LanceDBStore, *args: Any, **kwargs: Any) -> Any:
+    def append_fails(self: LanceDBStore, *args: Any, **kwargs: Any) -> Any:
         writes["count"] += 1
-        if writes["count"] > 1:
-            raise RetrievalError("simulated failure writing the second page")
-        return real_append(self, *args, **kwargs)
+        raise RetrievalError("simulated failure writing the first page")
 
-    monkeypatch.setattr(LanceDBStore, "append", append_once)
+    monkeypatch.setattr(LanceDBStore, "append", append_fails)
     with pytest.raises(RunError):
         run_project(tmp_path, select="context_search", full_refresh=True)
 
-    assert writes["count"] == 2
+    assert writes["count"] == 1
     with _store(tmp_path) as store:
         generations = [name for name in store.list_collections() if "__g" in name]
         assert len(generations) == 1
         left = store.inspect_collection(generations[0])
     assert left is not None
     assert left.source_progress is not None
-    assert json.loads(left.source_progress)["completed"] == 1
+    assert json.loads(left.source_progress)["completed"] == 0

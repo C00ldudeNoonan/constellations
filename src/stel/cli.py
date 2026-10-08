@@ -2445,6 +2445,19 @@ def mcp_serve(
         "--time-field."
     ),
 )
+@click.option(
+    "--title",
+    default=None,
+    help='Page heading and browser-tab title (default: "stel star map").',
+)
+@click.option(
+    "--subtitle",
+    default=None,
+    help=(
+        'Text shown after the title (default: "· <project> · N concepts", '
+        "computed from the bundle)."
+    ),
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -2466,6 +2479,8 @@ def concept_cloud(
     time_field: str | None,
     time_grain: str,
     top_n_per_period: int,
+    title: str | None,
+    subtitle: str | None,
     verbose: int,
     diagnostics_file: Path | None,
 ) -> None:
@@ -2479,7 +2494,7 @@ def concept_cloud(
     _configure_output(verbose, diagnostics_file=diagnostics_file)
     if placeholder or demo:
         bundle = demo_export() if demo else placeholder_export()
-        written = write_concept_cloud(bundle, output)
+        written = write_concept_cloud(bundle, output, title=title, subtitle=subtitle)
         click.echo(
             f"Wrote {'demo' if demo else 'placeholder'} concept-cloud artifact "
             f"({len(bundle.concepts)} concepts) to {written}"
@@ -2519,7 +2534,7 @@ def concept_cloud(
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e
-    written = write_concept_cloud(export, output)
+    written = write_concept_cloud(export, output, title=title, subtitle=subtitle)
     click.echo(
         f"Wrote concept-cloud artifact ({len(export.concepts)} concepts) to {written}"
     )

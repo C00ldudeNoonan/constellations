@@ -7,7 +7,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>stel star map</title>
+  <title>__CONCEPT_CLOUD_TITLE__</title>
   <style>
     :root {
       --bg: #05070f; --panel: rgba(13, 18, 32, 0.72); --fg: #dfe7f3;
@@ -101,7 +101,7 @@
 </head>
 <body>
   <header>
-    <h1><span class="glyph">✦</span>stel star map <small id="subtitle"></small></h1>
+    <h1><span class="glyph">✦</span>__CONCEPT_CLOUD_TITLE__ <small id="subtitle"></small></h1>
     <input id="search" type="search" placeholder="Search concepts…" autocomplete="off" />
   </header>
   <aside id="panel">
@@ -147,8 +147,11 @@
     "use strict";
     const CDN = "https://unpkg.com/3d-force-graph";
     const DATA = JSON.parse(document.getElementById("cc-data").textContent);
+    const SUBTITLE_OVERRIDE = __CONCEPT_CLOUD_SUBTITLE__;
     document.getElementById("subtitle").textContent =
-      "· " + DATA.project + " · " + DATA.concepts.length + " concepts";
+      SUBTITLE_OVERRIDE !== null
+        ? SUBTITLE_OVERRIDE
+        : "· " + DATA.project + " · " + DATA.concepts.length + " concepts";
 
     // Star-tinted categorical palette: bright enough to glow on deep space.
     const PALETTE = ["#7db8ff","#ffd76e","#8fe3a1","#ff8f85","#d8b4ff",

@@ -112,6 +112,42 @@ def test_the_title_is_escaped_to_prevent_markup_breakout() -> None:
     assert "&lt;/title&gt;&lt;script&gt;" in html
 
 
+def test_the_subtitles_quote_is_escaped_to_prevent_markup_breakout() -> None:
+    html = render_concept_cloud(
+        placeholder_export(), subtitle="</script><script>alert(1)</script>"
+    )
+    assert "<script>alert(1)" not in html
+    assert "\\u003c/script>" in html
+
+
+def test_bundle_text_matching_a_sentinel_does_not_corrupt_the_data_island() -> None:
+    # Regression: title/subtitle substitution must run before the bundle is
+    # embedded. A project name or concept display can happen to contain a
+    # sentinel's literal string; if substitution ran afterward it would rewrite
+    # that text inside the JSON island instead of the heading, and a subtitle
+    # containing a quote would break `JSON.parse` outright.
+    export = ConceptCloudExport(
+        generated_at="2026-08-04T00:00:00Z",
+        project="x __CONCEPT_CLOUD_SUBTITLE__ y",
+        dag_plane=DagPlane(
+            nodes=(DagNode(id="model.p.m", label="m", resource_type="model"),)
+        ),
+        concepts=(
+            Concept(
+                canonical_id="org:x",
+                display="__CONCEPT_CLOUD_TITLE__",
+                frequency=1,
+                provenance=Provenance(model="m"),
+            ),
+        ),
+    )
+    html = render_concept_cloud(export, subtitle='say "hi"')
+    island = _extract_data_island(html)
+    assert island["project"] == "x __CONCEPT_CLOUD_SUBTITLE__ y"
+    assert island["concepts"][0]["display"] == "__CONCEPT_CLOUD_TITLE__"
+    assert 'SUBTITLE_OVERRIDE = "say \\"hi\\""' in html
+
+
 def test_write_concept_cloud_creates_the_file(tmp_path: Path) -> None:
     out = tmp_path / "nested" / "cloud.html"
     written = write_concept_cloud(placeholder_export(), out)

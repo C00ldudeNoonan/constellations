@@ -43,9 +43,13 @@ def render_concept_cloud(
     template = _TEMPLATE.read_text(encoding="utf-8")
     if _DATA_SENTINEL not in template:
         raise RuntimeError("concept-cloud template is missing its data sentinel")
-    html = template.replace(_DATA_SENTINEL, _embed_json(export), 1)
-    html = html.replace(_TITLE_SENTINEL, escape(title or _DEFAULT_TITLE, quote=True))
+    # Title/subtitle substitute before the bundle is embedded, not after: bundle
+    # text (a project name, a concept display) can contain either sentinel's
+    # literal string, and a later unbounded replace would rewrite it inside the
+    # JSON island instead of in the heading, breaking `JSON.parse`.
+    html = template.replace(_TITLE_SENTINEL, escape(title or _DEFAULT_TITLE, quote=True))
     html = html.replace(_SUBTITLE_SENTINEL, _embed_subtitle(subtitle))
+    html = html.replace(_DATA_SENTINEL, _embed_json(export), 1)
     if inline_lib and _VENDOR_LIB.exists():
         html = html.replace(_LIB_SENTINEL, _VENDOR_LIB.read_text(encoding="utf-8"), 1)
     return html

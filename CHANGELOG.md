@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.21.1 - 2026-10-09
 
 ### The star map can focus on one concept's constellation (issue #555)
 

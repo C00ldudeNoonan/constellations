@@ -34,6 +34,7 @@ history (issue #311).
 | [0022](0022-a-schema-probe-is-never-cached-and-a-missed-column-fails-the-run.md) | A schema probe is never answered from a cache, and a column it missed fails the run instead of being dropped | accepted |
 | [0023](0023-a-keyed-warehouse-read-is-segmented-and-pinned-to-one-instant.md) | A keyed warehouse read is segmented and pinned to one instant, and resumes from its last completed segment | accepted |
 | [0024](0024-a-forced-reprocess-ignores-incremental-state-rather-than-clearing-it.md) | A forced reprocess reads incremental state and declines to skip on it, rather than clearing it | accepted; amends 0022 |
+| [0025](0025-a-declared-entity-scope-filters-after-retrieval-and-reports-what-it-excluded.md) | A declared entity scope filters after retrieval and reports what it excluded | accepted |
 
 ## When to write one
 

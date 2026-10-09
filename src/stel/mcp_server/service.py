@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from time import monotonic
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -23,7 +23,11 @@ from ..adapters.base import (
     ReadPredicateOperator,
     WarehouseIdentity,
 )
-from ..agent_context import citation_locator, freshness_status
+from ..agent_context import (
+    canonical_entity_key,
+    citation_locator,
+    freshness_status,
+)
 from ..append_log import query_fingerprint
 from ..retrieval.servability import (
     DEFAULT_CONTEXT_TIMEOUT_SECONDS,
@@ -52,6 +56,7 @@ from .authorization import (
 )
 from .catalog import ArtifactCatalog, ContextResource
 from .contracts import (
+    AppliedEntityScope,
     BusinessFilter,
     CitationDescriptor,
     CompactLineage,
@@ -60,6 +65,8 @@ from .contracts import (
     ContextLineageRecord,
     DocumentChunk,
     DocumentSource,
+    EntityExpansion,
+    EntityScope,
     FreshnessDescriptor,
     GetContextLineageRequest,
     GetContextLineageResponse,
@@ -68,6 +75,7 @@ from .contracts import (
     LineageReferenceType,
     ListContextModelsRequest,
     ListContextModelsResponse,
+    MatchedTerm,
     MCPErrorCode,
     SearchContextRequest,
     SearchContextResponse,
@@ -1147,8 +1155,30 @@ class ContextService:
             {str(row["context_id"]) for _, row, _ in readable},
             identity=authorized.warehouse_identity,
         )
+        # Scoped before the limit slice, so `limit` counts results that
+        # satisfy the scope rather than retrieval hits that may not.
+        scope = self._resolve_entity_scope(request.entity_scope)
+        matches: dict[str, tuple[MatchedTerm, ...]] = {}
+        excluded = 0
+        if scope is not None:
+            scoped: list[tuple[SearchResult, Mapping[str, Any], Mapping[str, Any]]] = []
+            for hit, row, registry in readable:
+                context_id = str(row["context_id"])
+                matched = scope.matches(links.get(context_id, ()))
+                if matched:
+                    matches[context_id] = matched
+                    scoped.append((hit, row, registry))
+            excluded = len(readable) - len(scoped)
+            readable = scoped
         results = tuple(
-            self._search_result(resource, hit, row, registry, links)
+            self._search_result(
+                resource,
+                hit,
+                row,
+                registry,
+                links,
+                matched_terms=matches.get(str(row["context_id"]), ()),
+            )
             for hit, row, registry in readable[: request.limit]
         )
         if pending_log is not None:
@@ -1169,6 +1199,9 @@ class ContextService:
         return SearchContextResponse(
             results=results,
             degraded=outcome.degraded,
+            entity_scope_applied=(
+                scope.applied(excluded) if scope is not None else None
+            ),
             safe_error_code=outcome.safe_error_code,
         )
 
@@ -1570,6 +1603,88 @@ class ContextService:
             )
         )
 
+    def _resolve_entity_scope(
+        self, scope: EntityScope | None
+    ) -> _ResolvedEntityScope | None:
+        """Turn a requested scope into the declared labels it accepts.
+
+        Refuses rather than returning an empty scope in three cases, because
+        each is a caller mistake and an empty result set would hide it: the
+        project declares no vocabulary at all, the named class is not
+        declared, or the named term is not declared. The messages name what
+        *is* declared, matching how `values_from:` reports an unknown
+        vocabulary at compile (issue #628).
+        """
+        if scope is None:
+            return None
+        vocabularies = self._catalog.vocabularies
+        if not vocabularies:
+            raise ContextServiceError(
+                MCPErrorCode.CAPABILITY_UNAVAILABLE,
+                "entity_scope requires the project to declare `vocabularies:`; "
+                "this one declares none",
+            )
+        if scope.entity_class is not None:
+            accepted = {
+                (name, label)
+                for name, vocabulary in vocabularies.items()
+                for label in vocabulary.labels_in_class(scope.entity_class)
+            }
+            if not accepted:
+                declared = sorted(
+                    {
+                        term.entity_class
+                        for vocabulary in vocabularies.values()
+                        for term in vocabulary.terms
+                        if term.entity_class is not None
+                    }
+                )
+                raise ContextServiceError(
+                    MCPErrorCode.INVALID_REQUEST,
+                    f"No declared term has class '{scope.entity_class}'. "
+                    f"Declared classes: {declared or '(none)'}",
+                )
+            return _ResolvedEntityScope(
+                requested=scope.entity_class,
+                requested_is_class=True,
+                expand=scope.expand,
+                exact=frozenset(accepted),
+                expanded=frozenset(),
+            )
+        term = scope.term
+        assert term is not None  # the scope validator permits no third case
+        holders = [
+            (name, vocabulary)
+            for name, vocabulary in vocabularies.items()
+            if any(item.label == term for item in vocabulary.terms)
+        ]
+        if not holders:
+            raise ContextServiceError(
+                MCPErrorCode.INVALID_REQUEST,
+                f"'{term}' is not a declared vocabulary term. The declared "
+                f"terms are published as a context model's `entity_types`.",
+            )
+        # A label may be declared in more than one vocabulary; the scope
+        # accepts it in each, and the hierarchy is walked per vocabulary so a
+        # term never inherits another vocabulary's parents or children.
+        expanded: set[tuple[str, str]] = set()
+        for name, vocabulary in holders:
+            if scope.expand is EntityExpansion.NARROWER:
+                expanded.update(
+                    (name, label) for label in vocabulary.narrower_labels(term)
+                )
+            elif scope.expand is EntityExpansion.BROADER:
+                expanded.update(
+                    (name, label) for label in vocabulary.broader_chain(term)
+                )
+        return _ResolvedEntityScope(
+            requested=term,
+            requested_is_class=False,
+            expand=scope.expand,
+            exact=frozenset((name, term) for name, _ in holders),
+            expanded=frozenset(expanded),
+        )
+
     def _entity_types(
         self,
         resource: ContextResource,
@@ -1636,6 +1751,8 @@ class ContextService:
         row: Mapping[str, Any],
         registry: Mapping[str, Any],
         links: Mapping[str, tuple[ContextEntity, ...]],
+        *,
+        matched_terms: tuple[MatchedTerm, ...],
     ) -> SearchContextResult:
         snippet, truncated = _truncate_text(
             _required_string(row, "text"),
@@ -1661,6 +1778,7 @@ class ContextService:
             # exactly the declared `returned: true` set, so this needs no
             # second read and cannot disagree with what the model declares.
             attributes=json_value(hit.metadata),
+            matched_terms=matched_terms,
         )
 
     def _document_chunk(
@@ -1802,6 +1920,86 @@ def _lineage(resource: ContextResource, row: Mapping[str, Any]) -> CompactLineag
         search_index_unique_id=resource.unique_id,
         store_type=resource.store_type,
     )
+
+
+def _declared_entity_key(label: str) -> Any:
+    """The decoded `entity_key` a declared term's link row carries.
+
+    Compared forward — label to key — rather than decoding a row's key back
+    into a label, because `canonical_entity_key` is this project's encoding
+    and its inverse is not published. A forward comparison cannot drift from
+    it; a hand-written decoder could.
+
+    Deliberately uncached: a module-level cache here would be process-global
+    state that outlives the test that filled it, and the encoding is a JSON
+    round trip over a short string.
+    """
+    return json.loads(canonical_entity_key(label))
+
+
+@dataclass(frozen=True)
+class _ResolvedEntityScope:
+    """A requested `entity_scope` resolved against the declaration (#628).
+
+    Matching is `(entity_namespace, entity_key)` against `(vocabulary name,
+    term label)` — the same reading of a link row that
+    `config.vocabulary.declared_terms` defines and the concept cloud uses, so
+    the two cannot disagree about what a link row means. A row whose
+    namespace names no declared vocabulary therefore matches nothing, which
+    is what keeps a fuzzy or hand-maintained resolver's rows from satisfying
+    a scope that names a declared class.
+    """
+
+    requested: str
+    requested_is_class: bool
+    expand: EntityExpansion
+    exact: frozenset[tuple[str, str]]
+    expanded: frozenset[tuple[str, str]]
+
+    def matches(self, entities: Sequence[ContextEntity]) -> tuple[MatchedTerm, ...]:
+        """Every accepted term one chunk's links satisfy, declared order aside.
+
+        Sorted so a response is stable across runs: the entity order comes
+        from the warehouse and the accepted set from a frozenset, neither of
+        which a caller should see vary.
+        """
+        found: list[MatchedTerm] = []
+        for namespace, label in sorted(self.exact | self.expanded):
+            expected = _declared_entity_key(label)
+            for entity in entities:
+                if entity.namespace == namespace and entity.entity_key == expected:
+                    found.append(
+                        MatchedTerm(
+                            namespace=namespace,
+                            label=label,
+                            requested=self.requested,
+                            relation=self._relation(namespace, label),
+                        )
+                    )
+                    break
+        return tuple(found)
+
+    def _relation(
+        self, namespace: str, label: str
+    ) -> Literal["exact", "narrower", "broader", "class_member"]:
+        if (namespace, label) in self.exact:
+            return "class_member" if self.requested_is_class else "exact"
+        return "narrower" if self.expand is EntityExpansion.NARROWER else "broader"
+
+    def applied(self, excluded: int) -> AppliedEntityScope:
+        return AppliedEntityScope(
+            requested_class=self.requested if self.requested_is_class else None,
+            requested_term=None if self.requested_is_class else self.requested,
+            expand=self.expand,
+            # Requested terms first, then the expanded ones, each sorted: a
+            # caller reading the head of the list sees what it asked for.
+            accepted_terms=(
+                tuple(sorted({label for _, label in self.exact}))
+                + tuple(sorted({label for _, label in self.expanded}))
+            ),
+            expanded_terms=tuple(sorted({label for _, label in self.expanded})),
+            results_excluded=excluded,
+        )
 
 
 def _entity(row: Mapping[str, Any]) -> ContextEntity:

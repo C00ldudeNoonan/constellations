@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### An agent can search by declared class and walk the hierarchy (issue #628)
+
+- **"Every central bank" was not an askable question.** `search_context`
+  could filter on a model's declared attributes, but an agent wanting the
+  documents about a kind of entity had to name each entity string a project
+  happened to write. `entity_scope` takes `{"class": "institution"}` for
+  every term of a declared class, or `{"term": "Central bank", "expand":
+  "narrower"}` for one term and the terms beneath it in the declared
+  `broader` hierarchy.
+- **Expansion is opt-in and never silent.** `expand` defaults to `none`.
+  Every scoped response carries `entity_scope_applied` — the requested class
+  or term, the accepted terms, which of them came from expansion, and how
+  many readable hits the scope excluded — and every result carries
+  `matched_terms`, naming the term it matched and whether that was the
+  requested term, a member of the requested class, or one reached through the
+  hierarchy. A hit that arrived by expansion is always distinguishable from
+  one that matched directly.
+- **A scope filters after retrieval**, against the entity links a hit already
+  carries, so it adds no warehouse read — and `limit` counts scoped results
+  rather than retrieval hits. The consequence is reported rather than hidden:
+  a narrow scope over a broad query can return fewer than `limit` while
+  matching documents sit deeper in the corpus, and `results_excluded` is the
+  signal to raise `candidate_limit`. ADR-0025 records why this is not a store
+  prefilter and what it would cost to make it one.
+- **A scope naming something undeclared is refused**, listing what is
+  declared, rather than returning nothing: an undeclared class and an empty
+  corpus are different answers. A project with no `vocabularies:` refuses an
+  `entity_scope` outright.
+- Matching is `(entity_namespace, entity_key)` against `(vocabulary name,
+  term label)`, so a link row from a fuzzy or hand-maintained resolver never
+  satisfies a scope naming a declared class. `agent_context/v1`'s
+  "not an entity-resolution system" scope note is reaffirmed with that
+  boundary stated, as the issue asks.
+- Additive to `mcp_context/v1` under ADR-0008's precedent: an unscoped caller
+  sees exactly the response it saw before.
+
 ### A context model's entity types come from the declaration (issue #628)
 
 - **`entity_types` was discovered by scanning, and could fail outright.** The

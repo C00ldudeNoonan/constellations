@@ -2005,6 +2005,78 @@ linking and the concept cloud, are covered in the entity-linking and
 relation-extraction sections; those are the separate pieces of work (issues
 #626-#629) that build on this declaration.
 
+**The governed MCP server reads it too.** A context model's descriptor
+(`list_context_models`) reports `entity_types`, the entity names an agent may
+ask about. With no `vocabularies:` block that list is discovered by scanning —
+every entity-link row, then every chunk those rows name, filtered to what the
+calling principal may read, and refused past `max_scan_rows`, so on a large
+corpus the descriptor call fails rather than answering. When a project
+declares a vocabulary, the list is the declared labels instead: constant time,
+no scan, and the same answer for every caller.
+
+That is a deliberate change of meaning, worth knowing if you read the field.
+It becomes *schema* — what the project declares it is about, the same kind of
+operator-authored fact as `schema_fields`, which the descriptor already
+publishes to everyone — rather than *data*, what happens to be in the rows you
+can see. An agent can no longer use `entity_types` to find out what the corpus
+actually contains, and a caller authorized for nothing still sees the
+vocabulary. In exchange the descriptor stops being a way to probe corpus
+contents, and stops failing on a large one. A project with no declaration
+keeps the scanned behaviour exactly.
+
+**And an agent can search by it.** `search_context` takes an `entity_scope`
+that restricts results to chunks linked to declared terms — the question
+"every central bank", which was previously askable only as the exact entity
+strings a project happened to write:
+
+```json
+{"model": "filings_search", "query": "balance sheet runoff",
+ "entity_scope": {"class": "institution"}}
+
+{"model": "filings_search", "query": "balance sheet runoff",
+ "entity_scope": {"term": "Central bank", "expand": "narrower"}}
+```
+
+A scope names exactly one of `class` (every term declaring that `class:`) or
+`term` (one term). `expand` applies to a term scope only, and is `none`
+unless asked for: `narrower` adds every term beneath it in the declared
+`broader` hierarchy, transitively; `broader` adds the chain above it.
+Expanding a `class` scope is refused — a class is already a set of terms.
+
+**Expansion is never silent.** Every scoped response carries
+`entity_scope_applied`, naming the requested class or term, the terms the
+scope accepted, which of those came from expansion (`expanded_terms`, empty
+when nothing was expanded), and `results_excluded`. Every result carries
+`matched_terms`, naming the term it actually matched and whether that was the
+requested term (`exact`), a member of the requested class (`class_member`), or
+one reached through the hierarchy (`narrower` / `broader`). So a hit that
+arrived because of expansion is always distinguishable from one that matched
+directly — which matters when citing it, since "about the Federal Reserve" and
+"about some central bank" are different claims.
+
+**A scope filters after retrieval**, against the entity links a hit already
+carries, so it costs no extra warehouse read. Because retrieval truncates its
+ranking to the limit it is given, a scoped request retrieves a *pool* rather
+than `limit` hits — `candidate_limit` when you set one, otherwise the same
+default the search itself would have used — and your `limit` is applied to
+what survives the scope. So `limit` counts scoped results, not retrieval hits,
+and its truncation is never counted as an exclusion.
+
+A narrow scope over a broad query can still return fewer than `limit` while
+matching documents sit deeper in the corpus, since the pool is finite.
+`results_excluded` is the signal: when it is large relative to what came back,
+raise `candidate_limit` to deepen the pool the scope filters. ADR-0025 records
+why this is not a store prefilter, and what making it one would cost.
+
+A scope requires a declaration. Naming an undeclared class or term is
+refused with `invalid_request`, listing what is declared, rather than
+returning nothing — an undeclared class and an empty corpus are different
+answers. A project with no `vocabularies:` at all refuses an `entity_scope`
+with `capability_unavailable`. Matching is `(entity_namespace, entity_key)`
+against `(vocabulary name, term label)`, so a link row written by a fuzzy or
+hand-maintained resolver — which carries an `entity_namespace` too, but is not
+a declaration — never satisfies a scope that names a declared class.
+
 Structure-preserving options for document parsing:
 
 ```yaml

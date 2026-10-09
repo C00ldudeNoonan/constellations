@@ -63,6 +63,97 @@ class BusinessFilter(BaseModel):
         return self
 
 
+class EntityExpansion(StrEnum):
+    """How far a declared term scope reaches past the term itself (issue #628).
+
+    `NONE` is the default because expansion changes what a search means: a
+    caller that asked for one term and silently received its children cannot
+    tell the difference, which is the behaviour the issue forbids.
+    """
+
+    NONE = "none"
+    NARROWER = "narrower"
+    BROADER = "broader"
+
+
+class EntityScope(BaseModel):
+    """Restrict a search to chunks linked to declared vocabulary terms.
+
+    Exactly one of `entity_class` (every term declaring that `class:`) or
+    `term` (one term, optionally expanded through `broader`). Both name
+    *declared* things: a scope naming something the project does not declare
+    is refused rather than quietly matching nothing, because an empty result
+    and an undeclared class are different answers to an agent.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    # Authored as `class:` to match `vocabularies:` term syntax; `class` is a
+    # Python keyword, so the attribute carries the same name it does on
+    # `VocabularyTerm`.
+    entity_class: str | None = Field(
+        default=None, alias="class", min_length=1, max_length=128
+    )
+    term: str | None = Field(default=None, min_length=1, max_length=256)
+    expand: EntityExpansion = EntityExpansion.NONE
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> EntityScope:
+        if (self.entity_class is None) == (self.term is None):
+            raise ValueError("an entity scope names exactly one of class or term")
+        if self.entity_class is not None and self.expand is not EntityExpansion.NONE:
+            # A class is already a set of terms; expanding it would mean
+            # walking every member's hierarchy, which is a different and much
+            # larger request than the issue asks for. Refused rather than
+            # ignored, so a caller is never told something it did not ask.
+            raise ValueError("expand applies to a term scope, not a class scope")
+        return self
+
+
+class MatchedTerm(BaseModel):
+    """Why one result satisfied the request's entity scope (issue #628).
+
+    Present on every result of a scoped search, so an agent can tell an exact
+    hit from one reached through the hierarchy without comparing the result's
+    entities against its own request.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    namespace: str
+    # The term the chunk is actually linked to, which is not the requested
+    # term when `relation` is anything but `exact`.
+    label: str
+    # What the caller asked for: the class name, or the term.
+    requested: str
+    relation: Literal["exact", "narrower", "broader", "class_member"]
+
+
+class AppliedEntityScope(BaseModel):
+    """What the request's entity scope resolved to, and what it cost.
+
+    Reported on every scoped response rather than only when expansion
+    happened: "nothing was expanded" is itself the answer to "did a narrower
+    term reach me", and a caller should not have to infer it from absence.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    requested_class: str | None = None
+    requested_term: str | None = None
+    expand: EntityExpansion = EntityExpansion.NONE
+    # Every declared label the scope accepts, including the requested term.
+    accepted_terms: tuple[str, ...] = ()
+    # The subset reached by expansion — empty under `expand: none`. An agent
+    # reading only this field can tell whether the hierarchy was walked.
+    expanded_terms: tuple[str, ...] = ()
+    # Hits the caller could read that the scope excluded. A scoped search
+    # filters after retrieval (see ADR-0025), so this is how a caller learns
+    # that a short result set means "the scope was narrow", not "the corpus
+    # is thin" — and that raising `candidate_limit` may return more.
+    results_excluded: int = 0
+
+
 class ContextField(BaseModel):
     model_config = _STRICT_CONFIG
 
@@ -135,6 +226,12 @@ class SearchContextRequest(BaseModel):
     # come back, which is `limit`.
     candidate_limit: int | None = Field(default=None, ge=1, le=1000)
     filters: tuple[BusinessFilter, ...] = ()
+    # Restrict results to chunks linked to declared vocabulary terms (issue
+    # #628). Unlike `filters`, which compile into the store's prefilter, this
+    # is applied after retrieval against the entity links a hit already
+    # carries; ADR-0025 records why, and `AppliedEntityScope.results_excluded`
+    # is how a caller sees the consequence.
+    entity_scope: EntityScope | None = None
 
 
 class ContextEntity(BaseModel):
@@ -229,6 +326,10 @@ class SearchContextResult(BaseModel):
     # `docs/adr/0008-mcp-hits-carry-declared-attributes.md` for why this is not
     # a v2.
     attributes: dict[str, JsonValue] = Field(default_factory=dict)
+    # Why this result satisfied the request's `entity_scope`, empty on an
+    # unscoped search (issue #628). Additive and defaulted, like `attributes`
+    # above and for the same reason — see ADR-0008.
+    matched_terms: tuple[MatchedTerm, ...] = ()
 
 
 class SearchContextResponse(BaseModel):
@@ -243,6 +344,9 @@ class SearchContextResponse(BaseModel):
     # response, where there is no lease to ask. Additive to `mcp_context/v1`
     # rather than a v2, per the precedent ADR-0008 set for `attributes`.
     degraded: bool = False
+    # What the request's `entity_scope` resolved to, None when unscoped
+    # (issue #628).
+    entity_scope_applied: AppliedEntityScope | None = None
     safe_error_code: str | None = None
     error: ToolError | None = None
 

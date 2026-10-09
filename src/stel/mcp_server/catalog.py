@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..config import load_project
+from ..config.vocabulary import Vocabulary
 from .authorization import PolicyAttribute
 from .contracts import (
     ContextField,
@@ -70,8 +71,19 @@ class ContextResource:
 
 
 class ArtifactCatalog:
-    def __init__(self, resources: Sequence[ContextResource]) -> None:
+    def __init__(
+        self,
+        resources: Sequence[ContextResource],
+        *,
+        vocabularies: Mapping[str, Vocabulary] | None = None,
+    ) -> None:
         self._resources = {resource.name: resource for resource in resources}
+        # The project's declared vocabularies (issue #625), or empty when the
+        # project declares none -- which is what makes the derived
+        # `entity_types` fall back to scanning rather than reporting nothing
+        # (issue #628). `from_payloads` has no project to read, so a caller
+        # holding only a manifest gets the scan too.
+        self._vocabularies: Mapping[str, Vocabulary] = dict(vocabularies or {})
 
     @classmethod
     def load(
@@ -90,6 +102,7 @@ class ArtifactCatalog:
             manifest,
             run_results=run_results,
             expected_target=expected_target,
+            vocabularies=project.vocabularies,
         )
 
     @classmethod
@@ -99,6 +112,7 @@ class ArtifactCatalog:
         *,
         run_results: Mapping[str, Any] | None = None,
         expected_target: str | None = None,
+        vocabularies: Mapping[str, Vocabulary] | None = None,
     ) -> ArtifactCatalog:
         if manifest.get("manifest_version") != 2:
             raise ArtifactCatalogError(
@@ -222,7 +236,12 @@ class ArtifactCatalog:
                     last_successful_materialization=last_success.get(name),
                 )
             )
-        return cls(resources)
+        return cls(resources, vocabularies=vocabularies)
+
+    @property
+    def vocabularies(self) -> Mapping[str, Vocabulary]:
+        """The declared vocabularies, empty when the project declares none."""
+        return self._vocabularies
 
     def all(self) -> tuple[ContextResource, ...]:
         return tuple(sorted(self._resources.values(), key=lambda item: item.name))

@@ -18,7 +18,7 @@ import pytest
 from stel.config.loader import ConfigError, load_project
 from stel.config.model import FieldConfig
 from stel.config.project import ProjectConfig
-from stel.config.vocabulary import Vocabulary, VocabularyTerm
+from stel.config.vocabulary import Vocabulary, VocabularyTerm, declared_terms
 
 # ─── the vocabulary declaration ─────────────────────────────────────────────
 
@@ -66,6 +66,82 @@ def test_duplicate_alias_is_rejected() -> None:
 def test_broader_term_must_exist_in_the_same_vocabulary() -> None:
     with pytest.raises(ValueError, match="not a term in this vocabulary"):
         Vocabulary(terms=[VocabularyTerm(label="fed", broader="central_bank")])
+
+
+def test_the_hierarchy_can_be_walked_in_both_directions() -> None:
+    """`broader` is declared one way and read both ways (issue #628).
+
+    Only `broader` is authored, so a term cannot be its parent's child
+    without that parent being its parent -- one direction is the single
+    source of truth. `narrower_labels` inverts it transitively, which is what
+    expanding a query to "every central bank" needs.
+    """
+    vocabulary = Vocabulary(
+        terms=[
+            VocabularyTerm(label="institution"),
+            VocabularyTerm(label="central_bank", broader="institution"),
+            VocabularyTerm(label="fed", broader="central_bank"),
+            VocabularyTerm(label="ecb", broader="central_bank"),
+            VocabularyTerm(label="imf", broader="institution"),
+        ]
+    )
+
+    # Nearest first, and never the term itself.
+    assert vocabulary.broader_chain("fed") == ["central_bank", "institution"]
+    assert vocabulary.broader_chain("institution") == []
+    # Breadth-first, transitive, and never the term itself.
+    assert vocabulary.narrower_labels("central_bank") == ["fed", "ecb"]
+    assert vocabulary.narrower_labels("institution") == [
+        "central_bank",
+        "imf",
+        "fed",
+        "ecb",
+    ]
+    assert vocabulary.narrower_labels("fed") == []
+    # An undeclared label is an empty answer, not an error: the caller decides
+    # whether asking about an unknown term is a mistake.
+    assert vocabulary.broader_chain("unknown") == []
+    assert vocabulary.narrower_labels("unknown") == []
+
+
+def test_terms_can_be_listed_by_declared_class() -> None:
+    vocabulary = Vocabulary(
+        terms=[
+            VocabularyTerm(label="fed", **{"class": "CentralBank"}),
+            VocabularyTerm(label="ecb", **{"class": "CentralBank"}),
+            VocabularyTerm(label="imf", **{"class": "Multilateral"}),
+            VocabularyTerm(label="unclassed"),
+        ]
+    )
+
+    # Declared order, not sorted: it is the order the operator wrote.
+    assert vocabulary.labels_in_class("CentralBank") == ["fed", "ecb"]
+    assert vocabulary.labels_in_class("Multilateral") == ["imf"]
+    assert vocabulary.labels_in_class("Nonexistent") == []
+
+
+def test_declared_terms_are_keyed_by_namespace_and_label() -> None:
+    """The one rule for reading a link row's declaration (issues #661, #628).
+
+    A `link_entities` row carries the vocabulary's name as its
+    `entity_namespace` and a term's label as the canonical id, so that pair is
+    the key. Shared by the concept cloud and the MCP server rather than
+    written twice -- two resolvers disagreeing about what a link row means is
+    the drift this prevents.
+    """
+    vocabularies = {
+        "indicators": Vocabulary(terms=[VocabularyTerm(label="cpi")]),
+        "institutions": Vocabulary(terms=[VocabularyTerm(label="fed")]),
+    }
+
+    index = declared_terms(vocabularies)
+
+    assert set(index) == {("indicators", "cpi"), ("institutions", "fed")}
+    assert index[("institutions", "fed")].label == "fed"
+    # A namespace naming no declared vocabulary contributes nothing, which is
+    # what keeps a fuzzy or hand-maintained resolver's rows from reading as
+    # declarations (issue #661) -- they carry an `entity_namespace` too.
+    assert ("spacy", "fed") not in index
 
 
 def test_broader_term_cannot_be_itself() -> None:

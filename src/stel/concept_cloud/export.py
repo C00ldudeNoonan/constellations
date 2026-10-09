@@ -26,7 +26,7 @@ from typing import Any, Literal, NamedTuple, cast
 import polars as pl
 
 from ..config import load_project
-from ..config.vocabulary import Vocabulary
+from ..config.vocabulary import Vocabulary, declared_terms
 from ..manifest import MANIFEST_FILENAME, write_manifest
 from .schema import (
     Concept,
@@ -292,15 +292,19 @@ def _declared_by_term(
 ) -> dict[tuple[str, str], _Declared]:
     """Declared fields keyed by (vocabulary name, term label). A vocabulary's
     name is the `entity_namespace` its alias rows carry (issue #627), and a
-    term's label is the canonical id those rows link to."""
+    term's label is the canonical id those rows link to.
+
+    The keying lives in `config.vocabulary.declared_terms` so the MCP server
+    resolves a link row the same way this does (issue #628); only the
+    projection to the fields a concept displays is local.
+    """
     return {
-        (vocab_name, term.label): _Declared(
+        key: _Declared(
             entity_class=term.entity_class,
             definition=term.description,
             broader=term.broader,
         )
-        for vocab_name, vocabulary in vocabularies.items()
-        for term in vocabulary.terms
+        for key, term in declared_terms(vocabularies).items()
     }
 
 

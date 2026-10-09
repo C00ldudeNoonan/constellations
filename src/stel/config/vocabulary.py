@@ -18,6 +18,7 @@ growing to anticipate them.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -136,6 +137,83 @@ class Vocabulary(BaseModel):
         return {
             term.label: term.description for term in self.terms if term.description
         }
+
+    def labels_in_class(self, entity_class: str) -> list[str]:
+        """Preferred labels whose term declares `entity_class`, in declared order.
+
+        Exact match on the class name, which `ProjectConfig` has already
+        checked against `classes:` for every term -- so an unknown class here
+        yields nothing rather than an error, and the caller decides whether
+        asking for an undeclared class is a mistake or an empty answer.
+        """
+        return [term.label for term in self.terms if term.entity_class == entity_class]
+
+    def broader_chain(self, label: str) -> list[str]:
+        """The labels above `label`, nearest first, excluding `label` itself.
+
+        Terminates because `broader` cycles are rejected at validation; the
+        `seen` guard is kept anyway so a future construction path that skips
+        validation cannot hang a server (this walks on a request).
+        """
+        by_label = {term.label: term for term in self.terms}
+        if label not in by_label:
+            return []
+        out: list[str] = []
+        seen = {label}
+        current = by_label[label].broader
+        while current is not None and current not in seen:
+            out.append(current)
+            seen.add(current)
+            current = by_label[current].broader if current in by_label else None
+        return out
+
+    def narrower_labels(self, label: str) -> list[str]:
+        """Every label under `label`, transitively, in declared order.
+
+        Derived from `broader` rather than declared separately: one direction
+        is the single source of truth, so a term cannot be its parent's child
+        without its parent being its parent. Breadth-first, so nearer terms
+        come first, and `label` itself is never included.
+        """
+        children: dict[str, list[str]] = {}
+        for term in self.terms:
+            if term.broader is not None:
+                children.setdefault(term.broader, []).append(term.label)
+        out: list[str] = []
+        seen = {label}
+        frontier = list(children.get(label, ()))
+        while frontier:
+            current = frontier.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            out.append(current)
+            frontier.extend(children.get(current, ()))
+        return out
+
+
+def declared_terms(
+    vocabularies: Mapping[str, Vocabulary],
+) -> dict[tuple[str, str], VocabularyTerm]:
+    """Every declared term keyed by (vocabulary name, term label).
+
+    That pair is how a `link_entities` output row names a declaration: the row
+    carries the vocabulary's name as its `entity_namespace` (issue #627) and
+    the term's label as the canonical id it linked to. Written inline for the
+    concept cloud first (issue #661) and lifted here when the MCP server
+    needed the identical lookup -- two resolvers disagreeing about what a link
+    row means is the drift worth one shared function.
+
+    A namespace that names no declared vocabulary simply contributes no keys,
+    which is what makes the lookup safe on rows a fuzzy or hand-maintained
+    resolver produced: those carry an `entity_namespace` too, and it is not a
+    declaration (issue #661).
+    """
+    return {
+        (vocab_name, term.label): term
+        for vocab_name, vocabulary in vocabularies.items()
+        for term in vocabulary.terms
+    }
 
 
 class RelationTypeDef(BaseModel):

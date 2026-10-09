@@ -119,6 +119,33 @@ guess. Record the deriving resolver with
 `entity_link:fuzzy:1`) so the link's method identity is auditable and
 invalidates the row when the resolver changes.
 
+### The entity-resolution boundary, restated (issue #628)
+
+That scope note is reaffirmed, not amended, and `search_context`'s
+`entity_scope` is where it was most likely to erode, so the line is worth
+stating in the terms the feature raises.
+
+A scope filters on labels a link row **already carries**. Resolving a mention
+to a canonical id is the `link_entities` transform's job, upstream of this
+contract, and remote knowledge-base resolution is a separate, unbuilt piece of
+work (issue #238). `entity_scope` performs no matching of its own: no fuzzy
+comparison, no normalization, no inference that two strings name the same
+thing. It accepts a chunk when `(entity_namespace, entity_key)` equals
+`(vocabulary name, term label)` exactly, and otherwise does not.
+
+Hierarchy expansion does not cross that line either. It walks `broader`,
+which an operator authored in `stel_project.yml` and `ProjectConfig`
+validated — a declared statement that one term is above another, not a
+derived one. stel does not infer hierarchy from the corpus, and a term's
+place in it is whatever the declaration says.
+
+The practical consequence, which the governed grain depends on: a link row
+produced by a fuzzy or hand-maintained resolver carries an
+`entity_namespace` too, and that namespace is not a declaration. Such a row
+never satisfies a scope naming a declared class. A caller asking for a
+declared class is answered from the declaration or not at all — this contract
+still does not decide who or what an entity is.
+
 ## Shared fields
 
 ### Bitemporal fields

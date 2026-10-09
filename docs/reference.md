@@ -4844,6 +4844,18 @@ counts the history strip already reads; no export or schema change. For a
 risk-factor map this is usually the headline a single frozen view hides most
 completely: Ukraine and inflation entering in 2022, COVID-19 fading by 2024.
 
+**"Focus on its constellation"** (issue #555 item 5) answers *what does X
+name?* A selected concept's card offers it: every concept outside that star's
+constellation is hidden rather than dimmed, and the camera re-frames on what
+is left — on a dense map, dimming shows where a star is, but only hiding shows
+what it is named with. The constellation is the one **in the current view**: a
+pair not named together in the selected period, or below the min edge
+strength, draws no line, so its far end is hidden too. Focus only ever hides
+more — a neighbour the legend or the min-frequency filter has hidden stays
+hidden. Clicking a neighbour moves the focus to it, so the graph can be walked
+one constellation at a time; clicking empty space clears the selection and
+brings the whole map back. Viewer-only; no export or schema change.
+
 **`--top-n-per-period N` keeps what mattered *within* a period.** `--top-n`
 ranks on total frequency across the corpus, which trims exactly what a time
 axis exists to show: a risk that enters, dominates one period, and is

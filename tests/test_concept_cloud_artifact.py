@@ -194,6 +194,19 @@ def test_cli_concept_cloud_threads_title_and_subtitle(tmp_path: Path) -> None:
     assert 'SUBTITLE_OVERRIDE = "2010-2024"' in html
 
 
+def test_cli_concept_cloud_takes_the_documented_short_output_flag(tmp_path: Path) -> None:
+    """Every example in docs/reference.md writes `-o cloud.html`; the option
+    had only its long form, so the first command a reader copied failed."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    out = tmp_path / "cloud.html"
+    result = CliRunner().invoke(cli, ["concept-cloud", "--placeholder", "-o", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+
+
 def test_cli_concept_cloud_requires_a_source() -> None:
     from click.testing import CliRunner
 
@@ -472,7 +485,7 @@ def test_the_detail_card_draws_a_concept_history() -> None:
 
     assert "function sparkline(node)" in html
     # Actually reached from the card, rather than defined and orphaned.
-    assert "sparkline(node);" in html
+    assert "sparkline(node) +" in html
     assert '<div class="spark">' in html
     # The strip is read against the period slider: the current bar is lit.
     assert '`<i class="${p === period ? "now" : ""}" ' in html
@@ -592,3 +605,38 @@ def test_an_unchanged_pair_of_periods_says_so_rather_than_an_empty_panel() -> No
     html = render_concept_cloud(_timed_export())
 
     assert '<span class="empty">No change between ${esc(from)} and ${esc(to)}.</span>' in html
+
+
+# ─── ego view: "what does X name" (issue #555 item 5) ───────────────────────
+
+
+def test_focus_hides_everything_outside_the_selected_constellation() -> None:
+    """Dimming answers "where is X"; on a dense map only hiding answers "what
+    does X name". The card offers it, and it hides concepts only -- the dbt
+    plane stays governed by lineage mode."""
+    html = render_concept_cloud(placeholder_export())
+
+    assert '"Show the whole map" : "Focus on its constellation"' in html
+    dag_rule = html.index('if (n.kind === "dag") return lineageMode;')
+    focus_rule = html.index("if (focus && !ego.has(n.id)) return false;")
+    assert dag_rule < focus_rule
+
+
+def test_the_focused_constellation_follows_the_period_and_strength_filter() -> None:
+    """A pair not named together in the selected period, or below the strength
+    filter, draws no line -- so its far end is not part of what the star names
+    right now, and focus must hide it rather than float it alone."""
+    html = render_concept_cloud(_weighted_export())
+
+    assert 'if (l.kind !== "concept" || periodWeight(l) < minWeight) return;' in html
+    # Recomputed on every refresh, which every period/strength change goes through.
+    assert "if (!selected) focus = false;\n        recomputeEgo();" in html
+
+
+def test_focus_reframes_the_camera_on_what_it_shows() -> None:
+    """Five stars seen from the whole-map distance are five specks. Leaving
+    focus by clearing the selection reframes on the whole map."""
+    html = render_concept_cloud(placeholder_export())
+
+    assert "Graph.zoomToFit(600, 60, n => nodeVisible(n))" in html
+    assert "if (wasFocused) fitView();" in html

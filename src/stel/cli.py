@@ -2330,6 +2330,7 @@ def mcp_serve(
 
 @cli.command("concept-cloud")
 @click.option(
+    "-o",
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=Path("concept_cloud.html"),

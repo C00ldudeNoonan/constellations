@@ -657,11 +657,17 @@ class _TwoAllowedSearch(FakeSearch):
         timings: PhaseTimings | None = None,
     ) -> SearchOutcome:
         self.request = request
+        self.policy_filters = tuple(policy_filters)
+        # Truncated to the requested limit, exactly as `search()` does to
+        # its fused ranking. A double that returned everything regardless
+        # would hide whether a scoped request retrieves a deeper pool at
+        # all (Codex review on #668).
+        results = (
+            _hit(CONTEXT_ALLOWED_1, DOC_ALLOWED, CHUNK_ALLOWED_1, rank=1),
+            _hit(CONTEXT_ALLOWED_2, DOC_ALLOWED, CHUNK_ALLOWED_2, rank=2),
+        )
         return SearchOutcome(
-            results=(
-                _hit(CONTEXT_ALLOWED_1, DOC_ALLOWED, CHUNK_ALLOWED_1, rank=1),
-                _hit(CONTEXT_ALLOWED_2, DOC_ALLOWED, CHUNK_ALLOWED_2, rank=2),
-            ),
+            results=results[: request.limit],
             degraded=False,
             safe_error_code=None,
         )
@@ -726,14 +732,17 @@ def _scope_rows(*, namespace: str = "institutions") -> dict[str, Any]:
 
 
 def _scoped_service(
-    *, rows: Mapping[str, Any] | None = None, declared: bool = True
-) -> ContextService:
-    service, _ = _service(
+    *,
+    rows: Mapping[str, Any] | None = None,
+    declared: bool = True,
+    settings: ContextServerSettings | None = None,
+) -> tuple[ContextService, FakeSearch]:
+    return _service(
         repository=FakeRepository(rows if rows is not None else _scope_rows()),
         search=_TwoAllowedSearch(),
         vocabularies=_scope_vocabularies() if declared else None,
+        settings=settings,
     )
-    return service
 
 
 def _scoped_search(
@@ -757,7 +766,7 @@ def test_a_class_scope_keeps_only_the_chunks_that_class_names() -> None:
     scope that matched everything would satisfy the `institution` assertion
     alone, and one that matched nothing would satisfy the `indicator` one.
     """
-    service = _scoped_service()
+    service, _ = _scoped_service()
     try:
         institutions = _scoped_search(service, EntityScope(entity_class="institution"))
         indicators = _scoped_search(service, EntityScope(entity_class="indicator"))
@@ -797,7 +806,7 @@ def test_narrower_expansion_is_opt_in_and_names_the_term_that_matched() -> None:
     reached too -- and says so, both per result and in the applied scope, so
     an agent never has to infer that the hierarchy was walked.
     """
-    service = _scoped_service()
+    service, _ = _scoped_service()
     try:
         exact = _scoped_search(service, EntityScope(term="Central bank"))
         expanded = _scoped_search(
@@ -837,7 +846,7 @@ def test_broader_expansion_reaches_the_parent_term() -> None:
     The sibling `Bank of England` is never reached: it is neither the term
     nor above it.
     """
-    service = _scoped_service()
+    service, _ = _scoped_service()
     try:
         response = _scoped_search(
             service,
@@ -867,7 +876,7 @@ def test_an_unscoped_search_reports_no_scope_at_all() -> None:
     which only holds if an unscoped caller sees exactly the response it saw
     before.
     """
-    service = _scoped_service()
+    service, _ = _scoped_service()
     try:
         response = _scoped_search(service, None)
     finally:
@@ -896,7 +905,7 @@ def test_a_scope_naming_something_undeclared_is_refused(
     it actually mistyped a class name. Both branches are covered because they
     look up different things and fail independently.
     """
-    service = _scoped_service()
+    service, _ = _scoped_service()
     try:
         response = _scoped_search(service, scope)
     finally:
@@ -914,7 +923,7 @@ def test_a_scope_against_a_project_with_no_declaration_is_refused() -> None:
     Distinct from an undeclared class: nothing is declared, so the capability
     itself is absent rather than the request being wrong.
     """
-    service = _scoped_service(declared=False)
+    service, _ = _scoped_service(declared=False)
     try:
         response = _scoped_search(service, EntityScope(entity_class="institution"))
     finally:
@@ -935,7 +944,7 @@ def test_a_link_outside_the_declaration_cannot_satisfy_a_class_scope() -> None:
     concept cloud follows. The labels here are the declared ones, so a match
     on label alone would return both chunks.
     """
-    service = _scoped_service(rows=_scope_rows(namespace="fuzzy_kb"))
+    service, _ = _scoped_service(rows=_scope_rows(namespace="fuzzy_kb"))
     try:
         response = _scoped_search(service, EntityScope(entity_class="institution"))
     finally:
@@ -970,7 +979,7 @@ def test_limit_counts_scoped_results_and_is_not_an_exclusion() -> None:
     truncation there would tell a caller to widen `candidate_limit` when the
     answer was simply capped.
     """
-    service = _scoped_service()
+    service, _ = _scoped_service()
     try:
         response = _scoped_search(
             service, EntityScope(entity_class="institution"), limit=1
@@ -981,6 +990,111 @@ def test_limit_counts_scoped_results_and_is_not_an_exclusion() -> None:
     assert len(response.results) == 1
     assert response.entity_scope_applied is not None
     assert response.entity_scope_applied.results_excluded == 0
+
+
+def test_a_scoped_request_retrieves_a_pool_deeper_than_its_limit() -> None:
+    """Otherwise the scope could only ever filter `limit` hits (#668 review).
+
+    `search()` truncates its fused ranking to the limit it is given, so a
+    scope applied afterwards would see exactly `limit` hits and no more --
+    `candidate_limit` could not deepen it, and the documented advice to raise
+    it would be false.
+
+    The qualifying chunk here is the *second* hit and `limit` is 1, so a
+    request that retrieved only `limit` would hand the scope one
+    non-qualifying hit and return nothing.
+    """
+    service, search = _scoped_service()
+    try:
+        response = _scoped_search(service, EntityScope(term="Central bank"), limit=1)
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert [result.context_id for result in response.results] == [CONTEXT_ALLOWED_2]
+    assert search.request is not None
+    assert search.request.limit > 1
+
+
+def test_a_caller_can_deepen_the_scoped_pool_with_candidate_limit() -> None:
+    """The documented lever has to actually move the pool (#668 review).
+
+    `results_excluded` tells a caller to raise `candidate_limit` when a scope
+    returns little; that advice is only true if the value reaches retrieval.
+    """
+    service, search = _scoped_service()
+    try:
+        service.search_context(
+            SearchContextRequest(
+                model="context_search",
+                query="rates",
+                mode="text",
+                limit=2,
+                candidate_limit=200,
+                entity_scope=EntityScope(entity_class="institution"),
+            )
+        )
+    finally:
+        service.close()
+
+    assert search.request is not None
+    assert search.request.limit == 200
+
+
+def test_scope_membership_is_judged_on_every_link_not_the_bounded_list() -> None:
+    """The response's entity list is capped; qualification is not (#668 review).
+
+    `max_entities_per_context` truncates what a result carries. Judging a
+    scope against that truncated list would exclude a chunk whose qualifying
+    term fell past the cap -- and since row order is not guaranteed, exclude
+    it only sometimes. Here the cap is 1 and the declared term is the *second*
+    link on the chunk.
+    """
+    rows = dict(_fixture_rows()) | {
+        "context_entity_links": (
+            _declared_link(CONTEXT_ALLOWED_2, "institutions", "Headline inflation"),
+            _declared_link(CONTEXT_ALLOWED_2, "institutions", "Central bank"),
+        )
+    }
+    service, _ = _scoped_service(
+        rows=rows,
+        settings=ContextServerSettings(max_entities_per_context=1),
+    )
+    try:
+        response = _scoped_search(service, EntityScope(term="Central bank"))
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert [result.context_id for result in response.results] == [CONTEXT_ALLOWED_2]
+    # The bounded list the response carries is still capped at one entity --
+    # the fix must not widen what a caller receives.
+    assert len(response.results[0].entities) == 1
+
+
+def test_an_undeclared_scope_is_refused_before_retrieval_runs() -> None:
+    """No embedding call, no warehouse read, for a request that cannot work.
+
+    Resolution used to happen after `_search.execute` and after the chunk,
+    registry and entity-link reads, so an undeclared class spent remote work
+    before being refused -- and if retrieval failed first the caller got that
+    operational error instead of the deterministic refusal (#668 review).
+    """
+    repository = FakeRepository(_scope_rows())
+    service, search = _service(
+        repository=repository,
+        search=_TwoAllowedSearch(),
+        vocabularies=_scope_vocabularies(),
+    )
+    try:
+        response = _scoped_search(service, EntityScope(entity_class="central_bank"))
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INVALID_REQUEST
+    assert search.request is None
+    assert repository.calls == []
 
 
 def test_missing_principal_fails_closed_before_discovery() -> None:

@@ -1107,17 +1107,38 @@ class ContextService:
                 MCPErrorCode.CAPABILITY_UNAVAILABLE,
                 "The context model does not support the requested retrieval mode",
             )
+        # Resolved before retrieval, so a scope naming an undeclared class
+        # cannot spend an embedding call and a warehouse read before being
+        # refused -- and so the refusal is deterministic rather than
+        # whichever error retrieval happened to raise first (Codex review on
+        # #668). It reads the declaration only; nothing here touches the
+        # network.
+        scope = self._resolve_entity_scope(request.entity_scope)
         filters = tuple(
             self._business_filter(resource, item) for item in request.filters
         )
         timings = PhaseTimings()
+        # `search()` truncates its fused ranking to the limit it is given, so
+        # a scope that filters afterwards would only ever see `limit` hits and
+        # `candidate_limit` could not deepen what it filters. A scoped request
+        # therefore retrieves a pool and the caller's `limit` is applied after
+        # scoping (ADR-0025).
+        retrieval_limit = (
+            _scope_pool_size(request, self._settings.max_candidates)
+            if scope is not None
+            else request.limit
+        )
         outcome = self._search.execute(
             SearchRequest(
                 model=resource.name,
                 query=request.query,
                 mode=SearchMode(request.mode),
-                limit=request.limit,
-                candidate_limit=request.candidate_limit,
+                limit=retrieval_limit,
+                candidate_limit=(
+                    retrieval_limit
+                    if scope is not None
+                    else request.candidate_limit
+                ),
                 filters=filters,
             ),
             policy_filters=authorized.policy_filters,
@@ -1150,21 +1171,26 @@ class ContextService:
             ):
                 continue
             readable.append((hit, row, registry))
-        links = self._entity_links(
+        links, link_keys = self._entity_links_and_keys(
             resource,
             {str(row["context_id"]) for _, row, _ in readable},
             identity=authorized.warehouse_identity,
         )
         # Scoped before the limit slice, so `limit` counts results that
         # satisfy the scope rather than retrieval hits that may not.
-        scope = self._resolve_entity_scope(request.entity_scope)
         matches: dict[str, tuple[MatchedTerm, ...]] = {}
         excluded = 0
         if scope is not None:
             scoped: list[tuple[SearchResult, Mapping[str, Any], Mapping[str, Any]]] = []
             for hit, row, registry in readable:
                 context_id = str(row["context_id"])
-                matched = scope.matches(links.get(context_id, ()))
+                # Matched against *every* link row read, not the bounded list
+                # the response carries: `max_entities_per_context` truncates
+                # the presentation set, and a chunk whose qualifying term fell
+                # past that cap would otherwise be excluded -- and, since row
+                # order is not guaranteed, excluded nondeterministically
+                # (Codex review on #668).
+                matched = scope.matches(link_keys.get(context_id, ()))
                 if matched:
                     matches[context_id] = matched
                     scoped.append((hit, row, registry))
@@ -1535,9 +1561,37 @@ class ContextService:
         *,
         identity: WarehouseIdentity,
     ) -> dict[str, tuple[ContextEntity, ...]]:
+        return self._entity_links_and_keys(
+            resource, context_ids, identity=identity
+        )[0]
+
+    def _entity_links_and_keys(
+        self,
+        resource: ContextResource,
+        context_ids: set[str],
+        *,
+        identity: WarehouseIdentity,
+    ) -> tuple[
+        dict[str, tuple[ContextEntity, ...]],
+        dict[str, tuple[tuple[str, Any], ...]],
+    ]:
+        """The bounded entity list a response carries, and every link's key.
+
+        Two returns from one read, because they answer different questions.
+        The first is presentation and is capped at
+        `max_entities_per_context`. The second is every
+        `(entity_namespace, entity_key)` the rows carry, uncapped, because an
+        entity scope decides whether a chunk *qualifies* -- and judging that
+        against a truncated list would exclude a chunk whose qualifying term
+        happened to fall past the cap, nondeterministically, since row order
+        is not guaranteed (Codex review on #668). Uncapped costs nothing
+        extra: these rows are already read, and the cap was only ever applied
+        while projecting them.
+        """
         grouped: dict[str, list[ContextEntity]] = {}
+        keys: dict[str, list[tuple[str, Any]]] = {}
         if not context_ids:
-            return {}
+            return {}, {}
         for relation in resource.entity_relations:
             rows = self._repository.read_rows(
                 relation,
@@ -1552,14 +1606,24 @@ class ContextService:
                 context_id = row.get("context_id")
                 if not isinstance(context_id, str) or context_id not in context_ids:
                     continue
+                entity = _entity(row)
+                keys.setdefault(context_id, []).append(
+                    (entity.namespace, entity.entity_key)
+                )
                 entities = grouped.setdefault(context_id, [])
                 if len(entities) >= self._settings.max_entities_per_context:
                     continue
-                entities.append(_entity(row))
-        return {
-            context_id: tuple(sorted(entities, key=lambda item: item.entity_id))
-            for context_id, entities in grouped.items()
-        }
+                entities.append(entity)
+        return (
+            {
+                context_id: tuple(sorted(entities, key=lambda item: item.entity_id))
+                for context_id, entities in grouped.items()
+            },
+            {
+                context_id: tuple(pairs)
+                for context_id, pairs in keys.items()
+            },
+        )
 
     def _declared_entity_types(self) -> tuple[str, ...] | None:
         """The labels a project's declaration offers, or None when it declares
@@ -1922,6 +1986,20 @@ def _lineage(resource: ContextResource, row: Mapping[str, Any]) -> CompactLineag
     )
 
 
+def _scope_pool_size(request: SearchContextRequest, ceiling: int) -> int:
+    """How deep a scoped request retrieves before the scope filters it.
+
+    `candidate_limit` when the caller set one, which is what makes the
+    documented advice true: raising it deepens the pool the scope sees.
+    Otherwise the same default `search()` would have computed for its own
+    candidates, so an unset `candidate_limit` behaves as it does everywhere
+    else. Bounded by the server's `max_candidates` because this is the number
+    of hits the service will then read chunks and registry rows for.
+    """
+    requested = request.candidate_limit or max(request.limit * 4, 50)
+    return max(request.limit, min(requested, ceiling))
+
+
 def _declared_entity_key(label: str) -> Any:
     """The decoded `entity_key` a declared term's link row carries.
 
@@ -1956,18 +2034,24 @@ class _ResolvedEntityScope:
     exact: frozenset[tuple[str, str]]
     expanded: frozenset[tuple[str, str]]
 
-    def matches(self, entities: Sequence[ContextEntity]) -> tuple[MatchedTerm, ...]:
-        """Every accepted term one chunk's links satisfy, declared order aside.
+    def matches(
+        self, link_keys: Sequence[tuple[str, Any]]
+    ) -> tuple[MatchedTerm, ...]:
+        """Every accepted term one chunk's links satisfy.
 
-        Sorted so a response is stable across runs: the entity order comes
-        from the warehouse and the accepted set from a frozenset, neither of
-        which a caller should see vary.
+        `link_keys` is every `(entity_namespace, entity_key)` the chunk's link
+        rows carry, uncapped — see `_entity_links_and_keys` for why the
+        bounded presentation list is the wrong input here.
+
+        Sorted so a response is stable across runs: the link order comes from
+        the warehouse and the accepted set from a frozenset, neither of which
+        a caller should see vary.
         """
         found: list[MatchedTerm] = []
         for namespace, label in sorted(self.exact | self.expanded):
             expected = _declared_entity_key(label)
-            for entity in entities:
-                if entity.namespace == namespace and entity.entity_key == expected:
+            for link_namespace, link_key in link_keys:
+                if link_namespace == namespace and link_key == expected:
                     found.append(
                         MatchedTerm(
                             namespace=namespace,

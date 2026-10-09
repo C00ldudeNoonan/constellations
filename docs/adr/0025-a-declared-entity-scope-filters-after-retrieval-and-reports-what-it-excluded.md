@@ -33,6 +33,31 @@ warehouse read and no store round trip. Filtering before the slice means
 `limit` counts results that satisfy the scope rather than retrieval hits that
 may not.
 
+Three consequences of "after retrieval" that are easy to get wrong, each
+pinned by a test:
+
+**A scoped request retrieves a pool, not `limit` hits.** `search()` truncates
+its fused ranking to the limit it is given, so a scope applied afterwards
+would see exactly `limit` hits — and `candidate_limit` could not deepen what
+the scope filters, making the advice below false. A scoped request therefore
+asks retrieval for `candidate_limit` when the caller set one, otherwise the
+same default `search()` would have computed for its own candidates, bounded by
+the server's `max_candidates`; the caller's `limit` is applied to what
+survives the scope.
+
+**Qualification is judged on every link, not the bounded list.**
+`max_entities_per_context` caps what a result carries. That cap is
+presentation: judging the scope against a truncated list would exclude a chunk
+whose qualifying term fell past it, and, since row order is not guaranteed,
+exclude it only sometimes. The rows are already read, so the uncapped key set
+costs nothing — the cap is applied only while projecting the response.
+
+**The scope resolves before retrieval runs.** It reads the declaration and
+touches no network, so resolving it after authorization and before
+`_search.execute` means an undeclared class cannot spend an embedding call and
+a warehouse read before being refused, and the refusal is deterministic rather
+than whichever error retrieval raised first.
+
 Matching is `(entity_namespace, entity_key)` against `(vocabulary name, term
 label)` — the reading of a link row that `config.vocabulary.declared_terms`
 defines and the concept cloud already follows. A row whose namespace names no
@@ -53,6 +78,27 @@ retrieved candidate set, a narrow scope over a broad query can return fewer
 results than `limit` while matching documents exist deeper in the corpus.
 `results_excluded` is how a caller learns that raising `candidate_limit` may
 return more, and the reference documents it in those terms.
+
+## Known limitation: the declaration is live, the links are published
+
+`ArtifactCatalog.load` reads `vocabularies:` from the current
+`stel_project.yml`, while the entity links it interprets were published by an
+earlier run. An operator who edits a term's `class:` or `broader` and starts
+the server *without* recompiling and republishing therefore has old link rows
+read under a new declaration: a scoped search can then return results that are
+wrong rather than merely stale — a term moved between classes changes which
+scope a chunk answers, with nothing reporting the mismatch.
+
+This is not introduced by the scope; the `entity_types` descriptor has the
+same exposure. It is sharper here because a scope's answer depends on class
+membership and hierarchy, not just on a label set.
+
+Not fixed in this decision, because the fix is an artifact contract change —
+persisting the declaration, or a fingerprint of it, into the manifest, which
+is `manifest_version: 2` today and would have to version. Tracked separately
+(issue #669). Until then the operational rule is the ordinary one: recompile
+and republish after editing the declaration, as for any other compile-time
+config.
 
 ## Alternatives considered
 

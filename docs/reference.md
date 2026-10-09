@@ -2055,13 +2055,18 @@ directly — which matters when citing it, since "about the Federal Reserve" and
 "about some central bank" are different claims.
 
 **A scope filters after retrieval**, against the entity links a hit already
-carries, so it costs no extra warehouse read — but it means a narrow scope
-over a broad query can return fewer than `limit` results while matching
-documents sit deeper in the corpus. `results_excluded` is the signal: when it
-is large, raise `candidate_limit` to deepen the pool the scope filters.
-`limit` itself counts scoped results, not retrieval hits, and its truncation
-is never counted as an exclusion. ADR-0025 records why this is not a store
-prefilter.
+carries, so it costs no extra warehouse read. Because retrieval truncates its
+ranking to the limit it is given, a scoped request retrieves a *pool* rather
+than `limit` hits — `candidate_limit` when you set one, otherwise the same
+default the search itself would have used — and your `limit` is applied to
+what survives the scope. So `limit` counts scoped results, not retrieval hits,
+and its truncation is never counted as an exclusion.
+
+A narrow scope over a broad query can still return fewer than `limit` while
+matching documents sit deeper in the corpus, since the pool is finite.
+`results_excluded` is the signal: when it is large relative to what came back,
+raise `candidate_limit` to deepen the pool the scope filters. ADR-0025 records
+why this is not a store prefilter, and what making it one would cost.
 
 A scope requires a declaration. Naming an undeclared class or term is
 refused with `invalid_request`, listing what is declared, rather than

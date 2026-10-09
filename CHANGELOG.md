@@ -21,11 +21,24 @@
   one that matched directly.
 - **A scope filters after retrieval**, against the entity links a hit already
   carries, so it adds no warehouse read — and `limit` counts scoped results
-  rather than retrieval hits. The consequence is reported rather than hidden:
-  a narrow scope over a broad query can return fewer than `limit` while
-  matching documents sit deeper in the corpus, and `results_excluded` is the
-  signal to raise `candidate_limit`. ADR-0025 records why this is not a store
+  rather than retrieval hits. A scoped request retrieves a *pool* to filter,
+  since retrieval truncates its ranking to the limit it is given:
+  `candidate_limit` when set, otherwise the default the search would have
+  used. The remaining consequence is reported rather than hidden — a narrow
+  scope over a broad query can still return fewer than `limit`, and
+  `results_excluded` is the signal to deepen the pool. Qualification is
+  judged on every link row, not the `max_entities_per_context`-bounded list
+  a result carries, so a chunk whose matching term fell past that cap is not
+  excluded nondeterministically. ADR-0025 records why this is not a store
   prefilter and what it would cost to make it one.
+- **An invalid scope is refused before retrieval runs**, so a request naming
+  an undeclared class cannot spend an embedding call and a warehouse read
+  first, and its refusal is deterministic rather than whichever error
+  retrieval happened to raise.
+- Known limitation, tracked as #669: the serving catalog reads the *live*
+  declaration rather than the one that published the links, so editing
+  `vocabularies:` without recompiling can change what a scope returns.
+  Recompile and republish after editing the declaration.
 - **A scope naming something undeclared is refused**, listing what is
   declared, rather than returning nothing: an undeclared class and an empty
   corpus are different answers. A project with no `vocabularies:` refuses an

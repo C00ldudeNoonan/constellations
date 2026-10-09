@@ -25,6 +25,7 @@ import polars as pl
 
 from ..adapters import (
     AdapterError,
+    LayoutPruningColumns,
     ReadPredicate,
     ReadPredicateOperator,
     StateAbsenceProbe,
@@ -33,6 +34,7 @@ from ..adapters import (
     StateValue,
     TableSnapshotGenerationChangedError,
     WarehouseAdapter,
+    layout_pruning_predicates,
 )
 from ..budget import BudgetExceededError, BudgetGuard, BudgetLedger
 from ..config.model import EMBED_METADATA_FIELDS, ModelConfig
@@ -207,7 +209,13 @@ def _run_embed_model(
     # first provider call, and only on the *resume* path, where the run being
     # resumed has already proven the corpus is large (issue #401 follow-up).
     reuse_reader = (
-        _EmbeddingReuseReader(adapter, model.name, config=config, timings=timings)
+        _EmbeddingReuseReader(
+            adapter,
+            model.name,
+            config=config,
+            pruning=adapter.layout_pruning_columns(warehouse_opts),
+            timings=timings,
+        )
         if is_incremental and not rebuild_target
         else None
     )
@@ -296,9 +304,7 @@ def _run_embed_model(
         nonlocal cache_hits
         if reuse_reader is None:
             return
-        window_reuse = reuse_reader.rows_for(
-            [item.record_id for item in window]
-        )
+        window_reuse = reuse_reader.rows_for([item.record for item in window])
         for item in window:
             existing = window_reuse.get(item.record_id)
             if (
@@ -756,6 +762,16 @@ class _EmbeddingReuseReader:
     - **Reuse columns, one window at a time.** A keyed IN predicate over the
       window's typed ids, projected to the hash/vector columns, so residency
       is bounded by `flush_every` whatever the corpus size.
+    - **Scoped to the window's layout values** (issue #664). A keyed read of
+      a column that is neither the partition nor a clustering key scans the
+      whole column -- 21 GiB per lookup on a 3.67M-row table, nearly all of
+      it the vector column -- so each lookup also carries the window's own
+      range over the target's partition column and value lists over its
+      clustering columns, which is what lets BigQuery skip the storage
+      outside the window. A target row published under *other* layout values
+      for the same id falls outside those predicates and is not found: that
+      row re-embeds, a paid call for correct output, the same price its text
+      changing would cost. No layout, no predicates, the read as it was.
 
     The target is mutable by design: every successful window publishes before
     the next lookup. A BigQuery query result is immutable, but eventually
@@ -772,6 +788,7 @@ class _EmbeddingReuseReader:
         table: str,
         *,
         config: Any,
+        pruning: LayoutPruningColumns,
         timings: PhaseTimings,
     ) -> None:
         self._adapter = adapter
@@ -785,6 +802,7 @@ class _EmbeddingReuseReader:
             config.vector_field,
             "embedded_at",
         )
+        self._pruning = pruning
         self._usable = False
         self._target_keys: dict[str, Any] = {}
         self._load_keys()
@@ -800,6 +818,20 @@ class _EmbeddingReuseReader:
             # A pre-embed table (or an older contract) has nothing to reuse;
             # the old whole-table loader answered {} here too.
             return
+        # The layout is declared on the model and the predicates run against
+        # the target, so a layout column the target does not have (declared
+        # after the table was built, say) is dropped here rather than failing
+        # every lookup at snapshot open.
+        self._pruning = LayoutPruningColumns(
+            (
+                self._pruning.range_column
+                if self._pruning.range_column in names
+                else None
+            ),
+            tuple(
+                column for column in self._pruning.membership_columns if column in names
+            ),
+        )
         self._target_keys = self._retry_snapshot_read(self._read_target_keys_once)
         self._usable = True
 
@@ -851,13 +883,17 @@ class _EmbeddingReuseReader:
     # fails before embedding begins.
     _LOOKUP_KEYS_PER_READ = 10_000
 
-    def rows_for(self, record_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+    def rows_for(
+        self, records: Sequence[Mapping[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """The target's reuse columns for the upstream `records` it holds,
+        keyed by stringified id. The records themselves, not only their ids:
+        their layout values are what scopes each lookup (issue #664)."""
         if not self._usable:
             return {}
-        typed = [
-            key
-            for record_id in record_ids
-            if (key := self._target_keys.get(record_id)) is not None
+        typed: list[tuple[Any, Mapping[str, Any]]] = []
+        for record in records:
+            key = self._target_keys.get(str(record[self._id_field]))
             # A key the predicate contract cannot carry (DuckDB DECIMAL,
             # BigQuery NUMERIC) skips reuse rather than failing the resume:
             # the row re-embeds -- correct output, paid call -- which is the
@@ -865,12 +901,14 @@ class _EmbeddingReuseReader:
             # whole-target dict handled these ids, so this is the one
             # narrowing the bounded path makes, and it is a cost, not a
             # correctness change.
-            and isinstance(key, str | int | float | bool | date | datetime)
-        ]
-        if len(typed) < len(record_ids):
+            if key is not None and isinstance(
+                key, str | int | float | bool | date | datetime
+            ):
+                typed.append((key, record))
+        if len(typed) < len(records):
             log.debug(
                 "embed reuse lookup skipped %d id(s) with non-scalar key types",
-                len(record_ids) - len(typed),
+                len(records) - len(typed),
             )
         found: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(typed), self._LOOKUP_KEYS_PER_READ):
@@ -880,12 +918,23 @@ class _EmbeddingReuseReader:
             )
         return found
 
-    def _read_rows_for_chunk(self, chunk: Sequence[Any]) -> dict[str, dict[str, Any]]:
-        predicate = ReadPredicate(
-            self._id_field,
-            ReadPredicateOperator.IN,
-            tuple(chunk),
-        )
+    def _read_rows_for_chunk(
+        self, chunk: Sequence[tuple[Any, Mapping[str, Any]]]
+    ) -> dict[str, dict[str, Any]]:
+        predicates = [
+            ReadPredicate(
+                self._id_field,
+                ReadPredicateOperator.IN,
+                tuple(key for key, _ in chunk),
+            ),
+            # Per chunk, not per window: a chunk's own range and value lists
+            # are at most as wide as the window's.
+            *layout_pruning_predicates(
+                self._pruning,
+                [record for _, record in chunk],
+                exclude=self._id_field,
+            ),
+        ]
         found: dict[str, dict[str, Any]] = {}
         # Credited whole -- open, pull, and the dict build -- where the
         # upstream `read` phase credits only the pull. The difference is not
@@ -904,7 +953,7 @@ class _EmbeddingReuseReader:
             with self._adapter.table_snapshot(
                 self._table,
                 columns=list(self._columns),
-                predicate=predicate,
+                predicate=predicates,
                 batch_size=len(chunk),
             ) as snapshot:
                 for batch in snapshot:

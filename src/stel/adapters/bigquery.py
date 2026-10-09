@@ -58,10 +58,13 @@ from ..progress import get_reporter
 from ..sql_models import build_key_check_sql
 from ..timing import PhaseTimings
 from .base import (
+    LAYOUT_MEMBERSHIP_LIMIT,
+    NO_LAYOUT_PRUNING,
     SERVING_LEDGER_TABLE,
     STAGING_TABLE_PREFIX,
     AdapterCapabilityError,
     AdapterError,
+    LayoutPruningColumns,
     ReadPredicate,
     ReadPredicateOperator,
     SnapshotResumePoint,
@@ -1295,6 +1298,20 @@ class BigQueryAdapter(WarehouseAdapter):
             )
         except ValueError as error:
             raise AdapterError(str(error)) from None
+
+    def layout_pruning_columns(self, options: BaseModel | None) -> LayoutPruningColumns:
+        # The *declared* layout, not the table's. An incremental target keeps
+        # its physical layout until --full-refresh, so the two can differ; a
+        # predicate on a column the table is not actually partitioned or
+        # clustered on skips nothing and excludes nothing, because the merge
+        # proves every matched row satisfies it first and the reuse read
+        # tolerates a miss.
+        layout = self._layout(options)
+        if layout is None:
+            return NO_LAYOUT_PRUNING
+        partition_by = layout.partition_by
+        range_column = partition_by.field if partition_by is not None else None
+        return LayoutPruningColumns(range_column, tuple(layout.cluster_by))
 
     # ─── lifecycle ────────────────────────────────────────────────────────
 
@@ -2640,6 +2657,168 @@ class BigQueryAdapter(WarehouseAdapter):
         trunc = "TIMESTAMP_TRUNC" if pb.data_type == "timestamp" else "DATETIME_TRUNC"
         return f"{trunc}({ref}, {granularity})"
 
+    def _prunable_merge_columns(
+        self, df: pl.DataFrame, options: BaseModel | None, *, key_col: str
+    ) -> LayoutPruningColumns:
+        """The declared layout columns this batch can prune its MERGE on
+        (issue #664): present in the batch, never the merge key itself, with
+        no NULL (a NULL matches no range and no list, so a matched target row
+        would fall outside the predicate and the guard would reject the whole
+        batch), and for a clustering column at most `LAYOUT_MEMBERSHIP_LIMIT`
+        distinct values. Decided from the frame, which is in hand, rather than
+        from the staging table, which would cost a query."""
+        declared = self.layout_pruning_columns(options)
+        range_column = declared.range_column
+        if (
+            range_column is not None
+            and (
+                range_column == key_col
+                or range_column not in df.columns
+                or df[range_column].null_count() > 0
+            )
+        ):
+            range_column = None
+        membership = tuple(
+            column
+            for column in declared.membership_columns
+            if column != key_col
+            and column in df.columns
+            and df[column].null_count() == 0
+            and df[column].n_unique() <= LAYOUT_MEMBERSHIP_LIMIT
+        )
+        return LayoutPruningColumns(range_column, membership)
+
+    def _prunable_merge_columns_from_staging(
+        self,
+        staging: str,
+        options: BaseModel | None,
+        *,
+        key_col: str,
+        staged_columns: Sequence[str],
+    ) -> LayoutPruningColumns:
+        """`_prunable_merge_columns` for a batch that exists only as a staged
+        table (the SQL-model path): one aggregate over the staging table
+        answers the NULL and cardinality questions the frame answers in
+        memory. Staging holds the batch, not the target, so the aggregate is
+        priced by the batch."""
+        declared = self.layout_pruning_columns(options)
+        candidates = [
+            column
+            for column in declared.columns
+            if column != key_col and column in staged_columns
+        ]
+        if not candidates:
+            return NO_LAYOUT_PRUNING
+        measures = ", ".join(
+            f"COUNTIF({self.quote_ident(column)} IS NULL), "
+            f"COUNT(DISTINCT {self.quote_ident(column)})"
+            for column in candidates
+        )
+        rows = list(
+            self._run_query(f"SELECT {measures} FROM {self.table_ref(staging)}").result()
+        )
+        if not rows:
+            return NO_LAYOUT_PRUNING
+        stats = list(rows[0].values())
+        usable: set[str] = set()
+        for index, column in enumerate(candidates):
+            nulls = int(stats[2 * index] or 0)
+            distinct = int(stats[2 * index + 1] or 0)
+            if nulls == 0 and (
+                column == declared.range_column or distinct <= LAYOUT_MEMBERSHIP_LIMIT
+            ):
+                usable.add(column)
+        range_column = declared.range_column
+        return LayoutPruningColumns(
+            range_column if range_column in usable else None,
+            tuple(column for column in declared.membership_columns if column in usable),
+        )
+
+    def _layout_pruned_merge(
+        self,
+        table: str,
+        staging: str,
+        *,
+        key_col: str,
+        prunable: LayoutPruningColumns,
+        target_alias: str,
+        source_alias: str,
+        merge_body: str,
+    ) -> str:
+        """One MERGE of `staging` into `table` on `key_col`, pruned to the
+        batch's layout values when that is provably safe (issue #664).
+
+        A MERGE whose join is only `target.key = source.key` reads every
+        partition and block of the target that *might* hold a key, which on a
+        wide table is most of it: 4.45 GiB per flush against a 28.5 GiB
+        embeddings table, 4 TiB over one backfill. A constant predicate on the
+        partition column (a closed range) and the clustering columns (a value
+        list) lets BigQuery skip the storage outside the batch -- but a target
+        row whose key is in the batch and whose layout values are *not* would
+        then be unmatched, and the MERGE would insert its key a second time.
+        dbt leaves that hazard to the operator (`incremental_predicates`); here
+        the script proves its absence first, with one join over the key and
+        layout columns only, and falls back to the unpruned MERGE when any
+        such row exists. The batch's values come from the staging table inside
+        the script, as script variables, which is the form BigQuery's own
+        partition pruning is documented to honor (the same form
+        `_insert_overwrite_script` relies on).
+
+        Without a prunable column the plain MERGE is returned unchanged.
+        """
+        join = (
+            f"{target_alias}.{self.quote_ident(key_col)} = "
+            f"{source_alias}.{self.quote_ident(key_col)}"
+        )
+        head = (
+            f"MERGE {self.table_ref(table)} AS {target_alias} "
+            f"USING {self.table_ref(staging)} AS {source_alias} ON "
+        )
+        if not prunable.columns:
+            return f"{head}{join} {merge_body}"
+        staging_ref = self.table_ref(staging)
+        declarations: list[str] = []
+        conditions: list[str] = []
+        if prunable.range_column is not None:
+            column = self.quote_ident(prunable.range_column)
+            declarations.append(
+                f"DECLARE stel_prune_lo DEFAULT (SELECT MIN({column}) FROM {staging_ref});"
+            )
+            declarations.append(
+                f"DECLARE stel_prune_hi DEFAULT (SELECT MAX({column}) FROM {staging_ref});"
+            )
+            conditions.append(
+                f"{target_alias}.{column} BETWEEN stel_prune_lo AND stel_prune_hi"
+            )
+        for index, name in enumerate(prunable.membership_columns):
+            column = self.quote_ident(name)
+            declarations.append(
+                f"DECLARE stel_prune_in_{index} DEFAULT "
+                f"ARRAY(SELECT DISTINCT {column} FROM {staging_ref});"
+            )
+            conditions.append(f"{target_alias}.{column} IN UNNEST(stel_prune_in_{index})")
+        pruned = " AND ".join(conditions)
+        # NOT COALESCE(..., FALSE): a target row with a NULL layout value fails
+        # the pruned join just as one outside the range does, so it has to
+        # count as a stray too.
+        guard = (
+            "DECLARE stel_prune_strays BOOL;\n"
+            "SET stel_prune_strays = EXISTS("
+            f"SELECT 1 FROM {self.table_ref(table)} AS {target_alias} "
+            f"JOIN {staging_ref} AS {source_alias} ON {join} "
+            f"WHERE NOT COALESCE({pruned}, FALSE));"
+        )
+        return (
+            "\n".join(declarations)
+            + "\n"
+            + guard
+            + "\nIF stel_prune_strays THEN\n"
+            + f"{head}{join} {merge_body};\n"
+            + "ELSE\n"
+            + f"{head}{join} AND {pruned} {merge_body};\n"
+            + "END IF;"
+        )
+
     def _insert_overwrite_script(
         self,
         table: str,
@@ -3136,18 +3315,24 @@ class BigQueryAdapter(WarehouseAdapter):
             # commits or fails, so a failed merge never leaves the target
             # partially updated. USING references the staged table directly
             # (not the original select_sql), so the merged rowset is exactly
-            # what was validated above.
-            merge_sql = (
-                f"MERGE {self.table_ref(table)} AS T "
-                f"USING {staging_ref} AS S "
-                f"ON T.{key} = S.{key} "
-                + (
+            # what was validated above. The layout-pruned form (issue #664)
+            # keeps that: its guard and its one MERGE run in one script.
+            merge_sql = self._layout_pruned_merge(
+                table,
+                staging,
+                key_col=unique_key,
+                prunable=self._prunable_merge_columns_from_staging(
+                    staging, options, key_col=unique_key, staged_columns=source_cols
+                ),
+                target_alias="T",
+                source_alias="S",
+                merge_body=(
                     f"WHEN MATCHED THEN UPDATE SET {update_set} "
                     if update_set
                     else ""
                 )
                 + f"WHEN NOT MATCHED THEN INSERT ({insert_col_list}) "
-                f"VALUES ({insert_val_list})"
+                f"VALUES ({insert_val_list})",
             )
             try:
                 job = self._run_query(merge_sql)
@@ -3446,13 +3631,21 @@ class BigQueryAdapter(WarehouseAdapter):
                     )
                     when_matched = f"WHEN MATCHED AND ({changed}) THEN UPDATE SET"
                 job = self._run_query(
-                    f"MERGE {self.table_ref(table)} AS target "
-                    f"USING {self.table_ref(staging)} AS source "
-                    f"ON target.{self.quote_ident(key_col)} = "
-                    f"source.{self.quote_ident(key_col)} "
-                    f"{when_matched} {assignments} "
-                    f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
-                    f"VALUES ({insert_values})",
+                    self._layout_pruned_merge(
+                        table,
+                        staging,
+                        key_col=key_col,
+                        prunable=self._prunable_merge_columns(
+                            load_df, options, key_col=key_col
+                        ),
+                        target_alias="target",
+                        source_alias="source",
+                        merge_body=(
+                            f"{when_matched} {assignments} "
+                            f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) "
+                            f"VALUES ({insert_values})"
+                        ),
+                    ),
                     job_labels=job_labels,
                 )
                 _log_publication(

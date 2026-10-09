@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### An incremental MERGE and the embed reuse read are pruned to the batch's layout (issue #664)
+
+- **A MERGE joined only on the key reads most of a wide table.** astrolabe's
+  3.67M-row embeddings table (28.5 GiB, partitioned by filing month, clustered
+  by `symbol, form_type`, keyed on a hash) billed 4.45 GiB per flush and 4 TiB
+  over one backfill; the embed resume's keyed read-back of the same table
+  billed 21 GiB per lookup, almost all of it the vector column.
+- On BigQuery, when a model declares `partition_by` with a `field` or
+  `cluster_by`, the incremental publish now carries the batch's own values on
+  those columns in the join — the partition column as a `MIN`..`MAX` range,
+  each clustering column as its distinct values — which is the form BigQuery
+  prunes on. **A guard proves it safe first:** one narrow join asks whether any
+  matched target row lies outside the batch's values (a re-dated filing), and
+  the unpruned MERGE runs when one does, so a key never ends with two rows.
+  Guard and MERGE are one script, one job.
+  [ADR-0024](docs/adr/0024-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md)
+  records why dbt's unguarded `incremental_predicates` was not copied.
+- The embed reuse lookup carries the same predicates per window. A target row
+  published under other layout values for the same id is a miss, and that row
+  re-embeds: a paid call for correct output, the same price as changed text.
+- The key is never repeated as a predicate; a column the batch lacks, has NULL
+  in, or (clustering) holds more than 1,000 distinct values of is left out for
+  that batch. `transform:` SQL models' MERGE takes the same path. The new
+  adapter seam is `layout_pruning_columns`; DuckDB declares none and is
+  unchanged.
+- **Docs:** a column test (`not_null`, `unique`, …) scans its whole column per
+  invocation; on a vector or long-text column that was 20.9 GiB a day.
+
 ## v0.21.0 - 2026-10-06
 
 ### A resumed search publish no longer pays index maintenance on every page (issue #616)

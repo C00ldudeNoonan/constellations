@@ -72,6 +72,10 @@
     .spark i { flex: 1 1 0; min-width: 2px; background: var(--accent);
       opacity: .62; border-radius: 1px 1px 0 0; transition: opacity .15s; }
     .spark i.now { opacity: 1; }
+    #detail .focus { display: block; margin-top: 10px; padding: 4px 10px;
+      background: rgba(5, 8, 16, .6); color: var(--accent); cursor: pointer;
+      border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 12px; }
+    #detail .focus:hover { border-color: var(--accent); }
     /* "What changed" between two periods (#555 item 6). */
     /* No `display: none` here: the element's own inline `style` attribute
        carries the initial hidden state, same as #period-ctl and the other
@@ -189,6 +193,10 @@
     let colorBy = DIMENSIONS[0];
     const hidden = new Set();   // values of the CURRENT dimension toggled off
     let selected = null;        // currently selected node id
+    // Ego view (#555 item 5): with a selection, hide every concept outside its
+    // constellation instead of dimming it. Dimming answers "where is X"; only
+    // hiding answers "what does X name" once the map is dense.
+    let focus = false;
     // Node id -> node, so the detail card can be re-rendered when the period
     // changes without waiting for the next click.
     const nodeById = new Map();
@@ -416,6 +424,7 @@
     // click or a search hit does before the library loads: nothing, rather
     // than throwing -- the library-independent UI renders first on purpose.
     let selectConceptById = () => {};
+    let toggleFocus = () => {};
 
     // Concept names and descriptions are warehouse text an operator wrote, and
     // both the panel and the library's tooltip render as HTML. Escape at the
@@ -468,7 +477,9 @@
             : "") + " · " +
           `<span class="k">link</span> ${esc(node.link_status)}` +
           (dims ? `<br>${dims}` : "") +
-          sparkline(node);
+          sparkline(node) +
+          `<button class="focus">${focus ? "Show the whole map" : "Focus on its constellation"}</button>`;
+        el.querySelector(".focus").onclick = () => toggleFocus();
       } else {
         el.innerHTML = `<strong>${esc(node.name)}</strong><br>` +
           `<span class="k">dbt ${esc(node.resource_type)}</span><br>${esc(node.id)}`;
@@ -646,6 +657,23 @@
         });
       }
 
+      // The selected star's constellation *in the current view*: itself plus
+      // every concept it is named with here. A pair the period or the strength
+      // filter hides draws no line, so its far end is not part of what the
+      // star names right now and focus hides it too.
+      const ego = new Set();
+      function recomputeEgo() {
+        ego.clear();
+        if (!selected) return;
+        ego.add(selected);
+        links.forEach(l => {
+          if (l.kind !== "concept" || periodWeight(l) < minWeight) return;
+          const s = l.source.id ?? l.source, t = l.target.id ?? l.target;
+          if (s === selected) ego.add(t);
+          else if (t === selected) ego.add(s);
+        });
+      }
+
       function conceptColor(n) {
         if (highlightOrphans) return isOrphan(n.id) ? "#ff5c5c" : DIM;
         const base = colorBy.color[colorBy.valueOf(n)] || "#5a6478";
@@ -684,6 +712,9 @@
 
       function nodeVisible(n) {
         if (n.kind === "dag") return lineageMode;
+        // Focus only ever hides more: a neighbour the legend, the period or
+        // the frequency filter has hidden stays hidden.
+        if (focus && !ego.has(n.id)) return false;
         if (hidden.has(colorBy.valueOf(n))) return false;
         const freq = periodFreq(n);
         // Absent in this period means absent from the sky. Scaling it to
@@ -794,10 +825,10 @@
           l.kind === "cross" && touching.has(linkKey(l)) ? 3 : 0)
         .onNodeClick(node => {
           selected = (selected === node.id) ? null : node.id;
-          recomputeTouching(); showDetail(selected ? node : null); fullRefresh();
+          refreshSelection();
         })
         .onBackgroundClick(() => {
-          selected = null; recomputeTouching(); showDetail(null); fullRefresh();
+          selected = null; refreshSelection();
         });
 
       if (THREE) {
@@ -807,6 +838,9 @@
       }
 
       fullRefresh = () => {
+        // Nothing selected means nothing to focus on.
+        if (!selected) focus = false;
+        recomputeEgo();
         // Library-driven accessors...
         Graph.nodeColor(Graph.nodeColor()).nodeVisibility(Graph.nodeVisibility())
              .linkVisibility(Graph.linkVisibility()).linkColor(Graph.linkColor())
@@ -838,9 +872,33 @@
         const node = nodeById.get(id);
         if (!node) return;
         selected = node.id; recomputeTouching(); showDetail(node);
+        fullRefresh();
+        if (focus) { fitView(); return; }
         const x = node.fx ?? node.x, y = node.fy ?? node.y, z = node.fz ?? node.z;
         if (x !== undefined) Graph.cameraPosition({ x, y: y + 30, z: z + 80 }, node, 600);
+      };
+
+      // Re-frame on what is shown rather than leave the camera where it was:
+      // five stars seen from the whole-map distance are five specks.
+      const fitView = () => Graph.zoomToFit(600, 60, n => nodeVisible(n));
+
+      // A click while focused moves the focus with it, so following a
+      // neighbour walks the graph one constellation at a time; clearing the
+      // selection brings the whole map back and frames it.
+      function refreshSelection() {
+        const wasFocused = focus;
+        recomputeTouching();
+        showDetail(selected ? nodeById.get(selected) : null);
         fullRefresh();
+        if (wasFocused) fitView();
+      }
+
+      toggleFocus = () => {
+        if (!selected) return;
+        focus = !focus;
+        fullRefresh();
+        showDetail(nodeById.get(selected));
+        fitView();
       };
 
       // 3d-force-graph sizes its canvas from the container once at init; if the
@@ -876,7 +934,7 @@
 
       document.getElementById("search").addEventListener("input", e => {
         const q = e.target.value.trim().toLowerCase();
-        if (!q) { selected = null; recomputeTouching(); showDetail(null); fullRefresh(); return; }
+        if (!q) { selected = null; refreshSelection(); return; }
         const hit = nodes.find(n => n.kind === "concept" &&
           (n.name.toLowerCase().includes(q) || n.id.toLowerCase().includes(q)));
         if (hit) selectConceptById(hit.id);

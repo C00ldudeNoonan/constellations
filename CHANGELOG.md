@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### The star map can focus on one concept's constellation (issue #555)
+
+- **"Focus on its constellation"** on a selected concept's card hides every
+  concept it is not named with, instead of dimming them, and re-frames the
+  camera — dimming shows where a star is; only hiding shows what it names on
+  a dense map. The constellation follows the period slider and the min edge
+  strength filter. Clicking a neighbour walks the focus to it; clicking empty
+  space brings the whole map back.
+- **`stel concept-cloud -o` works.** Every example in the reference wrote
+  `-o cloud.html`, but the option had only its long form `--output`, so the
+  first command a reader copied failed with `No such option '-o'`.
+
 ### The concept-cloud page heading is operator-settable (issue #555)
 
 - **`stel concept-cloud` gains `--title` / `--subtitle`.** The page heading and

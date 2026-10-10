@@ -535,6 +535,10 @@ def _bigquery_type(arrow_type: pa.DataType) -> str:
         return "STRING"
     if pa.types.is_integer(arrow_type):
         return "INTEGER"
+    if pa.types.is_timestamp(arrow_type):
+        # BigQuery hands a DATETIME back as a zone-less Arrow timestamp and a
+        # TIMESTAMP as a UTC one.
+        return "DATETIME" if arrow_type.tz is None else "TIMESTAMP"
     return "FLOAT"
 
 
@@ -683,6 +687,44 @@ def test_bigquery_streams_pages_with_projection_predicate_and_key_check() -> Non
     for _sql, job_config in client.queries:
         assert job_config.query_parameters[0].value == sentinel
         assert job_config.use_query_cache is False
+
+
+def test_bigquery_snapshot_binds_a_datetime_predicate_as_the_columns_type() -> None:
+    """Codex review on #670 (P1): every Python `datetime` used to bind as a
+    TIMESTAMP parameter, and GoogleSQL does not coerce a TIMESTAMP parameter
+    to a DATETIME column -- so a reuse lookup pruned on a `data_type:
+    datetime` partition failed at snapshot open instead of reading. The
+    column's own type now decides, for scalars and IN lists alike, and a
+    TIMESTAMP column keeps the TIMESTAMP binding it always had."""
+    filed = datetime(2026, 1, 5, 9, 30)
+    seen = datetime(2026, 1, 6, tzinfo=UTC)
+    client = _FakeBigQueryClient(
+        {
+            "record_id": pa.array(["a"]),
+            "filed_at": pa.array([filed], type=pa.timestamp("us")),
+            "seen_at": pa.array([seen], type=pa.timestamp("us", tz="UTC")),
+        }
+    )
+    adapter = _bigquery_adapter(client)
+
+    with adapter.table_snapshot(
+        "records",
+        columns=("record_id",),
+        predicate=[
+            ReadPredicate("filed_at", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, filed),
+            ReadPredicate("filed_at", ReadPredicateOperator.IN, (filed,)),
+            ReadPredicate("seen_at", ReadPredicateOperator.LESS_THAN_OR_EQUAL, seen),
+        ],
+    ) as snapshot:
+        list(snapshot)
+
+    [(_sql, job_config)] = [
+        (sql, cfg) for sql, cfg in client.queries if "CURRENT_TIMESTAMP()" not in sql
+    ]
+    scalar_lo, in_list, scalar_hi = job_config.query_parameters
+    assert scalar_lo.type_ == "DATETIME"
+    assert in_list.array_type == "DATETIME"
+    assert scalar_hi.type_ == "TIMESTAMP"
 
 
 def test_bigquery_key_failure_is_sanitized_and_cancels_result() -> None:

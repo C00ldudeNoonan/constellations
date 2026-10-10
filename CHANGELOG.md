@@ -45,6 +45,47 @@
   *usable* one by insertion order, and passed with the fix removed. The row
   order is load-bearing and the test says so.
 
+### An incremental MERGE and the embed reuse read are pruned to the batch's layout (issue #664)
+
+- **A MERGE joined only on the key reads most of a wide table.** astrolabe's
+  3.67M-row embeddings table (28.5 GiB, partitioned by filing month, clustered
+  by `symbol, form_type`, keyed on a hash) billed 4.45 GiB per flush and 4 TiB
+  over one backfill; the embed resume's keyed read-back of the same table
+  billed 21 GiB per lookup, almost all of it the vector column.
+- On BigQuery, when a model declares `partition_by` with a `field` or
+  `cluster_by`, the incremental publish now carries the batch's own values on
+  those columns in the join — the partition column as a `MIN`..`MAX` range,
+  each clustering column as its distinct values — which is the form BigQuery
+  prunes on. **A guard proves it safe first:** one narrow join asks whether any
+  matched target row lies outside the batch's values (a re-dated filing), and
+  the unpruned MERGE runs when one does, so a key never ends with two rows.
+  Guard and MERGE are one script, one job.
+  [ADR-0027](docs/adr/0027-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md)
+  records why dbt's unguarded `incremental_predicates` was not copied.
+- The embed reuse lookup carries the same predicates per window, built from
+  the layout values of the rows it fetches, which the key pass now reads
+  beside the id and text hash. Reuse is content-addressed (#665), so a hit is
+  often another row under other layout values -- re-keyed, or the same
+  boilerplate under another symbol -- and predicates built from the asking
+  window's values would have pruned away exactly the rows reuse exists to
+  find. Built from the fetched rows, they cannot exclude one.
+- A BigQuery read predicate on a `DATETIME` column now binds as `DATETIME`.
+  Every Python `datetime` bound as `TIMESTAMP`, which GoogleSQL does not
+  coerce to `DATETIME`, so a reuse lookup on a `data_type: datetime`
+  partition failed at snapshot open.
+- A `transform:` SQL model's pruned MERGE reports its row count from the
+  script's own `@@row_count`; the script's parent job carries none, so a
+  successful model reported `rows_written=0`. Under `on_schema_change:
+  ignore`, a newly selected layout column the target lacks is no longer
+  predicated on.
+- The key is never repeated as a predicate; a column the batch lacks, has NULL
+  in, or (clustering) holds more than 1,000 distinct values of is left out for
+  that batch. `transform:` SQL models' MERGE takes the same path. The new
+  adapter seam is `layout_pruning_columns`; DuckDB declares none and is
+  unchanged.
+- **Docs:** a column test (`not_null`, `unique`, …) scans its whole column per
+  invocation; on a vector or long-text column that was 20.9 GiB a day.
+
 ## v0.21.1 - 2026-10-09
 
 ### An agent can search by declared class and walk the hierarchy (issue #628)

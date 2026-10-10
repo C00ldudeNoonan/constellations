@@ -6,6 +6,7 @@ from .base import (
     AdapterCapabilityError,
     AdapterConfigError,
     AdapterError,
+    LayoutPruningColumns,
     LegacyWarehouseNamesError,
     ReadOrdering,
     ReadPredicate,
@@ -30,6 +31,7 @@ from .base import (
     TableSnapshotGenerationChangedError,
     WarehouseAdapter,
     WarehouseCapability,
+    layout_pruning_predicates,
 )
 from .migration import (
     MigrationConflictError,
@@ -52,6 +54,7 @@ __all__ = [
     "AdapterCapabilityError",
     "AdapterConfigError",
     "AdapterError",
+    "LayoutPruningColumns",
     "LegacyWarehouseNamesError",
     "MigrationConflictError",
     "ReadOrdering",
@@ -83,6 +86,7 @@ __all__ = [
     "adapter_supports_identity_scoped_connection",
     "apply_name_migration",
     "create_adapter",
+    "layout_pruning_predicates",
     "list_adapter_types",
     "parse_warehouse_config",
     "plan_name_migration",

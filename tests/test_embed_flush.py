@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ import duckdb
 import polars as pl
 import pytest
 
+from stel.adapters import LayoutPruningColumns
+from stel.adapters.base import NO_LAYOUT_PRUNING
 from stel.execution.contracts import RunError
 from stel.providers.deterministic import DeterministicEmbeddingProvider
 from stel.runner import run_project
@@ -662,6 +665,7 @@ def test_a_text_the_target_lacks_costs_no_vector_read(tmp_path: Path) -> None:
                 vector_field="embedding",
             ),
             config_hash="config-hash",
+            pruning=NO_LAYOUT_PRUNING,
             timings=PhaseTimings(),
         )
 
@@ -869,6 +873,7 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
                 id_field="chunk_id", vector_field="embedding",
             ),
             config_hash="g",
+            pruning=NO_LAYOUT_PRUNING,
             timings=PhaseTimings(),
         )
 
@@ -928,6 +933,7 @@ def test_a_stale_config_row_cannot_shadow_a_usable_one(tmp_path: Path) -> None:
                 vector_field="embedding",
             ),
             config_hash="current-config",
+            pruning=NO_LAYOUT_PRUNING,
             timings=PhaseTimings(),
         )
 
@@ -995,6 +1001,7 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
                 vector_field="embedding",
             ),
             config_hash="config-hash",
+            pruning=NO_LAYOUT_PRUNING,
             timings=PhaseTimings(),
         )
 
@@ -1012,3 +1019,132 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
         ):
             reader.rows_for(["input-hash"])
         assert snapshot_calls == 7
+
+
+# ─── the reuse lookup is scoped to the found rows' layout values (issue #664) ─
+
+
+@contextmanager
+def _layout_target(tmp_path: Path) -> Iterator[Any]:
+    """A DuckDB embed target with two layout columns beside the reuse columns:
+    DuckDB has no layout of its own, so the pruning is handed to the reader
+    directly, and DuckDB executes the predicates for real."""
+    from stel.adapters import create_adapter, parse_warehouse_config
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["a", "b", "c"],
+                    "filing_date": [date(2026, 1, 5), date(2026, 2, 9), date(2026, 3, 1)],
+                    "symbol": ["AAPL", "MSFT", "AAPL"],
+                    "embedding_input_hash": ["ha", "hb", "hc"],
+                    "embedding_config_hash": ["g", "g", "g"],
+                    "embedding": [[0.1], [0.2], [0.3]],
+                    "embedded_at": ["t", "t", "t"],
+                }
+            ),
+        )
+        yield adapter
+
+
+def _layout_reader(adapter: Any, pruning: LayoutPruningColumns) -> Any:
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
+
+    return _EmbeddingReuseReader(
+        adapter,
+        "emb",
+        config=EmbedConfig(
+            provider="deterministic",
+            model="m",
+            dimensions=1,
+            id_field="chunk_id",
+            vector_field="embedding",
+        ),
+        config_hash="g",
+        pruning=pruning,
+        timings=PhaseTimings(),
+    )
+
+
+def _capture_predicates(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    captured: list[Any] = []
+    original_snapshot = adapter.table_snapshot
+
+    @contextmanager
+    def recording(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        captured.append(kwargs.get("predicate"))
+        with original_snapshot(*args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(adapter, "table_snapshot", recording)
+    return captured
+
+
+def test_a_reuse_lookup_is_scoped_to_the_layout_of_the_rows_it_fetches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #664: a keyed read of a column that is neither the partition nor
+    a clustering key scans the whole column (21 GiB per lookup on the SEC
+    table). The lookup now also carries a range over the partition column and
+    value lists over the clustering columns -- built from the values the
+    *found rows* hold, recorded in the key pass.
+
+    That source is the point. Reuse is content-addressed (#665), so a hit is
+    often another row than the one asking, under other layout values: here
+    the window wants texts `ha` and `hb`, held by an AAPL row in January and
+    an MSFT row in February. Predicates built from the asking window's own
+    values would have pruned one of them away and paid to re-embed it; built
+    from the fetched rows they span both, and both are found."""
+    from stel.adapters import ReadPredicate, ReadPredicateOperator
+
+    with _layout_target(tmp_path) as adapter:
+        captured = _capture_predicates(adapter, monkeypatch)
+        reader = _layout_reader(adapter, LayoutPruningColumns("filing_date", ("symbol",)))
+        found = reader.rows_for(["ha", "hb"])
+        assert set(found) == {"ha", "hb"}
+        assert found["hb"]["chunk_id"] == "b"
+
+        [lookup] = [p for p in captured if p is not None]
+        assert list(lookup) == [
+            ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("a", "b")),
+            ReadPredicate(
+                "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 1, 5)
+            ),
+            ReadPredicate(
+                "filing_date", ReadPredicateOperator.LESS_THAN_OR_EQUAL, date(2026, 2, 9)
+            ),
+            ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL", "MSFT")),
+        ]
+
+
+def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The layout is declared on the model; the predicates run against the
+    target. A clustering column declared after the target was built would
+    fail the key pass and every lookup at snapshot open, so the reader keeps
+    only the layout columns the target actually has."""
+    from stel.adapters import ReadPredicate, ReadPredicateOperator
+
+    with _layout_target(tmp_path) as adapter:
+        captured = _capture_predicates(adapter, monkeypatch)
+        reader = _layout_reader(
+            adapter, LayoutPruningColumns("filing_date", ("symbol", "form_type"))
+        )
+        found = reader.rows_for(["ha"])
+        assert set(found) == {"ha"}
+        [lookup] = [p for p in captured if p is not None]
+        assert [p.column for p in lookup] == [
+            "chunk_id",
+            "filing_date",
+            "filing_date",
+            "symbol",
+        ]
+        assert ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)) in lookup

@@ -812,6 +812,117 @@ class TableReadRequest:
         }
 
 
+# A membership predicate past this many distinct values is not pushed. Both
+# consumers hand the list to the warehouse as one array value (a BigQuery
+# `IN UNNEST(?)` parameter, a DuckDB list), and a high-cardinality layout
+# column -- clustered on a per-row id rather than a per-group attribute --
+# would turn one flush into an array the size of the batch for no storage
+# skipped: every block holds some of the keys anyway.
+LAYOUT_MEMBERSHIP_LIMIT = 1_000
+
+
+@dataclass(frozen=True)
+class LayoutPruningColumns:
+    """The columns of a target whose physical layout lets a read or a merge skip
+    storage when the statement carries a constant predicate on them (issue #664).
+
+    `range_column` is the column the target is partitioned on, pruned by a
+    closed range; `membership_columns` are the ones it is clustered on, pruned
+    by a value list. An adapter with no such layout answers `NO_LAYOUT_PRUNING`;
+    the consumers then push no predicate and behave exactly as before.
+    """
+
+    range_column: str | None
+    membership_columns: tuple[str, ...]
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        if self.range_column is None:
+            return self.membership_columns
+        return (self.range_column, *self.membership_columns)
+
+
+NO_LAYOUT_PRUNING = LayoutPruningColumns(None, ())
+
+
+def _uniform_layout_values(
+    rows: Sequence[Mapping[str, Any]], column: str
+) -> list[Any] | None:
+    """The column's values across `rows`, or None when a predicate over them
+    cannot be stated: a row without the column, a NULL (no comparison matches
+    it, so a matched target row would be missed), a value outside the predicate
+    contract, or two Python types in one column (the contract requires one)."""
+    values: list[Any] = []
+    for row in rows:
+        if column not in row:
+            return None
+        value = row[column]
+        if value is None or not _is_read_scalar(value):
+            return None
+        values.append(value)
+    if not values:
+        return None
+    first_type = type(values[0])
+    if any(type(value) is not first_type for value in values[1:]):
+        return None
+    return values
+
+
+def layout_pruning_predicates(
+    pruning: LayoutPruningColumns,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    exclude: str,
+) -> tuple[ReadPredicate, ...]:
+    """Batch-scoped predicates on a target's layout columns, from the batch's
+    own rows (issue #664).
+
+    The range column gets `>= min AND <= max` of the batch; each membership
+    column gets `IN (distinct values)` when the batch holds at most
+    `LAYOUT_MEMBERSHIP_LIMIT` of them. A column whose values cannot be stated
+    as one predicate (`_uniform_layout_values`) is left out rather than
+    narrowed wrongly, and `exclude` -- the key the read or merge already joins
+    on -- is never repeated as a layout predicate.
+
+    The predicates describe where `rows` say they belong. A target row under
+    other layout values is outside them, so a consumer passing rows that are
+    not the target's own has to check for such a row first (the BigQuery
+    merge does). The embed reuse read passes the target rows it is about to
+    fetch, read in its key pass, so its predicates cannot exclude one.
+    """
+    predicates: list[ReadPredicate] = []
+    if pruning.range_column is not None and pruning.range_column != exclude:
+        values = _uniform_layout_values(rows, pruning.range_column)
+        if values is not None:
+            predicates.append(
+                ReadPredicate(
+                    pruning.range_column,
+                    ReadPredicateOperator.GREATER_THAN_OR_EQUAL,
+                    min(values),
+                )
+            )
+            predicates.append(
+                ReadPredicate(
+                    pruning.range_column,
+                    ReadPredicateOperator.LESS_THAN_OR_EQUAL,
+                    max(values),
+                )
+            )
+    for column in pruning.membership_columns:
+        if column == exclude:
+            continue
+        values = _uniform_layout_values(rows, column)
+        if values is None:
+            continue
+        distinct = sorted(set(values))
+        if len(distinct) > LAYOUT_MEMBERSHIP_LIMIT:
+            continue
+        predicates.append(
+            ReadPredicate(column, ReadPredicateOperator.IN, tuple(distinct))
+        )
+    return tuple(predicates)
+
+
 class ReadOrdering(StrEnum):
     UNSPECIFIED = "unspecified"
 
@@ -1160,6 +1271,15 @@ class WarehouseAdapter(ABC):
         adapter ignores the block entirely — a project can carry e.g. BigQuery
         partitioning config while its dev target runs DuckDB."""
         return None
+
+    def layout_pruning_columns(self, options: BaseModel | None) -> LayoutPruningColumns:
+        """The columns a target published under `options` can be pruned on by a
+        constant predicate (issue #664): its partition column as a range, its
+        clustering columns as value lists. The default is no layout at all, so
+        a consumer pushes nothing and reads exactly as it did before; an
+        adapter with a physical layout overrides this, and only this."""
+        del options
+        return NO_LAYOUT_PRUNING
 
     def warehouse_option_defaults(self, *, model_name: str) -> dict[str, Any]:
         """Return adapter-owned profile defaults for one model.

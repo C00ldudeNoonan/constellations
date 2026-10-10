@@ -30,7 +30,7 @@ from ..progress import get_reporter
 from ..state_reconciliation import iter_validated_state_pages
 from ..versioning import compute_code_version
 from .checkpoint import FlushPublisher
-from .contracts import ModelRunResult, RunError
+from .contracts import ModelRunResult, RunError, state_for_skipping
 from .heartbeat import Heartbeat
 from .values import scalarize, warehouse_key_cast_matches_python
 from .warehouse import warehouse_options
@@ -64,6 +64,7 @@ def run_chunk_model(
     project_dir: Path,
     adapter: WarehouseAdapter,
     full_refresh: bool,
+    reprocess_all: bool,
     subset_run: bool = False,
 ) -> ModelRunResult:
     assert model.chunk is not None
@@ -124,6 +125,7 @@ def run_chunk_model(
     state_scope = StateScope(model.name)
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(state_scope) if is_incremental else {}
+    skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
 
     # Generated values are replaced on every chunk; all other upstream metadata
     # participates in invalidation and remains available for filtering/lineage.
@@ -253,7 +255,7 @@ def run_chunk_model(
                         record, text_field=chunk_config.text_field
                     )
                     if is_incremental:
-                        prior = processed_state.get(document_id)
+                        prior = skip_state.get(document_id)
                         if prior == StateValue(document_hash, code_version):
                             skipped += 1
                             continue

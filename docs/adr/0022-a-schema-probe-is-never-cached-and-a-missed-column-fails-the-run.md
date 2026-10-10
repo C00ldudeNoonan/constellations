@@ -118,12 +118,14 @@ known, and it is before the first call.
   a hard error, and stel does not coordinate overlapping runs against one
   target — that remains a project responsibility.
 - **Nothing here recovers a state already poisoned** by the old behaviour.
-  #653's third ask is unmet: there is still no way to reprocess every row while
-  keeping vector reuse, so `--full-refresh` (which drops reuse) or editing
-  `stel_state` and `stel_sync_watermark` by hand are the only routes back. The
-  mechanism exists — clearing a model's state leaves `reuse_reader` live,
-  because `rebuild_target` is false while the table exists — but no CLI surface
-  reaches it.
+  #653's third ask was unmet when this was written and is now closed by
+  `--reprocess-all` (issue #655,
+  [0024](0024-a-forced-reprocess-ignores-incremental-state-rather-than-clearing-it.md)),
+  which reprocesses every row with vector reuse intact. Note that this ADR
+  guessed the mechanism wrong: clearing a model's state does leave
+  `reuse_reader` live, but it also stops removals reconciling and turns a
+  transform's reprocess into a silent full rebuild, so the flag reads state
+  and declines to skip on it instead of clearing it.
 - **The content fingerprint that gates the unchanged-parent skip is still
   cached.** Examined and left: it is an aggregate over row data, where
   BigQuery's documented invalidation applies, and making it uncached would put

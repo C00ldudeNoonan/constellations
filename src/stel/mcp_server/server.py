@@ -10,6 +10,7 @@ from ..optional_dependencies import import_optional_dependency
 from .contracts import (
     MCP_CONTEXT_SCHEMA_VERSION,
     BusinessFilter,
+    EntityScope,
     GetContextLineageRequest,
     GetContextLineageResponse,
     GetDocumentRequest,
@@ -137,6 +138,7 @@ def create_mcp_server(
         limit: int = 10,
         candidate_limit: int | None = None,
         filters: list[BusinessFilter] | None = None,
+        entity_scope: EntityScope | None = None,
         schema_version: Literal["mcp_context/v1"] = MCP_CONTEXT_SCHEMA_VERSION,
     ) -> SearchContextResponse:
         """Search an available context model with caller-derived authorization.
@@ -144,6 +146,16 @@ def create_mcp_server(
         `candidate_limit` is how many candidates each retrieval mode fetches
         before fusion, not how many results come back — that stays `limit`.
         Unset, it scales with `limit`.
+
+        `entity_scope` restricts results to chunks linked to declared
+        vocabulary terms: `{"class": "central_bank"}` for every term of a
+        class, or `{"term": "Federal Reserve", "expand": "narrower"}` for one
+        term and the terms beneath it. A model's declared terms are published
+        as its `entity_types`. Expansion is off unless asked for, and every
+        scoped response reports what the scope resolved to in
+        `entity_scope_applied`, with each result's `matched_terms` naming the
+        term it actually matched — so a hit reached through the hierarchy is
+        never indistinguishable from an exact one.
         """
         return service.search_context(
             SearchContextRequest(
@@ -154,6 +166,7 @@ def create_mcp_server(
                 limit=limit,
                 candidate_limit=candidate_limit,
                 filters=tuple(filters or ()),
+                entity_scope=entity_scope,
             ),
             caller=_caller_info(transport),
         )

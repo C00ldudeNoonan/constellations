@@ -382,13 +382,13 @@ stel init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh proj
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
-stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
+stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one golden set: deltas, and the queries that moved
-stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
+stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
-stel plan [--select EXPR] [--exclude EXPR] [--json]      # what the next run would reprocess, before it spends anything
+stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -695,6 +695,11 @@ no model table was touched, no provider was called. The ways forward:
   is the flag for "yes, I changed the embedding model on purpose".
 - **`--full-refresh`** rebuilds, and was always an explicit request to
   reprocess everything, so the guard never applies to it.
+- **`--reprocess-all`** reprocesses every published row while keeping what the
+  target holds, and the guard never applies to it *for an embed model* —
+  reusing a vector costs nothing, so there is nothing left to refuse. An llm
+  model is still guarded under it, because nothing gives an llm model its old
+  answers back. See below.
 - **`on_code_change: reprocess`** on the model restores the old behaviour for
   that model. **`reprocess_limit: N`** keeps `fail` but tolerates up to `N`
   rows, which is what a small model or a resume of an interrupted, already
@@ -714,6 +719,64 @@ The policy fields are not part of `code_version`, for the same reason
 `on_index_change` is not: relaxing a guard must never itself be a reprocess.
 ADR [0008](adr/0008-reprocess-guard-defaults-to-fail.md) records why `fail` is
 the default rather than a warning.
+
+### Reprocessing without re-paying: `--reprocess-all`
+
+`--full-refresh` is not the only reason to put every published row back
+through a stage. After a bad publish — a column that went missing, a
+transform that wrote the wrong thing — what you want is every row
+reprocessed and every vector *kept*, because the vectors were never the
+problem and re-computing them is what costs money. On a 3.6M-row corpus
+`--full-refresh` of an embed model is about 28k provider requests.
+
+```bash
+stel plan --select chunk_embeddings --reprocess-all   # price it first
+stel run  --select chunk_embeddings --reprocess-all
+```
+
+What it does, and does not do:
+
+- **Nothing is cleared.** Incremental state is read as usual and simply not
+  skipped on, so removals still reconcile, a transform stays incremental, and
+  an interrupted run leaves the baseline intact for the next ordinary one.
+  This is why there is no `stel state clear`: the useful behaviour is only
+  reachable from inside a run.
+- **Both skip tiers are declined**: per-record state, and the unchanged-parent
+  skip that would otherwise not enter the stage at all. No watermark is
+  touched.
+- **`update_when_changed` is ignored too.** That fingerprint normally spares a
+  matched row from being rewritten when none of its listed columns moved, so
+  re-publishing does not rewrite large payloads. Under a forced reprocess it
+  would do the opposite of what you asked: a column corrupted by a bad publish
+  is outside the fingerprint by construction, so every listed column matches,
+  the row is filtered out of the write, and the corruption survives a run that
+  reports it processed. Skipping a record and skipping its write are two
+  optimizations, and this turns off both.
+- **An embed model pays nothing** while its inputs are unchanged — vectors
+  come back out of its own target by `embedding_input_hash`, reported as
+  `cache_hits` with `provider_calls: 0`.
+- **An llm model pays in full.** There is no warehouse-side reuse for llm
+  output; the only cache is the optional local `llm_cache.duckdb`, which a
+  clean or a different machine does not have. The reprocess guard still
+  refuses it, and `--accept-reprocess` is how you say yes.
+- **A SQL transform is unaffected.** It keeps no per-record state — its skip
+  is the `is_incremental()` branch in its own SQL, and turning that off is
+  `--full-refresh`.
+- **A `search:` model is unaffected**, and `stel plan --reprocess-all` says so
+  rather than claiming otherwise. A search publish chooses between rebuilding
+  an index and extending it; it has no per-record skip for this flag to
+  decline, and `--full-refresh` is how you force the rebuild
+  (`stel run --select chunk_search --full-refresh`).
+- **Refused with `--full-refresh`**, which does not fetch state and drops the
+  target, so there would be nothing to reuse and the flag would silently cost
+  a full corpus. Refused with `--watch`, which would reprocess everything on
+  every saved file.
+
+`stel plan --reprocess-all` reports `changed` with every published row, rather
+than the `unchanged`/0 that an ordinary plan reports for a model whose
+`code_version` has not moved. ADR
+[0024](adr/0024-a-forced-reprocess-ignores-incremental-state-rather-than-clearing-it.md)
+records why ignoring state beat clearing it.
 
 ## Progress output
 
@@ -1998,6 +2061,78 @@ Relation types between classes, and reading this declaration from entity
 linking and the concept cloud, are covered in the entity-linking and
 relation-extraction sections; those are the separate pieces of work (issues
 #626-#629) that build on this declaration.
+
+**The governed MCP server reads it too.** A context model's descriptor
+(`list_context_models`) reports `entity_types`, the entity names an agent may
+ask about. With no `vocabularies:` block that list is discovered by scanning —
+every entity-link row, then every chunk those rows name, filtered to what the
+calling principal may read, and refused past `max_scan_rows`, so on a large
+corpus the descriptor call fails rather than answering. When a project
+declares a vocabulary, the list is the declared labels instead: constant time,
+no scan, and the same answer for every caller.
+
+That is a deliberate change of meaning, worth knowing if you read the field.
+It becomes *schema* — what the project declares it is about, the same kind of
+operator-authored fact as `schema_fields`, which the descriptor already
+publishes to everyone — rather than *data*, what happens to be in the rows you
+can see. An agent can no longer use `entity_types` to find out what the corpus
+actually contains, and a caller authorized for nothing still sees the
+vocabulary. In exchange the descriptor stops being a way to probe corpus
+contents, and stops failing on a large one. A project with no declaration
+keeps the scanned behaviour exactly.
+
+**And an agent can search by it.** `search_context` takes an `entity_scope`
+that restricts results to chunks linked to declared terms — the question
+"every central bank", which was previously askable only as the exact entity
+strings a project happened to write:
+
+```json
+{"model": "filings_search", "query": "balance sheet runoff",
+ "entity_scope": {"class": "institution"}}
+
+{"model": "filings_search", "query": "balance sheet runoff",
+ "entity_scope": {"term": "Central bank", "expand": "narrower"}}
+```
+
+A scope names exactly one of `class` (every term declaring that `class:`) or
+`term` (one term). `expand` applies to a term scope only, and is `none`
+unless asked for: `narrower` adds every term beneath it in the declared
+`broader` hierarchy, transitively; `broader` adds the chain above it.
+Expanding a `class` scope is refused — a class is already a set of terms.
+
+**Expansion is never silent.** Every scoped response carries
+`entity_scope_applied`, naming the requested class or term, the terms the
+scope accepted, which of those came from expansion (`expanded_terms`, empty
+when nothing was expanded), and `results_excluded`. Every result carries
+`matched_terms`, naming the term it actually matched and whether that was the
+requested term (`exact`), a member of the requested class (`class_member`), or
+one reached through the hierarchy (`narrower` / `broader`). So a hit that
+arrived because of expansion is always distinguishable from one that matched
+directly — which matters when citing it, since "about the Federal Reserve" and
+"about some central bank" are different claims.
+
+**A scope filters after retrieval**, against the entity links a hit already
+carries, so it costs no extra warehouse read. Because retrieval truncates its
+ranking to the limit it is given, a scoped request retrieves a *pool* rather
+than `limit` hits — `candidate_limit` when you set one, otherwise the same
+default the search itself would have used — and your `limit` is applied to
+what survives the scope. So `limit` counts scoped results, not retrieval hits,
+and its truncation is never counted as an exclusion.
+
+A narrow scope over a broad query can still return fewer than `limit` while
+matching documents sit deeper in the corpus, since the pool is finite.
+`results_excluded` is the signal: when it is large relative to what came back,
+raise `candidate_limit` to deepen the pool the scope filters. ADR-0025 records
+why this is not a store prefilter, and what making it one would cost.
+
+A scope requires a declaration. Naming an undeclared class or term is
+refused with `invalid_request`, listing what is declared, rather than
+returning nothing — an undeclared class and an empty corpus are different
+answers. A project with no `vocabularies:` at all refuses an `entity_scope`
+with `capability_unavailable`. Matching is `(entity_namespace, entity_key)`
+against `(vocabulary name, term label)`, so a link row written by a fuzzy or
+hand-maintained resolver — which carries an `entity_namespace` too, but is not
+a declaration — never satisfies a scope that names a declared class.
 
 Structure-preserving options for document parsing:
 
@@ -4777,6 +4912,16 @@ stel --project-dir path/to/stel_project concept-cloud \
   -o cloud.html
 ```
 
+**`--title`** and **`--subtitle`** set the page heading and browser-tab title,
+and the text after it, in place of the hardcoded "stel star map" and its
+computed "· `<project>` · N concepts" — that pair names the tool, not the
+map it renders:
+
+```bash
+stel concept-cloud --demo -o cloud.html \
+  --title "Risk factors" --subtitle "2010-2024, SEC 10-Ks"
+```
+
 The export job is a three-way join over artifacts stel already produces: the
 entity-linking output supplies canonical concepts (sized by mention frequency,
 colored by entity type) and the mention→canonical map; the relation grain
@@ -4843,6 +4988,18 @@ counts the history strip already reads; no export or schema change. For a
 risk-factor map this is usually the headline a single frozen view hides most
 completely: Ukraine and inflation entering in 2022, COVID-19 fading by 2024.
 
+**"Focus on its constellation"** (issue #555 item 5) answers *what does X
+name?* A selected concept's card offers it: every concept outside that star's
+constellation is hidden rather than dimmed, and the camera re-frames on what
+is left — on a dense map, dimming shows where a star is, but only hiding shows
+what it is named with. The constellation is the one **in the current view**: a
+pair not named together in the selected period, or below the min edge
+strength, draws no line, so its far end is hidden too. Focus only ever hides
+more — a neighbour the legend or the min-frequency filter has hidden stays
+hidden. Clicking a neighbour moves the focus to it, so the graph can be walked
+one constellation at a time; clicking empty space clears the selection and
+brings the whole map back. Viewer-only; no export or schema change.
+
 **`--top-n-per-period N` keeps what mattered *within* a period.** `--top-n`
 ranks on total frequency across the corpus, which trims exactly what a time
 axis exists to show: a risk that enters, dominates one period, and is
@@ -4878,6 +5035,21 @@ current.
 Scope: this carries what a declaration states about each concept. It does not
 lay concepts out by class or by hierarchy (issue #345), and it does not add a
 time-varying history of a concept's definition (issue #555).
+
+**Entity type prefers the alias table's namespace** (issue #555). When a
+concept was linked through an `alias_table` resolver sourced from a declared
+vocabulary (`aliases: vocab.<name>`), the viewer's "type" is that vocabulary's
+name — the most frequent namespace across the concept's mentions, ties broken
+lexically. A concept with no such mention falls back to the mention's own
+`label` column, then to the spaCy label on the entity table: a free-text NER
+tag, which disagrees with itself across mentions of the same real-world thing
+(a company tagged `PRODUCT` on one mention and `PERSON` on another) far more
+often than an operator-declared namespace does. `entity_namespace` is on every
+`link_entities` output row regardless of resolver (issue #627) — a
+hand-maintained alias table or a fuzzy/vector-similarity match carries one
+too, an identifier namespace like `ticker` or `cik`, never a type — so a
+namespace counts here only when it, and the concept's own id, are a term this
+project's `vocabularies:` actually declares.
 
 **Names and descriptions** (`--names-model <model>`, issue #554). Without it a
 concept is named by its **most frequent** mention text, ties broken lexically —

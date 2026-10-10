@@ -577,7 +577,14 @@ def _resolved(tmp_path: Path):
     )
 
 
-def _run_incremental(tmp_path: Path, adapter, model, *, full_refresh: bool = False):
+def _run_incremental(
+    tmp_path: Path,
+    adapter,
+    model,
+    *,
+    full_refresh: bool = False,
+    reprocess_all: bool = False,
+):
     from stel.config.project import ProjectConfig
     from stel.execution.transform import run_transform_model
 
@@ -588,6 +595,7 @@ def _run_incremental(tmp_path: Path, adapter, model, *, full_refresh: bool = Fal
         adapter=adapter,
         resolved=_resolved(tmp_path),
         full_refresh=full_refresh,
+        reprocess_all=reprocess_all,
     )
 
 

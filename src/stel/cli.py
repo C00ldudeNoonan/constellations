@@ -1021,6 +1021,14 @@ def _model_kind(model: ModelConfig) -> str:
 )
 @click.option("--exclude", default=None, help="Selector expression for models to skip.")
 @click.option(
+    "--reprocess-all",
+    is_flag=True,
+    help=(
+        "Report what `run --reprocess-all` would reprocess: every published "
+        "row, rather than only the rows whose code_version moved."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1033,6 +1041,7 @@ def plan(
     ctx: click.Context,
     select: str | None,
     exclude: str | None,
+    reprocess_all: bool,
     json_output: bool,
     verbose: int,
     diagnostics_file: Path | None,
@@ -1055,6 +1064,7 @@ def plan(
             exclude=exclude,
             target=target,
             profiles_dir=profiles_dir,
+            reprocess_all=reprocess_all,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1087,6 +1097,16 @@ def plan(
 @cli.command()
 @click.option(
     "--full-refresh", is_flag=True, help="Ignore incremental state and reprocess everything."
+)
+@click.option(
+    "--reprocess-all",
+    is_flag=True,
+    help=(
+        "Reprocess every published row while keeping what the target already "
+        "holds: an embed model re-reads its own vectors by input hash, so a "
+        "re-run whose inputs have not changed costs no provider calls. Unlike "
+        "--full-refresh, incremental state is kept and removals still reconcile."
+    ),
 )
 @click.option(
     "--accept-reprocess",
@@ -1159,6 +1179,7 @@ def plan(
 def run(
     ctx: click.Context,
     full_refresh: bool,
+    reprocess_all: bool,
     accept_reprocess: bool,
     select: str | None,
     exclude: str | None,
@@ -1185,6 +1206,12 @@ def run(
     )
 
     if watch:
+        if reprocess_all:
+            raise click.UsageError(
+                "--reprocess-all cannot be combined with --watch: a watch loop "
+                "would reprocess every published row on every file change. Run "
+                "it once by hand instead."
+            )
         _run_watch(
             project_dir,
             profiles_dir=profiles_dir,
@@ -1204,6 +1231,7 @@ def run(
         results = run_project(
             project_dir,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             select=select,
             exclude=exclude,
             target=target,
@@ -1337,6 +1365,16 @@ def _usage_summary(
     "--full-refresh", is_flag=True, help="Ignore incremental state and reprocess everything."
 )
 @click.option(
+    "--reprocess-all",
+    is_flag=True,
+    help=(
+        "Reprocess every published row while keeping what the target already "
+        "holds: an embed model re-reads its own vectors by input hash, so a "
+        "re-run whose inputs have not changed costs no provider calls. Unlike "
+        "--full-refresh, incremental state is kept and removals still reconcile."
+    ),
+)
+@click.option(
     "--accept-reprocess",
     is_flag=True,
     help=(
@@ -1397,6 +1435,7 @@ def _usage_summary(
 def build(
     ctx: click.Context,
     full_refresh: bool,
+    reprocess_all: bool,
     accept_reprocess: bool,
     select: str | None,
     exclude: str | None,
@@ -1420,6 +1459,7 @@ def build(
         result = build_project(
             project_dir,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             select=select,
             exclude=exclude,
             target=target,
@@ -2290,6 +2330,7 @@ def mcp_serve(
 
 @cli.command("concept-cloud")
 @click.option(
+    "-o",
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=Path("concept_cloud.html"),
@@ -2405,6 +2446,19 @@ def mcp_serve(
         "--time-field."
     ),
 )
+@click.option(
+    "--title",
+    default=None,
+    help='Page heading and browser-tab title (default: "stel star map").',
+)
+@click.option(
+    "--subtitle",
+    default=None,
+    help=(
+        'Text shown after the title (default: "· <project> · N concepts", '
+        "computed from the bundle)."
+    ),
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -2426,6 +2480,8 @@ def concept_cloud(
     time_field: str | None,
     time_grain: str,
     top_n_per_period: int,
+    title: str | None,
+    subtitle: str | None,
     verbose: int,
     diagnostics_file: Path | None,
 ) -> None:
@@ -2439,7 +2495,7 @@ def concept_cloud(
     _configure_output(verbose, diagnostics_file=diagnostics_file)
     if placeholder or demo:
         bundle = demo_export() if demo else placeholder_export()
-        written = write_concept_cloud(bundle, output)
+        written = write_concept_cloud(bundle, output, title=title, subtitle=subtitle)
         click.echo(
             f"Wrote {'demo' if demo else 'placeholder'} concept-cloud artifact "
             f"({len(bundle.concepts)} concepts) to {written}"
@@ -2479,7 +2535,7 @@ def concept_cloud(
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e
-    written = write_concept_cloud(export, output)
+    written = write_concept_cloud(export, output, title=title, subtitle=subtitle)
     click.echo(
         f"Wrote concept-cloud artifact ({len(export.concepts)} concepts) to {written}"
     )

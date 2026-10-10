@@ -632,8 +632,13 @@ def _run_search_model(
                     ):
                         persisted_segments = segment_progress.completed
                         spec = replace(spec, source_progress=segment_progress.to_stamp())
-                        coordinator.verify_publish(publish_lease)
-                        store.restamp_collection(spec)
+                        # A first build or a private generation has no collection
+                        # until its first write below, and a store cannot restamp
+                        # what it has not created (issue #658). That write creates
+                        # it from this `spec`, so the progress is stamped then.
+                        if collection_exists:
+                            coordinator.verify_publish(publish_lease)
+                            store.restamp_collection(spec)
                     indexed = _indexed_rows(
                         batch,
                         model,

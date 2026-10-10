@@ -18,8 +18,13 @@ from stel.adapters.base import (
     ReadPredicateOperator,
     WarehouseIdentity,
 )
-from stel.agent_context import AgentContextGrain, contract_descriptor
+from stel.agent_context import (
+    AgentContextGrain,
+    contract_descriptor,
+    project_entity_link,
+)
 from stel.append_log import QUERY_LOG_SCHEMA
+from stel.config.vocabulary import Vocabulary, VocabularyTerm
 from stel.mcp_server.authorization import (
     AuthorizationError,
     ClaimAuthorizationProvider,
@@ -30,6 +35,8 @@ from stel.mcp_server.authorization import (
 from stel.mcp_server.catalog import ArtifactCatalog
 from stel.mcp_server.contracts import (
     BusinessFilter,
+    EntityExpansion,
+    EntityScope,
     FilterOperator,
     GetContextLineageRequest,
     GetDocumentRequest,
@@ -37,6 +44,7 @@ from stel.mcp_server.contracts import (
     ListContextModelsRequest,
     MCPErrorCode,
     SearchContextRequest,
+    SearchContextResponse,
 )
 from stel.mcp_server.grants import WarehouseIdentityResolver
 from stel.mcp_server.server import create_mcp_server
@@ -186,7 +194,11 @@ def _matches(row: Mapping[str, Any], predicate: ReadPredicate) -> bool:
     raise AssertionError(f"unsupported fixture predicate {predicate.operator}")
 
 
-def _artifact_catalog(*, with_public_model: bool = False) -> ArtifactCatalog:
+def _artifact_catalog(
+    *,
+    with_public_model: bool = False,
+    vocabularies: Mapping[str, Vocabulary] | None = None,
+) -> ArtifactCatalog:
     registry_id = "model.context_demo.document_registry"
     chunks_id = "model.context_demo.document_chunks"
     links_id = "model.context_demo.context_entity_links"
@@ -305,7 +317,9 @@ def _artifact_catalog(*, with_public_model: bool = False) -> ArtifactCatalog:
         "metadata": {"generated_at": "2026-07-20T12:00:00+00:00"},
         "results": results,
     }
-    return ArtifactCatalog.from_payloads(manifest, run_results=run_results)
+    return ArtifactCatalog.from_payloads(
+        manifest, run_results=run_results, vocabularies=vocabularies
+    )
 
 
 def _context_model(
@@ -541,10 +555,13 @@ def _service(
     search: FakeSearch | None = None,
     warehouse_identity: WarehouseIdentityResolver | None = None,
     with_public_model: bool = False,
+    vocabularies: Mapping[str, Vocabulary] | None = None,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
-        catalog=_artifact_catalog(with_public_model=with_public_model),
+        catalog=_artifact_catalog(
+            with_public_model=with_public_model, vocabularies=vocabularies
+        ),
         repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
         principal_resolver=StaticPrincipalResolver(
@@ -580,6 +597,504 @@ def test_context_models_are_artifact_backed_and_principal_scoped() -> None:
     assert model.retrieval.modes == ("hybrid", "text", "vector")
     assert [field.field for field in model.retrieval.filter_fields] == ["category"]
     assert model.entity_types == ("series",)
+
+
+def test_entity_types_come_from_the_declaration_without_scanning() -> None:
+    """Derived from the declaration, not discovered by scanning (issue #628).
+
+    The scanned answer -- which the test above still pins, because a project
+    with no `vocabularies:` keeps it -- reads every entity-link row and then
+    every chunk those rows name, and raises past `max_scan_rows`, so a
+    descriptor call fails outright on a large corpus. It is also per-caller,
+    which makes `entity_types` a way to learn what the corpus holds.
+
+    So this asserts both halves: the value comes from the declaration, and
+    the entity-link relation is never read at all. The declared labels are
+    deliberately disjoint from the fixture's entity names (`series`), so a
+    scan that still ran would show up in the value too.
+    """
+    repository = FakeRepository(_fixture_rows())
+    service, _ = _service(
+        repository=repository,
+        vocabularies={
+            "indicators": Vocabulary(
+                terms=[
+                    VocabularyTerm(label="Unemployment rate"),
+                    VocabularyTerm(label="Headline inflation"),
+                ]
+            ),
+            "institutions": Vocabulary(terms=[VocabularyTerm(label="Federal Reserve")]),
+        },
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.models[0].entity_types == (
+        "Federal Reserve",
+        "Headline inflation",
+        "Unemployment rate",
+    )
+    assert not [relation for relation, _ in repository.calls if "entity" in relation]
+
+
+class _TwoAllowedSearch(FakeSearch):
+    """Returns both readable chunks, so a scope has something to exclude.
+
+    `FakeSearch` returns one readable hit and one the policy hides, which
+    cannot tell "the scope excluded it" from "authorization did". Subclassed
+    rather than written fresh so it keeps the same recording attributes every
+    other search test asserts against.
+    """
+
+    def execute(
+        self,
+        request: SearchRequest,
+        *,
+        policy_filters: Sequence[SearchFilter],
+        timings: PhaseTimings | None = None,
+    ) -> SearchOutcome:
+        self.request = request
+        self.policy_filters = tuple(policy_filters)
+        # Truncated to the requested limit, exactly as `search()` does to
+        # its fused ranking. A double that returned everything regardless
+        # would hide whether a scoped request retrieves a deeper pool at
+        # all (Codex review on #668).
+        results = (
+            _hit(CONTEXT_ALLOWED_1, DOC_ALLOWED, CHUNK_ALLOWED_1, rank=1),
+            _hit(CONTEXT_ALLOWED_2, DOC_ALLOWED, CHUNK_ALLOWED_2, rank=2),
+        )
+        return SearchOutcome(
+            results=results[: request.limit],
+            degraded=False,
+            safe_error_code=None,
+        )
+
+
+def _declared_link(context_id: str, namespace: str, label: str) -> Mapping[str, Any]:
+    """One `context_entity_links` row naming a declared term.
+
+    Built through `project_entity_link`, the documented bridge from
+    `link_entities` output into the governed grain, so the row's `entity_key`
+    carries the label in exactly the encoding a real project writes. A
+    hand-written key would let the scope match a shape that never ships.
+    """
+    return project_entity_link(
+        context_id=context_id,
+        entity_namespace=namespace,
+        entity_name="institution",
+        canonical_id=label,
+        relationship_type="applies_to",
+        link_method="deterministic:v1",
+        recorded_from=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+
+
+def _scope_vocabularies() -> dict[str, Vocabulary]:
+    """Two vocabularies; one carries a two-level hierarchy under one class."""
+    return {
+        "institutions": Vocabulary(
+            terms=[
+                VocabularyTerm(label="Central bank", entity_class="institution"),
+                VocabularyTerm(
+                    label="Federal Reserve",
+                    broader="Central bank",
+                    entity_class="institution",
+                ),
+                VocabularyTerm(
+                    label="Bank of England",
+                    broader="Central bank",
+                    entity_class="institution",
+                ),
+            ]
+        ),
+        "indicators": Vocabulary(
+            terms=[VocabularyTerm(label="Headline inflation", entity_class="indicator")]
+        ),
+    }
+
+
+def _scope_rows(*, namespace: str = "institutions") -> dict[str, Any]:
+    """The shared fixture with declared entity links on both readable chunks.
+
+    `CONTEXT_ALLOWED_1` is linked to the narrower term and `CONTEXT_ALLOWED_2`
+    to its parent, so a term scope and its expansion reach *different* chunks
+    and a test can tell which one answered.
+    """
+    return dict(_fixture_rows()) | {
+        "context_entity_links": (
+            _declared_link(CONTEXT_ALLOWED_1, namespace, "Federal Reserve"),
+            _declared_link(CONTEXT_ALLOWED_2, namespace, "Central bank"),
+        )
+    }
+
+
+def _scoped_service(
+    *,
+    rows: Mapping[str, Any] | None = None,
+    declared: bool = True,
+    settings: ContextServerSettings | None = None,
+) -> tuple[ContextService, FakeSearch]:
+    return _service(
+        repository=FakeRepository(rows if rows is not None else _scope_rows()),
+        search=_TwoAllowedSearch(),
+        vocabularies=_scope_vocabularies() if declared else None,
+        settings=settings,
+    )
+
+
+def _scoped_search(
+    service: ContextService, scope: EntityScope | None, *, limit: int = 10
+) -> SearchContextResponse:
+    return service.search_context(
+        SearchContextRequest(
+            model="context_search",
+            query="rates",
+            mode="text",
+            limit=limit,
+            entity_scope=scope,
+        )
+    )
+
+
+def test_a_class_scope_keeps_only_the_chunks_that_class_names() -> None:
+    """A class scope filters both ways, and says what it resolved to (#628).
+
+    Both directions, because a filter broken one way passes the other: a
+    scope that matched everything would satisfy the `institution` assertion
+    alone, and one that matched nothing would satisfy the `indicator` one.
+    """
+    service, _ = _scoped_service()
+    try:
+        institutions = _scoped_search(service, EntityScope(entity_class="institution"))
+        indicators = _scoped_search(service, EntityScope(entity_class="indicator"))
+    finally:
+        service.close()
+
+    assert institutions.error is None
+    assert len(institutions.results) == 2
+    applied = institutions.entity_scope_applied
+    assert applied is not None
+    assert applied.requested_class == "institution"
+    assert applied.requested_term is None
+    assert applied.accepted_terms == (
+        "Bank of England",
+        "Central bank",
+        "Federal Reserve",
+    )
+    assert applied.expanded_terms == ()
+    assert applied.results_excluded == 0
+    assert [term.relation for result in institutions.results for term in result.matched_terms] == [
+        "class_member",
+        "class_member",
+    ]
+
+    # The declaration holds `Headline inflation` under `indicator`, which no
+    # fixture chunk links to -- so the scope is valid and excludes everything.
+    assert indicators.results == ()
+    assert indicators.entity_scope_applied is not None
+    assert indicators.entity_scope_applied.results_excluded == 2
+
+
+def test_narrower_expansion_is_opt_in_and_names_the_term_that_matched() -> None:
+    """The issue's central requirement: expansion is never silent (#628).
+
+    Without `expand`, a scope on `Central bank` reaches only the chunk linked
+    to that exact term. With it, the chunk linked to `Federal Reserve` is
+    reached too -- and says so, both per result and in the applied scope, so
+    an agent never has to infer that the hierarchy was walked.
+    """
+    service, _ = _scoped_service()
+    try:
+        exact = _scoped_search(service, EntityScope(term="Central bank"))
+        expanded = _scoped_search(
+            service,
+            EntityScope(term="Central bank", expand=EntityExpansion.NARROWER),
+        )
+    finally:
+        service.close()
+
+    assert [result.context_id for result in exact.results] == [CONTEXT_ALLOWED_2]
+    assert [term.relation for term in exact.results[0].matched_terms] == ["exact"]
+    assert exact.entity_scope_applied is not None
+    assert exact.entity_scope_applied.expanded_terms == ()
+    assert exact.entity_scope_applied.results_excluded == 1
+
+    assert [result.context_id for result in expanded.results] == [
+        CONTEXT_ALLOWED_1,
+        CONTEXT_ALLOWED_2,
+    ]
+    reached = expanded.results[0].matched_terms
+    assert [(term.label, term.relation, term.requested) for term in reached] == [
+        ("Federal Reserve", "narrower", "Central bank")
+    ]
+    applied = expanded.entity_scope_applied
+    assert applied is not None
+    assert applied.requested_term == "Central bank"
+    assert applied.expand is EntityExpansion.NARROWER
+    assert applied.expanded_terms == ("Bank of England", "Federal Reserve")
+    assert applied.results_excluded == 0
+
+
+def test_broader_expansion_reaches_the_parent_term() -> None:
+    """The other direction the issue names, and it is not symmetric (#628).
+
+    `broader` walks the chain the declaration authored, so a scope on
+    `Federal Reserve` also reaches the chunk linked only to `Central bank`.
+    The sibling `Bank of England` is never reached: it is neither the term
+    nor above it.
+    """
+    service, _ = _scoped_service()
+    try:
+        response = _scoped_search(
+            service,
+            EntityScope(term="Federal Reserve", expand=EntityExpansion.BROADER),
+        )
+    finally:
+        service.close()
+
+    assert [result.context_id for result in response.results] == [
+        CONTEXT_ALLOWED_1,
+        CONTEXT_ALLOWED_2,
+    ]
+    assert [term.relation for term in response.results[0].matched_terms] == ["exact"]
+    parent = response.results[1].matched_terms
+    assert [(term.label, term.relation) for term in parent] == [
+        ("Central bank", "broader")
+    ]
+    applied = response.entity_scope_applied
+    assert applied is not None
+    assert applied.expanded_terms == ("Central bank",)
+
+
+def test_an_unscoped_search_reports_no_scope_at_all() -> None:
+    """The scope report is absent unless asked for (#628).
+
+    Both fields are additive to `mcp_context/v1` under ADR-0008's precedent,
+    which only holds if an unscoped caller sees exactly the response it saw
+    before.
+    """
+    service, _ = _scoped_service()
+    try:
+        response = _scoped_search(service, None)
+    finally:
+        service.close()
+
+    assert len(response.results) == 2
+    assert response.entity_scope_applied is None
+    assert all(result.matched_terms == () for result in response.results)
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        (EntityScope(entity_class="central_bank"), "Declared classes"),
+        (EntityScope(term="Bundesbank"), "not a declared vocabulary term"),
+    ],
+    ids=["undeclared-class", "undeclared-term"],
+)
+def test_a_scope_naming_something_undeclared_is_refused(
+    scope: EntityScope, expected: str
+) -> None:
+    """Refused, not silently empty (#628).
+
+    An undeclared class and an empty result are different answers, and an
+    agent that cannot tell them apart will conclude the corpus is empty when
+    it actually mistyped a class name. Both branches are covered because they
+    look up different things and fail independently.
+    """
+    service, _ = _scoped_service()
+    try:
+        response = _scoped_search(service, scope)
+    finally:
+        service.close()
+
+    assert response.results == ()
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INVALID_REQUEST
+    assert expected in response.error.message
+
+
+def test_a_scope_against_a_project_with_no_declaration_is_refused() -> None:
+    """`entity_scope` needs a declaration to mean anything (#628).
+
+    Distinct from an undeclared class: nothing is declared, so the capability
+    itself is absent rather than the request being wrong.
+    """
+    service, _ = _scoped_service(declared=False)
+    try:
+        response = _scoped_search(service, EntityScope(entity_class="institution"))
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.CAPABILITY_UNAVAILABLE
+    assert "declare `vocabularies:`" in response.error.message
+
+
+def test_a_link_outside_the_declaration_cannot_satisfy_a_class_scope() -> None:
+    """The declaration boundary, which is a correctness property (#628).
+
+    A fuzzy or hand-maintained resolver writes `entity_namespace` too, and it
+    is not a declaration. Matching on the label alone would let those rows
+    answer a scope that names a declared class, so the namespace has to name
+    a declared vocabulary -- the same rule `declared_terms` states and the
+    concept cloud follows. The labels here are the declared ones, so a match
+    on label alone would return both chunks.
+    """
+    service, _ = _scoped_service(rows=_scope_rows(namespace="fuzzy_kb"))
+    try:
+        response = _scoped_search(service, EntityScope(entity_class="institution"))
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert response.results == ()
+    assert response.entity_scope_applied is not None
+    assert response.entity_scope_applied.results_excluded == 2
+
+
+def test_expanding_a_class_scope_is_refused_at_the_contract() -> None:
+    """A class is already a set of terms (#628).
+
+    Expanding one would mean walking every member's hierarchy -- a much
+    larger request than the issue asks for. Refused rather than ignored, so a
+    caller is never handed something other than what it asked for.
+    """
+    with pytest.raises(ValueError, match="expand applies to a term scope"):
+        EntityScope(entity_class="institution", expand=EntityExpansion.NARROWER)
+
+    with pytest.raises(ValueError, match="exactly one of class or term"):
+        EntityScope(entity_class="institution", term="Central bank")
+
+
+def test_limit_counts_scoped_results_and_is_not_an_exclusion() -> None:
+    """`limit` applies after the scope, and does not inflate the count (#628).
+
+    The scope filters before the limit slice, so `limit` counts results that
+    satisfy it rather than retrieval hits that may not. `results_excluded`
+    reports what the *scope* dropped and nothing else -- counting the limit's
+    truncation there would tell a caller to widen `candidate_limit` when the
+    answer was simply capped.
+    """
+    service, _ = _scoped_service()
+    try:
+        response = _scoped_search(
+            service, EntityScope(entity_class="institution"), limit=1
+        )
+    finally:
+        service.close()
+
+    assert len(response.results) == 1
+    assert response.entity_scope_applied is not None
+    assert response.entity_scope_applied.results_excluded == 0
+
+
+def test_a_scoped_request_retrieves_a_pool_deeper_than_its_limit() -> None:
+    """Otherwise the scope could only ever filter `limit` hits (#668 review).
+
+    `search()` truncates its fused ranking to the limit it is given, so a
+    scope applied afterwards would see exactly `limit` hits and no more --
+    `candidate_limit` could not deepen it, and the documented advice to raise
+    it would be false.
+
+    The qualifying chunk here is the *second* hit and `limit` is 1, so a
+    request that retrieved only `limit` would hand the scope one
+    non-qualifying hit and return nothing.
+    """
+    service, search = _scoped_service()
+    try:
+        response = _scoped_search(service, EntityScope(term="Central bank"), limit=1)
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert [result.context_id for result in response.results] == [CONTEXT_ALLOWED_2]
+    assert search.request is not None
+    assert search.request.limit > 1
+
+
+def test_a_caller_can_deepen_the_scoped_pool_with_candidate_limit() -> None:
+    """The documented lever has to actually move the pool (#668 review).
+
+    `results_excluded` tells a caller to raise `candidate_limit` when a scope
+    returns little; that advice is only true if the value reaches retrieval.
+    """
+    service, search = _scoped_service()
+    try:
+        service.search_context(
+            SearchContextRequest(
+                model="context_search",
+                query="rates",
+                mode="text",
+                limit=2,
+                candidate_limit=200,
+                entity_scope=EntityScope(entity_class="institution"),
+            )
+        )
+    finally:
+        service.close()
+
+    assert search.request is not None
+    assert search.request.limit == 200
+
+
+def test_scope_membership_is_judged_on_every_link_not_the_bounded_list() -> None:
+    """The response's entity list is capped; qualification is not (#668 review).
+
+    `max_entities_per_context` truncates what a result carries. Judging a
+    scope against that truncated list would exclude a chunk whose qualifying
+    term fell past the cap -- and since row order is not guaranteed, exclude
+    it only sometimes. Here the cap is 1 and the declared term is the *second*
+    link on the chunk.
+    """
+    rows = dict(_fixture_rows()) | {
+        "context_entity_links": (
+            _declared_link(CONTEXT_ALLOWED_2, "institutions", "Headline inflation"),
+            _declared_link(CONTEXT_ALLOWED_2, "institutions", "Central bank"),
+        )
+    }
+    service, _ = _scoped_service(
+        rows=rows,
+        settings=ContextServerSettings(max_entities_per_context=1),
+    )
+    try:
+        response = _scoped_search(service, EntityScope(term="Central bank"))
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert [result.context_id for result in response.results] == [CONTEXT_ALLOWED_2]
+    # The bounded list the response carries is still capped at one entity --
+    # the fix must not widen what a caller receives.
+    assert len(response.results[0].entities) == 1
+
+
+def test_an_undeclared_scope_is_refused_before_retrieval_runs() -> None:
+    """No embedding call, no warehouse read, for a request that cannot work.
+
+    Resolution used to happen after `_search.execute` and after the chunk,
+    registry and entity-link reads, so an undeclared class spent remote work
+    before being refused -- and if retrieval failed first the caller got that
+    operational error instead of the deterministic refusal (#668 review).
+    """
+    repository = FakeRepository(_scope_rows())
+    service, search = _service(
+        repository=repository,
+        search=_TwoAllowedSearch(),
+        vocabularies=_scope_vocabularies(),
+    )
+    try:
+        response = _scoped_search(service, EntityScope(entity_class="central_bank"))
+    finally:
+        service.close()
+
+    assert response.error is not None
+    assert response.error.code is MCPErrorCode.INVALID_REQUEST
+    assert search.request is None
+    assert repository.calls == []
 
 
 def test_missing_principal_fails_closed_before_discovery() -> None:

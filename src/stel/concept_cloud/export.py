@@ -26,7 +26,7 @@ from typing import Any, Literal, NamedTuple, cast
 import polars as pl
 
 from ..config import load_project
-from ..config.vocabulary import Vocabulary
+from ..config.vocabulary import Vocabulary, declared_terms
 from ..manifest import MANIFEST_FILENAME, write_manifest
 from .schema import (
     Concept,
@@ -292,15 +292,19 @@ def _declared_by_term(
 ) -> dict[tuple[str, str], _Declared]:
     """Declared fields keyed by (vocabulary name, term label). A vocabulary's
     name is the `entity_namespace` its alias rows carry (issue #627), and a
-    term's label is the canonical id those rows link to."""
+    term's label is the canonical id those rows link to.
+
+    The keying lives in `config.vocabulary.declared_terms` so the MCP server
+    resolves a link row the same way this does (issue #628); only the
+    projection to the fields a concept displays is local.
+    """
     return {
-        (vocab_name, term.label): _Declared(
+        key: _Declared(
             entity_class=term.entity_class,
             definition=term.description,
             broader=term.broader,
         )
-        for vocab_name, vocabulary in vocabularies.items()
-        for term in vocabulary.terms
+        for key, term in declared_terms(vocabularies).items()
     }
 
 
@@ -375,7 +379,24 @@ def _aggregate_concepts(
         documents = {
             r.get("document_id") for r in rows if r.get("document_id") is not None
         }
-        label = _first(
+        # A declared vocabulary's own name, when a row was linked through its
+        # alias table, names the type better than spaCy's label ever can:
+        # spaCy tagged AbbVie PRODUCT, Autodesk PERSON and Europe LOC on a
+        # two-type alias table, which is spaCy guessing at something the
+        # vocabulary already states (issue #555). `entity_namespace` is on
+        # every `link_entities` output row regardless of resolver (#627), so
+        # a hand-maintained alias table or a fuzzy/vector-similarity match
+        # carries one too -- an identifier namespace like `ticker` or `cik`,
+        # never a type. Only a (namespace, canonical_id) pair this project's
+        # `vocabularies:` actually declares counts (Codex on #661); anything
+        # else falls back to the pre-#555 behavior -- the row's own label,
+        # then the entity table's.
+        declared_namespaces: list[object | None] = [
+            namespace
+            for r in rows
+            if (namespace := str(r.get("entity_namespace") or "")) and (namespace, cid) in declared
+        ]
+        label = _most_common(declared_namespaces) or _first(
             [r.get("label") for r in rows]
             + [label_by_mention.get(str(r["mention_id"])) for r in rows]
         )

@@ -45,8 +45,10 @@ def rag_project(tmp_path: Path) -> Path:
     return _copy_example(tmp_path, "rag_chunks_pipeline")
 
 
-def _by_name(project_dir: Path, *, select: str | None = None) -> dict[str, ModelPlan]:
-    plan = plan_project(project_dir, select=select)
+def _by_name(
+    project_dir: Path, *, select: str | None = None, reprocess_all: bool = False
+) -> dict[str, ModelPlan]:
+    plan = plan_project(project_dir, select=select, reprocess_all=reprocess_all)
     return {model.name: model for model in plan.models}
 
 
@@ -101,6 +103,47 @@ def test_unchanged_after_a_run(invoice_project: Path) -> None:
     assert raw.stale_rows == 0
     assert raw.rows_to_reprocess == 0
     assert raw.caused_by == ()
+
+
+def test_reprocess_all_plans_every_published_row(invoice_project: Path) -> None:
+    """`stel plan --reprocess-all` has to answer for the flag (issue #655).
+
+    Classified from `code_version` counts alone, a model whose code has not
+    moved plans as `unchanged` with 0 rows -- true of an ordinary run and
+    wrong under this flag, which reprocesses every published row whatever
+    their version. The reprocess guard reads these same plans, so the number
+    being right here is also what keeps an llm model from re-paying for its
+    whole corpus unannounced.
+    """
+    run_project(invoice_project)
+    assert _by_name(invoice_project)["raw_invoices"].rows_to_reprocess == 0
+
+    raw = _by_name(invoice_project, reprocess_all=True)["raw_invoices"]
+
+    assert raw.status == "changed"
+    assert (raw.state_rows, raw.rows_to_reprocess) == (5, 5)
+    # Not an upper bound: every published row really does reprocess.
+    assert raw.reprocess_is_upper_bound is False
+    assert "--reprocess-all" in raw.reason
+
+
+def test_reprocess_all_does_not_promise_a_search_model_a_reprocess(
+    rag_project: Path,
+) -> None:
+    """Plan and run have to agree about `search:` (found by Codex on PR #660).
+
+    The runner does not hand the flag to `run_search_model` -- whose own
+    decision is rebuild-vs-extend, not a per-record skip, and whose rebuild is
+    what `--full-refresh` is for. Classifying its published rows as
+    reprocessing would promise a run that never happens. The same exclusion
+    `_can_skip_unchanged_scan` already makes for this kind.
+    """
+    run_project(rag_project)
+
+    plans = _by_name(rag_project, reprocess_all=True)
+
+    assert "--reprocess-all" in plans["chunk_embeddings"].reason
+    assert "--reprocess-all" not in plans["chunk_search"].reason
 
 
 def test_config_change_counts_stale_rows_and_reaches_downstream(

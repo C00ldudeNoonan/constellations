@@ -90,6 +90,23 @@ def test_run_with_unmatched_tag_succeeds_with_empty_selection(
     assert "No models selected." in result.output
 
 
+def test_reprocess_all_with_watch_exits_2(
+    tmp_path: Path, example_project_dir: Path
+) -> None:
+    """A watch loop under `--reprocess-all` would reprocess every published
+    row on every saved file (issue #655). Refused as a usage error before the
+    watcher starts, rather than accepted and ignored."""
+    dst = _copy_example(tmp_path, example_project_dir)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--project-dir", str(dst), "run", "--watch", "--reprocess-all"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--reprocess-all cannot be combined with --watch" in result.output
+
+
 def test_run_malformed_yaml_exits_2(tmp_path: Path, example_project_dir: Path) -> None:
     dst = _copy_example(tmp_path, example_project_dir)
     (dst / "stel_project.yml").write_text("name: broken\nversion: [oops\n")

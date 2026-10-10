@@ -185,6 +185,35 @@ def test_full_refresh_bypasses_the_guard(rag_project: Path) -> None:
     assert all(not r.errors for r in results)
 
 
+def test_reprocess_all_releases_an_embed_model_but_still_guards_an_llm_one(
+    rag_project: Path,
+) -> None:
+    """What `--reprocess-all` is and is not an announcement of (issue #655).
+
+    The guard exists to stop unannounced provider *spend*, and the two paid
+    kinds answer that differently. An embed model reads its existing vectors
+    back out of its own target by input hash, so an announced reprocess whose
+    inputs have not moved costs nothing -- requiring `--accept-reprocess` as
+    well would put two flags in front of the one recovery the flag is for. An
+    llm model has no warehouse-side reuse at all, only an optional local
+    cache a clean or another machine does not have, so announcing the
+    reprocess does not make it free.
+
+    Both models here are on the default `on_code_change: fail` with
+    `reprocess_limit: 0`, so each would refuse on the row count alone.
+    """
+    run_project(rag_project)
+
+    results = run_project(rag_project, select="chunk_embeddings", reprocess_all=True)
+    assert all(not r.errors for r in results)
+
+    with pytest.raises(RunError) as excinfo:
+        run_project(rag_project, select="chunk_facts", reprocess_all=True)
+    message = str(excinfo.value)
+    assert "chunk_facts" in message
+    assert "--accept-reprocess" in message
+
+
 def test_embed_identity_change_refuses_only_that_model(rag_project: Path) -> None:
     run_project(rag_project)
     _replace_in_model(

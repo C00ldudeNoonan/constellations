@@ -270,6 +270,127 @@ def test_incremental_embed_reuses_vectors_for_metadata_only_updates(
     assert unchanged.documents_skipped == 2
 
 
+def test_reprocess_all_puts_every_row_through_again_and_pays_for_none(
+    tmp_path: Path,
+) -> None:
+    """The recovery #653 had no cheap way out of (issue #655).
+
+    `--full-refresh` is the only other switch that puts every published row
+    back through the stage, and on an embed model it re-embeds the whole
+    corpus at provider prices -- on astrolabe's that is 3.6M rows and about
+    28k Vertex requests, which is why the only affordable fix for one dropped
+    column was editing `stel_state` by hand. This flag keeps the target, so
+    every vector comes back out of it by input hash: every row is rewritten
+    and the provider is never called.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    columns = (
+        'SELECT chunk_id, embedding, embedded_at FROM "db".docs.document_embeddings '
+        "ORDER BY chunk_id"
+    )
+    before = _query(project, columns)
+
+    [result] = run_project(project, select="document_embeddings", reprocess_all=True)
+
+    # The exact inverse of the ordinary second run above, which skips both.
+    assert result.documents_processed == 2
+    assert result.documents_skipped == 0
+    assert result.metrics["provider_calls"] == 0
+    assert result.metrics["cache_hits"] == 2
+    # Reused, not recomputed: a re-embed with the same provider would produce
+    # equal vectors too, but it would not preserve `embedded_at`.
+    assert _query(project, columns) == before
+
+
+def test_reprocess_all_still_reconciles_a_removal(tmp_path: Path) -> None:
+    """Why the flag ignores state instead of clearing it (issue #655).
+
+    Every stage computes what vanished upstream as `set(published state) -
+    current ids`. Clearing the state to force the reprocess -- which is what
+    #655 originally proposed -- empties the left side, so a row deleted
+    upstream survives in the target. Silently, because an empty diff is also
+    what a run with no removals produces.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+    _query(
+        project,
+        'DELETE FROM "db".docs.document_chunks WHERE title = ?',
+        ["Release A"],
+    )
+
+    [result] = run_project(project, select="document_embeddings", reprocess_all=True)
+
+    assert result.documents_processed == 1
+    assert _query(project, 'SELECT title FROM "db".docs.document_embeddings') == [
+        ("Release B",)
+    ]
+
+
+def test_reprocess_all_overrides_an_update_when_changed_filter(
+    tmp_path: Path,
+) -> None:
+    """A forced reprocess has to turn off the publish-side filter too, not
+    just the record-side skip (found by Codex reviewing PR #660).
+
+    `update_when_changed` rewrites a matched row only when one of the listed
+    columns differs. A column corrupted by a bad publish lies *outside* that
+    fingerprint by construction -- a fingerprint names the columns that decide
+    identity, and the corruption is in a payload column -- so every listed
+    column matches, the MERGE discards the row, and the corruption outlives a
+    run that reports each row processed and reused. Which is the exact
+    recovery this flag is advertised for.
+    """
+    project = _embedding_project(tmp_path)
+    models = project / "models" / "documents.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "      dimensions: 4\n      batch_size: 1\n"
+            "    materialization: incremental\n",
+            "      dimensions: 4\n      batch_size: 1\n"
+            "    materialization: incremental\n"
+            "    update_when_changed: [embedding_input_hash]\n",
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    # A bad publish, after the fact: the vector and its input hash are intact,
+    # so every column the fingerprint names still matches.
+    _query(
+        project,
+        'UPDATE "db".docs.document_embeddings SET title = ? WHERE title = ?',
+        ["corrupted", "Release A"],
+    )
+
+    [result] = run_project(project, select="document_embeddings", reprocess_all=True)
+
+    assert result.documents_processed == 2
+    assert result.metrics["provider_calls"] == 0
+    assert sorted(
+        _query(project, 'SELECT title FROM "db".docs.document_embeddings')
+    ) == [("Release A",), ("Release B",)]
+
+
+def test_reprocess_all_is_refused_with_full_refresh(tmp_path: Path) -> None:
+    """The one combination that would cost money to accept (issue #655).
+
+    A full refresh does not fetch state, so the flag has nothing left to act
+    on and resolves silently in favour of the expensive reading: every vector
+    recomputed, which is the exact outcome the operator passed it to avoid.
+    """
+    project = _embedding_project(tmp_path)
+    run_project(project)
+
+    with pytest.raises(RunError, match=r"--reprocess-all cannot be combined"):
+        run_project(
+            project,
+            select="document_embeddings",
+            full_refresh=True,
+            reprocess_all=True,
+        )
+
+
 def test_incremental_embed_recomputes_text_and_removes_deleted_rows(
     tmp_path: Path,
 ) -> None:

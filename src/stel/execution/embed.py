@@ -48,7 +48,12 @@ from ..state_reconciliation import iter_validated_state_pages
 from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
-from .contracts import ModelRunResult, RunError
+from .contracts import (
+    ModelRunResult,
+    RunError,
+    state_for_skipping,
+    update_filter_for_publish,
+)
 from .errors import artifact_error_text
 from .usage import add_provider_usage
 from .values import scalarize, warehouse_key_cast_matches_python
@@ -88,6 +93,7 @@ def run_embed_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    reprocess_all: bool,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
@@ -108,6 +114,7 @@ def run_embed_model(
             adapter=adapter,
             resolved=resolved,
             full_refresh=full_refresh,
+            reprocess_all=reprocess_all,
             run_budget=run_budget,
             subset_run=subset_run,
             read_predicates=read_predicates,
@@ -127,6 +134,7 @@ def _run_embed_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    reprocess_all: bool,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
     read_predicates: Sequence[ReadPredicate] = (),
@@ -208,6 +216,7 @@ def _run_embed_model(
     # is ~25KB per 768-dim row: at 3.6M chunks that is ~90GB spent before the
     # first provider call, and only on the *resume* path, where the run being
     # resumed has already proven the corpus is large (issue #401 follow-up).
+    skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
     reuse_reader = (
         _EmbeddingReuseReader(
             adapter,
@@ -273,7 +282,7 @@ def _run_embed_model(
             domain="embedding-input-row",
             version=1,
         )
-        if processed_state.get(record_id) == StateValue(
+        if skip_state.get(record_id) == StateValue(
             input_fingerprint,
             code_version,
         ):
@@ -487,7 +496,9 @@ def _run_embed_model(
                         else "append_new_columns"
                     ),
                     options=warehouse_opts,
-                    update_when_changed=model.update_when_changed,
+                    update_when_changed=update_filter_for_publish(
+                        model.update_when_changed, reprocess_all=reprocess_all
+                    ),
                 ),
                 state_records=[
                     StateRecord(item.record_id, item.input_fingerprint, code_version)

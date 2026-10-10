@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,7 +42,12 @@ from ..progress import get_reporter
 from ..providers import get_inference_provider
 from ..versioning import compute_model_code_version
 from .checkpoint import FlushPublisher
-from .contracts import ModelRunResult, RunError
+from .contracts import (
+    ModelRunResult,
+    RunError,
+    state_for_skipping,
+    update_filter_for_publish,
+)
 from .cost import budget_cost_estimator
 from .errors import artifact_error_text
 from .extraction import EXTRACTION_FIELD_DTYPES  # shared declared-data_type contract
@@ -109,7 +114,7 @@ def _stream_llm_input_plan(
     *,
     config: LLMTransformConfig,
     model_name: str,
-    processed_state: dict[str, StateValue],
+    processed_state: Mapping[str, StateValue],
     code_version: str,
 ) -> _LLMInputPlan:
     """Validate and classify every input without retaining corpus text.
@@ -207,7 +212,7 @@ def _iter_llm_work_windows(
     table: str,
     *,
     config: LLMTransformConfig,
-    processed_state: dict[str, StateValue],
+    processed_state: Mapping[str, StateValue],
     code_version: str,
 ) -> Iterator[list[_LLMWork]]:
     """Stream changed inputs into flush-sized work windows."""
@@ -343,6 +348,7 @@ def run_llm_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    reprocess_all: bool,
     run_budget: BudgetLedger | None = None,
 ) -> ModelRunResult:
     assert model.llm is not None
@@ -405,12 +411,13 @@ def run_llm_model(
         if is_incremental and not rebuild_target
         else {}
     )
+    skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
     input_plan = _stream_llm_input_plan(
         adapter,
         upstream,
         config=config,
         model_name=model.name,
-        processed_state=processed_state,
+        processed_state=skip_state,
         code_version=code_version,
     )
     existing_id_values = (
@@ -533,7 +540,9 @@ def run_llm_model(
                         else "append_new_columns"
                     ),
                     options=warehouse_opts,
-                    update_when_changed=model.update_when_changed,
+                    update_when_changed=update_filter_for_publish(
+                        model.update_when_changed, reprocess_all=reprocess_all
+                    ),
                 )
                 if window_rows
                 else 0
@@ -560,7 +569,7 @@ def run_llm_model(
                     adapter,
                     upstream,
                     config=config,
-                    processed_state=processed_state,
+                    processed_state=skip_state,
                     code_version=code_version,
                 )
                 if input_plan.work_count

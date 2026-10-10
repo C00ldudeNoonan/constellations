@@ -53,7 +53,12 @@ from ..progress import get_reporter
 from ..providers import InferenceProvider, get_inference_provider
 from ..sources import DocumentRef, DocumentSource
 from ..versioning import compute_model_code_version
-from .contracts import ModelRunResult, RunError
+from .contracts import (
+    ModelRunResult,
+    RunError,
+    state_for_skipping,
+    update_filter_for_publish,
+)
 from .cost import budget_cost_estimator, estimate_cost
 from .errors import artifact_error_text
 from .values import scalarize
@@ -314,6 +319,7 @@ def run_extraction_model(
     adapter: WarehouseAdapter,
     resolved: ResolvedProfile,
     full_refresh: bool,
+    reprocess_all: bool,
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
@@ -419,6 +425,7 @@ def run_extraction_model(
 
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(state_scope) if is_incremental else {}
+    skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
     existing_tables = set(adapter.list_tables()) if is_incremental else set()
     empty_incremental_target = (
         is_incremental
@@ -430,7 +437,7 @@ def run_extraction_model(
     docs_to_process: list[DocumentRef] = []
     for doc in docs:
         if is_incremental:
-            prior = processed_state.get(doc.document_id)
+            prior = skip_state.get(doc.document_id)
             if prior == StateValue(doc.content_hash, code_version):
                 continue
         docs_to_process.append(doc)
@@ -700,7 +707,10 @@ def run_extraction_model(
                                 else "append_new_columns"
                             ),
                             options=warehouse_opts,
-                            update_when_changed=model.update_when_changed,
+                            update_when_changed=update_filter_for_publish(
+                                model.update_when_changed,
+                                reprocess_all=reprocess_all,
+                            ),
                         )
                     except AdapterError as e:
                         # RunError so `build` fails this model and blocks

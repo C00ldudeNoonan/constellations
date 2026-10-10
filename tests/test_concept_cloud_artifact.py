@@ -88,6 +88,66 @@ def test_render_escapes_angle_brackets_to_prevent_script_breakout() -> None:
     assert island["concepts"][0]["display"] == "</script><script>alert(1)</script>"
 
 
+def test_the_title_and_subtitle_default_to_the_hardcoded_header() -> None:
+    export = placeholder_export()
+    html = render_concept_cloud(export)
+    assert html.count("stel star map") == 2  # <title> and the <h1>
+    assert "SUBTITLE_OVERRIDE = null" in html
+    assert "__CONCEPT_CLOUD_TITLE__" not in html
+    assert "__CONCEPT_CLOUD_SUBTITLE__" not in html
+
+
+def test_an_operator_title_and_subtitle_replace_the_default() -> None:
+    export = placeholder_export()
+    html = render_concept_cloud(export, title="Risk factors", subtitle="2010-2024")
+    assert "stel star map" not in html
+    assert "<title>Risk factors</title>" in html
+    assert "Risk factors <small" in html
+    assert 'SUBTITLE_OVERRIDE = "2010-2024"' in html
+
+
+def test_the_title_is_escaped_to_prevent_markup_breakout() -> None:
+    html = render_concept_cloud(placeholder_export(), title="</title><script>alert(1)</script>")
+    assert "<script>alert(1)" not in html
+    assert "&lt;/title&gt;&lt;script&gt;" in html
+
+
+def test_the_subtitles_quote_is_escaped_to_prevent_markup_breakout() -> None:
+    html = render_concept_cloud(
+        placeholder_export(), subtitle="</script><script>alert(1)</script>"
+    )
+    assert "<script>alert(1)" not in html
+    assert "\\u003c/script>" in html
+
+
+def test_bundle_text_matching_a_sentinel_does_not_corrupt_the_data_island() -> None:
+    # Regression: title/subtitle substitution must run before the bundle is
+    # embedded. A project name or concept display can happen to contain a
+    # sentinel's literal string; if substitution ran afterward it would rewrite
+    # that text inside the JSON island instead of the heading, and a subtitle
+    # containing a quote would break `JSON.parse` outright.
+    export = ConceptCloudExport(
+        generated_at="2026-08-04T00:00:00Z",
+        project="x __CONCEPT_CLOUD_SUBTITLE__ y",
+        dag_plane=DagPlane(
+            nodes=(DagNode(id="model.p.m", label="m", resource_type="model"),)
+        ),
+        concepts=(
+            Concept(
+                canonical_id="org:x",
+                display="__CONCEPT_CLOUD_TITLE__",
+                frequency=1,
+                provenance=Provenance(model="m"),
+            ),
+        ),
+    )
+    html = render_concept_cloud(export, subtitle='say "hi"')
+    island = _extract_data_island(html)
+    assert island["project"] == "x __CONCEPT_CLOUD_SUBTITLE__ y"
+    assert island["concepts"][0]["display"] == "__CONCEPT_CLOUD_TITLE__"
+    assert 'SUBTITLE_OVERRIDE = "say \\"hi\\""' in html
+
+
 def test_write_concept_cloud_creates_the_file(tmp_path: Path) -> None:
     out = tmp_path / "nested" / "cloud.html"
     written = write_concept_cloud(placeholder_export(), out)
@@ -107,6 +167,44 @@ def test_cli_concept_cloud_placeholder_writes_artifact(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert out.exists()
     assert "invoice_pipeline" in _extract_data_island(out.read_text(encoding="utf-8"))["project"]
+
+
+def test_cli_concept_cloud_threads_title_and_subtitle(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    out = tmp_path / "cloud.html"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "concept-cloud",
+            "--placeholder",
+            "--output",
+            str(out),
+            "--title",
+            "Risk factors",
+            "--subtitle",
+            "2010-2024",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    html = out.read_text(encoding="utf-8")
+    assert "<title>Risk factors</title>" in html
+    assert 'SUBTITLE_OVERRIDE = "2010-2024"' in html
+
+
+def test_cli_concept_cloud_takes_the_documented_short_output_flag(tmp_path: Path) -> None:
+    """Every example in docs/reference.md writes `-o cloud.html`; the option
+    had only its long form, so the first command a reader copied failed."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    out = tmp_path / "cloud.html"
+    result = CliRunner().invoke(cli, ["concept-cloud", "--placeholder", "-o", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.exists()
 
 
 def test_cli_concept_cloud_requires_a_source() -> None:
@@ -387,7 +485,7 @@ def test_the_detail_card_draws_a_concept_history() -> None:
 
     assert "function sparkline(node)" in html
     # Actually reached from the card, rather than defined and orphaned.
-    assert "sparkline(node);" in html
+    assert "sparkline(node) +" in html
     assert '<div class="spark">' in html
     # The strip is read against the period slider: the current bar is lit.
     assert '`<i class="${p === period ? "now" : ""}" ' in html
@@ -507,3 +605,38 @@ def test_an_unchanged_pair_of_periods_says_so_rather_than_an_empty_panel() -> No
     html = render_concept_cloud(_timed_export())
 
     assert '<span class="empty">No change between ${esc(from)} and ${esc(to)}.</span>' in html
+
+
+# ─── ego view: "what does X name" (issue #555 item 5) ───────────────────────
+
+
+def test_focus_hides_everything_outside_the_selected_constellation() -> None:
+    """Dimming answers "where is X"; on a dense map only hiding answers "what
+    does X name". The card offers it, and it hides concepts only -- the dbt
+    plane stays governed by lineage mode."""
+    html = render_concept_cloud(placeholder_export())
+
+    assert '"Show the whole map" : "Focus on its constellation"' in html
+    dag_rule = html.index('if (n.kind === "dag") return lineageMode;')
+    focus_rule = html.index("if (focus && !ego.has(n.id)) return false;")
+    assert dag_rule < focus_rule
+
+
+def test_the_focused_constellation_follows_the_period_and_strength_filter() -> None:
+    """A pair not named together in the selected period, or below the strength
+    filter, draws no line -- so its far end is not part of what the star names
+    right now, and focus must hide it rather than float it alone."""
+    html = render_concept_cloud(_weighted_export())
+
+    assert 'if (l.kind !== "concept" || periodWeight(l) < minWeight) return;' in html
+    # Recomputed on every refresh, which every period/strength change goes through.
+    assert "if (!selected) focus = false;\n        recomputeEgo();" in html
+
+
+def test_focus_reframes_the_camera_on_what_it_shows() -> None:
+    """Five stars seen from the whole-map distance are five specks. Leaving
+    focus by clearing the selection reframes on the whole map."""
+    html = render_concept_cloud(placeholder_export())
+
+    assert "Graph.zoomToFit(600, 60, n => nodeVisible(n))" in html
+    assert "if (wasFocused) fitView();" in html

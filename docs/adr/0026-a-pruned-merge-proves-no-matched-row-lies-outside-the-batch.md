@@ -1,4 +1,4 @@
-# ADR-0024: a pruned incremental MERGE first proves no matched row lies outside the batch's layout values
+# ADR-0026: a pruned incremental MERGE first proves no matched row lies outside the batch's layout values
 
 - **Status:** accepted
 - **Date:** 2026-10-09

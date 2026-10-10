@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from ..adapters import StateValue
 
 
 class RunError(Exception):
@@ -73,3 +76,64 @@ class ModelRunResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     artifact_metadata: dict[str, Any] | None = None
     serving_resource: dict[str, Any] | None = None
+
+
+def state_for_skipping(
+    state: Mapping[str, StateValue], *, reprocess_all: bool
+) -> Mapping[str, StateValue]:
+    """The state a stage may skip records on -- which `--reprocess-all` empties.
+
+    Deliberately *not* the same mapping the stage reconciles removals against,
+    which stays whole. Ignoring state is not the same as clearing it, and the
+    difference is load-bearing three times over (issue #655):
+
+    - **Removals still reconcile.** A stage works out what vanished upstream
+      from the state it published last time: by a warehouse anti-join against
+      `stel_state` where the id column's cast round-trips (issue #428), and
+      by a Python set difference over this mapping otherwise. Clearing the
+      state empties the left side of both, so a row deleted upstream survives
+      in the target -- silently, because an empty removal set is also what a
+      run with no removals produces. Mutation-checked: implementing this flag
+      as `clear_state(scope)` leaves that row published while every assertion
+      about reuse still passes, which is what makes it the plausible wrong
+      answer rather than an obviously broken one.
+    - **A transform stays incremental.** `_run_incremental_transform` reads an
+      empty state baseline over an existing target as "rebuild with a full
+      replace", because a child-keyed upsert onto rows no per-parent state
+      owns would leave orphan children. Clearing state would trip that branch
+      and turn an announced reprocess into a silent full rebuild -- a
+      different operation, at a different cost.
+    - **A failed run stays resumable.** Nothing on disk is destroyed, so an
+      interrupted reprocess leaves the baseline that the next ordinary run
+      needs. Clearing first means a crash costs the baseline too.
+
+    The caller keeps both mappings in scope under separate names so which
+    question is being asked -- "may I skip this record?" versus "what did the
+    last run publish?" -- is visible at each site. `--full-refresh` answers
+    both with "nothing" by not fetching state at all; this flag answers only
+    the first.
+    """
+    return {} if reprocess_all else state
+
+
+def update_filter_for_publish(
+    columns: Sequence[str], *, reprocess_all: bool
+) -> Sequence[str]:
+    """The `update_when_changed` fingerprint a publish may filter on -- which
+    `--reprocess-all` empties.
+
+    `update_when_changed` (issue #281) is a *publication* optimization: a
+    matched row is rewritten only when one of the listed columns differs, so
+    re-publishing an unchanged row does not rewrite its large payload
+    columns. Under a forced reprocess that is precisely backwards. A column
+    corrupted by a bad publish -- the case the flag exists for -- sits
+    *outside* the declared fingerprint by construction, since a fingerprint
+    names the columns that decide identity: every listed column matches, the
+    MERGE filters the row out, and the corruption survives while the run
+    reports every row processed and reused (PR #660 review).
+
+    Skipping a *record* and skipping its *write* are two different
+    optimizations keyed off two different things, and a forced reprocess has
+    to turn off both. `state_for_skipping` is the other one.
+    """
+    return () if reprocess_all else columns

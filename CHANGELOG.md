@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### A LanceDB store keeps a mirror, and a fresh host restores from it (issue #666)
+
+- **A local store had no copy anywhere else.** v0.22.0 let a store declare an
+  `identity:` so its bytes could move off a `gs://` URI onto local disk and stop
+  paying egress on every read. That left the copy -- the thing a fresh host is
+  rebuilt from -- to a `gcloud storage rsync` stel knew nothing about. A LanceDB
+  store now takes `mirror:` (a `gs://` or `s3://` URI, or a local path), and
+  every successful publish and `stel serving activate` ends by syncing the
+  served generation to it. Builds and queries never read the mirror.
+- **The copy is files, not rows.** A Lance table is immutable files plus the
+  manifests that name them, so the mirror holds the same versions and the same
+  indices; nothing is rebuilt there, and nothing is rebuilt on restore. Files
+  land before the manifests that name them and the version hint lands last, so
+  the mirror is a readable table wherever a copy stops, and a rerun copies only
+  what the mirror lacks. Files the primary prunes leave the mirror too, and a
+  rebuild's superseded generation is retired from it once the new one is
+  recorded.
+- **A sync is a reader.** It holds a query lease for the length of the copy,
+  which keeps an in-place publish and generation retirement off the collection
+  it is copying, and it mirrors a collection only when that collection is the
+  generation the serving ledger activated.
+- **The ledger records what the mirror holds.** Three nullable columns on the
+  serving ledger (`mirror_generation`, `mirror_target`, `mirrored_epoch`), added
+  in place to an existing ledger. `stel serving status` now prints a `mirror:`
+  line saying whether the mirror holds the served generation, and an
+  `identity:` line naming the store's declared identity -- once a store can
+  move, its location no longer says which store a command resolved to.
+- **`stel serving sync <index>`** retries a sync that failed, or gives an index
+  published before the mirror existed its first copy. A sync that fails at the
+  end of a publish fails the model and names this command; the publication
+  itself stands, still ready and serving.
+- **`stel serving restore <index> --target T`** copies the served generation
+  from the mirror onto a primary that lacks it -- a fresh host, a lost disk.
+  The publication state was in the warehouse all along, so the next run
+  reconciles nothing and embeds nothing. It restores only when the mirror holds
+  exactly the generation the ledger serves, never overwrites a file the
+  primary already has, and checks the generation it produced before reporting
+  success.
+- `mirror:` requires a local primary `path`, and reaches its bucket with the
+  environment's default credentials (Application Default Credentials for
+  `gs://`, the AWS default chain for `s3://`). ADR-0030 records why the mirror
+  is a byte copy, why a failed sync fails the model, and why the sync holds a
+  query lease rather than the publish claim.
+
 ## v0.22.0 - 2026-10-09
 
 ### A store can be named independently of where it sits (issue #666)

@@ -701,7 +701,7 @@ def test_contract_is_discoverable_in_manifest_dbt_sources_and_docs(
     )
 
     manifest = build_manifest(tmp_path)
-    assert manifest["manifest_version"] == 2
+    assert manifest["manifest_version"] == 3
     model = manifest["models"][0]
     descriptor = model["agent_context"]
     assert descriptor["contract"] == AGENT_CONTEXT_CONTRACT

@@ -1,6 +1,6 @@
 # ADR-0025: a declared entity scope filters after retrieval and reports what it excluded
 
-- **Status:** accepted
+- **Status:** accepted; its known limitation is resolved by [ADR-0028](0028-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
 - **Date:** 2026-10-09
 - **Prompted by:** #628
 

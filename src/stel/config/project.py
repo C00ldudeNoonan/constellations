@@ -12,7 +12,7 @@ from pydantic import (
 )
 
 from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME, validate_node_name
-from .vocabulary import RelationTypeDef, Vocabulary
+from .vocabulary import RelationTypeDef, Vocabulary, check_declaration
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
 
@@ -67,13 +67,6 @@ class ProjectConfig(BaseModel):
     classes: tuple[str, ...] = Field(default_factory=tuple)
     relations: tuple[RelationTypeDef, ...] = Field(default_factory=tuple)
 
-    @field_validator("vocabularies")
-    @classmethod
-    def _validate_vocabulary_names(cls, v: dict[str, Vocabulary]) -> dict[str, Vocabulary]:
-        for name in v:
-            validate_node_name(name, kind="Vocabulary")
-        return v
-
     @field_validator("classes")
     @classmethod
     def _validate_classes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
@@ -85,20 +78,11 @@ class ProjectConfig(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def _validate_term_classes(self) -> ProjectConfig:
-        # A term's `class:` is a membership claim against the same declaration
-        # relations are checked against (issue #629). Undeclared, it would
-        # attach a class no relation or agent-facing list knows about.
-        for vocab_name, vocabulary in self.vocabularies.items():
-            for term in vocabulary.terms:
-                if term.entity_class is None:
-                    continue
-                if term.entity_class not in self.classes:
-                    raise ValueError(
-                        f"vocabulary '{vocab_name}' term '{term.label}' declares "
-                        f"`class: {term.entity_class}`, which is not declared under "
-                        f"`classes:`. Declared: {sorted(self.classes) or '(none)'}"
-                    )
+    def _validate_declaration(self) -> ProjectConfig:
+        # Vocabulary names and term classes are checked against the project
+        # around them, in the function the serving catalog also applies to a
+        # compiled declaration (issue #669), so the two cannot disagree.
+        check_declaration(self.vocabularies, self.classes)
         return self
 
     @model_validator(mode="after")

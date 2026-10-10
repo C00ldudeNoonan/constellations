@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Embedding reuse is keyed by the text, not by the row (issue #665)
+
+- **An id-space change re-paid for every vector.** Reuse looked the existing
+  target up by row id and checked the text hash afterwards, so a corpus whose
+  *ids* moved got no hits even though the text — and its
+  `embedding_input_hash` — was unchanged. astrolabe's SEC corpus did exactly
+  that: an agent_context wrapper hop re-keyed 3.67M chunks onto `context_id`,
+  every vector was discarded, and the corpus was embedded about 1.9 times
+  (7.78B input characters against a single pass's ~4.1B; ~$195 against ~$100).
+  Reuse is now keyed on `embedding_input_hash`, so a re-keyed or re-chunked
+  row whose text did not change reuses its vector. The row id is how the row
+  is fetched, not how it is found.
+- **New text costs no vector read.** The id/hash index is consulted in memory
+  before any lookup, so a window of text the target does not hold issues no
+  warehouse read at all. The projection those reads pull is almost entirely
+  the vector column — 21.3 GiB per lookup job on that corpus (issue #664).
+- **The configuration check is what now guards correctness.** Keying by hash
+  makes the old `embedding_input_hash == text_hash` comparison true by
+  construction, leaving `embedding_config_hash` as the only thing between
+  matching text and a vector built under a different provider, model,
+  dimensions, or implementation. It has its own test and mutation check.
+- A resumed run's key scan now projects two columns (the id and
+  `embedding_input_hash`) instead of one. ADR-0026 records what that residency
+  buys, and why the lookup resolves hashes to ids in memory rather than
+  predicating on the hash column.
+- Fixed while here: `test_a_decimal_id_degrades_to_no_reuse_instead_of_failing`
+  passed a record id to a lookup that now takes a text hash, so it asserted
+  "no reuse" for a reason unrelated to the DECIMAL keys it exists to cover. It
+  takes the row's hash now, and fails again when the guard is removed.
+
 ## v0.21.1 - 2026-10-09
 
 ### An agent can search by declared class and walk the hierarchy (issue #628)

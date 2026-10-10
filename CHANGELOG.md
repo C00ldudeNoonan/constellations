@@ -18,19 +18,32 @@
   before any lookup, so a window of text the target does not hold issues no
   warehouse read at all. The projection those reads pull is almost entirely
   the vector column — 21.3 GiB per lookup job on that corpus (issue #664).
-- **The configuration check is what now guards correctness.** Keying by hash
-  makes the old `embedding_input_hash == text_hash` comparison true by
-  construction, leaving `embedding_config_hash` as the only thing between
-  matching text and a vector built under a different provider, model,
-  dimensions, or implementation. It has its own test and mutation check.
-- A resumed run's key scan now projects two columns (the id and
-  `embedding_input_hash`) instead of one. ADR-0026 records what that residency
-  buys, and why the lookup resolves hashes to ids in memory rather than
-  predicating on the hash column.
+- **Only vectors from this run's configuration are reusable, and that is
+  decided when the index is built.** Keying by hash makes the old
+  `embedding_input_hash == text_hash` comparison true by construction, so
+  `embedding_config_hash` is what stands between matching text and a vector
+  built under a different provider, model, dimensions, or implementation.
+  The index therefore records a representative row per text hash only among
+  rows carrying the current config hash. Without that filter, a target
+  holding the same text under two configurations — duplicate text, plus a
+  config change, plus a publish interrupted partway — kept whichever row the
+  unordered scan saw last, and an old-config row winning that race meant
+  paying to re-embed text the target already held a current vector for.
+  Filtering at index time also means such a row is never fetched.
+- A resumed run's key scan now projects three columns (the id,
+  `embedding_input_hash` and `embedding_config_hash`) instead of one. The
+  config hash shrinks the index rather than growing it, since stale-config
+  rows are excluded. ADR-0026 records what that residency buys, why the
+  lookup resolves hashes to ids in memory rather than predicating on the
+  hash column, and why retaining a candidate list per hash was declined.
 - Fixed while here: `test_a_decimal_id_degrades_to_no_reuse_instead_of_failing`
   passed a record id to a lookup that now takes a text hash, so it asserted
   "no reuse" for a reason unrelated to the DECIMAL keys it exists to cover. It
   takes the row's hash now, and fails again when the guard is removed.
+- Also caught by mutation checking rather than by review: the first version of
+  the stale-config test listed its rows so that an unfiltered index kept the
+  *usable* one by insertion order, and passed with the fix removed. The row
+  order is load-bearing and the test says so.
 
 ## v0.21.1 - 2026-10-09
 

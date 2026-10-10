@@ -394,6 +394,8 @@ stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FI
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
 stel serving recover <search-index> --target T --owner-terminated  # explicit authority reassignment after a crash
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
+stel serving sync <search-index>                         # copy the served generation to the store's mirror
+stel serving restore <search-index> --target T           # bring the served generation back from the mirror
 stel grants list [--subject S] [--relation R]            # what the governed MCP server authorizes from
 stel grants show <subject>                               # one subject's grants, and what it reads as
 stel grants history [--subject S] [--limit N]            # recorded changes, newest first: who changed what, when
@@ -2986,7 +2988,8 @@ about $70 of it for a single index rebuild (issue #666).
 A cloud store earns that when readers are genuinely distributed — a builder and
 servers in different containers that share no filesystem. When they are not,
 the store wants to be local, with a copy to the bucket for durability and for
-restoring onto another host. That is what `identity:` below makes possible.
+restoring onto another host. That is what `identity:` and `mirror:` below make
+possible.
 
 #### A store's identity, and moving a store
 
@@ -3037,6 +3040,67 @@ Two different stores given the same `identity:` are one store as far as stel
 can tell — it will read one's publication state against the other. The derived
 default is what protects a profile that declares nothing, which is why it stays
 the default.
+
+#### A mirror: a copy of every served generation
+
+A LanceDB store with a local primary can keep a second copy in object storage:
+
+```yaml
+          local:
+            type: lancedb
+            path: /srv/lancedb                 # builds and queries read this
+            identity: econ-prod                # so a restored copy is the same store
+            mirror: gs://bucket/lancedb        # never read by a query
+```
+
+Every successful publish and `stel serving activate` ends by syncing the
+generation the serving ledger now serves to the mirror. The copy is a byte copy
+of the Lance table's files -- the same versions and the same indices, so nothing
+is rebuilt at the mirror or on restore -- and it copies only the files the
+mirror lacks. Files land before the manifests that name them, so the mirror is
+a readable table wherever a copy stops. Files the primary prunes leave the
+mirror too, and a rebuild's superseded generation is retired from it.
+
+`mirror:` takes a `gs://` or `s3://` URI or a local path, and reaches a bucket
+with the environment's default credentials -- Application Default Credentials
+for `gs://`, the AWS default chain for `s3://` -- the same ones `gcloud storage`
+or the AWS CLI would use. It requires a local primary `path`. It does not change
+the store's identity, so adding or moving a mirror re-keys nothing.
+
+**A sync that fails fails the model, not the publication.** The generation is
+already published and serving when the sync runs, so the ledger stays `ready`;
+the model reports the failure and names the command that retries it:
+
+```bash
+stel serving sync sec_search --target prod
+```
+
+Run the same command to give an index published before its store had a mirror
+its first copy. A sync holds a query lease while it copies, so an in-place
+publish of the same index waits for it as it would for any reader. It mirrors a
+collection only when that collection is the generation the ledger activated: an
+in-place publish that failed and left the scope `degraded` is not mirrored until
+a publish succeeds.
+
+`stel serving status` reports the mirror on its own line -- whether it holds the
+served generation and when it was synced, or that it is behind or was never
+synced -- and names the store's declared `identity:`.
+
+**Restoring onto a fresh host.** With the profile pointing at an empty primary
+and the same `identity:`:
+
+```bash
+stel serving restore sec_search --target prod
+```
+
+copies the served generation from the mirror into the primary. The publication
+state never left the warehouse, so the next run reconciles nothing and embeds
+nothing. A restore requires `--target`; it is refused unless the mirror holds
+exactly the generation the ledger serves, since an older copy would be served
+under state that does not describe it; it never overwrites a file the primary
+already has; and it checks that what it produced is the served generation
+before reporting success. A store restored to a different path without a
+declared `identity:` is a different store, and the restore says so.
 
 #### Bounding LanceDB's caches
 

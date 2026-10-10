@@ -75,6 +75,7 @@ from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .contracts import ModelRunResult, RunError
+from .mirror import sync_mirror_after_publish
 
 log = logging.getLogger(__name__)
 
@@ -1067,6 +1068,27 @@ def _run_search_model(
             ) from None
         raise RunError(str(error), metrics=timings.as_metrics(), progress=progress) from None
 
+    if store_config.mirror_location() is not None:
+        # After activation and outside the publish's own failure handling:
+        # the generation is live whatever the copy does, so a failed sync
+        # must not mark the publication failed (issue #666).
+        assert state_scope is not None
+        sync_mirror_after_publish(
+            store=store,
+            coordinator=coordinator,
+            scope=state_scope,
+            logical_collection=logical_collection,
+            model_name=model.name,
+            timings=timings,
+            progress={
+                "documents_processed": inserted + updated,
+                "documents_skipped": skipped,
+                "documents_deleted": deleted,
+                "rows_written": rows_written,
+                "rows_inserted": inserted,
+                "rows_updated": updated,
+            },
+        )
     assert spec is not None
     safe_target = store.safe_descriptor()
     return ModelRunResult(

@@ -2683,6 +2683,11 @@ def _echo_serving_context(report: Any) -> None:
         f"store:             {report.store_alias} ({report.store_type}) "
         f"{report.store_location}"
     )
+    # Once a store can move, its location no longer says which logical store
+    # this is; the declared identity does (issue #666).
+    from .cli_services.serving import describe_identity
+
+    click.echo(f"identity:          {describe_identity(report.store_identity)}")
 
 
 @serving.command("status")
@@ -2693,6 +2698,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
     import time
 
+    from .cli_services.serving import describe_mirror as _describe_mirror
     from .cli_services.serving import describe_publisher_claim as _describe_publisher
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
@@ -2724,6 +2730,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
     # What the two lines above mean for a reader, in words (issue #617).
     click.echo(f"serving:           {_describe_serving(entry)}")
+    click.echo(f"mirror:            {_describe_mirror(entry, mirror=report.store_mirror)}")
     # Who holds the claim and how long since they were heard from (issue
     # #621), where `active` used to stand in for both.
     click.echo(f"publisher:         {_describe_publisher(entry, now_epoch=int(time.time()))}")
@@ -2957,6 +2964,103 @@ def serving_migrate_scope(
     click.echo(
         f"Migrated serving scope for '{model_name}': "
         f"ledger_rows={result['ledger_rows']} state_rows={result['state_rows']}"
+    )
+
+
+@serving.command("sync")
+@click.argument("model_name")
+@_project_context_options
+@click.pass_context
+def serving_sync(ctx: click.Context, model_name: str) -> None:
+    """Copy the generation a search index serves to its store's mirror.
+
+    Every successful publish and `serving activate` already ends with this
+    when the store declares a `mirror:` (issue #666). Run it to retry a sync
+    that failed, or to give an index published before the mirror existed its
+    first copy. It copies only the files the mirror lacks, removes what the
+    primary has pruned, and retires the mirror's superseded generations.
+
+    The sync holds a query lease for its duration, so an in-place publish of
+    the same index waits for it, as it would for any reader.
+    """
+    from .cli_services.serving import describe_mirror as _describe_mirror
+    from .cli_services.serving import serving_sync as _serving_sync
+    from .retrieval import RetrievalError
+
+    try:
+        outcome = _serving_sync(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, RetrievalError) as e:
+        raise click.ClickException(str(e)) from e
+    _echo_serving_context(outcome.report)
+    sync = outcome.outcome
+    click.echo(
+        f"Synced '{sync.collection}' for '{model_name}': "
+        f"{sync.copy.files_copied} file(s) copied ({sync.copy.bytes_copied} bytes), "
+        f"{sync.copy.files_deleted} removed, {len(sync.retired)} superseded "
+        "generation(s) retired."
+    )
+    if not sync.recorded:
+        click.echo(
+            "note:              a newer generation was activated during the copy; "
+            "its own publish syncs it."
+        )
+    entry = outcome.report.entry
+    click.echo(f"mirror:            {_describe_mirror(entry, mirror=outcome.report.store_mirror)}")
+
+
+@serving.command("restore")
+@click.argument("model_name")
+@_project_context_options
+@click.pass_context
+def serving_restore(ctx: click.Context, model_name: str) -> None:
+    """Bring the generation a search index serves back from its store's mirror.
+
+    For a host whose primary lacks the index: a fresh machine, or one whose
+    disk was lost (issue #666). The publication state is already in the
+    warehouse, so once the bytes are back the index serves and the next
+    incremental run reconciles from where the last one finished. Nothing is
+    re-embedded.
+
+    Restores only the generation the ledger serves, and only when the mirror
+    holds exactly that generation. Never overwrites a file the primary
+    already has. A store restored to a different path must declare the
+    `identity:` it published under, or its serving record is not found.
+
+    Requires --target.
+    """
+    from .cli_services.serving import serving_restore as _serving_restore
+    from .retrieval import RetrievalError
+
+    try:
+        outcome = _serving_restore(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, RetrievalError) as e:
+        raise click.ClickException(str(e)) from e
+    _echo_serving_context(outcome.report)
+    restore = outcome.outcome
+    if not restore.copy.files_copied:
+        click.echo(
+            f"Nothing to restore for '{model_name}': the primary already holds "
+            f"'{restore.collection}' at the served generation."
+        )
+        return
+    click.echo(
+        f"Restored '{restore.collection}' for '{model_name}': "
+        f"{restore.copy.files_copied} file(s) ({restore.copy.bytes_copied} bytes). "
+        "It is the served generation; queries can use it now."
     )
 
 

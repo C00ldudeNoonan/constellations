@@ -95,6 +95,11 @@ _LEDGER_COLUMNS_ADDED_LATER: tuple[tuple[str, str], ...] = (
     ("publisher_namespace", "STRING"),
     # What a long publication phase has done so far (issue #635).
     ("progress_note", "STRING"),
+    # Which generation the store's mirror holds, which mirror, and when it
+    # was last brought up to date (issue #666).
+    ("mirror_generation", "STRING"),
+    ("mirror_target", "STRING"),
+    ("mirrored_epoch", "BIGINT"),
 )
 
 
@@ -145,6 +150,14 @@ class ServingLedgerEntry:
     # it, and `stel serving status` is where it is read.
     publisher: PublisherIdentity | None
     publisher_heartbeat_epoch: int | None
+    # The generation the store's mirror holds, the fingerprint of the mirror
+    # that holds it, and when it was copied (issue #666). Independent of the
+    # active pointer on purpose: a publish moves that, and the mirror is
+    # current only once a sync catches up, which `stel serving status` reports
+    # by comparing the two. None until a first sync.
+    mirror_generation: str | None
+    mirror_target: str | None
+    mirrored_epoch: int | None
 
 
 @dataclass(frozen=True)
@@ -257,7 +270,10 @@ class ServingCoordinator:
                 publisher_started_epoch BIGINT,
                 publisher_label STRING,
                 publisher_heartbeat_epoch BIGINT,
-                publisher_namespace STRING
+                publisher_namespace STRING,
+                mirror_generation STRING,
+                mirror_target STRING,
+                mirrored_epoch BIGINT
             )
             """
         )
@@ -432,7 +448,8 @@ class ServingCoordinator:
                    rows_inserted, rows_updated, rows_skipped, rows_deleted,
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
-                   publisher_heartbeat_epoch, publisher_namespace, progress_note
+                   publisher_heartbeat_epoch, publisher_namespace, progress_note,
+                   mirror_generation, mirror_target, mirrored_epoch
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -466,6 +483,7 @@ class ServingCoordinator:
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
                    publisher_heartbeat_epoch, publisher_namespace, progress_note,
+                   mirror_generation, mirror_target, mirrored_epoch,
                    (
                        SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
                        WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -535,6 +553,9 @@ class ServingCoordinator:
                 query_leases=0,
                 publisher=None,
                 publisher_heartbeat_epoch=None,
+                mirror_generation=None,
+                mirror_target=None,
+                mirrored_epoch=None,
             )
         return ServingLedgerEntry(
             status=str(row[1]),
@@ -553,6 +574,9 @@ class ServingCoordinator:
             query_leases=self._lease_count(scope),
             publisher=_publisher_from_row(row),
             publisher_heartbeat_epoch=None if row[16] is None else int(row[16]),
+            mirror_generation=None if row[19] is None else str(row[19]),
+            mirror_target=None if row[20] is None else str(row[20]),
+            mirrored_epoch=None if row[21] is None else int(row[21]),
         )
 
     # ─── publication claims ───────────────────────────────────────────────
@@ -1109,6 +1133,44 @@ class ServingCoordinator:
         self._adapter.execute(
             f"DELETE FROM {self._ref(LEASE_TABLE)} WHERE lease_id = ?",
             [lease.lease_id],
+        )
+
+    # ─── mirror (issue #666) ──────────────────────────────────────────────
+
+    def record_mirror(self, lease: QueryLease, *, mirror_target: str) -> bool:
+        """Record that the mirror now holds the generation `lease` pins.
+
+        Conditional on that generation still being the active one, so a sync
+        that finishes after a later activation cannot overwrite the record a
+        sync of the newer generation wrote. Not fenced by a publish claim: a
+        mirror sync is a reader, and holds a query lease rather than the
+        claim, which is what keeps an in-place publisher and the retirement
+        sweep off the collection while it is copied.
+
+        Returns whether the record landed. False means the generation stopped
+        being active during the copy; the activation that replaced it syncs
+        its own.
+        """
+        self._adapter.execute(
+            f"""
+            UPDATE {self._ref(LEDGER_TABLE)}
+            SET mirror_generation = ?, mirror_target = ?, mirrored_epoch = ?
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND active_generation = ?
+            """,
+            [
+                lease.pinned_generation,
+                mirror_target,
+                int(time.time()),
+                *self._scope_params(lease.scope),
+                lease.pinned_generation,
+            ],
+        )
+        row = self._read_row(lease.scope)
+        return (
+            row is not None
+            and row[19] == lease.pinned_generation
+            and row[20] == mirror_target
         )
 
     # ─── administrative recovery ──────────────────────────────────────────

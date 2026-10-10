@@ -1,4 +1,4 @@
-# ADR-0027: the serving catalog reads the declaration the artifact was compiled with, not the live project file
+# ADR-0028: the serving catalog reads the declaration the artifact was compiled with, not the live project file
 
 - **Status:** accepted
 - **Date:** 2026-10-10

@@ -2222,10 +2222,30 @@ corpus, then streams the rows themselves in batches to fill each flush window
 that, a *fresh* run's peak was O(corpus) no matter how small `flush_every`
 was, because the whole upstream was read before the first provider call.
 
-The resume is bounded too: a resumed run reads the existing target's
-id column once (streamed and projected — no vectors), then looks up reuse
-candidates one window at a time by key, so resuming a large corpus never
-costs more memory than running it.
+The resume is bounded too: a resumed run reads the existing target's id and
+`embedding_input_hash` columns once (streamed and projected — no vectors),
+then looks up reuse candidates one window at a time, so resuming a large
+corpus never costs more memory than running it.
+
+**Reuse is keyed by the text, not by the row** (issue #665). A vector is
+reusable when some row in the target recorded the same
+`embedding_input_hash` under the same embedding configuration — not only
+when *this* row did. So re-keying a corpus, or re-chunking it in a way that
+preserves chunk text, keeps every vector already paid for. Keyed by row id,
+as it was previously, an id-space change silently discarded the lot:
+astrolabe's 3.67M-chunk SEC corpus moved its identity onto `context_id` and
+was embedded about 1.9 times for it.
+
+The configuration still decides: same text under a different provider, model,
+dimensions, or implementation is a different vector and is recomputed. Only
+rows carrying the current configuration are reuse candidates, so a target that
+holds the same text under *both* an old and the current configuration — which
+a config change interrupted partway leaves behind — reuses the current one
+rather than being blocked by the stale row.
+
+And because the hash index is consulted in memory, text the target does not
+hold costs no vector read at all — which matters most where that column is
+most of the table's bytes.
 
 On BigQuery the reuse target is also the table each window just updated. If
 table metadata advances while one of those immutable query results is being
@@ -2687,7 +2707,8 @@ copied into artifacts.
 Incremental runs distinguish three cases:
 
 - unchanged rows are skipped;
-- metadata-only changes reuse the existing vector and refresh the warehouse row;
+- metadata-only changes reuse the existing vector and refresh the warehouse
+  row, as does a row whose id changed while its text did not;
 - text, model, provider, dimensions, or implementation changes recompute it.
 
 Removed upstream IDs are deleted downstream. Provider results are validated for

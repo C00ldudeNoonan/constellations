@@ -16,11 +16,54 @@
   rather than read as declaring nothing. A server started beside a project
   file whose declaration differs from its manifest logs a warning naming the
   remedy.
-  [ADR-0027](docs/adr/0027-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
+  [ADR-0028](docs/adr/0028-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
   records why the declaration is persisted rather than fingerprinted, and why
   it is not yet tied to the serving generation.
 - **Upgrade note:** recompile once. The downstream Dagster launcher reads only
   `depends_on` from the manifest and is unaffected.
+
+### Embedding reuse is keyed by the text, not by the row (issue #665)
+
+- **An id-space change re-paid for every vector.** Reuse looked the existing
+  target up by row id and checked the text hash afterwards, so a corpus whose
+  *ids* moved got no hits even though the text — and its
+  `embedding_input_hash` — was unchanged. astrolabe's SEC corpus did exactly
+  that: an agent_context wrapper hop re-keyed 3.67M chunks onto `context_id`,
+  every vector was discarded, and the corpus was embedded about 1.9 times
+  (7.78B input characters against a single pass's ~4.1B; ~$195 against ~$100).
+  Reuse is now keyed on `embedding_input_hash`, so a re-keyed or re-chunked
+  row whose text did not change reuses its vector. The row id is how the row
+  is fetched, not how it is found.
+- **New text costs no vector read.** The id/hash index is consulted in memory
+  before any lookup, so a window of text the target does not hold issues no
+  warehouse read at all. The projection those reads pull is almost entirely
+  the vector column — 21.3 GiB per lookup job on that corpus (issue #664).
+- **Only vectors from this run's configuration are reusable, and that is
+  decided when the index is built.** Keying by hash makes the old
+  `embedding_input_hash == text_hash` comparison true by construction, so
+  `embedding_config_hash` is what stands between matching text and a vector
+  built under a different provider, model, dimensions, or implementation.
+  The index therefore records a representative row per text hash only among
+  rows carrying the current config hash. Without that filter, a target
+  holding the same text under two configurations — duplicate text, plus a
+  config change, plus a publish interrupted partway — kept whichever row the
+  unordered scan saw last, and an old-config row winning that race meant
+  paying to re-embed text the target already held a current vector for.
+  Filtering at index time also means such a row is never fetched.
+- A resumed run's key scan now projects three columns (the id,
+  `embedding_input_hash` and `embedding_config_hash`) instead of one. The
+  config hash shrinks the index rather than growing it, since stale-config
+  rows are excluded. ADR-0026 records what that residency buys, why the
+  lookup resolves hashes to ids in memory rather than predicating on the
+  hash column, and why retaining a candidate list per hash was declined.
+- Fixed while here: `test_a_decimal_id_degrades_to_no_reuse_instead_of_failing`
+  passed a record id to a lookup that now takes a text hash, so it asserted
+  "no reuse" for a reason unrelated to the DECIMAL keys it exists to cover. It
+  takes the row's hash now, and fails again when the guard is removed.
+- Also caught by mutation checking rather than by review: the first version of
+  the stale-config test listed its rows so that an unfiltered index kept the
+  *usable* one by insertion order, and passed with the fix removed. The row
+  order is load-bearing and the test says so.
 
 ## v0.21.1 - 2026-10-09
 

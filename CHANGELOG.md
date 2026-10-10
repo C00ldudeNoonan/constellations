@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### A store can be named independently of where it sits (issue #666)
+
+- **A cloud store could not move, so it kept charging for being read.** A
+  store's publication state, serving-ledger row and publisher lock are keyed on
+  a fingerprint of its *location*, so copying a `gs://` store onto local disk
+  produced a store that had never published anything: `stel mcp serve` refused
+  it, and the next run re-embedded the corpus. Reading the bucket instead cost
+  1.43 TB of egress over two months on one real deployment — about $150, some
+  $70 of it per index rebuild — because every process reading it ran outside
+  GCP. A store config now takes `identity:`, a stable label that *is* the
+  store's identity: the location and its routing leave the fingerprint, so one
+  store resolves to one scope whether it is read from the bucket, a local
+  primary, or a copy restored onto a fresh host.
+- **Declaring nothing changes nothing.** Without `identity:` the fingerprint is
+  byte-identical to the one that shipped, down to omitting empty routing.
+  `tests/test_store_identity.py` pins the three digests as literals read off an
+  unmodified tree, because getting this wrong strands every published index.
+- **A label is not a location.** `identity:` takes 1 to 128 characters of
+  `[A-Za-z0-9._:-]` starting with a letter or digit, so a pasted URI is refused
+  at the profile boundary instead of quietly becoming a third identity. It is
+  keyed apart from derived locations, so no label can collide with the
+  fingerprint another store derives from a path that spells the same text.
+- **An index published before the move brings its rows with it.** `stel serving
+  migrate-scope --from-path gs://bucket/lancedb` re-derives the scope the store
+  had at its old location — routing included, since the old fingerprint folded
+  it in — and moves the ledger row and publication state onto the scope the
+  profile resolves now. Still idempotent, and a `--from-path` naming the
+  store's current location moves nothing rather than reporting the whole corpus
+  as migrated.
+- ADR-0029 records why the decoupling lands before the `mirror:` URI #666 asks
+  for: a mirror at a second URI is a different store until identity stops being
+  the path, so `mirror:` would have had to smuggle this in as a side effect of
+  a sync feature.
+
 ### The serving catalog reads the declaration the artifact was compiled with (issue #669)
 
 - **The MCP server read `vocabularies:` from the live project file** while the

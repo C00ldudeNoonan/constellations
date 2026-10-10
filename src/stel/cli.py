@@ -2882,17 +2882,38 @@ def serving_activate(
 
 @serving.command("migrate-scope")
 @click.argument("model_name")
+@click.option(
+    "--from-path",
+    "from_path",
+    default=None,
+    help=(
+        "The location this index's store used to have, when the store has "
+        "moved: its ledger row and publication state are keyed on where it "
+        "was, so they are moved onto the scope the profile resolves now. Give "
+        "the old `path` exactly as the profile carried it (for example "
+        "`gs://bucket/lancedb`). Declare an `identity:` on the store as well, "
+        "or the next move strands the scope again."
+    ),
+)
 @_project_context_options
 @click.pass_context
-def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
-    """Move a search index's serving scope onto its logical-collection key.
+def serving_migrate_scope(
+    ctx: click.Context, model_name: str, from_path: str | None
+) -> None:
+    """Move a search index's serving scope onto the one its profile resolves.
 
-    Issue #355 re-keys the retrieval serving scope from the physical
+    Issue #355 re-keyed the retrieval serving scope from the physical
     collection to the logical one, so the ledger stays readable once a
     logical collection can have several physical generations behind it. An
     index published before that change keeps its ledger row and publication
     state under the old key, where nothing looks for it — and stel treats an
     index with unreachable state as unpublished, which means re-embedding it.
+
+    `--from-path` covers the other way a scope is stranded: a store that moved
+    (issue #666). A scope is keyed on the store's identity, which is derived
+    from its location unless the profile declares an `identity:`, so copying a
+    store to a cheaper location otherwise reads as a store that never
+    published anything.
 
     Run this once per affected index. It is idempotent: a second run reports
     zero rows moved.
@@ -2906,6 +2927,7 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
             profiles_dir=ctx.obj["profiles_dir"],
             target=ctx.obj["target"],
             model_name=model_name,
+            from_path=from_path,
         )
     except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e

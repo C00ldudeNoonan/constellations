@@ -38,6 +38,7 @@ history (issue #311).
 | [0026](0026-embedding-reuse-is-keyed-by-content-and-fetched-by-id.md) | Embedding reuse is keyed by content and fetched by id | accepted |
 | [0027](0027-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md) | A pruned incremental MERGE first proves no matched row lies outside the batch's layout values; the reuse read is scoped to the rows it fetches | accepted |
 | [0028](0028-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md) | The serving catalog reads the declaration the artifact was compiled with, not the live project file; the manifest carries it and moves to v3 | accepted; resolves 0025's known limitation |
+| [0029](0029-a-store-identity-is-declared-not-derived-from-its-location.md) | A retrieval store's identity may be declared, so a store can move without reading as one that never published | accepted |
 
 ## When to write one
 

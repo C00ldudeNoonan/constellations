@@ -9,6 +9,7 @@ vector-store backend.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -20,8 +21,9 @@ from ..profile import resolve_profile
 from .context import ConfigClickError
 
 if TYPE_CHECKING:
+    from ..adapters.base import StateScope
     from ..profile import ResolvedProfile
-    from ..retrieval import ServingLedgerEntry
+    from ..retrieval import RetrievalStoreConfig, ServingLedgerEntry
 
 
 @dataclass(frozen=True)
@@ -47,13 +49,75 @@ class ServingReport:
     had_ledger_row: bool
 
 
+@dataclass(frozen=True)
+class _ServingScopes:
+    """What a serving command resolves from a project directory and a model name.
+
+    One named value rather than a tuple because `migrate-scope` needs the store
+    config and the logical collection to re-derive this index's scope for a
+    store that has since moved (issue #666), and an unnamed sixth tuple slot is
+    how a caller ends up re-keying state against the wrong scope.
+    """
+
+    scope: StateScope
+    legacy_scope: StateScope
+    resolved: ResolvedProfile
+    # (store alias, store type, physical location) -- for `_report`, which
+    # names the resolution in output so acting on the wrong one is evident.
+    context: tuple[str, str, str]
+    store_config: RetrievalStoreConfig
+    project_name: str
+    logical_collection: str
+    model_name: str
+
+    def scope_at(self, location: str) -> StateScope:
+        """This index's scope as it would be with the store at `location`.
+
+        A scope is keyed on the store's identity fingerprint, and that is
+        derived from where the store is unless the profile declares an
+        `identity:`. A store that moved -- or one that has just declared an
+        identity so that it *can* move -- therefore left its ledger row and
+        publication state under the fingerprint of the location it used to
+        have, where nothing looks for them; stel reads an index whose state is
+        unreachable as unpublished, and re-embeds the corpus (issue #666).
+
+        The copy keeps this store's routing options, because the fingerprint
+        the old location produced folded them in. Only the path and any
+        declared identity are replaced.
+        """
+        from ..adapters.base import StateScope
+        from ..retrieval import StoreRole, create_store
+
+        alias, _store_type, _location = self.context
+        # `model_copy` rather than re-validating a dump: a dump redacts the
+        # credential references a store config may hold, so rebuilding from one
+        # would either lose them or fail validation. Nothing here needs a
+        # credential -- a descriptor is computed from the location and the
+        # non-secret routing alone, and this store is never opened.
+        source = self.store_config.model_copy(
+            update={"path": location, "identity": None}
+        )
+        store = create_store(
+            source,
+            project_name=self.project_name,
+            target_name=self.resolved.target_name,
+            alias=alias,
+            role=StoreRole.INSPECT,
+        )
+        return StateScope.for_target_descriptor(
+            self.model_name,
+            stage="retrieval_publish",
+            descriptor=store.state_descriptor(self.logical_collection).descriptor(),
+        )
+
+
 def _resolve_serving_scopes(
     project_dir: Path,
     *,
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> tuple[Any, Any, ResolvedProfile, tuple[str, str, str]]:
+) -> _ServingScopes:
     """Resolve the current and pre-#355 retrieval-publish scopes for an index.
 
     Domain failures (unknown index, no retrieval config, unavailable store)
@@ -99,7 +163,16 @@ def _resolve_serving_scopes(
         stage="retrieval_publish",
         descriptor=state_target.legacy_descriptor(),
     )
-    return scope, legacy_scope, resolved, context
+    return _ServingScopes(
+        scope=scope,
+        legacy_scope=legacy_scope,
+        resolved=resolved,
+        context=context,
+        store_config=store_config,
+        project_name=project_config.name,
+        logical_collection=logical,
+        model_name=model.name,
+    )
 
 
 def resolve_serving_scope(
@@ -108,15 +181,15 @@ def resolve_serving_scope(
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> tuple[Any, ResolvedProfile]:
+) -> tuple[StateScope, ResolvedProfile]:
     """The current (logical-keyed) serving scope for one search index."""
-    scope, _legacy, resolved, _context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir,
         profiles_dir=profiles_dir,
         target=target,
         model_name=model_name,
     )
-    return scope, resolved
+    return resolution.scope, resolution.resolved
 
 
 def serving_status(
@@ -129,9 +202,10 @@ def serving_status(
     """Read the publication ledger for one search index."""
     from ..retrieval import ServingCoordinator
 
-    scope, _legacy, resolved, context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
+    scope, resolved, context = resolution.scope, resolution.resolved, resolution.context
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         return _report(
@@ -155,9 +229,10 @@ def serving_recover(
     and unless they named the target explicitly."""
     from ..retrieval import ServingCoordinator
 
-    scope, _legacy, resolved, context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
+    scope, resolved, context = resolution.scope, resolution.resolved, resolution.context
     if target is None:
         # Resolution above is a read, so this refuses before anything moves
         # -- and it can name the default the caller would otherwise have
@@ -211,9 +286,10 @@ def serving_activate(
     from ..execution.activation import activate_search_generation
     from ..retrieval import ServingCoordinator
 
-    scope, _legacy, resolved, context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
+    scope, resolved, context = resolution.scope, resolution.resolved, resolution.context
     if target is None:
         raise ConfigClickError(
             "'stel serving activate' requires an explicit --target: it changes "
@@ -329,38 +405,73 @@ def _report(
     )
 
 
+def _sources_to_rekey(
+    destination: StateScope, candidates: Sequence[StateScope]
+) -> list[StateScope]:
+    """The candidates worth re-keying onto `destination`, in the order given.
+
+    A candidate equal to the destination is dropped, and so is a repeat: a
+    re-key onto the same scope is not a no-op at the adapter -- it matches
+    every row and reports them as moved -- so leaving one in would answer
+    "migrated 20,115 rows" to a command that moved nothing. `--from-path`
+    naming the store's current location is the obvious operator mistake, and
+    it is the one that would look most like success (issue #666).
+    """
+    seen = {destination.target_identity}
+    pending: list[StateScope] = []
+    for candidate in candidates:
+        if candidate.target_identity in seen:
+            continue
+        seen.add(candidate.target_identity)
+        pending.append(candidate)
+    return pending
+
+
 def serving_migrate_scope(
     project_dir: Path,
     *,
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
+    from_path: str | None,
 ) -> dict[str, int | str]:
-    """Move an index's serving scope from the pre-#355 physical-collection key
-    onto the logical-collection key.
+    """Move an index's serving scope onto the scope its profile resolves today.
 
-    Issue #355 re-keys the retrieval serving scope so the ledger stays
-    readable once a logical collection can have more than one physical
-    generation behind it. Indexes published before that change keep their
-    state and ledger row under the old identity, where nothing looks for it —
-    and an unreachable publication state means the next run re-embeds an index
-    that is already published. This moves both, or reports that there is
-    nothing to move.
+    Two things move a scope out from under an index. Issue #355 re-keyed it so
+    the ledger stays readable once a logical collection can have more than one
+    physical generation behind it, which stranded every index published before
+    that change. Issue #666 added a declared store `identity:`, so a store can
+    move — off a gs:// URI onto local disk, say, to stop paying egress on every
+    read — and `--from-path` is how the rows it published at the old location
+    come with it.
+
+    Either way the state and ledger row sit under a key nothing looks for, and
+    an unreachable publication state means the next run re-embeds an index that
+    is already published. This moves both, or reports that there is nothing to
+    move. It is idempotent: a second run finds nothing and reports zero.
     """
     from ..retrieval import ServingCoordinator
 
-    scope, legacy_scope, resolved, _context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
-    if scope.target_identity == legacy_scope.target_identity:
+    scope = resolution.scope
+    candidates = [resolution.legacy_scope]
+    if from_path is not None:
+        candidates.append(resolution.scope_at(from_path))
+    pending = _sources_to_rekey(scope, candidates)
+    if not pending:
         return {"model": model_name, "state_rows": 0, "ledger_rows": 0}
-    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+    state_rows = 0
+    ledger_rows = 0
+    with create_adapter(resolution.resolved.warehouse, project_dir=project_dir) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
-        # Ledger first: it is the row that decides whether an index is
-        # considered published at all. If the state move fails after it, a
-        # re-run finds the ledger already moved and finishes the state.
-        ledger_rows = coordinator.rekey_scope(legacy_scope, scope)
-        state_rows = adapter.rekey_state_scope(legacy_scope, scope)
+        for source in pending:
+            # Ledger first: it is the row that decides whether an index is
+            # considered published at all. If the state move fails after it, a
+            # re-run finds the ledger already moved and finishes the state.
+            ledger_rows += coordinator.rekey_scope(source, scope)
+            state_rows += adapter.rekey_state_scope(source, scope)
     return {
         "model": model_name,
         "state_rows": state_rows,

@@ -2222,11 +2222,16 @@ as it was previously, an id-space change silently discarded the lot:
 astrolabe's 3.67M-chunk SEC corpus moved its identity onto `context_id` and
 was embedded about 1.9 times for it.
 
-The configuration check is what remains load-bearing: same text under a
-different provider, model, dimensions, or implementation is a different
-vector and is recomputed. And because the hash index is consulted in
-memory, text the target does not hold costs no vector read at all — which
-matters most where that column is most of the table's bytes.
+The configuration still decides: same text under a different provider, model,
+dimensions, or implementation is a different vector and is recomputed. Only
+rows carrying the current configuration are reuse candidates, so a target that
+holds the same text under *both* an old and the current configuration — which
+a config change interrupted partway leaves behind — reuses the current one
+rather than being blocked by the stale row.
+
+And because the hash index is consulted in memory, text the target does not
+hold costs no vector read at all — which matters most where that column is
+most of the table's bytes.
 
 On BigQuery the reuse target is also the table each window just updated. If
 table metadata advances while one of those immutable query results is being

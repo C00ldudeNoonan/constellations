@@ -9,7 +9,7 @@ import logging
 import os
 import pickle
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1598,6 +1598,284 @@ def test_full_chunks_ctas_carries_options_clause() -> None:
     assert client.queries[0][1].labels == {"team": "econ"}
 
 
+# ─── the incremental MERGE is pruned to the batch's layout (issue #664) ──────
+#
+# A MERGE joined only on the key reads every partition and block that might
+# hold a key: 4.45 GiB per flush against the 28.5 GiB SEC embeddings table.
+# With the batch's own range over the partition column and value lists over
+# the clustering columns in the join, BigQuery skips the rest -- but only
+# after a guard proves no matched target row lies outside them, since such a
+# row would otherwise be inserted a second time.
+
+_SEC_LAYOUT = {
+    "partition_by": {"field": "filing_date", "granularity": "month"},
+    "cluster_by": ["symbol", "form_type"],
+}
+
+
+def _sec_batch(**overrides: Any) -> pl.DataFrame:
+    columns: dict[str, Any] = {
+        "context_id": ["a", "b", "c"],
+        "filing_date": [date(2026, 3, 1), date(2026, 1, 5), date(2026, 2, 9)],
+        "symbol": ["MSFT", "AAPL", "AAPL"],
+        "form_type": ["10-K", "10-K", "8-K"],
+        "embedding": [[0.1], [0.2], [0.3]],
+    }
+    columns.update(overrides)
+    return pl.DataFrame(columns)
+
+
+def _sec_merge(client: _FakeClient, df: pl.DataFrame, layout: dict[str, Any]) -> str:
+    client.tables["proj.ds.emb"] = list(df.columns)
+    adapter = _adapter(client)
+    adapter.materialize_incremental(
+        "emb", df, key_col="context_id", options=_parse_options(layout)
+    )
+    assert len(client.queries) == 1  # the guard and the MERGE are one script
+    return client.queries[0][0]
+
+
+def test_bigquery_layout_pruning_columns_are_the_declared_partition_and_clusters() -> None:
+    from stel.adapters import LayoutPruningColumns
+    from stel.adapters.base import NO_LAYOUT_PRUNING
+
+    adapter = _adapter()
+    assert adapter.layout_pruning_columns(None) is NO_LAYOUT_PRUNING
+    assert adapter.layout_pruning_columns(_parse_options(_SEC_LAYOUT)) == (
+        LayoutPruningColumns("filing_date", ("symbol", "form_type"))
+    )
+    # Ingestion-time partitioning has no column to prune on.
+    assert adapter.layout_pruning_columns(
+        _parse_options({"partition_by": {"data_type": "timestamp"}, "cluster_by": "cik"})
+    ) == LayoutPruningColumns(None, ("cik",))
+
+
+def test_incremental_merge_is_pruned_to_the_batch_layout_behind_a_guard() -> None:
+    client = _FakeClient()
+    script = _sec_merge(client, _sec_batch(), _SEC_LAYOUT)
+    staging = client.loads[0][1]
+    staging_ref = "`proj`.`ds`.`" + staging.split(".")[-1] + "`"
+
+    # The batch's values are read from the staging table inside the script,
+    # the form BigQuery's partition pruning is documented to honor.
+    assert (
+        f"DECLARE stel_prune_lo DEFAULT (SELECT MIN(`filing_date`) FROM {staging_ref});"
+        in script
+    )
+    assert (
+        f"DECLARE stel_prune_hi DEFAULT (SELECT MAX(`filing_date`) FROM {staging_ref});"
+        in script
+    )
+    assert (
+        "DECLARE stel_prune_in_0 DEFAULT "
+        f"ARRAY(SELECT DISTINCT `symbol` FROM {staging_ref});" in script
+    )
+    assert (
+        "DECLARE stel_prune_in_1 DEFAULT "
+        f"ARRAY(SELECT DISTINCT `form_type` FROM {staging_ref});" in script
+    )
+    pruned = (
+        "target.`filing_date` BETWEEN stel_prune_lo AND stel_prune_hi "
+        "AND target.`symbol` IN UNNEST(stel_prune_in_0) "
+        "AND target.`form_type` IN UNNEST(stel_prune_in_1)"
+    )
+    # The guard joins the target to the batch on the key and asks whether any
+    # matched row falls outside the pruned join; NULL counts as outside.
+    assert (
+        "SET stel_prune_strays = EXISTS(SELECT 1 FROM `proj`.`ds`.`emb` AS target "
+        f"JOIN {staging_ref} AS source ON target.`context_id` = source.`context_id` "
+        f"WHERE NOT COALESCE({pruned}, FALSE));" in script
+    )
+    head = f"MERGE `proj`.`ds`.`emb` AS target USING {staging_ref} AS source ON "
+    unpruned_merge, pruned_merge = (
+        line for line in script.splitlines() if line.startswith("MERGE ")
+    )
+    assert script.index("IF stel_prune_strays THEN") < script.index(unpruned_merge)
+    assert unpruned_merge.startswith(f"{head}target.`context_id` = source.`context_id` WHEN")
+    assert pruned_merge.startswith(
+        f"{head}target.`context_id` = source.`context_id` AND {pruned} WHEN"
+    )
+    assert script.index("ELSE") < script.index(pruned_merge) < script.index("END IF;")
+    # Both branches are the same MERGE otherwise.
+    for merge in (unpruned_merge, pruned_merge):
+        assert "WHEN MATCHED THEN UPDATE SET" in merge
+        assert (
+            "WHEN NOT MATCHED THEN INSERT (`context_id`, `filing_date`, `symbol`, "
+            "`form_type`, `embedding`)" in merge
+        )
+    assert client.dropped == [staging]
+
+
+def test_merge_pruning_keeps_the_fingerprint_and_labels() -> None:
+    """The pruned join composes with #281's change-detection fingerprint and
+    #91's job labels; neither moved."""
+    client = _FakeClient()
+    client.tables["proj.ds.emb"] = ["context_id", "filing_date", "symbol", "form_type", "embedding"]
+    adapter = _adapter(client)
+    adapter.materialize_incremental(
+        "emb",
+        _sec_batch(),
+        key_col="context_id",
+        options=_parse_options({**_SEC_LAYOUT, "labels": {"team": "econ"}}),
+        update_when_changed=["embedding"],
+    )
+    script, config = client.queries[0]
+    assert script.count("WHEN MATCHED AND (") == 2
+    assert config.labels == {"team": "econ"}
+
+
+def test_merge_pruning_skips_a_layout_column_with_a_null_in_the_batch() -> None:
+    """A NULL matches no list and no range, so a matched target row would fall
+    outside the pruned join and the guard would reject the whole batch. The
+    column with the NULL is left out; the others still prune."""
+    client = _FakeClient()
+    script = _sec_merge(client, _sec_batch(symbol=["MSFT", None, "AAPL"]), _SEC_LAYOUT)
+    assert "stel_prune_lo" in script
+    assert "`symbol` IN UNNEST" not in script
+    assert "target.`form_type` IN UNNEST(stel_prune_in_0)" in script
+
+
+def test_merge_pruning_skips_a_clustering_column_past_the_membership_limit() -> None:
+    """A clustering column with (nearly) one value per row -- a per-row id
+    beside the key -- would make the value list the size of the batch and
+    skip nothing. Past the limit the column is left out; at it, pushed."""
+    from stel.adapters.base import LAYOUT_MEMBERSHIP_LIMIT
+
+    layout = {"cluster_by": ["parent_id"]}
+    n = LAYOUT_MEMBERSHIP_LIMIT + 1
+    wide = pl.DataFrame({"context_id": [str(i) for i in range(n)], "parent_id": list(range(n))})
+    script = _sec_merge(_FakeClient(), wide, layout)
+    assert script.startswith("MERGE `proj`.`ds`.`emb` AS target")  # plain, no script
+    at_limit = wide.head(LAYOUT_MEMBERSHIP_LIMIT)
+    script = _sec_merge(_FakeClient(), at_limit, layout)
+    assert "target.`parent_id` IN UNNEST(stel_prune_in_0)" in script
+
+
+def test_merge_pruning_never_repeats_the_key_or_an_absent_column() -> None:
+    """Clustering on the merge key (#294's recipe) is already the join;
+    repeating it as a value list would be the whole batch as an array for
+    nothing. A declared layout column the batch does not carry cannot be
+    read from staging. Either way the plain MERGE is issued."""
+    df = pl.DataFrame({"context_id": ["a", "b"], "embedding": [[0.1], [0.2]]})
+    script = _sec_merge(
+        _FakeClient(),
+        df,
+        {"partition_by": {"field": "filing_date"}, "cluster_by": ["context_id"]},
+    )
+    assert script.startswith("MERGE `proj`.`ds`.`emb` AS target")
+    assert "DECLARE" not in script
+
+
+def test_bigquery_materialize_sql_incremental_prunes_from_staging_stats(
+    _fixed_staging_uuid,
+) -> None:
+    """The SQL-model path has the batch only as a staged table, so one
+    aggregate over staging answers the NULL and cardinality questions the
+    frame answers in memory: `symbol` carries a NULL and is left out,
+    `filing_date` and `form_type` prune."""
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "filing_date", "symbol", "form_type", "v"]
+    _stage_schema(
+        client,
+        [
+            ("id", "INTEGER"),
+            ("filing_date", "DATE"),
+            ("symbol", "STRING"),
+            ("form_type", "STRING"),
+            ("v", "STRING"),
+        ],
+    )
+    client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging AS select_sql
+        _FakeJob(rows=[(0, 0)]),  # unique-key check
+        _FakeJob(rows=[(0, 40, 2, 7, 0, 3)]),  # nulls/distinct per candidate column
+        # As BigQuery reports a script: no DML count on the parent job (each
+        # statement is a child job), and the result of its last statement.
+        _FakeJob(rows=[(3,)], affected=None),
+    ]
+    adapter = _adapter(client)
+    result = adapter.materialize_sql_incremental(
+        "tgt",
+        "SELECT * FROM src",
+        unique_key="id",
+        options=_parse_options(_SEC_LAYOUT),
+    )
+    assert result.rows_written == 3
+    stats_sql, _ = client.queries[2]
+    assert stats_sql == (
+        "SELECT COUNTIF(`filing_date` IS NULL), COUNT(DISTINCT `filing_date`), "
+        "COUNTIF(`symbol` IS NULL), COUNT(DISTINCT `symbol`), "
+        "COUNTIF(`form_type` IS NULL), COUNT(DISTINCT `form_type`) "
+        f"FROM `proj`.`ds`.`{_STAGING_TABLE}`"
+    )
+    script, _ = client.queries[-1]
+    assert (
+        "ON T.`id` = S.`id` AND T.`filing_date` BETWEEN stel_prune_lo AND stel_prune_hi "
+        "AND T.`form_type` IN UNNEST(stel_prune_in_0) WHEN MATCHED" in script
+    )
+    assert "`symbol` IN UNNEST" not in script
+    # The count is the MERGE's own @@row_count, captured in whichever branch
+    # ran, not the parent job's statistic -- which a script does not carry,
+    # so a successful model used to report rows_written=0 (Codex review on
+    # #670).
+    assert script.count("SET stel_merge_rows = @@row_count;") == 2
+    assert script.endswith("END IF;\nSELECT stel_merge_rows;")
+    assert client.dropped == [_STAGING_ID]
+
+
+def test_bigquery_sql_incremental_ignored_layout_column_is_not_pruned_on(
+    _fixed_staging_uuid,
+) -> None:
+    """Codex review on #670 (P2): under `on_schema_change: ignore` a query
+    that newly selects a declared layout column has that column dropped by
+    reconciliation, because the target lacks it. Pruning still read the
+    staged columns, so the guard and MERGE named `T.<column>` and BigQuery
+    rejected a run the policy promised to let through. Pruning is now
+    decided over the reconciled columns: `form_type`, absent from the
+    target, is neither measured nor predicated on."""
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "filing_date", "v"]
+    _stage_schema(
+        client,
+        [("id", "INTEGER"), ("filing_date", "DATE"), ("form_type", "STRING"), ("v", "STRING")],
+    )
+    client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging AS select_sql
+        _FakeJob(rows=[(0, 0)]),  # unique-key check
+        _FakeJob(rows=[(0, 40)]),  # nulls/distinct for filing_date alone
+        _FakeJob(rows=[(2,)], affected=None),  # the script
+    ]
+    adapter = _adapter(client)
+    result = adapter.materialize_sql_incremental(
+        "tgt",
+        "SELECT * FROM src",
+        unique_key="id",
+        options=_parse_options(_SEC_LAYOUT),
+        on_schema_change="ignore",
+    )
+    stats_sql, _ = client.queries[2]
+    assert "form_type" not in stats_sql
+    script, _ = client.queries[-1]
+    assert "form_type" not in script
+    assert "T.`filing_date` BETWEEN stel_prune_lo AND stel_prune_hi" in script
+    assert result.rows_written == 2
+
+
+def test_bigquery_materialize_sql_incremental_without_a_layout_issues_no_stats_query(
+    _fixed_staging_uuid,
+) -> None:
+    """No declared layout, no extra query and no script: the plain MERGE of
+    `test_bigquery_materialize_sql_incremental_builds_merge`, unchanged."""
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "v"]
+    _stage_schema(client, [("id", "INTEGER"), ("v", "STRING")])
+    client.query_results = [_FakeJob(), _FakeJob(rows=[(0, 0)]), _FakeJob(affected=1)]
+    adapter = _adapter(client)
+    adapter.materialize_sql_incremental("tgt", "SELECT id, v FROM src", unique_key="id")
+    assert len(client.queries) == 3
+    assert client.queries[-1][0].startswith("MERGE `proj`.`ds`.`tgt` AS T")
+
+
 # ─── incremental_strategy: insert_overwrite ──────────────────────────────────
 
 
@@ -2017,7 +2295,9 @@ def test_incremental_cluster_by_change_is_not_a_format_mismatch() -> None:
         key_col="document_id",
         options=_parse_options({"cluster_by": ["document_id", "x"]}),
     )
-    assert client.queries[-1][0].startswith("MERGE `proj`.`ds`.`docs`")
+    # `x` is a clustering column the batch can prune on (issue #664), so the
+    # statement is the guarded script around the MERGE, not the bare MERGE.
+    assert "MERGE `proj`.`ds`.`docs` AS target" in client.queries[-1][0]
 
 
 def test_materialize_full_iceberg_validates_schema_before_dropping() -> None:
@@ -2395,6 +2675,99 @@ def test_integration_warehouse_options_round_trip() -> None:
                 "ORDER BY document_id"
             )
             assert rows == [("a2",), ("b",)]
+    finally:
+        adapter._reset_storage_for_test()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_layout_pruned_merge_keeps_one_row_per_key() -> None:
+    """Issue #664, against a real partitioned and clustered target. The first
+    merge's batch lies inside its own layout values, so the pruned MERGE runs;
+    the second carries a key whose target row sits under *other* layout values
+    (a filing re-dated), which the guard must catch and route to the unpruned
+    MERGE -- the failure this protects against is that key appearing twice."""
+    from datetime import date as date_type
+
+    cfg = parse_warehouse_config(
+        {
+            "type": "bigquery",
+            "project": _BQ_PROJECT,
+            "dataset": "stel_it_" + os.urandom(3).hex(),
+        }
+    )
+    adapter = create_adapter(cfg)
+    assert isinstance(adapter, BigQueryAdapter)
+    opts = adapter.parse_warehouse_options(
+        {"partition_by": {"field": "filing_date"}, "cluster_by": ["vendor"]},
+        model_name="docs",
+    )
+    assert adapter.layout_pruning_columns(opts).columns == ("filing_date", "vendor")
+
+    def _frame(rows: list[tuple[str, str, date_type, int]]) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                "document_id": [r[0] for r in rows],
+                "vendor": [r[1] for r in rows],
+                "filing_date": [r[2] for r in rows],
+                "x": [r[3] for r in rows],
+            }
+        )
+
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "docs",
+                _frame(
+                    [
+                        ("a", "acme", date_type(2026, 1, 1), 1),
+                        ("b", "zenith", date_type(2026, 2, 1), 2),
+                    ]
+                ),
+                options=opts,
+            )
+            # Inside the layout: `a` updates in place, `c` inserts.
+            adapter.materialize_incremental(
+                "docs",
+                _frame(
+                    [
+                        ("a", "acme", date_type(2026, 1, 1), 10),
+                        ("c", "acme", date_type(2026, 1, 15), 3),
+                    ]
+                ),
+                key_col="document_id",
+                options=opts,
+            )
+            # Outside it: `b` re-dated into another partition under another
+            # vendor. The pruned join would miss the stored `b`; the guard
+            # must fall back so `b` is updated, not duplicated.
+            adapter.materialize_incremental(
+                "docs",
+                _frame([("b", "acme", date_type(2026, 3, 1), 20)]),
+                key_col="document_id",
+                options=opts,
+            )
+            # The SQL-model path takes the same script, and its row count is
+            # the executed MERGE's own @@row_count: the script's parent job
+            # carries no DML statistic (Codex review on #670).
+            sql_result = adapter.materialize_sql_incremental(
+                "docs",
+                "SELECT 'a' AS document_id, 'acme' AS vendor, "
+                "DATE '2026-01-01' AS filing_date, 11 AS x",
+                unique_key="document_id",
+                options=opts,
+            )
+            assert sql_result.rows_written == 1
+            rows = adapter.rows(
+                f"SELECT document_id, vendor, filing_date, x "
+                f"FROM {adapter.table_ref('docs')} ORDER BY document_id"
+            )
+            assert rows == [
+                ("a", "acme", date_type(2026, 1, 1), 11),
+                ("b", "acme", date_type(2026, 3, 1), 20),
+                ("c", "acme", date_type(2026, 1, 15), 3),
+            ]
     finally:
         adapter._reset_storage_for_test()
 
@@ -4540,7 +4913,6 @@ _UNCOVERED_BY_LIVE_TESTS = frozenset(
         "list_all_tables",
         "materialize_full_chunks",
         "materialize_sql_full",
-        "materialize_sql_incremental",
         "query_df",
         "quote_ident",
         "replace_children",

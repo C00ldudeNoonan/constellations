@@ -1288,3 +1288,85 @@ def test_replace_state_writes_a_whole_window_after_clearing(tmp_path: Path) -> N
     assert "stale" not in stored
     assert len(stored) == 500
     assert stored["doc-0"] == StateValue("fresh", "v2")
+
+
+# ─── layout pruning predicates (issue #664) ──────────────────────────────────
+
+
+def _pruning_predicates(
+    pruning: Any, rows: list[dict[str, Any]], *, exclude: str = "id"
+) -> list[tuple[str, str, Any]]:
+    from stel.adapters import layout_pruning_predicates
+
+    return [
+        (p.column, p.operator.value, p.value)
+        for p in layout_pruning_predicates(pruning, rows, exclude=exclude)
+    ]
+
+
+def test_layout_predicates_are_the_batch_range_and_its_distinct_values() -> None:
+    from datetime import date
+
+    from stel.adapters import LayoutPruningColumns
+
+    rows = [
+        {"id": 1, "d": date(2026, 3, 1), "s": "MSFT", "f": "10-K"},
+        {"id": 2, "d": date(2026, 1, 5), "s": "AAPL", "f": "10-K"},
+        {"id": 3, "d": date(2026, 2, 9), "s": "AAPL", "f": "8-K"},
+    ]
+    assert _pruning_predicates(LayoutPruningColumns("d", ("s", "f")), rows) == [
+        ("d", "ge", date(2026, 1, 5)),
+        ("d", "le", date(2026, 3, 1)),
+        ("s", "in", ("AAPL", "MSFT")),
+        ("f", "in", ("10-K", "8-K")),
+    ]
+
+
+def test_layout_predicates_never_repeat_the_join_key() -> None:
+    """The key is already the join or the IN list the read runs on; a
+    clustering declared on it (the #294 recipe) adds nothing as a predicate
+    and would be the whole batch as an array."""
+    from stel.adapters import LayoutPruningColumns
+
+    rows = [{"id": 1, "s": "A"}, {"id": 2, "s": "A"}]
+    assert _pruning_predicates(LayoutPruningColumns("id", ("id", "s")), rows) == [
+        ("s", "in", ("A",))
+    ]
+
+
+def test_a_layout_column_a_predicate_cannot_state_is_left_out() -> None:
+    """A NULL matches no range and no list, so a matched target row would be
+    missed; two Python types in one column breach the predicate contract; a
+    row without the column at all cannot be described. Each drops that one
+    column and keeps the others."""
+    from stel.adapters import LayoutPruningColumns
+
+    pruning = LayoutPruningColumns("d", ("s",))
+    with_null = [{"id": 1, "d": 1, "s": None}, {"id": 2, "d": 3, "s": "A"}]
+    assert _pruning_predicates(pruning, with_null) == [("d", "ge", 1), ("d", "le", 3)]
+    mixed = [{"id": 1, "d": 1, "s": "A"}, {"id": 2, "d": 2.5, "s": "A"}]
+    assert _pruning_predicates(pruning, mixed) == [("s", "in", ("A",))]
+    missing = [{"id": 1, "s": "A"}, {"id": 2, "d": 2, "s": "A"}]
+    assert _pruning_predicates(pruning, missing) == [("s", "in", ("A",))]
+    assert _pruning_predicates(pruning, []) == []
+
+
+def test_a_membership_list_past_the_limit_is_not_pushed() -> None:
+    from stel.adapters import LayoutPruningColumns
+    from stel.adapters.base import LAYOUT_MEMBERSHIP_LIMIT
+
+    pruning = LayoutPruningColumns(None, ("s",))
+    at_limit = [{"id": i, "s": f"s{i}"} for i in range(LAYOUT_MEMBERSHIP_LIMIT)]
+    [(column, operator, values)] = _pruning_predicates(pruning, at_limit)
+    assert (column, operator, len(values)) == ("s", "in", LAYOUT_MEMBERSHIP_LIMIT)
+    past = [{"id": i, "s": f"s{i}"} for i in range(LAYOUT_MEMBERSHIP_LIMIT + 1)]
+    assert _pruning_predicates(pruning, past) == []
+
+
+def test_an_adapter_without_a_layout_prunes_nothing(tmp_path: Path) -> None:
+    from stel.adapters.base import NO_LAYOUT_PRUNING
+
+    cfg = parse_warehouse_config({"type": "duckdb", "path": str(tmp_path / "w.duckdb")})
+    with create_adapter(cfg) as adapter:
+        assert adapter.layout_pruning_columns(None) is NO_LAYOUT_PRUNING
+        assert _pruning_predicates(NO_LAYOUT_PRUNING, [{"id": 1, "s": "A"}]) == []

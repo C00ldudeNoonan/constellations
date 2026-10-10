@@ -1546,13 +1546,15 @@ listing the model's key first:
 
 Notes and boundaries:
 
-- **Clustering helps the read; it is not a guaranteed bound.** stel emits a
-  column-to-column join (`ON target.key = source.key`), not a static
-  `WHERE key IN (…)` predicate, so pruning is an optimizer decision, not a
-  guarantee — a small batch can still scan more than its keys. Treat clustering
-  as a likely optimization and confirm the win with the bytes-processed
-  telemetry below rather than assuming it. `update_when_changed` (the write
-  side) composes with it.
+- **Clustering on the key helps the read; it is not a guaranteed bound.** For
+  the key itself stel emits a column-to-column join (`ON target.key =
+  source.key`), not a static `WHERE key IN (…)` predicate, so pruning on it is
+  an optimizer decision, not a guarantee — a small batch can still scan more
+  than its keys. Treat clustering on the key as a likely optimization and
+  confirm the win with the bytes-processed telemetry below rather than
+  assuming it. `update_when_changed` (the write side) composes with it. The
+  *other* layout columns are a different matter: see the next section, which
+  adds constant predicates on them.
 - **A layout change needs a rebuild.** Like all `warehouse_options`, `cluster_by`
   applies when the table is created; an existing table keeps its physical layout
   until `--full-refresh` rebuilds it. Adding or changing `cluster_by` on a table
@@ -1576,6 +1578,66 @@ Notes and boundaries:
   same target. The publication telemetry from issue #292 (`-v` /
   `STEL_VERBOSE`) surfaces each MERGE's job id and bytes processed so you can
   measure all of this against real cost.
+
+#### Pruning the MERGE and the reuse read to the batch (partitioning and clustering)
+
+A MERGE joined only on the key reads every partition and every block of the
+target that *might* hold one of the batch's keys — on a table partitioned by
+date and clustered by attributes the key says nothing about, that is most of
+the table. astrolabe's 3.67M-row, 28.5 GiB embeddings table (partitioned by
+filing month, clustered by `symbol, form_type`, keyed on a hash) billed
+4.45 GiB per flush and 4 TiB over one backfill that way, and the embed resume's
+keyed read of the same table billed 21 GiB per lookup, almost all of it the
+vector column (issue #664).
+
+So when a model declares `partition_by` with a `field` and/or `cluster_by`,
+the incremental publish and the embed reuse read also carry **the batch's own
+values on those columns**, which is the form BigQuery prunes on:
+
+- the partition column as a closed range — the batch's `MIN` and `MAX`;
+- each clustering column as a value list — the batch's distinct values.
+
+The key is never repeated this way; it is already the join. A layout column is
+left out of a given batch's predicate when the batch does not carry it, when
+any batch row has it NULL (NULL matches no range and no list), or, for a
+clustering column, when the batch holds more than 1,000 distinct values (a
+per-row id clustered beside the key would make the list the size of the batch
+and skip nothing). Left out means that column prunes nothing for that batch;
+the publish is otherwise unchanged.
+
+**The MERGE proves the pruning safe first.** A target row whose key is in the
+batch but whose layout values are *not* — a filing re-dated into another
+month, say — would be unmatched by the pruned join and inserted a second time.
+dbt leaves that hazard to the operator (`incremental_predicates`). stel's
+publish is one script: it reads the batch's values from the staging table into
+script variables, asks whether any matched target row falls outside them (one
+join over the key and layout columns only, a narrow projection), and runs the
+pruned MERGE when none does and the unpruned MERGE when one does. Either way
+every key ends with one row. The guard is itself a read of the key and layout
+columns across the whole target, so on a table whose MERGE was already cheap it
+is the visible cost: a few hundred MiB on the SEC table against the 4.45 GiB it
+replaces.
+
+**The reuse read is scoped to the rows it fetches.** The embed resume
+resolves each window's text to target rows in memory, then fetches those rows
+by id. Its layout predicates come from *those rows'* values, read once in the
+same key pass as the ids, not from the window's: reuse is keyed by text, so a
+hit is often another row under other layout values (a re-keyed corpus, the
+same boilerplate under another symbol), and predicates built from the window
+would prune away exactly the rows reuse exists to find. Built from the fetched
+rows they cannot exclude one, so no guard is needed. A layout column the
+target does not have (declared after the table was built) is dropped from the
+lookup rather than failing it. A `DATETIME` layout column is bound as
+`DATETIME`, not as the `TIMESTAMP` a Python `datetime` otherwise binds as.
+
+Both apply to the *declared* layout. An incremental target keeps its physical
+layout until `--full-refresh`, so a predicate on a column the table is not
+actually partitioned or clustered on skips nothing, and excludes nothing
+either. Confirm the saving the same way as clustering: the bytes-processed
+telemetry per publication (`-v`), and `INFORMATION_SCHEMA.JOBS` for the run.
+The SQL-model MERGE (`transform:` models with `materialization: incremental`)
+takes the same path, answering the NULL and cardinality questions with one
+aggregate over its staging table first.
 
 **BigLake managed Apache Iceberg tables** (issue #163) — set
 `table_format: iceberg` to store a model as Iceberg in Cloud Storage, queryable
@@ -2225,7 +2287,11 @@ was, because the whole upstream was read before the first provider call.
 The resume is bounded too: a resumed run reads the existing target's id and
 `embedding_input_hash` columns once (streamed and projected — no vectors),
 then looks up reuse candidates one window at a time, so resuming a large
-corpus never costs more memory than running it.
+corpus never costs more memory than running it. On a target with a
+declared BigQuery layout each lookup also carries a range over the
+partition column and value lists over the clustering columns, so the
+warehouse reads the matched rows' storage rather than the whole vector
+column (issue #664; see [Pruning the MERGE and the reuse read](#pruning-the-merge-and-the-reuse-read-to-the-batch-partitioning-and-clustering)).
 
 **Reuse is keyed by the text, not by the row** (issue #665). A vector is
 reusable when some row in the target recorded the same
@@ -4573,6 +4639,16 @@ tests:
 
 `grounded_in` also supports `method: fuzzy` with a `min_score`. These run as
 full-table aggregates, so they stay cheap and reproducible.
+
+**A column test is a scan of that column, every invocation.** `not_null`,
+`unique`, `null_rate` and the rest read the whole column they name on every
+`stel test` or `stel build`, on a warehouse that bills by bytes scanned. On a
+narrow column that is nothing; on a vector or long-text column it is the
+largest read the model makes — `not_null: [text, embedding]` on a 3.67M-row
+embeddings table was 20.9 GiB per invocation, every day (issue #664). Test the
+id and hash columns, which are small and catch the same publication failures,
+and reach for the embedding-quality checks below when the vectors themselves
+are in question: they read the vector column once, deliberately.
 
 **Distribution checks** (deterministic statistics over a single column):
 

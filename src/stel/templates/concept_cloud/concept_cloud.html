@@ -72,6 +72,12 @@
     .spark i { flex: 1 1 0; min-width: 2px; background: var(--accent);
       opacity: .62; border-radius: 1px 1px 0 0; transition: opacity .15s; }
     .spark i.now { opacity: 1; }
+    /* Who names a concept (#555 item 5). The track's own grey is the share of
+       documents with no value, so it shows without a segment of its own. */
+    #detail .bd { display: block; margin-top: 8px; font-size: 12px; }
+    .bdbar { display: flex; height: 8px; margin: 4px 0 3px; border-radius: 4px;
+      overflow: hidden; background: #5a6478; }
+    .bdbar i { display: block; height: 100%; }
     #detail .focus { display: block; margin-top: 10px; padding: 4px 10px;
       background: rgba(5, 8, 16, .6); color: var(--accent); cursor: pointer;
       border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 12px; }
@@ -189,6 +195,16 @@
         dim.color[v] = heat ? HEAT_COLORS[v] : PALETTE[i % PALETTE.length]);
       dim.color["—"] = dim.color["—"] || "#5a6478";
     }
+
+    // Breakdown name -> value -> color, from the bundle's declared value set,
+    // so a value is the same color on every card (#555 item 5).
+    const BREAKDOWNS = (DATA.breakdowns || []).map(b => ({
+      name: b.name,
+      color: Object.fromEntries(
+        b.values.map((v, i) => [v, PALETTE[i % PALETTE.length]])),
+    }));
+    // Values named on the card; the rest are in the bar's hover titles.
+    const BREAKDOWN_ROWS = 4;
 
     let colorBy = DIMENSIONS[0];
     const hidden = new Set();   // values of the CURRENT dimension toggled off
@@ -459,6 +475,42 @@
         `<span class="k">peak</span> ${esc(PERIODS[counts.indexOf(peak)])} (${peak})`;
     }
 
+    const share = (n, total) => {
+      const p = (100 * n) / total;
+      // Markup, not text: it is spliced into innerHTML.
+      return p < 1 ? "&lt;1%" : `${Math.round(p)}%`;
+    };
+
+    // Who names a concept (#555 item 5): its documents counted by a
+    // document-level field. A document with no value is the bar's grey
+    // remainder and is said in words -- never folded into a value, which would
+    // claim a sector for a filing the operator's table does not place.
+    function breakdowns(node) {
+      const total = node.documents;
+      if (!total) return "";
+      return BREAKDOWNS.map(b => {
+        const counts = Object.entries(node.breakdowns?.[b.name] || {})
+          .sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+        if (!counts.length) return "";
+        const known = counts.reduce((sum, [, n]) => sum + n, 0);
+        const bar = counts.map(([v, n]) =>
+          `<i style="width:${(100 * n) / total}%;background:${b.color[v]}" ` +
+          `title="${esc(v)}: ${n} (${share(n, total)})"></i>`).join("");
+        const rows = counts.slice(0, BREAKDOWN_ROWS)
+          .map(([v, n]) => `${esc(v)} <span class="k">${share(n, total)}</span>`);
+        if (counts.length > BREAKDOWN_ROWS) {
+          rows.push(`<span class="k">+${counts.length - BREAKDOWN_ROWS} more</span>`);
+        }
+        if (known < total) {
+          rows.push(`<span class="k">no ${esc(b.name)} ${share(total - known, total)}</span>`);
+        }
+        // Counted over every period: the slider changes the stars, not this.
+        const scope = period !== null ? " (all periods)" : "";
+        return `<span class="bd"><span class="k">${esc(b.name)}${scope}</span>` +
+          `<span class="bdbar">${bar}</span>${rows.join(" · ")}</span>`;
+      }).join("");
+    }
+
     function showDetail(node) {
       const el = document.getElementById("detail");
       if (!node) { el.style.display = "none"; return; }
@@ -476,7 +528,12 @@
             ? ` <span class="k">in ${esc(period)}</span> ${node.by_period?.[period] || 0}`
             : "") + " · " +
           `<span class="k">link</span> ${esc(node.link_status)}` +
+          (node.documents
+            ? `<br><span class="k">named in</span> ${node.documents} ` +
+              `document${node.documents === 1 ? "" : "s"}`
+            : "") +
           (dims ? `<br>${dims}` : "") +
+          breakdowns(node) +
           sparkline(node) +
           `<button class="focus">${focus ? "Show the whole map" : "Focus on its constellation"}</button>`;
         el.querySelector(".focus").onclick = () => toggleFocus();
@@ -616,6 +673,8 @@
           link_status: c.link_status, frequency: c.frequency,
           dimensions: c.dimensions || {}, labelled: labelled.has(c.canonical_id),
           by_period: c.by_period || {},
+          documents: c.provenance?.documents || 0,
+          breakdowns: c.breakdowns || {},
         };
         if (c.position) {
           node.fx = c.position.x;

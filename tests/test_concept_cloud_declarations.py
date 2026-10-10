@@ -160,13 +160,13 @@ def test_bundle_round_trips_through_the_versioned_contract() -> None:
 
     parsed = parse_concept_cloud_export(bundle)
 
-    assert parsed.schema_version == CONCEPT_CLOUD_SCHEMA_VERSION == "4"
+    assert parsed.schema_version == CONCEPT_CLOUD_SCHEMA_VERSION == "5"
     assert _concept(parsed, "Federal Reserve").entity_class == "institution"
 
 
-def test_a_version_3_bundle_is_rejected_rather_than_read_as_current() -> None:
+def test_a_version_4_bundle_is_rejected_rather_than_read_as_current() -> None:
     bundle = json.loads(_build(None).to_json())
-    bundle["schema_version"] = "3"
+    bundle["schema_version"] = "4"
 
     with pytest.raises(ValueError, match="unsupported concept-cloud schema_version"):
         parse_concept_cloud_export(bundle)

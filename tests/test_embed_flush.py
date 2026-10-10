@@ -534,6 +534,156 @@ def test_resume_still_reuses_vectors_for_metadata_only_changes(
     assert result.metrics["cache_hits"] == DOCUMENTS
 
 
+def test_a_rekeyed_corpus_reuses_every_vector_it_already_paid_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The incident #665 was filed for: an id-space change re-paid for 3.67M
+    chunks of unchanged text.
+
+    astrolabe's SEC corpus moved its embedding identity onto `context_id` (an
+    agent_context wrapper hop). The text was byte-identical and its
+    `embedding_input_hash` unchanged, but reuse was looked up by row id, so
+    every vector missed and the corpus was embedded about 1.9 times -- ~$195
+    against a ~$100 single pass.
+
+    Here every chunk id changes and no text does. Keyed by content, that is
+    a full-reuse run with no provider call at all.
+    """
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # A new id space over identical text: every state key misses and no
+        # row in the target can be found by id any more.
+        connection.execute(
+            'UPDATE "db".docs.document_chunks SET chunk_id = chunk_id || \'-rekeyed\''
+        )
+    finally:
+        connection.close()
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_processed == DOCUMENTS
+    assert calls["n"] == 0
+    assert result.metrics["cache_hits"] == DOCUMENTS
+    assert result.metrics["provider_calls"] == 0
+
+
+def test_same_text_under_a_different_config_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one check that stayed load-bearing when reuse became content-keyed.
+
+    Looking up by `embedding_input_hash` makes the old
+    `embedding_input_hash == text_hash` comparison true by construction, so
+    `embedding_config_hash` is now the *only* thing standing between a
+    matching text and a vector produced under a different embedding
+    configuration. Same text, different config, must still be a paid
+    re-embed (issue #665).
+    """
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # Text hashes stay correct; the recorded configuration does not. The
+        # id change is only there to make state miss so reuse is consulted.
+        connection.execute(
+            'UPDATE "db".docs.document_embeddings '
+            "SET embedding_config_hash = 'a-different-configuration'"
+        )
+        connection.execute(
+            'UPDATE "db".docs.document_chunks SET chunk_id = chunk_id || \'-rekeyed\''
+        )
+    finally:
+        connection.close()
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert calls["n"] == DOCUMENTS
+    assert result.metrics["cache_hits"] == 0
+    assert result.metrics["provider_calls"] == DOCUMENTS
+
+
+def test_a_text_the_target_lacks_costs_no_vector_read(tmp_path: Path) -> None:
+    """New text must not open a read of the vector column (issues #665/#664).
+
+    The id/hash index is in memory, so a hash the target does not hold is
+    answered without a warehouse round trip. That matters because the
+    projection those reads pull is almost entirely the 768-float vector
+    column -- 21.3 GiB per lookup job on astrolabe's corpus.
+    """
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["a"],
+                    "embedding_input_hash": ["held"],
+                    "embedding_config_hash": ["config-hash"],
+                    "embedding": [[0.1]],
+                    "embedded_at": ["2026-08-30T00:00:00+00:00"],
+                }
+            ),
+        )
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic",
+                model="m",
+                dimensions=1,
+                id_field="chunk_id",
+                vector_field="embedding",
+            ),
+            config_hash="config-hash",
+            timings=PhaseTimings(),
+        )
+
+        opens = {"n": 0}
+        original_snapshot = adapter.table_snapshot
+
+        @contextmanager
+        def counting_snapshot(*args: Any, **kwargs: Any) -> Iterator[Any]:
+            opens["n"] += 1
+            with original_snapshot(*args, **kwargs) as snapshot:
+                yield snapshot
+
+        adapter.table_snapshot = counting_snapshot  # type: ignore[method-assign]
+
+        assert reader.rows_for(["absent", "also-absent"]) == {}
+        assert opens["n"] == 0
+
+        # Positive control: a hash the target does hold is worth the read.
+        assert set(reader.rows_for(["held"])) == {"held"}
+        assert opens["n"] == 1
+
+
 # ─── the run budget can finally see embed spend ─────────────────────────────
 
 
@@ -718,11 +868,75 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
                 provider="deterministic", model="m", dimensions=1,
                 id_field="chunk_id", vector_field="embedding",
             ),
+            config_hash="g",
             timings=PhaseTimings(),
         )
 
         assert reader.target_key("1.50") is not None
-        assert reader.rows_for(["1.50"]) == {}
+        # Asked by the row's text hash, which the index does resolve --
+        # to a Decimal key the predicate contract cannot carry. Passing
+        # the record id here would answer {} for the wrong reason (#665).
+        assert reader.rows_for(["h"]) == {}
+
+
+def test_a_stale_config_row_cannot_shadow_a_usable_one(tmp_path: Path) -> None:
+    """One representative id per text hash must be a *usable* one (#671 review).
+
+    A target can hold the same text twice under two embedding configurations:
+    duplicate text (SEC filings repeat risk-factor language), plus a config
+    change, plus a publish interrupted partway. Indexing one representative
+    per hash without filtering by config kept whichever row the unordered
+    scan saw last -- and when that was the old-config row, the lookup fetched
+    it, the caller rejected it, and stel paid to re-embed text the target
+    already held a current vector for.
+
+    The usable row is listed *first* and the stale one last, deliberately: a
+    dict that keeps the last writer therefore keeps the stale row when the
+    config filter is removed, and this test fails. Written the other way
+    round it passed with the filter gone -- the mutation check caught that
+    before the ordering was fixed.
+    """
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["usable", "stale"],
+                    "embedding_input_hash": ["shared", "shared"],
+                    "embedding_config_hash": ["current-config", "old-config"],
+                    "embedding": [[0.1], [0.9]],
+                    "embedded_at": ["2026-08-01T00:00:00+00:00"] * 2,
+                }
+            ),
+        )
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic",
+                model="m",
+                dimensions=1,
+                id_field="chunk_id",
+                vector_field="embedding",
+            ),
+            config_hash="current-config",
+            timings=PhaseTimings(),
+        )
+
+        row = reader.rows_for(["shared"])["shared"]
+        assert row["chunk_id"] == "usable"
+        assert row["embedding_config_hash"] == "current-config"
+        # Both rows still answer for removals: the index filter narrows what
+        # can be *reused*, never what the target is known to contain.
+        assert reader.target_key("stale") is not None
 
 
 def test_reuse_reader_retries_complete_mutable_target_snapshots(
@@ -780,11 +994,15 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
                 id_field="chunk_id",
                 vector_field="embedding",
             ),
+            config_hash="config-hash",
             timings=PhaseTimings(),
         )
 
         assert snapshot_calls == 2
-        assert reader.rows_for(["a"])["a"]["embedding_input_hash"] == "input-hash"
+        # Asked by text hash and answered by text hash: the row id 'a'
+        # is how the row is fetched, not how it is looked up (#665).
+        row = reader.rows_for(["input-hash"])["input-hash"]
+        assert row["chunk_id"] == "a"
         assert snapshot_calls == 4
 
         changing_calls.update({5, 6, 7})
@@ -792,5 +1010,5 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
             TableSnapshotGenerationChangedError,
             match="simulated target generation change",
         ):
-            reader.rows_for(["a"])
+            reader.rows_for(["input-hash"])
         assert snapshot_calls == 7

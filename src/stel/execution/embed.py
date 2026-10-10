@@ -216,7 +216,13 @@ def _run_embed_model(
     # resumed has already proven the corpus is large (issue #401 follow-up).
     skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
     reuse_reader = (
-        _EmbeddingReuseReader(adapter, model.name, config=config, timings=timings)
+        _EmbeddingReuseReader(
+            adapter,
+            model.name,
+            config=config,
+            config_hash=identity.config_hash,
+            timings=timings,
+        )
         if is_incremental and not rebuild_target
         else None
     )
@@ -301,18 +307,29 @@ def _run_embed_model(
         load per run: residency is bounded by `flush_every` rows of reuse
         columns, and a corpus that never changes text pays warehouse reads,
         not provider calls.
+
+        Looked up by text hash, not by row id (issue #665). The row that
+        holds a usable vector is any row whose input text was the same; it
+        need not be *this* row, which is what lets a corpus whose ids moved
+        keep every vector it has already paid for.
+
+        The config check below is deliberately redundant with the reader's
+        index, which only indexes rows recorded under this run's
+        configuration. It is kept because that index is a snapshot of a
+        table the run itself keeps writing to, so it is a staleness guard
+        rather than the primary rule, and because reusing a vector built
+        under another configuration would be a wrong answer rather than a
+        slow one. Being redundant, no test pins it alone; the index filter
+        is what the configuration tests exercise.
         """
         nonlocal cache_hits
         if reuse_reader is None:
             return
-        window_reuse = reuse_reader.rows_for(
-            [item.record_id for item in window]
-        )
+        window_reuse = reuse_reader.rows_for([item.text_hash for item in window])
         for item in window:
-            existing = window_reuse.get(item.record_id)
+            existing = window_reuse.get(item.text_hash)
             if (
                 existing is not None
-                and existing.get("embedding_input_hash") == item.text_hash
                 and existing.get("embedding_config_hash") == identity.config_hash
             ):
                 vector = _coerce_embedding_vector(
@@ -751,22 +768,40 @@ def _iter_removed_state_keys(
 
 
 class _EmbeddingReuseReader:
-    """Bounded reads of the existing embed target on resume (issue #401).
+    """Bounded, content-addressed reads of the existing embed target.
 
-    The resume path used to read the whole target into Python dicts, vectors
-    included, before any embedding began -- ~25KB per 768-dim row, ~90GB at
-    3.6M chunks -- and it is reachable only on resume, when the corpus has
-    already proven itself too large for exactly that. What the run actually
-    needs is far smaller:
+    Two issues shaped this. #401 made the reads bounded: the resume path used
+    to load the whole target into Python dicts, vectors included -- ~25KB per
+    768-dim row, ~90GB at 3.6M chunks -- and it is reachable only on resume,
+    when the corpus has already proven itself too large for exactly that.
+    #665 made them content-addressed, which is a correctness-of-cost change:
 
-    - **The id column, once.** State keys are stringified ids, but the target
-      column may be typed (a numeric id is a tested contract), so deleting
-      removed rows and pushing keyed predicates both need the *typed* value.
-      One streamed, projected pass builds that map: no vectors, no metadata,
-      residency proportional to key count rather than row width.
+    - **The reuse key is the text, not the row.** Lookups were keyed by row
+      id with the text hash checked afterwards, so a corpus whose *ids*
+      changed got no hits and re-paid the provider for text it had already
+      embedded. astrolabe's SEC corpus did exactly that -- an agent_context
+      wrapper hop re-keyed 3.67M chunks onto `context_id`, every vector was
+      discarded, and the corpus was embedded about 1.9 times. Keyed on
+      `embedding_input_hash`, a re-keyed or re-chunked row whose text did not
+      change reuses its vector.
+    - **The vector column is read only for rows that can hit.** The id/hash
+      index is consulted first, in memory, so a row whose text is new costs
+      no vector read at all. On BigQuery that column is most of the table
+      (21.3 GiB per lookup job on that corpus, issue #664).
+
+    What the run holds, and why each part:
+
+    - **The id, text-hash and config-hash columns, once.** State keys are
+      stringified ids, but the target column may be typed (a numeric id is a
+      tested contract), so deleting removed rows and pushing keyed predicates
+      both need the *typed* value. One streamed, projected pass builds both
+      maps: no vectors, residency proportional to key count rather than row
+      width. The config hash is read to *exclude* rows this run cannot use,
+      so it shrinks the index rather than growing it.
     - **Reuse columns, one window at a time.** A keyed IN predicate over the
-      window's typed ids, projected to the hash/vector columns, so residency
-      is bounded by `flush_every` whatever the corpus size.
+      typed ids of rows whose text the window actually wants, projected to
+      the hash/vector columns, so residency is bounded by `flush_every`
+      whatever the corpus size.
 
     The target is mutable by design: every successful window publishes before
     the next lookup. A BigQuery query result is immutable, but eventually
@@ -783,12 +818,14 @@ class _EmbeddingReuseReader:
         table: str,
         *,
         config: Any,
+        config_hash: str,
         timings: PhaseTimings,
     ) -> None:
         self._adapter = adapter
         self._table = table
         self._timings = timings
         self._id_field = config.id_field
+        self._config_hash = config_hash
         self._columns = (
             config.id_field,
             "embedding_input_hash",
@@ -798,6 +835,20 @@ class _EmbeddingReuseReader:
         )
         self._usable = False
         self._target_keys: dict[str, Any] = {}
+        # One representative typed id per distinct text hash, indexed only
+        # for rows recorded under *this* run's embedding configuration.
+        #
+        # Both halves matter. One representative is enough because every row
+        # carrying that hash under that config holds a vector for the same
+        # text, so any of them answers. Filtering by config at index time is
+        # what stops a stale row shadowing a usable one: a target can hold
+        # the same text twice under two configs (duplicate text plus a config
+        # change plus a partial publish), and indexing without the filter
+        # kept whichever row the unordered scan saw last -- which, when that
+        # was the old-config row, meant fetching it, rejecting it, and paying
+        # to re-embed text the target already held a current vector for
+        # (Codex review on #671).
+        self._keys_by_text_hash: dict[str, Any] = {}
         self._load_keys()
 
     def _load_keys(self) -> None:
@@ -811,29 +862,57 @@ class _EmbeddingReuseReader:
             # A pre-embed table (or an older contract) has nothing to reuse;
             # the old whole-table loader answered {} here too.
             return
-        self._target_keys = self._retry_snapshot_read(self._read_target_keys_once)
+        self._retry_snapshot_read(self._read_target_keys_once)
         self._usable = True
 
-    def _read_target_keys_once(self) -> dict[str, Any]:
+    def _read_target_keys_once(self) -> None:
+        # Rebuilt from empty on every attempt: a generation-change retry
+        # discards a partial read, and merging one into the previous
+        # attempt's map would leave rows from two generations.
         target_keys: dict[str, Any] = {}
+        keys_by_text_hash: dict[str, Any] = {}
         with self._timings.phase("reuse"):
             with self._adapter.table_snapshot(
                 self._table,
-                columns=[self._id_field],
+                columns=[
+                    self._id_field,
+                    "embedding_input_hash",
+                    "embedding_config_hash",
+                ],
                 batch_size=100_000,
             ) as snapshot:
                 for batch in snapshot:
-                    target_keys.update(self._target_keys_from_batch(batch))
-        return target_keys
+                    self._index_batch(batch, target_keys, keys_by_text_hash)
+        self._target_keys = target_keys
+        self._keys_by_text_hash = keys_by_text_hash
 
-    def _target_keys_from_batch(self, batch: Any) -> dict[str, Any]:
+    def _index_batch(
+        self,
+        batch: Any,
+        target_keys: dict[str, Any],
+        keys_by_text_hash: dict[str, Any],
+    ) -> None:
         frame = pl.from_arrow(batch)
         assert isinstance(frame, pl.DataFrame)
-        return {
-            str(value): value
-            for value in frame[self._id_field].to_list()
-            if value is not None
-        }
+        for value, text_hash, config_hash in zip(
+            frame[self._id_field].to_list(),
+            frame["embedding_input_hash"].to_list(),
+            frame["embedding_config_hash"].to_list(),
+            strict=True,
+        ):
+            if value is None:
+                continue
+            target_keys[str(value)] = value
+            # A row with no hash cannot be found by content, and a row from
+            # another embedding configuration holds a vector this run cannot
+            # use. Both still answer `target_key` for removals, which is why
+            # these skip the index rather than the row.
+            if (
+                isinstance(text_hash, str)
+                and text_hash
+                and config_hash == self._config_hash
+            ):
+                keys_by_text_hash[text_hash] = value
 
     def _retry_snapshot_read[T](self, operation: Callable[[], T]) -> T:
         for attempt in range(1, self._SNAPSHOT_ATTEMPTS + 1):
@@ -862,26 +941,44 @@ class _EmbeddingReuseReader:
     # fails before embedding begins.
     _LOOKUP_KEYS_PER_READ = 10_000
 
-    def rows_for(self, record_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+    def rows_for(self, text_hashes: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Reuse rows for the window's text hashes, keyed by text hash.
+
+        Keyed by content on both ends: the caller asks by text hash and is
+        answered by text hash, so a row whose id moved still answers for its
+        text (issue #665). A hash the target does not hold is dropped here,
+        before any read -- which is what keeps the vector column out of a
+        lookup that cannot hit.
+        """
         if not self._usable:
             return {}
-        typed = [
-            key
-            for record_id in record_ids
-            if (key := self._target_keys.get(record_id)) is not None
+        typed: list[Any] = []
+        unknown = 0
+        untyped = 0
+        for text_hash in dict.fromkeys(text_hashes):
+            key = self._keys_by_text_hash.get(text_hash)
+            if key is None:
+                unknown += 1
+                continue
             # A key the predicate contract cannot carry (DuckDB DECIMAL,
             # BigQuery NUMERIC) skips reuse rather than failing the resume:
             # the row re-embeds -- correct output, paid call -- which is the
-            # same price the row would pay if its text had changed. The old
-            # whole-target dict handled these ids, so this is the one
-            # narrowing the bounded path makes, and it is a cost, not a
-            # correctness change.
-            and isinstance(key, str | int | float | bool | date | datetime)
-        ]
-        if len(typed) < len(record_ids):
+            # same price the row would pay if its text had changed.
+            if not isinstance(key, str | int | float | bool | date | datetime):
+                untyped += 1
+                continue
+            typed.append(key)
+        if untyped:
             log.debug(
-                "embed reuse lookup skipped %d id(s) with non-scalar key types",
-                len(record_ids) - len(typed),
+                "embed reuse lookup skipped %d text hash(es) whose target row "
+                "has a non-scalar key type",
+                untyped,
+            )
+        if unknown:
+            log.debug(
+                "embed reuse lookup skipped %d text hash(es) the target does "
+                "not hold, without reading the vector column",
+                unknown,
             )
         found: dict[str, dict[str, Any]] = {}
         for offset in range(0, len(typed), self._LOOKUP_KEYS_PER_READ):
@@ -892,6 +989,10 @@ class _EmbeddingReuseReader:
         return found
 
     def _read_rows_for_chunk(self, chunk: Sequence[Any]) -> dict[str, dict[str, Any]]:
+        # Still predicated on the id column, not on `embedding_input_hash`:
+        # the id is what the index resolved to, and keeping the predicate on
+        # it means no adapter learns a second keyed-read shape. The hash is
+        # the *lookup* key; the id is how the row is fetched.
         predicate = ReadPredicate(
             self._id_field,
             ReadPredicateOperator.IN,
@@ -925,12 +1026,16 @@ class _EmbeddingReuseReader:
     def _rows_from_batch(self, batch: Any) -> dict[str, dict[str, Any]]:
         frame = pl.from_arrow(batch)
         assert isinstance(frame, pl.DataFrame)
+        # Keyed by the row's own `embedding_input_hash`, which is what makes
+        # the caller's `existing["embedding_input_hash"] == item.text_hash`
+        # check unnecessary rather than merely redundant: a row can only be
+        # found under the hash it actually carries.
         return {
-            str(key): row
+            text_hash: row
             for row in frame.iter_rows(named=True)
-            if (key := row.get(self._id_field)) is not None
+            if isinstance(text_hash := row.get("embedding_input_hash"), str)
+            and text_hash
         }
-
 
 def _coerce_embedding_vector(
     value: Any,

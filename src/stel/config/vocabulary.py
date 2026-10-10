@@ -18,9 +18,11 @@ growing to anticipate them.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .identifiers import validate_node_name
 
 # `values_from: vocab.<name>` — the only source kind today. Prefixed rather
 # than a bare name so a later `values_from:` source (e.g. a warehouse column)
@@ -190,6 +192,33 @@ class Vocabulary(BaseModel):
             out.append(current)
             frontier.extend(children.get(current, ()))
         return out
+
+
+def check_declaration(
+    vocabularies: Mapping[str, Vocabulary], classes: Sequence[str]
+) -> None:
+    """The cross-vocabulary half of validating a declaration; raises ValueError.
+
+    A `Vocabulary` validates itself -- unique labels, a `broader` that resolves
+    and does not cycle -- but a vocabulary's *name* and a term's `class:` are
+    claims against the project around it: the name must be an identifier and
+    the class must be declared under `classes:` (issue #629), or a relation or
+    agent-facing list would see a class nothing else knows about. Both
+    `ProjectConfig` at load and the serving catalog, reading the declaration
+    back out of a compiled manifest (issue #669), apply the same check here, so
+    a declaration the compiler would have refused cannot be served.
+    """
+    declared_classes = set(classes)
+    for vocab_name, vocabulary in vocabularies.items():
+        validate_node_name(vocab_name, kind="Vocabulary")
+        for term in vocabulary.terms:
+            if term.entity_class is None or term.entity_class in declared_classes:
+                continue
+            raise ValueError(
+                f"vocabulary '{vocab_name}' term '{term.label}' declares "
+                f"`class: {term.entity_class}`, which is not declared under "
+                f"`classes:`. Declared: {sorted(declared_classes) or '(none)'}"
+            )
 
 
 def declared_terms(

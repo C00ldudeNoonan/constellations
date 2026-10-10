@@ -160,3 +160,27 @@ def test_a_declaration_that_does_not_validate_is_refused() -> None:
     }
     with pytest.raises(ArtifactCatalogError, match=r"vocabulary 'v' does not validate"):
         ArtifactCatalog.from_payloads(manifest)
+
+
+def test_a_term_class_outside_the_declared_classes_is_refused() -> None:
+    """The cross-vocabulary half of the check (#673 review).
+
+    `Vocabulary` cannot see `classes:`, so a payload whose term claims a class
+    the artifact does not declare validates vocabulary by vocabulary and would
+    be served as a scope nothing else knows about. The catalog runs the same
+    `check_declaration` the compiler does.
+    """
+    manifest = {
+        "manifest_version": SERVING_MANIFEST_VERSION,
+        "declarations": {
+            "classes": [],
+            "vocabularies": {
+                "v": {"terms": [{"label": "Central bank", "class": "institution"}]}
+            },
+        },
+        "target": {"name": "dev"},
+        "models": [],
+        "dag": {},
+    }
+    with pytest.raises(ArtifactCatalogError, match=r"not declared under `classes:`"):
+        ArtifactCatalog.from_payloads(manifest)

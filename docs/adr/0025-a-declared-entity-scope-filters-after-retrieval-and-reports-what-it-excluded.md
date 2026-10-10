@@ -1,6 +1,6 @@
 # ADR-0025: a declared entity scope filters after retrieval and reports what it excluded
 
-- **Status:** accepted
+- **Status:** accepted; its known limitation is resolved by [ADR-0027](0027-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
 - **Date:** 2026-10-09
 - **Prompted by:** #628
 
@@ -80,10 +80,6 @@ results than `limit` while matching documents exist deeper in the corpus.
 return more, and the reference documents it in those terms.
 
 ## Known limitation: the declaration is live, the links are published
-
-> Resolved by [ADR-0027](0027-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
-> (#669): the manifest now carries the declaration and the catalog reads it
-> from there. The text below records the state this decision was made in.
 
 `ArtifactCatalog.load` reads `vocabularies:` from the current
 `stel_project.yml`, while the entity links it interprets were published by an

@@ -12,7 +12,7 @@ from typing import Any, Literal
 from pydantic import ValidationError
 
 from ..config import load_project
-from ..config.vocabulary import Vocabulary
+from ..config.vocabulary import Vocabulary, check_declaration
 from ..manifest import SERVING_MANIFEST_VERSION
 from .authorization import PolicyAttribute
 from .contracts import (
@@ -273,13 +273,15 @@ class ArtifactCatalog:
 
 
 def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]:
-    """The `declarations.vocabularies` block, validated back into models.
+    """The `declarations` block, validated back into models as a whole.
 
-    Validation is the same `Vocabulary` runs at project load, so a hierarchy
-    the catalog walks or a class it resolves cannot be one the compiler would
-    have refused. A manifest at the right version always carries the block;
-    its absence or a payload that fails to validate is a damaged artifact,
-    not an empty declaration, and is refused the way a wrong version is.
+    Validation is what project load runs: each `Vocabulary` validates itself,
+    and `check_declaration` holds vocabulary names and term classes against
+    `classes`, so a class the catalog resolves a scope to cannot be one the
+    compiler would have refused. A manifest at the right version always
+    carries the block; its absence or a payload that fails to validate is a
+    damaged artifact, not an empty declaration, and is refused the way a wrong
+    version is.
     """
     declarations = manifest.get("declarations")
     if not isinstance(declarations, Mapping):
@@ -287,9 +289,10 @@ def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]
             "The manifest has no `declarations` block; run `stel compile`"
         )
     payload = declarations.get("vocabularies")
-    if not isinstance(payload, Mapping):
+    classes = declarations.get("classes")
+    if not isinstance(payload, Mapping) or not isinstance(classes, list):
         raise ArtifactCatalogError(
-            "The manifest's `declarations.vocabularies` is not an object; "
+            "The manifest's `declarations` block is not the compiled shape; "
             "run `stel compile`"
         )
     vocabularies: dict[str, Vocabulary] = {}
@@ -301,6 +304,12 @@ def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]
                 f"The manifest's declaration of vocabulary '{name}' does not "
                 "validate; run `stel compile`"
             ) from None
+    try:
+        check_declaration(vocabularies, [str(value) for value in classes])
+    except ValueError as exc:
+        raise ArtifactCatalogError(
+            f"The manifest's declaration does not validate: {exc}; run `stel compile`"
+        ) from None
     return vocabularies
 
 

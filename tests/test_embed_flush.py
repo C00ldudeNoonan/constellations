@@ -661,6 +661,7 @@ def test_a_text_the_target_lacks_costs_no_vector_read(tmp_path: Path) -> None:
                 id_field="chunk_id",
                 vector_field="embedding",
             ),
+            config_hash="config-hash",
             timings=PhaseTimings(),
         )
 
@@ -867,6 +868,7 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
                 provider="deterministic", model="m", dimensions=1,
                 id_field="chunk_id", vector_field="embedding",
             ),
+            config_hash="g",
             timings=PhaseTimings(),
         )
 
@@ -875,6 +877,66 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
         # to a Decimal key the predicate contract cannot carry. Passing
         # the record id here would answer {} for the wrong reason (#665).
         assert reader.rows_for(["h"]) == {}
+
+
+def test_a_stale_config_row_cannot_shadow_a_usable_one(tmp_path: Path) -> None:
+    """One representative id per text hash must be a *usable* one (#671 review).
+
+    A target can hold the same text twice under two embedding configurations:
+    duplicate text (SEC filings repeat risk-factor language), plus a config
+    change, plus a publish interrupted partway. Indexing one representative
+    per hash without filtering by config kept whichever row the unordered
+    scan saw last -- and when that was the old-config row, the lookup fetched
+    it, the caller rejected it, and stel paid to re-embed text the target
+    already held a current vector for.
+
+    The usable row is listed *first* and the stale one last, deliberately: a
+    dict that keeps the last writer therefore keeps the stale row when the
+    config filter is removed, and this test fails. Written the other way
+    round it passed with the filter gone -- the mutation check caught that
+    before the ordering was fixed.
+    """
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["usable", "stale"],
+                    "embedding_input_hash": ["shared", "shared"],
+                    "embedding_config_hash": ["current-config", "old-config"],
+                    "embedding": [[0.1], [0.9]],
+                    "embedded_at": ["2026-08-01T00:00:00+00:00"] * 2,
+                }
+            ),
+        )
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic",
+                model="m",
+                dimensions=1,
+                id_field="chunk_id",
+                vector_field="embedding",
+            ),
+            config_hash="current-config",
+            timings=PhaseTimings(),
+        )
+
+        row = reader.rows_for(["shared"])["shared"]
+        assert row["chunk_id"] == "usable"
+        assert row["embedding_config_hash"] == "current-config"
+        # Both rows still answer for removals: the index filter narrows what
+        # can be *reused*, never what the target is known to contain.
+        assert reader.target_key("stale") is not None
 
 
 def test_reuse_reader_retries_complete_mutable_target_snapshots(
@@ -932,6 +994,7 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
                 id_field="chunk_id",
                 vector_field="embedding",
             ),
+            config_hash="config-hash",
             timings=PhaseTimings(),
         )
 

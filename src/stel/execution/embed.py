@@ -216,7 +216,13 @@ def _run_embed_model(
     # resumed has already proven the corpus is large (issue #401 follow-up).
     skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
     reuse_reader = (
-        _EmbeddingReuseReader(adapter, model.name, config=config, timings=timings)
+        _EmbeddingReuseReader(
+            adapter,
+            model.name,
+            config=config,
+            config_hash=identity.config_hash,
+            timings=timings,
+        )
         if is_incremental and not rebuild_target
         else None
     )
@@ -305,9 +311,16 @@ def _run_embed_model(
         Looked up by text hash, not by row id (issue #665). The row that
         holds a usable vector is any row whose input text was the same; it
         need not be *this* row, which is what lets a corpus whose ids moved
-        keep every vector it has already paid for. The config hash is still
-        checked here, and is the one check that remains load-bearing: same
-        text under a different embedding configuration is a different vector.
+        keep every vector it has already paid for.
+
+        The config check below is deliberately redundant with the reader's
+        index, which only indexes rows recorded under this run's
+        configuration. It is kept because that index is a snapshot of a
+        table the run itself keeps writing to, so it is a staleness guard
+        rather than the primary rule, and because reusing a vector built
+        under another configuration would be a wrong answer rather than a
+        slow one. Being redundant, no test pins it alone; the index filter
+        is what the configuration tests exercise.
         """
         nonlocal cache_hits
         if reuse_reader is None:
@@ -778,11 +791,13 @@ class _EmbeddingReuseReader:
 
     What the run holds, and why each part:
 
-    - **The id column and the hash column, once.** State keys are stringified
-      ids, but the target column may be typed (a numeric id is a tested
-      contract), so deleting removed rows and pushing keyed predicates both
-      need the *typed* value. One streamed, projected pass builds both maps:
-      no vectors, residency proportional to key count rather than row width.
+    - **The id, text-hash and config-hash columns, once.** State keys are
+      stringified ids, but the target column may be typed (a numeric id is a
+      tested contract), so deleting removed rows and pushing keyed predicates
+      both need the *typed* value. One streamed, projected pass builds both
+      maps: no vectors, residency proportional to key count rather than row
+      width. The config hash is read to *exclude* rows this run cannot use,
+      so it shrinks the index rather than growing it.
     - **Reuse columns, one window at a time.** A keyed IN predicate over the
       typed ids of rows whose text the window actually wants, projected to
       the hash/vector columns, so residency is bounded by `flush_every`
@@ -803,12 +818,14 @@ class _EmbeddingReuseReader:
         table: str,
         *,
         config: Any,
+        config_hash: str,
         timings: PhaseTimings,
     ) -> None:
         self._adapter = adapter
         self._table = table
         self._timings = timings
         self._id_field = config.id_field
+        self._config_hash = config_hash
         self._columns = (
             config.id_field,
             "embedding_input_hash",
@@ -818,12 +835,19 @@ class _EmbeddingReuseReader:
         )
         self._usable = False
         self._target_keys: dict[str, Any] = {}
-        # One representative typed id per distinct text hash. One is enough:
-        # every row carrying that hash holds a vector for the same text, so
-        # any of them answers the lookup. Which one wins is whichever the
-        # scan saw last, and that is not a correctness question -- the
-        # `embedding_config_hash` check at the call site still decides
-        # whether the vector is usable.
+        # One representative typed id per distinct text hash, indexed only
+        # for rows recorded under *this* run's embedding configuration.
+        #
+        # Both halves matter. One representative is enough because every row
+        # carrying that hash under that config holds a vector for the same
+        # text, so any of them answers. Filtering by config at index time is
+        # what stops a stale row shadowing a usable one: a target can hold
+        # the same text twice under two configs (duplicate text plus a config
+        # change plus a partial publish), and indexing without the filter
+        # kept whichever row the unordered scan saw last -- which, when that
+        # was the old-config row, meant fetching it, rejecting it, and paying
+        # to re-embed text the target already held a current vector for
+        # (Codex review on #671).
         self._keys_by_text_hash: dict[str, Any] = {}
         self._load_keys()
 
@@ -850,7 +874,11 @@ class _EmbeddingReuseReader:
         with self._timings.phase("reuse"):
             with self._adapter.table_snapshot(
                 self._table,
-                columns=[self._id_field, "embedding_input_hash"],
+                columns=[
+                    self._id_field,
+                    "embedding_input_hash",
+                    "embedding_config_hash",
+                ],
                 batch_size=100_000,
             ) as snapshot:
                 for batch in snapshot:
@@ -866,18 +894,24 @@ class _EmbeddingReuseReader:
     ) -> None:
         frame = pl.from_arrow(batch)
         assert isinstance(frame, pl.DataFrame)
-        for value, text_hash in zip(
+        for value, text_hash, config_hash in zip(
             frame[self._id_field].to_list(),
             frame["embedding_input_hash"].to_list(),
+            frame["embedding_config_hash"].to_list(),
             strict=True,
         ):
             if value is None:
                 continue
             target_keys[str(value)] = value
-            # A row with no hash cannot be found by content. It still answers
-            # `target_key` for removals, which is why this is a `continue`
-            # rather than skipping the row outright.
-            if isinstance(text_hash, str) and text_hash:
+            # A row with no hash cannot be found by content, and a row from
+            # another embedding configuration holds a vector this run cannot
+            # use. Both still answer `target_key` for removals, which is why
+            # these skip the index rather than the row.
+            if (
+                isinstance(text_hash, str)
+                and text_hash
+                and config_hash == self._config_hash
+            ):
                 keys_by_text_hash[text_hash] = value
 
     def _retry_snapshot_read[T](self, operation: Callable[[], T]) -> T:

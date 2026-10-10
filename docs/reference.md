@@ -2971,6 +2971,73 @@ my_project:
             path: ./target/lancedb
 ```
 
+#### What a cloud store costs to read from outside the cloud
+
+A `gs://`, `s3://` or `az://` store is read over the network on every build and
+every query. When the processes reading it run outside that provider's network
+— a laptop, a CI runner, a container on another cloud — each of those reads is
+billed as internet egress, and an index rebuild reads the whole corpus.
+
+Measured on one real deployment over two months: 1.43 TB egress and 11.8M
+ReadObject calls against a `gs://` store whose publisher and query processes
+all ran on one machine outside GCP, which is roughly $150 at GCS egress rates,
+about $70 of it for a single index rebuild (issue #666).
+
+A cloud store earns that when readers are genuinely distributed — a builder and
+servers in different containers that share no filesystem. When they are not,
+the store wants to be local, with a copy to the bucket for durability and for
+restoring onto another host. That is what `identity:` below makes possible.
+
+#### A store's identity, and moving a store
+
+A store is identified by a fingerprint, and the search model's publication
+state, its serving-ledger row and its publisher lock are all keyed on it. By
+default that fingerprint is derived from *where the store is* — the normalized
+path, or the canonical cloud URI plus any non-secret routing. Two paths are two
+stores, which is what keeps state written against one object store from being
+read against another.
+
+It also means a store cannot move. Copy a `gs://` store to local disk and the
+copy is a different store: no ledger row, no publication state, so `stel mcp
+serve` refuses it as never published and the next run re-embeds the corpus.
+
+Declare an `identity:` to name the store independently of where it sits:
+
+```yaml
+          local:
+            type: lancedb
+            path: /srv/lancedb                 # where the bytes are today
+            identity: econ-prod                # what the store *is*
+```
+
+With one declared, the location and its routing are excluded from the
+fingerprint entirely, so the same store resolves to one scope whether it is
+read from the bucket, from a local primary, or from a copy restored onto a
+fresh host. It is a label, not a location: 1 to 128 characters of
+`[A-Za-z0-9._:-]` starting with a letter or digit, so a pasted URI is refused
+at the profile boundary rather than silently becoming a third identity. Keep it
+secret-free — it is fingerprinted into every scope the store owns.
+
+Declaring nothing keeps exactly the fingerprint that shipped, so adding the
+field to a profile changes no existing index.
+
+**An index published before the move needs its scope moved too**, because its
+rows are keyed on the location the store had:
+
+```bash
+stel serving migrate-scope sec_search --target prod --from-path gs://bucket/lancedb
+```
+
+That moves the ledger row and the publication state onto the scope the profile
+resolves now. It is idempotent: a second run reports zero rows moved. Give the
+old `path` exactly as the profile carried it; a store that declares no
+`identity:` will strand its scope again the next time it moves.
+
+Two different stores given the same `identity:` are one store as far as stel
+can tell — it will read one's publication state against the other. The derived
+default is what protects a profile that declares nothing, which is why it stays
+the default.
+
 #### Bounding LanceDB's caches
 
 LanceDB keeps an index cache and a metadata cache whose own defaults are large

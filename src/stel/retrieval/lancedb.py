@@ -40,6 +40,7 @@ from .base import (
     StateRetrievalTarget,
     StoreRole,
     reject_generation_shaped_collection_name,
+    safe_retrieval_target,
     sanitized_retrieval_cause,
     validate_generation_token,
 )
@@ -716,21 +717,19 @@ class LanceDBStore(RetrievalStore):
         return base / digest
 
     def safe_descriptor(self) -> SafeRetrievalTarget:
-        payload: dict[str, Any] = {
-            "store_type": self.store_type(),
-            "path": self._config.identity_key(),
-        }
-        # Add routing only when present so local stores (and cloud stores without
-        # routing) keep the exact pre-routing fingerprint — existing state scopes
-        # stay valid. A changed endpoint/region now yields a distinct identity,
-        # so state from one physical store can't be misread against another.
-        routing = self._config.routing_options()
-        if routing:
-            payload["routing"] = routing
-        identity = canonical_fingerprint(
-            payload, domain="dbt-ml-safe-retrieval-target"
+        # Routing is folded in only when the identity is derived from the
+        # location, and only when it is present: a local store (and a cloud
+        # store without routing) keeps the exact pre-routing fingerprint, so
+        # existing state scopes stay valid, while a changed endpoint/region
+        # yields a distinct identity rather than letting state from one
+        # physical store be misread against another. A declared identity
+        # supersedes both -- see `safe_retrieval_target`.
+        return safe_retrieval_target(
+            self.store_type(),
+            declared_identity=self._config.identity,
+            derived_location=self._config.identity_key(),
+            routing=self._config.routing_options(),
         )
-        return SafeRetrievalTarget(self.store_type(), identity)
 
     def state_descriptor(self, collection: str) -> StateRetrievalTarget:
         return StateRetrievalTarget(

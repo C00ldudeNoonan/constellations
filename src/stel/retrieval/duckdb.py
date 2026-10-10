@@ -62,6 +62,7 @@ from .base import (
     StateRetrievalTarget,
     StoreRole,
     reject_generation_shaped_collection_name,
+    safe_retrieval_target,
     validate_generation_token,
 )
 from .locks import PublisherLock
@@ -349,11 +350,14 @@ class DuckDBStore(RetrievalStore):
     # ── identity and naming ─────────────────────────────────────────────────
 
     def safe_descriptor(self) -> SafeRetrievalTarget:
-        identity = canonical_fingerprint(
-            {"store_type": self.store_type(), "path": self._config.identity_key()},
-            domain="dbt-ml-safe-retrieval-target",
+        # No routing: a DuckDB store is a local file, and there is nothing
+        # between the process and it to change.
+        return safe_retrieval_target(
+            self.store_type(),
+            declared_identity=self._config.identity,
+            derived_location=self._config.identity_key(),
+            routing={},
         )
-        return SafeRetrievalTarget(self.store_type(), identity)
 
     def state_descriptor(self, collection: str) -> StateRetrievalTarget:
         return StateRetrievalTarget(

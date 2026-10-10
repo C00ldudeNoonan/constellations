@@ -36,6 +36,22 @@
   the path, so `mirror:` would have had to smuggle this in as a side effect of
   a sync feature.
 
+### The concept cloud says who names a concept (issue #555 item 5)
+
+- **`concept-cloud --breakdown name=model.column`** (repeatable) counts each
+  concept's documents by a document-level field from a `document_id`-keyed
+  model. The detail card now says how many documents name the concept and
+  shows the split: "FERC: named in 300 filings, 71% Utilities, 18% Energy, no
+  sector 11%". Counts are distinct documents, the same unit as the new "named
+  in N documents" line, so documents with no value are shown as such, never
+  folded into a value.
+- A document given two different values is refused, as is a field with more
+  than 50 distinct values. A breakdown is a categorical document field, not an
+  identifier.
+- **The bundle is schema version 5.** Version 4 bundles are refused. Re-export
+  to upgrade; a bundle without `--breakdown` carries an empty `breakdowns`.
+- `--demo` now includes a `section` breakdown.
+
 ### The serving catalog reads the declaration the artifact was compiled with (issue #669)
 
 - **The MCP server read `vocabularies:` from the live project file** while the

@@ -2409,6 +2409,17 @@ def mcp_serve(
     ),
 )
 @click.option(
+    "--breakdown",
+    "breakdowns",
+    multiple=True,
+    help=(
+        "Count each concept's documents by a document-level field, as "
+        "name=model.column (repeatable): the model is keyed `document_id`. "
+        "The detail card shows who names the concept, e.g. its share of "
+        "filings by sector."
+    ),
+)
+@click.option(
     "--names-model",
     default=None,
     help=(
@@ -2476,6 +2487,7 @@ def concept_cloud(
     embed_model: str | None,
     with_query_log: bool,
     dimensions: tuple[str, ...],
+    breakdowns: tuple[str, ...],
     names_model: str | None,
     time_field: str | None,
     time_grain: str,
@@ -2506,14 +2518,8 @@ def concept_cloud(
             "Pass --linking-model <model> to export a project's concepts, "
             "or --demo / --placeholder for a built-in bundle."
         )
-    dimension_specs: dict[str, str] = {}
-    for raw in dimensions:
-        name, _, spec = raw.partition("=")
-        if not name or not spec:
-            raise click.ClickException(
-                f"--dimension must be name=model.column, got {raw!r}"
-            )
-        dimension_specs[name] = spec
+    dimension_specs = _named_specs("--dimension", dimensions)
+    breakdown_specs = _named_specs("--breakdown", breakdowns)
     try:
         export = export_concept_cloud(
             ctx.obj["project_dir"],
@@ -2528,6 +2534,7 @@ def concept_cloud(
             embed_model=embed_model,
             with_query_log=with_query_log,
             dimension_specs=dimension_specs or None,
+            breakdown_specs=breakdown_specs or None,
             names_model=names_model,
             time_field=time_field,
             time_grain=cast(TimeGrain, time_grain),
@@ -2539,6 +2546,17 @@ def concept_cloud(
     click.echo(
         f"Wrote concept-cloud artifact ({len(export.concepts)} concepts) to {written}"
     )
+
+
+def _named_specs(flag: str, raws: tuple[str, ...]) -> dict[str, str]:
+    """`name=model.column` values of a repeatable flag, by name."""
+    specs: dict[str, str] = {}
+    for raw in raws:
+        name, _, spec = raw.partition("=")
+        if not name or not spec:
+            raise click.ClickException(f"{flag} must be name=model.column, got {raw!r}")
+        specs[name] = spec
+    return specs
 
 
 @cli.group()

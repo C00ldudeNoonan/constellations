@@ -5134,9 +5134,7 @@ come only from the declaration, never from document text, and they are
 separate from the `description` above, which comes from the names relation the
 operator maintains. A concept nothing declares, or one that two vocabularies
 declare differently, carries none of the three: the keys are absent from the
-bundle, not null, because an absent key is the signal. The bundle is schema
-version 4; a version 3 bundle is refused by the artifact rather than read as
-current.
+bundle, not null, because an absent key is the signal.
 
 Scope: this carries what a declaration states about each concept. It does not
 lay concepts out by class or by hierarchy (issue #345), and it does not add a
@@ -5156,6 +5154,42 @@ hand-maintained alias table or a fuzzy/vector-similarity match carries one
 too, an identifier namespace like `ticker` or `cik`, never a type — so a
 namespace counts here only when it, and the concept's own id, are a term this
 project's `vocabularies:` actually declares.
+
+**Who names a concept** (`--breakdown name=model.column`, repeatable; issue
+#555 item 5). "Focus" above answers *what does X name?*; this answers *who
+names X?* Point it at a **document-keyed** model, `document_id` plus a
+categorical column, and each concept's documents are counted by that column.
+The card then reads "named in 300 documents" with a bar and the top values:
+*sector: Utilities 71% · Energy 18% · no sector 11%*.
+
+```bash
+stel --project-dir path/to/stel_project concept-cloud \
+  --linking-model sec_starmap_links \
+  --breakdown sector=filing_sectors.sector \
+  -o cloud.html
+```
+
+- **Documents, not mentions.** A filing that names FERC forty times is one
+  Utilities filing. The unit is the same one behind "named in N documents", so
+  the shares are of that number. The linking model needs a `document_id`
+  column.
+- **No value is said, not guessed.** A document the model gives no value
+  (no row, or a null or blank cell) appears in no count. The card shows it as
+  "no sector" and as the bar's grey remainder.
+- **One value per document.** Two rows giving one document two different
+  values are refused, naming the documents: a warehouse read promises no row
+  order, so picking one would change the shares between two exports of
+  unchanged data. Two identical rows are fine.
+- **Categorical, at most 50 values.** The card lists a concept's values, so a
+  breakdown is a sector or a form type, not an identifier. A field with more
+  than 50 distinct values (a ticker, say) is refused with the remedy: group
+  the values in the model.
+- **Counted over every period.** With a time axis the slider changes the
+  stars, not the breakdown; the card labels it "(all periods)".
+
+A *dimension* (below) gives a concept one value and colors the star by it. A
+breakdown gives it a count per value, because a concept named across hundreds
+of filings has no single sector of its own.
 
 **Names and descriptions** (`--names-model <model>`, issue #554). Without it a
 concept is named by its **most frequent** mention text, ties broken lexically —
@@ -5208,7 +5242,8 @@ NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
 warehouse credentials ever enter it, and raw document text appears only when the
 operator opted into it upstream. The bundle is a versioned contract
 (`ConceptCloudExport`, `schema_version`), so the static viewer and the export job
-evolve independently.
+evolve independently. The current version is 5. A bundle from any other version
+is refused by the artifact rather than read as current.
 
 ## Append-only logs
 

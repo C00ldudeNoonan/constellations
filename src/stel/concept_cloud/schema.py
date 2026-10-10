@@ -29,7 +29,9 @@ from pydantic import (
 # artifact per period.
 # v4 (issue #629): per-concept declared class, definition and broader term,
 # sourced from the project's vocabularies and omitted when undeclared.
-CONCEPT_CLOUD_SCHEMA_VERSION = "4"
+# v5 (issue #555 item 5): per-concept document counts by a document-level
+# field ("who names X?"), declared once on the bundle as `breakdowns`.
+CONCEPT_CLOUD_SCHEMA_VERSION = "5"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -170,6 +172,35 @@ class DimensionDef(_Frozen):
         return cleaned
 
 
+class BreakdownDef(_Frozen):
+    """A document-level field a concept's documents are counted by (issue #555
+    item 5): "FERC is named by 300 filings, 71% Utilities". A dimension gives a
+    concept *one* value; a breakdown gives it a count per value, because a
+    concept named across many documents has no single sector of its own.
+
+    The value set is closed and declared here, on the same terms as
+    `DimensionDef`, so the viewer can color a value the same way on every
+    card."""
+
+    name: str
+    values: tuple[str, ...]
+
+    @field_validator("name")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+    @field_validator("values")
+    @classmethod
+    def _values_non_empty_and_unique(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if not values:
+            raise ValueError("breakdown must declare at least one value")
+        cleaned = tuple(_require_non_empty(value) for value in values)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("breakdown values must be unique")
+        return cleaned
+
+
 class Concept(_Frozen):
     """One canonical entity in the cloud. Keyed on `canonical_id` from the
     entity-linking output; `display` is human-readable only when the operator
@@ -210,6 +241,12 @@ class Concept(_Frozen):
     # zero: absence is the signal ("first named in 2019"), and writing zeros
     # for every period of every concept would dominate the bundle.
     by_period: dict[str, int] = Field(default_factory=dict)
+    # Breakdown name -> value -> how many of this concept's documents carry
+    # that value (issue #555 item 5). Counted in documents, the same unit as
+    # `provenance.documents`, so a value's share is its count over that. A
+    # document with no value is in neither: the shortfall is "no value", not
+    # an extra value.
+    breakdowns: dict[str, dict[str, int]] = Field(default_factory=dict)
 
     @field_validator("canonical_id", "display")
     @classmethod
@@ -296,7 +333,7 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["4"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["5"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane
@@ -311,6 +348,9 @@ class ConceptCloudExport(_Frozen):
     # the corpus covers, and a slider that skipped it would misread a gap as
     # absent data. Empty when no time field was declared.
     periods: tuple[str, ...] = ()
+    # Declared document-level breakdowns (issue #555 item 5); order is the
+    # order the card lists them in.
+    breakdowns: tuple[BreakdownDef, ...] = ()
 
     @field_validator("generated_at", "project")
     @classmethod
@@ -354,6 +394,7 @@ class ConceptCloudExport(_Frozen):
                     f"concept '{concept.canonical_id}' has counts for "
                     f"undeclared period(s) {sorted(undeclared)}"
                 )
+        self._check_breakdowns()
         node_ids = {node.id for node in self.dag_plane.nodes}
         for edge in self.concept_edges:
             undeclared = set(edge.by_period) - declared_periods
@@ -377,6 +418,40 @@ class ConceptCloudExport(_Frozen):
                     f"cross_layer_edge references unknown dag node '{link.dag_node}'"
                 )
         return self
+
+    def _check_breakdowns(self) -> None:
+        """Every count names a declared breakdown and value, and a concept's
+        counts never exceed its documents: each document carries at most one
+        value, so a sum above `provenance.documents` is a bundle that would
+        draw shares over 100%."""
+        declared = {b.name: set(b.values) for b in self.breakdowns}
+        if len(declared) != len(self.breakdowns):
+            raise ValueError("breakdown names must be unique")
+        for concept in self.concepts:
+            for name, counts in concept.breakdowns.items():
+                allowed = declared.get(name)
+                if allowed is None:
+                    raise ValueError(
+                        f"concept '{concept.canonical_id}' uses undeclared "
+                        f"breakdown '{name}'"
+                    )
+                outside = set(counts) - allowed
+                if outside:
+                    raise ValueError(
+                        f"concept '{concept.canonical_id}' has breakdown "
+                        f"'{name}' values {sorted(outside)} outside its declared set"
+                    )
+                if any(count < 1 for count in counts.values()):
+                    raise ValueError(
+                        f"concept '{concept.canonical_id}' breakdown '{name}' "
+                        "counts must be at least 1; omit a value with none"
+                    )
+                if sum(counts.values()) > concept.provenance.documents:
+                    raise ValueError(
+                        f"concept '{concept.canonical_id}' breakdown '{name}' "
+                        f"counts {sum(counts.values())} documents, more than "
+                        f"the {concept.provenance.documents} it is named in"
+                    )
 
     def to_json(self) -> str:
         """Serialize to the on-disk bundle JSON (aliased keys, e.g. `from`)."""

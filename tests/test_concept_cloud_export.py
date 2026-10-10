@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -898,6 +899,62 @@ def test_cli_names_model_reaches_the_export(tmp_path: pathlib.Path) -> None:
     assert "A fictional maker of anvils." in html
 
 
+def test_cli_breakdown_reaches_the_bundle(tmp_path: pathlib.Path) -> None:
+    """`--breakdown` is hand-wired through the CLI and the export wrapper to
+    `build_concept_cloud`; a dropped keyword anywhere would ship a map with no
+    breakdown and no error (issue #555 item 5)."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    _manifest_project(tmp_path)
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    with create_adapter(resolved.warehouse, project_dir=tmp_path) as adapter:
+        adapter.materialize_full(
+            "filing_sectors",
+            pl.DataFrame({"document_id": ["d1", "d2"], "sector": ["Energy", "Utilities"]}),
+        )
+
+    out = tmp_path / "cloud.html"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--project-dir", str(tmp_path), "concept-cloud",
+            "--linking-model", "link_entities",
+            "--breakdown", "sector=filing_sectors.sector",
+            "--output", str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    bundle = _extract_bundle(out.read_text(encoding="utf-8"))
+    assert bundle["breakdowns"] == [{"name": "sector", "values": ["Energy", "Utilities"]}]
+    by_id = {c["canonical_id"]: c for c in bundle["concepts"]}
+    assert by_id["org:acme"]["breakdowns"] == {"sector": {"Energy": 1, "Utilities": 1}}
+
+
+def test_a_malformed_breakdown_spec_fails_before_the_project_is_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The directory holds no project at all, so reaching `load_project` would
+    raise something else: the spec is checked first, before any warehouse or
+    credential is touched."""
+    with pytest.raises(
+        ConceptCloudExportError,
+        match=re.escape("breakdown 'sector' must be `model.column`, got 'filing_sectors'"),
+    ):
+        export_concept_cloud(
+            tmp_path, linking_model="link_entities",
+            breakdown_specs={"sector": "filing_sectors"},
+        )
+
+
+def _extract_bundle(html: str) -> dict[str, Any]:
+    start = html.index('<script id="cc-data" type="application/json">')
+    body = html[start:].split(">", 1)[1].split("</script>", 1)[0]
+    return cast(dict[str, Any], json.loads(body))
+
+
 # ─── v3: a time axis (issue #553) ───────────────────────────────────────────
 
 
@@ -924,7 +981,7 @@ def test_a_time_field_gives_each_concept_its_periods() -> None:
         time_field="filing_year",
     )
 
-    assert export.schema_version == "4"
+    assert export.schema_version == "5"
     assert export.periods == ("2019", "2021")
     by_id = {c.canonical_id: c for c in export.concepts}
     assert by_id["FERC"].by_period == {"2019": 2, "2021": 1}

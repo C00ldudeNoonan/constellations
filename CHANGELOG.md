@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.21.1 - 2026-10-10
 
 ### The serving catalog reads the declaration the artifact was compiled with (issue #669)
 
@@ -105,8 +105,6 @@
   unchanged.
 - **Docs:** a column test (`not_null`, `unique`, …) scans its whole column per
   invocation; on a vector or long-text column that was 20.9 GiB a day.
-
-## v0.21.1 - 2026-10-09
 
 ### An agent can search by declared class and walk the hierarchy (issue #628)
 

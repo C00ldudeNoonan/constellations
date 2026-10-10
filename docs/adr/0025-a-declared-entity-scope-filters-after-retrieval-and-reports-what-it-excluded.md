@@ -81,6 +81,10 @@ return more, and the reference documents it in those terms.
 
 ## Known limitation: the declaration is live, the links are published
 
+> Resolved by [ADR-0027](0027-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
+> (#669): the manifest now carries the declaration and the catalog reads it
+> from there. The text below records the state this decision was made in.
+
 `ArtifactCatalog.load` reads `vocabularies:` from the current
 `stel_project.yml`, while the entity links it interprets were published by an
 earlier run. An operator who edits a term's `class:` or `broader` and starts

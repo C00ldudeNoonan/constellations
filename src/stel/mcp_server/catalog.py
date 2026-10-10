@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -8,8 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from pydantic import ValidationError
+
 from ..config import load_project
 from ..config.vocabulary import Vocabulary
+from ..manifest import SERVING_MANIFEST_VERSION
 from .authorization import PolicyAttribute
 from .contracts import (
     ContextField,
@@ -18,6 +22,8 @@ from .contracts import (
     FilterOperator,
     RetrievalCapability,
 )
+
+log = logging.getLogger(__name__)
 
 
 class ArtifactCatalogError(Exception):
@@ -75,15 +81,14 @@ class ArtifactCatalog:
         self,
         resources: Sequence[ContextResource],
         *,
-        vocabularies: Mapping[str, Vocabulary] | None = None,
+        vocabularies: Mapping[str, Vocabulary],
     ) -> None:
         self._resources = {resource.name: resource for resource in resources}
-        # The project's declared vocabularies (issue #625), or empty when the
-        # project declares none -- which is what makes the derived
-        # `entity_types` fall back to scanning rather than reporting nothing
-        # (issue #628). `from_payloads` has no project to read, so a caller
-        # holding only a manifest gets the scan too.
-        self._vocabularies: Mapping[str, Vocabulary] = dict(vocabularies or {})
+        # The declared vocabularies (issue #625) as the manifest carries them,
+        # or empty when the project declared none -- which is what makes the
+        # derived `entity_types` fall back to scanning rather than reporting
+        # nothing (issue #628).
+        self._vocabularies: Mapping[str, Vocabulary] = dict(vocabularies)
 
     @classmethod
     def load(
@@ -98,12 +103,26 @@ class ArtifactCatalog:
         run_results = _read_json(target_dir / "run_results.json", required=False)
         if manifest is None:
             raise AssertionError("required manifest read returned no payload")
-        return cls.from_payloads(
+        catalog = cls.from_payloads(
             manifest,
             run_results=run_results,
             expected_target=expected_target,
-            vocabularies=project.vocabularies,
         )
+        # The project file is read for `target_path` only. Its `vocabularies:`
+        # is the *live* declaration; the one the catalog serves is the one
+        # compiled into the manifest, because that is the declaration the
+        # entity links were published under (issue #669). A difference is not
+        # an error -- the served answer is right for the published rows -- but
+        # it is the one state an operator cannot otherwise see.
+        if _declaration_payload(project.vocabularies) != _declaration_payload(
+            catalog.vocabularies
+        ):
+            log.warning(
+                "stel_project.yml declares a `vocabularies:` block that differs "
+                "from the one in manifest.json; the server serves the compiled "
+                "declaration. Recompile and republish for the edit to take effect."
+            )
+        return catalog
 
     @classmethod
     def from_payloads(
@@ -112,12 +131,14 @@ class ArtifactCatalog:
         *,
         run_results: Mapping[str, Any] | None = None,
         expected_target: str | None = None,
-        vocabularies: Mapping[str, Vocabulary] | None = None,
     ) -> ArtifactCatalog:
-        if manifest.get("manifest_version") != 2:
+        version = manifest.get("manifest_version")
+        if version != SERVING_MANIFEST_VERSION:
             raise ArtifactCatalogError(
-                "stel MCP requires a manifest v2 artifact; run `stel compile`"
+                f"stel MCP requires a manifest v{SERVING_MANIFEST_VERSION} "
+                f"artifact and this one is v{version}; run `stel compile`"
             )
+        vocabularies = _declared_vocabularies(manifest)
         target = manifest.get("target")
         if not isinstance(target, Mapping):
             raise ArtifactCatalogError("The manifest has no safe target descriptor")
@@ -240,7 +261,8 @@ class ArtifactCatalog:
 
     @property
     def vocabularies(self) -> Mapping[str, Vocabulary]:
-        """The declared vocabularies, empty when the project declares none."""
+        """The declared vocabularies as compiled into the manifest; empty when
+        the project declared none."""
         return self._vocabularies
 
     def all(self) -> tuple[ContextResource, ...]:
@@ -248,6 +270,47 @@ class ArtifactCatalog:
 
     def get(self, name: str) -> ContextResource | None:
         return self._resources.get(name)
+
+
+def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]:
+    """The `declarations.vocabularies` block, validated back into models.
+
+    Validation is the same `Vocabulary` runs at project load, so a hierarchy
+    the catalog walks or a class it resolves cannot be one the compiler would
+    have refused. A manifest at the right version always carries the block;
+    its absence or a payload that fails to validate is a damaged artifact,
+    not an empty declaration, and is refused the way a wrong version is.
+    """
+    declarations = manifest.get("declarations")
+    if not isinstance(declarations, Mapping):
+        raise ArtifactCatalogError(
+            "The manifest has no `declarations` block; run `stel compile`"
+        )
+    payload = declarations.get("vocabularies")
+    if not isinstance(payload, Mapping):
+        raise ArtifactCatalogError(
+            "The manifest's `declarations.vocabularies` is not an object; "
+            "run `stel compile`"
+        )
+    vocabularies: dict[str, Vocabulary] = {}
+    for name, value in payload.items():
+        try:
+            vocabularies[str(name)] = Vocabulary.model_validate(value)
+        except ValidationError:
+            raise ArtifactCatalogError(
+                f"The manifest's declaration of vocabulary '{name}' does not "
+                "validate; run `stel compile`"
+            ) from None
+    return vocabularies
+
+
+def _declaration_payload(
+    vocabularies: Mapping[str, Vocabulary],
+) -> dict[str, Any]:
+    return {
+        name: vocabulary.model_dump(mode="json", by_alias=True)
+        for name, vocabulary in vocabularies.items()
+    }
 
 
 def _read_json(path: Path, *, required: bool) -> Mapping[str, Any] | None:

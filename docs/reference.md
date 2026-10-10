@@ -2077,6 +2077,20 @@ against `(vocabulary name, term label)`, so a link row written by a fuzzy or
 hand-maintained resolver — which carries an `entity_namespace` too, but is not
 a declaration — never satisfies a scope that names a declared class.
 
+**The server reads the declaration the artifact was compiled with**, not the
+project file it starts beside. The entity links a scope interprets were
+published under one `vocabularies:` block; if the server read the live file, a
+term moved between classes or renamed after the last run would silently change
+which chunks a scope returns, or report `results_excluded` for chunks that do
+qualify. So `stel compile`, `run` and `build` write the declaration into
+`manifest.json`, `entity_types` and `entity_scope` resolve against that copy,
+and an edit to the project file does nothing to a running or restarted server
+until you recompile and republish. A server started beside a project file that
+differs from its manifest logs a warning saying so. A manifest from before
+`manifest_version: 3` is refused with "run `stel compile`" rather than read as
+declaring nothing, since an empty declaration would downgrade `entity_types` to
+the scan and refuse every scope for the wrong reason.
+
 Structure-preserving options for document parsing:
 
 ```yaml
@@ -3238,7 +3252,7 @@ the declared row contract before each mutation, upsert changed rows, delete
 stale rows, and advance warehouse state only after exact durable receipts,
 index validation, and the snapshot generation check all succeed.
 `ls --resource-type search_index` lists serving resources; `show` rejects them
-because they have no warehouse table. Manifest v2 exposes a non-secret
+because they have no warehouse table. The serving manifest exposes a non-secret
 `serving_resource` descriptor with the resolved embedding identity.
 
 Query the index from the CLI:
@@ -5398,7 +5412,11 @@ What it does and does not do:
 run results under `target-path`:
 
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
-  model, DAG nodes+edges+execution order. Re-generated each run.
+  model, DAG nodes+edges+execution order. Re-generated each run. A project
+  with a search or agent-context model writes the serving manifest
+  (`manifest_version: 3`), which also carries `declarations`: the project's
+  `classes:` and `vocabularies:` as compiled, because the MCP server reads the
+  declaration from here rather than from the project file (issue #669).
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,
   elapsed, and `sources_considered`) plus per-model documents
   processed/skipped, rows written, duration, the model's own `started_at` and

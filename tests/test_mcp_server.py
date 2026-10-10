@@ -25,6 +25,7 @@ from stel.agent_context import (
 )
 from stel.append_log import QUERY_LOG_SCHEMA
 from stel.config.vocabulary import Vocabulary, VocabularyTerm
+from stel.manifest import SERVING_MANIFEST_VERSION
 from stel.mcp_server.authorization import (
     AuthorizationError,
     ClaimAuthorizationProvider,
@@ -205,7 +206,11 @@ def _artifact_catalog(
     embed_id = "model.context_demo.context_embeddings"
     search_id = "search_index.context_demo.context_search"
     manifest = {
-        "manifest_version": 2,
+        "manifest_version": SERVING_MANIFEST_VERSION,
+        # The declaration travels in the artifact, not beside it (issue #669):
+        # the service reads what `stel compile` wrote, the same way the server
+        # does, so these tests exercise the persisted shape.
+        "declarations": _declarations_block(vocabularies),
         "target": {"name": "dev", "warehouse": {}},
         "models": [
             _context_model(
@@ -317,9 +322,27 @@ def _artifact_catalog(
         "metadata": {"generated_at": "2026-07-20T12:00:00+00:00"},
         "results": results,
     }
-    return ArtifactCatalog.from_payloads(
-        manifest, run_results=run_results, vocabularies=vocabularies
-    )
+    return ArtifactCatalog.from_payloads(manifest, run_results=run_results)
+
+
+def _declarations_block(
+    vocabularies: Mapping[str, Vocabulary] | None,
+) -> dict[str, Any]:
+    declared = dict(vocabularies or {})
+    return {
+        "classes": sorted(
+            {
+                term.entity_class
+                for vocabulary in declared.values()
+                for term in vocabulary.terms
+                if term.entity_class is not None
+            }
+        ),
+        "vocabularies": {
+            name: vocabulary.model_dump(mode="json", by_alias=True)
+            for name, vocabulary in declared.items()
+        },
+    }
 
 
 def _context_model(

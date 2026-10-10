@@ -1691,14 +1691,24 @@ source or relation key.
 
 ## Artifact contract and migration
 
-### Manifest v2
+### The serving manifest (v2, now v3)
 
-Adding a non-relation resource requires `manifest_version: 2`. The existing
+Adding a non-relation resource required `manifest_version: 2`. The existing
 `models` list remains the ordered list of model-file DAG resources for a small
 migration surface, but every entry gains an explicit discriminator and output.
 v2 moves resolved target data out of v1's `project` object into a canonical
 top-level `target` sibling of `project`, `models`, and `sources`; the v2
-`project` object contains project name and version only:
+`project` object contains project name and version only.
+
+v3 (issue #669) adds one top-level sibling, `declarations`, carrying the
+project's `classes:` and `vocabularies:` as compiled, each term with its
+authored fields (`label`, `description`, `aliases`, `broader`, `class`). The
+MCP catalog reads the declaration from here and not from `stel_project.yml`,
+so published `context_entity_links` rows are interpreted under the declaration
+that produced them. The catalog refuses a manifest at any other version: an
+older artifact has no declaration, and reading it as an empty one would be a
+silent downgrade rather than a visible "run `stel compile`". Everything below
+is unchanged from v2:
 
 ```json
 {

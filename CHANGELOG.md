@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### The serving catalog reads the declaration the artifact was compiled with (issue #669)
+
+- **The MCP server read `vocabularies:` from the live project file** while the
+  entity links it interpreted were published under an earlier one. Editing a
+  term's `class:` or `broader`, or renaming it, and restarting the server
+  without recompiling and republishing changed which chunks an `entity_scope`
+  returned, silently (the known limitation #668 recorded).
+- `stel compile`, `run` and `build` now write the project's `classes:` and
+  `vocabularies:` into the serving manifest as a `declarations` block, and the
+  catalog builds `entity_types` and every scope from that copy. The manifest
+  version moves to **3**; a v2 artifact is refused with "run `stel compile`"
+  rather than read as declaring nothing. A server started beside a project
+  file whose declaration differs from its manifest logs a warning naming the
+  remedy.
+  [ADR-0027](docs/adr/0027-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md)
+  records why the declaration is persisted rather than fingerprinted, and why
+  it is not yet tied to the serving generation.
+- **Upgrade note:** recompile once. The downstream Dagster launcher reads only
+  `depends_on` from the manifest and is unaffected.
+
 ## v0.21.1 - 2026-10-09
 
 ### An agent can search by declared class and walk the hierarchy (issue #628)

@@ -41,6 +41,13 @@ from .versioning import (
 )
 
 MANIFEST_VERSION = 1
+# The serving manifest: written for a project with a search or agent-context
+# model, and the artifact the MCP server reads. v3 adds `declarations`, the
+# project's `classes:` and `vocabularies:` as compiled (issue #669), so the
+# catalog interprets published entity links under the declaration that was
+# in force when the artifact was written rather than whatever the project
+# file says when the server starts.
+SERVING_MANIFEST_VERSION = 3
 MANIFEST_FILENAME = "manifest.json"
 RUN_RESULTS_FILENAME = "run_results.json"
 
@@ -420,9 +427,10 @@ def _build_manifest_v2(
                 }
             )
     return {
-        "manifest_version": 2,
+        "manifest_version": SERVING_MANIFEST_VERSION,
         "generated_at": _now(),
         "project": {"name": project.name, "version": project.version},
+        "declarations": _declarations(project),
         "target": {
             "profile": resolved.profile_name,
             "name": resolved.target_name,
@@ -683,6 +691,24 @@ def compute_modified_models(
         if previous.get(model.name) != current:
             modified.add(model.name)
     return modified
+
+
+def _declarations(project: ProjectConfig) -> dict[str, Any]:
+    """The project's domain declaration as the serving catalog reads it.
+
+    Term order and every term field survive the round trip: `Vocabulary`
+    validates the payload back into the same model at load, so a hierarchy or
+    class membership the catalog resolves is the compiled one, not the live
+    file's. `class:` keeps its authored spelling (`by_alias`) so the block
+    reads like the project file it came from.
+    """
+    return {
+        "classes": list(project.classes),
+        "vocabularies": {
+            name: vocabulary.model_dump(mode="json", by_alias=True)
+            for name, vocabulary in project.vocabularies.items()
+        },
+    }
 
 
 def _now() -> str:

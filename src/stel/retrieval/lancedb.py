@@ -9,12 +9,12 @@ from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
 from functools import partial
 from math import isfinite
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, Literal, Self
 
 import pyarrow as pa
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from ..credentials import CredentialReference
 from ..hashing import canonical_fingerprint
@@ -27,9 +27,11 @@ from .base import (
     CollectionMetadata,
     CollectionSpec,
     IndexedRow,
+    MirrorCopy,
     MutationOutcome,
     MutationReceipt,
     RetrievalCapabilities,
+    RetrievalConfigError,
     RetrievalError,
     RetrievalFeature,
     RetrievalPredicate,
@@ -44,6 +46,7 @@ from .base import (
     sanitized_retrieval_cause,
     validate_generation_token,
 )
+from .lance_mirror import TreeLocation, cloud_tree, copy_table, drop_table, local_tree, table_names
 from .locks import PublisherLock, default_host_lock_base
 from .registry import register
 
@@ -286,6 +289,9 @@ _CLOUD_SCHEMES = ("s3", "s3a", "gs", "gcs", "az", "abfs", "abfss")
 # `s3://b/p` and `s3a://b/p` as the same target rather than two.
 _SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs"}
 _CLOUD_URI_RE = re.compile(rf"^({'|'.join(_CLOUD_SCHEMES)})://", re.IGNORECASE)
+# The object stores a mirror may live in, after alias folding: the ones the
+# copy's filesystem layer reaches with default credentials from a URI alone.
+_MIRROR_SCHEMES = frozenset({"gs", "s3"})
 # scheme://authority[/path] — the authority (bucket/container/account) must be
 # present. Rejects `s3://` and `gs:///prefix` at parse time instead of failing
 # late inside lancedb.connect() after a publication lease is already held.
@@ -354,6 +360,42 @@ class LanceDBConfig(RetrievalStoreConfig):
     # identity: neither reaches the store descriptor.
     index_build_attempts: int = Field(default=3, ge=1, le=10)
     index_build_retry_seconds: float = Field(default=5.0, ge=0, le=600)
+    # A second copy of every served generation, kept current after each
+    # publish and activation and never read by a query (issue #666). The
+    # primary `path` is what builds and serving touch; this is what
+    # `stel serving restore` brings a generation back from onto a fresh host.
+    # Execution setting, not identity: a store that adds or moves its mirror
+    # is the same store, so it reaches neither `routing_options()` nor the
+    # safe descriptor.
+    mirror: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_mirror(self) -> LanceDBConfig:
+        if self.mirror is None:
+            return self
+        if self.is_cloud_uri:
+            # The copy reads the primary through a filesystem that knows
+            # nothing of `storage_options_env`, and a bucket-to-bucket copy is
+            # a job the provider's own transfer tools already do better.
+            raise ValueError(
+                "mirror requires a local primary path: it exists so builds and "
+                "queries read local disk while a copy lives in object storage"
+            )
+        if _CLOUD_URI_RE.match(self.mirror):
+            if not _CLOUD_URI_AUTHORITY_RE.match(self.mirror):
+                raise ValueError(
+                    "mirror must include a bucket, e.g. gs://bucket/prefix or "
+                    "s3://bucket/prefix"
+                )
+            scheme = _canonical_cloud_uri(self.mirror).split("://", 1)[0]
+            if scheme not in _MIRROR_SCHEMES:
+                raise ValueError(
+                    "mirror supports gs:// and s3:// object stores or a local "
+                    f"path; {scheme}:// is not supported"
+                )
+        elif Path(self.mirror) == Path(self.path):
+            raise ValueError("mirror must not be the store's own path")
+        return self
 
     @field_validator("path")
     @classmethod
@@ -434,12 +476,25 @@ class LanceDBConfig(RetrievalStoreConfig):
         their descriptor fingerprint byte-identical to the pre-routing shape."""
         return {key: self.storage_options[key] for key in sorted(self.storage_options)}
 
+    def mirror_location(self) -> str | None:
+        if self.mirror is None:
+            return None
+        if _CLOUD_URI_RE.match(self.mirror):
+            return _canonical_cloud_uri(self.mirror)
+        return Path(self.mirror).as_posix()
+
     def absolutize(self, project_dir: Path) -> LanceDBConfig:
         if self.is_cloud_uri:
             return self
         path = Path(self.path)
         resolved = path if path.is_absolute() else project_dir / path
-        return self.model_copy(update={"path": str(resolved.resolve())})
+        update: dict[str, str] = {"path": str(resolved.resolve())}
+        if self.mirror is not None and not _CLOUD_URI_RE.match(self.mirror):
+            mirror = Path(self.mirror)
+            update["mirror"] = str(
+                (mirror if mirror.is_absolute() else project_dir / mirror).resolve()
+            )
+        return self.model_copy(update=update)
 
 
 # `search.vector.index` -> the `lancedb.index` config class that builds it, and
@@ -786,6 +841,46 @@ class LanceDBStore(RetrievalStore):
         except Exception as error:
             failure = _operation_failed("drop", "lancedb_drop_failed", error)
         raise failure
+
+    def _mirror_tree(self) -> TreeLocation:
+        location = self._config.mirror_location()
+        if location is None:
+            raise RetrievalConfigError(
+                "LanceDB store has no mirror configured (code=lancedb_no_mirror)"
+            )
+        if _CLOUD_URI_RE.match(location):
+            return cloud_tree(location)
+        return local_tree(location)
+
+    def _primary_tree(self) -> TreeLocation:
+        return local_tree(str(self._config.local_data_path()))
+
+    def sync_to_mirror(self, collection: str) -> MirrorCopy:
+        # Opened through the owned-table path, so a collection stel did not
+        # create is never copied anywhere under stel's name.
+        table = self._open_owned_table(collection)
+        # The copy addresses a table as `<root>/<name>.lance`. That is how
+        # LanceDB lays a directory store out, and a version that stopped doing
+        # so must fail here rather than mirror the wrong directory.
+        if PurePosixPath(str(table.uri).replace("\\", "/")).name != f"{collection}.lance":
+            raise RetrievalError(
+                "LanceDB collection is not stored where a mirror copy expects it "
+                "(code=lancedb_mirror_layout)"
+            )
+        return copy_table(self._primary_tree(), self._mirror_tree(), collection, mode="mirror")
+
+    def restore_from_mirror(self, collection: str) -> MirrorCopy:
+        if not _COLLECTION_RE.fullmatch(collection):
+            raise RetrievalError("LanceDB collection name is invalid")
+        return copy_table(self._mirror_tree(), self._primary_tree(), collection, mode="restore")
+
+    def mirror_collections(self) -> tuple[str, ...]:
+        return table_names(self._mirror_tree())
+
+    def drop_mirror_collection(self, name: str) -> None:
+        if not _COLLECTION_RE.fullmatch(name):
+            raise RetrievalError("LanceDB collection name is invalid")
+        drop_table(self._mirror_tree(), name)
 
     def inspect_collection(self, name: str) -> CollectionMetadata | None:
         db = self._connection()

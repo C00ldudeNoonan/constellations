@@ -316,6 +316,24 @@ _PHASES: tuple[Step, ...] = (
         ),
     ),
     Step(
+        "mirror.py",
+        "mirror_sync",
+        HOLDS,
+        HOLDS,
+        "file",
+        "A byte copy that skips every file the mirror already holds at the "
+        "source's size, so a rerun copies only what an interrupted one did not; "
+        "manifests land after the files they name, so the mirror is a readable "
+        "table wherever the copy stopped. Runs after activation, so a failure "
+        "fails the model without touching the published generation, and "
+        "`stel serving sync` resumes it (#666).",
+        (
+            "test_an_interrupted_copy_is_finished_by_the_next",
+            "test_every_instant_of_a_copy_is_a_readable_table",
+            "test_a_failed_sync_fails_the_model_but_not_the_publication",
+        ),
+    ),
+    Step(
         "embed.py",
         "read",
         HOLDS,

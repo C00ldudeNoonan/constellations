@@ -304,6 +304,10 @@ economic_data:
             # URI, a generation restored onto a fresh host -- without its
             # published collections reading as never published (issue #666).
             # identity: econ-prod       # a label, never a location
+            # A byte copy of every served generation, synced after each
+            # publish and activation and never queried; `stel serving restore`
+            # brings it back onto a fresh host (issue #666). Local `path` only.
+            # mirror: gs://bucket/lancedb
             collection_template: '{project}__{target}__{collection}'
             timeout_seconds: 30
             minimum_consistency: strong

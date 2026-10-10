@@ -70,9 +70,11 @@ from ..retrieval import (
     StoreRole,
     create_store,
 )
+from ..timing import PhaseTimings
 from ..versioning import compute_model_code_version
 from .contracts import RunError
 from .heartbeat import Heartbeat
+from .mirror import MirrorSync, sync_mirror_after_publish
 from .search import (
     _activate_generation,
     _generation_state_scope,
@@ -125,6 +127,10 @@ class GenerationActivation:
     rows_without_state: int
     code_version: str
     fencing_token: int
+    # The sync that followed, when the store keeps a mirror (issue #666); None
+    # when it does not, or when another publisher claimed the scope first and
+    # syncs on its own completion.
+    mirror: MirrorSync | None
 
 
 def activation_refusal(
@@ -400,6 +406,19 @@ def activate_search_generation(
         if isinstance(error, RunError):
             raise
         raise RunError(str(error)) from None
+    mirror = (
+        sync_mirror_after_publish(
+            store=store,
+            coordinator=coordinator,
+            scope=state_scope,
+            logical_collection=logical_collection,
+            model_name=model.name,
+            timings=PhaseTimings(),
+            progress={},
+        )
+        if store_config.mirror_location() is not None
+        else None
+    )
     rows_behind_upstream = upstream_rows - existing.row_count
     log.info(
         "%s: activated %s (%d rows; state from the generation for %d, from the "
@@ -425,6 +444,7 @@ def activate_search_generation(
         rows_without_state=rows_without_state,
         code_version=code_version,
         fencing_token=lease.fencing_token,
+        mirror=mirror,
     )
 
 

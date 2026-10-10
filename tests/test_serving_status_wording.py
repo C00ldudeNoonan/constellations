@@ -34,6 +34,9 @@ def _entry(
     progress_note: str | None = None,
     publisher: PublisherIdentity | None = None,
     publisher_heartbeat_epoch: int | None = None,
+    mirror_generation: str | None = None,
+    mirror_target: str | None = None,
+    mirrored_epoch: int | None = None,
 ) -> ServingLedgerEntry:
     return ServingLedgerEntry(
         status=status,
@@ -52,6 +55,9 @@ def _entry(
         query_leases=0,
         publisher=publisher,
         publisher_heartbeat_epoch=publisher_heartbeat_epoch,
+        mirror_generation=mirror_generation,
+        mirror_target=mirror_target,
+        mirrored_epoch=mirrored_epoch,
     )
 
 

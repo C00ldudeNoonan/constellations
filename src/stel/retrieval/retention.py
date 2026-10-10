@@ -33,6 +33,7 @@ and safe to drop.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 from .base import (
     GENERATION_MARKER,
@@ -64,10 +65,26 @@ def superseded_generations(
     valid token — are candidates, so a collection that merely shares the
     prefix without the generation shape is never classified as one.
     """
-    prefix = generation_prefix(store, logical_collection)
+    return superseded_among(
+        store.list_collections(),
+        prefix=generation_prefix(store, logical_collection),
+        active_collection=active_collection,
+    )
+
+
+def superseded_among(
+    names: Iterable[str], *, prefix: str, active_collection: str | None
+) -> list[str]:
+    """The generation-shaped names under `prefix` other than the active one.
+
+    The classification `superseded_generations` applies to the store's own
+    listing, applied to any listing -- a store's mirror holds the same
+    collections under the same names, and retiring there has to agree exactly
+    with retiring here (issue #666).
+    """
     return sorted(
         name
-        for name in store.list_collections()
+        for name in names
         if name.startswith(prefix)
         and _GENERATION_TOKEN_RE.fullmatch(name[len(prefix) :])
         and name != active_collection

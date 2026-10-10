@@ -133,3 +133,28 @@ def test_duplicate_canonical_ids_are_rejected() -> None:
                 "cross_layer_edges": [],
             }
         )
+
+
+def test_source_access_round_trips_and_is_absent_by_default() -> None:
+    """v6 (#678): the bundle names the governed context model a card searches,
+    and carries nothing else from the serving side."""
+    from stel.concept_cloud.schema import SourceAccess
+
+    assert placeholder_export().source_access is None
+
+    sourced = placeholder_export().model_copy(
+        update={"source_access": SourceAccess(model="sec_context_chunks")}
+    )
+    reparsed = parse_concept_cloud_export(json.loads(sourced.to_json()))
+    assert reparsed.source_access is not None
+    assert reparsed.source_access.model == "sec_context_chunks"
+
+
+def test_a_source_access_without_a_model_is_refused() -> None:
+    """An empty name would reach the server as a model lookup for "", whose
+    refusal would name the bundle's own blank rather than the mistake."""
+    from stel.concept_cloud.schema import SourceAccess
+
+    for blank in ("", "   "):
+        with pytest.raises(ValidationError):
+            SourceAccess(model=blank)

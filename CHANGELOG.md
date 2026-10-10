@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### The star map reaches the source (issue #555 item 7, #678)
+
+- **The map could not say "says who?".** It carried concept frequencies,
+  per-period history and document breakdowns, and no way to see one sentence
+  behind any of it -- while the project already served exactly that sentence
+  through `search_context`. `stel concept-cloud --context-model <model>
+  --serve` now writes the artifact and serves it on `127.0.0.1`, and the
+  detail card grows a **Show me a sentence** button.
+- **The sentence is fetched on click, never baked in.** The bundle (schema
+  v6) carries `source_access: {model}` -- a name, and nothing else from the
+  serving side. An artifact shared with someone holds the aggregates it
+  always did, and the viewer gates its button on a same-origin probe, so a
+  file opened from disk shows no affordance rather than a dead one.
+- **It is the governed service answering.** The lookup goes through
+  `ContextService`, the same object `stel mcp serve` wraps, so a sentence has
+  passed the same authorization and policy filter an agent's would, against
+  the same pinned generation, and leaves a query-log row naming
+  `stel concept-cloud` as the client. A degraded index is reported on the
+  card rather than silently served as current.
+- **The card says how it found the sentence.** A concept whose `canonical_id`
+  is a declared `vocabularies:` term is fetched scoped to that term, so the
+  chunk is one entity linking actually linked to it; a concept no vocabulary
+  declares is matched as text, and that weaker claim is labelled as one.
+- **Loopback, single-operator, and enforced as such.** The process is the
+  principal exactly as over stdio, so the bind address is not configurable; a
+  foreign `Host` (DNS rebinding) or a cross-origin `Origin` is refused, no
+  CORS header is emitted, and the endpoint answers only for concept ids the
+  served bundle contains -- so it cannot be driven as a search proxy by
+  anything else that reaches loopback. ADR-0031 records why this shape rather
+  than a token in the artifact.
+
 ### A LanceDB store keeps a mirror, and a fresh host restores from it (issue #666)
 
 - **A local store had no copy anywhere else.** v0.22.0 let a store declare an

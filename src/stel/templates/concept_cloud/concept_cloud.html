@@ -78,10 +78,19 @@
     .bdbar { display: flex; height: 8px; margin: 4px 0 3px; border-radius: 4px;
       overflow: hidden; background: #5a6478; }
     .bdbar i { display: block; height: 100%; }
-    #detail .focus { display: block; margin-top: 10px; padding: 4px 10px;
+    #detail .focus, #detail .srcbtn { display: block; margin-top: 10px; padding: 4px 10px;
       background: rgba(5, 8, 16, .6); color: var(--accent); cursor: pointer;
       border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 12px; }
-    #detail .focus:hover { border-color: var(--accent); }
+    #detail .focus:hover, #detail .srcbtn:hover { border-color: var(--accent); }
+    /* Reach the source (#555 item 7): one sentence, fetched on click, never
+       in the file. Scrollable rather than unbounded -- a chunk can be long,
+       and the card must not grow off the top of the screen. */
+    #detail .source { display: block; margin-top: 8px; font-size: 12px; }
+    #detail .source blockquote { margin: 6px 0 4px; padding-left: 8px;
+      border-left: 2px solid var(--accent); color: var(--fg); opacity: .86;
+      line-height: 1.45; max-height: 24vh; overflow-y: auto; }
+    #detail .source .cite { color: var(--muted); word-break: break-word; }
+    #detail .source .warn { color: #ffd76e; }
     /* "What changed" between two periods (#555 item 6). */
     /* No `display: none` here: the element's own inline `style` attribute
        carries the initial hidden state, same as #period-ctl and the other
@@ -205,6 +214,35 @@
     }));
     // Values named on the card; the rest are in the bar's hover titles.
     const BREAKDOWN_ROWS = 4;
+
+    // Reach the source (#555 item 7). The bundle names a governed context
+    // model and carries no document text; a sentence is fetched on click from
+    // stel serving this page, which is also why the affordance is gated on a
+    // same-origin probe rather than on the bundle alone -- an artifact opened
+    // from disk, or shared with someone, must not offer a button that cannot
+    // work.
+    const SOURCE_MODEL = DATA.source_access?.model || null;
+    // Per concept, for this page view only, and deliberately not persisted:
+    // fetching on click is what keeps governed document text from coming to
+    // rest in the artifact or the browser.
+    const SENTENCES = new Map();
+    let sourceReady = false;
+    // Assigned by buildGraph, which owns `nodeById`. Module-level so the
+    // probe below can refresh an already-open card, on the same footing as
+    // `toggleFocus`.
+    let redrawDetail = () => {};
+
+    function probeSource() {
+      if (!SOURCE_MODEL) return;
+      fetch("/_stel/source/health", { headers: { Accept: "application/json" } })
+        .then(r => (r.ok ? r.json() : null))
+        .then(body => {
+          sourceReady = Boolean(body && body.ok);
+          if (sourceReady) redrawDetail();
+        })
+        .catch(() => { sourceReady = false; });
+    }
+    probeSource();
 
     let colorBy = DIMENSIONS[0];
     const hidden = new Set();   // values of the CURRENT dimension toggled off
@@ -511,6 +549,57 @@
       }).join("");
     }
 
+    // The sentence and how it was found. A `term` scope means the chunk is
+    // linked to this concept through a declared vocabulary term; a `query`
+    // scope means it matched the concept's name as text. Those are different
+    // claims about the corpus, so the card never reports one as the other.
+    function sourceSection(node) {
+      if (!sourceReady || node.kind !== "concept") return "";
+      const got = SENTENCES.get(node.id);
+      if (!got) return '<button class="srcbtn">Show me a sentence</button>';
+      if (got.state === "pending") {
+        return '<span class="source"><span class="k">fetching…</span></span>';
+      }
+      if (got.state === "none") {
+        return '<span class="source"><span class="k">no sentence</span> ' +
+          "nothing in this model names it that you are allowed to read</span>";
+      }
+      if (got.state === "error") {
+        return '<span class="source"><span class="k">source unavailable</span> ' +
+          esc(got.message) + "</span>";
+      }
+      const how = got.scope === "term"
+        ? "linked to " + esc((got.matched_terms || []).join(", ") || node.id)
+        : "text match on its name";
+      const where = [got.document_id, (got.section_path || []).join(" / ")]
+        .filter(Boolean).map(esc).join(" · ");
+      return '<span class="source"><blockquote>' + esc(got.snippet) +
+        (got.truncated ? "…" : "") + "</blockquote>" +
+        '<span class="cite">' + where + "</span><br>" +
+        '<span class="k">' + how + "</span>" +
+        (got.degraded
+          ? '<br><span class="warn">index degraded — this may be stale</span>'
+          : "") + "</span>";
+    }
+
+    function fetchSentence(id) {
+      SENTENCES.set(id, { state: "pending" });
+      redrawDetail();
+      const land = entry => { SENTENCES.set(id, entry); redrawDetail(); };
+      fetch("/_stel/source?concept=" + encodeURIComponent(id),
+            { headers: { Accept: "application/json" } })
+        .then(r => r.json().then(body => ({ ok: r.ok, body })))
+        .then(({ ok, body }) => {
+          if (body.error) land({ state: "error", message: body.error.message });
+          else if (!ok) land({ state: "error", message: "the server refused" });
+          else if (!body.sentence) land({ state: "none" });
+          else land({ state: "ok", ...body.sentence });
+        })
+        .catch(() => land({
+          state: "error", message: "stel is no longer serving this page",
+        }));
+    }
+
     function showDetail(node) {
       const el = document.getElementById("detail");
       if (!node) { el.style.display = "none"; return; }
@@ -535,8 +624,11 @@
           (dims ? `<br>${dims}` : "") +
           breakdowns(node) +
           sparkline(node) +
+          sourceSection(node) +
           `<button class="focus">${focus ? "Show the whole map" : "Focus on its constellation"}</button>`;
         el.querySelector(".focus").onclick = () => toggleFocus();
+        const srcbtn = el.querySelector(".srcbtn");
+        if (srcbtn) srcbtn.onclick = () => fetchSentence(node.id);
       } else {
         el.innerHTML = `<strong>${esc(node.name)}</strong><br>` +
           `<span class="k">dbt ${esc(node.resource_type)}</span><br>${esc(node.id)}`;
@@ -951,6 +1043,10 @@
         fullRefresh();
         if (wasFocused) fitView();
       }
+
+      redrawDetail = () => {
+        if (selected) showDetail(nodeById.get(selected));
+      };
 
       toggleFocus = () => {
         if (!selected) return;

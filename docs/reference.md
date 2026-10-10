@@ -5297,6 +5297,50 @@ coloring:
   categorical column into a dimension. `llm:` enum fields fit directly: the
   label set is already declared and validated upstream.
 
+**Reach the source** (issue #678). The map is an aggregate: it says a concept
+was named in 300 documents and by whom, never what was said. `--context-model`
+plus `--serve` adds a **Show me a sentence** button to the detail card, which
+fetches one chunk naming that concept through the project's governed context
+service.
+
+```bash
+stel --project-dir path/to/stel_project concept-cloud \
+  --linking-model link_entities \
+  --context-model sec_context_chunks \
+  --serve --port 8081 \
+  -o cloud.html
+# Serving cloud.html at http://127.0.0.1:8081/  (Ctrl-C to stop)
+```
+
+- **No sentence is in the artifact.** The bundle carries the model's *name*
+  and nothing else from the serving side; the text is fetched on click while
+  the server runs, and is cached only in the page for that view. An artifact
+  you email to someone carries the aggregates it always did.
+- **It is `ContextService` answering** — the same object `stel mcp serve`
+  wraps — so a sentence has passed the same authorization and the same
+  policy filter an agent's would, against the same pinned generation, and
+  leaves a query-log row naming `stel concept-cloud` as the client.
+- **The button only appears while stel is serving the page.** The viewer
+  probes its own origin first, so an artifact opened from disk shows no
+  affordance rather than one that cannot work.
+- **The card says how the sentence was found.** A concept whose
+  `canonical_id` is a declared `vocabularies:` term is fetched scoped to that
+  term, so the chunk is one entity linking actually linked to it ("linked to
+  Federal Reserve"). A concept no vocabulary declares can only be matched as
+  text ("text match on its name") — a weaker claim, and it is labelled as
+  one.
+- **Single-operator, loopback only.** The process is the principal, exactly
+  as over stdio, so the bind address is `127.0.0.1` and is not configurable.
+  Requests that do not name this server — a foreign `Host`, a cross-origin
+  `Origin` — are refused, and no CORS header is emitted; the endpoint also
+  accepts only concept ids the served bundle contains, so it cannot be driven
+  as a general search proxy. It is a tool for the operator at the keyboard,
+  not a server to put in front of anyone else.
+
+`--serve` serves the artifact it just wrote, so re-browsing means re-running
+the export. `--context-model` without `--serve` is useful on its own: it
+records the model in the bundle, ready for whenever it is served.
+
 **Prerequisites.** The cloud is keyed on `canonical_id`, so an entity-linking
 (`link_entities`) model must have run; and human-readable node labels require the
 NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
@@ -5306,7 +5350,7 @@ NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
 warehouse credentials ever enter it, and raw document text appears only when the
 operator opted into it upstream. The bundle is a versioned contract
 (`ConceptCloudExport`, `schema_version`), so the static viewer and the export job
-evolve independently. The current version is 5. A bundle from any other version
+evolve independently. The current version is 6. A bundle from any other version
 is refused by the artifact rather than read as current.
 
 ## Append-only logs

@@ -31,7 +31,10 @@ from pydantic import (
 # sourced from the project's vocabularies and omitted when undeclared.
 # v5 (issue #555 item 5): per-concept document counts by a document-level
 # field ("who names X?"), declared once on the bundle as `breakdowns`.
-CONCEPT_CLOUD_SCHEMA_VERSION = "5"
+# v6 (issue #555 item 7): `source_access` names the governed context model a
+# concept's sentences are fetched from at view time. The bundle carries the
+# model's *name* and never a sentence — see `SourceAccess`.
+CONCEPT_CLOUD_SCHEMA_VERSION = "6"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -201,6 +204,32 @@ class BreakdownDef(_Frozen):
         return cleaned
 
 
+class SourceAccess(_Frozen):
+    """Which governed context model a concept's sentences come from (issue
+    #555 item 7, #678).
+
+    The bundle carries a model *name*, never document text: the aggregate map
+    stays shareable, and a sentence is fetched on click from the same
+    `ContextService` that `stel mcp serve` wraps — so the policy filter, the
+    generation pin and the query-log row are the server's, not a copy of them.
+    Reaching that service needs stel to be serving the page (`stel
+    concept-cloud --serve`); an artifact opened from disk shows no button,
+    because there is nothing same-origin to ask.
+
+    The name is not checked here. The model has to exist in whatever target
+    the *viewer* is served against, which is not knowable at export time and
+    need not be the target the bundle was exported from, so it is verified
+    when a server starts rather than written into the artifact as a promise.
+    """
+
+    model: str
+
+    @field_validator("model")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+
 class Concept(_Frozen):
     """One canonical entity in the cloud. Keyed on `canonical_id` from the
     entity-linking output; `display` is human-readable only when the operator
@@ -333,7 +362,7 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["5"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["6"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane
@@ -351,6 +380,10 @@ class ConceptCloudExport(_Frozen):
     # Declared document-level breakdowns (issue #555 item 5); order is the
     # order the card lists them in.
     breakdowns: tuple[BreakdownDef, ...] = ()
+    # The governed context model a concept's sentences are fetched from at
+    # view time (issue #555 item 7). None means the artifact has no
+    # reach-the-source affordance at all, which is the default.
+    source_access: SourceAccess | None = None
 
     @field_validator("generated_at", "project")
     @classmethod

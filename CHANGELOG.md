@@ -139,10 +139,11 @@
   an undeclared class cannot spend an embedding call and a warehouse read
   first, and its refusal is deterministic rather than whichever error
   retrieval happened to raise.
-- Known limitation, tracked as #669: the serving catalog reads the *live*
+- While #628 was in development the serving catalog read the *live*
   declaration rather than the one that published the links, so editing
-  `vocabularies:` without recompiling can change what a scope returns.
-  Recompile and republish after editing the declaration.
+  `vocabularies:` without recompiling could change what a scope returned.
+  That was #669, and it was fixed before this release shipped -- see the
+  entry above. No released version carries the live-declaration behavior.
 - **A scope naming something undeclared is refused**, listing what is
   declared, rather than returning nothing: an undeclared class and an empty
   corpus are different answers. A project with no `vocabularies:` refuses an
@@ -169,10 +170,13 @@
   `schema_fields`) rather than what is in the rows a given caller may read. An
   agent can no longer probe corpus contents through it, and a caller
   authorized for nothing still sees the vocabulary.
-- **No manifest or contract change.** `ArtifactCatalog.load` already read the
-  project to find `target_path` and discarded the rest; it now keeps the
-  declaration. `context_entity_links` is untouched, so `agent_context/v1`
-  does not move.
+- **#628 needed no manifest or contract change of its own.**
+  `ArtifactCatalog.load` already read the project to find `target_path` and
+  discarded the rest; it kept the declaration without a schema change. The
+  manifest does move to v3 in this release, for #669 above, which persists the
+  declaration into the artifact rather than re-reading the project.
+  `context_entity_links` is untouched either way, so `agent_context/v1` does
+  not move.
 - **A declared hierarchy can now be walked.** `broader` was authored and
   validated (cycles rejected) but nothing could read it. `broader_chain()`
   walks up, `narrower_labels()` inverts it transitively, and

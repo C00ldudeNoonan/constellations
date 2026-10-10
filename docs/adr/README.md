@@ -35,7 +35,8 @@ history (issue #311).
 | [0023](0023-a-keyed-warehouse-read-is-segmented-and-pinned-to-one-instant.md) | A keyed warehouse read is segmented and pinned to one instant, and resumes from its last completed segment | accepted |
 | [0024](0024-a-forced-reprocess-ignores-incremental-state-rather-than-clearing-it.md) | A forced reprocess reads incremental state and declines to skip on it, rather than clearing it | accepted; amends 0022 |
 | [0025](0025-a-declared-entity-scope-filters-after-retrieval-and-reports-what-it-excluded.md) | A declared entity scope filters after retrieval and reports what it excluded | accepted |
-| [0026](0026-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md) | A pruned incremental MERGE first proves no matched row lies outside the batch's layout values; the reuse read tolerates a miss instead | accepted |
+| [0026](0026-embedding-reuse-is-keyed-by-content-and-fetched-by-id.md) | Embedding reuse is keyed by content and fetched by id | accepted |
+| [0027](0027-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md) | A pruned incremental MERGE first proves no matched row lies outside the batch's layout values; the reuse read is scoped to the rows it fetches | accepted |
 
 ## When to write one
 

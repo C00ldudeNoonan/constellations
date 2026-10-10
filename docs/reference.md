@@ -1618,12 +1618,17 @@ columns across the whole target, so on a table whose MERGE was already cheap it
 is the visible cost: a few hundred MiB on the SEC table against the 4.45 GiB it
 replaces.
 
-**The reuse read tolerates a miss instead.** The embed resume looks reuse
-candidates up by key and now also by the window's layout values. A target row
-published under other layout values for the same id is not found, and that row
-re-embeds — a paid provider call for correct output, the same price its text
-changing would cost. A layout column the target does not have (declared after
-the table was built) is dropped from the lookup rather than failing it.
+**The reuse read is scoped to the rows it fetches.** The embed resume
+resolves each window's text to target rows in memory, then fetches those rows
+by id. Its layout predicates come from *those rows'* values, read once in the
+same key pass as the ids, not from the window's: reuse is keyed by text, so a
+hit is often another row under other layout values (a re-keyed corpus, the
+same boilerplate under another symbol), and predicates built from the window
+would prune away exactly the rows reuse exists to find. Built from the fetched
+rows they cannot exclude one, so no guard is needed. A layout column the
+target does not have (declared after the table was built) is dropped from the
+lookup rather than failing it. A `DATETIME` layout column is bound as
+`DATETIME`, not as the `TIMESTAMP` a Python `datetime` otherwise binds as.
 
 Both apply to the *declared* layout. An incremental target keeps its physical
 layout until `--full-refresh`, so a predicate on a column the table is not
@@ -2265,15 +2270,29 @@ corpus, then streams the rows themselves in batches to fill each flush window
 that, a *fresh* run's peak was O(corpus) no matter how small `flush_every`
 was, because the whole upstream was read before the first provider call.
 
-The resume is bounded too: a resumed run reads the existing target's
-id column once (streamed and projected — no vectors), then looks up reuse
-candidates one window at a time by key, so resuming a large corpus never
-costs more memory than running it. On a target with a declared BigQuery
-layout each lookup also carries the window's range over the partition column
-and its values on the clustering columns, so the warehouse reads the window's
-storage rather than the whole vector column (issue #664; see [Pruning the
-MERGE and the reuse read](#pruning-the-merge-and-the-reuse-read-to-the-batch-partitioning-and-clustering)
-for what that leaves out).
+The resume is bounded too: a resumed run reads the existing target's id and
+`embedding_input_hash` columns once (streamed and projected — no vectors),
+then looks up reuse candidates one window at a time, so resuming a large
+corpus never costs more memory than running it. On a target with a
+declared BigQuery layout each lookup also carries a range over the
+partition column and value lists over the clustering columns, so the
+warehouse reads the matched rows' storage rather than the whole vector
+column (issue #664; see [Pruning the MERGE and the reuse read](#pruning-the-merge-and-the-reuse-read-to-the-batch-partitioning-and-clustering)).
+
+**Reuse is keyed by the text, not by the row** (issue #665). A vector is
+reusable when some row in the target recorded the same
+`embedding_input_hash` under the same embedding configuration — not only
+when *this* row did. So re-keying a corpus, or re-chunking it in a way that
+preserves chunk text, keeps every vector already paid for. Keyed by row id,
+as it was previously, an id-space change silently discarded the lot:
+astrolabe's 3.67M-chunk SEC corpus moved its identity onto `context_id` and
+was embedded about 1.9 times for it.
+
+The configuration check is what remains load-bearing: same text under a
+different provider, model, dimensions, or implementation is a different
+vector and is recomputed. And because the hash index is consulted in
+memory, text the target does not hold costs no vector read at all — which
+matters most where that column is most of the table's bytes.
 
 On BigQuery the reuse target is also the table each window just updated. If
 table metadata advances while one of those immutable query results is being
@@ -2735,7 +2754,8 @@ copied into artifacts.
 Incremental runs distinguish three cases:
 
 - unchanged rows are skipped;
-- metadata-only changes reuse the existing vector and refresh the warehouse row;
+- metadata-only changes reuse the existing vector and refresh the warehouse
+  row, as does a row whose id changed while its text did not;
 - text, model, provider, dimensions, or implementation changes recompute it.
 
 Removed upstream IDs are deleted downstream. Provider results are validated for

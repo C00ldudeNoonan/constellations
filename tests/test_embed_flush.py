@@ -537,6 +537,157 @@ def test_resume_still_reuses_vectors_for_metadata_only_changes(
     assert result.metrics["cache_hits"] == DOCUMENTS
 
 
+def test_a_rekeyed_corpus_reuses_every_vector_it_already_paid_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The incident #665 was filed for: an id-space change re-paid for 3.67M
+    chunks of unchanged text.
+
+    astrolabe's SEC corpus moved its embedding identity onto `context_id` (an
+    agent_context wrapper hop). The text was byte-identical and its
+    `embedding_input_hash` unchanged, but reuse was looked up by row id, so
+    every vector missed and the corpus was embedded about 1.9 times -- ~$195
+    against a ~$100 single pass.
+
+    Here every chunk id changes and no text does. Keyed by content, that is
+    a full-reuse run with no provider call at all.
+    """
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # A new id space over identical text: every state key misses and no
+        # row in the target can be found by id any more.
+        connection.execute(
+            'UPDATE "db".docs.document_chunks SET chunk_id = chunk_id || \'-rekeyed\''
+        )
+    finally:
+        connection.close()
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.documents_processed == DOCUMENTS
+    assert calls["n"] == 0
+    assert result.metrics["cache_hits"] == DOCUMENTS
+    assert result.metrics["provider_calls"] == 0
+
+
+def test_same_text_under_a_different_config_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one check that stayed load-bearing when reuse became content-keyed.
+
+    Looking up by `embedding_input_hash` makes the old
+    `embedding_input_hash == text_hash` comparison true by construction, so
+    `embedding_config_hash` is now the *only* thing standing between a
+    matching text and a vector produced under a different embedding
+    configuration. Same text, different config, must still be a paid
+    re-embed (issue #665).
+    """
+    project = _project(tmp_path, flush_every=2)
+    run_project(project)
+
+    calls = {"n": 0}
+    original = DeterministicEmbeddingProvider._embed
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", counting)
+    connection = duckdb.connect(str(project / "target" / "db.duckdb"))
+    try:
+        # Text hashes stay correct; the recorded configuration does not. The
+        # id change is only there to make state miss so reuse is consulted.
+        connection.execute(
+            'UPDATE "db".docs.document_embeddings '
+            "SET embedding_config_hash = 'a-different-configuration'"
+        )
+        connection.execute(
+            'UPDATE "db".docs.document_chunks SET chunk_id = chunk_id || \'-rekeyed\''
+        )
+    finally:
+        connection.close()
+
+    [result] = run_project(project, select="document_embeddings")
+
+    assert calls["n"] == DOCUMENTS
+    assert result.metrics["cache_hits"] == 0
+    assert result.metrics["provider_calls"] == DOCUMENTS
+
+
+def test_a_text_the_target_lacks_costs_no_vector_read(tmp_path: Path) -> None:
+    """New text must not open a read of the vector column (issues #665/#664).
+
+    The id/hash index is in memory, so a hash the target does not hold is
+    answered without a warehouse round trip. That matters because the
+    projection those reads pull is almost entirely the 768-float vector
+    column -- 21.3 GiB per lookup job on astrolabe's corpus.
+    """
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["a"],
+                    "embedding_input_hash": ["held"],
+                    "embedding_config_hash": ["config-hash"],
+                    "embedding": [[0.1]],
+                    "embedded_at": ["2026-08-30T00:00:00+00:00"],
+                }
+            ),
+        )
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic",
+                model="m",
+                dimensions=1,
+                id_field="chunk_id",
+                vector_field="embedding",
+            ),
+            config_hash="config-hash",
+            pruning=NO_LAYOUT_PRUNING,
+            timings=PhaseTimings(),
+        )
+
+        opens = {"n": 0}
+        original_snapshot = adapter.table_snapshot
+
+        @contextmanager
+        def counting_snapshot(*args: Any, **kwargs: Any) -> Iterator[Any]:
+            opens["n"] += 1
+            with original_snapshot(*args, **kwargs) as snapshot:
+                yield snapshot
+
+        adapter.table_snapshot = counting_snapshot  # type: ignore[method-assign]
+
+        assert reader.rows_for(["absent", "also-absent"]) == {}
+        assert opens["n"] == 0
+
+        # Positive control: a hash the target does hold is worth the read.
+        assert set(reader.rows_for(["held"])) == {"held"}
+        assert opens["n"] == 1
+
+
 # ─── the run budget can finally see embed spend ─────────────────────────────
 
 
@@ -721,12 +872,77 @@ def test_a_decimal_id_degrades_to_no_reuse_instead_of_failing(
                 provider="deterministic", model="m", dimensions=1,
                 id_field="chunk_id", vector_field="embedding",
             ),
+            config_hash="g",
             pruning=NO_LAYOUT_PRUNING,
             timings=PhaseTimings(),
         )
 
         assert reader.target_key("1.50") is not None
-        assert reader.rows_for([{"chunk_id": "1.50"}]) == {}
+        # Asked by the row's text hash, which the index does resolve --
+        # to a Decimal key the predicate contract cannot carry. Passing
+        # the record id here would answer {} for the wrong reason (#665).
+        assert reader.rows_for(["h"]) == {}
+
+
+def test_a_stale_config_row_cannot_shadow_a_usable_one(tmp_path: Path) -> None:
+    """One representative id per text hash must be a *usable* one (#671 review).
+
+    A target can hold the same text twice under two embedding configurations:
+    duplicate text (SEC filings repeat risk-factor language), plus a config
+    change, plus a publish interrupted partway. Indexing one representative
+    per hash without filtering by config kept whichever row the unordered
+    scan saw last -- and when that was the old-config row, the lookup fetched
+    it, the caller rejected it, and stel paid to re-embed text the target
+    already held a current vector for.
+
+    The usable row is listed *first* and the stale one last, deliberately: a
+    dict that keeps the last writer therefore keeps the stale row when the
+    config filter is removed, and this test fails. Written the other way
+    round it passed with the filter gone -- the mutation check caught that
+    before the ordering was fixed.
+    """
+    from stel.adapters import create_adapter, parse_warehouse_config
+    from stel.config.model import EmbedConfig
+    from stel.execution.embed import _EmbeddingReuseReader
+    from stel.timing import PhaseTimings
+
+    config = parse_warehouse_config(
+        {"type": "duckdb", "path": str(tmp_path / "w.duckdb"), "schema": "docs"}
+    )
+    with create_adapter(config) as adapter:
+        adapter.materialize_full(
+            "emb",
+            pl.DataFrame(
+                {
+                    "chunk_id": ["usable", "stale"],
+                    "embedding_input_hash": ["shared", "shared"],
+                    "embedding_config_hash": ["current-config", "old-config"],
+                    "embedding": [[0.1], [0.9]],
+                    "embedded_at": ["2026-08-01T00:00:00+00:00"] * 2,
+                }
+            ),
+        )
+        reader = _EmbeddingReuseReader(
+            adapter,
+            "emb",
+            config=EmbedConfig(
+                provider="deterministic",
+                model="m",
+                dimensions=1,
+                id_field="chunk_id",
+                vector_field="embedding",
+            ),
+            config_hash="current-config",
+            pruning=NO_LAYOUT_PRUNING,
+            timings=PhaseTimings(),
+        )
+
+        row = reader.rows_for(["shared"])["shared"]
+        assert row["chunk_id"] == "usable"
+        assert row["embedding_config_hash"] == "current-config"
+        # Both rows still answer for removals: the index filter narrows what
+        # can be *reused*, never what the target is known to contain.
+        assert reader.target_key("stale") is not None
 
 
 def test_reuse_reader_retries_complete_mutable_target_snapshots(
@@ -784,13 +1000,16 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
                 id_field="chunk_id",
                 vector_field="embedding",
             ),
+            config_hash="config-hash",
             pruning=NO_LAYOUT_PRUNING,
             timings=PhaseTimings(),
         )
 
         assert snapshot_calls == 2
-        found = reader.rows_for([{"chunk_id": "a"}])
-        assert found["a"]["embedding_input_hash"] == "input-hash"
+        # Asked by text hash and answered by text hash: the row id 'a'
+        # is how the row is fetched, not how it is looked up (#665).
+        row = reader.rows_for(["input-hash"])["input-hash"]
+        assert row["chunk_id"] == "a"
         assert snapshot_calls == 4
 
         changing_calls.update({5, 6, 7})
@@ -798,11 +1017,11 @@ def test_reuse_reader_retries_complete_mutable_target_snapshots(
             TableSnapshotGenerationChangedError,
             match="simulated target generation change",
         ):
-            reader.rows_for([{"chunk_id": "a"}])
+            reader.rows_for(["input-hash"])
         assert snapshot_calls == 7
 
 
-# ─── the reuse lookup is scoped to the window's layout values (issue #664) ──
+# ─── the reuse lookup is scoped to the found rows' layout values (issue #664) ─
 
 
 @contextmanager
@@ -848,6 +1067,7 @@ def _layout_reader(adapter: Any, pruning: LayoutPruningColumns) -> Any:
             id_field="chunk_id",
             vector_field="embedding",
         ),
+        config_hash="g",
         pruning=pruning,
         timings=PhaseTimings(),
     )
@@ -867,55 +1087,41 @@ def _capture_predicates(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> list[A
     return captured
 
 
-def test_a_reuse_lookup_carries_the_windows_layout_range_and_lists(
+def test_a_reuse_lookup_is_scoped_to_the_layout_of_the_rows_it_fetches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Issue #664: a keyed read of a column that is neither the partition nor
     a clustering key scans the whole column (21 GiB per lookup on the SEC
-    table). The lookup now also carries the window's own range over the
-    partition column and value lists over the clustering columns, so the
-    warehouse can skip the storage outside the window. The rows the window
-    names are still found -- the predicates narrow storage, not the answer."""
+    table). The lookup now also carries a range over the partition column and
+    value lists over the clustering columns -- built from the values the
+    *found rows* hold, recorded in the key pass.
+
+    That source is the point. Reuse is content-addressed (#665), so a hit is
+    often another row than the one asking, under other layout values: here
+    the window wants texts `ha` and `hb`, held by an AAPL row in January and
+    an MSFT row in February. Predicates built from the asking window's own
+    values would have pruned one of them away and paid to re-embed it; built
+    from the fetched rows they span both, and both are found."""
     from stel.adapters import ReadPredicate, ReadPredicateOperator
 
     with _layout_target(tmp_path) as adapter:
         captured = _capture_predicates(adapter, monkeypatch)
         reader = _layout_reader(adapter, LayoutPruningColumns("filing_date", ("symbol",)))
-        found = reader.rows_for(
-            [
-                {"chunk_id": "a", "filing_date": date(2026, 1, 5), "symbol": "AAPL"},
-                {"chunk_id": "c", "filing_date": date(2026, 3, 1), "symbol": "AAPL"},
-            ]
-        )
-        assert set(found) == {"a", "c"}
-        assert found["c"]["embedding_input_hash"] == "hc"
+        found = reader.rows_for(["ha", "hb"])
+        assert set(found) == {"ha", "hb"}
+        assert found["hb"]["chunk_id"] == "b"
 
         [lookup] = [p for p in captured if p is not None]
         assert list(lookup) == [
-            ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("a", "c")),
+            ReadPredicate("chunk_id", ReadPredicateOperator.IN, ("a", "b")),
             ReadPredicate(
                 "filing_date", ReadPredicateOperator.GREATER_THAN_OR_EQUAL, date(2026, 1, 5)
             ),
             ReadPredicate(
-                "filing_date", ReadPredicateOperator.LESS_THAN_OR_EQUAL, date(2026, 3, 1)
+                "filing_date", ReadPredicateOperator.LESS_THAN_OR_EQUAL, date(2026, 2, 9)
             ),
-            ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL",)),
+            ReadPredicate("symbol", ReadPredicateOperator.IN, ("AAPL", "MSFT")),
         ]
-
-
-def test_a_target_row_under_other_layout_values_is_a_miss_not_an_error(
-    tmp_path: Path,
-) -> None:
-    """The documented cost of #664's read scoping: the upstream now says row
-    `b` belongs to another symbol than the target published it under, so the
-    scoped lookup does not see it. The row re-embeds (a paid call for correct
-    output); the lookup neither fails nor returns the stale vector."""
-    with _layout_target(tmp_path) as adapter:
-        reader = _layout_reader(adapter, LayoutPruningColumns("filing_date", ("symbol",)))
-        found = reader.rows_for(
-            [{"chunk_id": "b", "filing_date": date(2026, 2, 9), "symbol": "GOOG"}]
-        )
-        assert found == {}
 
 
 def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(
@@ -923,8 +1129,8 @@ def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(
 ) -> None:
     """The layout is declared on the model; the predicates run against the
     target. A clustering column declared after the target was built would
-    fail every lookup at snapshot open, so the reader keeps only the layout
-    columns the target actually has."""
+    fail the key pass and every lookup at snapshot open, so the reader keeps
+    only the layout columns the target actually has."""
     from stel.adapters import ReadPredicate, ReadPredicateOperator
 
     with _layout_target(tmp_path) as adapter:
@@ -932,17 +1138,8 @@ def test_a_layout_column_the_target_lacks_is_dropped_from_the_lookup(
         reader = _layout_reader(
             adapter, LayoutPruningColumns("filing_date", ("symbol", "form_type"))
         )
-        found = reader.rows_for(
-            [
-                {
-                    "chunk_id": "a",
-                    "filing_date": date(2026, 1, 5),
-                    "symbol": "AAPL",
-                    "form_type": "10-K",
-                }
-            ]
-        )
-        assert set(found) == {"a"}
+        found = reader.rows_for(["ha"])
+        assert set(found) == {"ha"}
         [lookup] = [p for p in captured if p is not None]
         assert [p.column for p in lookup] == [
             "chunk_id",

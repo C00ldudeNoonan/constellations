@@ -1789,7 +1789,9 @@ def test_bigquery_materialize_sql_incremental_prunes_from_staging_stats(
         _FakeJob(),  # CREATE TABLE staging AS select_sql
         _FakeJob(rows=[(0, 0)]),  # unique-key check
         _FakeJob(rows=[(0, 40, 2, 7, 0, 3)]),  # nulls/distinct per candidate column
-        _FakeJob(affected=3),  # the script
+        # As BigQuery reports a script: no DML count on the parent job (each
+        # statement is a child job), and the result of its last statement.
+        _FakeJob(rows=[(3,)], affected=None),
     ]
     adapter = _adapter(client)
     result = adapter.materialize_sql_incremental(
@@ -1812,7 +1814,51 @@ def test_bigquery_materialize_sql_incremental_prunes_from_staging_stats(
         "AND T.`form_type` IN UNNEST(stel_prune_in_0) WHEN MATCHED" in script
     )
     assert "`symbol` IN UNNEST" not in script
+    # The count is the MERGE's own @@row_count, captured in whichever branch
+    # ran, not the parent job's statistic -- which a script does not carry,
+    # so a successful model used to report rows_written=0 (Codex review on
+    # #670).
+    assert script.count("SET stel_merge_rows = @@row_count;") == 2
+    assert script.endswith("END IF;\nSELECT stel_merge_rows;")
     assert client.dropped == [_STAGING_ID]
+
+
+def test_bigquery_sql_incremental_ignored_layout_column_is_not_pruned_on(
+    _fixed_staging_uuid,
+) -> None:
+    """Codex review on #670 (P2): under `on_schema_change: ignore` a query
+    that newly selects a declared layout column has that column dropped by
+    reconciliation, because the target lacks it. Pruning still read the
+    staged columns, so the guard and MERGE named `T.<column>` and BigQuery
+    rejected a run the policy promised to let through. Pruning is now
+    decided over the reconciled columns: `form_type`, absent from the
+    target, is neither measured nor predicated on."""
+    client = _FakeClient()
+    client.tables["proj.ds.tgt"] = ["id", "filing_date", "v"]
+    _stage_schema(
+        client,
+        [("id", "INTEGER"), ("filing_date", "DATE"), ("form_type", "STRING"), ("v", "STRING")],
+    )
+    client.query_results = [
+        _FakeJob(),  # CREATE TABLE staging AS select_sql
+        _FakeJob(rows=[(0, 0)]),  # unique-key check
+        _FakeJob(rows=[(0, 40)]),  # nulls/distinct for filing_date alone
+        _FakeJob(rows=[(2,)], affected=None),  # the script
+    ]
+    adapter = _adapter(client)
+    result = adapter.materialize_sql_incremental(
+        "tgt",
+        "SELECT * FROM src",
+        unique_key="id",
+        options=_parse_options(_SEC_LAYOUT),
+        on_schema_change="ignore",
+    )
+    stats_sql, _ = client.queries[2]
+    assert "form_type" not in stats_sql
+    script, _ = client.queries[-1]
+    assert "form_type" not in script
+    assert "T.`filing_date` BETWEEN stel_prune_lo AND stel_prune_hi" in script
+    assert result.rows_written == 2
 
 
 def test_bigquery_materialize_sql_incremental_without_a_layout_issues_no_stats_query(
@@ -2702,12 +2748,23 @@ def test_integration_layout_pruned_merge_keeps_one_row_per_key() -> None:
                 key_col="document_id",
                 options=opts,
             )
+            # The SQL-model path takes the same script, and its row count is
+            # the executed MERGE's own @@row_count: the script's parent job
+            # carries no DML statistic (Codex review on #670).
+            sql_result = adapter.materialize_sql_incremental(
+                "docs",
+                "SELECT 'a' AS document_id, 'acme' AS vendor, "
+                "DATE '2026-01-01' AS filing_date, 11 AS x",
+                unique_key="document_id",
+                options=opts,
+            )
+            assert sql_result.rows_written == 1
             rows = adapter.rows(
                 f"SELECT document_id, vendor, filing_date, x "
                 f"FROM {adapter.table_ref('docs')} ORDER BY document_id"
             )
             assert rows == [
-                ("a", "acme", date_type(2026, 1, 1), 10),
+                ("a", "acme", date_type(2026, 1, 1), 11),
                 ("b", "acme", date_type(2026, 3, 1), 20),
                 ("c", "acme", date_type(2026, 1, 15), 3),
             ]
@@ -4856,7 +4913,6 @@ _UNCOVERED_BY_LIVE_TESTS = frozenset(
         "list_all_tables",
         "materialize_full_chunks",
         "materialize_sql_full",
-        "materialize_sql_incremental",
         "query_df",
         "quote_ident",
         "replace_children",

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Embedding reuse is keyed by the text, not by the row (issue #665)
+
+- **An id-space change re-paid for every vector.** Reuse looked the existing
+  target up by row id and checked the text hash afterwards, so a corpus whose
+  *ids* moved got no hits even though the text — and its
+  `embedding_input_hash` — was unchanged. astrolabe's SEC corpus did exactly
+  that: an agent_context wrapper hop re-keyed 3.67M chunks onto `context_id`,
+  every vector was discarded, and the corpus was embedded about 1.9 times
+  (7.78B input characters against a single pass's ~4.1B; ~$195 against ~$100).
+  Reuse is now keyed on `embedding_input_hash`, so a re-keyed or re-chunked
+  row whose text did not change reuses its vector. The row id is how the row
+  is fetched, not how it is found.
+- **New text costs no vector read.** The id/hash index is consulted in memory
+  before any lookup, so a window of text the target does not hold issues no
+  warehouse read at all. The projection those reads pull is almost entirely
+  the vector column — 21.3 GiB per lookup job on that corpus (issue #664).
+- **The configuration check is what now guards correctness.** Keying by hash
+  makes the old `embedding_input_hash == text_hash` comparison true by
+  construction, leaving `embedding_config_hash` as the only thing between
+  matching text and a vector built under a different provider, model,
+  dimensions, or implementation. It has its own test and mutation check.
+- A resumed run's key scan now projects two columns (the id and
+  `embedding_input_hash`) instead of one. ADR-0026 records what that residency
+  buys, and why the lookup resolves hashes to ids in memory rather than
+  predicating on the hash column.
+- Fixed while here: `test_a_decimal_id_degrades_to_no_reuse_instead_of_failing`
+  passed a record id to a lookup that now takes a text hash, so it asserted
+  "no reuse" for a reason unrelated to the DECIMAL keys it exists to cover. It
+  takes the row's hash now, and fails again when the guard is removed.
+
 ### An incremental MERGE and the embed reuse read are pruned to the batch's layout (issue #664)
 
 - **A MERGE joined only on the key reads most of a wide table.** astrolabe's
@@ -17,11 +47,24 @@
   matched target row lies outside the batch's values (a re-dated filing), and
   the unpruned MERGE runs when one does, so a key never ends with two rows.
   Guard and MERGE are one script, one job.
-  [ADR-0026](docs/adr/0026-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md)
+  [ADR-0027](docs/adr/0027-a-pruned-merge-proves-no-matched-row-lies-outside-the-batch.md)
   records why dbt's unguarded `incremental_predicates` was not copied.
-- The embed reuse lookup carries the same predicates per window. A target row
-  published under other layout values for the same id is a miss, and that row
-  re-embeds: a paid call for correct output, the same price as changed text.
+- The embed reuse lookup carries the same predicates per window, built from
+  the layout values of the rows it fetches, which the key pass now reads
+  beside the id and text hash. Reuse is content-addressed (#665), so a hit is
+  often another row under other layout values -- re-keyed, or the same
+  boilerplate under another symbol -- and predicates built from the asking
+  window's values would have pruned away exactly the rows reuse exists to
+  find. Built from the fetched rows, they cannot exclude one.
+- A BigQuery read predicate on a `DATETIME` column now binds as `DATETIME`.
+  Every Python `datetime` bound as `TIMESTAMP`, which GoogleSQL does not
+  coerce to `DATETIME`, so a reuse lookup on a `data_type: datetime`
+  partition failed at snapshot open.
+- A `transform:` SQL model's pruned MERGE reports its row count from the
+  script's own `@@row_count`; the script's parent job carries none, so a
+  successful model reported `rows_written=0`. Under `on_schema_change:
+  ignore`, a newly selected layout column the target lacks is no longer
+  predicated on.
 - The key is never repeated as a predicate; a column the batch lacks, has NULL
   in, or (clustering) holds more than 1,000 distinct values of is left out for
   that batch. `transform:` SQL models' MERGE takes the same path. The new

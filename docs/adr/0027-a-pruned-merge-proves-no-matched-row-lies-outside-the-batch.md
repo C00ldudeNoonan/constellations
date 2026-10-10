@@ -1,4 +1,4 @@
-# ADR-0026: a pruned incremental MERGE first proves no matched row lies outside the batch's layout values
+# ADR-0027: a pruned incremental MERGE first proves no matched row lies outside the batch's layout values
 
 - **Status:** accepted
 - **Date:** 2026-10-09
@@ -38,8 +38,12 @@ configures nothing: the pruning is on whenever the model declares a layout and
 the batch carries the columns without NULLs, with a value list capped at 1,000
 distinct values so a per-row id clustered beside the key is not sent as an
 array the size of the batch. The embed reuse read carries the same predicates
-without a guard, because for it a missed row is a paid re-embed and never wrong
-output.
+without a guard, built from the layout values of the rows it is about to fetch
+rather than from the asking window: reuse is keyed by text (ADR-0026), so the
+row that answers is often another row under other layout values, and
+predicates built from the window would exclude it. The key pass already reads
+every row's id and text hash, so it reads the layout columns beside them and
+the lookup's predicates cannot miss a row it fetches.
 
 ## Alternatives considered
 
@@ -90,17 +94,26 @@ where the saving is for that table.
 - The guard is a read of the key and layout columns across the whole target on
   every pruned publish. On a table whose MERGE was already cheap it is the
   visible cost, and on the SEC table a few hundred MiB against 4.45 GiB.
-- The publish job is a script, so its parent job's `num_dml_affected_rows` is
-  whatever BigQuery reports for a multi-statement job; the `rows_affected`
-  field of the publication telemetry is less informative than it was for the
-  plain MERGE. `rows_written` is counted from the batch and is unchanged.
+- The publish job is a script, and a script's parent job carries no
+  `num_dml_affected_rows`: each statement runs as a child job. The
+  `rows_affected` field of the publication telemetry is therefore empty for a
+  pruned publish. The DataFrame path counts `rows_written` from the batch and
+  is unchanged; the SQL-model path read the parent's statistic, so the script
+  records the executed MERGE's `@@row_count` in each branch and selects it
+  last, and the count is read from there.
 - The pruning is on the *declared* layout. A target whose physical layout has
   not been rebuilt to match its declaration prunes nothing, correctly.
 - A row whose layout values change still publishes correctly, at the unpruned
   price for that batch. A model whose rows do that routinely gets no saving
   and pays the guard; the telemetry is how to see it.
-- The embed reuse read's miss on a re-laid-out row is a cost the docs state,
-  not a guarded case.
+- The embed reuse key pass reads the layout columns too, and holds one
+  interned layout tuple per indexed text hash: a dict slot per hash, since
+  layout columns are low-cardinality by design. A target without a layout
+  pays nothing.
+- A BigQuery read predicate is typed from the column it compares with where
+  the Python value alone is ambiguous: a `datetime` against a `DATETIME`
+  column binds as `DATETIME`, since GoogleSQL does not coerce a `TIMESTAMP`
+  parameter to it.
 
 ## Evidence
 

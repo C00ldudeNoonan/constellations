@@ -884,12 +884,11 @@ def layout_pruning_predicates(
     narrowed wrongly, and `exclude` -- the key the read or merge already joins
     on -- is never repeated as a layout predicate.
 
-    The predicates describe where the batch's rows *now* say they belong. A
-    target row published under other layout values for the same key is
-    outside them; a consumer that cannot tolerate missing such a row has to
-    check for it first (the BigQuery merge does), and one that can (the embed
-    reuse read, where a miss is a paid re-embed and never wrong output) only
-    documents it.
+    The predicates describe where `rows` say they belong. A target row under
+    other layout values is outside them, so a consumer passing rows that are
+    not the target's own has to check for such a row first (the BigQuery
+    merge does). The embed reuse read passes the target rows it is about to
+    fetch, read in its key pass, so its predicates cannot exclude one.
     """
     predicates: list[ReadPredicate] = []
     if pruning.range_column is not None and pruning.range_column != exclude:

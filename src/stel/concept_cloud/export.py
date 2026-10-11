@@ -41,6 +41,7 @@ from .schema import (
     DimensionDef,
     Position,
     Provenance,
+    SourceAccess,
 )
 
 # stel DAG node kind -> a resource_type label for the plane.
@@ -150,6 +151,7 @@ def build_concept_cloud(
     top_n_per_period: int = 0,
     vocabularies: Mapping[str, Vocabulary] | None = None,
     breakdown_columns: dict[str, tuple[pl.DataFrame, str]] | None = None,
+    context_model: str | None = None,
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -165,6 +167,10 @@ def build_concept_cloud(
 
     `breakdown_columns` maps a breakdown name to a document-keyed frame and
     its value column (issue #555 item 5); see `document_breakdown`.
+
+    `context_model` names the governed context model a reader's "show me a
+    sentence" click searches (issue #555 item 7). Only the name is carried;
+    see `SourceAccess` for why it is not verified here.
     """
     generated_at = generated_at or datetime.now(UTC).isoformat()
     node_ids = {node.id for node in dag_plane.nodes}
@@ -250,6 +256,9 @@ def build_concept_cloud(
         dimensions=tuple(dimension_defs),
         periods=periods,
         breakdowns=tuple(breakdown_defs),
+        source_access=(
+            SourceAccess(model=context_model) if context_model else None
+        ),
     )
 
 
@@ -978,6 +987,7 @@ def export_concept_cloud(
     top_n_per_period: int = 0,
     names_model: str | None = None,
     breakdown_specs: dict[str, str] | None = None,
+    context_model: str | None = None,
 ) -> ConceptCloudExport:
     """Read the project's tables through the active adapter and build a bundle.
 
@@ -1087,6 +1097,7 @@ def export_concept_cloud(
         top_n_per_period=top_n_per_period,
         vocabularies=project.vocabularies,
         breakdown_columns=breakdown_columns or None,
+        context_model=context_model,
     )
 
 

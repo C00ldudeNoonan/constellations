@@ -25,6 +25,7 @@ from .cli_services.context import load_project_or_click as _load
 from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .concept_cloud import (
+    ConceptCloudExport,
     ConceptCloudExportError,
     TimeGrain,
     demo_export,
@@ -2458,6 +2459,30 @@ def mcp_serve(
     ),
 )
 @click.option(
+    "--context-model",
+    default=None,
+    help=(
+        "Governed context model a card's `Show me a sentence` searches. The "
+        "bundle carries the name only; the sentence is fetched on click from "
+        "`--serve`, never baked into the artifact."
+    ),
+)
+@click.option(
+    "--serve",
+    is_flag=True,
+    help=(
+        "After writing, serve the artifact on 127.0.0.1 so its cards can "
+        "reach the source through this project's governed context service. "
+        "Needs --context-model. Ctrl-C to stop."
+    ),
+)
+@click.option(
+    "--port",
+    default=8081,
+    show_default=True,
+    help="Port for --serve.",
+)
+@click.option(
     "--title",
     default=None,
     help='Page heading and browser-tab title (default: "stel star map").',
@@ -2492,6 +2517,9 @@ def concept_cloud(
     time_field: str | None,
     time_grain: str,
     top_n_per_period: int,
+    context_model: str | None,
+    serve: bool,
+    port: int,
     title: str | None,
     subtitle: str | None,
     verbose: int,
@@ -2503,8 +2531,31 @@ def concept_cloud(
     ``--relation-model``/``--entity-model`` and a downstream ``--dbt-manifest``),
     ``--demo`` for the sizable built-in example, or ``--placeholder`` for the
     minimal one.
+
+    ``--context-model`` plus ``--serve`` adds the reach-the-source affordance
+    (#678): the card fetches one sentence per concept from the project's
+    governed context service while the server runs.
     """
     _configure_output(verbose, diagnostics_file=diagnostics_file)
+    # Checked before the export, which reads the warehouse and can run for
+    # hours: being told the flags do not combine is worth nothing afterwards.
+    if serve and not context_model:
+        raise click.ClickException(
+            "--serve reaches the source through a context model, so it needs "
+            "--context-model <model>. To view an artifact without one, open "
+            "the HTML file directly."
+        )
+    # Refused rather than ignored. The built-in bundles return before the
+    # export below, so either flag passed with one would silently do nothing,
+    # and their concepts are samples no project's index contains. One check
+    # covers both, because --serve without --context-model is already refused
+    # above.
+    if context_model and (placeholder or demo):
+        raise click.ClickException(
+            "--context-model names a model in your own project, so it does "
+            "not apply to the built-in --placeholder or --demo bundle. "
+            "Export with --linking-model to reach a project's own concepts."
+        )
     if placeholder or demo:
         bundle = demo_export() if demo else placeholder_export()
         written = write_concept_cloud(bundle, output, title=title, subtitle=subtitle)
@@ -2539,6 +2590,7 @@ def concept_cloud(
             time_field=time_field,
             time_grain=cast(TimeGrain, time_grain),
             top_n_per_period=top_n_per_period,
+            context_model=context_model,
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e
@@ -2546,6 +2598,33 @@ def concept_cloud(
     click.echo(
         f"Wrote concept-cloud artifact ({len(export.concepts)} concepts) to {written}"
     )
+    if serve:
+        _serve_concept_cloud(ctx, export, written, port=port)
+
+
+def _serve_concept_cloud(
+    ctx: click.Context, export: ConceptCloudExport, artifact: Path, *, port: int
+) -> None:
+    """Hand off to the loopback viewer server (#678).
+
+    Imported here rather than at module scope: it pulls in the context
+    service and the catalog, which no other `stel` invocation needs.
+    """
+    from .concept_cloud.serve import ConceptCloudServeError, serve_concept_cloud
+
+    try:
+        serve_concept_cloud(
+            export,
+            artifact,
+            project_dir=ctx.obj["project_dir"],
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            port=port,
+        )
+    except ConceptCloudServeError as e:
+        raise click.ClickException(str(e)) from e
+    except (AdapterError, *_CONFIG_ERRORS) as e:
+        raise ConfigClickError(str(e)) from e
 
 
 def _named_specs(flag: str, raws: tuple[str, ...]) -> dict[str, str]:

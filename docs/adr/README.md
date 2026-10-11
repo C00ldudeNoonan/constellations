@@ -40,6 +40,7 @@ history (issue #311).
 | [0028](0028-the-serving-catalog-reads-the-declaration-the-artifact-was-compiled-with.md) | The serving catalog reads the declaration the artifact was compiled with, not the live project file; the manifest carries it and moves to v3 | accepted; resolves 0025's known limitation |
 | [0029](0029-a-store-identity-is-declared-not-derived-from-its-location.md) | A retrieval store's identity may be declared, so a store can move without reading as one that never published | accepted |
 | [0030](0030-a-store-mirror-is-a-byte-copy-synced-by-a-reader.md) | A store mirror is a byte copy of each Lance table, synced after activation by a query-lease reader; a failed sync fails the model, not the publication | accepted |
+| [0031](0031-a-concept-cloud-reaches-the-source-through-a-loopback-server.md) | A concept cloud reaches the source through a loopback server serving the artifact same-origin, not a token baked into it | accepted |
 
 ## When to write one
 

@@ -17,7 +17,7 @@ updates:
     open-pull-requests-limit: 0
 
   # Actions here are pinned by major tag -- checkout@v4, setup-uv@v6,
-  # upload/download-artifact@v4, codeql-action@v3 -- so nothing moves until a
+  # upload/download-artifact@v4, codeql-action@v4 -- so nothing moves until a
   # new major ships. Version updates stay on: unlike uv, bumping an action
   # touches no lockfile, so there is no resolution churn to rule out, and a
   # stale pin is how a workflow quietly keeps running on a deprecated runner.

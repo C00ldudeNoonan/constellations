@@ -15,3 +15,23 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 0
+
+  # Actions here are pinned by major tag -- checkout@v4, setup-uv@v6,
+  # upload/download-artifact@v4, codeql-action@v3 -- so nothing moves until a
+  # new major ships. Version updates stay on: unlike uv, bumping an action
+  # touches no lockfile, so there is no resolution churn to rule out, and a
+  # stale pin is how a workflow quietly keeps running on a deprecated runner.
+  # Grouped into one PR because majors tend to land in clusters, and six
+  # actions arriving separately is six reviews of the same decision.
+  #
+  # One pin Dependabot will not touch: release/v1 is a rolling branch ref
+  # pypa/gh-action-pypi-publish asks consumers to track, not a version tag.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"

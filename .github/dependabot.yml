@@ -1,0 +1,17 @@
+version: 2
+
+updates:
+  # The Python project lives at the repository root, and root uv.lock is the
+  # only lockfile. Declaring that explicitly is the point of this file: GitHub's
+  # dependency graph still held orphaned snapshots at stel/uv.lock and
+  # dbt-ml/uv.lock from pre-flatten layouts, and Dependabot kept trying to open
+  # security PRs against /stel -- two runs failed that way before this landed.
+  #
+  # open-pull-requests-limit: 0 disables routine version bumps, which AGENTS.md
+  # rules out as unrelated lock churn; security updates ignore the limit and
+  # still open PRs, which is the half worth having.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0

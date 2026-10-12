@@ -1,0 +1,42 @@
+name: codeql
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # Advisories land between pushes, and a quiet week should not mean a stale
+    # analysis. Off-peak Monday, offset so it does not collide with the hour.
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Writing the SARIF results back to the Security tab is the whole job;
+      # the rest stays read-only.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # actions covers workflow injection and unpinned-action classes, which
+        # ci.yml's ruff/ty/pip-audit tier cannot see. python needs no build
+        # step -- CodeQL extracts interpreted sources directly.
+        language: [actions, python]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

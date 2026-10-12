@@ -31,6 +31,12 @@ suppression comment. Do not add broad suppressions to keep the command clean. CI
 and release validation run the same checks; the workflows live in the
 repository-level `.github/workflows/` directory.
 
+One CI check has no local equivalent. The `codeql` workflow runs GitHub's code
+scanning over the `python` and `actions` sources and reports to the Security
+tab, so a finding there arrives on the pull request rather than from the list
+above — `actions` in particular covers workflow injection and unpinned-action
+classes that ruff, ty and pip-audit cannot see.
+
 ## Adding a new backend
 
 1. New file in `src/stel/backends/` inheriting from `BaseBackend`.

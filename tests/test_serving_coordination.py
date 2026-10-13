@@ -2518,3 +2518,123 @@ def test_recovery_keeps_the_activation_time_of_the_generation_it_retains(
     assert recovered.status == STATUS_DEGRADED
     assert recovered.active_generation == "gen1"
     assert recovered.activated_epoch == _ACTIVATED
+
+
+def test_a_failure_that_drops_the_generation_drops_its_date_too(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scope serving nothing has no materialization (PR #685 review, P1).
+
+    An in-place failure on a store that cannot promise an interrupted write
+    left the collection sound clears both pointers and stops admitting
+    queries. The activation stamp has to go with them: a timestamp that
+    outlived its generation would have the MCP catalog report a successful
+    materialization, and possibly `fresh`, for an index that answers nothing.
+    """
+    advance_to = _frozen_clock(monkeypatch, _ACTIVATED)
+    scope = _scope()
+    first = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        first,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(1, 0, 0, 0),
+    )
+    assert coordinator.status(scope).activated_epoch == _ACTIVATED
+
+    advance_to(_LATER)
+    retry = coordinator.acquire_publish(
+        scope, expected_code_version="v2", config_fingerprint="cfg2"
+    )
+    # No generation and no fingerprint passed back: the fail-closed path.
+    coordinator.mark_failed(retry, safe_error_code="store_error")
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_FAILED
+    assert entry.active_generation is None
+    assert entry.activated_epoch is None
+
+
+def test_a_claim_that_drops_the_generation_keeps_its_date_for_a_retry(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim is the one place the row may outlive its own pointer.
+
+    `acquire_publish` nulls `active_generation` unless the claim preserves it,
+    and the first version of this fix cleared the date with it -- symmetric,
+    and wrong. An in-place failure on an interruption-safe store hands both
+    pointers back and goes `degraded`, so the generation just nulled can be
+    live again minutes later; clearing its date would mean a retained
+    generation served with no age at all, for the same reason #449 exists.
+
+    Nothing reports a materialization in the meantime: the catalog refuses an
+    age while `active_generation` is null, which is what makes leaving the
+    stamp here safe rather than merely convenient (PR #685 review).
+    """
+    advance_to = _frozen_clock(monkeypatch, _ACTIVATED)
+    scope = _scope()
+    first = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        first,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(1, 0, 0, 0),
+    )
+
+    advance_to(_LATER)
+    retry = coordinator.acquire_publish(
+        scope,
+        expected_code_version="v2",
+        config_fingerprint="cfg2",
+        preserves_active_generation=False,
+    )
+    assert coordinator.status(scope).active_generation is None
+
+    # The failure hands the live generation back, and its date is still there
+    # to be about it.
+    coordinator.mark_failed(
+        retry,
+        safe_error_code="store_error",
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+    )
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
+    assert entry.activated_epoch == _ACTIVATED
+
+
+def test_a_preserving_claim_keeps_the_generation_and_its_date(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other side of the claim, so clearing unconditionally could not pass
+    the test above: a private-generation build writes where nothing reads, so
+    the live generation and the date it went live both stand."""
+    advance_to = _frozen_clock(monkeypatch, _ACTIVATED)
+    scope = _scope()
+    first = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        first,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(1, 0, 0, 0),
+    )
+
+    advance_to(_LATER)
+    coordinator.acquire_publish(
+        scope,
+        expected_code_version="v2",
+        config_fingerprint="cfg1",
+        preserves_active_generation=True,
+    )
+
+    entry = coordinator.status(scope)
+    assert entry.active_generation == "gen1"
+    assert entry.activated_epoch == _ACTIVATED

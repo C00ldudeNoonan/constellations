@@ -85,7 +85,12 @@ def read_activations(
             # reports a relation missing a projected column as absent, which
             # yields "no activation on record". That is both true and useful;
             # failing the listing would be neither.
-            columns=["model_name", "target_identity", "activated_epoch"],
+            columns=[
+                "model_name",
+                "target_identity",
+                "active_generation",
+                "activated_epoch",
+            ],
         )
     except ContextRepositoryError:
         # The class name is not even included: this error is already stel's
@@ -106,6 +111,15 @@ def read_activations(
     for resource in resources:
         row = by_scope.get((resource.name, resource.scope_fingerprint))
         if row is None:
+            continue
+        # A date is about a generation, so a scope with no active generation
+        # has no age to report -- whatever timestamp the row still carries.
+        # Asserted here rather than left to the writers: several paths clear
+        # the pointer (a fail-closed in-place failure, a non-preserving
+        # publish claim, recovery with nothing servable), and a reader that
+        # trusted the stamp alone would report a materialization for an index
+        # that serves nothing.
+        if row.get("active_generation") is None:
             continue
         activated = _epoch(row.get("activated_epoch"))
         if activated is not None:

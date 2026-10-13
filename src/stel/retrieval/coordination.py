@@ -26,7 +26,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from ..adapters.base import SERVING_LEASE_TABLE, SERVING_LEDGER_TABLE
@@ -73,6 +73,14 @@ STATUS_PUBLISHING_IN_PLACE = "publishing_in_place"
 SERVABLE_STATUSES = (STATUS_READY, STATUS_DEGRADED, STATUS_PUBLISHING)
 
 RECOVERY_ERROR_CODE = "administrative_recovery"
+
+# `_finish`'s activation argument has three cases, spelled out because the
+# difference between two of them was a bug: an `int` stamps the activation,
+# `None` clears it, and `KEEP_ACTIVATION` leaves whatever is there. A single
+# `None`-means-leave convention made clearing unexpressible, so a failure
+# that dropped the active generation kept its predecessor's timestamp and
+# the catalog reported a materialization for a scope serving nothing.
+KEEP_ACTIVATION = "keep"
 
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -654,6 +662,15 @@ class ServingCoordinator:
         if publisher is None:
             publisher = PublisherIdentity.current()
         self._ensure_row(scope)
+        # `activated_epoch` is deliberately left alone here, though this may
+        # clear the generation it dates (issue #682, PR #685 review). An
+        # in-place failure on an interruption-safe store hands both pointers
+        # back and goes `degraded`, so the generation this nulls can be live
+        # again minutes later -- and the date would have to come back with it
+        # from a caller that never read it. Leaving it costs nothing, because
+        # the catalog reports no age while `active_generation` is null; it is
+        # the same reason `mark_failed` retains the pointers rather than
+        # forcing a re-embed.
         publication_id = uuid4().hex
         ledger = self._ref(LEDGER_TABLE)
         leases = self._ref(LEASE_TABLE)
@@ -788,7 +805,7 @@ class ServingCoordinator:
         safe_error_code: str | None,
         counts: tuple[int, int, int, int],
         active_collection: str | None,
-        activated_epoch: int | None,
+        activated_epoch: int | None | Literal["keep"],
         config_fingerprint: str | None = None,
     ) -> None:
         inserted, updated, skipped, deleted = counts
@@ -798,12 +815,14 @@ class ServingCoordinator:
             "" if config_fingerprint is None else ", config_fingerprint = ?"
         )
         fingerprint_param = [] if config_fingerprint is None else [config_fingerprint]
-        # Only an activation dates the served rows (issue #682). None means
-        # "leave whatever is there", which is what a failed publish retaining
-        # its predecessor needs: the generation did not change, so neither did
-        # the time it went live.
-        stamp_activation = "" if activated_epoch is None else ", activated_epoch = ?"
-        activation_param = [] if activated_epoch is None else [activated_epoch]
+        # Only an activation dates the served rows (issue #682), and only a
+        # generation can carry a date: see `KEEP_ACTIVATION`.
+        stamp_activation = (
+            "" if activated_epoch == KEEP_ACTIVATION else ", activated_epoch = ?"
+        )
+        activation_param: list[Any] = (
+            [] if activated_epoch == KEEP_ACTIVATION else [activated_epoch]
+        )
         self._adapter.execute(
             f"""
             UPDATE {self._ref(LEDGER_TABLE)}
@@ -982,10 +1001,13 @@ class ServingCoordinator:
             active_collection=active_collection,
             safe_error_code=validate_safe_error_code(safe_error_code),
             counts=counts,
-            # Not an activation: a retained generation keeps the time it
-            # actually went live, and a cleared one keeps nothing to date
-            # (issue #682). Either way this failure is not a materialization.
-            activated_epoch=None,
+            # Never an activation, but not always a no-op (issue #682). A
+            # retained generation keeps the time it actually went live. A
+            # cleared one leaves nothing for a timestamp to be about, and
+            # keeping the predecessor's would have the catalog report a
+            # successful materialization -- possibly `fresh` -- for a scope
+            # that now serves nothing at all.
+            activated_epoch=KEEP_ACTIVATION if active_generation else None,
             config_fingerprint=config_fingerprint if active_generation else None,
         )
 

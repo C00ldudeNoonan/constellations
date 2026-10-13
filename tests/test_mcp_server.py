@@ -408,6 +408,7 @@ def _ledger_row(
     *,
     activated_at: datetime | None = ACTIVATED_AT,
     status: str = "ready",
+    active_generation: str | None = "g1b2c3d4",
 ) -> dict[str, Any]:
     """One serving-ledger row, as the coordinator would have written it.
 
@@ -420,6 +421,9 @@ def _ledger_row(
         "stage": RETRIEVAL_PUBLISH_STAGE,
         "target_identity": target_identity,
         "status": status,
+        # A row that has a date has a generation to date: the reader refuses
+        # to report an age without one (PR #685 review).
+        "active_generation": active_generation,
         "activated_epoch": (
             None if activated_at is None else int(activated_at.timestamp())
         ),
@@ -793,6 +797,29 @@ def test_an_index_with_no_activation_on_record_reports_unknown() -> None:
     model = response.models[0]
     assert model.freshness == "unknown"
     assert model.last_successful_materialization is None
+
+
+def test_an_index_with_no_active_generation_reports_no_materialization() -> None:
+    """A date is about a generation (PR #685 review, P1).
+
+    Several paths clear the active pointer -- a fail-closed in-place failure,
+    a non-preserving publish claim, recovery with nothing servable -- and each
+    now clears the stamp with it. The reader asserts the invariant anyway,
+    because trusting the stamp alone means one missed writer reports a
+    successful materialization for an index that serves nothing, which is a
+    worse answer than `unknown`.
+    """
+    stranded = _ledger_row("context_search", GOVERNED_SCOPE, status="failed")
+    del stranded["active_generation"]
+    service, _ = _service(repository=FakeRepository(_ledger(stranded)))
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    model = response.models[0]
+    assert model.last_successful_materialization is None
+    assert model.freshness == "unknown"
 
 
 def test_a_ledger_row_under_another_scope_does_not_date_this_index() -> None:

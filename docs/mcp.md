@@ -673,11 +673,12 @@ been failing for days therefore stops looking fresh, which is the one thing a
 caller otherwise has no way to notice: queries are still answered, from rows
 that are getting older.
 
-`freshness` is `unknown` only when there is genuinely no activation on
-record — a scope that has never published, or one last published by a release
-older than the stamp. An index that has published but declares no policy
-reports `fresh`, with the activation time alongside it so a caller can judge
-the age itself.
+`freshness` is `unknown` only when there is genuinely no activation to
+report — a scope that has never published, one last published by a release
+older than the stamp, or one with no active generation at all, because a date
+describes the generation being served and a scope serving nothing has no age.
+An index that has published but declares no policy reports `fresh`, with the
+activation time alongside it so a caller can judge the age itself.
 
 To have stel judge it instead, declare how long the contents stay current:
 

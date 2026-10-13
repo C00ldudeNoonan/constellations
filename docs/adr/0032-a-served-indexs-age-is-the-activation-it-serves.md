@@ -53,6 +53,22 @@ the row. `completed_at` moves on every finished publication attempt, failures
 included, so it dates the last time a publisher ran rather than the rows being
 served — which is the conflation this ADR exists to undo.
 
+**A date is about a generation, so an index with no active generation has no
+age.** A fail-closed in-place failure clears both pointers, and `mark_failed`
+clears the stamp with them; recovery with nothing servable writes none. The
+catalog enforces the same invariant on read rather than trusting the writers,
+because one missed path reports a successful materialization — possibly
+`fresh` — for a scope that answers nothing, which is a worse answer than
+`unknown`.
+
+The publish claim is the one place the row may hold a stamp whose generation is
+null, and it does so deliberately. `acquire_publish` nulls `active_generation`
+unless the claim preserves it, but an in-place failure on an interruption-safe
+store hands both pointers back and goes `degraded` (#449, #617) — so the
+generation it nulled can be live again minutes later, and clearing its date
+would mean a retained generation serving with no age at all. The read-side
+invariant is what makes leaving it safe.
+
 The policy is reporting only. `freshness` joins `NON_SEMANTIC_FIELDS`, so
 tightening a threshold does not re-key or republish a row; on the 3.6M-row
 index this was measured against, the alternative would make a one-word config

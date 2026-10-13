@@ -13,7 +13,9 @@
   reported both.
 - **The age is now the activation it serves.** The serving ledger gains
   `activated_epoch`, written only by `mark_ready`, and
-  `list_context_models` reads it per listing. Because a failed publish that
+  `list_context_models` reads it per listing. A date describes a generation,
+  so a failure that drops the active generation drops the date with it, and
+  the catalog reports no age while nothing is active. Because a failed publish that
   keeps serving its predecessor leaves the stamp alone, an index whose
   publishes have been failing for days stops looking fresh -- the #617 shape
   that previously looked identical to a fresh index. Recovery carries the

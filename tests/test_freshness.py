@@ -4,6 +4,11 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
+from stel.config.model import SearchFreshnessConfig
+from stel.config.source import DurationSpec, FreshnessConfig
 from stel.freshness import check_freshness
 
 
@@ -111,3 +116,24 @@ def test_missing_source_directory(tmp_path: Path) -> None:
     results = check_freshness(project)
     assert results[0].status == "no_data"
     assert "does not exist" in results[0].message
+
+
+def test_a_nonpositive_duration_is_refused_by_configuration() -> None:
+    """A threshold of zero or less is refused where it is declared.
+
+    Every reader of a `DurationSpec` compares an age against it, so a
+    non-positive count means "instantly overdue" -- which nobody declares on
+    purpose. It is rejected by the config model rather than by whichever
+    reader gets there first, so a bad threshold fails `stel compile` instead
+    of the MCP server that later has to interpret the compiled artifact
+    (PR #685 review).
+    """
+    assert DurationSpec(count=1, period="hour").to_seconds() == 3600
+    for count in (0, -1):
+        with pytest.raises(ValidationError, match="greater than 0"):
+            DurationSpec(count=count, period="hour")
+        # Both readers of the shape, so neither can regain it on its own.
+        with pytest.raises(ValidationError, match="greater than 0"):
+            FreshnessConfig(warn_after={"count": count, "period": "hour"})
+        with pytest.raises(ValidationError, match="greater than 0"):
+            SearchFreshnessConfig(stale_after={"count": count, "period": "day"})

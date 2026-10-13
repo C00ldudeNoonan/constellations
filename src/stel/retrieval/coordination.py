@@ -100,6 +100,14 @@ _LEDGER_COLUMNS_ADDED_LATER: tuple[tuple[str, str], ...] = (
     ("mirror_generation", "STRING"),
     ("mirror_target", "STRING"),
     ("mirrored_epoch", "BIGINT"),
+    # When the generation `active_generation` names was activated (issue
+    # #682). Distinct from `completed_at`, which every finished publication
+    # attempt moves, this one included: a failed publish that retains its
+    # predecessor leaves this alone, so it dates the rows actually being
+    # served rather than the last time a publisher ran. That difference is the
+    # whole point -- an index that has stopped publishing has to stop looking
+    # fresh. Epoch seconds for the reason the publisher columns above are.
+    ("activated_epoch", "BIGINT"),
 )
 
 
@@ -158,6 +166,10 @@ class ServingLedgerEntry:
     mirror_generation: str | None
     mirror_target: str | None
     mirrored_epoch: int | None
+    # When the active generation was activated, epoch seconds (issue #682).
+    # None on a scope that has never had a successful publication, and on one
+    # last activated by a release that predates this column.
+    activated_epoch: int | None
 
 
 @dataclass(frozen=True)
@@ -273,7 +285,8 @@ class ServingCoordinator:
                 publisher_namespace STRING,
                 mirror_generation STRING,
                 mirror_target STRING,
-                mirrored_epoch BIGINT
+                mirrored_epoch BIGINT,
+                activated_epoch BIGINT
             )
             """
         )
@@ -449,7 +462,8 @@ class ServingCoordinator:
                    active_collection, publisher_host, publisher_pid,
                    publisher_started_epoch, publisher_label,
                    publisher_heartbeat_epoch, publisher_namespace, progress_note,
-                   mirror_generation, mirror_target, mirrored_epoch
+                   mirror_generation, mirror_target, mirrored_epoch,
+                   activated_epoch
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -484,6 +498,7 @@ class ServingCoordinator:
                    publisher_started_epoch, publisher_label,
                    publisher_heartbeat_epoch, publisher_namespace, progress_note,
                    mirror_generation, mirror_target, mirrored_epoch,
+                   activated_epoch,
                    (
                        SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
                        WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -556,6 +571,7 @@ class ServingCoordinator:
                 mirror_generation=None,
                 mirror_target=None,
                 mirrored_epoch=None,
+                activated_epoch=None,
             )
         return ServingLedgerEntry(
             status=str(row[1]),
@@ -577,6 +593,7 @@ class ServingCoordinator:
             mirror_generation=None if row[19] is None else str(row[19]),
             mirror_target=None if row[20] is None else str(row[20]),
             mirrored_epoch=None if row[21] is None else int(row[21]),
+            activated_epoch=None if row[22] is None else int(row[22]),
         )
 
     # ─── publication claims ───────────────────────────────────────────────
@@ -771,6 +788,7 @@ class ServingCoordinator:
         safe_error_code: str | None,
         counts: tuple[int, int, int, int],
         active_collection: str | None,
+        activated_epoch: int | None,
         config_fingerprint: str | None = None,
     ) -> None:
         inserted, updated, skipped, deleted = counts
@@ -780,6 +798,12 @@ class ServingCoordinator:
             "" if config_fingerprint is None else ", config_fingerprint = ?"
         )
         fingerprint_param = [] if config_fingerprint is None else [config_fingerprint]
+        # Only an activation dates the served rows (issue #682). None means
+        # "leave whatever is there", which is what a failed publish retaining
+        # its predecessor needs: the generation did not change, so neither did
+        # the time it went live.
+        stamp_activation = "" if activated_epoch is None else ", activated_epoch = ?"
+        activation_param = [] if activated_epoch is None else [activated_epoch]
         self._adapter.execute(
             f"""
             UPDATE {self._ref(LEDGER_TABLE)}
@@ -788,7 +812,7 @@ class ServingCoordinator:
                 rows_inserted = ?, rows_updated = ?, rows_skipped = ?,
                 rows_deleted = ?, publication_id = NULL,
                 progress_note = NULL,
-                completed_at = CURRENT_TIMESTAMP{restore_fingerprint},
+                completed_at = CURRENT_TIMESTAMP{restore_fingerprint}{stamp_activation},
                 publisher_host = NULL, publisher_pid = NULL,
                 publisher_started_epoch = NULL, publisher_label = NULL,
                 publisher_heartbeat_epoch = NULL, publisher_namespace = NULL
@@ -805,6 +829,7 @@ class ServingCoordinator:
                 skipped,
                 deleted,
                 *fingerprint_param,
+                *activation_param,
                 *self._scope_params(lease.scope),
                 lease.publication_id,
                 lease.fencing_token,
@@ -899,6 +924,9 @@ class ServingCoordinator:
             active_collection=active_collection,
             safe_error_code=None,
             counts=counts,
+            # This is the activation, so this is the moment the rows now being
+            # served went live (issue #682).
+            activated_epoch=int(time.time()),
             config_fingerprint=config_fingerprint,
         )
 
@@ -954,6 +982,10 @@ class ServingCoordinator:
             active_collection=active_collection,
             safe_error_code=validate_safe_error_code(safe_error_code),
             counts=counts,
+            # Not an activation: a retained generation keeps the time it
+            # actually went live, and a cleared one keeps nothing to date
+            # (issue #682). Either way this failure is not a materialization.
+            activated_epoch=None,
             config_fingerprint=config_fingerprint if active_generation else None,
         )
 
@@ -1229,7 +1261,8 @@ class ServingCoordinator:
         # duplicate creation races, and `_read_row` refuses exactly that case.
         pointer = self._adapter.rows(
             f"""
-            SELECT active_generation, active_collection, config_fingerprint
+            SELECT active_generation, active_collection, config_fingerprint,
+                   activated_epoch
             FROM {ledger}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             ORDER BY fencing_token DESC
@@ -1244,6 +1277,14 @@ class ServingCoordinator:
             active_generation: str | None = str(pointer[0][0])
             active_collection = None if pointer[0][1] is None else str(pointer[0][1])
             config_fingerprint: str | None = str(pointer[0][2])
+            # Carried from the same row as the pointers, for the same reason
+            # (issue #682): recovery retains that generation, so the time it
+            # went live is still the truth about the rows being served. Losing
+            # it here would make a recovered index report "unknown" age for as
+            # long as it serves, which is the gap #682 closed.
+            activated_epoch: int | None = (
+                None if pointer[0][3] is None else int(pointer[0][3])
+            )
         else:
             # No servable generation survives -- a fail-closed in-place claim
             # already cleared it, or the scope never had one. Fall back to any
@@ -1262,6 +1303,8 @@ class ServingCoordinator:
             active_generation = None
             active_collection = str(legacy[0][0]) if legacy else None
             config_fingerprint = None
+            # Nothing servable survives, so there is no generation to date.
+            activated_epoch = None
         self._adapter.execute(
             f"""
             DELETE FROM {self._ref(LEASE_TABLE)}
@@ -1292,9 +1335,11 @@ class ServingCoordinator:
                 model_name, stage, target_identity, row_id, fencing_token,
                 status, safe_error_code, active_generation, active_collection,
                 config_fingerprint, rows_inserted,
-                rows_updated, rows_skipped, rows_deleted, completed_at
+                rows_updated, rows_skipped, rows_deleted, completed_at,
+                activated_epoch
             )
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0,
+                   CURRENT_TIMESTAMP, ?
             FROM (SELECT 1) AS seed
             """,
             [
@@ -1306,6 +1351,7 @@ class ServingCoordinator:
                 active_generation,
                 active_collection,
                 config_fingerprint,
+                activated_epoch,
             ],
         )
         return self.status(scope)

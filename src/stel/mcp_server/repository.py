@@ -48,6 +48,30 @@ class ContextRepository(Protocol):
         """
         ...
 
+    def read_owned_rows(
+        self,
+        relation: str,
+        *,
+        predicates: Sequence[ReadPredicate],
+        max_rows: int,
+        columns: Sequence[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Read one of stel's own persisted tables, as the operator.
+
+        Separate from `read_rows` because the model namespace deliberately
+        hides these: `list_tables()` excludes every internal table, so
+        `read_rows` can only ever report one as absent (issue #682). There is
+        no `identity` parameter for the same reason there is no choice to
+        make -- a caller holds no grant on stel's infrastructure, so these
+        reads are the operator's by definition.
+
+        `columns` is required, and a relation missing any of them reads as
+        absent rather than failing: these tables are created with CREATE
+        TABLE IF NOT EXISTS and gain columns across releases, so a projection
+        naming a newer one must not turn an older table into an error.
+        """
+        ...
+
     def log_query(self, row: Mapping[str, Any]) -> None:
         """Append one served query to the MCP query log (issue #329).
 
@@ -217,5 +241,47 @@ class WarehouseContextRepository:
         except AdapterError:
             raise ContextRepositoryError(
                 "The governed context relation could not be read"
+            ) from None
+        return tuple(rows)
+
+    def read_owned_rows(
+        self,
+        relation: str,
+        *,
+        predicates: Sequence[ReadPredicate],
+        max_rows: int,
+        columns: Sequence[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        if max_rows < 1:
+            raise ValueError("max_rows must be positive")
+        rows: list[Mapping[str, Any]] = []
+        try:
+            with self._session.warehouse(None, identity=OPERATOR_IDENTITY) as adapter:
+                # Checked, not caught: `table_column_names` answers both
+                # "is it there" and "does it have these columns" for a
+                # stel-owned table, which is what it exists for.
+                present = adapter.table_column_names(relation)
+                if present is None:
+                    return ()
+                if not {column.lower() for column in columns} <= present:
+                    return ()
+                with adapter.table_snapshot(
+                    relation,
+                    columns=columns,
+                    batch_size=min(max_rows + 1, 1000),
+                    predicate=predicates,
+                ) as snapshot:
+                    for batch in snapshot:
+                        for row in batch.to_pylist():
+                            rows.append(row)
+                            if len(rows) > max_rows:
+                                raise ContextRepositoryLimitError(
+                                    "A stel-owned relation exceeded its scan limit"
+                                )
+        except ContextRepositoryLimitError:
+            raise
+        except AdapterError:
+            raise ContextRepositoryError(
+                "A stel-owned relation could not be read"
             ) from None
         return tuple(rows)

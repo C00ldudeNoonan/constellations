@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -2396,3 +2397,124 @@ def test_search_timings_cover_deletion_and_activation(tmp_path: Path) -> None:
     assert "seconds_store_write" in search.metrics
     assert "seconds_state" in search.metrics
     assert json.dumps(search.metrics)  # metrics stay JSON-serializable
+
+
+# ─── activation stamps (issue #682) ─────────────────────────────────────────
+
+# Epoch seconds the clock below hands out, far enough apart that a stamp
+# written at one is distinguishable from one written at another. Real time
+# would not be: a publish and the failure after it land in the same second, so
+# a test comparing the two could not tell a preserved stamp from a rewritten
+# one, and would pass against the bug it was written for.
+_ACTIVATED = 1_000_000
+_LATER = 2_000_000
+
+
+def _frozen_clock(
+    monkeypatch: pytest.MonkeyPatch, start: int
+) -> Callable[[int], None]:
+    """Pin the coordinator's clock, and hand back a way to move it."""
+    from stel.retrieval import coordination
+
+    now = {"value": start}
+    monkeypatch.setattr(coordination.time, "time", lambda: now["value"])
+
+    def advance_to(value: int) -> None:
+        now["value"] = value
+
+    return advance_to
+
+
+def test_activation_stamps_the_time_the_served_rows_went_live(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mark_ready` dates the generation it activates (issue #682).
+
+    The MCP catalog reports this as an index's
+    `last_successful_materialization`. Nothing else in the ledger answers the
+    question: `completed_at` moves on every finished attempt, successful or
+    not.
+    """
+    _frozen_clock(monkeypatch, _ACTIVATED)
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(1, 0, 0, 0),
+    )
+
+    assert coordinator.status(scope).activated_epoch == _ACTIVATED
+
+
+def test_a_failed_publish_does_not_move_the_activation_stamp(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mechanism the whole of #682 rests on.
+
+    A publish that fails and retains its predecessor has refreshed nothing, so
+    the rows being served are exactly as old as they were. If this stamp moved
+    here, an index whose publishes have been failing for days would report
+    itself freshly materialized every time one failed -- which is the #617
+    shape the issue was filed about, made invisible again.
+    """
+    advance_to = _frozen_clock(monkeypatch, _ACTIVATED)
+    scope = _scope()
+    first = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        first,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(1, 0, 0, 0),
+    )
+
+    advance_to(_LATER)
+    retry = coordinator.acquire_publish(
+        scope, expected_code_version="v2", config_fingerprint="cfg2"
+    )
+    coordinator.mark_failed(
+        retry,
+        safe_error_code="store_error",
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+    )
+
+    entry = coordinator.status(scope)
+    assert entry.status == STATUS_DEGRADED
+    assert entry.active_generation == "gen1"
+    assert entry.activated_epoch == _ACTIVATED
+
+
+def test_recovery_keeps_the_activation_time_of_the_generation_it_retains(
+    coordinator: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery rebuilds the ledger row, and must carry the stamp with the
+    pointers it retains (issue #682).
+
+    Losing it here would make a recovered index report an unknown age for as
+    long as it kept serving -- the row is rewritten from scratch, so the stamp
+    has to be read off the old one and written back deliberately.
+    """
+    advance_to = _frozen_clock(monkeypatch, _ACTIVATED)
+    scope = _scope()
+    lease = coordinator.acquire_publish(
+        scope, expected_code_version="v1", config_fingerprint="cfg1"
+    )
+    coordinator.mark_ready(
+        lease,
+        active_generation="gen1",
+        config_fingerprint="cfg1",
+        counts=(1, 0, 0, 0),
+    )
+
+    advance_to(_LATER)
+    recovered = coordinator.recover(scope, owner_terminated=True)
+
+    assert recovered.status == STATUS_DEGRADED
+    assert recovered.active_generation == "gen1"
+    assert recovered.activated_epoch == _ACTIVATED

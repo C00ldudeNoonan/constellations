@@ -2150,13 +2150,19 @@ def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None
     """A new key in a documented artifact is a schema change (AGENTS.md), even
     an additive one: a consumer pinning version 1 should fail loudly rather
     than read the wider shape as the narrower. The default is never written,
-    so the only difference between the versions is a declared `index`."""
+    so the only difference between the versions is a declared `index`.
+
+    Version 3 adds `stale_after_seconds` (issue #682), the declared freshness
+    policy the MCP catalog judges an index's activation time against. Null
+    here, because this project declares no policy -- which is what every
+    descriptor written under 1 and 2 means too."""
     write_project(tmp_path)
     resource = next(
         model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
     )["output"]["serving_resource"]
-    assert resource["schema_version"] == 2
+    assert resource["schema_version"] == 3
     assert "index" not in resource["vector"]
+    assert resource["stale_after_seconds"] is None
 
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
@@ -2168,7 +2174,7 @@ def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None
     resource = next(
         model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
     )["output"]["serving_resource"]
-    assert resource["schema_version"] == 2
+    assert resource["schema_version"] == 3
     assert resource["vector"]["index"] == "ivf_pq"
 
 

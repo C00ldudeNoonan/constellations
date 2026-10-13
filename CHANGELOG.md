@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### A served index says how current it is (issue #682)
+
+- **A live index reported `unknown`.** `list_context_models` hard-coded
+  `freshness: "unknown"`, and `last_successful_materialization` came from the
+  latest `run_results.json` -- which goes back to null after any run whose
+  selection leaves the search index out, and after a container start that
+  rehydrates the store from object storage without a run at all. Against
+  astrolabe prod on 2026-10-12 the index was active and answering, and
+  reported both.
+- **The age is now the activation it serves.** The serving ledger gains
+  `activated_epoch`, written only by `mark_ready`, and
+  `list_context_models` reads it per listing. Because a failed publish that
+  keeps serving its predecessor leaves the stamp alone, an index whose
+  publishes have been failing for days stops looking fresh -- the #617 shape
+  that previously looked identical to a fresh index. Recovery carries the
+  stamp forward with the pointers it retains.
+- **`freshness` can be judged against a declared policy.** `search:` takes an
+  optional `freshness: stale_after: {count, period}`; past it the model
+  reports `pipeline_stale`. With no policy declared a published index reports
+  `fresh` and carries its activation time, and `unknown` now means only that
+  there is no activation on record. The threshold is reporting policy, so it
+  sits outside `code_version`: tightening it never republishes a row.
+- **The catalog no longer reads `run_results.json`.** How current an index is
+  is live warehouse state. Serving-descriptor `schema_version` is 3, carrying
+  the declared policy; a ledger written before the column reads as "no
+  activation on record" rather than failing a listing. Recorded in
+  [ADR-0032](docs/adr/0032-a-served-indexs-age-is-the-activation-it-serves.md).
+
 ### The star map reaches the source (issue #555 item 7, #678)
 
 - **The map could not say "says who?".** It carried concept frequencies,

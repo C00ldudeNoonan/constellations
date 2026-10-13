@@ -58,6 +58,10 @@ def _entry(
         mirror_generation=mirror_generation,
         mirror_target=mirror_target,
         mirrored_epoch=mirrored_epoch,
+        # Not what either of these helpers is about: the stamp the MCP catalog
+        # dates an index by (issue #682) has no bearing on the wording or the
+        # mirror comparison under test here.
+        activated_epoch=None,
     )
 
 

@@ -223,6 +223,16 @@ SYNC_WATERMARK_TABLE = "stel_sync_watermark"
 SERVING_LEDGER_TABLE = "stel_serving_ledger"
 LEGACY_SERVING_LEDGER_TABLE = "dbt_ml_serving_ledger"
 
+# The ledger stage a search index's serving scope is keyed under. Here with the
+# table name, and for the same reason: it is half of the ledger's key, and the
+# modules that compute the scope -- compilation, planning, the CLI, publication
+# -- must not have to import retrieval code to spell it. It became a shared
+# constant rather than nine string literals when the MCP catalog started
+# reading this row to say how current the index it serves is (issue #682): two
+# spellings of the stage would make that read miss, and a miss reports
+# "unknown" forever, which is the bug it was added to fix.
+RETRIEVAL_PUBLISH_STAGE = "retrieval_publish"
+
 # Serving leases, aliased by retrieval.coordination, which owns the protocol.
 # The name lives here so migration planning can see all three persisted tables
 # without adapters importing retrieval code.

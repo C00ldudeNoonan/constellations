@@ -27,9 +27,11 @@ project:
 uv add 'stel[mcp,lancedb]'
 ```
 
-The server reads `target/manifest.json` and `target/run_results.json`, then
-reads authorized rows through the configured warehouse adapter. Run the
-project before starting the server so those artifacts and relations agree:
+The server reads `target/manifest.json`, then reads authorized rows through
+the configured warehouse adapter. It does not read `run_results.json`: how
+current an index is comes from the serving ledger instead, for the reasons
+under [How current an index is](#how-current-an-index-is). Run the project
+before starting the server so the manifest and the relations agree:
 
 ```bash
 uv run stel run
@@ -647,6 +649,54 @@ arrive JSON-shaped: a `date` or `timestamp` attribute is an ISO string.
 `returned: false` withholds an attribute from both this response and
 `stel search`. It is the only control over what leaves the governed boundary,
 so an attribute declared for filtering alone should say so.
+
+## How current an index is
+
+`list_context_models` reports two fields an agent can use to decide whether to
+trust what it is about to read:
+
+| Field | Meaning |
+| --- | --- |
+| `last_successful_materialization` | When the generation now being served was activated. |
+| `freshness` | `fresh`, `pipeline_stale`, or `unknown`. |
+
+Both come from the serving ledger, which is warehouse state, so they survive
+anything that happens to the local artifacts. That is the point: the timestamp
+used to come from `run_results.json`, where it went back to null after any run
+whose selection left the index out, and after a container start that rehydrated
+the store from object storage without running anything at all.
+
+The ledger records the activation, not the attempt. A publish that fails and
+keeps serving its predecessor has refreshed nothing, so it leaves the stamp
+alone and the index's reported age keeps growing. An index whose publishes have
+been failing for days therefore stops looking fresh, which is the one thing a
+caller otherwise has no way to notice: queries are still answered, from rows
+that are getting older.
+
+`freshness` is `unknown` only when there is genuinely no activation on
+record — a scope that has never published, or one last published by a release
+older than the stamp. An index that has published but declares no policy
+reports `fresh`, with the activation time alongside it so a caller can judge
+the age itself.
+
+To have stel judge it instead, declare how long the contents stay current:
+
+```yaml
+models:
+  - name: sec_chunk_search
+    search:
+      freshness:
+        stale_after: {count: 2, period: day}
+```
+
+Past `stale_after` the model reports `pipeline_stale` — stel's own publication
+is late, as distinct from the row-level `source_stale`, which says the upstream
+document is. The threshold is reporting policy only: changing it never re-keys
+or republishes a row, so it can be tightened on a large corpus for free.
+
+`stel serving status` remains the operator's view, and says more: who holds the
+publish claim, which generation is active, and why a degraded scope is
+degraded.
 
 Every response uses the `mcp_context/v1` schema and returns a structured error
 with a stable code. Unauthorized and nonexistent models or records both return

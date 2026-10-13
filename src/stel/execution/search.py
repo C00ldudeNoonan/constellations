@@ -30,7 +30,7 @@ from ..adapters import (
     WarehouseAdapter,
     WarehouseCapability,
 )
-from ..adapters.base import SnapshotResumePoint, TableReadSnapshot
+from ..adapters.base import RETRIEVAL_PUBLISH_STAGE, SnapshotResumePoint, TableReadSnapshot
 from ..config.model import ModelConfig, SearchConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -184,7 +184,7 @@ def _run_search_model(
             # resolves without knowing which generation is live (issue #355).
             state_scope = StateScope.for_target_descriptor(
                 model.name,
-                stage="retrieval_publish",
+                stage=RETRIEVAL_PUBLISH_STAGE,
                 descriptor=store.state_descriptor(logical_collection).descriptor(),
             )
             # A null activation pointer means the unsuffixed default, which is

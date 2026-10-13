@@ -18,6 +18,7 @@ import pyarrow as pa
 from .adapters import WarehouseAdapter, create_adapter
 from .adapters.base import (
     OPERATOR_IDENTITY,
+    RETRIEVAL_PUBLISH_STAGE,
     AdapterError,
     StateScope,
     WarehouseIdentity,
@@ -786,14 +787,14 @@ def _search(
     state_descriptor = store.state_descriptor(logical_collection)
     state_scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_descriptor.descriptor(),
     )
     # Only read when the current key misses, to tell "never published" apart
     # from "published before #355 re-keyed the scope" (issue #413).
     legacy_state_scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_descriptor.legacy_descriptor(),
     )
     candidate_limit = request.candidate_limit or min(max(request.limit * 4, 50), 1000)

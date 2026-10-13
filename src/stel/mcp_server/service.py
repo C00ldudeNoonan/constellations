@@ -97,6 +97,8 @@ from .repository import (
     ContextRepositoryLimitError,
     WarehouseContextRepository,
 )
+from .serving_state import freshness as serving_freshness
+from .serving_state import read_activations
 
 
 class ContextServerSettings(BaseModel):
@@ -1046,11 +1048,24 @@ class ContextService:
             if len(available) > len(page) and page
             else None
         )
+        # One ledger read for the whole page, before the summaries (issue
+        # #682). How current an index is is live warehouse state: the manifest
+        # cannot know it, and `run_results.json` -- which this used to read --
+        # was wrong whenever a run left the index out or a container start
+        # rehydrated the store without running anything.
+        activations = read_activations(self._repository, page)
+        now = datetime.now(UTC)
         models = tuple(
             resource.summary(
                 entity_types=self._entity_types(
                     resource, principal, identity=identities[resource.name]
-                )
+                ),
+                last_successful_materialization=activations.get(resource.name),
+                freshness=serving_freshness(
+                    activations.get(resource.name),
+                    stale_after_seconds=resource.stale_after_seconds,
+                    now=now,
+                ),
             )
             for resource in page
         )

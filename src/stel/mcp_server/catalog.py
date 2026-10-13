@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from ..agent_context import FreshnessStatus
 from ..config import load_project
 from ..config.vocabulary import Vocabulary, check_declaration
 from ..manifest import SERVING_MANIFEST_VERSION
@@ -55,9 +56,31 @@ class ContextResource:
     id_field: str
     store_type: str
     lineage_resources: tuple[str, ...]
-    last_successful_materialization: datetime | None
+    # The serving ledger's `target_identity` for this index, as compilation
+    # computed it. Carried so the server can read the index's activation
+    # record without building a store -- which would mean a vector-store
+    # import and its credentials inside the MCP process (issue #682).
+    scope_fingerprint: str
+    # The declared freshness policy in seconds, or None when the model
+    # declares none. Absent means the catalog reports when the index was last
+    # activated without judging whether that is recent enough.
+    stale_after_seconds: int | None
 
-    def summary(self, *, entity_types: Sequence[str] = ()) -> ContextModelSummary:
+    def summary(
+        self,
+        *,
+        entity_types: Sequence[str] = (),
+        freshness: FreshnessStatus,
+        last_successful_materialization: datetime | None,
+    ) -> ContextModelSummary:
+        """The catalog entry for this index.
+
+        `freshness` and `last_successful_materialization` are parameters
+        rather than fields because they are live warehouse state, not artifact
+        state (issue #682). Reading them from the manifest is what made both
+        wrong: a served index reported `unknown` and null however long it had
+        been publishing.
+        """
         return ContextModelSummary(
             name=self.name,
             description=self.description,
@@ -70,8 +93,8 @@ class ContextResource:
                 consistency=self.consistency,
                 filter_fields=self.business_filters,
             ),
-            freshness="unknown",
-            last_successful_materialization=self.last_successful_materialization,
+            freshness=freshness.value,
+            last_successful_materialization=last_successful_materialization,
             entity_types=tuple(sorted(set(entity_types))),
         )
 
@@ -100,14 +123,9 @@ class ArtifactCatalog:
         project, _, _ = load_project(project_dir)
         target_dir = (project_dir / project.target_path).resolve()
         manifest = _read_json(target_dir / "manifest.json", required=True)
-        run_results = _read_json(target_dir / "run_results.json", required=False)
         if manifest is None:
             raise AssertionError("required manifest read returned no payload")
-        catalog = cls.from_payloads(
-            manifest,
-            run_results=run_results,
-            expected_target=expected_target,
-        )
+        catalog = cls.from_payloads(manifest, expected_target=expected_target)
         # The project file is read for `target_path` only. Its `vocabularies:`
         # is the *live* declaration; the one the catalog serves is the one
         # compiled into the manifest, because that is the declaration the
@@ -129,7 +147,6 @@ class ArtifactCatalog:
         cls,
         manifest: Mapping[str, Any],
         *,
-        run_results: Mapping[str, Any] | None = None,
         expected_target: str | None = None,
     ) -> ArtifactCatalog:
         version = manifest.get("manifest_version")
@@ -163,7 +180,6 @@ class ArtifactCatalog:
             for value in dag_raw.get("execution_order", ())
             if isinstance(value, str)
         )
-        last_success = _successful_materializations(run_results)
         resources: list[ContextResource] = []
         for unique_id, model in models.items():
             if model.get("resource_type") != "search_index":
@@ -254,7 +270,8 @@ class ArtifactCatalog:
                         for resource_id in execution_order
                         if resource_id in ancestors or resource_id == unique_id
                     ),
-                    last_successful_materialization=last_success.get(name),
+                    scope_fingerprint=_scope_fingerprint(serving),
+                    stale_after_seconds=_stale_after_seconds(serving),
                 )
             )
         return cls(resources, vocabularies=vocabularies)
@@ -450,26 +467,28 @@ def _filter_capability(attribute: Mapping[str, Any]) -> FilterCapability:
     )
 
 
-def _successful_materializations(
-    run_results: Mapping[str, Any] | None,
-) -> dict[str, datetime]:
-    if run_results is None:
-        return {}
-    metadata = run_results.get("metadata")
-    generated = metadata.get("generated_at") if isinstance(metadata, Mapping) else None
-    if not isinstance(generated, str):
-        return {}
-    try:
-        generated_at = datetime.fromisoformat(generated)
-    except ValueError:
-        return {}
-    rows = run_results.get("results")
-    if not isinstance(rows, list):
-        return {}
-    return {
-        str(row["model_name"]): generated_at
-        for row in rows
-        if isinstance(row, Mapping)
-        and row.get("status") == "success"
-        and isinstance(row.get("model_name"), str)
-    }
+def _scope_fingerprint(descriptor: Mapping[str, Any]) -> str:
+    value = descriptor.get("scope_fingerprint")
+    if not isinstance(value, str) or not value:
+        raise ArtifactCatalogError(
+            "A search index's serving descriptor is missing its scope "
+            "fingerprint; run `stel compile`"
+        )
+    return value
+
+
+def _stale_after_seconds(descriptor: Mapping[str, Any]) -> int | None:
+    """The declared freshness policy, or None when the model declares none.
+
+    Descriptors written before schema version 3 carry no key at all, which
+    means the same thing as a declared null: no policy (issue #682).
+    """
+    value = descriptor.get("stale_after_seconds")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ArtifactCatalogError(
+            "A search index's declared freshness policy is not a positive "
+            "number of seconds; run `stel compile`"
+        )
+    return value

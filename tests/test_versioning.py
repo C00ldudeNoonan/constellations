@@ -482,6 +482,10 @@ def _search_code_version(search: SearchConfig, tmp_path: Path) -> str:
         pytest.param({"on_index_change": "rebuild"}, id="on_index_change"),
         pytest.param({"index_options": {"num_partitions": 512}}, id="index_options"),
         pytest.param({"vector": {"refine_factor": 30}}, id="refine_factor"),
+        pytest.param(
+            {"freshness": {"stale_after": {"count": 2, "period": "day"}}},
+            id="freshness",
+        ),
     ],
 )
 def test_search_cadence_and_query_time_fields_stay_out_of_code_version(
@@ -491,7 +495,11 @@ def test_search_cadence_and_query_time_fields_stay_out_of_code_version(
     (issue #587). `batch_size` is the incident: lowering it was the fix for a
     failing publish (#592), and it marked 3.6M published rows as changed. The
     docs promised all four were outside `code_version`; only `refine_factor`
-    was."""
+    was.
+
+    `freshness` is here for the same reason (issue #682): it says how long the
+    index's contents stay current enough to call fresh, which no stored row
+    depends on. Shortening a threshold must not republish the corpus."""
     assert _search_code_version(_search_config(), tmp_path) == (
         _search_code_version(_search_config(**tuned), tmp_path)
     )

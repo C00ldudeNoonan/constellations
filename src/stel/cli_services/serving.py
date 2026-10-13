@@ -92,7 +92,7 @@ class _ServingScopes:
         the old location produced folded them in. Only the path and any
         declared identity are replaced.
         """
-        from ..adapters.base import StateScope
+        from ..adapters.base import RETRIEVAL_PUBLISH_STAGE, StateScope
         from ..retrieval import StoreRole, create_store
 
         alias, _store_type, _location = self.context
@@ -113,7 +113,7 @@ class _ServingScopes:
         )
         return StateScope.for_target_descriptor(
             self.model_name,
-            stage="retrieval_publish",
+            stage=RETRIEVAL_PUBLISH_STAGE,
             descriptor=store.state_descriptor(self.logical_collection).descriptor(),
         )
 
@@ -130,7 +130,7 @@ def _resolve_serving_scopes(
     Domain failures (unknown index, no retrieval config, unavailable store)
     raise ConfigClickError (exit 2); configuration/profile errors propagate for
     the edge to translate."""
-    from ..adapters.base import StateScope
+    from ..adapters.base import RETRIEVAL_PUBLISH_STAGE, StateScope
     from ..retrieval import StoreRole, create_store
 
     project_config, sources, models = load_project(project_dir)
@@ -162,12 +162,12 @@ def _resolve_serving_scopes(
     context = (alias, store_config.type, store_config.storage_location())
     scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_target.descriptor(),
     )
     legacy_scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_target.legacy_descriptor(),
     )
     return _ServingScopes(

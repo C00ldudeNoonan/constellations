@@ -9,6 +9,7 @@ from typing import Any
 
 from ._distribution import distribution_version
 from .adapters import StateScope
+from .adapters.base import RETRIEVAL_PUBLISH_STAGE
 from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
@@ -526,7 +527,7 @@ def _model_dict_v2(
     state_target = store.state_descriptor(logical)
     scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_target.descriptor(),
     )
     capabilities = store_class(config.type).capabilities()
@@ -585,7 +586,12 @@ def _model_dict_v2(
                 # structure, when it is not the default. Absent means
                 # `ivf_hnsw_flat` -- the config's serializer omits the default
                 # so every descriptor written under version 1 reads the same.
-                "schema_version": 2,
+                # 3 (issue #682): `stale_after_seconds` carries the declared
+                # freshness policy, so the MCP catalog can judge the index's
+                # activation time without reading project YAML. Null means no
+                # policy was declared, which is what every descriptor written
+                # under 1 and 2 means.
+                "schema_version": 3,
                 "config_fingerprint": collection_config_fingerprint(
                     effective_search, store_type=config.type
                 ),
@@ -606,6 +612,11 @@ def _model_dict_v2(
                     "modes": sorted(search.query.modes),
                     "consistency": search.query.consistency,
                 },
+                "stale_after_seconds": (
+                    None
+                    if search.freshness is None
+                    else search.freshness.stale_after.to_seconds()
+                ),
                 "capabilities": {
                     "required": sorted(required),
                     "available": sorted(feature.value for feature in capabilities.features),

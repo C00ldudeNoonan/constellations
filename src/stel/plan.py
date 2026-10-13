@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .adapters import StateScope, WarehouseAdapter, create_adapter
+from .adapters.base import RETRIEVAL_PUBLISH_STAGE
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config.loader import load_project
 from .config.model import ModelConfig
@@ -265,7 +266,7 @@ def _state_scope(
     logical_collection = search.collection or model.name
     return StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=store.state_descriptor(logical_collection).descriptor(),
     )
 

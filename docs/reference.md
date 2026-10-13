@@ -3594,6 +3594,35 @@ that model's exact provider identity for query-time embedding and rejects stale
 or dimension-incompatible indexes. Externally generated vectors still declare
 a complete embedding identity and require a precomputed query vector.
 
+### Declaring how long an index stays fresh
+
+`search: freshness: stale_after:` says how long the published contents stay
+current enough to report as fresh over MCP:
+
+```yaml
+models:
+  - name: sec_chunk_search
+    search:
+      freshness:
+        stale_after: {count: 2, period: day}
+```
+
+`stale_after` takes the same `{count, period}` shape as source freshness, with
+`period` one of `minute`, `hour`, `day`, or `week`. It is measured from the
+moment the serving generation was **activated**, not from the last time a
+publisher ran — a publish that fails and keeps serving its predecessor has
+refreshed nothing, so it does not reset the clock. An index whose publishes
+have been failing therefore reports `pipeline_stale` once it passes the
+threshold, while still answering queries from the generation it has (issue
+#682).
+
+Declaring the block is optional. Without it `list_context_models` reports when
+the index was last activated and leaves the age unjudged, as `fresh`; it
+reports `unknown` only when there is no activation on record at all. Nothing
+refuses a query on this basis — it is a signal for the caller, and
+`stel serving status` is the operator's fuller view. See
+[How current an index is](mcp.md#how-current-an-index-is).
+
 ### Changing a published index's configuration
 
 A published collection records a **semantic descriptor** of the configuration
@@ -3604,8 +3633,10 @@ Fields that only affect execution cadence are not part of the descriptor and
 never invalidate an index: **`batch_size`**, **`index_options`**, and
 `on_index_change` itself. Tuning publish pacing is free. So is
 **`vector: {refine_factor: ...}`**, which changes how a query is answered
-rather than what was published. The same four are outside the model's
-`code_version`, so changing one does not reclassify a single published row:
+rather than what was published, and **`freshness`**, which only says how long
+the contents stay current enough to report as fresh. The same five are outside
+the model's `code_version`, so changing one does not reclassify a single
+published row:
 `stel plan` reports the model `unchanged`, and the next publish touches only
 rows whose input actually changed (issue #587). What *is* in `code_version`
 for a `search:` model is exactly the descriptor's semantic projection plus

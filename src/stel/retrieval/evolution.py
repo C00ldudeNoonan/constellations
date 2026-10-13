@@ -31,7 +31,14 @@ from typing import Any
 # Excluded from the descriptor entirely: per the design doc's change table
 # these are "no semantic invalidation" — they change execution cadence,
 # never the content of a published row.
-NON_SEMANTIC_FIELDS = frozenset({"batch_size", "index_options", "on_index_change"})
+# `freshness` joins them for the same reason (issue #682): it declares how
+# long the index's contents stay current enough to call fresh, which is a
+# statement about reporting, not about any stored row. Including it would make
+# shortening a staleness threshold re-key and republish the whole corpus --
+# 3.6M rows on the index this was measured against.
+NON_SEMANTIC_FIELDS = frozenset(
+    {"batch_size", "freshness", "index_options", "on_index_change"}
+)
 
 # Routing identity rather than configuration: these select *which* physical
 # collection is published, so a change means an independent publication

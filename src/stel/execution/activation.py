@@ -56,6 +56,7 @@ from ..adapters import (
     StateScopeAbsenceProbe,
     WarehouseAdapter,
 )
+from ..adapters.base import RETRIEVAL_PUBLISH_STAGE
 from ..config.model import ModelConfig
 from ..config.project import ProjectConfig
 from ..dag import parse_ref
@@ -234,7 +235,7 @@ def activate_search_generation(
 
     state_scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=store.state_descriptor(logical_collection).descriptor(),
     )
     entry = coordinator.status(state_scope)

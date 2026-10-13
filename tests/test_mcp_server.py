@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +14,8 @@ import pytest
 
 from stel.adapters.base import (
     OPERATOR_IDENTITY,
+    RETRIEVAL_PUBLISH_STAGE,
+    SERVING_LEDGER_TABLE,
     ReadPredicate,
     ReadPredicateOperator,
     WarehouseIdentity,
@@ -48,6 +50,7 @@ from stel.mcp_server.contracts import (
     SearchContextResponse,
 )
 from stel.mcp_server.grants import WarehouseIdentityResolver
+from stel.mcp_server.repository import ContextRepositoryError
 from stel.mcp_server.server import create_mcp_server
 from stel.mcp_server.service import (
     ContextSearch,
@@ -74,6 +77,19 @@ VERSION_HIDDEN = "2" * 32
 CONTEXT_HIDDEN = "3" * 32
 CHUNK_HIDDEN = "4" * 32
 MISSING_ID = "0" * 32
+
+# The serving ledger's `target_identity` for each fixture index, as compilation
+# writes it into the descriptor. The MCP catalog reads the index's activation
+# record under this key (issue #682), so a row only counts when the scope
+# matches -- an orphaned row left by a store that moved must not date the index
+# that replaced it.
+GOVERNED_SCOPE = "a1" * 16
+PUBLIC_SCOPE = "b2" * 16
+
+# When the fixture indexes' live generation was activated. The catalog reports
+# this as `last_successful_materialization`; it used to come from
+# `run_results.json`, which is the bug (issue #682).
+ACTIVATED_AT = datetime(2026, 7, 20, 12, tzinfo=UTC)
 
 
 class FakeRepository:
@@ -104,6 +120,28 @@ class FakeRepository:
 
     def close(self) -> None:
         self.closes += 1
+
+    def read_owned_rows(
+        self,
+        relation: str,
+        *,
+        predicates: Sequence[ReadPredicate],
+        max_rows: int,
+        columns: Sequence[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """stel's own tables, which the model namespace hides (issue #682).
+
+        Records the operator identity the real implementation has no choice
+        about, so a test can still assert which reads were the caller's.
+        """
+        if not columns:
+            raise AssertionError("read_owned_rows requires a projection")
+        return self.read_rows(
+            relation,
+            identity=OPERATOR_IDENTITY,
+            predicates=predicates,
+            max_rows=max_rows,
+        )
 
     def read_rows(
         self,
@@ -199,6 +237,7 @@ def _artifact_catalog(
     *,
     with_public_model: bool = False,
     vocabularies: Mapping[str, Vocabulary] | None = None,
+    stale_after_seconds: int | None = None,
 ) -> ArtifactCatalog:
     registry_id = "model.context_demo.document_registry"
     chunks_id = "model.context_demo.document_chunks"
@@ -248,6 +287,8 @@ def _artifact_catalog(
                     "serving_resource": {
                         "store_type": "fake",
                         "id_field": "context_id",
+                        "scope_fingerprint": GOVERNED_SCOPE,
+                        "stale_after_seconds": stale_after_seconds,
                         "attributes": [
                             {
                                 "name": "tenant_id",
@@ -291,7 +332,6 @@ def _artifact_catalog(
             ],
         },
     }
-    results = [{"model_name": "context_search", "status": "success"}]
     if with_public_model:
         public_id = "search_index.context_demo.public_search"
         manifest["models"].append(
@@ -306,6 +346,7 @@ def _artifact_catalog(
                     "serving_resource": {
                         "store_type": "fake",
                         "id_field": "context_id",
+                        "scope_fingerprint": PUBLIC_SCOPE,
                         "attributes": [],
                         "query": {
                             "modes": ["hybrid", "text", "vector"],
@@ -317,12 +358,7 @@ def _artifact_catalog(
         )
         manifest["dag"]["execution_order"].append(public_id)
         manifest["dag"]["edges"].append([embed_id, public_id])
-        results.append({"model_name": "public_search", "status": "success"})
-    run_results = {
-        "metadata": {"generated_at": "2026-07-20T12:00:00+00:00"},
-        "results": results,
-    }
-    return ArtifactCatalog.from_payloads(manifest, run_results=run_results)
+    return ArtifactCatalog.from_payloads(manifest)
 
 
 def _declarations_block(
@@ -366,8 +402,40 @@ def _context_model(
     }
 
 
+def _ledger_row(
+    model_name: str,
+    target_identity: str,
+    *,
+    activated_at: datetime | None = ACTIVATED_AT,
+    status: str = "ready",
+    active_generation: str | None = "g1b2c3d4",
+) -> dict[str, Any]:
+    """One serving-ledger row, as the coordinator would have written it.
+
+    Only the columns the catalog's read projects. `activated_at=None` is a
+    scope that has never activated a generation, or one last activated by a
+    release older than the column.
+    """
+    return {
+        "model_name": model_name,
+        "stage": RETRIEVAL_PUBLISH_STAGE,
+        "target_identity": target_identity,
+        "status": status,
+        # A row that has a date has a generation to date: the reader refuses
+        # to report an age without one (PR #685 review).
+        "active_generation": active_generation,
+        "activated_epoch": (
+            None if activated_at is None else int(activated_at.timestamp())
+        ),
+    }
+
+
 def _fixture_rows() -> dict[str, tuple[Mapping[str, Any], ...]]:
     return {
+        SERVING_LEDGER_TABLE: (
+            _ledger_row("context_search", GOVERNED_SCOPE),
+            _ledger_row("public_search", PUBLIC_SCOPE),
+        ),
         "document_registry": (
             _registry(DOC_ALLOWED, VERSION_ALLOWED, tenant="research", source_version="v2"),
             _registry(DOC_HIDDEN, VERSION_HIDDEN, tenant="restricted", source_version="v9"),
@@ -579,11 +647,14 @@ def _service(
     warehouse_identity: WarehouseIdentityResolver | None = None,
     with_public_model: bool = False,
     vocabularies: Mapping[str, Vocabulary] | None = None,
+    stale_after_seconds: int | None = None,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
         catalog=_artifact_catalog(
-            with_public_model=with_public_model, vocabularies=vocabularies
+            with_public_model=with_public_model,
+            vocabularies=vocabularies,
+            stale_after_seconds=stale_after_seconds,
         ),
         repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
@@ -614,12 +685,192 @@ def test_context_models_are_artifact_backed_and_principal_scoped() -> None:
     assert [model.name for model in response.models] == ["context_search"]
     model = response.models[0]
     assert model.contract == "agent_context/v1"
-    assert model.last_successful_materialization == datetime(
-        2026, 7, 20, 12, tzinfo=UTC
-    )
+    assert model.last_successful_materialization == ACTIVATED_AT
     assert model.retrieval.modes == ("hybrid", "text", "vector")
     assert [field.field for field in model.retrieval.filter_fields] == ["category"]
     assert model.entity_types == ("series",)
+
+
+def _ledger(*rows: Mapping[str, Any]) -> dict[str, tuple[Mapping[str, Any], ...]]:
+    """The standard fixture rows with the serving ledger replaced."""
+    return _fixture_rows() | {SERVING_LEDGER_TABLE: tuple(rows)}
+
+
+def test_a_served_index_is_dated_by_its_activation_not_by_a_run_artifact() -> None:
+    """The catalog dates an index from the serving ledger (issue #682).
+
+    The fixture carries no `run_results.json` at all, which is the point: the
+    timestamp used to come from the latest one, and so went back to null after
+    any run whose selection left the index out, or a container start that
+    rehydrated the store without running anything. The ledger survives both.
+
+    Declaring no policy leaves the age unjudged rather than unknown: the index
+    has materialized, and nothing says that was too long ago.
+    """
+    # Whole seconds: the ledger column is epoch seconds, so a stamp carries
+    # no sub-second part to compare against.
+    activated = (datetime.now(UTC) - timedelta(hours=3)).replace(microsecond=0)
+    service, _ = _service(
+        repository=FakeRepository(
+            _ledger(
+                _ledger_row("context_search", GOVERNED_SCOPE, activated_at=activated)
+            )
+        )
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    model = response.models[0]
+    assert model.last_successful_materialization == activated
+    assert model.freshness == "fresh"
+
+
+def test_an_index_past_its_declared_freshness_policy_reports_stale() -> None:
+    """An index that has stopped publishing must stop looking fresh (#682).
+
+    This is the #617 shape: queries are still served, from a generation that
+    went live days ago, because every publish since has failed. The activation
+    stamp is what makes that visible -- a failed publish does not move it, so
+    the age keeps growing past the policy.
+    """
+    service, _ = _service(
+        stale_after_seconds=int(timedelta(days=1).total_seconds()),
+        repository=FakeRepository(
+            _ledger(
+                _ledger_row(
+                    "context_search",
+                    GOVERNED_SCOPE,
+                    activated_at=datetime.now(UTC) - timedelta(days=5),
+                    # Still servable, and that is exactly the problem.
+                    status="degraded",
+                )
+            )
+        ),
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.models[0].freshness == "pipeline_stale"
+
+
+def test_an_index_inside_its_declared_freshness_policy_is_fresh() -> None:
+    """The other side of the same threshold, so a policy that always reported
+    stale could not pass the test above."""
+    service, _ = _service(
+        stale_after_seconds=int(timedelta(days=7).total_seconds()),
+        repository=FakeRepository(
+            _ledger(
+                _ledger_row(
+                    "context_search",
+                    GOVERNED_SCOPE,
+                    activated_at=datetime.now(UTC) - timedelta(days=5),
+                )
+            )
+        ),
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.models[0].freshness == "fresh"
+
+
+def test_an_index_with_no_activation_on_record_reports_unknown() -> None:
+    """`unknown` keeps one meaning: nothing has ever been activated here
+    (issue #682). A ledger row with a null stamp is also a scope last
+    published by a release older than the column, which is the same answer."""
+    service, _ = _service(
+        repository=FakeRepository(
+            _ledger(_ledger_row("context_search", GOVERNED_SCOPE, activated_at=None))
+        )
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    model = response.models[0]
+    assert model.freshness == "unknown"
+    assert model.last_successful_materialization is None
+
+
+def test_an_index_with_no_active_generation_reports_no_materialization() -> None:
+    """A date is about a generation (PR #685 review, P1).
+
+    Several paths clear the active pointer -- a fail-closed in-place failure,
+    a non-preserving publish claim, recovery with nothing servable -- and each
+    now clears the stamp with it. The reader asserts the invariant anyway,
+    because trusting the stamp alone means one missed writer reports a
+    successful materialization for an index that serves nothing, which is a
+    worse answer than `unknown`.
+    """
+    stranded = _ledger_row("context_search", GOVERNED_SCOPE, status="failed")
+    del stranded["active_generation"]
+    service, _ = _service(repository=FakeRepository(_ledger(stranded)))
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    model = response.models[0]
+    assert model.last_successful_materialization is None
+    assert model.freshness == "unknown"
+
+
+def test_a_ledger_row_under_another_scope_does_not_date_this_index() -> None:
+    """The scope, not the model name, identifies the row (issue #682).
+
+    A store that moved leaves a row under the old target identity with the
+    same model name. Dating the index from it would report the age of an index
+    nobody is serving -- and report it as the age of one they are.
+    """
+    service, _ = _service(
+        repository=FakeRepository(
+            _ledger(
+                _ledger_row(
+                    "context_search",
+                    "orphaned-scope-from-a-store-that-moved",
+                    activated_at=datetime.now(UTC),
+                )
+            )
+        )
+    )
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.models[0].freshness == "unknown"
+
+
+def test_a_ledger_that_cannot_be_read_still_lists_the_models() -> None:
+    """A missing diagnostic must not become a missing catalog (issue #682).
+
+    Listing the models is the tool's job; saying how old they are is metadata
+    on top of it. A ledger this deployment cannot read -- no permission on
+    stel's own schema -- degrades to an unknown age.
+    """
+
+    class _UnreadableLedger(FakeRepository):
+        def read_owned_rows(
+            self, relation: str, **kwargs: Any
+        ) -> tuple[Mapping[str, Any], ...]:
+            raise ContextRepositoryError(f"{relation} could not be read")
+
+    service, _ = _service(repository=_UnreadableLedger(_fixture_rows()))
+    try:
+        response = service.list_context_models(ListContextModelsRequest())
+    finally:
+        service.close()
+
+    assert response.error is None
+    assert [model.name for model in response.models] == ["context_search"]
+    assert response.models[0].freshness == "unknown"
 
 
 def test_entity_types_come_from_the_declaration_without_scanning() -> None:
@@ -2810,4 +3061,17 @@ def test_a_public_model_still_uses_an_identity_when_the_caller_has_one() -> None
         "context_search",
         "public_search",
     }
-    assert set(repository.identities) == {caller}
+    # Every read of a caller-visible relation runs as the caller. The one
+    # exception is stel's own serving ledger, which the catalog reads as the
+    # operator to date each index (issue #682, ADR-0010) -- a caller holds no
+    # grant on stel's infrastructure tables, so reading it as them would deny
+    # the age of a model they are allowed to see.
+    ledger_reads = [
+        identity
+        for (relation, _), identity in zip(
+            repository.calls, repository.identities, strict=True
+        )
+        if relation == SERVING_LEDGER_TABLE
+    ]
+    assert ledger_reads == [OPERATOR_IDENTITY]
+    assert set(repository.identities) - {OPERATOR_IDENTITY} == {caller}

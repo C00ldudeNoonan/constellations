@@ -55,10 +55,12 @@ _VECTOR_INDEX_ONLY_FIELDS = frozenset({"search", "index"})
 
 # `vector` sub-fields dropped from the descriptor before it is compared or
 # hashed. `refine_factor` re-ranks an ANN index's candidates at *query* time
-# (issue #520); it changes neither the rows written nor the index built, so a
-# collection published before it was set must keep serving unchanged rather
-# than reporting a configuration drift and demanding a republish.
-_VECTOR_QUERY_ONLY_FIELDS = frozenset({"refine_factor"})
+# (issue #520) and `nprobes` decides how many of its partitions a query
+# visits (issue #684); neither changes the rows written nor the index built,
+# so a collection published before either was set must keep serving
+# unchanged rather than reporting a configuration drift and demanding a
+# republish.
+_VECTOR_QUERY_ONLY_FIELDS = frozenset({"refine_factor", "nprobes"})
 
 
 class ChangeKind(StrEnum):
@@ -136,8 +138,9 @@ def search_code_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
     that said "published" against a collection the rows were never written to
     would leave the new one empty. What `semantic_search_config` drops as
     cadence -- `batch_size`, `index_options`, `on_index_change`, and the
-    query-time `vector.refine_factor` -- stays out, because a field that
-    cannot change a stored row must not re-key every stored row (issue #587).
+    query-time `vector.refine_factor` and `vector.nprobes` -- stays out,
+    because a field that cannot change a stored row must not re-key every
+    stored row (issue #587).
     `code_version` is built from this, so the two projections cannot drift.
     """
     identity = semantic_search_config(dict(payload))

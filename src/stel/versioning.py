@@ -168,8 +168,9 @@ def compute_code_version(
         ),
         # The descriptor's own notion of what defines the index, plus routing.
         # Publish cadence (`batch_size`, `index_options`, `on_index_change`)
-        # and the query-time `vector.refine_factor` (issue #520) change no
-        # published row, so they must not re-key the model: a 3.6M-row corpus
+        # and the query-time `vector.refine_factor` (issue #520) and
+        # `vector.nprobes` (issue #684) change no published row, so they must
+        # not re-key the model: a 3.6M-row corpus
         # was rewritten in full for a `batch_size` change that had to be made
         # to recover from a failing publish (issue #587).
         "search": (

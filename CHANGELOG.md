@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### An approximate search can probe more of its index (issue #684)
+
+- **Every `approximate` query searched 20 IVF partitions of about 1,900.**
+  The partition count LanceDB chooses grows with the corpus and the probe
+  count it defaults to does not, so at 3.67M rows a query looked at about 1%
+  of the index. A document's own vector sits deep in one partition, which is
+  why chunk-as-query probes and a fixed eval suite recalled 0.98-0.99 at
+  that default; the queries agents actually send embed between partitions,
+  and 111 of them from the MCP query log recalled **0.76** at top-20 against
+  an exact search, with a p10 of 0.35. `refine_factor` could not help: a
+  neighbour in a partition the query never visited is not a candidate.
+- `search.vector.nprobes` sets how many partitions a query visits. It is the
+  floor and the ceiling — LanceDB's filtered-query widening is pinned to the
+  same value, so a prefiltered query searches exactly this many — and it has
+  no cap, since a value above the partition count is exact search at index
+  cost. Stamped exactly like `refine_factor`: a query-time knob outside the
+  collection descriptor and `code_version`, omitted from every dump when
+  unset, refused under `search: exact`. Measured on the same index and
+  queries, `nprobes: 100` with `refine_factor: 100` recalled 0.917 at about
+  3x the query time; the reference carries the table.
+- **`refine_factor`'s cap moves from 100 to 1000.** Probes alone plateau at
+  0.87; reaching 0.945 took `refine_factor: 300`, which the old cap refused.
+  The read it bounds is `limit * refine_factor` vectors, about 18 MB at a
+  limit of 20 and 300, and the reference now states the formula beside the
+  knob.
+- Both knobs are pinned as forwarded from the model's declaration to the
+  store, on the vector half of a hybrid query included, and as applied to
+  the query LanceDB executes.
+
 ## v0.21.1 - 2026-10-10
 
 ### The serving catalog reads the declaration the artifact was compiled with (issue #669)

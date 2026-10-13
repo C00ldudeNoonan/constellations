@@ -775,15 +775,19 @@ class RetrievalStore(ABC):
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
         refine_factor: int | None = None,
+        nprobes: int | None = None,
     ) -> pa.Table:
         """Rank rows by distance to `vector`.
 
         `refine_factor` asks a store that answers from a *compressed* index to
         re-rank its candidates against the stored vectors before returning
         them, trading `limit * refine_factor` vector reads for an exact
-        ordering and an exact score (issue #520). It is advisory: a store that
-        always computes true distances ignores it, because there is nothing to
-        re-rank.
+        ordering and an exact score (issue #520). `nprobes` asks a store that
+        answers from a *partitioned* index how many partitions to search
+        before it re-ranks anything, trading scan time for candidates the
+        re-rank can see at all (issue #684). Both are advisory: a store that
+        always computes true distances over every vector ignores them,
+        because there is nothing to re-rank and nothing to choose among.
         """
 
     @abstractmethod

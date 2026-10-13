@@ -631,7 +631,7 @@ The statuses:
 | Status | Meaning |
 | --- | --- |
 | `unchanged` | Every published row carries the current `code_version`. Only an input that changed will run, and the run finds those itself. |
-| `changed` | Some published rows carry a different `code_version`. `reprocess` is exact: those rows. Cadence-only settings (`flush_every`, `batch_size`, `refine_factor`, `warehouse_options`, …) never produce this, for the same reason they never invalidate state. |
+| `changed` | Some published rows carry a different `code_version`. `reprocess` is exact: those rows. Cadence-only settings (`flush_every`, `batch_size`, `refine_factor`, `nprobes`, `warehouse_options`, …) never produce this, for the same reason they never invalidate state. |
 | `cascade` | This model's own configuration is unchanged, but a planned upstream model is `changed` (or is itself downstream of one). A re-keyed chunk model gives its embed child new ids; a re-run transform gives its child new input fingerprints. The exact count needs the upstream output the run will produce, so `reprocess` is a ceiling: every published row, written `<=N`. |
 | `new` | No published state. The first run processes every input. |
 | `full` | `materialization: full` rebuilds from its input every run; nothing is skipped or reprocessed incrementally. Listed so a changed upstream is still seen to reach it. |
@@ -1059,8 +1059,8 @@ of one corpus share no ids. A test that judges a chunking change labels
 documents instead, with `granularity: document` on the retrieval test: hits
 collapse to their `document_id_field` in rank order, at the rank of their
 best chunk, and the golden set's ids are document ids. Variants that keep
-the record ids (embedding model, index type, search mode, `refine_factor`)
-compare fine at the default `granularity: record`.
+the record ids (embedding model, index type, search mode, `refine_factor`,
+`nprobes`) compare fine at the default `granularity: record`.
 
 **When the experiment ends.** Keep the winner by dropping the axis and
 writing its value into the base model. That is a `code_version` change, so
@@ -3312,6 +3312,82 @@ neither rebuilds the collection, nor rebuilds its index, nor reprocesses a
 single row. The collections that most need it are the ones large enough to
 make a rebuild unaffordable, which is exactly why it is stamped this way.
 
+**The ceiling is 1000, and the number to watch is the product.** A query
+reads `limit * refine_factor` full vectors: at a limit of 20 and 768
+dimensions, `refine_factor: 300` is 6,000 vectors, about 18 MB, once per
+query. The cap was 100 when the knob shipped, from the 100k-row case above
+where 10 sufficed; the measurement under `nprobes` below needed 300 on a
+3.67M-row corpus, so it was raised (issue #684).
+
+#### Widening an approximate search — `nprobes`
+
+Every `approximate` index is IVF-partitioned: the vectors are clustered into
+about `sqrt(rows)` partitions by LanceDB's default — ~1,900 at 3.67M rows —
+and a query visits only the `nprobes` partitions whose centroids are nearest
+to it, **20 unless told otherwise**, so about 1% of that index. `refine_factor`
+re-ranks what those partitions yielded; a neighbour in a partition the query
+never visited is not a candidate at all, and no amount of re-ranking recovers
+it.
+
+How much that costs depends on where the query vector lands. A document's own
+vector sits deep inside one partition, so chunk-as-query probes and a fixed
+eval suite of broad topics both recall almost everything at the default. The
+queries agents actually send are shorter and embed *between* partitions.
+Measured on prod's own SEC vectors against an exact cosine top-20, with the
+same `ivf_pq` index and `refine_factor: 30`:
+
+| query set | recall@20 mean | p10 |
+|---|---|---|
+| 500 chunks used as queries | 0.99 | 0.95 |
+| five fixed eval queries | 0.98 | — |
+| 111 distinct agent queries from the MCP query log | **0.76** | **0.35** |
+
+Probing more partitions is the first lever, and re-ranking wider is the
+second; the two compound. On the same index and the same 116 real queries:
+
+| `nprobes` | `refine_factor: 30` | `refine_factor: 100` | `refine_factor: 300` |
+|---|---|---|---|
+| 20 (default) | 0.758 (28 ms) | | |
+| 50 | 0.844 (50 ms) | 0.888 (72 ms) | 0.910 (165 ms) |
+| 100 | 0.862 (61 ms) | **0.917 (93 ms)** | 0.945 (167 ms) |
+| 200 | 0.869 (95 ms) | | |
+| 400 | 0.869 (157 ms) | | |
+
+Probes alone plateau near 0.87: past 100 the missing neighbours are ones the
+quantized ordering ranked outside the candidate window, which only a wider
+`refine_factor` reaches. Pick the pair from a measurement on your own logged
+queries rather than on a fixed suite, because the suite is the row that said
+0.98.
+
+```yaml
+  vector:
+    field: embedding
+    dimensions: 768
+    search: approximate
+    index: ivf_pq
+    nprobes: 100            # unset by default: LanceDB's 20
+    refine_factor: 100
+```
+
+Three things to know:
+
+- **It is the floor and the ceiling.** LanceDB can widen a search when a
+  prefilter leaves too few rows in the probed partitions; `nprobes` sets both
+  ends to one value, so a filtered query searches exactly this many
+  partitions, no more and no fewer, and a short page under a selective filter
+  means the knob should be higher rather than that LanceDB decided for you.
+- **There is no cap.** A value above the partition count probes every
+  partition, which is exact search at index cost rather than an unbounded
+  read. Latency grows roughly linearly with the probes, so the table above is
+  the budget to read it against.
+- **It is stamped exactly like `refine_factor`.** A query-time knob: absent
+  from the collection descriptor and from `code_version`, so setting it
+  rebuilds nothing and reprocesses nothing; omitted from every dump when
+  unset, so a collection published before it existed is not re-keyed; refused
+  under `search: exact`, which scans every vector and has no partitions to
+  choose among. It applies to every `approximate` index type, since all three
+  are IVF-partitioned, and to the vector half of a hybrid query.
+
 **stel estimates the build before paying for the rows.** Inside a container,
 a publish to a LanceDB store reads the cgroup memory ceiling and, from the row
 count, the dimensions, and the ratios above, warns when the build would need
@@ -3471,9 +3547,10 @@ difference, so a change is named rather than merely detected.
 
 Fields that only affect execution cadence are not part of the descriptor and
 never invalidate an index: **`batch_size`**, **`index_options`**, and
-`on_index_change` itself. Tuning publish pacing is free. So is
-**`vector: {refine_factor: ...}`**, which changes how a query is answered
-rather than what was published. The same four are outside the model's
+`on_index_change` itself. Tuning publish pacing is free. So are
+**`vector: {refine_factor: ...}`** and **`vector: {nprobes: ...}`**, which
+change how a query is answered rather than what was published. The same
+five are outside the model's
 `code_version`, so changing one does not reclassify a single published row:
 `stel plan` reports the model `unchanged`, and the next publish touches only
 rows whose input actually changed (issue #587). What *is* in `code_version`

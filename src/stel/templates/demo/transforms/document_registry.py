@@ -15,6 +15,10 @@ import polars as pl
 
 from stel.agent_context import empty_agent_context_frame, project_document_registry_row
 
+# The directories `sources/acme.yml` reads, as citations should name them.
+_DOCS_DIR = "data/docs"
+_TICKETS_DIR = "data/tickets"
+
 # Columns added on top of the contract. `text` is what `passages` chunks.
 _EXTRA_FIELDS: dict[str, pl.DataType] = {
     "title": pl.String(),
@@ -57,7 +61,7 @@ def _row(
         source_key=source_key,
         source_version=source_version,
         source_uri=source_uri,
-        upstream_unique_id=f"model.demo.raw_{source_system}",
+        upstream_unique_id=f"model.__PROJECT_NAME__.raw_{source_system}",
         invocation_id="demo-v1",
         recorded_from=at,
         ingested_at=at,
@@ -79,6 +83,12 @@ def _row(
     )
 
 
+def _source_uri(directory: str, row: dict[str, Any]) -> str:
+    # `source_path` is the file's path within its source's directory, so the
+    # citation names the file that was actually read.
+    return f"{directory}/{PurePath(str(row['source_path'])).as_posix()}"
+
+
 def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for doc in deps["raw_docs"].iter_rows(named=True):
@@ -87,7 +97,7 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
             source_system="docs",
             source_key=PurePath(name).stem,
             source_version=str(doc["content_hash"]),
-            source_uri=f"data/docs/{name}",
+            source_uri=_source_uri(_DOCS_DIR, doc),
             dated=str(doc["published_at"]),
             text=str(doc["body"]),
         )
@@ -110,7 +120,7 @@ def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
             source_system="tickets",
             source_key=ticket_id,
             source_version=str(ticket["content_hash"]),
-            source_uri=f"data/tickets/{ticket_id.lower()}.json",
+            source_uri=_source_uri(_TICKETS_DIR, ticket),
             dated=str(ticket["opened_at"]),
             text=text,
         )

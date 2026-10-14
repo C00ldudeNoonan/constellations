@@ -3,8 +3,9 @@
 Acme Cloud is a made-up company with a small pile of documents: three incident
 postmortems, three runbooks, two months of release notes, and eight customer
 support tickets. This project turns that pile into a tested, searchable,
-entity-linked knowledge base that an agent can query with citations. It runs
-offline, needs no API keys, and keeps everything in one DuckDB file.
+entity-linked knowledge base that an agent can query with citations. It needs
+no API keys and keeps everything in one DuckDB file. The first build downloads
+DuckDB's `vss` and `fts` search extensions, once; after that it runs offline.
 
 ```bash
 stel build

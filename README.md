@@ -163,8 +163,9 @@ uv add 'stel[bigquery,gcs,gdrive]'
 
 See the whole thing work first. The `demo` template scaffolds a complete
 project with its own documents: a made-up company's postmortems, runbooks,
-release notes, and support tickets. It runs offline, needs no API keys, and
-builds into one DuckDB file:
+release notes, and support tickets. It needs no API keys and builds into one
+DuckDB file; the first build downloads DuckDB's `vss` and `fts` extensions,
+and after that it runs offline:
 
 ```bash
 uvx stel init acme --template demo

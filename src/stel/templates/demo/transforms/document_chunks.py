@@ -30,29 +30,33 @@ def _schema() -> dict[str, pl.DataType]:
 
 def declared_incremental_contract(options: dict[str, Any]) -> IncrementalContract:
     """Documents are the parents and the registry a keyed reference, so a
-    changed document re-projects its own chunks and nobody else's."""
+    changed document re-projects its own chunks and nobody else's.
+
+    Keyed by `document_id`, which is unique across sources: a source key is
+    unique only within its source, so a doc named `T-1041.md` and ticket
+    T-1041 would share one."""
     return IncrementalContract(
-        parent_key="source_key",
+        parent_key="document_id",
         child_key="chunk_id",
         parent_source="passages",
-        parent_source_key="source_key",
-        reference_deps=(ReferenceDep("document_registry", join_key="source_key"),),
+        parent_source_key="document_id",
+        reference_deps=(ReferenceDep("document_registry", join_key="document_id"),),
     )
 
 
 def run(deps: dict[str, pl.DataFrame]) -> pl.DataFrame:
     registry = {
-        str(row["source_key"]): row for row in deps["document_registry"].iter_rows(named=True)
+        str(row["document_id"]): row for row in deps["document_registry"].iter_rows(named=True)
     }
     rows: list[dict[str, Any]] = []
     for chunk in deps["passages"].iter_rows(named=True):
-        parent = registry[str(chunk["source_key"])]
+        parent = registry[str(chunk["document_id"])]
         section = chunk.get("section")
         row = project_document_chunk_row(
             parent,
             chunk_index=int(chunk["chunk_index"]),
             text=str(chunk["text"]),
-            upstream_unique_id="model.demo.passages",
+            upstream_unique_id="model.__PROJECT_NAME__.passages",
             invocation_id="demo-v1",
             chunker_identity=f"{chunk['chunk_strategy']}:600:0:v1",
             citation_section_path=[str(section)] if section else None,

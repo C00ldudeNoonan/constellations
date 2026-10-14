@@ -9,7 +9,8 @@
   working end to end. `stel init <name> --template demo` scaffolds a complete
   project with its own documents (a made-up company's postmortems, runbooks,
   release notes, and support tickets). `stel build` runs 13 models and their
-  tests offline, with no credentials, into one DuckDB file that holds the
+  tests with no credentials (the first build downloads DuckDB's `vss` and
+  `fts` extensions) into one DuckDB file that holds the
   tables, the incremental state, and a DuckDB-native vector and full-text
   index.
 - The project's `README.md` walks through querying the results, `stel
@@ -21,8 +22,9 @@
   the terms in a `vocabularies:` block, and `link_entities` resolves them with
   `aliases: vocab.systems`. A `system_names` model gives the star map each
   term's name, description, and class.
-- `stel init` now substitutes the project name into a template's `README.md`
-  as well as its project and profile files.
+- `stel init` now substitutes the project name into every text file a
+  template ships, not only its project and profile files, so a transform can
+  record `model.<project>.<name>` provenance.
 
 ### An approximate search can probe more of its index (issue #684)
 

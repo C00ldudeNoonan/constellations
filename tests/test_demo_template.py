@@ -156,6 +156,58 @@ def test_search_finds_the_root_cause_and_filters_to_tickets(built: Path) -> None
     assert tickets[0].metadata["title"] == "T-1188: Refund webhooks arriving hours late"
 
 
+def test_provenance_names_the_scaffolded_project(built: Path) -> None:
+    """agent_context/v1's `upstream_unique_id` is a real `model.<project>.<name>`,
+    whatever the project was called at init (Codex review on #689)."""
+    rows = _rows(
+        built,
+        f"select distinct upstream_unique_id from {NAME}.document_registry "
+        f"union select distinct upstream_unique_id from {NAME}.document_chunks",
+    )
+    assert sorted(row[0] for row in rows) == [
+        f"model.{NAME}.passages",
+        f"model.{NAME}.raw_docs",
+        f"model.{NAME}.raw_tickets",
+    ]
+
+
+@pytest.fixture(scope="module")
+def customized(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The demo after a user swaps in their own files, two ways the sample data
+    never exercises: a doc whose name is a ticket id, and a ticket file not
+    named after its id (Codex review on #689)."""
+    project = _scaffold(tmp_path_factory.mktemp("customized"))
+    (project / "data" / "docs" / "T-1041.md").write_text(
+        '---\ntitle: "Notes on T-1041"\nkind: runbook\nteam: support\n'
+        'published_at: "2026-03-12"\n---\n\n# Notes on T-1041\n\nFollow-up notes.\n',
+        encoding="utf-8",
+    )
+    tickets = project / "data" / "tickets"
+    (tickets / "t-1042.json").rename(tickets / "case-42.json")
+    run_project(project)
+    return project
+
+
+def test_a_doc_named_like_a_ticket_keeps_its_own_passages(customized: Path) -> None:
+    rows = _rows(
+        customized,
+        f"select c.title, r.title from {NAME}.document_chunks c "
+        f"join {NAME}.document_registry r using (document_id) "
+        "where c.source_key = 'T-1041'",
+    )
+    titles = sorted({chunk_title for chunk_title, _ in rows})
+    assert titles == ["Notes on T-1041", "T-1041: Checkout failing for our customers"]
+    assert all(chunk_title == registry_title for chunk_title, registry_title in rows)
+
+
+def test_a_citation_names_the_file_that_was_read(customized: Path) -> None:
+    rows = _rows(
+        customized,
+        f"select source_uri from {NAME}.document_registry where source_key = 'T-1042'",
+    )
+    assert rows == [("data/tickets/case-42.json",)]
+
+
 def test_changing_one_document_reprocesses_only_its_passages(tmp_path: Path) -> None:
     """The README's step 3, with the counts it prints."""
     project = _scaffold(tmp_path)

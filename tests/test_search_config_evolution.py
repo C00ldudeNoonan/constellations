@@ -721,28 +721,61 @@ def test_an_index_type_change_alongside_a_dimension_change_still_rebuilds() -> N
     assert [change.kind for change in changes] == [ChangeKind.REBUILD_REQUIRED]
 
 
-def test_refine_factor_does_not_invalidate_a_published_index() -> None:
-    """`refine_factor` re-ranks an ANN index's candidates at query time
-    (issue #520): it changes neither the rows written nor the index built.
-    Inside the fingerprint it would demand a blue/green rebuild and a full
-    re-embed to turn on a knob that only affects how a query is answered —
-    and the collection it most needs turning on for is the one large enough
+# The two query-time knobs share every stamping rule: `refine_factor` (issue
+# #520) re-ranks an ANN index's candidates, `nprobes` (issue #684) decides how
+# many of its partitions a query visits. Each test below runs for both.
+_QUERY_KNOB_VALUES = {"refine_factor": 10, "nprobes": 100}
+_QUERY_KNOBS = [
+    pytest.param(knob, value, id=knob) for knob, value in _QUERY_KNOB_VALUES.items()
+]
+
+
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_a_query_knob_does_not_invalidate_a_published_index(knob: str, value: int) -> None:
+    """A query-time knob changes neither the rows written nor the index
+    built. Inside the fingerprint it would demand a blue/green rebuild and a
+    full re-embed to turn on a knob that only affects how a query is answered
+    — and the collection it most needs turning on for is the one large enough
     to make that rebuild unaffordable."""
     approximate = {**_APPROX_VECTOR}
-    refined = {**_APPROX_VECTOR, "refine_factor": 10}
+    tuned = {**_APPROX_VECTOR, knob: value}
 
-    assert _fingerprint(vector=refined) == _fingerprint(vector=approximate)
-    assert classify_changes(_search(vector=approximate), _search(vector=refined)) == []
+    assert _fingerprint(vector=tuned) == _fingerprint(vector=approximate)
+    assert classify_changes(_search(vector=approximate), _search(vector=tuned)) == []
 
 
-def test_refine_factor_is_dropped_from_the_descriptor_not_merely_ignored() -> None:
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_a_query_knob_does_not_fail_a_pre_344_collections_proof(knob: str, value: int) -> None:
+    """Codex review, #686. A collection stamped before descriptors existed is
+    re-stamped in place only if the legacy whole-config digest still matches;
+    otherwise the run demands `--full-refresh`. Turning on a query knob must
+    not break that match. Descriptors shipped in #344, before either knob
+    existed, so no legacy stamp can contain one and dropping it proves
+    nothing away."""
+    plain = legacy_collection_config_fingerprint(
+        _config(vector={**_APPROX_VECTOR}), store_type="lancedb"
+    )
+    tuned = legacy_collection_config_fingerprint(
+        _config(vector={**_APPROX_VECTOR, knob: value}), store_type="lancedb"
+    )
+
+    assert tuned == plain
+    assert legacy_collection_config_fingerprint(
+        _config(vector={**_APPROX_VECTOR, "dimensions": 3}), store_type="lancedb"
+    ) != plain, "a real change must still break the proof"
+
+
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_a_query_knob_is_dropped_from_the_descriptor_not_merely_ignored(
+    knob: str, value: int
+) -> None:
     """A stored descriptor is compared field by field, so the knob has to be
     absent from it rather than compared and found equal — otherwise a
     collection stamped before the field existed reports a drift against one
     stamped after it."""
-    descriptor = _search(vector={**_APPROX_VECTOR, "refine_factor": 10})
+    descriptor = _search(vector={**_APPROX_VECTOR, knob: value})
 
-    assert "refine_factor" not in descriptor["vector"]
+    assert knob not in descriptor["vector"]
     assert descriptor["vector"]["search"] == "approximate"
 
 
@@ -811,45 +844,70 @@ def test_an_id_field_that_is_also_an_attribute_is_indexed_once() -> None:
     assert fields == ("chunk_id",)
 
 
-# ─── refine_factor is a query knob, not an index property (issue #520) ──────
+# ─── refine_factor and nprobes are query knobs, not index properties ────────
+# (issues #520 and #684)
 
 
-def test_refine_factor_under_exact_search_is_refused_at_config_time() -> None:
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_a_query_knob_under_exact_search_is_refused_at_config_time(
+    knob: str, value: int
+) -> None:
     """Same rule as `index`, same reason. Exact search computes true distances
-    over the stored vectors, so re-ranking them against those same vectors
-    changes nothing — accepting the key would be a flag that looks like a
-    decision and is not."""
+    over every stored vector, so re-ranking them against those same vectors
+    changes nothing and there are no partitions to probe — accepting the key
+    would be a flag that looks like a decision and is not."""
     with pytest.raises(ValidationError, match="only applies to search: approximate"):
-        _vector_model(search="exact", refine_factor=10)
+        _vector_model(search="exact", **{knob: value})
 
 
-@pytest.mark.parametrize("value", [0, -1, 101])
+@pytest.mark.parametrize("value", [0, -1, 1001])
 def test_refine_factor_is_bounded(value: int) -> None:
     """The candidates fetched are `limit * refine_factor` full vectors, so an
-    unbounded value turns one query into an unbounded read."""
+    unbounded value turns one query into an unbounded read. The cap moved
+    from 100 to 1000 for #684: a 3.67M-row corpus needed 300 to reach recall
+    0.945 on real agent queries, and the previous cap put that out of reach."""
     with pytest.raises(ValidationError):
         _vector_model(search="approximate", refine_factor=value)
 
 
-def test_refine_factor_is_accepted_under_approximate_search() -> None:
-    model = _vector_model(search="approximate", refine_factor=10)
+@pytest.mark.parametrize("value", [0, -1])
+def test_nprobes_must_be_positive(value: int) -> None:
+    """Zero probes is no search at all. There is no upper cap: above the
+    partition count LanceDB probes every partition, which is exact search at
+    index cost, not an unbounded read."""
+    with pytest.raises(ValidationError):
+        _vector_model(search="approximate", nprobes=value)
+
+
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_a_query_knob_is_accepted_under_approximate_search(knob: str, value: int) -> None:
+    model = _vector_model(search="approximate", **{knob: value})
 
     assert model.search is not None and model.search.vector is not None
-    assert model.search.vector.refine_factor == 10
+    assert getattr(model.search.vector, knob) == value
 
 
-def test_an_unset_refine_factor_is_invisible_in_every_dump() -> None:
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_an_unset_query_knob_is_invisible_in_every_dump(knob: str, value: int) -> None:
     """The upgrade trap. Every fingerprint, the collection descriptor, the
     manifest, and the code-version hash all start from a dump of this model,
     so a new field that surfaced as `None` would have re-keyed every search
-    model ever published — reprocessing a corpus to add a knob nobody set."""
+    model ever published — reprocessing a corpus to add a knob nobody set.
+    And setting one knob must not surface the other."""
     model = _vector_model(search="approximate")
     assert model.search is not None and model.search.vector is not None
+    assert knob not in model.search.vector.model_dump(mode="python")
 
-    assert "refine_factor" not in model.search.vector.model_dump(mode="python")
+    other = next(name for name in _QUERY_KNOB_VALUES if name != knob)
+    tuned = _vector_model(search="approximate", **{other: _QUERY_KNOB_VALUES[other]})
+    assert tuned.search is not None and tuned.search.vector is not None
+    assert knob not in tuned.search.vector.model_dump(mode="python")
 
 
-def test_setting_refine_factor_does_not_re_key_the_model(tmp_path: Path) -> None:
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_setting_a_query_knob_does_not_re_key_the_model(
+    tmp_path: Path, knob: str, value: int
+) -> None:
     """And the other half: turning it *on* must not reprocess the corpus
     either, because it changes how a query is answered and not one published
     row."""
@@ -857,8 +915,8 @@ def test_setting_refine_factor_does_not_re_key_the_model(tmp_path: Path) -> None
     plain = compute_model_code_version(
         _vector_model(search="approximate"), project, tmp_path
     )
-    refined = compute_model_code_version(
-        _vector_model(search="approximate", refine_factor=10), project, tmp_path
+    tuned = compute_model_code_version(
+        _vector_model(search="approximate", **{knob: value}), project, tmp_path
     )
 
-    assert plain == refined
+    assert plain == tuned

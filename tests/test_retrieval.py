@@ -261,6 +261,45 @@ def test_public_search_requires_operator_profile_opt_in(tmp_path: Path) -> None:
         validate_retrieval_capabilities(models, project, resolved)
 
 
+@pytest.mark.parametrize("nprobes", [100, None], ids=["declared", "absent"])
+def test_nprobes_is_refused_for_a_store_without_partitions(
+    tmp_path: Path, nprobes: int | None
+) -> None:
+    """Codex review, #686. DuckDB's approximate index is HNSW, not IVF, so
+    `nprobes` has nothing to act on there; accepted, it would be a tuning
+    that looks operative and does nothing. Refused at preflight, before any
+    source is read. The `absent` case proves the refusal is `nprobes`'s and
+    not the store's: the same approximate model without it validates."""
+    write_project(tmp_path)
+    profile_path = tmp_path / "profiles.yml"
+    profile_path.write_text(
+        profile_path.read_text(encoding="utf-8").replace(
+            "            type: lancedb\n            path: target/lancedb\n",
+            "            type: duckdb\n            path: target/retrieval.duckdb\n"
+            "            hnsw_experimental_persistence: true\n",
+        ),
+        encoding="utf-8",
+    )
+    knob = f"        nprobes: {nprobes}\n" if nprobes is not None else ""
+    model_path = tmp_path / "models" / "retrieval.yml"
+    model_path.write_text(
+        model_path.read_text(encoding="utf-8").replace(
+            "        search: exact\n", f"        search: approximate\n{knob}"
+        ),
+        encoding="utf-8",
+    )
+    project, sources, models = load_project(tmp_path)
+    validate_project_contract(project, sources, models, tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+
+    if nprobes is None:
+        validate_retrieval_capabilities(models, project, resolved)
+        return
+    with pytest.raises(ConfigError, match="partition_probes") as error:
+        validate_retrieval_capabilities(models, project, resolved)
+    assert "duckdb" in str(error.value)
+
+
 def test_inherited_embedding_identity_requires_an_upstream_embed_resource(
     tmp_path: Path,
 ) -> None:
@@ -2146,28 +2185,30 @@ def test_a_pq_collection_that_shrank_below_the_floor_keeps_publishing(tmp_path: 
         assert _vector_index_types(store, name) == ["IvfPq"]
 
 
-def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None:
+def test_the_serving_descriptor_versions_its_vector_fields(tmp_path: Path) -> None:
     """A new key in a documented artifact is a schema change (AGENTS.md), even
-    an additive one: a consumer pinning version 1 should fail loudly rather
-    than read the wider shape as the narrower. The default is never written,
-    so the only difference between the versions is a declared `index`.
-
-    Version 3 adds `stale_after_seconds` (issue #682), the declared freshness
-    policy the MCP catalog judges an index's activation time against. Null
-    here, because this project declares no policy -- which is what every
-    descriptor written under 1 and 2 means too."""
+    an additive one: a consumer pinning an older version should fail loudly
+    rather than read the wider shape as the narrower. Version 2 added a
+    declared `index` (#476). Version 3 adds `stale_after_seconds` (#682), the
+    declared freshness policy the MCP catalog judges an index's activation
+    time against, and the query knobs `refine_factor` and `nprobes` (#684,
+    Codex review #686). None of the optional `vector` keys is written when
+    unset, and `stale_after_seconds` is null when no policy is declared, so
+    the versions differ only in what a model declares."""
     write_project(tmp_path)
     resource = next(
         model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
     )["output"]["serving_resource"]
     assert resource["schema_version"] == 3
-    assert "index" not in resource["vector"]
+    assert not {"index", "refine_factor", "nprobes"} & set(resource["vector"])
     assert resource["stale_after_seconds"] is None
 
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(
         model_path.read_text(encoding="utf-8").replace(
-            "        search: exact\n", "        search: approximate\n        index: ivf_pq\n"
+            "        search: exact\n",
+            "        search: approximate\n        index: ivf_pq\n"
+            "        refine_factor: 30\n        nprobes: 100\n",
         ),
         encoding="utf-8",
     )
@@ -2176,6 +2217,9 @@ def test_the_serving_descriptor_versions_the_index_field(tmp_path: Path) -> None
     )["output"]["serving_resource"]
     assert resource["schema_version"] == 3
     assert resource["vector"]["index"] == "ivf_pq"
+    assert resource["vector"]["refine_factor"] == 30
+    assert resource["vector"]["nprobes"] == 100
+    assert "partition_probes" in resource["capabilities"]["required"]
 
 
 # ─── resuming a generation a failed publish left behind (issue #492) ────────

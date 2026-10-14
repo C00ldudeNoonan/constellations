@@ -552,6 +552,8 @@ def _model_dict_v2(
     ]
     if search.vector is not None:
         required.append(f"{search.vector.search}_vector_search")
+        if search.vector.nprobes is not None:
+            required.append("partition_probes")
     if search.full_text is not None:
         required.append("full_text_search")
     if any(attribute.filter_role != "none" for attribute in search.attributes):
@@ -586,11 +588,15 @@ def _model_dict_v2(
                 # structure, when it is not the default. Absent means
                 # `ivf_hnsw_flat` -- the config's serializer omits the default
                 # so every descriptor written under version 1 reads the same.
-                # 3 (issue #682): `stale_after_seconds` carries the declared
-                # freshness policy, so the MCP catalog can judge the index's
-                # activation time without reading project YAML. Null means no
-                # policy was declared, which is what every descriptor written
-                # under 1 and 2 means.
+                # 3 (issues #682, #684): `stale_after_seconds` carries the
+                # declared freshness policy, so the MCP catalog can judge the
+                # index's activation time without reading project YAML; null
+                # means no policy was declared, which is what every descriptor
+                # written under 1 and 2 means. And `vector` may carry the
+                # query-time knobs `refine_factor` and `nprobes`, each only when
+                # set -- #520 added `refine_factor` under 2 without a bump
+                # (Codex review, #686). Both landed before any release shipped
+                # 3, so one version covers them.
                 "schema_version": 3,
                 "config_fingerprint": collection_config_fingerprint(
                     effective_search, store_type=config.type

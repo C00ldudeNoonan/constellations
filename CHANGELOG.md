@@ -45,7 +45,162 @@
   now dropped from that hash, as from the descriptor. No legacy stamp can
   contain them, since both postdate descriptors.
 
-## v0.21.1 - 2026-10-10
+### A served index says how current it is (issue #682)
+
+- **A live index reported `unknown`.** `list_context_models` hard-coded
+  `freshness: "unknown"`, and `last_successful_materialization` came from the
+  latest `run_results.json` -- which goes back to null after any run whose
+  selection leaves the search index out, and after a container start that
+  rehydrates the store from object storage without a run at all. Against
+  astrolabe prod on 2026-10-12 the index was active and answering, and
+  reported both.
+- **The age is now the activation it serves.** The serving ledger gains
+  `activated_epoch`, written only by `mark_ready`, and
+  `list_context_models` reads it per listing. A date describes a generation,
+  so a failure that drops the active generation drops the date with it, and
+  the catalog reports no age while nothing is active. Because a failed publish that
+  keeps serving its predecessor leaves the stamp alone, an index whose
+  publishes have been failing for days stops looking fresh -- the #617 shape
+  that previously looked identical to a fresh index. Recovery carries the
+  stamp forward with the pointers it retains.
+- **`freshness` can be judged against a declared policy.** `search:` takes an
+  optional `freshness: stale_after: {count, period}`; past it the model
+  reports `pipeline_stale`. With no policy declared a published index reports
+  `fresh` and carries its activation time, and `unknown` now means only that
+  there is no activation on record. The threshold is reporting policy, so it
+  sits outside `code_version`: tightening it never republishes a row.
+- **The catalog no longer reads `run_results.json`.** How current an index is
+  is live warehouse state. Serving-descriptor `schema_version` is 3, carrying
+  the declared policy; a ledger written before the column reads as "no
+  activation on record" rather than failing a listing. Recorded in
+  [ADR-0032](docs/adr/0032-a-served-indexs-age-is-the-activation-it-serves.md).
+
+### The star map reaches the source (issue #555 item 7, #678)
+
+- **The map could not say "says who?".** It carried concept frequencies,
+  per-period history and document breakdowns, and no way to see one sentence
+  behind any of it -- while the project already served exactly that sentence
+  through `search_context`. `stel concept-cloud --context-model <model>
+  --serve` now writes the artifact and serves it on `127.0.0.1`, and the
+  detail card grows a **Show me a sentence** button.
+- **The sentence is fetched on click, never baked in.** The bundle (schema
+  v6) carries `source_access: {model}` -- a name, and nothing else from the
+  serving side. An artifact shared with someone holds the aggregates it
+  always did, and the viewer gates its button on a same-origin probe, so a
+  file opened from disk shows no affordance rather than a dead one.
+- **It is the governed service answering.** The lookup goes through
+  `ContextService`, the same object `stel mcp serve` wraps, so a sentence has
+  passed the same authorization and policy filter an agent's would, against
+  the same pinned generation, and leaves a query-log row naming
+  `stel concept-cloud` as the client. A degraded index is reported on the
+  card rather than silently served as current.
+- **The card says how it found the sentence.** A concept whose `canonical_id`
+  is a declared `vocabularies:` term is fetched scoped to that term, so the
+  chunk is one entity linking actually linked to it; a concept no vocabulary
+  declares is matched as text, and that weaker claim is labelled as one.
+- **Loopback, single-operator, and enforced as such.** The process is the
+  principal exactly as over stdio, so the bind address is not configurable; a
+  foreign `Host` (DNS rebinding) or a cross-origin `Origin` is refused, no
+  CORS header is emitted, and the endpoint answers only for concept ids the
+  served bundle contains -- so it cannot be driven as a search proxy by
+  anything else that reaches loopback. ADR-0031 records why this shape rather
+  than a token in the artifact.
+
+### A LanceDB store keeps a mirror, and a fresh host restores from it (issue #666)
+
+- **A local store had no copy anywhere else.** v0.22.0 let a store declare an
+  `identity:` so its bytes could move off a `gs://` URI onto local disk and stop
+  paying egress on every read. That left the copy -- the thing a fresh host is
+  rebuilt from -- to a `gcloud storage rsync` stel knew nothing about. A LanceDB
+  store now takes `mirror:` (a `gs://` or `s3://` URI, or a local path), and
+  every successful publish and `stel serving activate` ends by syncing the
+  served generation to it. Builds and queries never read the mirror.
+- **The copy is files, not rows.** A Lance table is immutable files plus the
+  manifests that name them, so the mirror holds the same versions and the same
+  indices; nothing is rebuilt there, and nothing is rebuilt on restore. Files
+  land before the manifests that name them and the version hint lands last, so
+  the mirror is a readable table wherever a copy stops, and a rerun copies only
+  what the mirror lacks. Files the primary prunes leave the mirror too, and a
+  rebuild's superseded generation is retired from it once the new one is
+  recorded.
+- **A sync is a reader.** It holds a query lease for the length of the copy,
+  which keeps an in-place publish and generation retirement off the collection
+  it is copying, and it mirrors a collection only when that collection is the
+  generation the serving ledger activated.
+- **The ledger records what the mirror holds.** Three nullable columns on the
+  serving ledger (`mirror_generation`, `mirror_target`, `mirrored_epoch`), added
+  in place to an existing ledger. `stel serving status` now prints a `mirror:`
+  line saying whether the mirror holds the served generation, and an
+  `identity:` line naming the store's declared identity -- once a store can
+  move, its location no longer says which store a command resolved to.
+- **`stel serving sync <index>`** retries a sync that failed, or gives an index
+  published before the mirror existed its first copy. A sync that fails at the
+  end of a publish fails the model and names this command; the publication
+  itself stands, still ready and serving.
+- **`stel serving restore <index> --target T`** copies the served generation
+  from the mirror onto a primary that lacks it -- a fresh host, a lost disk.
+  The publication state was in the warehouse all along, so the next run
+  reconciles nothing and embeds nothing. It restores only when the mirror holds
+  exactly the generation the ledger serves, never overwrites a file the
+  primary already has, and checks the generation it produced before reporting
+  success.
+- `mirror:` requires a local primary `path`, and reaches its bucket with the
+  environment's default credentials (Application Default Credentials for
+  `gs://`, the AWS default chain for `s3://`). ADR-0030 records why the mirror
+  is a byte copy, why a failed sync fails the model, and why the sync holds a
+  query lease rather than the publish claim.
+
+## v0.22.0 - 2026-10-09
+
+### A store can be named independently of where it sits (issue #666)
+
+- **A cloud store could not move, so it kept charging for being read.** A
+  store's publication state, serving-ledger row and publisher lock are keyed on
+  a fingerprint of its *location*, so copying a `gs://` store onto local disk
+  produced a store that had never published anything: `stel mcp serve` refused
+  it, and the next run re-embedded the corpus. Reading the bucket instead cost
+  1.43 TB of egress over two months on one real deployment — about $150, some
+  $70 of it per index rebuild — because every process reading it ran outside
+  GCP. A store config now takes `identity:`, a stable label that *is* the
+  store's identity: the location and its routing leave the fingerprint, so one
+  store resolves to one scope whether it is read from the bucket, a local
+  primary, or a copy restored onto a fresh host.
+- **Declaring nothing changes nothing.** Without `identity:` the fingerprint is
+  byte-identical to the one that shipped, down to omitting empty routing.
+  `tests/test_store_identity.py` pins the three digests as literals read off an
+  unmodified tree, because getting this wrong strands every published index.
+- **A label is not a location.** `identity:` takes 1 to 128 characters of
+  `[A-Za-z0-9._:-]` starting with a letter or digit, so a pasted URI is refused
+  at the profile boundary instead of quietly becoming a third identity. It is
+  keyed apart from derived locations, so no label can collide with the
+  fingerprint another store derives from a path that spells the same text.
+- **An index published before the move brings its rows with it.** `stel serving
+  migrate-scope --from-path gs://bucket/lancedb` re-derives the scope the store
+  had at its old location — routing included, since the old fingerprint folded
+  it in — and moves the ledger row and publication state onto the scope the
+  profile resolves now. Still idempotent, and a `--from-path` naming the
+  store's current location moves nothing rather than reporting the whole corpus
+  as migrated.
+- ADR-0029 records why the decoupling lands before the `mirror:` URI #666 asks
+  for: a mirror at a second URI is a different store until identity stops being
+  the path, so `mirror:` would have had to smuggle this in as a side effect of
+  a sync feature.
+
+### The concept cloud says who names a concept (issue #555 item 5)
+
+- **`concept-cloud --breakdown name=model.column`** (repeatable) counts each
+  concept's documents by a document-level field from a `document_id`-keyed
+  model. The detail card now says how many documents name the concept and
+  shows the split: "FERC: named in 300 filings, 71% Utilities, 18% Energy, no
+  sector 11%". Counts are distinct documents, the same unit as the new "named
+  in N documents" line, so documents with no value are shown as such, never
+  folded into a value.
+- A document given two different values is refused, as is a field with more
+  than 50 distinct values. A breakdown is a categorical document field, not an
+  identifier.
+- **The bundle is schema version 5.** Version 4 bundles are refused. Re-export
+  to upgrade; a bundle without `--breakdown` carries an empty `breakdowns`.
+- `--demo` now includes a `section` breakdown.
 
 ### The serving catalog reads the declaration the artifact was compiled with (issue #669)
 
@@ -184,10 +339,11 @@
   an undeclared class cannot spend an embedding call and a warehouse read
   first, and its refusal is deterministic rather than whichever error
   retrieval happened to raise.
-- Known limitation, tracked as #669: the serving catalog reads the *live*
+- While #628 was in development the serving catalog read the *live*
   declaration rather than the one that published the links, so editing
-  `vocabularies:` without recompiling can change what a scope returns.
-  Recompile and republish after editing the declaration.
+  `vocabularies:` without recompiling could change what a scope returned.
+  That was #669, and it was fixed before this release shipped -- see the
+  entry above. No released version carries the live-declaration behavior.
 - **A scope naming something undeclared is refused**, listing what is
   declared, rather than returning nothing: an undeclared class and an empty
   corpus are different answers. A project with no `vocabularies:` refuses an
@@ -214,10 +370,13 @@
   `schema_fields`) rather than what is in the rows a given caller may read. An
   agent can no longer probe corpus contents through it, and a caller
   authorized for nothing still sees the vocabulary.
-- **No manifest or contract change.** `ArtifactCatalog.load` already read the
-  project to find `target_path` and discarded the rest; it now keeps the
-  declaration. `context_entity_links` is untouched, so `agent_context/v1`
-  does not move.
+- **#628 needed no manifest or contract change of its own.**
+  `ArtifactCatalog.load` already read the project to find `target_path` and
+  discarded the rest; it kept the declaration without a schema change. The
+  manifest does move to v3 in this release, for #669 above, which persists the
+  declaration into the artifact rather than re-reading the project.
+  `context_entity_links` is untouched either way, so `agent_context/v1` does
+  not move.
 - **A declared hierarchy can now be walked.** `broader` was authored and
   validated (cycles rejected) but nothing could read it. `broader_chain()`
   walks up, `narrower_labels()` inverts it transitively, and

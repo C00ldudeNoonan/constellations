@@ -562,6 +562,7 @@ _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
     ("llm-map-config", 1, "5ed9c5ffcb8d96f026b8a3bbd2946510"),
     ("stel.correction-input", 1, "493291bb0fe948b2f4bae167d8d9956c"),
     ("stel.retrieval-judgment-candidate", 1, "9962684026d2803c4aeaf1a21a6da8e0"),
+    ("stel.retrieval-mirror", 1, "ffc00e3298ef1ab26e9fcdf0f9678eb8"),
     ("stel.transcript-tool-args", 1, "fd50cbbb265122dee92aedd63a226410"),
 )
 

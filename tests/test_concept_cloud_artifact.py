@@ -640,3 +640,123 @@ def test_focus_reframes_the_camera_on_what_it_shows() -> None:
 
     assert "Graph.zoomToFit(600, 60, n => nodeVisible(n))" in html
     assert "if (wasFocused) fitView();" in html
+
+
+# ─── v6: reach the source (issue #555 item 7, #678) ─────────────────────────
+
+
+def _sourced_export() -> ConceptCloudExport:
+    from stel.concept_cloud.schema import SourceAccess
+
+    return placeholder_export().model_copy(
+        update={"source_access": SourceAccess(model="sec_context_chunks")}
+    )
+
+
+def test_a_bundle_declares_no_context_model_by_default() -> None:
+    """The affordance is opt-in. Without `--context-model` the artifact is
+    what v5 produced: no key in the island, and nothing for the viewer to
+    gate on."""
+    island = _extract_data_island(render_concept_cloud(placeholder_export()))
+    assert island["source_access"] is None
+
+
+def test_the_declared_context_model_reaches_the_bundle_and_the_viewer() -> None:
+    html = render_concept_cloud(_sourced_export())
+    island = _extract_data_island(html)
+    assert island["source_access"] == {"model": "sec_context_chunks"}
+    assert "DATA.source_access?.model" in html
+
+
+def test_no_sentence_is_in_the_artifact_only_the_model_name() -> None:
+    """The whole reason the sentence is fetched on click: an artifact that is
+    emailed around carries aggregates and a model name, never governed
+    document text. The bundle has exactly one string from the serving side."""
+    island = _extract_data_island(render_concept_cloud(_sourced_export()))
+    assert list(island["source_access"]) == ["model"]
+    assert "snippet" not in json.dumps(island)
+
+
+def test_the_source_button_is_gated_on_a_same_origin_probe() -> None:
+    """A shared artifact must not offer a button that cannot work, so the
+    bundle declaring a model is necessary but not sufficient: the viewer asks
+    whether anything is serving it first."""
+    html = render_concept_cloud(_sourced_export())
+    assert "function probeSource()" in html
+    assert '"/_stel/source/health"' in html
+    # The renderer returns nothing at all until the probe has answered.
+    assert 'if (!sourceReady || node.kind !== "concept") return "";' in html
+    assert 'class="srcbtn">Show me a sentence' in html
+
+
+def test_the_card_says_whether_a_sentence_was_linked_or_text_matched() -> None:
+    """"Linked to FERC" and "contains the word FERC" are different claims
+    about the corpus, and the card reports which one it got."""
+    html = render_concept_cloud(_sourced_export())
+    assert 'got.scope === "term"' in html
+    assert '"linked to "' in html
+    assert '"text match on its name"' in html
+
+
+def test_the_fetched_sentence_is_escaped_before_it_becomes_markup() -> None:
+    """A snippet is warehouse document text and the card is innerHTML. The
+    JSON island cannot carry it -- it arrives over fetch -- so `esc` is the
+    only guard there is."""
+    html = render_concept_cloud(_sourced_export())
+    assert "esc(got.snippet)" in html
+    assert "${got.snippet}" not in html
+    assert "esc(got.message)" in html
+
+
+def test_a_fetched_sentence_is_never_persisted() -> None:
+    """Fetching on click is what keeps governed text from coming to rest. A
+    cache in browser storage would undo that for every reader of the page,
+    so the viewer uses none at all."""
+    html = render_concept_cloud(_sourced_export())
+    for api in ("localStorage", "sessionStorage", "indexedDB", "document.cookie"):
+        assert api not in html, api
+    # In-memory for the page view, and that is the whole cache.
+    assert "const SENTENCES = new Map();" in html
+
+
+def test_cli_concept_cloud_refuses_serve_without_a_context_model() -> None:
+    """Refused before the export, which reads the warehouse and can run for
+    hours: being told the flags do not combine is worth nothing afterwards."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    result = CliRunner().invoke(cli, ["concept-cloud", "--demo", "--serve"])
+    assert result.exit_code != 0
+    assert "--context-model" in result.output
+
+
+def test_cli_concept_cloud_takes_the_documented_reach_the_source_flags() -> None:
+    """The reference's reach-the-source example is one command a reader
+    copies; the `-o` incident above is what happens when a documented flag
+    does not exist."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    help_text = CliRunner().invoke(cli, ["concept-cloud", "--help"]).output
+    for flag in ("--context-model", "--serve", "--port"):
+        assert flag in help_text, flag
+
+
+def test_cli_concept_cloud_refuses_reach_the_source_on_a_built_in_bundle() -> None:
+    """The built-in bundles return before the export runs, so either flag
+    passed with one would silently do nothing -- and their concepts are
+    samples no project's index contains. Both spellings are refused."""
+    from click.testing import CliRunner
+
+    from stel.cli import cli
+
+    for args in (
+        ["--demo", "--context-model", "m"],
+        ["--demo", "--serve", "--context-model", "m"],
+        ["--placeholder", "--context-model", "m"],
+    ):
+        result = CliRunner().invoke(cli, ["concept-cloud", *args])
+        assert result.exit_code != 0, args
+        assert "--placeholder or --demo" in result.output, args

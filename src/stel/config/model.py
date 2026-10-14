@@ -24,6 +24,7 @@ from pydantic_core import CoreSchema, PydanticCustomError, core_schema
 from ..agent_context import AgentContextGrain
 from ..credentials import CredentialReference, CredentialReferenceError
 from .identifiers import validate_node_name
+from .source import DurationSpec
 from .vocabulary import VALUES_FROM_PATTERN
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
@@ -852,6 +853,26 @@ class EvalConfig(BaseModel):
         return v
 
 
+class SearchFreshnessConfig(BaseModel):
+    """How long this index's contents stay current enough to call fresh.
+
+    Measured from the moment the serving generation was activated, not from
+    the last time a publisher ran: a publish that fails and retains its
+    predecessor has not refreshed anything, and an index whose publishes have
+    been failing for days is exactly the case this exists to make visible
+    (issues #617, #682).
+
+    `stale_after` is required, because the only reason to declare this block
+    is to name the threshold. Declaring no block at all leaves the index
+    without a policy, and `list_context_models` then reports the activation
+    time without judging it.
+    """
+
+    model_config = _STRICT_CONFIG
+
+    stale_after: DurationSpec
+
+
 class SearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -868,6 +889,7 @@ class SearchConfig(BaseModel):
     attributes: tuple[SearchAttributeConfig, ...] = ()
     display_fields: tuple[str, ...] = ()
     query: SearchQueryConfig
+    freshness: SearchFreshnessConfig | None = None
     on_index_change: Literal["fail", "rebuild", "online"] = "fail"
     batch_size: int = Field(default=1000, ge=1, le=100_000)
     index_options: dict[str, Any] = Field(default_factory=dict)

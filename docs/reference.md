@@ -394,6 +394,8 @@ stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FI
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
 stel serving recover <search-index> --target T --owner-terminated  # explicit authority reassignment after a crash
 stel serving migrate-scope <search-index>                # one-time move onto the logical-collection serving key
+stel serving sync <search-index>                         # copy the served generation to the store's mirror
+stel serving restore <search-index> --target T           # bring the served generation back from the mirror
 stel grants list [--subject S] [--relation R]            # what the governed MCP server authorizes from
 stel grants show <subject>                               # one subject's grants, and what it reads as
 stel grants history [--subject S] [--limit N]            # recorded changes, newest first: who changed what, when
@@ -2971,6 +2973,135 @@ my_project:
             path: ./target/lancedb
 ```
 
+#### What a cloud store costs to read from outside the cloud
+
+A `gs://`, `s3://` or `az://` store is read over the network on every build and
+every query. When the processes reading it run outside that provider's network
+— a laptop, a CI runner, a container on another cloud — each of those reads is
+billed as internet egress, and an index rebuild reads the whole corpus.
+
+Measured on one real deployment over two months: 1.43 TB egress and 11.8M
+ReadObject calls against a `gs://` store whose publisher and query processes
+all ran on one machine outside GCP, which is roughly $150 at GCS egress rates,
+about $70 of it for a single index rebuild (issue #666).
+
+A cloud store earns that when readers are genuinely distributed — a builder and
+servers in different containers that share no filesystem. When they are not,
+the store wants to be local, with a copy to the bucket for durability and for
+restoring onto another host. That is what `identity:` and `mirror:` below make
+possible.
+
+#### A store's identity, and moving a store
+
+A store is identified by a fingerprint, and the search model's publication
+state, its serving-ledger row and its publisher lock are all keyed on it. By
+default that fingerprint is derived from *where the store is* — the normalized
+path, or the canonical cloud URI plus any non-secret routing. Two paths are two
+stores, which is what keeps state written against one object store from being
+read against another.
+
+It also means a store cannot move. Copy a `gs://` store to local disk and the
+copy is a different store: no ledger row, no publication state, so `stel mcp
+serve` refuses it as never published and the next run re-embeds the corpus.
+
+Declare an `identity:` to name the store independently of where it sits:
+
+```yaml
+          local:
+            type: lancedb
+            path: /srv/lancedb                 # where the bytes are today
+            identity: econ-prod                # what the store *is*
+```
+
+With one declared, the location and its routing are excluded from the
+fingerprint entirely, so the same store resolves to one scope whether it is
+read from the bucket, from a local primary, or from a copy restored onto a
+fresh host. It is a label, not a location: 1 to 128 characters of
+`[A-Za-z0-9._:-]` starting with a letter or digit, so a pasted URI is refused
+at the profile boundary rather than silently becoming a third identity. Keep it
+secret-free — it is fingerprinted into every scope the store owns.
+
+Declaring nothing keeps exactly the fingerprint that shipped, so adding the
+field to a profile changes no existing index.
+
+**An index published before the move needs its scope moved too**, because its
+rows are keyed on the location the store had:
+
+```bash
+stel serving migrate-scope sec_search --target prod --from-path gs://bucket/lancedb
+```
+
+That moves the ledger row and the publication state onto the scope the profile
+resolves now. It is idempotent: a second run reports zero rows moved. Give the
+old `path` exactly as the profile carried it; a store that declares no
+`identity:` will strand its scope again the next time it moves.
+
+Two different stores given the same `identity:` are one store as far as stel
+can tell — it will read one's publication state against the other. The derived
+default is what protects a profile that declares nothing, which is why it stays
+the default.
+
+#### A mirror: a copy of every served generation
+
+A LanceDB store with a local primary can keep a second copy in object storage:
+
+```yaml
+          local:
+            type: lancedb
+            path: /srv/lancedb                 # builds and queries read this
+            identity: econ-prod                # so a restored copy is the same store
+            mirror: gs://bucket/lancedb        # never read by a query
+```
+
+Every successful publish and `stel serving activate` ends by syncing the
+generation the serving ledger now serves to the mirror. The copy is a byte copy
+of the Lance table's files -- the same versions and the same indices, so nothing
+is rebuilt at the mirror or on restore -- and it copies only the files the
+mirror lacks. Files land before the manifests that name them, so the mirror is
+a readable table wherever a copy stops. Files the primary prunes leave the
+mirror too, and a rebuild's superseded generation is retired from it.
+
+`mirror:` takes a `gs://` or `s3://` URI or a local path, and reaches a bucket
+with the environment's default credentials -- Application Default Credentials
+for `gs://`, the AWS default chain for `s3://` -- the same ones `gcloud storage`
+or the AWS CLI would use. It requires a local primary `path`. It does not change
+the store's identity, so adding or moving a mirror re-keys nothing.
+
+**A sync that fails fails the model, not the publication.** The generation is
+already published and serving when the sync runs, so the ledger stays `ready`;
+the model reports the failure and names the command that retries it:
+
+```bash
+stel serving sync sec_search --target prod
+```
+
+Run the same command to give an index published before its store had a mirror
+its first copy. A sync holds a query lease while it copies, so an in-place
+publish of the same index waits for it as it would for any reader. It mirrors a
+collection only when that collection is the generation the ledger activated: an
+in-place publish that failed and left the scope `degraded` is not mirrored until
+a publish succeeds.
+
+`stel serving status` reports the mirror on its own line -- whether it holds the
+served generation and when it was synced, or that it is behind or was never
+synced -- and names the store's declared `identity:`.
+
+**Restoring onto a fresh host.** With the profile pointing at an empty primary
+and the same `identity:`:
+
+```bash
+stel serving restore sec_search --target prod
+```
+
+copies the served generation from the mirror into the primary. The publication
+state never left the warehouse, so the next run reconciles nothing and embeds
+nothing. A restore requires `--target`; it is refused unless the mirror holds
+exactly the generation the ledger serves, since an older copy would be served
+under state that does not describe it; it never overwrites a file the primary
+already has; and it checks that what it produced is the served generation
+before reporting success. A store restored to a different path without a
+declared `identity:` is a different store, and the restore says so.
+
 #### Bounding LanceDB's caches
 
 LanceDB keeps an index cache and a metadata cache whose own defaults are large
@@ -3546,6 +3677,35 @@ that model's exact provider identity for query-time embedding and rejects stale
 or dimension-incompatible indexes. Externally generated vectors still declare
 a complete embedding identity and require a precomputed query vector.
 
+### Declaring how long an index stays fresh
+
+`search: freshness: stale_after:` says how long the published contents stay
+current enough to report as fresh over MCP:
+
+```yaml
+models:
+  - name: sec_chunk_search
+    search:
+      freshness:
+        stale_after: {count: 2, period: day}
+```
+
+`stale_after` takes the same `{count, period}` shape as source freshness, with
+`period` one of `minute`, `hour`, `day`, or `week`. It is measured from the
+moment the serving generation was **activated**, not from the last time a
+publisher ran — a publish that fails and keeps serving its predecessor has
+refreshed nothing, so it does not reset the clock. An index whose publishes
+have been failing therefore reports `pipeline_stale` once it passes the
+threshold, while still answering queries from the generation it has (issue
+#682).
+
+Declaring the block is optional. Without it `list_context_models` reports when
+the index was last activated and leaves the age unjudged, as `fresh`; it
+reports `unknown` only when there is no activation on record at all. Nothing
+refuses a query on this basis — it is a signal for the caller, and
+`stel serving status` is the operator's fuller view. See
+[How current an index is](mcp.md#how-current-an-index-is).
+
 ### Changing a published index's configuration
 
 A published collection records a **semantic descriptor** of the configuration
@@ -3556,9 +3716,10 @@ Fields that only affect execution cadence are not part of the descriptor and
 never invalidate an index: **`batch_size`**, **`index_options`**, and
 `on_index_change` itself. Tuning publish pacing is free. So are
 **`vector: {refine_factor: ...}`** and **`vector: {nprobes: ...}`**, which
-change how a query is answered rather than what was published. The same
-five are outside the model's
-`code_version`, so changing one does not reclassify a single published row:
+change how a query is answered rather than what was published, and
+**`freshness`**, which only says how long the contents stay current enough to
+report as fresh. The same six are outside the model's `code_version`, so
+changing one does not reclassify a single published row:
 `stel plan` reports the model `unchanged`, and the next publish touches only
 rows whose input actually changed (issue #587). What *is* in `code_version`
 for a `search:` model is exactly the descriptor's semantic projection plus
@@ -5151,9 +5312,7 @@ come only from the declaration, never from document text, and they are
 separate from the `description` above, which comes from the names relation the
 operator maintains. A concept nothing declares, or one that two vocabularies
 declare differently, carries none of the three: the keys are absent from the
-bundle, not null, because an absent key is the signal. The bundle is schema
-version 4; a version 3 bundle is refused by the artifact rather than read as
-current.
+bundle, not null, because an absent key is the signal.
 
 Scope: this carries what a declaration states about each concept. It does not
 lay concepts out by class or by hierarchy (issue #345), and it does not add a
@@ -5173,6 +5332,42 @@ hand-maintained alias table or a fuzzy/vector-similarity match carries one
 too, an identifier namespace like `ticker` or `cik`, never a type — so a
 namespace counts here only when it, and the concept's own id, are a term this
 project's `vocabularies:` actually declares.
+
+**Who names a concept** (`--breakdown name=model.column`, repeatable; issue
+#555 item 5). "Focus" above answers *what does X name?*; this answers *who
+names X?* Point it at a **document-keyed** model, `document_id` plus a
+categorical column, and each concept's documents are counted by that column.
+The card then reads "named in 300 documents" with a bar and the top values:
+*sector: Utilities 71% · Energy 18% · no sector 11%*.
+
+```bash
+stel --project-dir path/to/stel_project concept-cloud \
+  --linking-model sec_starmap_links \
+  --breakdown sector=filing_sectors.sector \
+  -o cloud.html
+```
+
+- **Documents, not mentions.** A filing that names FERC forty times is one
+  Utilities filing. The unit is the same one behind "named in N documents", so
+  the shares are of that number. The linking model needs a `document_id`
+  column.
+- **No value is said, not guessed.** A document the model gives no value
+  (no row, or a null or blank cell) appears in no count. The card shows it as
+  "no sector" and as the bar's grey remainder.
+- **One value per document.** Two rows giving one document two different
+  values are refused, naming the documents: a warehouse read promises no row
+  order, so picking one would change the shares between two exports of
+  unchanged data. Two identical rows are fine.
+- **Categorical, at most 50 values.** The card lists a concept's values, so a
+  breakdown is a sector or a form type, not an identifier. A field with more
+  than 50 distinct values (a ticker, say) is refused with the remedy: group
+  the values in the model.
+- **Counted over every period.** With a time axis the slider changes the
+  stars, not the breakdown; the card labels it "(all periods)".
+
+A *dimension* (below) gives a concept one value and colors the star by it. A
+breakdown gives it a count per value, because a concept named across hundreds
+of filings has no single sector of its own.
 
 **Names and descriptions** (`--names-model <model>`, issue #554). Without it a
 concept is named by its **most frequent** mention text, ties broken lexically —
@@ -5216,6 +5411,50 @@ coloring:
   categorical column into a dimension. `llm:` enum fields fit directly: the
   label set is already declared and validated upstream.
 
+**Reach the source** (issue #678). The map is an aggregate: it says a concept
+was named in 300 documents and by whom, never what was said. `--context-model`
+plus `--serve` adds a **Show me a sentence** button to the detail card, which
+fetches one chunk naming that concept through the project's governed context
+service.
+
+```bash
+stel --project-dir path/to/stel_project concept-cloud \
+  --linking-model link_entities \
+  --context-model sec_context_chunks \
+  --serve --port 8081 \
+  -o cloud.html
+# Serving cloud.html at http://127.0.0.1:8081/  (Ctrl-C to stop)
+```
+
+- **No sentence is in the artifact.** The bundle carries the model's *name*
+  and nothing else from the serving side; the text is fetched on click while
+  the server runs, and is cached only in the page for that view. An artifact
+  you email to someone carries the aggregates it always did.
+- **It is `ContextService` answering** — the same object `stel mcp serve`
+  wraps — so a sentence has passed the same authorization and the same
+  policy filter an agent's would, against the same pinned generation, and
+  leaves a query-log row naming `stel concept-cloud` as the client.
+- **The button only appears while stel is serving the page.** The viewer
+  probes its own origin first, so an artifact opened from disk shows no
+  affordance rather than one that cannot work.
+- **The card says how the sentence was found.** A concept whose
+  `canonical_id` is a declared `vocabularies:` term is fetched scoped to that
+  term, so the chunk is one entity linking actually linked to it ("linked to
+  Federal Reserve"). A concept no vocabulary declares can only be matched as
+  text ("text match on its name") — a weaker claim, and it is labelled as
+  one.
+- **Single-operator, loopback only.** The process is the principal, exactly
+  as over stdio, so the bind address is `127.0.0.1` and is not configurable.
+  Requests that do not name this server — a foreign `Host`, a cross-origin
+  `Origin` — are refused, and no CORS header is emitted; the endpoint also
+  accepts only concept ids the served bundle contains, so it cannot be driven
+  as a general search proxy. It is a tool for the operator at the keyboard,
+  not a server to put in front of anyone else.
+
+`--serve` serves the artifact it just wrote, so re-browsing means re-running
+the export. `--context-model` without `--serve` is useful on its own: it
+records the model in the bundle, ready for whenever it is served.
+
 **Prerequisites.** The cloud is keyed on `canonical_id`, so an entity-linking
 (`link_entities`) model must have run; and human-readable node labels require the
 NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
@@ -5225,7 +5464,8 @@ NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
 warehouse credentials ever enter it, and raw document text appears only when the
 operator opted into it upstream. The bundle is a versioned contract
 (`ConceptCloudExport`, `schema_version`), so the static viewer and the export job
-evolve independently.
+evolve independently. The current version is 6. A bundle from any other version
+is refused by the artifact rather than read as current.
 
 ## Append-only logs
 

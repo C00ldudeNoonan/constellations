@@ -13,7 +13,9 @@ from types import MappingProxyType, TracebackType
 from typing import Any, Self
 
 import pyarrow as pa
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from ..hashing import canonical_fingerprint
 
 
 class RetrievalError(Exception):
@@ -39,13 +41,50 @@ class RetrievalCapabilityError(RetrievalError):
     pass
 
 
+# A label, not a location: no separators, no whitespace, nothing that invites
+# pasting a URI (which is what the field exists to stop being the identity).
+_STORE_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
 class RetrievalStoreConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: str
+    # The store's logical identity, when the operator declares one. Unset means
+    # "derive it from where the store physically is", which is what every
+    # existing profile gets and what keeps its published collections reachable.
+    # Declaring one is what lets a store live in more than one place over its
+    # life -- a local primary now, a copy restored onto a fresh host later --
+    # without the move reading as a different store that was never published
+    # (issue #666).
+    identity: str | None = None
+
+    @field_validator("identity")
+    @classmethod
+    def _validate_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _STORE_IDENTITY_RE.fullmatch(value):
+            raise ValueError(
+                "identity must be a stable label: 1-128 characters from "
+                "[A-Za-z0-9._:-] starting with a letter or digit. It is "
+                "deliberately not a path -- it names the store across "
+                "locations, so a location is the one thing it cannot be -- and "
+                "it must carry no secret, because it is fingerprinted into "
+                "every state scope and serving-ledger row the store owns"
+            )
+        return value
 
     def absolutize(self, project_dir: Path) -> RetrievalStoreConfig:
         return self
+
+    def mirror_location(self) -> str | None:
+        """Where this store keeps its mirror, canonicalized, or None.
+
+        Only a store type that can copy a generation byte for byte has a
+        mirror to configure (issue #666); every other one answers None.
+        """
+        return None
 
     def storage_location(self) -> str:
         """Where this store physically is, for output that has to name it.
@@ -302,6 +341,69 @@ def reject_generation_shaped_collection_name(physical: str) -> str:
 class SafeRetrievalTarget:
     store_type: str
     safe_target_identity: str
+
+
+def safe_retrieval_target(
+    store_type: str,
+    *,
+    declared_identity: str | None,
+    derived_location: str,
+    routing: Mapping[str, str],
+) -> SafeRetrievalTarget:
+    """Fingerprint one store's identity, declared or derived (issue #666).
+
+    A declared identity *replaces* the location, routing included. That is the
+    whole point of declaring one: the bytes may move -- a gs:// store copied
+    onto local disk to stop paying egress on every read, a generation restored
+    onto a fresh host -- while the collections the store published stay
+    reachable. Folding the location in anyway would make every such move a
+    different store with no ledger row and no publication state, which reads as
+    "never published" and re-embeds the corpus.
+
+    A declared identity is keyed under `identity` rather than `path`, so it can
+    never collide with the fingerprint another store derives from a location of
+    the same text.
+
+    With nothing declared the payload is byte-identical to the pre-#666 shape
+    -- including omitting `routing` when empty -- so every existing profile
+    keeps the state scope and ledger row it already has.
+    """
+    if declared_identity is not None:
+        payload: dict[str, Any] = {
+            "store_type": store_type,
+            "identity": declared_identity,
+        }
+    else:
+        payload = {"store_type": store_type, "path": derived_location}
+        if routing:
+            payload["routing"] = dict(routing)
+    return SafeRetrievalTarget(
+        store_type,
+        canonical_fingerprint(payload, domain="dbt-ml-safe-retrieval-target"),
+    )
+
+
+def mirror_fingerprint(location: str) -> str:
+    """Fingerprint of a canonical mirror location, for the serving ledger.
+
+    The ledger records which mirror holds a generation so that changing the
+    `mirror:` URI reads as "never synced to this one" rather than as a sync
+    that happened to a different bucket. A fingerprint and not the URI: the
+    ledger holds identities, never locations (ADR-0029).
+    """
+    return canonical_fingerprint({"mirror": location}, domain="stel.retrieval-mirror")
+
+
+@dataclass(frozen=True)
+class MirrorCopy:
+    """What one copy of a collection to or from a store's mirror did."""
+
+    files_copied: int
+    bytes_copied: int
+    # Removed from the mirror because the primary no longer has them --
+    # versions it pruned, or a file an interrupted copy left half-written.
+    # Always zero for a restore, which never removes anything.
+    files_deleted: int
 
 
 @dataclass(frozen=True)
@@ -612,6 +714,46 @@ class RetrievalStore(ABC):
             )
         raise RetrievalCapabilityError(
             f"Retrieval store '{self.store_type()}' cannot drop collections"
+        )
+
+    def sync_to_mirror(self, collection: str) -> MirrorCopy:
+        """Make the mirror hold `collection` exactly as the primary does.
+
+        A byte copy, never a re-write: the mirror holds the same versions and
+        the same indices, so a restore serves without rebuilding anything
+        (issue #666). The caller holds a query lease on the generation being
+        copied, which is what keeps an in-place publisher and a retirement
+        sweep off it for the duration. Idempotent: an interrupted copy is
+        finished by the next one.
+        """
+        del collection
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot keep a mirror"
+        )
+
+    def restore_from_mirror(self, collection: str) -> MirrorCopy:
+        """Copy `collection` from the mirror into the primary.
+
+        Copies only what the primary lacks and never replaces or removes a
+        file there, so a primary that has diverged from the mirror is refused
+        rather than overwritten. Idempotent, like the sync.
+        """
+        del collection
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot keep a mirror"
+        )
+
+    def mirror_collections(self) -> tuple[str, ...]:
+        """Every collection the mirror holds, by physical name."""
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot keep a mirror"
+        )
+
+    def drop_mirror_collection(self, name: str) -> None:
+        """Remove one collection from the mirror. Never touches the primary."""
+        del name
+        raise RetrievalCapabilityError(
+            f"Retrieval store '{self.store_type()}' cannot keep a mirror"
         )
 
     def index_config_refusal(

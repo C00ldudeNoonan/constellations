@@ -2189,15 +2189,19 @@ def test_the_serving_descriptor_versions_its_vector_fields(tmp_path: Path) -> No
     """A new key in a documented artifact is a schema change (AGENTS.md), even
     an additive one: a consumer pinning an older version should fail loudly
     rather than read the wider shape as the narrower. Version 2 added a
-    declared `index` (#476); version 3 the query knobs `refine_factor` and
-    `nprobes` (#684, Codex review #686). None is written when unset, so the
-    versions differ only in what a model declares."""
+    declared `index` (#476). Version 3 adds `stale_after_seconds` (#682), the
+    declared freshness policy the MCP catalog judges an index's activation
+    time against, and the query knobs `refine_factor` and `nprobes` (#684,
+    Codex review #686). None of the optional `vector` keys is written when
+    unset, and `stale_after_seconds` is null when no policy is declared, so
+    the versions differ only in what a model declares."""
     write_project(tmp_path)
     resource = next(
         model for model in build_manifest(tmp_path)["models"] if model["name"] == "context_search"
     )["output"]["serving_resource"]
     assert resource["schema_version"] == 3
     assert not {"index", "refine_factor", "nprobes"} & set(resource["vector"])
+    assert resource["stale_after_seconds"] is None
 
     model_path = tmp_path / "models" / "retrieval.yml"
     model_path.write_text(

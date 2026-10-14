@@ -25,6 +25,7 @@ from .cli_services.context import load_project_or_click as _load
 from .cli_services.watch import run_watch as _run_watch
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .concept_cloud import (
+    ConceptCloudExport,
     ConceptCloudExportError,
     TimeGrain,
     demo_export,
@@ -2409,6 +2410,17 @@ def mcp_serve(
     ),
 )
 @click.option(
+    "--breakdown",
+    "breakdowns",
+    multiple=True,
+    help=(
+        "Count each concept's documents by a document-level field, as "
+        "name=model.column (repeatable): the model is keyed `document_id`. "
+        "The detail card shows who names the concept, e.g. its share of "
+        "filings by sector."
+    ),
+)
+@click.option(
     "--names-model",
     default=None,
     help=(
@@ -2447,6 +2459,30 @@ def mcp_serve(
     ),
 )
 @click.option(
+    "--context-model",
+    default=None,
+    help=(
+        "Governed context model a card's `Show me a sentence` searches. The "
+        "bundle carries the name only; the sentence is fetched on click from "
+        "`--serve`, never baked into the artifact."
+    ),
+)
+@click.option(
+    "--serve",
+    is_flag=True,
+    help=(
+        "After writing, serve the artifact on 127.0.0.1 so its cards can "
+        "reach the source through this project's governed context service. "
+        "Needs --context-model. Ctrl-C to stop."
+    ),
+)
+@click.option(
+    "--port",
+    default=8081,
+    show_default=True,
+    help="Port for --serve.",
+)
+@click.option(
     "--title",
     default=None,
     help='Page heading and browser-tab title (default: "stel star map").',
@@ -2476,10 +2512,14 @@ def concept_cloud(
     embed_model: str | None,
     with_query_log: bool,
     dimensions: tuple[str, ...],
+    breakdowns: tuple[str, ...],
     names_model: str | None,
     time_field: str | None,
     time_grain: str,
     top_n_per_period: int,
+    context_model: str | None,
+    serve: bool,
+    port: int,
     title: str | None,
     subtitle: str | None,
     verbose: int,
@@ -2491,8 +2531,31 @@ def concept_cloud(
     ``--relation-model``/``--entity-model`` and a downstream ``--dbt-manifest``),
     ``--demo`` for the sizable built-in example, or ``--placeholder`` for the
     minimal one.
+
+    ``--context-model`` plus ``--serve`` adds the reach-the-source affordance
+    (#678): the card fetches one sentence per concept from the project's
+    governed context service while the server runs.
     """
     _configure_output(verbose, diagnostics_file=diagnostics_file)
+    # Checked before the export, which reads the warehouse and can run for
+    # hours: being told the flags do not combine is worth nothing afterwards.
+    if serve and not context_model:
+        raise click.ClickException(
+            "--serve reaches the source through a context model, so it needs "
+            "--context-model <model>. To view an artifact without one, open "
+            "the HTML file directly."
+        )
+    # Refused rather than ignored. The built-in bundles return before the
+    # export below, so either flag passed with one would silently do nothing,
+    # and their concepts are samples no project's index contains. One check
+    # covers both, because --serve without --context-model is already refused
+    # above.
+    if context_model and (placeholder or demo):
+        raise click.ClickException(
+            "--context-model names a model in your own project, so it does "
+            "not apply to the built-in --placeholder or --demo bundle. "
+            "Export with --linking-model to reach a project's own concepts."
+        )
     if placeholder or demo:
         bundle = demo_export() if demo else placeholder_export()
         written = write_concept_cloud(bundle, output, title=title, subtitle=subtitle)
@@ -2506,14 +2569,8 @@ def concept_cloud(
             "Pass --linking-model <model> to export a project's concepts, "
             "or --demo / --placeholder for a built-in bundle."
         )
-    dimension_specs: dict[str, str] = {}
-    for raw in dimensions:
-        name, _, spec = raw.partition("=")
-        if not name or not spec:
-            raise click.ClickException(
-                f"--dimension must be name=model.column, got {raw!r}"
-            )
-        dimension_specs[name] = spec
+    dimension_specs = _named_specs("--dimension", dimensions)
+    breakdown_specs = _named_specs("--breakdown", breakdowns)
     try:
         export = export_concept_cloud(
             ctx.obj["project_dir"],
@@ -2528,10 +2585,12 @@ def concept_cloud(
             embed_model=embed_model,
             with_query_log=with_query_log,
             dimension_specs=dimension_specs or None,
+            breakdown_specs=breakdown_specs or None,
             names_model=names_model,
             time_field=time_field,
             time_grain=cast(TimeGrain, time_grain),
             top_n_per_period=top_n_per_period,
+            context_model=context_model,
         )
     except (ConceptCloudExportError, AdapterError, *_CONFIG_ERRORS) as e:
         raise ConfigClickError(str(e)) from e
@@ -2539,6 +2598,44 @@ def concept_cloud(
     click.echo(
         f"Wrote concept-cloud artifact ({len(export.concepts)} concepts) to {written}"
     )
+    if serve:
+        _serve_concept_cloud(ctx, export, written, port=port)
+
+
+def _serve_concept_cloud(
+    ctx: click.Context, export: ConceptCloudExport, artifact: Path, *, port: int
+) -> None:
+    """Hand off to the loopback viewer server (#678).
+
+    Imported here rather than at module scope: it pulls in the context
+    service and the catalog, which no other `stel` invocation needs.
+    """
+    from .concept_cloud.serve import ConceptCloudServeError, serve_concept_cloud
+
+    try:
+        serve_concept_cloud(
+            export,
+            artifact,
+            project_dir=ctx.obj["project_dir"],
+            target=ctx.obj["target"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            port=port,
+        )
+    except ConceptCloudServeError as e:
+        raise click.ClickException(str(e)) from e
+    except (AdapterError, *_CONFIG_ERRORS) as e:
+        raise ConfigClickError(str(e)) from e
+
+
+def _named_specs(flag: str, raws: tuple[str, ...]) -> dict[str, str]:
+    """`name=model.column` values of a repeatable flag, by name."""
+    specs: dict[str, str] = {}
+    for raw in raws:
+        name, _, spec = raw.partition("=")
+        if not name or not spec:
+            raise click.ClickException(f"{flag} must be name=model.column, got {raw!r}")
+        specs[name] = spec
+    return specs
 
 
 @cli.group()
@@ -2665,6 +2762,11 @@ def _echo_serving_context(report: Any) -> None:
         f"store:             {report.store_alias} ({report.store_type}) "
         f"{report.store_location}"
     )
+    # Once a store can move, its location no longer says which logical store
+    # this is; the declared identity does (issue #666).
+    from .cli_services.serving import describe_identity
+
+    click.echo(f"identity:          {describe_identity(report.store_identity)}")
 
 
 @serving.command("status")
@@ -2675,6 +2777,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     """Show the publication ledger for one search index."""
     import time
 
+    from .cli_services.serving import describe_mirror as _describe_mirror
     from .cli_services.serving import describe_publisher_claim as _describe_publisher
     from .cli_services.serving import describe_serving as _describe_serving
     from .cli_services.serving import serving_status as _serving_status
@@ -2706,6 +2809,7 @@ def serving_status(ctx: click.Context, model_name: str) -> None:
     click.echo(f"active_collection: {entry.active_collection or '- (default)'}")
     # What the two lines above mean for a reader, in words (issue #617).
     click.echo(f"serving:           {_describe_serving(entry)}")
+    click.echo(f"mirror:            {_describe_mirror(entry, mirror=report.store_mirror)}")
     # Who holds the claim and how long since they were heard from (issue
     # #621), where `active` used to stand in for both.
     click.echo(f"publisher:         {_describe_publisher(entry, now_epoch=int(time.time()))}")
@@ -2882,17 +2986,38 @@ def serving_activate(
 
 @serving.command("migrate-scope")
 @click.argument("model_name")
+@click.option(
+    "--from-path",
+    "from_path",
+    default=None,
+    help=(
+        "The location this index's store used to have, when the store has "
+        "moved: its ledger row and publication state are keyed on where it "
+        "was, so they are moved onto the scope the profile resolves now. Give "
+        "the old `path` exactly as the profile carried it (for example "
+        "`gs://bucket/lancedb`). Declare an `identity:` on the store as well, "
+        "or the next move strands the scope again."
+    ),
+)
 @_project_context_options
 @click.pass_context
-def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
-    """Move a search index's serving scope onto its logical-collection key.
+def serving_migrate_scope(
+    ctx: click.Context, model_name: str, from_path: str | None
+) -> None:
+    """Move a search index's serving scope onto the one its profile resolves.
 
-    Issue #355 re-keys the retrieval serving scope from the physical
+    Issue #355 re-keyed the retrieval serving scope from the physical
     collection to the logical one, so the ledger stays readable once a
     logical collection can have several physical generations behind it. An
     index published before that change keeps its ledger row and publication
     state under the old key, where nothing looks for it — and stel treats an
     index with unreachable state as unpublished, which means re-embedding it.
+
+    `--from-path` covers the other way a scope is stranded: a store that moved
+    (issue #666). A scope is keyed on the store's identity, which is derived
+    from its location unless the profile declares an `identity:`, so copying a
+    store to a cheaper location otherwise reads as a store that never
+    published anything.
 
     Run this once per affected index. It is idempotent: a second run reports
     zero rows moved.
@@ -2906,6 +3031,7 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
             profiles_dir=ctx.obj["profiles_dir"],
             target=ctx.obj["target"],
             model_name=model_name,
+            from_path=from_path,
         )
     except (ConfigError, ProfileError) as e:
         raise ConfigClickError(str(e)) from e
@@ -2917,6 +3043,103 @@ def serving_migrate_scope(ctx: click.Context, model_name: str) -> None:
     click.echo(
         f"Migrated serving scope for '{model_name}': "
         f"ledger_rows={result['ledger_rows']} state_rows={result['state_rows']}"
+    )
+
+
+@serving.command("sync")
+@click.argument("model_name")
+@_project_context_options
+@click.pass_context
+def serving_sync(ctx: click.Context, model_name: str) -> None:
+    """Copy the generation a search index serves to its store's mirror.
+
+    Every successful publish and `serving activate` already ends with this
+    when the store declares a `mirror:` (issue #666). Run it to retry a sync
+    that failed, or to give an index published before the mirror existed its
+    first copy. It copies only the files the mirror lacks, removes what the
+    primary has pruned, and retires the mirror's superseded generations.
+
+    The sync holds a query lease for its duration, so an in-place publish of
+    the same index waits for it, as it would for any reader.
+    """
+    from .cli_services.serving import describe_mirror as _describe_mirror
+    from .cli_services.serving import serving_sync as _serving_sync
+    from .retrieval import RetrievalError
+
+    try:
+        outcome = _serving_sync(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, RetrievalError) as e:
+        raise click.ClickException(str(e)) from e
+    _echo_serving_context(outcome.report)
+    sync = outcome.outcome
+    click.echo(
+        f"Synced '{sync.collection}' for '{model_name}': "
+        f"{sync.copy.files_copied} file(s) copied ({sync.copy.bytes_copied} bytes), "
+        f"{sync.copy.files_deleted} removed, {len(sync.retired)} superseded "
+        "generation(s) retired."
+    )
+    if not sync.recorded:
+        click.echo(
+            "note:              a newer generation was activated during the copy; "
+            "its own publish syncs it."
+        )
+    entry = outcome.report.entry
+    click.echo(f"mirror:            {_describe_mirror(entry, mirror=outcome.report.store_mirror)}")
+
+
+@serving.command("restore")
+@click.argument("model_name")
+@_project_context_options
+@click.pass_context
+def serving_restore(ctx: click.Context, model_name: str) -> None:
+    """Bring the generation a search index serves back from its store's mirror.
+
+    For a host whose primary lacks the index: a fresh machine, or one whose
+    disk was lost (issue #666). The publication state is already in the
+    warehouse, so once the bytes are back the index serves and the next
+    incremental run reconciles from where the last one finished. Nothing is
+    re-embedded.
+
+    Restores only the generation the ledger serves, and only when the mirror
+    holds exactly that generation. Never overwrites a file the primary
+    already has. A store restored to a different path must declare the
+    `identity:` it published under, or its serving record is not found.
+
+    Requires --target.
+    """
+    from .cli_services.serving import serving_restore as _serving_restore
+    from .retrieval import RetrievalError
+
+    try:
+        outcome = _serving_restore(
+            ctx.obj["project_dir"],
+            profiles_dir=ctx.obj["profiles_dir"],
+            target=ctx.obj["target"],
+            model_name=model_name,
+        )
+    except (ConfigError, ProfileError) as e:
+        raise ConfigClickError(str(e)) from e
+    except (AdapterError, RetrievalError) as e:
+        raise click.ClickException(str(e)) from e
+    _echo_serving_context(outcome.report)
+    restore = outcome.outcome
+    if not restore.copy.files_copied:
+        click.echo(
+            f"Nothing to restore for '{model_name}': the primary already holds "
+            f"'{restore.collection}' at the served generation."
+        )
+        return
+    click.echo(
+        f"Restored '{restore.collection}' for '{model_name}': "
+        f"{restore.copy.files_copied} file(s) ({restore.copy.bytes_copied} bytes). "
+        "It is the served generation; queries can use it now."
     )
 
 

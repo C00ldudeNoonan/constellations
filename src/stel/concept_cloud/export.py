@@ -29,6 +29,7 @@ from ..config import load_project
 from ..config.vocabulary import Vocabulary, declared_terms
 from ..manifest import MANIFEST_FILENAME, write_manifest
 from .schema import (
+    BreakdownDef,
     Concept,
     ConceptCloudExport,
     ConceptEdge,
@@ -40,6 +41,7 @@ from .schema import (
     DimensionDef,
     Position,
     Provenance,
+    SourceAccess,
 )
 
 # stel DAG node kind -> a resource_type label for the plane.
@@ -148,6 +150,8 @@ def build_concept_cloud(
     time_grain: TimeGrain = "year",
     top_n_per_period: int = 0,
     vocabularies: Mapping[str, Vocabulary] | None = None,
+    breakdown_columns: dict[str, tuple[pl.DataFrame, str]] | None = None,
+    context_model: str | None = None,
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -160,6 +164,13 @@ def build_concept_cloud(
     takes its class, definition and broader term from the declared term whose
     label is its canonical id, in a vocabulary that its linked rows name as their
     namespace; a concept nothing declares carries none of them.
+
+    `breakdown_columns` maps a breakdown name to a document-keyed frame and
+    its value column (issue #555 item 5); see `document_breakdown`.
+
+    `context_model` names the governed context model a reader's "show me a
+    sentence" click searches (issue #555 item 7). Only the name is carried;
+    see `SourceAccess` for why it is not verified here.
     """
     generated_at = generated_at or datetime.now(UTC).isoformat()
     node_ids = {node.id for node in dag_plane.nodes}
@@ -211,6 +222,22 @@ def build_concept_cloud(
             c.model_copy(update={"dimensions": values_by_concept.get(c.canonical_id, {})})
             for c in concepts
         ]
+    breakdown_defs: list[BreakdownDef] = []
+    counts_by_concept: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
+    linked = _linked_rows(links, statuses) if breakdown_columns else links
+    for name, (frame, value_column) in sorted((breakdown_columns or {}).items()):
+        breakdown_def, breakdown_counts = document_breakdown(
+            name, frame, value_column, linked=linked, kept=kept
+        )
+        if breakdown_def is not None:
+            breakdown_defs.append(breakdown_def)
+            for cid, counts in breakdown_counts.items():
+                counts_by_concept[cid][name] = counts
+    if counts_by_concept:
+        concepts = [
+            c.model_copy(update={"breakdowns": counts_by_concept.get(c.canonical_id, {})})
+            for c in concepts
+        ]
     cross_layer_edges = (
         tuple(
             CrossLayerEdge(concept=c.canonical_id, dag_node=linking_node_id)
@@ -228,10 +255,14 @@ def build_concept_cloud(
         cross_layer_edges=cross_layer_edges,
         dimensions=tuple(dimension_defs),
         periods=periods,
+        breakdowns=tuple(breakdown_defs),
+        source_access=(
+            SourceAccess(model=context_model) if context_model else None
+        ),
     )
 
 
-TimeGrain = Literal["year", "quarter", "month"]
+TimeGrain =Literal["year", "quarter", "month"]
 
 
 def _period_key(value: object, grain: TimeGrain) -> str | None:
@@ -344,9 +375,7 @@ def _aggregate_concepts(
         raise ConceptCloudExportError(
             "entity-linking output must have `canonical_id` and `mention_id` columns"
         )
-    frame = links.filter(pl.col("canonical_id").is_not_null())
-    if "status" in frame.columns:
-        frame = frame.filter(pl.col("status").is_in(list(statuses)))
+    frame = _linked_rows(links, statuses)
     if frame.height == 0:
         return [], {}, {}
 
@@ -464,6 +493,16 @@ def _aggregate_concepts(
     kept = selected
     canonical_of = {m: c for m, c in canonical_of.items() if c in kept}
     return concepts, canonical_of, period_of
+
+
+def _linked_rows(links: pl.DataFrame, statuses: tuple[str, ...]) -> pl.DataFrame:
+    """The linking rows a concept is built from: linked to a canonical id, in
+    an accepted status. One definition, so a breakdown counts exactly the
+    documents `provenance.documents` counts and its shares cannot pass 100%."""
+    frame = links.filter(pl.col("canonical_id").is_not_null())
+    if "status" in frame.columns:
+        frame = frame.filter(pl.col("status").is_in(list(statuses)))
+    return frame
 
 
 def _mention_enrichment(
@@ -734,6 +773,103 @@ def column_dimension(
     return definition, values
 
 
+# The card lists every value a concept's documents carry, so a breakdown is a
+# categorical field -- a sector, a form type -- not an identifier. A field like
+# a filer's ticker would turn every card into a few hundred rows and the bundle
+# into a concept-by-filer matrix, so it is refused with the remedy instead.
+_BREAKDOWN_MAX_VALUES = 50
+
+
+def document_breakdown(
+    name: str,
+    frame: pl.DataFrame,
+    value_column: str,
+    *,
+    linked: pl.DataFrame,
+    kept: set[str],
+) -> tuple[BreakdownDef | None, dict[str, dict[str, int]]]:
+    """Who names each concept: its documents counted by a document-level
+    field (issue #555 item 5), so a card can say "FERC: named by 300 filings,
+    71% Utilities, 18% Energy".
+
+    `frame` is document-keyed (`document_id` plus the value column) and
+    `linked` is the linking rows concepts are built from. A document counts
+    once per concept however many times it names it, matching
+    `provenance.documents`. A document the frame gives no value is left out of
+    the counts rather than given one, so the card can show it as "no value".
+
+    A document given two different values is refused, not resolved: a
+    warehouse read promises no row order, so picking one would let a card's
+    shares change between two exports of unchanged data (the rule
+    `concept_names` applies to duplicate names).
+    """
+    if "document_id" not in frame.columns or value_column not in frame.columns:
+        raise ConceptCloudExportError(
+            f"breakdown '{name}' needs `document_id` and `{value_column}` columns"
+        )
+    if "document_id" not in linked.columns:
+        raise ConceptCloudExportError(
+            f"breakdown '{name}' counts each concept's documents, so the "
+            "linking model needs a `document_id` column"
+        )
+    values = (
+        frame.select(
+            pl.col("document_id").cast(pl.String),
+            pl.col(value_column).cast(pl.String).str.strip_chars().alias("value"),
+        )
+        .filter(
+            pl.col("document_id").is_not_null()
+            & pl.col("value").is_not_null()
+            & (pl.col("value") != "")
+        )
+        .unique()
+    )
+    conflicting = (
+        values.group_by("document_id").len().filter(pl.col("len") > 1)
+        .get_column("document_id").sort().to_list()
+    )
+    if conflicting:
+        listed = ", ".join(conflicting[:5])
+        raise ConceptCloudExportError(
+            f"breakdown '{name}' gives more than one `{value_column}` to "
+            f"{len(conflicting)} document(s): {listed}. One value per document."
+        )
+    distinct = values.get_column("value").n_unique()
+    if distinct > _BREAKDOWN_MAX_VALUES:
+        raise ConceptCloudExportError(
+            f"breakdown '{name}' has {distinct} distinct `{value_column}` values; "
+            f"a breakdown is a categorical document field and is capped at "
+            f"{_BREAKDOWN_MAX_VALUES}. Group the values in the model."
+        )
+    counts = (
+        linked.filter(
+            pl.col("canonical_id").is_in(sorted(kept))
+            & pl.col("document_id").is_not_null()
+        )
+        .select(
+            pl.col("canonical_id").cast(pl.String),
+            pl.col("document_id").cast(pl.String),
+        )
+        .unique()
+        .join(values, on="document_id", how="inner")
+        .group_by("canonical_id", "value")
+        .len()
+        # The bundle is written from these dicts, and two exports of unchanged
+        # data should be byte-identical: group_by yields no stable order.
+        .sort("canonical_id", "value")
+    )
+    by_concept: dict[str, dict[str, int]] = defaultdict(dict)
+    for row in counts.iter_rows(named=True):
+        by_concept[str(row["canonical_id"])][str(row["value"])] = int(row["len"])
+    if not by_concept:
+        return None, {}
+    definition = BreakdownDef(
+        name=name,
+        values=tuple(sorted({value for c in by_concept.values() for value in c})),
+    )
+    return definition, dict(by_concept)
+
+
 def _first(values: list[object]) -> object | None:
     for v in values:
         if v is not None and str(v).strip():
@@ -850,6 +986,8 @@ def export_concept_cloud(
     time_grain: TimeGrain = "year",
     top_n_per_period: int = 0,
     names_model: str | None = None,
+    breakdown_specs: dict[str, str] | None = None,
+    context_model: str | None = None,
 ) -> ConceptCloudExport:
     """Read the project's tables through the active adapter and build a bundle.
 
@@ -866,6 +1004,17 @@ def export_concept_cloud(
             "so it needs --time-field to know what the periods are"
         )
 
+    # Parsed before the project, profile or warehouse is touched, so a
+    # malformed spec fails before any of them rather than after the linking
+    # model has been pulled.
+    dimension_reads = {
+        name: _model_column("dimension", name, spec)
+        for name, spec in sorted((dimension_specs or {}).items())
+    }
+    breakdown_reads = {
+        name: _model_column("breakdown", name, spec)
+        for name, spec in sorted((breakdown_specs or {}).items())
+    }
     project_path = Path(project_dir)
     project, _, _ = load_project(project_path)
     resolved = resolve_profile(
@@ -907,6 +1056,7 @@ def export_concept_cloud(
         linking_node_id = id_by_name.get(linking_model)
 
     dimension_columns: dict[str, tuple[pl.DataFrame, str]] = {}
+    breakdown_columns: dict[str, tuple[pl.DataFrame, str]] = {}
     with create_adapter(resolved.warehouse, project_dir=project_path) as adapter:
         links = adapter.read_table(linking_model)
         relations = adapter.read_table(relation_model) if relation_model else None
@@ -923,16 +1073,10 @@ def export_concept_cloud(
                 query_log = adapter.read_table(relation)
             except Exception:
                 query_log = None
-        for name, spec in sorted((dimension_specs or {}).items()):
-            model_name, _, value_column = spec.partition(".")
-            if not model_name or not value_column:
-                raise ConceptCloudExportError(
-                    f"dimension '{name}' must be `model.column`, got {spec!r}"
-                )
-            dimension_columns[name] = (
-                adapter.read_table(model_name),
-                value_column,
-            )
+        for name, (model_name, value_column) in dimension_reads.items():
+            dimension_columns[name] = (adapter.read_table(model_name), value_column)
+        for name, (model_name, value_column) in breakdown_reads.items():
+            breakdown_columns[name] = (adapter.read_table(model_name), value_column)
 
     return build_concept_cloud(
         project=project.name,
@@ -952,4 +1096,16 @@ def export_concept_cloud(
         time_grain=time_grain,
         top_n_per_period=top_n_per_period,
         vocabularies=project.vocabularies,
+        breakdown_columns=breakdown_columns or None,
+        context_model=context_model,
     )
+
+
+def _model_column(kind: str, name: str, spec: str) -> tuple[str, str]:
+    """Split a `model.column` spec, refusing one with either half missing."""
+    model_name, _, value_column = spec.partition(".")
+    if not model_name or not value_column:
+        raise ConceptCloudExportError(
+            f"{kind} '{name}' must be `model.column`, got {spec!r}"
+        )
+    return model_name, value_column

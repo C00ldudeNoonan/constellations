@@ -57,7 +57,12 @@ def validate_file_pattern(pattern: str) -> str:
 class DurationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    count: int
+    # Positive, because every reader of a duration compares an age against it
+    # and a zero or negative threshold makes that comparison meaningless --
+    # everything is instantly overdue. Rejected here rather than by whoever
+    # reads it, so a project that declares one fails `stel compile` instead of
+    # the server that later has to interpret it (PR #685 review).
+    count: int = Field(gt=0)
     period: Literal["minute", "hour", "day", "week"]
 
     def to_seconds(self) -> int:

@@ -9,7 +9,9 @@ vector-store backend.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,8 +22,9 @@ from ..profile import resolve_profile
 from .context import ConfigClickError
 
 if TYPE_CHECKING:
+    from ..adapters.base import StateScope
     from ..profile import ResolvedProfile
-    from ..retrieval import ServingLedgerEntry
+    from ..retrieval import RetrievalStore, RetrievalStoreConfig, ServingLedgerEntry
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,74 @@ class ServingReport:
     # `status=unpublished` entry means this warehouse has no record of the
     # index at all, which is the shape a wrong-target lookup takes.
     had_ledger_row: bool
+    # The store's declared identity, or None when it is derived from the
+    # location (issue #666). Once a store can move, the location no longer
+    # says which logical store a command resolved to; this does.
+    store_identity: str | None
+    # The store's canonical mirror location, or None without one.
+    store_mirror: str | None
+
+
+@dataclass(frozen=True)
+class _ServingScopes:
+    """What a serving command resolves from a project directory and a model name.
+
+    One named value rather than a tuple because `migrate-scope` needs the store
+    config and the logical collection to re-derive this index's scope for a
+    store that has since moved (issue #666), and an unnamed sixth tuple slot is
+    how a caller ends up re-keying state against the wrong scope.
+    """
+
+    scope: StateScope
+    legacy_scope: StateScope
+    resolved: ResolvedProfile
+    # (store alias, store type, physical location) -- for `_report`, which
+    # names the resolution in output so acting on the wrong one is evident.
+    context: tuple[str, str, str]
+    store_config: RetrievalStoreConfig
+    project_name: str
+    logical_collection: str
+    model_name: str
+
+    def scope_at(self, location: str) -> StateScope:
+        """This index's scope as it would be with the store at `location`.
+
+        A scope is keyed on the store's identity fingerprint, and that is
+        derived from where the store is unless the profile declares an
+        `identity:`. A store that moved -- or one that has just declared an
+        identity so that it *can* move -- therefore left its ledger row and
+        publication state under the fingerprint of the location it used to
+        have, where nothing looks for them; stel reads an index whose state is
+        unreachable as unpublished, and re-embeds the corpus (issue #666).
+
+        The copy keeps this store's routing options, because the fingerprint
+        the old location produced folded them in. Only the path and any
+        declared identity are replaced.
+        """
+        from ..adapters.base import RETRIEVAL_PUBLISH_STAGE, StateScope
+        from ..retrieval import StoreRole, create_store
+
+        alias, _store_type, _location = self.context
+        # `model_copy` rather than re-validating a dump: a dump redacts the
+        # credential references a store config may hold, so rebuilding from one
+        # would either lose them or fail validation. Nothing here needs a
+        # credential -- a descriptor is computed from the location and the
+        # non-secret routing alone, and this store is never opened.
+        source = self.store_config.model_copy(
+            update={"path": location, "identity": None}
+        )
+        store = create_store(
+            source,
+            project_name=self.project_name,
+            target_name=self.resolved.target_name,
+            alias=alias,
+            role=StoreRole.INSPECT,
+        )
+        return StateScope.for_target_descriptor(
+            self.model_name,
+            stage=RETRIEVAL_PUBLISH_STAGE,
+            descriptor=store.state_descriptor(self.logical_collection).descriptor(),
+        )
 
 
 def _resolve_serving_scopes(
@@ -53,13 +124,13 @@ def _resolve_serving_scopes(
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> tuple[Any, Any, ResolvedProfile, tuple[str, str, str]]:
+) -> _ServingScopes:
     """Resolve the current and pre-#355 retrieval-publish scopes for an index.
 
     Domain failures (unknown index, no retrieval config, unavailable store)
     raise ConfigClickError (exit 2); configuration/profile errors propagate for
     the edge to translate."""
-    from ..adapters.base import StateScope
+    from ..adapters.base import RETRIEVAL_PUBLISH_STAGE, StateScope
     from ..retrieval import StoreRole, create_store
 
     project_config, sources, models = load_project(project_dir)
@@ -91,15 +162,24 @@ def _resolve_serving_scopes(
     context = (alias, store_config.type, store_config.storage_location())
     scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_target.descriptor(),
     )
     legacy_scope = StateScope.for_target_descriptor(
         model.name,
-        stage="retrieval_publish",
+        stage=RETRIEVAL_PUBLISH_STAGE,
         descriptor=state_target.legacy_descriptor(),
     )
-    return scope, legacy_scope, resolved, context
+    return _ServingScopes(
+        scope=scope,
+        legacy_scope=legacy_scope,
+        resolved=resolved,
+        context=context,
+        store_config=store_config,
+        project_name=project_config.name,
+        logical_collection=logical,
+        model_name=model.name,
+    )
 
 
 def resolve_serving_scope(
@@ -108,15 +188,15 @@ def resolve_serving_scope(
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
-) -> tuple[Any, ResolvedProfile]:
+) -> tuple[StateScope, ResolvedProfile]:
     """The current (logical-keyed) serving scope for one search index."""
-    scope, _legacy, resolved, _context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir,
         profiles_dir=profiles_dir,
         target=target,
         model_name=model_name,
     )
-    return scope, resolved
+    return resolution.scope, resolution.resolved
 
 
 def serving_status(
@@ -129,15 +209,17 @@ def serving_status(
     """Read the publication ledger for one search index."""
     from ..retrieval import ServingCoordinator
 
-    scope, _legacy, resolved, context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
+    scope, resolved, context = resolution.scope, resolution.resolved, resolution.context
     with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
         return _report(
             coordinator.status(scope),
             resolved=resolved,
             context=context,
+            store_config=resolution.store_config,
             had_ledger_row=coordinator.scope_exists(scope),
         )
 
@@ -155,9 +237,10 @@ def serving_recover(
     and unless they named the target explicitly."""
     from ..retrieval import ServingCoordinator
 
-    scope, _legacy, resolved, context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
+    scope, resolved, context = resolution.scope, resolution.resolved, resolution.context
     if target is None:
         # Resolution above is a read, so this refuses before anything moves
         # -- and it can name the default the caller would otherwise have
@@ -177,7 +260,11 @@ def serving_recover(
         had_row = coordinator.scope_exists(scope)
         entry = coordinator.recover(scope, owner_terminated=owner_terminated)
         return _report(
-            entry, resolved=resolved, context=context, had_ledger_row=had_row
+            entry,
+            resolved=resolved,
+            context=context,
+            store_config=resolution.store_config,
+            had_ledger_row=had_row,
         )
 
 
@@ -211,9 +298,10 @@ def serving_activate(
     from ..execution.activation import activate_search_generation
     from ..retrieval import ServingCoordinator
 
-    scope, _legacy, resolved, context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
+    scope, resolved, context = resolution.scope, resolution.resolved, resolution.context
     if target is None:
         raise ConfigClickError(
             "'stel serving activate' requires an explicit --target: it changes "
@@ -249,6 +337,7 @@ def serving_activate(
             coordinator.status(scope),
             resolved=resolved,
             context=context,
+            store_config=resolution.store_config,
             had_ledger_row=True,
         )
     return ActivationReport(report=report, activation=activation)
@@ -292,6 +381,44 @@ def describe_serving(entry: ServingLedgerEntry) -> str:
     return served
 
 
+def describe_identity(identity: str | None) -> str:
+    """Which logical store a command resolved to (issue #666).
+
+    A store that declares an identity can sit at any location, so the
+    `store:` line no longer answers this on its own once a store has moved.
+    """
+    if identity is None:
+        return "derived from the store location"
+    return f"{identity} (declared)"
+
+
+def describe_mirror(entry: ServingLedgerEntry, *, mirror: str | None) -> str:
+    """One line saying whether the store's mirror can restore what is served.
+
+    The ledger records the generation the mirror holds and which mirror holds
+    it; whether that is current is a comparison an operator would otherwise
+    make by eye between opaque digests (issue #666).
+    """
+    from ..retrieval.base import mirror_fingerprint
+
+    if mirror is None:
+        return "-"
+    if entry.mirror_generation is None or entry.mirror_target != mirror_fingerprint(mirror):
+        return f"{mirror}; never synced, so it cannot restore this index yet"
+    synced = (
+        ""
+        if entry.mirrored_epoch is None
+        else ", synced "
+        + datetime.fromtimestamp(entry.mirrored_epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    if entry.mirror_generation == entry.active_generation:
+        return f"{mirror}; holds the served generation{synced}"
+    return (
+        f"{mirror}; behind: holds generation {entry.mirror_generation}, not the "
+        f"served one{synced}. `stel serving sync` brings it up to date"
+    )
+
+
 def describe_publisher_claim(entry: ServingLedgerEntry, *, now_epoch: int) -> str:
     """One line saying who holds the publish claim and when they were last
     heard from, or "-" when nobody does (issue #621).
@@ -312,6 +439,7 @@ def _report(
     *,
     resolved: ResolvedProfile,
     context: tuple[str, str, str],
+    store_config: RetrievalStoreConfig,
     had_ledger_row: bool,
 ) -> ServingReport:
     alias, store_type, location = context
@@ -326,7 +454,31 @@ def _report(
         store_type=store_type,
         store_location=location,
         had_ledger_row=had_ledger_row,
+        store_identity=store_config.identity,
+        store_mirror=store_config.mirror_location(),
     )
+
+
+def _sources_to_rekey(
+    destination: StateScope, candidates: Sequence[StateScope]
+) -> list[StateScope]:
+    """The candidates worth re-keying onto `destination`, in the order given.
+
+    A candidate equal to the destination is dropped, and so is a repeat: a
+    re-key onto the same scope is not a no-op at the adapter -- it matches
+    every row and reports them as moved -- so leaving one in would answer
+    "migrated 20,115 rows" to a command that moved nothing. `--from-path`
+    naming the store's current location is the obvious operator mistake, and
+    it is the one that would look most like success (issue #666).
+    """
+    seen = {destination.target_identity}
+    pending: list[StateScope] = []
+    for candidate in candidates:
+        if candidate.target_identity in seen:
+            continue
+        seen.add(candidate.target_identity)
+        pending.append(candidate)
+    return pending
 
 
 def serving_migrate_scope(
@@ -335,34 +487,172 @@ def serving_migrate_scope(
     profiles_dir: Path | None,
     target: str | None,
     model_name: str,
+    from_path: str | None,
 ) -> dict[str, int | str]:
-    """Move an index's serving scope from the pre-#355 physical-collection key
-    onto the logical-collection key.
+    """Move an index's serving scope onto the scope its profile resolves today.
 
-    Issue #355 re-keys the retrieval serving scope so the ledger stays
-    readable once a logical collection can have more than one physical
-    generation behind it. Indexes published before that change keep their
-    state and ledger row under the old identity, where nothing looks for it —
-    and an unreachable publication state means the next run re-embeds an index
-    that is already published. This moves both, or reports that there is
-    nothing to move.
+    Two things move a scope out from under an index. Issue #355 re-keyed it so
+    the ledger stays readable once a logical collection can have more than one
+    physical generation behind it, which stranded every index published before
+    that change. Issue #666 added a declared store `identity:`, so a store can
+    move — off a gs:// URI onto local disk, say, to stop paying egress on every
+    read — and `--from-path` is how the rows it published at the old location
+    come with it.
+
+    Either way the state and ledger row sit under a key nothing looks for, and
+    an unreachable publication state means the next run re-embeds an index that
+    is already published. This moves both, or reports that there is nothing to
+    move. It is idempotent: a second run finds nothing and reports zero.
     """
     from ..retrieval import ServingCoordinator
 
-    scope, legacy_scope, resolved, _context = _resolve_serving_scopes(
+    resolution = _resolve_serving_scopes(
         project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
     )
-    if scope.target_identity == legacy_scope.target_identity:
+    scope = resolution.scope
+    candidates = [resolution.legacy_scope]
+    if from_path is not None:
+        candidates.append(resolution.scope_at(from_path))
+    pending = _sources_to_rekey(scope, candidates)
+    if not pending:
         return {"model": model_name, "state_rows": 0, "ledger_rows": 0}
-    with create_adapter(resolved.warehouse, project_dir=project_dir) as adapter:
+    state_rows = 0
+    ledger_rows = 0
+    with create_adapter(resolution.resolved.warehouse, project_dir=project_dir) as adapter:
         coordinator = ServingCoordinator(adapter, ensure_schema=True)
-        # Ledger first: it is the row that decides whether an index is
-        # considered published at all. If the state move fails after it, a
-        # re-run finds the ledger already moved and finishes the state.
-        ledger_rows = coordinator.rekey_scope(legacy_scope, scope)
-        state_rows = adapter.rekey_state_scope(legacy_scope, scope)
+        for source in pending:
+            # Ledger first: it is the row that decides whether an index is
+            # considered published at all. If the state move fails after it, a
+            # re-run finds the ledger already moved and finishes the state.
+            ledger_rows += coordinator.rekey_scope(source, scope)
+            state_rows += adapter.rekey_state_scope(source, scope)
     return {
         "model": model_name,
         "state_rows": state_rows,
         "ledger_rows": ledger_rows,
     }
+
+
+@dataclass(frozen=True)
+class MirrorReport:
+    """What `serving sync` or `serving restore` did, plus the ledger after."""
+
+    report: ServingReport
+    # `MirrorSync` or `MirrorRestore`, typed loosely so this module stays
+    # importable without the execution stack.
+    outcome: Any
+
+
+def serving_sync(
+    project_dir: Path,
+    *,
+    profiles_dir: Path | None,
+    target: str | None,
+    model_name: str,
+) -> MirrorReport:
+    """Copy the generation a search index serves to its store's mirror.
+
+    What every successful publish already ends with, as a command: to retry a
+    sync that failed, or to give an existing index its first copy. Copies only
+    what the mirror lacks. Does not require `--target`: it changes nothing a
+    reader sees, and the mirror it writes is the resolved target's own.
+    """
+    from ..execution.mirror import sync_search_mirror
+    from ..retrieval import ServingCoordinator
+
+    resolution = _resolve_serving_scopes(
+        project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
+    )
+    store = _mirror_store(resolution)
+    with create_adapter(resolution.resolved.warehouse, project_dir=project_dir) as adapter:
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
+        outcome = sync_search_mirror(
+            store=store,
+            coordinator=coordinator,
+            scope=resolution.scope,
+            logical_collection=resolution.logical_collection,
+        )
+        report = _report(
+            coordinator.status(resolution.scope),
+            resolved=resolution.resolved,
+            context=resolution.context,
+            store_config=resolution.store_config,
+            had_ledger_row=True,
+        )
+    return MirrorReport(report=report, outcome=outcome)
+
+
+def serving_restore(
+    project_dir: Path,
+    *,
+    profiles_dir: Path | None,
+    target: str | None,
+    model_name: str,
+) -> MirrorReport:
+    """Bring the generation a search index serves back from its mirror.
+
+    For a host whose primary lacks it: a fresh machine, or one whose disk was
+    lost. Refused without an explicit target, like the other commands that
+    write into a store (#511): restoring prod's index into dev's store path is
+    the mistake a default makes easy.
+    """
+    from ..execution.mirror import restore_search_mirror
+    from ..retrieval import ServingCoordinator
+
+    resolution = _resolve_serving_scopes(
+        project_dir, profiles_dir=profiles_dir, target=target, model_name=model_name
+    )
+    alias, store_type, location = resolution.context
+    target_name = resolution.resolved.target_name
+    if target is None:
+        raise ConfigClickError(
+            "'stel serving restore' requires an explicit --target: it writes a "
+            "generation into a store, so it must not act on a target nobody "
+            f"named. This profile would have used '{target_name}' (store "
+            f"{alias}: {store_type} {location}). Re-run with --target "
+            f"{target_name} to confirm that is the one you mean."
+        )
+    store = _mirror_store(resolution)
+    with create_adapter(resolution.resolved.warehouse, project_dir=project_dir) as adapter:
+        coordinator = ServingCoordinator(adapter, ensure_schema=True)
+        if not coordinator.scope_exists(resolution.scope):
+            # The likeliest cause on a fresh host is a store at a new path
+            # with no declared identity, which is a different store.
+            raise ConfigClickError(
+                f"This warehouse has no serving record for '{model_name}' under "
+                f"the store this profile resolves ({alias}: {store_type} "
+                f"{location}). A store restored to a new location keeps its "
+                "record only if it declares the `identity:` it published under."
+            )
+        outcome = restore_search_mirror(
+            store=store,
+            coordinator=coordinator,
+            scope=resolution.scope,
+            logical_collection=resolution.logical_collection,
+        )
+        report = _report(
+            coordinator.status(resolution.scope),
+            resolved=resolution.resolved,
+            context=resolution.context,
+            store_config=resolution.store_config,
+            had_ledger_row=True,
+        )
+    return MirrorReport(report=report, outcome=outcome)
+
+
+def _mirror_store(resolution: _ServingScopes) -> RetrievalStore:
+    from ..retrieval import StoreRole, create_store
+
+    if resolution.store_config.mirror_location() is None:
+        raise ConfigClickError(
+            f"Retrieval store '{resolution.context[0]}' has no mirror; add "
+            "`mirror:` to the store in the profile"
+        )
+    return create_store(
+        resolution.store_config,
+        project_name=resolution.project_name,
+        target_name=resolution.resolved.target_name,
+        alias=resolution.context[0],
+        # Descriptors and file copies; no index is opened.
+        role=StoreRole.INSPECT,
+    )

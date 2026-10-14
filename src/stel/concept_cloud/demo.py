@@ -13,6 +13,7 @@ import re
 from typing import cast
 
 from .schema import (
+    BreakdownDef,
     Concept,
     ConceptCloudExport,
     ConceptEdge,
@@ -210,6 +211,31 @@ def _demo_retrieval(display: str, frequency: int) -> str:
     return "cold"
 
 
+_DEMO_SECTIONS = ("Business", "Markets", "Policy", "World")
+# The desk that mostly writes about each entity type.
+_SECTION_LEAN = {
+    "ORG": "Business", "PERSON": "Policy", "GPE": "World", "MONEY": "Markets",
+    "PERCENT": "Markets", "EVENT": "World", "LAW": "Policy", "NORP": "Policy",
+}
+
+
+def _demo_sections(label: str, documents: int) -> dict[str, int]:
+    """Who names the concept, by news section (issue #555 item 5): most of its
+    documents from the desk that covers its type, the rest spread across the
+    others, and one in ten with no section -- the case the card has to show
+    as "no value" rather than invent one for."""
+    placed = documents - documents // 10
+    lean = _SECTION_LEAN[label]
+    counts = {lean: max(1, (placed * 6) // 10)} if placed else {}
+    rest = placed - sum(counts.values())
+    others = [section for section in _DEMO_SECTIONS if section != lean]
+    for i, section in enumerate(others):
+        share = rest // len(others) + (1 if i < rest % len(others) else 0)
+        if share:
+            counts[section] = share
+    return counts
+
+
 def demo_export() -> ConceptCloudExport:
     """A sizable, realistic economic-news concept cloud over a layered dbt DAG."""
     id_by_display = {d: _canonical_id(d, lbl) for d, lbl, _, _ in _CONCEPTS}
@@ -230,6 +256,7 @@ def demo_export() -> ConceptCloudExport:
             ),
             position=_demo_position(id_by_display[display], label),
             dimensions={"retrieval": _demo_retrieval(display, freq)},
+            breakdowns={"section": _demo_sections(label, documents_of[display])},
         )
         for display, label, freq, status in _CONCEPTS
     )
@@ -279,4 +306,5 @@ def demo_export() -> ConceptCloudExport:
                 description="How often agents' queries returned this concept's chunks",
             ),
         ),
+        breakdowns=(BreakdownDef(name="section", values=_DEMO_SECTIONS),),
     )

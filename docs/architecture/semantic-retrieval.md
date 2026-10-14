@@ -298,6 +298,16 @@ economic_data:
             #   region: us-central1
             # storage_options_env:      # option-key -> env-var name (a reference)
             #   aws_secret_access_key: STEL_LANCEDB_AWS_SECRET
+            # A store's identity is derived from `path` (plus non-secret
+            # routing) unless it is declared. Declaring it excludes both, so
+            # the store can move -- a local primary read instead of a gs://
+            # URI, a generation restored onto a fresh host -- without its
+            # published collections reading as never published (issue #666).
+            # identity: econ-prod       # a label, never a location
+            # A byte copy of every served generation, synced after each
+            # publish and activation and never queried; `stel serving restore`
+            # brings it back onto a fresh host (issue #666). Local `path` only.
+            # mirror: gs://bucket/lancedb
             collection_template: '{project}__{target}__{collection}'
             timeout_seconds: 30
             minimum_consistency: strong

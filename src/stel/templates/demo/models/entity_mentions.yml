@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: entity_mentions
+    description: "Every mention of a declared system, one row per mention"
+    depends_on: [ref('document_chunks')]
+    transform:
+      type: python
+      module: transforms.entity_mentions
+      options:
+        vocabulary: systems
+    materialization: full
+    tests:
+      - not_null: [entity_id, context_id, entity_text, label]
+      - unique: entity_id
+      - accepted_values:
+          column: label
+          values: [service, datastore]

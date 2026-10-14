@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1194",
+  "customer": "Fernhill Garden Supply",
+  "opened_at": "2026-07-03T11:30:00Z",
+  "priority": "normal",
+  "subject": "Duplicate webhooks after yesterday's delay",
+  "body": "After the delays yesterday we received a few order events twice. Is it safe to ignore an event whose order id we have already processed?"
+}

@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: raw_tickets
+    description: "One row per customer support ticket"
+    source: ref('support_tickets')
+    extraction:
+      backend: json
+      options:
+        fields: [ticket_id, customer, opened_at, priority, subject, body]
+    materialization: incremental
+    tests:
+      - not_null: [ticket_id, customer, opened_at, subject, body]
+      - unique: ticket_id
+      - accepted_values:
+          column: priority
+          values: [urgent, high, normal]

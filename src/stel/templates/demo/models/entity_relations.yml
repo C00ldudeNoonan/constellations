@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: entity_relations
+    description: "Two systems named in the same sentence"
+    depends_on: [ref('entity_mentions')]
+    transform:
+      type: python
+      module: stel.text.transforms.extract_relations
+      options:
+        mentions: entity_mentions
+        document_id_field: context_id
+        scope: sentence
+        relation_type: co_occurs_with
+    materialization: full
+    tests:
+      - not_null: [relation_id, relation_type, method]
+      - unique: relation_id

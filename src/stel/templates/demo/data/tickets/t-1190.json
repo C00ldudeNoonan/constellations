@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1190",
+  "customer": "Quayside Books",
+  "opened_at": "2026-07-02T09:03:00Z",
+  "priority": "high",
+  "subject": "No order webhooks since early morning",
+  "body": "Our fulfilment system has not received an order event since about 03:45. Is the webhook dispatcher down? Orders are showing in the dashboard."
+}

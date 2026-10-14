@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### A demo you can run from PyPI: `stel init --template demo` (issue #688)
+
+- **Every demo lived in the repository**, and each showed one primitive, so
+  someone who installed stel had nothing to run that showed the product
+  working end to end. `stel init <name> --template demo` scaffolds a complete
+  project with its own documents (a made-up company's postmortems, runbooks,
+  release notes, and support tickets). `stel build` runs 13 models and their
+  tests offline, with no credentials, into one DuckDB file that holds the
+  tables, the incremental state, and a DuckDB-native vector and full-text
+  index.
+- The project's `README.md` walks through querying the results, `stel
+  search`, an incremental rebuild that reprocesses only the changed document,
+  `stel docs`, the concept-cloud star map with "Show me a sentence", and
+  serving the index over MCP with `entity_scope`. A test runs every `stel`
+  command in it.
+- Entity linking needs no spaCy model: a project transform finds mentions of
+  the terms in a `vocabularies:` block, and `link_entities` resolves them with
+  `aliases: vocab.systems`. A `system_names` model gives the star map each
+  term's name, description, and class.
+- `stel init` now substitutes the project name into a template's `README.md`
+  as well as its project and profile files.
+
 ### An approximate search can probe more of its index (issue #684)
 
 - **Every `approximate` query searched 20 IVF partitions of about 1,900.**

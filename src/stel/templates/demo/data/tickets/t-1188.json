@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1188",
+  "customer": "Larkspur Ceramics",
+  "opened_at": "2026-07-02T08:12:00Z",
+  "priority": "urgent",
+  "subject": "Refund webhooks arriving hours late",
+  "body": "We received refund events at 08:00 for refunds issued before 04:00. Our warehouse shipped two orders that had already been refunded. The webhook delivery delays are costing us money."
+}

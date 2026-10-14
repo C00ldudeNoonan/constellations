@@ -161,9 +161,30 @@ uv add 'stel[bigquery,gcs,gdrive]'
 
 ## Quickstart
 
+See the whole thing work first. The `demo` template scaffolds a complete
+project with its own documents: a made-up company's postmortems, runbooks,
+release notes, and support tickets. It runs offline, needs no API keys, and
+builds into one DuckDB file:
+
 ```bash
-git clone https://github.com/C00ldudeNoonan/dbt-ml constellations
-cd constellations/stel
+uvx stel init acme --template demo
+cd acme
+uvx stel build
+```
+
+That extracts the documents, chunks them by section, links every mention of a
+system to the vocabulary declared in `stel_project.yml`, answers a question in
+plain SQL, publishes a vector and full-text index inside the warehouse file,
+and tests all of it. The project's own `README.md` then walks through search,
+an incremental rebuild that reprocesses only the document you changed, the
+lineage site, a 3D map of what the corpus is about, and serving the index to
+an agent over MCP.
+
+To run the repository's examples instead:
+
+```bash
+git clone https://github.com/C00ldudeNoonan/constellations
+cd constellations
 uv sync
 uv run stel --project-dir examples/invoice_pipeline seed --count 5
 uv run stel --project-dir examples/invoice_pipeline run

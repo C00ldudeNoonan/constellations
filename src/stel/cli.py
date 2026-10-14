@@ -465,7 +465,7 @@ _SEEDERS_BY_TYPE: dict[str, Seeder] = {
 }
 
 
-_AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html")
+_AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html", "demo")
 
 
 @cli.command()
@@ -476,7 +476,10 @@ _AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html")
     type=click.Choice(_AVAILABLE_TEMPLATES, case_sensitive=False),
     default="json",
     show_default=True,
-    help="Which backend to scaffold for.",
+    help=(
+        "Which backend to scaffold for, or `demo` for a complete offline "
+        "project with its own documents."
+    ),
 )
 def init(name: str, template: str) -> None:
     """Scaffold a new stel project at ./<name>/."""
@@ -492,7 +495,7 @@ def init(name: str, template: str) -> None:
     for path in target.rglob(".gitkeep"):
         path.unlink()
 
-    for filename in (PROJECT_FILENAME, PROFILES_FILENAME):
+    for filename in (PROJECT_FILENAME, PROFILES_FILENAME, "README.md"):
         path = target / filename
         if path.exists():
             path.write_text(
@@ -504,6 +507,10 @@ def init(name: str, template: str) -> None:
     click.echo("")
     click.echo("Next:")
     click.echo(f"  cd {name}")
+    if template == "demo":
+        click.echo("  stel build")
+        click.echo("  # then follow README.md: search, incremental rebuilds, the star map, MCP")
+        return
     if template == "json":
         click.echo("  uv run stel seed --count 20")
     else:

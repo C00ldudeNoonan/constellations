@@ -1,0 +1,15 @@
+version: 2
+
+models:
+  - name: system_names
+    description: "The declared systems, as the star map names and colours them"
+    depends_on: [ref('entity_links')]
+    transform:
+      type: python
+      module: transforms.system_names
+      options:
+        vocabulary: systems
+    materialization: full
+    tests:
+      - not_null: [canonical_id, display_name, class]
+      - unique: canonical_id

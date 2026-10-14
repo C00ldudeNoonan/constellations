@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: raw_docs
+    description: "Frontmatter and body of every engineering doc"
+    source: ref('engineering_docs')
+    extraction:
+      backend: markdown
+      options:
+        frontmatter_fields: [title, kind, team, published_at]
+    # Edit one file and re-run: only that document is re-extracted, and only
+    # its chunks are re-embedded and republished.
+    materialization: incremental
+    fields:
+      - {name: title, data_type: string}
+      - {name: kind, data_type: string}
+      - {name: team, data_type: string}
+      - {name: published_at, data_type: string}
+      - {name: body, data_type: string}
+    tests:
+      - not_null: [title, kind, team, published_at, body]
+      - unique: source_path
+      - accepted_values:
+          column: kind
+          values: [postmortem, runbook, release_note]

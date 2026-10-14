@@ -1,0 +1,21 @@
+version: 2
+
+# The built-in chunker. Every `## ` heading opens a section, so each chunk
+# knows which part of its document it came from ("Root cause", "Impact").
+models:
+  - name: passages
+    description: "Heading-attributed chunks of every document"
+    depends_on: [ref('document_registry')]
+    chunk:
+      strategy: recursive
+      text_field: text
+      chunk_size: 600
+      # No overlap: every passage starts on a paragraph boundary, so a
+      # citation never opens mid-sentence.
+      chunk_overlap: 0
+      headings:
+        pattern: '^## (.+)$'
+    materialization: incremental
+    tests:
+      - not_null: [chunk_id, document_id, text]
+      - unique: chunk_id

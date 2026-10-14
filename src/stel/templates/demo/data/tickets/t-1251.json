@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1251",
+  "customer": "Larkspur Ceramics",
+  "opened_at": "2026-08-14T16:22:00Z",
+  "priority": "normal",
+  "subject": "Customers asked to sign in again",
+  "body": "Some of our customers say they were signed out and asked to sign in again through the login page. Is this the new Auth Gateway session limit from the release notes?"
+}

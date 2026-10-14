@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: system_health
+    description: "Per system: postmortems, tickets, and runbook coverage"
+    transform:
+      type: sql
+      path: sql/system_health.sql
+    materialization: full
+    fields:
+      - {name: system, data_type: string}
+      - {name: postmortems, data_type: integer}
+      - {name: tickets, data_type: integer}
+      - {name: has_runbook, data_type: boolean}
+      - {name: last_postmortem, data_type: string}
+    tests:
+      - not_null: [system, postmortems, tickets, has_runbook]
+      - unique: system

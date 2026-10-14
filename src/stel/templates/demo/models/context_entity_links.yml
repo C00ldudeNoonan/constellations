@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: context_entity_links
+    description: "Which passages are about which system, for agents over MCP"
+    depends_on: [ref('entity_links'), ref('document_chunks')]
+    transform:
+      type: python
+      module: transforms.context_entity_links
+    agent_context:
+      contract: agent_context/v1
+      grain: context_entity_links
+    materialization: full
+    tests:
+      - not_null: [context_entity_link_id, context_id, entity_id]
+      - unique: context_entity_link_id

@@ -1,0 +1,22 @@
+version: 2
+
+models:
+  - name: document_registry
+    description: "Every doc and ticket as one agent_context/v1 document"
+    depends_on: [ref('raw_docs'), ref('raw_tickets')]
+    transform:
+      type: python
+      module: transforms.document_registry
+    agent_context:
+      contract: agent_context/v1
+      grain: document_registry
+    fields:
+      - {name: title, data_type: string}
+      - {name: kind, data_type: string}
+      - {name: team, data_type: string}
+      - {name: published_at, data_type: string}
+      - {name: text, data_type: string}
+    materialization: full
+    tests:
+      - not_null: [document_id, document_version_id, source_key, title, kind, text]
+      - unique: document_version_id

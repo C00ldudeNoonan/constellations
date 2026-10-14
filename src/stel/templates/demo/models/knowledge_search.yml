@@ -1,0 +1,43 @@
+version: 2
+
+models:
+  - name: knowledge_search
+    description: "Search over every postmortem, runbook, release note, and ticket"
+    depends_on: [ref('chunk_embeddings')]
+    materialization: incremental
+    tags: [retrieval]
+    search:
+      access: public
+      store: local
+      collection: acme_knowledge
+      id_field: context_id
+      document_id_field: document_id
+      chunk_id_field: chunk_id
+      text_fields: [text]
+      return_text_fields: [text]
+      vector:
+        field: embedding
+        dimensions: 8
+        metric: cosine
+        search: exact
+        embedding: inherit
+      full_text:
+        fields: [text]
+      attributes:
+        - name: title
+          data_type: string
+          returned: true
+        - name: kind
+          data_type: string
+          filter_role: user
+          returned: true
+        - name: section
+          data_type: string
+          returned: true
+          nullable: true
+      display_fields: [title]
+      query:
+        modes: [vector, text, hybrid]
+        consistency: strong
+      on_index_change: fail
+      batch_size: 100

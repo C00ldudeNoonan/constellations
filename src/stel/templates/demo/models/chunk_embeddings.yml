@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: chunk_embeddings
+    description: "One vector per passage"
+    depends_on: [ref('document_chunks')]
+    # `deterministic` is offline and free, so the demo needs no API key --
+    # but it is a hash, not a language model, so it does not capture
+    # meaning. Text search (BM25) carries the demo's relevance. Swap in a
+    # real provider (see docs/reference.md, "Embedding models") and the
+    # same index answers by meaning too.
+    embed:
+      provider: deterministic
+      model: deterministic-v1
+      text_field: text
+      id_field: context_id
+      vector_field: embedding
+      dimensions: 8
+      batch_size: 128
+    materialization: incremental
+    tests:
+      - not_null: [context_id, embedding]
+      - unique: context_id

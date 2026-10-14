@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: engineering_docs
+    description: "Acme Cloud postmortems, runbooks, and release notes"
+    path: "./data/docs/"
+    file_pattern: "*.md"
+  - name: support_tickets
+    description: "Customer support tickets, one JSON file each"
+    path: "./data/tickets/"
+    file_pattern: "*.json"

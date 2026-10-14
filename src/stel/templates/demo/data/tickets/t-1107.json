@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1107",
+  "customer": "Fernhill Garden Supply",
+  "opened_at": "2026-05-20T10:05:00Z",
+  "priority": "high",
+  "subject": "Product search is extremely slow",
+  "body": "Search on our store takes four or five seconds to return results this morning. Autocomplete is timing out entirely. Nothing has changed on our side."
+}

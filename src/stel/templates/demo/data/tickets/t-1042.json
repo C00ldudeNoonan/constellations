@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1042",
+  "customer": "Quayside Books",
+  "opened_at": "2026-03-11T14:20:00Z",
+  "priority": "high",
+  "subject": "Were any cards charged twice during the outage?",
+  "body": "Several customers say they saw a failed checkout and then retried. Can you confirm the Payments API did not charge anyone twice?"
+}

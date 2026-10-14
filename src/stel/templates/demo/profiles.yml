@@ -1,0 +1,41 @@
+__PROJECT_NAME__:
+  target: dev
+  outputs:
+    dev:
+      # One file holds everything: the extracted tables, the incremental
+      # state, and the search index. Open it with any DuckDB client.
+      warehouse:
+        type: duckdb
+        path: ./target/warehouse.duckdb
+        schema: __PROJECT_NAME__
+      retrieval:
+        default: local
+        # The demo's documents are all public, so its index is too; a
+        # profile has to opt in before any public index is published.
+        allow_public_indexes: true
+        stores:
+          # Vector and full-text search run inside the warehouse file
+          # itself, through DuckDB's `vss` and `fts` extensions. DuckDB
+          # downloads them once on first use; an offline host needs them
+          # installed beforehand.
+          local:
+            type: duckdb
+            path: ./target/warehouse.duckdb
+
+    # MotherDuck is the same DuckDB engine, managed. Uncomment and run
+    # `stel run --target motherduck` with MOTHERDUCK_TOKEN set in your
+    # environment; never put the token value in this file. The search index
+    # stays a local DuckDB file.
+    # motherduck:
+    #   warehouse:
+    #     type: duckdb
+    #     path: md:__PROJECT_NAME__
+    #     token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+    #     schema: __PROJECT_NAME__
+    #   retrieval:
+    #     default: local
+    #     allow_public_indexes: true
+    #     stores:
+    #       local:
+    #         type: duckdb
+    #         path: ./target/search.duckdb

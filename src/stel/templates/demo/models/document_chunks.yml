@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: document_chunks
+    description: "Citable passages: each chunk with its document's provenance"
+    depends_on: [ref('document_registry'), ref('passages')]
+    transform:
+      type: python
+      module: transforms.document_chunks
+    agent_context:
+      contract: agent_context/v1
+      grain: document_chunks
+    fields:
+      - {name: title, data_type: string}
+      - {name: kind, data_type: string}
+      - {name: section, data_type: string}
+      - {name: source_key, data_type: string}
+    materialization: incremental
+    tests:
+      - not_null: [context_id, chunk_id, document_version_id, text, kind]
+      - unique: context_id

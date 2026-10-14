@@ -1,0 +1,49 @@
+name: __PROJECT_NAME__
+version: "0.1.0"
+profile: __PROJECT_NAME__
+
+source-paths: ["sources"]
+model-paths: ["models"]
+transform-paths: ["transforms"]
+target-path: "target"
+
+# What this corpus is about, declared once. `entity_mentions` finds these
+# names in the text, `entity_links` resolves them to canonical terms, the
+# star map colours them by class, and an agent over MCP can scope a search
+# to a class ("every datastore") or a single term.
+classes: [service, datastore]
+vocabularies:
+  systems:
+    terms:
+      - label: Payments API
+        description: Authorizes cards and writes orders
+        class: service
+        aliases: [payments-api, payments service, checkout API]
+      - label: Search Service
+        description: Product search and autocomplete
+        class: service
+        aliases: [search-service, product search]
+      - label: Webhook Dispatcher
+        description: Delivers order, refund, and shipment events to customers
+        class: service
+        aliases: [webhook-dispatcher, webhooks, dispatcher]
+      - label: Auth Gateway
+        description: Sign-in, sessions, and passkeys
+        class: service
+        aliases: [auth-gateway, login page]
+      - label: Postgres
+        description: The primary database behind orders
+        class: datastore
+        aliases: [PostgreSQL, primary database]
+      - label: Kafka
+        description: The event bus between services
+        class: datastore
+        aliases: [order-events, refund-events]
+      - label: Redis
+        description: The cache in front of search
+        class: datastore
+        aliases: [cache cluster]
+      - label: PgBouncer
+        description: Connection pooler in front of Postgres
+        class: datastore
+        aliases: [connection pooler]

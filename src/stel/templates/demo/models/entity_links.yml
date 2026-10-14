@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: entity_links
+    description: "Each mention resolved to its canonical system"
+    depends_on: [ref('entity_mentions')]
+    transform:
+      type: python
+      module: stel.text.transforms.link_entities
+      options:
+        mentions: entity_mentions
+        # The alias table is the vocabulary itself: "payments-api",
+        # "checkout API", and "Payments API" all resolve to one term.
+        aliases: vocab.systems
+        document_id_field: context_id
+        include_mention_text: true
+    materialization: full
+    tests:
+      - not_null: [entity_link_id, mention_id, status]
+      - unique: entity_link_id
+      - accepted_values:
+          column: status
+          values: [matched, ambiguous, unmatched]

@@ -34,7 +34,6 @@ from .concept_cloud import (
     write_concept_cloud,
 )
 from .config import ConfigError
-from .config.identifiers import PROJECT_FILENAME
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
@@ -56,7 +55,6 @@ from .orphans import find_orphans, format_orphans
 from .paths import resolve_within_project
 from .plan import PlanError, format_plan_table, plan_project, write_plan_artifact
 from .profile import (
-    PROFILES_FILENAME,
     ProfileError,
     apply_source_path_overrides,
     resolve_llm_options,
@@ -465,7 +463,8 @@ _SEEDERS_BY_TYPE: dict[str, Seeder] = {
 }
 
 
-_AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html")
+_AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html", "demo")
+_TEMPLATED_SUFFIXES = frozenset({".yml", ".yaml", ".md", ".py", ".sql"})
 
 
 @cli.command()
@@ -476,7 +475,10 @@ _AVAILABLE_TEMPLATES = ("json", "pdf", "markdown", "html")
     type=click.Choice(_AVAILABLE_TEMPLATES, case_sensitive=False),
     default="json",
     show_default=True,
-    help="Which backend to scaffold for.",
+    help=(
+        "Which backend to scaffold for, or `demo` for a complete offline "
+        "project with its own documents."
+    ),
 )
 def init(name: str, template: str) -> None:
     """Scaffold a new stel project at ./<name>/."""
@@ -492,18 +494,23 @@ def init(name: str, template: str) -> None:
     for path in target.rglob(".gitkeep"):
         path.unlink()
 
-    for filename in (PROJECT_FILENAME, PROFILES_FILENAME):
-        path = target / filename
-        if path.exists():
-            path.write_text(
-                path.read_text(encoding="utf-8").replace("__PROJECT_NAME__", name),
-                encoding="utf-8",
-            )
+    # Every text file a template ships may name the project: its config, its
+    # README, and transforms that record `model.<project>.<name>` provenance.
+    for path in sorted(target.rglob("*")):
+        if path.suffix not in _TEMPLATED_SUFFIXES or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "__PROJECT_NAME__" in text:
+            path.write_text(text.replace("__PROJECT_NAME__", name), encoding="utf-8")
 
     click.echo(f"Created stel project at {target} (template: {template})")
     click.echo("")
     click.echo("Next:")
     click.echo(f"  cd {name}")
+    if template == "demo":
+        click.echo("  stel build")
+        click.echo("  # then follow README.md: search, incremental rebuilds, the star map, MCP")
+        return
     if template == "json":
         click.echo("  uv run stel seed --count 20")
     else:

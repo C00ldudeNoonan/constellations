@@ -1,0 +1,8 @@
+{
+  "ticket_id": "T-1110",
+  "customer": "Bramble Outfitters",
+  "opened_at": "2026-05-20T10:41:00Z",
+  "priority": "normal",
+  "subject": "Search results slow, then fine after refresh",
+  "body": "The first search after loading the page is very slow and later ones are quicker. Feels like a cache problem in the Search Service."
+}

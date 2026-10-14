@@ -70,6 +70,25 @@ duckdb target/stel.duckdb -c "SELECT * FROM my_project.raw_pdf_text LIMIT 5"
 That's the whole loop. Everything else (selectors, profiles, tests, LLM
 extraction, dbt handoff) is opt-in on top.
 
+### Or start from a working project
+
+`stel init <name> --template demo` scaffolds a project that brings its own
+documents instead of waiting for yours: postmortems, runbooks, release notes,
+and support tickets from a made-up company. `stel build` runs it with no
+credentials and no network calls beyond DuckDB fetching its `vss` and `fts`
+extensions once, and writes everything to `target/warehouse.duckdb`: the
+tables, the incremental state, and the search index (see
+[DuckDB-native search](#duckdb-native-search)).
+
+The project is ordinary stel, so reading it is reading a worked example of
+most of this reference: markdown and JSON extraction, heading-attributed
+chunks, `agent_context/v1` wrappers, a `vocabularies:` block driving
+`link_entities` and `extract_relations`, a SQL model, a public search index,
+and the inputs `stel concept-cloud` and `stel mcp serve` need. Its embeddings
+come from the offline `deterministic` provider, so text search carries its
+relevance; its `README.md` says where to swap in a real provider. That README
+walks through each command, and a test runs every `stel` command in it.
+
 ### Optional dependencies
 
 The core install stays lean. Add only the feature groups a project uses:
@@ -378,7 +397,7 @@ extraction models preflight credentials even if their response cache is warm.
 ## The CLI
 
 ```
-stel init <name> [--template {json,pdf,markdown,html}]   # scaffold a fresh project
+stel init <name> [--template {json,pdf,markdown,html,demo}]  # scaffold a fresh project
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
@@ -5977,7 +5996,7 @@ src/stel/
 ├── transforms/runner.py   # loads user Python transform modules + TransformContext
 ├── checks/                # schema tests + custom Python tests + severity
 ├── synth/                 # synthetic data generators per shape
-└── templates/             # init scaffolds for {json,pdf,markdown,html}
+└── templates/             # init scaffolds for {json,pdf,markdown,html,demo}
 ```
 
 ## Roadmap

@@ -652,7 +652,32 @@ class SearchVectorConfig(BaseModel):
     # neither rebuilds the collection nor rebuilds its index. Null leaves
     # LanceDB's default (no re-ranking). Inert under `search: exact`, which
     # already computes true distances.
-    refine_factor: int | None = Field(default=None, gt=0, le=100)
+    #
+    # The cap bounds that read. It was 100 when the field shipped, set from a
+    # 100k-row case where 10 sufficed; on a 3.67M-row corpus the real agent
+    # queries plateaued at recall 0.87 under any number of probes and needed
+    # 300 to reach 0.945 (issue #684). At the limits a served query uses --
+    # 20 rows, 768 dimensions -- 300 is 6,000 vectors, about 18 MB, read once
+    # per query; the product with `limit` is the number to watch, and the
+    # reference states the formula next to the knob.
+    refine_factor: int | None = Field(default=None, gt=0, le=1000)
+    # How many IVF partitions a query probes before re-ranking (issue #684).
+    # Every `approximate` index is IVF-partitioned -- about sqrt(rows)
+    # partitions by Lance's default, ~1,900 at 3.67M rows -- and a query
+    # visits only the `nprobes` nearest centroids, 20 unless told otherwise.
+    # A document's own vector sits deep in one partition, so chunk-as-query
+    # probes and a fixed eval suite recalled 0.98-0.99 at the default; the
+    # queries agents actually send embed between partitions and recalled
+    # 0.76 at top-20 (p10 0.35), 0.86 at 100 probes. It is the floor and the
+    # ceiling: LanceDB can widen the search when a prefilter leaves too few
+    # rows in the probed partitions, and this knob sets both ends to one
+    # value, so a filtered query searches exactly this many. Same stamping as
+    # `refine_factor`: a query-time knob, outside the collection's identity,
+    # null leaves LanceDB's default, refused under `search: exact`, which
+    # builds no partitions to probe. Above the partition count it probes them
+    # all, which is exact search at index cost rather than an unbounded
+    # read, so there is no cap to set.
+    nprobes: int | None = Field(default=None, gt=0)
     embedding: Literal["inherit"] | SearchEmbeddingIdentityConfig
 
     @model_validator(mode="after")
@@ -687,6 +712,14 @@ class SearchVectorConfig(BaseModel):
                 "to search: approximate; exact search already computes true "
                 "distances, so there is nothing to re-rank"
             )
+        # And again: exact search scans every vector, so there are no
+        # partitions to choose among.
+        if "nprobes" in self.model_fields_set and self.search != "approximate":
+            raise ValueError(
+                f"search.vector.nprobes {self.nprobes!r} only applies to "
+                "search: approximate; exact search scans every vector, so "
+                "there are no index partitions to probe"
+            )
         return self
 
     @model_serializer(mode="wrap")
@@ -708,6 +741,8 @@ class SearchVectorConfig(BaseModel):
         # every search model that has ever been published.
         if data.get("refine_factor") is None:
             data.pop("refine_factor", None)
+        if data.get("nprobes") is None:
+            data.pop("nprobes", None)
         return data
 
 

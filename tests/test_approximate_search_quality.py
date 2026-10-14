@@ -17,6 +17,16 @@ off by 0.40 in cosine units; `refine_factor: 10` took that to recall 1.00 and
 an exact score. The second test pins the mechanism at a size the suite can
 afford: with `refine_factor` set, the scores that come back are the true
 distances rather than quantized ones.
+
+#684 is the other half of the same index: `ivf_pq` partitions the vectors
+(about sqrt(rows) partitions by Lance's default) and a query visits only the
+`nprobes` nearest, 20 unless told otherwise. Real agent queries on a 3.67M-row
+corpus recalled 0.76 at that default against an exact top-20 and 0.86 at 100
+probes. That difference is invisible at a size the suite can afford -- 600
+rows fit in a handful of partitions, and one probe returns the same page as
+a thousand -- so the last tests pin the mechanism instead: LanceDB's builder
+still has the method, both knobs are applied to the query it executes, and
+an unset knob is never applied.
 """
 
 from __future__ import annotations
@@ -207,3 +217,87 @@ def test_refine_factor_is_optional_and_absent_by_default(store: Any) -> None:
     plain = _search(store, predicates=predicates)
     assert plain.num_rows == 10
     assert set(plain.column("symbol").to_pylist()) == {TARGET}
+
+
+# ─── nprobes reaches the query (issue #684) ─────────────────────────────────
+
+
+def test_nprobes_is_accepted_by_the_store(store: Any) -> None:
+    """The knob is forwarded to LanceDB's own query builder, so this pins that
+    the builder still has it: a lancedb release that renamed `nprobes` would
+    surface here as a `lancedb_vector_search_failed`, not in production."""
+    predicates = (RetrievalPredicate("symbol", RetrievalPredicateOperator.EQUAL, TARGET),)
+    page = _search(store, predicates=predicates, nprobes=100, refine_factor=10)
+    assert page.num_rows == 10
+    assert set(page.column("symbol").to_pylist()) == {TARGET}
+
+
+class _RecordingQuery:
+    """A double for `LanceVectorQueryBuilder`: the same chainable surface,
+    recording what was asked of it. Its method names are checked against the
+    real builder below, so a lancedb rename breaks this test rather than
+    leaving it certifying a method that no longer exists."""
+
+    def __init__(self, table: pa.Table) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self._table = table
+
+    def _record(self, name: str, value: Any) -> _RecordingQuery:
+        self.calls.append((name, value))
+        return self
+
+    def where(self, where: str, prefilter: bool = False) -> _RecordingQuery:
+        return self._record("where", (where, prefilter))
+
+    def refine_factor(self, refine_factor: int) -> _RecordingQuery:
+        return self._record("refine_factor", refine_factor)
+
+    def nprobes(self, nprobes: int) -> _RecordingQuery:
+        return self._record("nprobes", nprobes)
+
+    def select(self, columns: Any) -> _RecordingQuery:
+        return self._record("select", columns)
+
+    def limit(self, limit: int) -> _RecordingQuery:
+        return self._record("limit", limit)
+
+    def to_arrow(self) -> pa.Table:
+        return self._table
+
+
+def test_nprobes_and_refine_factor_reach_the_query(store: Any, monkeypatch: Any) -> None:
+    """Which partitions a query visits is invisible in a page this small --
+    the fixture's 600 rows fit in a handful of partitions, so one probe and
+    a thousand return the same ten -- and the 3.67M-row measurement that
+    motivated the knob is not a test. What *can* be pinned is that both
+    knobs are applied to the query LanceDB executes, and that an unset knob
+    is never applied, since the builder's default is what the collection was
+    measured at."""
+    from lancedb.query import LanceVectorQueryBuilder
+
+    for name in ("where", "refine_factor", "nprobes", "select", "limit", "to_arrow"):
+        assert callable(getattr(LanceVectorQueryBuilder, name)), name
+
+    real_table = store._open_owned_table(COLLECTION)
+    page = pa.Table.from_pylist([{"id": "1", "symbol": TARGET, "_distance": 0.1}])
+    recorded: list[_RecordingQuery] = []
+
+    class _Table:
+        schema = real_table.schema
+
+        def search(self, vector: Any, vector_column_name: str) -> _RecordingQuery:
+            assert vector_column_name == "embedding"
+            query = _RecordingQuery(page)
+            recorded.append(query)
+            return query
+
+    monkeypatch.setattr(store, "_open_owned_table", lambda _collection: _Table())
+
+    _search(store, nprobes=100, refine_factor=30)
+    _search(store)
+
+    tuned, plain = recorded
+    assert ("nprobes", 100) in tuned.calls
+    assert ("refine_factor", 30) in tuned.calls
+    assert tuned.calls[-1] == ("limit", 10)
+    assert [name for name, _ in plain.calls] == ["select", "limit"]

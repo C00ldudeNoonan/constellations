@@ -12,7 +12,7 @@ from .base import (
     RetrievalStoreConfig,
     StoreRole,
 )
-from .evolution import semantic_search_config
+from .evolution import semantic_search_config, without_query_knobs
 
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
 
@@ -132,20 +132,25 @@ def legacy_collection_config_fingerprint(
     instead of rebuilt. Removable once no collection carries a v1 stamp
     (the #321 category-1 rule).
 
-    Fields added after descriptors existed are left out: no v1 stamp can
-    contain them, so hashing them could only make an unchanged collection
-    fail the proof and demand a rebuild it does not need.
+    Fields added after descriptors existed are left out: the top-level
+    `_POST_DESCRIPTOR_FIELDS` (`freshness`, #682) and the `vector` query knobs
+    `refine_factor` (#520) and `nprobes` (#684). Descriptors shipped in #344,
+    before any of them, so no v1 stamp can contain one: hashing them could
+    only make an unchanged collection fail the proof and demand a rebuild it
+    does not need.
     """
     return canonical_fingerprint(
         {
             "contract_version": 1,
             "store_type": store_type,
             "store_implementation": store_class(store_type).implementation_identity(),
-            "search": {
-                key: value
-                for key, value in search_config.items()
-                if key not in _POST_DESCRIPTOR_FIELDS
-            },
+            "search": without_query_knobs(
+                {
+                    key: value
+                    for key, value in search_config.items()
+                    if key not in _POST_DESCRIPTOR_FIELDS
+                }
+            ),
         },
         domain="dbt-ml-search-collection-config",
     )

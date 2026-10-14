@@ -584,6 +584,10 @@ class LanceDBStore(RetrievalStore):
                 {
                     RetrievalFeature.EXACT_VECTOR_SEARCH,
                     RetrievalFeature.APPROXIMATE_VECTOR_SEARCH,
+                    # Every index type `approximate` can build here is IVF at
+                    # the top level (`ivf_pq`, `ivf_hnsw_sq`, `ivf_hnsw_flat`),
+                    # so `nprobes` always has partitions to act on (#684).
+                    RetrievalFeature.PARTITION_PROBES,
                     RetrievalFeature.METADATA_FILTERING,
                     RetrievalFeature.FULL_TEXT_SEARCH,
                     RetrievalFeature.KEYED_UPSERT,
@@ -1470,6 +1474,7 @@ class LanceDBStore(RetrievalStore):
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
         refine_factor: int | None = None,
+        nprobes: int | None = None,
     ) -> pa.Table:
         failure: RetrievalError | None = None
         try:
@@ -1496,6 +1501,12 @@ class LanceDBStore(RetrievalStore):
                 query = query.where(where, prefilter=True)
             if refine_factor is not None:
                 query = query.refine_factor(refine_factor)
+            if nprobes is not None:
+                # `nprobes` sets LanceDB's minimum and maximum probe counts
+                # to one value: the floor every query pays and the ceiling a
+                # prefilter that found too few rows may not exceed. One knob,
+                # one meaning, documented as such (issue #684).
+                query = query.nprobes(nprobes)
             if columns is not None:
                 query = query.select(_include_score_column(columns, "_distance"))
             result = query.limit(limit).to_arrow()

@@ -16,6 +16,12 @@ from .evolution import semantic_search_config, without_query_knobs
 
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
 
+# Top-level `search:` fields introduced after descriptors (#344, 2026-08-22),
+# which the legacy pre-#344 digest must not hash. `freshness` (#682) dumps
+# even when unset, as `None`, so hashing it moved the digest of every legacy
+# stamp, not only those of models that declare a policy.
+_POST_DESCRIPTOR_FIELDS = frozenset({"freshness"})
+
 
 def register[StoreT: RetrievalStore](cls: type[StoreT]) -> type[StoreT]:
     _REGISTRY[cls.store_type()] = cls
@@ -126,17 +132,25 @@ def legacy_collection_config_fingerprint(
     instead of rebuilt. Removable once no collection carries a v1 stamp
     (the #321 category-1 rule).
 
-    The query knobs are dropped before hashing. Descriptors shipped in #344,
-    before `refine_factor` (#520) or `nprobes` (#684) existed, so no v1 stamp
-    can contain either: dropping them only stops a knob-only change from
-    failing the proof and demanding a rebuild it does not need.
+    Fields added after descriptors existed are left out: the top-level
+    `_POST_DESCRIPTOR_FIELDS` (`freshness`, #682) and the `vector` query knobs
+    `refine_factor` (#520) and `nprobes` (#684). Descriptors shipped in #344,
+    before any of them, so no v1 stamp can contain one: hashing them could
+    only make an unchanged collection fail the proof and demand a rebuild it
+    does not need.
     """
     return canonical_fingerprint(
         {
             "contract_version": 1,
             "store_type": store_type,
             "store_implementation": store_class(store_type).implementation_identity(),
-            "search": without_query_knobs(search_config),
+            "search": without_query_knobs(
+                {
+                    key: value
+                    for key, value in search_config.items()
+                    if key not in _POST_DESCRIPTOR_FIELDS
+                }
+            ),
         },
         domain="dbt-ml-search-collection-config",
     )

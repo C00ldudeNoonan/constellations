@@ -74,6 +74,13 @@
   the declared policy; a ledger written before the column reads as "no
   activation on record" rather than failing a listing. Recorded in
   [ADR-0032](docs/adr/0032-a-served-indexs-age-is-the-activation-it-serves.md).
+- **`freshness` no longer fails a pre-#344 collection's upgrade proof.** A
+  collection stamped before descriptors existed is recognized by a digest
+  over the whole search config, and an unset `freshness` still dumps as
+  `None`. That moved the digest for every such collection, with no policy
+  declared, and the next publish demanded `--full-refresh`. The legacy digest
+  now leaves out fields added after descriptors, `freshness` first: no
+  legacy stamp can contain one.
 
 ### The star map reaches the source (issue #555 item 7, #678)
 

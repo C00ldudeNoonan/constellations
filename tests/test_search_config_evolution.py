@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from stel.config import SearchConfig
-from stel.config.model import ModelConfig, SearchVectorConfig
+from stel.config.model import ModelConfig, SearchFreshnessConfig, SearchVectorConfig
 from stel.config.project import ProjectConfig
 from stel.embedding import effective_search_config
 from stel.execution.contracts import RunError
@@ -253,6 +253,43 @@ def test_a_pre_344_collection_whose_config_really_changed_still_fails() -> None:
         _verify_collection_config(store, existing, _spec())
 
     assert store.restamped == []
+
+
+@pytest.mark.parametrize(
+    "freshness",
+    [None, {"stale_after": {"count": 2, "period": "day"}}],
+    ids=["unset", "declared"],
+)
+def test_freshness_does_not_fail_a_pre_344_collections_proof(
+    freshness: dict[str, Any] | None,
+) -> None:
+    """#682 added `freshness`, and an unset one still dumps as
+    `"freshness": None`. A legacy stamp was hashed before the key existed, so
+    the legacy digest moved for every pre-#344 collection, and each one
+    demanded `--full-refresh` with nothing declared at all. Descriptors (#344)
+    predate `freshness`, so no legacy stamp can contain it, and leaving it out
+    of the digest proves nothing away."""
+    payload = effective_search_config(_vector_model(), [])
+    assert "freshness" in payload, "the dump carries the key; that is the bug"
+    stamped = {key: value for key, value in payload.items() if key != "freshness"}
+    current = {
+        **payload,
+        "freshness": (
+            None
+            if freshness is None
+            else SearchFreshnessConfig.model_validate(freshness).model_dump()
+        ),
+    }
+
+    assert legacy_collection_config_fingerprint(
+        current, store_type="lancedb"
+    ) == legacy_collection_config_fingerprint(stamped, store_type="lancedb")
+    changed = effective_search_config(_vector_model(metric="dot"), [])
+    assert legacy_collection_config_fingerprint(
+        changed, store_type="lancedb"
+    ) != legacy_collection_config_fingerprint(
+        stamped, store_type="lancedb"
+    ), "a real change must still break the proof"
 
 
 def test_a_matching_descriptor_neither_fails_nor_restamps() -> None:

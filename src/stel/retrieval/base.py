@@ -136,6 +136,13 @@ class RetrievalFeature(StrEnum):
     # place, or whose index build rewrites the data it indexes, must not
     # declare it.
     INTERRUPTION_SAFE_MUTATION = "interruption_safe_mutation"
+    # The approximate index is partitioned, and a query can be told how many
+    # partitions to search (`search.vector.nprobes`, issue #684). Required only
+    # when a model declares `nprobes`: a store whose approximate index is a
+    # graph (DuckDB's HNSW) has no partitions to choose among, and accepting
+    # the key there would be a tuning that looks operative and does nothing
+    # (Codex review, #686).
+    PARTITION_PROBES = "partition_probes"
 
 
 PUBLISHER_FENCING_FEATURES = frozenset(
@@ -785,9 +792,11 @@ class RetrievalStore(ABC):
         ordering and an exact score (issue #520). `nprobes` asks a store that
         answers from a *partitioned* index how many partitions to search
         before it re-ranks anything, trading scan time for candidates the
-        re-rank can see at all (issue #684). Both are advisory: a store that
-        always computes true distances over every vector ignores them,
-        because there is nothing to re-rank and nothing to choose among.
+        re-rank can see at all (issue #684). `refine_factor` is advisory: a
+        store that computes true distances ignores it, because there is
+        nothing to re-rank. `nprobes` is not: preflight refuses it for a store
+        that does not declare `PARTITION_PROBES`, so a store receives a value
+        only if it can honor one.
         """
 
     @abstractmethod

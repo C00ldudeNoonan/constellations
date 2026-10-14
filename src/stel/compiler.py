@@ -481,6 +481,10 @@ def validate_retrieval_capabilities(
                 if search.vector.search == "approximate"
                 else RetrievalFeature.EXACT_VECTOR_SEARCH
             ] = f"{search.vector.search} vector search"
+            if search.vector.nprobes is not None:
+                required[RetrievalFeature.PARTITION_PROBES] = (
+                    "`nprobes`, which chooses how many index partitions a query searches"
+                )
             if search.vector.metric not in capabilities.distance_metrics:
                 raise _model_error(
                     model,

@@ -551,6 +551,8 @@ def _model_dict_v2(
     ]
     if search.vector is not None:
         required.append(f"{search.vector.search}_vector_search")
+        if search.vector.nprobes is not None:
+            required.append("partition_probes")
     if search.full_text is not None:
         required.append("full_text_search")
     if any(attribute.filter_role != "none" for attribute in search.attributes):
@@ -585,7 +587,11 @@ def _model_dict_v2(
                 # structure, when it is not the default. Absent means
                 # `ivf_hnsw_flat` -- the config's serializer omits the default
                 # so every descriptor written under version 1 reads the same.
-                "schema_version": 2,
+                # 3 (issue #684): `vector` may carry the query-time knobs
+                # `refine_factor` and `nprobes`, each only when set. #520 added
+                # `refine_factor` under 2 without a bump; this one covers both
+                # (Codex review, #686).
+                "schema_version": 3,
                 "config_fingerprint": collection_config_fingerprint(
                     effective_search, store_type=config.type
                 ),

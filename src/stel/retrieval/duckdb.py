@@ -809,9 +809,11 @@ class DuckDBStore(RetrievalStore):
         refine_factor: int | None = None,
         nprobes: int | None = None,
     ) -> pa.Table:
-        # Ignored by contract: this store computes true distances over stored
-        # vectors, so there are no approximate candidates to re-rank (#520)
-        # and no IVF partitions to choose among (#684).
+        # `refine_factor` is advisory and ignored: this store computes true
+        # distances, so there are no approximate candidates to re-rank (#520).
+        # `nprobes` never arrives: this store does not declare
+        # PARTITION_PROBES, its approximate index being HNSW rather than IVF,
+        # so preflight refuses a model that sets it (#684, Codex review #686).
         del refine_factor, nprobes
         _validate_query_limit(limit)
         _validate_query_projection(columns)

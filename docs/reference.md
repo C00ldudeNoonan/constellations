@@ -3369,7 +3369,7 @@ queries rather than on a fixed suite, because the suite is the row that said
     refine_factor: 100
 ```
 
-Three things to know:
+Four things to know:
 
 - **It is the floor and the ceiling.** LanceDB can widen a search when a
   prefilter leaves too few rows in the probed partitions; `nprobes` sets both
@@ -3386,7 +3386,14 @@ Three things to know:
   unset, so a collection published before it existed is not re-keyed; refused
   under `search: exact`, which scans every vector and has no partitions to
   choose among. It applies to every `approximate` index type, since all three
-  are IVF-partitioned, and to the vector half of a hybrid query.
+  are IVF-partitioned, and to the vector half of a hybrid query. A collection
+  stamped before collection descriptors existed is not refused for it either:
+  the knobs are left out of that older proof too.
+- **It needs a partitioned store.** The `lancedb` store declares the
+  `partition_probes` capability. The `duckdb` store does not, because its
+  `approximate` index is HNSW, so `nprobes` there is refused at compile time
+  rather than silently ignored. `refine_factor` stays advisory: a store that
+  computes true distances ignores it.
 
 **stel estimates the build before paying for the rows.** Inside a container,
 a publish to a LanceDB store reads the cgroup memory ceiling and, from the row

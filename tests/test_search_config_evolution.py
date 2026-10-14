@@ -745,6 +745,27 @@ def test_a_query_knob_does_not_invalidate_a_published_index(knob: str, value: in
 
 
 @pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
+def test_a_query_knob_does_not_fail_a_pre_344_collections_proof(knob: str, value: int) -> None:
+    """Codex review, #686. A collection stamped before descriptors existed is
+    re-stamped in place only if the legacy whole-config digest still matches;
+    otherwise the run demands `--full-refresh`. Turning on a query knob must
+    not break that match. Descriptors shipped in #344, before either knob
+    existed, so no legacy stamp can contain one and dropping it proves
+    nothing away."""
+    plain = legacy_collection_config_fingerprint(
+        _config(vector={**_APPROX_VECTOR}), store_type="lancedb"
+    )
+    tuned = legacy_collection_config_fingerprint(
+        _config(vector={**_APPROX_VECTOR, knob: value}), store_type="lancedb"
+    )
+
+    assert tuned == plain
+    assert legacy_collection_config_fingerprint(
+        _config(vector={**_APPROX_VECTOR, "dimensions": 3}), store_type="lancedb"
+    ) != plain, "a real change must still break the proof"
+
+
+@pytest.mark.parametrize("knob,value", _QUERY_KNOBS)
 def test_a_query_knob_is_dropped_from_the_descriptor_not_merely_ignored(
     knob: str, value: int
 ) -> None:

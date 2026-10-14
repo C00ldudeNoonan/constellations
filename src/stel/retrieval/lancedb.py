@@ -528,6 +528,10 @@ class LanceDBStore(RetrievalStore):
                 {
                     RetrievalFeature.EXACT_VECTOR_SEARCH,
                     RetrievalFeature.APPROXIMATE_VECTOR_SEARCH,
+                    # Every index type `approximate` can build here is IVF at
+                    # the top level (`ivf_pq`, `ivf_hnsw_sq`, `ivf_hnsw_flat`),
+                    # so `nprobes` always has partitions to act on (#684).
+                    RetrievalFeature.PARTITION_PROBES,
                     RetrievalFeature.METADATA_FILTERING,
                     RetrievalFeature.FULL_TEXT_SEARCH,
                     RetrievalFeature.KEYED_UPSERT,

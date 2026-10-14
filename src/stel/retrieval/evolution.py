@@ -120,14 +120,27 @@ def semantic_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         for key, value in sorted(payload.items())
         if key not in excluded
     }
-    vector = projected.get("vector")
-    if isinstance(vector, Mapping):
-        projected["vector"] = {
+    return without_query_knobs(projected)
+
+
+def without_query_knobs(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """A dumped `SearchConfig` with the query-only `vector` sub-fields removed.
+
+    Shared by the descriptor and the legacy pre-#344 digest, so a knob that
+    changes only how a query is answered registers as a configuration change
+    on neither path (Codex review, #686).
+    """
+    vector = payload.get("vector")
+    if not isinstance(vector, Mapping):
+        return dict(payload)
+    return {
+        **payload,
+        "vector": {
             key: value
             for key, value in vector.items()
             if key not in _VECTOR_QUERY_ONLY_FIELDS
-        }
-    return projected
+        },
+    }
 
 
 def search_code_identity(payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -12,7 +12,7 @@ from .base import (
     RetrievalStoreConfig,
     StoreRole,
 )
-from .evolution import semantic_search_config
+from .evolution import semantic_search_config, without_query_knobs
 
 _REGISTRY: dict[str, type[RetrievalStore]] = {}
 
@@ -125,13 +125,18 @@ def legacy_collection_config_fingerprint(
     and prove its configuration is unchanged, so it can be re-stamped in place
     instead of rebuilt. Removable once no collection carries a v1 stamp
     (the #321 category-1 rule).
+
+    The query knobs are dropped before hashing. Descriptors shipped in #344,
+    before `refine_factor` (#520) or `nprobes` (#684) existed, so no v1 stamp
+    can contain either: dropping them only stops a knob-only change from
+    failing the proof and demanding a rebuild it does not need.
     """
     return canonical_fingerprint(
         {
             "contract_version": 1,
             "store_type": store_type,
             "store_implementation": store_class(store_type).implementation_identity(),
-            "search": search_config,
+            "search": without_query_knobs(search_config),
         },
         domain="dbt-ml-search-collection-config",
     )

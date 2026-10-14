@@ -942,6 +942,8 @@ def _validate_capabilities(
             if vector.search == "approximate"
             else RetrievalFeature.EXACT_VECTOR_SEARCH
         ] = f"{request.mode.value} query"
+        if vector.nprobes is not None:
+            required[RetrievalFeature.PARTITION_PROBES] = "`nprobes` on the model"
     if request.mode in {SearchMode.TEXT, SearchMode.HYBRID}:
         if search_config.full_text is None:
             raise SearchError("The search index has no full-text configuration")

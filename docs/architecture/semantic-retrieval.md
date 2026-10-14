@@ -1011,6 +1011,10 @@ class RetrievalFeature(StrEnum):
     # row whole, so the serving ledger keeps serving a generation a failed or
     # killed in-place publish was writing into (issue #617, ADR-0016).
     INTERRUPTION_SAFE_MUTATION = "interruption_safe_mutation"
+    # The approximate index is partitioned and a query can choose how many
+    # partitions to search; required only when a model sets `nprobes`
+    # (issue #684).
+    PARTITION_PROBES = "partition_probes"
 
 
 class RetrievalCapabilities(BaseModel):

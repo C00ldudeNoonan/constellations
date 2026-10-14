@@ -30,6 +30,20 @@
 - Both knobs are pinned as forwarded from the model's declaration to the
   store, on the vector half of a hybrid query included, and as applied to
   the query LanceDB executes.
+- **`nprobes` is refused on a store with no partitions.** A new
+  `partition_probes` capability is declared by `lancedb` and not by
+  `duckdb`, whose approximate index is HNSW. A model that sets `nprobes`
+  against such a store fails at compile time instead of compiling to a
+  setting that does nothing.
+- **The manifest's `serving_resource` moves to `schema_version: 3`.** Its
+  `vector` block may now carry `nprobes`, and `refine_factor`, which #520
+  added under version 2 without a bump. A model that sets `nprobes` also
+  lists `partition_probes` under `capabilities.required`.
+- **A collection stamped before descriptors existed (pre-#344) is not refused
+  for a knob.** Its legacy proof hashed the whole search config, so turning
+  on either knob failed the proof and demanded `--full-refresh`. Both are
+  now dropped from that hash, as from the descriptor. No legacy stamp can
+  contain them, since both postdate descriptors.
 
 ## v0.21.1 - 2026-10-10
 

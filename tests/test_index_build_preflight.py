@@ -349,3 +349,43 @@ def test_an_in_place_write_is_not_warned_about_because_it_extends(
 
     assert result.rows_written == 2
     assert "peaks at roughly" not in caplog.text
+
+
+def test_an_extension_past_the_measured_range_is_reported_not_retrained(
+    tmp_path: Path,
+) -> None:
+    """What an extension costs in drift reaches the run summary (issue #683).
+
+    The other side of the test above: the write is still absorbed without a
+    retrain, but once extension has placed more vectors than 30% of what the
+    index was trained on, the run says so and names the retrain. One of the two
+    rows is rewritten, so the index is now 50% extension. Not both: a write
+    that replaces every row the index covers leaves LanceDB nothing to extend,
+    and the index is retrained from scratch -- the record then rightly starts
+    over.
+    """
+    from stel.runner import run_project
+
+    prepare_online_switch(tmp_path)
+    [built] = run_project(tmp_path, select="context_search")
+    assert built.serving_resource is not None
+    assert built.serving_resource["vector_index_trained_rows"] == 2
+    assert built.serving_resource["vector_index_extended_rows"] == 0
+    assert built.warnings == {}
+
+    one_changed = sample_rows().with_columns(
+        pl.when(pl.col("chunk_id") == "c1")
+        .then(pl.lit("changed"))
+        .otherwise(pl.col("title"))
+        .alias("title")
+    )
+    materialize_upstream(tmp_path, one_changed)
+    [extended] = run_project(tmp_path, select="context_search")
+
+    assert extended.rows_written == 1
+    assert extended.serving_resource is not None
+    assert extended.serving_resource["vector_index_trained_rows"] == 2
+    assert extended.serving_resource["vector_index_extended_rows"] == 1
+    [advisory] = extended.warnings
+    assert "trained on 2 rows" in advisory and "(50% of that sample)" in advisory
+    assert "--select context_search --full-refresh" in advisory

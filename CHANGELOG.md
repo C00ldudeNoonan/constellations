@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### A publish says how far its vector index has been extended past its training (issue #683)
+
+- **Drift exposure is recorded, not guessed.** Since #651 an incremental
+  publish extends a LanceDB index instead of retraining it, so the centroids
+  were trained once, on whatever the corpus was at the last full build. The
+  store now stamps the rows each vector index was trained on, and adds every
+  vector an extension places without retraining (updated rows included).
+  Run results carry both as `vector_index_trained_rows` and
+  `vector_index_extended_rows` on the search model's `serving_resource`.
+- **Past 30%, the run says so.** Once extension has placed more than 30% of
+  the training sample, the publish reports a warning in the run summary and
+  `run_results.json` naming `stel run --select <model> --full-refresh` as the
+  retrain. 30% is the largest extension measured on 3.67M SEC vectors, where
+  recall@20 stayed inside the spread between two fresh builds; past it there
+  is no data, not evidence of a problem. stel never retrains on its own.
+- An index trained before this release has no record; its count starts at
+  its next extension, from what the index held then, so it reads low rather
+  than not at all.
+
 ### An embed pays once per text, and `stel plan` says what a reprocess costs (issue #665)
 
 - **Three ways a corpus still paid twice for the same text.** #671 made

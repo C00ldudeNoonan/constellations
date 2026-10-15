@@ -262,3 +262,47 @@ def index_build_advisory(
             "the private generation is abandoned and the live index keeps serving."
         )
     return f"{measured}. {remedy}"
+
+
+# ─── index extension (issue #683) ───────────────────────────────────────────
+
+# Vectors placed by extension, as a share of the sample the index was trained
+# on, past which the advisory speaks. Not a measured failure point: it is the
+# largest extension measured (#683, 3.67M SEC filing vectors, `ivf_pq` trained
+# on the filings before a cutoff and extended with the rest). At 5%, 15% and
+# 30% recall@20 stayed inside the spread between two fresh builds. Past 30%
+# there is no data rather than evidence of a problem, so the advisory says that
+# and leaves the retrain to the operator: an automatic one would bring back the
+# whole-corpus cost #619 removed.
+INDEX_EXTENSION_ADVISORY_RATIO: Final = 0.30
+
+
+def index_extension_advisory(
+    *,
+    model: str,
+    collection: str,
+    trained_rows: int | None,
+    extended_rows: int | None,
+) -> str | None:
+    """The note an index extended this far past its training deserves, if any.
+
+    None when the store recorded no training, when nothing has been extended,
+    or while extension is still within the measured range.
+    """
+    if trained_rows is None or extended_rows is None or trained_rows <= 0:
+        return None
+    ratio = extended_rows / trained_rows
+    if ratio <= INDEX_EXTENSION_ADVISORY_RATIO:
+        return None
+    return (
+        f"collection '{collection}': its vector index was trained on "
+        f"{trained_rows:,} rows, and extension has since placed {extended_rows:,} "
+        f"more vectors into it ({ratio:.0%} of that sample) without retraining. "
+        "Extension assigns new vectors to centroids the original sample trained; "
+        "up to "
+        f"{INDEX_EXTENSION_ADVISORY_RATIO:.0%} it was measured to leave recall "
+        "unchanged (issue #683), and past that nothing has been measured. "
+        f"`stel run --select {model} --full-refresh` retrains it from empty in a "
+        "private generation while the live index keeps serving; `stel eval` "
+        "shows whether it is worth doing."
+    )

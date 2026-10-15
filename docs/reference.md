@@ -3309,6 +3309,19 @@ drifts as the corpus moves away from that training sample. `--full-refresh`
 retrains it from empty. There is no in-place retrain, because Lance
 deprecated the `retrain` flag its `optimize()` once took.
 
+How far an index has drifted from its training is recorded rather than
+guessed. Each vector index build stamps the rows it trained on, and each
+extension adds the vectors it placed, an updated row as well as a new one.
+A search model's `serving_resource` in `run_results.json` carries both as
+`vector_index_trained_rows` and `vector_index_extended_rows`. Once
+extension passes 30% of the training sample, the publish warns and names
+`stel run --select <model> --full-refresh`. It never retrains on its own,
+because that would bring back the whole-corpus cost extension removed. 30%
+is not a failure point: it is the largest extension measured on a 3.67M-row
+SEC corpus (issue #683), where recall@20 stayed within the spread between
+two fresh builds. Past it there is no data. An index built before this was
+recorded starts counting at its next extension, from what it held then.
+
 ### DuckDB-native search
 
 When the warehouse is already DuckDB, a separate retrieval system is an extra

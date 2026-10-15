@@ -272,6 +272,18 @@ _SOURCE_ROWS_KEY = b"stel.source_rows"
 # The segmented read position an unfinished publish left (issue #614). Cleared
 # the same way: an empty value reads back as absent.
 _SOURCE_PROGRESS_KEY = b"stel.source_progress"
+# The rows the vector index was trained on, and the vectors extension has
+# placed into it since (issue #683). Lance records neither: its index uuid and
+# `created_at` change on every `optimize()`, so the index cannot say when it
+# was last trained. Cleared with an empty value, like the stamps above.
+_INDEX_TRAINED_ROWS_KEY = b"stel.vector_index_trained_rows"
+_INDEX_EXTENDED_ROWS_KEY = b"stel.vector_index_extended_rows"
+# An extension in flight: the vectors it is about to place, and the index's
+# shape before it. Written before `optimize()` and folded in after, so a
+# process that dies between Lance's commit and the count can still be
+# settled by the next publish (Codex review, #691).
+_INDEX_PENDING_ROWS_KEY = b"stel.vector_index_pending_rows"
+_INDEX_PENDING_MARKER_KEY = b"stel.vector_index_pending_marker"
 # Rows per batch when seeding a generation from another collection. Chosen so
 # one batch of 768-dim float32 vectors is tens of MB rather than gigabytes;
 # the point is bounded residency, not throughput (issue #495).
@@ -914,6 +926,12 @@ class LanceDBStore(RetrievalStore):
                 source_generation=_read_field_value(schema, _SOURCE_GENERATION_KEY),
                 source_rows=_read_int_field_value(schema, _SOURCE_ROWS_KEY),
                 source_progress=_read_field_value(schema, _SOURCE_PROGRESS_KEY),
+                vector_index_trained_rows=_read_int_field_value(
+                    schema, _INDEX_TRAINED_ROWS_KEY
+                ),
+                vector_index_extended_rows=_read_int_field_value(
+                    schema, _INDEX_EXTENDED_ROWS_KEY
+                ),
             )
         except RetrievalError:
             raise
@@ -1209,6 +1227,9 @@ class LanceDBStore(RetrievalStore):
         behind = sum(1 for index in indexes if index.num_unindexed_rows)
         if not behind or self._index_shape_changed(spec, indexes):
             return indexes
+        vector = self._vector_index(spec, indexes)
+        if vector is not None:
+            self._begin_extension(table, spec, vector)
         try:
             table.optimize()
         except Exception as error:
@@ -1234,7 +1255,117 @@ class LanceDBStore(RetrievalStore):
             spec.logical_name,
             behind,
         )
-        return list(table.list_indices())
+        extended = list(table.list_indices())
+        self._settle_extension(table, spec, extended)
+        return extended
+
+    def _begin_extension(self, table: Any, spec: CollectionSpec, vector: Any) -> None:
+        """Record the vectors an extension is about to place (#683).
+
+        `num_unindexed_rows` before the `optimize()` is exactly that set: an
+        upserted row is rewritten into a new fragment, so an updated vector is
+        counted alongside a new one, and both are assigned to centroids the
+        index already has. Held as pending until `_settle_extension` sees the
+        extension commit.
+
+        An index trained before this was recorded has no stamp. Its baseline is
+        what it holds before this extension, so the count starts here and reads
+        low rather than not at all -- a collection that only ever extends would
+        otherwise stay unmeasured until its next full build.
+        """
+        trained = _read_int_field_value(table.schema, _INDEX_TRAINED_ROWS_KEY)
+        extended = _read_int_field_value(table.schema, _INDEX_EXTENDED_ROWS_KEY)
+        if trained is None:
+            trained, extended = int(vector.num_indexed_rows), 0
+        self._stamp_index_training(
+            table,
+            spec,
+            trained_rows=trained,
+            extended_rows=extended or 0,
+            pending=(int(vector.num_unindexed_rows), _index_marker(vector)),
+        )
+
+    def _settle_extension(
+        self, table: Any, spec: CollectionSpec, indexes: list[Any]
+    ) -> None:
+        """Fold a pending extension into the count if it committed (#683).
+
+        Runs right after `optimize()` and again at the start of the next
+        `ensure_indexes`, which is what makes a death between Lance's commit
+        and this write recoverable (Codex review, #691). Without it the next
+        publish would find nothing unindexed and never count those vectors,
+        which errs the one way an advisory must not: silent.
+
+        Whether the extension committed is read from the index itself: every
+        `optimize()` that indexes rows either appends a segment or merges
+        segments into a new index, so its uuid and segment count are never
+        both unchanged (probed on lancedb 0.34 across all three ANN types).
+        Unchanged means the rows are still unindexed, and the next extension
+        counts them; folding them here as well would count them twice.
+        """
+        pending = _read_int_field_value(table.schema, _INDEX_PENDING_ROWS_KEY)
+        marker = _read_field_value(table.schema, _INDEX_PENDING_MARKER_KEY)
+        if pending is None or marker is None:
+            return
+        trained = _read_int_field_value(table.schema, _INDEX_TRAINED_ROWS_KEY)
+        extended = _read_int_field_value(table.schema, _INDEX_EXTENDED_ROWS_KEY) or 0
+        vector = self._vector_index(spec, indexes)
+        committed = vector is not None and _index_marker(vector) != marker
+        self._stamp_index_training(
+            table,
+            spec,
+            trained_rows=trained,
+            extended_rows=extended + pending if committed else extended,
+            pending=None,
+        )
+
+    def _stamp_index_training(
+        self,
+        table: Any,
+        spec: CollectionSpec,
+        *,
+        trained_rows: int | None,
+        extended_rows: int | None,
+        pending: tuple[int, str] | None,
+    ) -> None:
+        """Write, or with None clear, the vector index's training stamps.
+
+        One metadata commit for all of them, so the count and the pending
+        extension it absorbs can never be read half-written.
+        """
+        table.update_field_metadata(
+            {
+                "path": spec.id_field,
+                "metadata": {
+                    _INDEX_TRAINED_ROWS_KEY.decode(): (
+                        "" if trained_rows is None else str(trained_rows)
+                    ),
+                    _INDEX_EXTENDED_ROWS_KEY.decode(): (
+                        "" if extended_rows is None else str(extended_rows)
+                    ),
+                    _INDEX_PENDING_ROWS_KEY.decode(): (
+                        "" if pending is None else str(pending[0])
+                    ),
+                    _INDEX_PENDING_MARKER_KEY.decode(): (
+                        "" if pending is None else pending[1]
+                    ),
+                },
+            }
+        )
+
+    def _vector_index(self, spec: CollectionSpec, indexes: list[Any]) -> Any | None:
+        """The ANN index on the spec's vector field, if one exists."""
+        if spec.vector_field is None:
+            return None
+        return next(
+            (
+                index
+                for index in indexes
+                if index.columns == [spec.vector_field]
+                and index.index_type in _VECTOR_INDEX_TYPES.values()
+            ),
+            None,
+        )
 
     def _index_shape_changed(self, spec: CollectionSpec, indexes: list[Any]) -> bool:
         """Does a declared index need building rather than extending (#619)?
@@ -1245,17 +1376,7 @@ class LanceDBStore(RetrievalStore):
         its unindexed count intact. Scalar and full-text indices have one
         shape each and can always be extended.
         """
-        if spec.vector_field is None:
-            return False
-        vector = next(
-            (
-                index
-                for index in indexes
-                if index.columns == [spec.vector_field]
-                and index.index_type in _VECTOR_INDEX_TYPES.values()
-            ),
-            None,
-        )
+        vector = self._vector_index(spec, indexes)
         if vector is None:
             return False
         if spec.vector_search != "approximate":
@@ -1318,6 +1439,8 @@ class LanceDBStore(RetrievalStore):
             )
             step = "index listing"
             indexes = list(table.list_indices())
+            step = "training record"
+            self._settle_extension(table, spec, indexes)
             step = "index extension"
             indexes = self._extend_indexes(table, spec, indexes)
             for field in spec.scalar_index_fields:
@@ -1363,15 +1486,7 @@ class LanceDBStore(RetrievalStore):
                         existing=current is not None,
                     )
             if spec.vector_field is not None:
-                current = next(
-                    (
-                        index
-                        for index in indexes
-                        if index.columns == [spec.vector_field]
-                        and index.index_type in _VECTOR_INDEX_TYPES.values()
-                    ),
-                    None,
-                )
+                current = self._vector_index(spec, indexes)
                 if spec.vector_search == "approximate":
                     chosen = spec.vector_index
                     if chosen not in _VECTOR_INDEX_TYPES:
@@ -1422,6 +1537,14 @@ class LanceDBStore(RetrievalStore):
                             ),
                             existing=current is not None,
                         )
+                        step = f"training record for '{spec.vector_field}'"
+                        self._stamp_index_training(
+                            table,
+                            spec,
+                            trained_rows=table.count_rows(),
+                            extended_rows=0,
+                            pending=None,
+                        )
                 elif current is not None:
                     # `exact` is implemented by the *absence* of an ANN index --
                     # LanceDB uses one whenever it exists. Leaving a stale index
@@ -1430,6 +1553,9 @@ class LanceDBStore(RetrievalStore):
                     # ones (issue #461).
                     step = f"stale {current.index_type} vector index drop for '{spec.vector_field}'"
                     table.drop_index(current.name)
+                    self._stamp_index_training(
+                        table, spec, trained_rows=None, extended_rows=None, pending=None
+                    )
         except RetrievalError:
             # A deliberate refusal keeps its own code, as in `upsert`/`delete`.
             raise
@@ -1604,6 +1730,11 @@ def _with_descriptor(schema: pa.Schema, spec: CollectionSpec) -> pa.Schema:
     )
     metadata[_SOURCE_PROGRESS_KEY] = (spec.source_progress or "").encode()
     return schema.set(index, field.with_metadata(metadata))
+
+
+def _index_marker(vector: Any) -> str:
+    """What a committed `optimize()` changes about an index (Codex review, #691)."""
+    return f"{vector.index_uuid}:{vector.num_segments}"
 
 
 def _read_int_field_value(schema: pa.Schema, key: bytes) -> int | None:

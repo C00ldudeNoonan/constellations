@@ -685,10 +685,13 @@ its last five priced runs in the [run log](#append-only-logs), pooled as
 `run-log:` enabled and a `pricing:` block (`llm.pricing` or
 `embedding.pricing`) the model's earlier runs were priced under; without
 either the column is `-` and the footer says why, so a blank never reads as
-free. The figure is written `<=$N` because it is always a ceiling: it prices
-every row as though it reaches the provider, and vector reuse, the response
-caches, and duplicate text only lower it. It uses the rates those earlier runs
-were priced at, so a price change shows up after the next run, not before it.
+free. The figure is written `~$N` because it is an estimate, not a cap, and
+it can miss in either direction. It prices every row as though it reaches the
+provider, so vector reuse, the response caches and duplicate text make the run
+cheaper; rows longer than the history's, a costlier prompt or model, or a
+price rise since those runs make it dearer. It uses the rates those earlier
+runs were priced at, so a price change shows up after the next run, not
+before it. Set a run budget's `max_cost_usd` when you need a cap.
 `plan.json` carries it per model as `estimated_cost_usd`, and the run log it
 was read from as `metadata.cost_source` (plan schema version 2), and a refusal
 under `on_code_change: fail` names it.
@@ -2864,6 +2867,11 @@ embedding:
   because the vectors in hand are already paid for and about to publish.
 - Run metrics split `cache_hits` by source: `response_cache_hits` from the
   file, `duplicate_text_hits` from the window, and the rest from the target.
+- Two embed models that share a cache path and embedding configuration and
+  run at the same time (`--threads` above 1) can both miss on the same text
+  and both pay for it once each: a lookup does not reserve the texts it
+  missed. Sequential runs, and models with different configurations, are
+  unaffected.
 
 `embedding.pricing` gives an embed the same `estimated_cost_usd` an `llm:`
 model gets from `llm.pricing`: input tokens and input characters times

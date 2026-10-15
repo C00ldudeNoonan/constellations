@@ -389,8 +389,8 @@ def test_plan_prices_reprocessing_rows_at_the_cost_per_provider_row(
 
     result = CliRunner().invoke(cli, ["--project-dir", str(project), "plan"])
     assert result.exit_code == 0, result.output
-    assert "<=$55.00" in result.output
-    assert "Provider cost: at most $55.00" in result.output
+    assert "~$55.00" in result.output
+    assert "Provider cost: about $55.00" in result.output
 
 
 def test_plan_without_a_run_log_says_cost_is_not_estimated(tmp_path: Path) -> None:

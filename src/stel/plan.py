@@ -106,9 +106,10 @@ class ModelPlan:
     #: USD those rows would cost if every one reached the provider (issue
     #: #665), priced at this model's recent cost per provider row in the run
     #: log; None without a run log, without priced history, or for a kind
-    #: whose rows are not counted (`full`). Always a ceiling in practice:
-    #: vector reuse, the response caches and in-window duplicates only lower
-    #: it, and the plan cannot see any of them.
+    #: whose rows are not counted (`full`). An estimate, not a bound, in both
+    #: directions: reuse, the response caches and in-window duplicates lower
+    #: what a run pays, while longer text, a costlier prompt or model, or a
+    #: price rise since those runs raise it (Codex review on #690).
     estimated_cost_usd: float | None
     #: The model's `on_code_change` policy and `reprocess_limit` (issue #530);
     #: None for a kind that carries no guard.
@@ -628,7 +629,7 @@ def format_plan_table(plan: ProjectPlan) -> list[str]:
         cost = (
             "-"
             if model.estimated_cost_usd is None
-            else f"<={format_usd(model.estimated_cost_usd)}"
+            else f"~{format_usd(model.estimated_cost_usd)}"
         )
         lines.append(
             f"{model.name:<{name_width}}{model.kind:<12}{model.materialization:<13}"
@@ -695,9 +696,10 @@ def _cost_sentence(plan: ProjectPlan) -> str:
     if priced:
         total = sum(m.estimated_cost_usd or 0.0 for m in priced)
         sentence = (
-            f"Provider cost: at most {format_usd(total)}, priced at each "
+            f"Provider cost: about {format_usd(total)}, priced at each "
             f"model's cost per provider row over its last {_PRICED_RUNS} "
-            f"priced runs in {plan.cost_source}; reuse and caches only lower it."
+            f"priced runs in {plan.cost_source}. An estimate, not a cap: reuse "
+            "and caches lower it, longer text or a costlier model raise it."
         )
     if unpriced:
         sentence += (

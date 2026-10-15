@@ -95,7 +95,7 @@ def test_cascade_upper_bound_is_refused() -> None:
 def test_a_refusal_names_the_priced_cost_when_the_plan_has_one() -> None:
     """The refusal is where an operator decides whether to pay (issue #665)."""
     (refusal,) = guard_reprocess([_plan(status="changed", cost=1234.5)])
-    assert "at most $1,234.50" in refusal.describe()
+    assert "about $1,234.50" in refusal.describe()
 
 
 def test_within_limit_new_unchanged_and_full_pass() -> None:

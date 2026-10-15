@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
 
+from stel.cache_files import private_cache_umask
 from stel.execution.embed_cache import EmbeddingResponseCache
 
 
@@ -63,3 +65,40 @@ def test_cache_file_is_private_and_rejects_symlinks(tmp_path: Path) -> None:
     link.symlink_to(path)
     with pytest.raises(ValueError, match="Embedding cache path must be a regular"):
         EmbeddingResponseCache(link, config_hash="config", dimensions=2)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX umask")
+def test_overlapping_private_umasks_restore_the_process_mask() -> None:
+    """The llm and embedding caches each lock their own writers, but the
+    umask is process-wide. Two overlapping contexts without a shared lock
+    leave the process's mask at 0o077 for good (Codex review on #690)."""
+    first_inside = threading.Event()
+    second_inside = threading.Event()
+    first_done = threading.Event()
+
+    # The interleaving that breaks an unserialized mask: the second context
+    # enters while the first holds 0o077 (so it saves 0o077 as "previous"),
+    # and the first exits before the second does. With the shared lock the
+    # second cannot enter, the first's wait times out, and they run in turn.
+    def first() -> None:
+        with private_cache_umask():
+            first_inside.set()
+            second_inside.wait(timeout=0.5)
+        first_done.set()
+
+    def second() -> None:
+        first_inside.wait()
+        with private_cache_umask():
+            second_inside.set()
+            first_done.wait(timeout=5)
+
+    original = os.umask(0o022)
+    try:
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert os.umask(0o022) == 0o022
+    finally:
+        os.umask(original)

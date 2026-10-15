@@ -26,8 +26,8 @@
   had no price and the cost cap could not see them.
 - **`stel plan` has an `est_cost` column.** With `run-log:` enabled, each
   reprocessing model is priced at its recent cost per provider row (its last
-  five priced runs) times the rows to reprocess. The figure is a ceiling,
-  since reuse and caches only lower it, and a refusal under
+  five priced runs) times the rows to reprocess. The figure is an
+  estimate, not a cap, written `~$N`; a refusal under
   `on_code_change: fail` names it. Without a run log the footer says the cost
   is not estimated instead of leaving it blank. `plan.json` moves to schema
   version 2: `estimated_cost_usd` per model, `metadata.cost_source`.

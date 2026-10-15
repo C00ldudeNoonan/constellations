@@ -11,9 +11,19 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+# The umask is process-wide, so the lock guarding it must be too. Each cache
+# serializes its own writers with its own lock, but an llm-cache write and an
+# embedding-cache write can overlap: without this, the first to finish
+# restores the ordinary mask while the second is still creating files, and the
+# second then "restores" 0o077 as the process's mask for good (Codex review on
+# #690). Always taken innermost, after a cache's own lock, so it cannot
+# deadlock against one.
+_UMASK_LOCK = threading.Lock()
 
 
 @contextmanager
@@ -21,14 +31,14 @@ def private_cache_umask() -> Iterator[None]:
     if os.name == "nt":
         yield
         return
-    # DuckDB creates its write-ahead log beside the database. The process-wide
-    # mask is restored immediately, while each cache's write lock serializes
-    # this package's writers.
-    previous = os.umask(0o077)
-    try:
-        yield
-    finally:
-        os.umask(previous)
+    # DuckDB creates its write-ahead log beside the database, so the mask
+    # covers the whole connection, not only the main file's creation.
+    with _UMASK_LOCK:
+        previous = os.umask(0o077)
+        try:
+            yield
+        finally:
+            os.umask(previous)
 
 
 def harden_cache_files(path: Path, *, require_main: bool, label: str) -> bool:

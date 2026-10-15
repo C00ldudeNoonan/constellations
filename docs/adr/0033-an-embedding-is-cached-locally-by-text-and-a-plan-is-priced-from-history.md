@@ -33,8 +33,8 @@ not a cache is configured. **`embedding.pricing` prices embeds** (per million
 tokens and/or characters, characters counted by stel), and **`stel plan`
 prices each reprocessing model at its recent cost per provider row, read from
 the run log**: pooled `estimated_cost_usd / (rows_processed - cache_hits)`
-over its last five priced runs, times the rows to reprocess, shown as a
-ceiling.
+over its last five priced runs, times the rows to reprocess, shown as an
+estimate (`~$N`), never as a bound.
 
 ## Alternatives considered
 
@@ -110,8 +110,17 @@ log records.
 - The cache grows without bound: ~8 bytes per dimension per distinct text.
   There is no eviction; deleting it is always safe.
 - A plan's cost lags a price change by one run, and is `-` until a model has
-  a priced run in the run log. It is a ceiling: reuse, caches and duplicates
-  only lower it, and the plan can see none of them.
+  a priced run in the run log. It is an estimate in both directions: reuse,
+  caches and duplicates lower what a run pays, and longer text, a costlier
+  prompt or model, or a price rise raise it. The first draft rendered it as
+  a ceiling (`<=`, "at most"); Codex's review on #690 pointed out that
+  history bounds nothing, and `max_cost_usd` is the cap.
+- Two embed models sharing a cache path and configuration, running
+  concurrently, can each pay once for the same text: a miss does not
+  reserve the key. Single-flight coordination across models was declined as
+  machinery for a configuration nobody runs — one embed model per corpus is
+  the shape every project here has — and the cost is bounded at one extra
+  call per text per concurrent model, not a re-embed of the corpus.
 - `rows_processed - cache_hits` is the per-row denominator for every paid
   kind, so a kind whose `cache_hits` is not in row units is priced only
   approximately. Embed counts hits per row and an `llm:` model per row (one

@@ -48,7 +48,7 @@ class Refusal:
             else ""
         )
         cost = (
-            f", at most {format_usd(plan.estimated_cost_usd)}"
+            f", about {format_usd(plan.estimated_cost_usd)}"
             if plan.estimated_cost_usd is not None
             else ""
         )

@@ -240,8 +240,8 @@ def test_star_map_names_and_colours_systems_from_the_vocabulary(built: Path) -> 
     assert len(concepts) == 8
     # Named by the vocabulary, not by the most frequent mention ("webhooks").
     assert concepts["Webhook Dispatcher"].display == "Webhook Dispatcher"
-    assert concepts["Webhook Dispatcher"].dimensions == {"class": "service"}
-    assert concepts["Postgres"].dimensions == {"class": "datastore"}
+    assert concepts["Webhook Dispatcher"].dimensions["class"] == "service"
+    assert concepts["Postgres"].dimensions["class"] == "datastore"
     assert export.concept_edges
 
 

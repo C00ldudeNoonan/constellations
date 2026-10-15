@@ -277,6 +277,37 @@ def test_render_includes_the_dimension_picker_and_entry_point() -> None:
     assert "stel star map" in html
 
 
+def test_the_viewer_reads_the_lens_contract() -> None:
+    """v7 (#345): an ordinal lens colors along the ramp, an unavailable lens is
+    listed with its reason rather than drawn, and the caption counts what the
+    export left out. Exercised in a browser against the demo; pinned here so a
+    template edit that drops one of the reads fails."""
+    from stel.concept_cloud import demo_export
+    from stel.concept_cloud.schema import Coverage
+
+    export = demo_export().model_copy(
+        update={"coverage": Coverage(concepts_total=4318, unmatched_mentions=12)}
+    )
+    html = render_concept_cloud(export)
+    data = _extract_data_island(html)
+
+    assert data["coverage"] == {"concepts_total": 4318, "unmatched_mentions": 12}
+    assert any(d["ordinal"] for d in data["dimensions"])
+    assert "dim.ordinal ? rampColor(i, dim.values.length)" in html
+    assert "DATA.unavailable_dimensions" in html
+    assert 'cov.concepts_total.toLocaleString() + " concepts"' in html
+
+
+def test_a_legend_value_is_text_not_markup() -> None:
+    """A `--dimension` value is warehouse text. Interpolated into the legend's
+    innerHTML, a value like `<img onerror=...>` ran in every copy of a shared
+    artifact; it is appended as a text node instead."""
+    html = render_concept_cloud(placeholder_export())
+
+    assert "row.append(v);" in html
+    assert "></span>${v}`" not in html
+
+
 def test_baked_positions_pin_concept_nodes() -> None:
     """Concepts with positions are pinned (fx/fy/fz): position IS the meaning,
     and the force simulation would erase the projection in seconds. This is a

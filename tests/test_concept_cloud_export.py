@@ -529,8 +529,9 @@ def test_retrieval_heat_joins_the_query_log_to_concepts() -> None:
     export = build_concept_cloud(
         project="p", links=_links(), dag_plane=_plane(), query_log=_query_log(),
     )
-    assert [d.name for d in export.dimensions] == ["retrieval"]
-    assert export.dimensions[0].source == "query_log"
+    declared = [d for d in export.dimensions if d.source != "derived"]
+    assert [d.name for d in declared] == ["retrieval"]
+    assert declared[0].source == "query_log"
     by_id = {c.canonical_id: c.dimensions["retrieval"] for c in export.concepts}
     # Acme's documents (d1, d2) were hit 4 times; NY's (d1) 3 times: both
     # retrieved, Acme hotter or equal. Exact buckets depend on tertiles; the
@@ -566,7 +567,7 @@ def test_declared_column_dimension_takes_the_modal_value() -> None:
         project="p", links=_links(), dag_plane=_plane(),
         dimension_columns={"tone": (sentiment, "tone")},
     )
-    (definition,) = export.dimensions
+    (definition,) = [d for d in export.dimensions if d.source != "derived"]
     assert definition.name == "tone" and definition.source == "column"
     # Only assigned values are declared: 'negative' lost the modal vote on
     # every concept, so declaring it would put a dead entry in the legend.
@@ -949,6 +950,19 @@ def test_a_malformed_breakdown_spec_fails_before_the_project_is_read(
         )
 
 
+def test_a_dimension_named_like_a_lens_fails_before_the_project_is_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Every bundle carries the built-in lenses (#345), so `--dimension
+    mentions=...` could only fail at the bundle's unique-name check, after the
+    warehouse had been read. Refused at the spec instead."""
+    with pytest.raises(ConceptCloudExportError, match="built-in lens"):
+        export_concept_cloud(
+            tmp_path, linking_model="link_entities",
+            dimension_specs={"mentions": "concept_counts.band"},
+        )
+
+
 def _extract_bundle(html: str) -> dict[str, Any]:
     start = html.index('<script id="cc-data" type="application/json">')
     body = html[start:].split(">", 1)[1].split("</script>", 1)[0]
@@ -981,7 +995,7 @@ def test_a_time_field_gives_each_concept_its_periods() -> None:
         time_field="filing_year",
     )
 
-    assert export.schema_version == "6"
+    assert export.schema_version == "7"
     assert export.periods == ("2019", "2021")
     by_id = {c.canonical_id: c for c in export.concepts}
     assert by_id["FERC"].by_period == {"2019": 2, "2021": 1}

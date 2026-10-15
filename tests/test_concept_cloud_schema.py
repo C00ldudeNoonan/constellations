@@ -150,6 +150,26 @@ def test_source_access_round_trips_and_is_absent_by_default() -> None:
     assert reparsed.source_access.model == "sec_context_chunks"
 
 
+def test_coverage_may_not_count_fewer_concepts_than_the_bundle_carries() -> None:
+    """v7 (#345): the caption reads "N of total"; a total below N is a bundle
+    whose caption would claim it shows more than exists."""
+    bundle = _bundle()
+    bundle["coverage"] = {"concepts_total": 1, "unmatched_mentions": 0}
+
+    with pytest.raises(ValueError, match="fewer than the 3"):
+        parse_concept_cloud_export(bundle)
+
+
+def test_a_lens_cannot_be_both_drawn_and_unavailable() -> None:
+    bundle = _bundle()
+    bundle["dimensions"] = [{"name": "link score", "values": ["0.95 and up"],
+                             "source": "derived", "ordinal": True}]
+    bundle["unavailable_dimensions"] = [{"name": "link score", "reason": "no scores"}]
+
+    with pytest.raises(ValueError, match="both declared and unavailable"):
+        parse_concept_cloud_export(bundle)
+
+
 def test_a_source_access_without_a_model_is_refused() -> None:
     """An empty name would reach the server as a model lookup for "", whose
     refusal would name the bundle's own blank rather than the mistake."""

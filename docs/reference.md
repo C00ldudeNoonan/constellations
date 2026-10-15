@@ -5307,8 +5307,8 @@ stel --project-dir path/to/stel_project concept-cloud \
 
 **`--title`** and **`--subtitle`** set the page heading and browser-tab title,
 and the text after it, in place of the hardcoded "stel star map" and its
-computed "· `<project>` · N concepts" — that pair names the tool, not the
-map it renders:
+computed "· `<project>` · N of M concepts" caption (see *Built-in lenses*
+below) — that pair names the tool, not the map it renders:
 
 ```bash
 stel concept-cloud --demo -o cloud.html \
@@ -5520,6 +5520,44 @@ coloring:
   categorical column into a dimension. `llm:` enum fields fit directly: the
   label set is already declared and validated upstream.
 
+**Built-in lenses** (issue #345). Every export also carries four lenses,
+listed in the picker after the declared dimensions, built from fields every
+concept already has:
+
+| lens | bands |
+|---|---|
+| `mentions` | mentions linked to the concept: `1`, `2–9`, `10–99`, `100–999`, `1,000+` |
+| `documents` | distinct documents naming it, in the same decade bands |
+| `link status` | `matched`, or `ambiguous` when the resolver could not choose between candidates for at least one of its mentions |
+| `link score` | its best match score: `below 0.80`, `0.80–0.90`, `0.90–0.95`, `0.95 and up` |
+
+They are worth switching between because they disagree. A concept in the top
+`documents` band whose `link score` is `below 0.80` is named everywhere and
+never linked confidently. Neither coloring shows that on its own.
+
+- **The bands are fixed, not per-corpus quantiles.** A quantile ramp puts some
+  concept in the top band even when every concept is rare, and gives one count
+  two colors on two corpora. Every band is declared on every bundle, so a band
+  keeps its color between exports. The legend lists only the bands that hold
+  a concept.
+- **Ordered lenses share one blue ramp**, getting lighter as the value
+  rises, so the order still reads in greyscale and for the common
+  colour-vision deficiencies.
+- **A lens with no data is unavailable, not drawn.** An `alias_table`
+  resolver scores nothing, so `link score` would show every concept in one
+  band, as though they were all equal. The picker lists such a lens as
+  unavailable and the panel says why. The same goes for `documents` when the
+  linking rows carry no `document_id`. A concept that has no value in a lens
+  that is otherwise available (an unscored link in a scored corpus) is drawn
+  grey, never in the lowest band.
+- These four names are reserved: `--dimension mentions=...` is refused before
+  anything is read.
+
+The caption counts what the cloud leaves out. A `--top-n` cap reads "200 of
+4,318 concepts" rather than "200 concepts", and mentions entity linking left
+unmatched, which have no node to draw, are given as a number: "1,204 unmatched
+mentions not drawn".
+
 **Reach the source** (issue #678). The map is an aggregate: it says a concept
 was named in 300 documents and by whom, never what was said. `--context-model`
 plus `--serve` adds a **Show me a sentence** button to the detail card, which
@@ -5573,7 +5611,7 @@ NLP/linking models to set `include_text: true` (otherwise nodes show ids), or a
 warehouse credentials ever enter it, and raw document text appears only when the
 operator opted into it upstream. The bundle is a versioned contract
 (`ConceptCloudExport`, `schema_version`), so the static viewer and the export job
-evolve independently. The current version is 6. A bundle from any other version
+evolve independently. The current version is 7. A bundle from any other version
 is refused by the artifact rather than read as current.
 
 ## Append-only logs

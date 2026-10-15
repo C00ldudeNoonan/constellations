@@ -51,6 +51,7 @@
     .swatch { width: 9px; height: 9px; border-radius: 50%; flex: none;
       box-shadow: 0 0 6px 1px currentColor; }
     .legend-item.off { opacity: .3; }
+    .lens-note { color: var(--muted); font-size: 11px; line-height: 1.45; margin: 6px 0 0; }
     #filters { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
     .ctl { display: block; margin: 9px 0; font-size: 13px; cursor: pointer; }
     .ctl input[type="range"] { width: 100%; margin-top: 4px; accent-color: var(--accent); }
@@ -127,6 +128,8 @@
     <h2>Color by</h2>
     <select id="colorby"></select>
     <div id="legend"></div>
+    <p class="lens-note" id="lens-desc" hidden></p>
+    <p class="lens-note" id="lens-unavailable" hidden></p>
     <div id="filters">
       <h2>Filters</h2>
       <label class="ctl"><input type="checkbox" id="orphans"> Highlight orphans</label>
@@ -170,7 +173,23 @@
     document.getElementById("subtitle").textContent =
       SUBTITLE_OVERRIDE !== null
         ? SUBTITLE_OVERRIDE
-        : "· " + DATA.project + " · " + DATA.concepts.length + " concepts";
+        : "· " + DATA.project + " · " + coverageCaption();
+
+    // Count every truncation (#345): "200 concepts" and "200 of 4,318" are
+    // different claims about a corpus, and only the second is true of a
+    // capped export. Unmatched mentions have no node, so only a number can
+    // say they exist.
+    function coverageCaption() {
+      const shown = DATA.concepts.length;
+      const cov = DATA.coverage;
+      if (!cov) return shown.toLocaleString() + " concepts";
+      const parts = [cov.concepts_total > shown
+        ? shown.toLocaleString() + " of " + cov.concepts_total.toLocaleString() + " concepts"
+        : shown.toLocaleString() + " concepts"];
+      if (cov.unmatched_mentions > 0)
+        parts.push(cov.unmatched_mentions.toLocaleString() + " unmatched mentions not drawn");
+      return parts.join(" · ");
+    }
 
     // Star-tinted categorical palette: bright enough to glow on deep space.
     const PALETTE = ["#7db8ff","#ffd76e","#8fe3a1","#ff8f85","#d8b4ff",
@@ -178,6 +197,17 @@
     // Retrieval heat reads as temperature, not as arbitrary categories.
     const HEAT_COLORS = { hot: "#ff8f85", warm: "#ffd76e", cold: "#9fd8ff",
                           never: "#5a6478" };
+    // One blue ramp for every ordinal lens (#345), lightness rising with the
+    // value so it survives greyscale and the common colour-vision deficiencies.
+    // Dark end stops at a step that still clears 2:1 on the night sky. A band
+    // takes its color from its position in the declared values, and every
+    // band is always declared, so a color means the same band on every bundle.
+    const ORDINAL_RAMP = ["#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5",
+                          "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6",
+                          "#cde2fb"];
+    const rampColor = (i, n) =>
+      ORDINAL_RAMP[n < 2 ? ORDINAL_RAMP.length - 1
+                         : Math.round(i * (ORDINAL_RAMP.length - 1) / (n - 1))];
     const DIM = "#2b3644";  // deselected / receded
     // Known dbt resource kinds; anything else falls back to the neutral grey.
     const RESOURCE_COLOR = {
@@ -194,6 +224,7 @@
         valueOf: n => n.label || "—" },
       ...(DATA.dimensions || []).map(d => ({
         name: d.name, title: d.name, values: [...d.values],
+        ordinal: Boolean(d.ordinal), description: d.description || "",
         valueOf: n => (n.dimensions || {})[d.name] || "—",
       })),
     ];
@@ -201,9 +232,14 @@
       dim.color = {};
       const heat = dim.values.every(v => v in HEAT_COLORS);
       dim.values.forEach((v, i) =>
-        dim.color[v] = heat ? HEAT_COLORS[v] : PALETTE[i % PALETTE.length]);
+        dim.color[v] = heat ? HEAT_COLORS[v]
+          : dim.ordinal ? rampColor(i, dim.values.length)
+          : PALETTE[i % PALETTE.length]);
       dim.color["—"] = dim.color["—"] || "#5a6478";
     }
+    // Lenses this corpus cannot fill (#345): listed, with the reason, rather
+    // than drawn as one band that would read as "all equal".
+    const UNAVAILABLE = DATA.unavailable_dimensions || [];
 
     // Breakdown name -> value -> color, from the bundle's declared value set,
     // so a value is the same color on every card (#555 item 5).
@@ -322,6 +358,18 @@
         option.textContent = dim.title;
         select.appendChild(option);
       });
+      UNAVAILABLE.forEach(u => {
+        const option = document.createElement("option");
+        option.disabled = true;
+        option.textContent = u.name + " (unavailable)";
+        select.appendChild(option);
+      });
+      if (UNAVAILABLE.length) {
+        const note = document.getElementById("lens-unavailable");
+        note.textContent = "Unavailable: " +
+          UNAVAILABLE.map(u => u.name + ": " + u.reason).join("; ") + ".";
+        note.hidden = false;
+      }
       select.addEventListener("change", () => {
         colorBy = DIMENSIONS[Number(select.value)];
         hidden.clear();           // the hidden set is per-dimension values
@@ -333,11 +381,21 @@
     function buildLegend() {
       const legend = document.getElementById("legend");
       legend.innerHTML = "";
-      colorBy.values.forEach(v => {
+      const desc = document.getElementById("lens-desc");
+      desc.textContent = colorBy.description || "";
+      desc.hidden = !colorBy.description;
+      // A fixed band keeps its color by position whether or not any concept
+      // falls in it, but an empty band gets no legend row: it would be an
+      // entry that toggles nothing.
+      const present = new Set(DATA.concepts.map(c => colorBy.valueOf(c)));
+      colorBy.values.filter(v => !colorBy.ordinal || present.has(v)).forEach(v => {
         const row = document.createElement("div");
         row.className = "legend-item";
         row.innerHTML =
-          `<span class="swatch" style="background:${colorBy.color[v]};color:${colorBy.color[v]}"></span>${v}`;
+          `<span class="swatch" style="background:${colorBy.color[v]};color:${colorBy.color[v]}"></span>`;
+        // A `--dimension` value is warehouse text, so it goes in as a text
+        // node, never as markup. (`esc` is declared after this first runs.)
+        row.append(v);
         row.onclick = () => {
           if (hidden.has(v)) hidden.delete(v); else hidden.add(v);
           row.classList.toggle("off", hidden.has(v));

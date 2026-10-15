@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.23.0 - 2026-10-15
 
 ### The star map gets built-in lenses, and its caption counts what it left out (issue #345)
 
@@ -18,7 +18,8 @@
 - **The caption counts truncation**: "200 of 4,318 concepts" under a
   `--top-n` cap, and how many unmatched mentions have no node.
 - Bundle schema v7: `derived` dimension source, `ordinal` on a dimension,
-  `unavailable_dimensions`, and `coverage`. A v6 bundle is refused. The lens
+  `unavailable_dimensions`, and `coverage`. Any earlier bundle is refused;
+  v0.22.0 wrote v5, and v6 (#678, below) never shipped on its own. The lens
   names are reserved: `--dimension mentions=...` is refused before anything
   is read.
 - **Fix: a legend value is text, not markup.** The legend put each
@@ -137,7 +138,9 @@
 - **The manifest's `serving_resource` moves to `schema_version: 3`.** Its
   `vector` block may now carry `nprobes`, and `refine_factor`, which #520
   added under version 2 without a bump. A model that sets `nprobes` also
-  lists `partition_probes` under `capabilities.required`.
+  lists `partition_probes` under `capabilities.required`. This is the same
+  bump that carries #682's `stale_after_seconds` (below): one move from 2 to
+  3 covers both.
 - **A collection stamped before descriptors existed (pre-#344) is not refused
   for a knob.** Its legacy proof hashed the whole search config, so turning
   on either knob failed the proof and demanded `--full-refresh`. Both are
@@ -170,7 +173,8 @@
   sits outside `code_version`: tightening it never republishes a row.
 - **The catalog no longer reads `run_results.json`.** How current an index is
   is live warehouse state. Serving-descriptor `schema_version` is 3, carrying
-  the declared policy; a ledger written before the column reads as "no
+  the declared policy as `stale_after_seconds` (the same version 3 that #684
+  uses for its query knobs, above); a ledger written before the column reads as "no
   activation on record" rather than failing a listing. Recorded in
   [ADR-0032](docs/adr/0032-a-served-indexs-age-is-the-activation-it-serves.md).
 - **`freshness` no longer fails a pre-#344 collection's upgrade proof.** A
@@ -190,7 +194,7 @@
   --serve` now writes the artifact and serves it on `127.0.0.1`, and the
   detail card grows a **Show me a sentence** button.
 - **The sentence is fetched on click, never baked in.** The bundle (schema
-  v6) carries `source_access: {model}` -- a name, and nothing else from the
+  v6 when this landed, v7 as released with #345's lenses above) carries `source_access: {model}` -- a name, and nothing else from the
   serving side. An artifact shared with someone holds the aggregates it
   always did, and the viewer gates its button on a same-origin probe, so a
   file opened from disk shows no affordance rather than a dead one.

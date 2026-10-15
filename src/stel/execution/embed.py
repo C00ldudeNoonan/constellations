@@ -21,6 +21,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import polars as pl
 
 from ..adapters import (
@@ -54,6 +55,8 @@ from .contracts import (
     state_for_skipping,
     update_filter_for_publish,
 )
+from .cost import estimate_embedding_cost
+from .embed_cache import EmbeddingResponseCache
 from .errors import artifact_error_text
 from .usage import add_provider_usage
 from .values import scalarize, warehouse_key_cast_matches_python
@@ -229,15 +232,35 @@ def _run_embed_model(
         if is_incremental and not rebuild_target
         else None
     )
+    # `resolve_embedding_options` above has already refused a profile block
+    # naming another provider, so a block that exists is this model's.
+    profile_embedding = resolved.embedding
+    pricing = profile_embedding.pricing if profile_embedding is not None else None
+    response_cache = _open_response_cache(
+        profile_embedding.cache_path if profile_embedding is not None else None,
+        model_name=model.name,
+        identity=identity,
+    )
     # Embeds were the only provider-spending stage the run budget could not
     # see: --max-cost and friends gated extraction and llm calls while a
-    # Vertex embed run spent freely. No cost estimator yet -- embedding
-    # pricing is not modeled -- so max_api_calls, max_input_tokens, and
-    # max_documents are the enforceable dimensions, and with per-flush
-    # publication a budget stop is graceful: published windows stay, state is
-    # advanced for exactly them, and the run reports budget_exceeded instead
-    # of pretending to fail.
-    budget_guard = BudgetGuard(None, run_budget) if run_budget is not None else None
+    # Vertex embed run spent freely. max_api_calls, max_input_tokens, and
+    # max_documents are always enforceable; max_cost_usd is once the profile
+    # prices embeddings (issue #665). With per-flush publication a budget stop
+    # is graceful: published windows stay, state is advanced for exactly
+    # them, and the run reports budget_exceeded instead of pretending to fail.
+    budget_guard = (
+        BudgetGuard(
+            None,
+            run_budget,
+            cost_estimator=(
+                partial(estimate_embedding_cost, pricing=pricing)
+                if pricing is not None
+                else None
+            ),
+        )
+        if run_budget is not None
+        else None
+    )
 
     # A subset run reads a deliberate slice of the upstream, so every id
     # outside the slice would look removed; reconciliation belongs to the
@@ -253,6 +276,10 @@ def _run_embed_model(
     flush_every = config.flush_every
     skipped = 0
     cache_hits = 0
+    # Subsets of `cache_hits`, by where the vector came from (issue #665).
+    # Target reuse is the remainder: the hits the warehouse answered.
+    response_cache_hits = 0
+    duplicate_text_hits = 0
     embedded_count = 0
     processed = 0
     usage_totals: dict[str, int | float] = {}
@@ -328,8 +355,11 @@ def _run_embed_model(
         nonlocal cache_hits
         if reuse_reader is None:
             return
-        window_reuse = reuse_reader.rows_for([item.text_hash for item in window])
-        for item in window:
+        wanting = [item for item in window if item.vector is None]
+        if not wanting:
+            return
+        window_reuse = reuse_reader.rows_for([item.text_hash for item in wanting])
+        for item in wanting:
             existing = window_reuse.get(item.text_hash)
             if (
                 existing is not None
@@ -346,6 +376,27 @@ def _run_embed_model(
                         str(embedded_at) if embedded_at is not None else None
                     )
                     cache_hits += 1
+
+    def _apply_response_cache(window: list[_EmbedWork]) -> None:
+        """Reclaim vectors the response cache holds, before the target is asked.
+
+        First because it is local: a window the cache answers whole issues no
+        warehouse read at all, where target reuse is a query job per window
+        on BigQuery. The cache also holds what the target cannot -- a vector
+        paid for after the last flush of a run that then crashed.
+        """
+        nonlocal cache_hits, response_cache_hits
+        if response_cache is None:
+            return
+        cached = response_cache.get_many([item.text_hash for item in window])
+        for item in window:
+            hit = cached.get(item.text_hash)
+            if hit is None:
+                continue
+            item.vector = hit.vector
+            item.embedded_at = hit.embedded_at
+            cache_hits += 1
+            response_cache_hits += 1
 
     def _iter_windows() -> Iterator[list[_EmbedWork]]:
         """Yield at most `flush_every` items at a time.
@@ -408,6 +459,9 @@ def _run_embed_model(
         """Embed one provider batch. Runs on a worker thread."""
         nonlocal provider_batches, provider_calls
         texts = [item.text for item in batch]
+        # Counted by stel because a character-billed provider (Vertex text
+        # embeddings) reports tokens, not the unit it bills in.
+        characters = sum(len(text) for text in texts)
         reserved = estimate_embed_requests(
             texts,
             identity,
@@ -428,30 +482,60 @@ def _run_embed_model(
                 max_retries=config.max_retries,
                 timeout_seconds=embedding_options.timeout_seconds,
             )
+            usage = {**embedded.usage.to_metrics(), "input_characters": characters}
             if reservation is not None:
-                reservation.settle(
-                    embedded.usage.to_metrics(),
-                    actual_calls=embedded.provider_requests,
-                )
+                reservation.settle(usage, actual_calls=embedded.provider_requests)
         with usage_lock:
             provider_batches += 1
             provider_calls += embedded.provider_requests
-            add_provider_usage(usage_totals, embedded.usage.to_metrics())
+            add_provider_usage(usage_totals, usage)
         # Each item is written by exactly one batch, so the vectors need no
         # lock; only the shared counters above do.
         for item, vector in zip(batch, embedded.vectors, strict=True):
             item.vector = vector
+        # Written per provider batch, not per window: a crash between this
+        # batch and its window's publish is precisely the spend the cache
+        # exists to keep (issue #665).
+        if response_cache is not None:
+            response_cache.put_many(
+                [
+                    (item.text_hash, vector)
+                    for item, vector in zip(batch, embedded.vectors, strict=True)
+                ],
+                embedded_at=now,
+            )
 
     def _embed_window(window: list[_EmbedWork]) -> None:
-        nonlocal embedded_count
-        pending = [item for item in window if item.vector is None]
+        nonlocal embedded_count, cache_hits, duplicate_text_hits
+        # One provider text per distinct text (issue #665). A window holding
+        # the same boilerplate twice used to pay for it twice; the first
+        # occurrence is embedded now and the rest take its vector. Across
+        # windows the response cache does the same job, when one is set.
+        representatives: dict[str, _EmbedWork] = {}
+        duplicates: list[_EmbedWork] = []
+        for item in window:
+            if item.vector is not None:
+                continue
+            if item.text_hash in representatives:
+                duplicates.append(item)
+            else:
+                representatives[item.text_hash] = item
+        pending = list(representatives.values())
         embedded_count += len(pending)
         if pending and budget_guard is not None:
             budget_guard.charge_documents(len(pending))
-        batches = [
-            pending[offset : offset + config.batch_size]
-            for offset in range(0, len(pending), config.batch_size)
-        ]
+        _embed_batches(
+            [
+                pending[offset : offset + config.batch_size]
+                for offset in range(0, len(pending), config.batch_size)
+            ]
+        )
+        for item in duplicates:
+            item.vector = representatives[item.text_hash].vector
+        cache_hits += len(duplicates)
+        duplicate_text_hits += len(duplicates)
+
+    def _embed_batches(batches: list[list[_EmbedWork]]) -> None:
         if not batches:
             return
         # Issue the window's batches concurrently (issue #432). Embed was the
@@ -534,6 +618,7 @@ def _run_embed_model(
             # routing a warehouse error through it hands the raw message to its
             # fallback, and that message can quote the offending row and the
             # statement that touched it (issue #401 review).
+            _apply_response_cache(window)
             _apply_reuse(window)
             try:
                 _embed_window(window)
@@ -614,6 +699,10 @@ def _run_embed_model(
     except AdapterError as e:
         raise RunError(str(e)) from e
 
+    if usage_totals and pricing is not None:
+        usage_totals["estimated_cost_usd"] = estimate_embedding_cost(
+            usage_totals, pricing
+        )
     metrics: dict[str, Any] = {
         "provider_calls": provider_calls,
         "batches": provider_batches,
@@ -621,6 +710,8 @@ def _run_embed_model(
         "cache_misses": embedded_count,
         "rows_embedded": embedded_count,
         "metadata_updates": cache_hits,
+        "response_cache_hits": response_cache_hits,
+        "duplicate_text_hits": duplicate_text_hits,
         **usage_totals,
         # Where the wall clock went (#432). Summed across threads, so these
         # can exceed `duration_seconds` once provider batches overlap -- that
@@ -646,6 +737,35 @@ def _run_embed_model(
         metrics=metrics,
         artifact_metadata={"embedding": identity.to_dict()},
     )
+
+
+def _open_response_cache(
+    path: Path | None,
+    *,
+    model_name: str,
+    identity: EmbeddingIdentity,
+) -> EmbeddingResponseCache | None:
+    """Open the profile's embedding cache before anything is spent.
+
+    A path that cannot hold the cache fails the run here, where failing is
+    free, rather than at the first write, where it would be paid for.
+    """
+    if path is None:
+        return None
+    try:
+        return EmbeddingResponseCache(
+            path, config_hash=identity.config_hash, dimensions=identity.dimensions
+        )
+    except ValueError as error:
+        # The refusal is ours ("... must be a regular, non-symlink file").
+        raise RunError(f"Embed model '{model_name}': {error}") from None
+    except (OSError, duckdb.Error) as error:
+        # Theirs can quote the path and the statement; the class name is
+        # enough to locate it.
+        raise RunError(
+            f"Embed model '{model_name}': embedding.cache_path could not be "
+            f"opened [{type(error).__name__}]"
+        ) from None
 
 
 def _validate_upstream_ids(

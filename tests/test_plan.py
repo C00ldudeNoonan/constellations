@@ -305,7 +305,7 @@ def test_cli_table_and_json(invoice_project: Path) -> None:
     result = runner.invoke(cli, ["--project-dir", str(invoice_project), "plan", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["metadata"]["schema_version"] == 1
+    assert payload["metadata"]["schema_version"] == 2
     assert payload["metadata"]["invocation"] == "plan"
     assert payload["metadata"]["target"]["adapter_type"] == "duckdb"
     assert payload["metadata"]["counts"]["total"] == 3

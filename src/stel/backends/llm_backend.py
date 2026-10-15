@@ -4,11 +4,10 @@ import hashlib
 import json
 import logging
 import os
-import stat
 import threading
 import time
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from collections.abc import Mapping
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,7 @@ from typing import Any
 import duckdb
 
 from ..budget import BudgetExceededError, BudgetGuard
+from ..cache_files import harden_cache_files, private_cache_umask
 from ..config.profile import DEFAULT_LLM_PROVIDER
 from ..credentials import CredentialReference, CredentialReferenceError
 from ..hashing import HASH_DIGEST_SIZE
@@ -82,6 +82,7 @@ _DEFAULT_TIMEOUT_SECONDS = 60.0
 
 # DuckDB cache writes can race when extraction is parallelized; serialize them.
 _CACHE_WRITE_LOCK = threading.Lock()
+_CACHE_LABEL = "LLM cache"
 
 # API-level concurrency caps are account-wide, so gates live at module scope
 # and are shared across every model in the process. One gate per configured
@@ -1210,7 +1211,7 @@ def _job_get(path: Path, job_key: str) -> str | None:
     if os.name == "nt":
         if not path.exists():
             return None
-    elif not _harden_cache_files(path, require_main=True):
+    elif not harden_cache_files(path, require_main=True, label=_CACHE_LABEL):
         return None
     con = duckdb.connect(str(path), read_only=True)
     try:
@@ -1233,8 +1234,8 @@ def _job_put(path: Path, job_key: str, *, provider: str, batch_id: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _CACHE_WRITE_LOCK:
         if os.name != "nt":
-            _harden_cache_files(path, require_main=False)
-        with _private_cache_umask():
+            harden_cache_files(path, require_main=False, label=_CACHE_LABEL)
+        with private_cache_umask():
             con = duckdb.connect(str(path))
             try:
                 con.execute(_JOB_TABLE_DDL)
@@ -1257,7 +1258,7 @@ def _job_put(path: Path, job_key: str, *, provider: str, batch_id: str) -> None:
             finally:
                 con.close()
         if os.name != "nt":
-            _harden_cache_files(path, require_main=True)
+            harden_cache_files(path, require_main=True, label=_CACHE_LABEL)
 
 
 def _job_delete(path: Path, job_key: str) -> None:
@@ -1279,7 +1280,7 @@ def _cache_get(path: Path, key: str) -> dict[str, Any] | None:
     if os.name == "nt":
         if not path.exists():
             return None
-    elif not _harden_cache_files(path, require_main=True):
+    elif not harden_cache_files(path, require_main=True, label=_CACHE_LABEL):
         return None
     con = duckdb.connect(str(path), read_only=True)
     try:
@@ -1316,8 +1317,8 @@ def _cache_put_locked(
     fields: dict[str, Any],
 ) -> None:
     if os.name != "nt":
-        _harden_cache_files(path, require_main=False)
-    with _private_cache_umask():
+        harden_cache_files(path, require_main=False, label=_CACHE_LABEL)
+    with private_cache_umask():
         con = duckdb.connect(str(path))
         try:
             con.execute(
@@ -1346,67 +1347,4 @@ def _cache_put_locked(
         finally:
             con.close()
     if os.name != "nt":
-        _harden_cache_files(path, require_main=True)
-
-
-@contextmanager
-def _private_cache_umask() -> Iterator[None]:
-    if os.name == "nt":
-        yield
-        return
-    # DuckDB creates its write-ahead log beside the database. The process-wide
-    # mask is restored immediately, while the cache write lock serializes this
-    # package's writers.
-    previous = os.umask(0o077)
-    try:
-        yield
-    finally:
-        os.umask(previous)
-
-
-def _harden_cache_files(path: Path, *, require_main: bool) -> bool:
-    main_exists = _harden_optional_cache_file(path)
-    _harden_optional_cache_file(Path(f"{path}.wal"))
-    if require_main and not main_exists:
-        return False
-    return main_exists
-
-
-def _harden_optional_cache_file(path: Path) -> bool:
-    try:
-        _harden_existing_cache_file(path)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _harden_existing_cache_file(path: Path) -> None:
-    if path.is_symlink():
-        raise ValueError("LLM cache path must be a regular, non-symlink file")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError as error:
-        if os.path.lexists(path):
-            raise ValueError(
-                "LLM cache path must be a regular, non-symlink file"
-            ) from error
-        raise
-    except OSError as error:
-        raise ValueError(
-            "LLM cache path must be a regular, non-symlink file"
-        ) from error
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(
-                "LLM cache path must be a regular, non-symlink file"
-            )
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
-    finally:
-        os.close(descriptor)
+        harden_cache_files(path, require_main=True, label=_CACHE_LABEL)

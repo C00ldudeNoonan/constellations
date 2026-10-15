@@ -202,7 +202,7 @@ def resolve_profile(
                 f"{profiles_path}: profile '{project.profile}' target "
                 f"'{target_name}' selects {e}"
             ) from e
-    embedding = selected.embedding
+    embedding = _absolutize_embedding(selected.embedding, project_dir)
     if embedding is not None:
         try:
             embedding_provider = get_embedding_provider(
@@ -237,6 +237,16 @@ def _absolutize_llm(llm: LLMConfig | None, project_dir: Path) -> LLMConfig | Non
         return llm
     return llm.model_copy(
         update={"cache_path": (project_dir / llm.cache_path).resolve()}
+    )
+
+
+def _absolutize_embedding(
+    embedding: EmbeddingProfileConfig | None, project_dir: Path
+) -> EmbeddingProfileConfig | None:
+    if embedding is None or embedding.cache_path is None:
+        return embedding
+    return embedding.model_copy(
+        update={"cache_path": (project_dir / embedding.cache_path).resolve()}
     )
 
 

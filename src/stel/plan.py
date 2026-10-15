@@ -14,16 +14,30 @@ model whose own code_version is unchanged still reprocesses. The plan names
 that as `cascade` with an upper bound (every published row), because the
 exact count is only knowable by reading the upstream output the run will
 produce.
+
+Rows become dollars through history (issue #665): when the target keeps a
+run log, each reprocessing model is priced at what its recent runs paid per
+row that reached the provider. That is stel's own table too, read once.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .adapters import StateScope, WarehouseAdapter, create_adapter
+import polars as pl
+
+from .adapters import (
+    AdapterError,
+    ReadPredicate,
+    ReadPredicateOperator,
+    StateScope,
+    WarehouseAdapter,
+    create_adapter,
+)
 from .adapters.base import RETRIEVAL_PUBLISH_STAGE
 from .compiler import validate_project_contract, validate_warehouse_capabilities
 from .config.loader import load_project
@@ -40,8 +54,11 @@ from .versioning import (
     describe_model_llm,
 )
 
+log = logging.getLogger(__name__)
+
 PLAN_FILENAME = "plan.json"
-PLAN_SCHEMA_VERSION = 1
+# 2: `estimated_cost_usd` per model and `cost_source` in metadata (issue #665).
+PLAN_SCHEMA_VERSION = 2
 
 PlanStatus = Literal["new", "unchanged", "changed", "cascade", "full"]
 
@@ -50,6 +67,11 @@ PlanStatus = Literal["new", "unchanged", "changed", "cascade", "full"]
 # stel could know before reading the upstream, so a placeholder text is the
 # honest input.
 _PLACEHOLDER_TEXT = "x"
+
+# Runs a model's cost per provider row is pooled over. Recent enough that a
+# changed price or prompt shows up within a few runs, wide enough that one
+# small run does not set the rate.
+_PRICED_RUNS = 5
 
 
 class PlanError(RuntimeError):
@@ -81,6 +103,14 @@ class ModelPlan:
     provider: str | None
     provider_model: str | None
     reason: str
+    #: USD those rows would cost if every one reached the provider (issue
+    #: #665), priced at this model's recent cost per provider row in the run
+    #: log; None without a run log, without priced history, or for a kind
+    #: whose rows are not counted (`full`). An estimate, not a bound, in both
+    #: directions: reuse, the response caches and in-window duplicates lower
+    #: what a run pays, while longer text, a costlier prompt or model, or a
+    #: price rise since those runs raise it (Codex review on #690).
+    estimated_cost_usd: float | None
     #: The model's `on_code_change` policy and `reprocess_limit` (issue #530);
     #: None for a kind that carries no guard.
     reprocess_policy: str | None = None
@@ -101,6 +131,7 @@ class ModelPlan:
             "estimated_provider_calls": self.estimated_provider_calls,
             "provider": self.provider,
             "provider_model": self.provider_model,
+            "estimated_cost_usd": self.estimated_cost_usd,
             "reason": self.reason,
             "reprocess_policy": self.reprocess_policy,
             "reprocess_limit": self.reprocess_limit,
@@ -112,6 +143,9 @@ class ProjectPlan:
     models: tuple[ModelPlan, ...]
     target: dict[str, Any]
     generated_at: str
+    #: The run-log relation costs were priced from, or None when the target
+    #: has no run log enabled and no model could be priced.
+    cost_source: str | None
 
     def counts(self) -> dict[str, int]:
         counts = {status: 0 for status in ("new", "unchanged", "changed", "cascade", "full")}
@@ -128,6 +162,7 @@ class ProjectPlan:
                 "generated_at": self.generated_at,
                 "target": self.target,
                 "counts": self.counts(),
+                "cost_source": self.cost_source,
             },
             "models": [model.to_dict() for model in self.models],
         }
@@ -167,9 +202,16 @@ def plan_project(
             resolved=resolved,
             reprocess_all=reprocess_all,
         )
+        # Priced here rather than in `plan_models`: the runner's reprocess
+        # guard reads that function before every run, and a cost it never
+        # shows is not worth a warehouse read per invocation.
+        cost_source = _run_log_relation(resolved)
+        if cost_source is not None:
+            plans = _price_plans(plans, adapter=adapter, relation=cost_source)
     warehouse = resolved.warehouse
     return ProjectPlan(
         models=tuple(plans),
+        cost_source=cost_source,
         target={
             "profile": resolved.profile_name,
             "name": resolved.target_name,
@@ -357,6 +399,7 @@ def _classify(
         provider=provider,
         provider_model=provider_model,
         reason=reason,
+        estimated_cost_usd=None,
         reprocess_policy=policy.on_code_change if policy is not None else None,
         reprocess_limit=policy.reprocess_limit if policy is not None else None,
     )
@@ -403,6 +446,115 @@ def _estimate_provider_calls(
     if model.extraction is not None:
         return (rows, *_descriptor_identity(descriptor))
     return (None, *_descriptor_identity(descriptor))
+
+
+def _run_log_relation(resolved: ResolvedProfile) -> str | None:
+    run_log = resolved.run_log
+    if run_log is None or not run_log.enabled:
+        return None
+    return run_log.relation
+
+
+def _price_plans(
+    plans: list[ModelPlan], *, adapter: WarehouseAdapter, relation: str
+) -> list[ModelPlan]:
+    """Price each reprocessing model at its recent cost per provider row.
+
+    A plan cannot know what a row costs before it is read -- an embed bills
+    by the characters in it, an llm call by its tokens -- so the honest unit
+    is history: what this model's last priced runs paid per row that reached
+    the provider. That is the run log's `estimated_cost_usd` (the arithmetic
+    `pricing:` already does after the fact) over `rows_processed -
+    cache_hits`, and it uses the rates those runs were priced at.
+
+    Rows only, never calls: a request's cost depends on how many texts it
+    carries, which is the provider's batch split rather than anything the
+    log records.
+    """
+    wanted = tuple(
+        plan.name
+        for plan in plans
+        if plan.rows_to_reprocess > 0 and plan.provider is not None
+    )
+    if not wanted:
+        return plans
+    try:
+        rates = _cost_per_provider_row(adapter, relation=relation, models=wanted)
+    except AdapterError as error:
+        # The run log is best-effort when written, so reading it is too: a
+        # plan that cannot price is still a plan.
+        log.warning(
+            "Could not read run log '%s' to price this plan [%s]",
+            relation,
+            type(error).__name__,
+        )
+        return plans
+    return [
+        replace(
+            plan,
+            estimated_cost_usd=round(plan.rows_to_reprocess * rates[plan.name], 6),
+        )
+        if plan.name in rates
+        else plan
+        for plan in plans
+    ]
+
+
+_RUN_LOG_COST_COLUMNS = (
+    "model_name",
+    "rows_processed",
+    "cache_hits",
+    "estimated_cost_usd",
+    "completed_at",
+)
+
+
+def _cost_per_provider_row(
+    adapter: WarehouseAdapter, *, relation: str, models: tuple[str, ...]
+) -> dict[str, float]:
+    """USD per provider row over each model's last priced runs.
+
+    A run counts when it was priced and something reached the provider: a
+    run with no `pricing:` has no cost, and a run answered wholly by reuse
+    has no denominator. Pooled (total cost over total rows) rather than a
+    mean of per-run rates, so a 10-row run cannot outvote a 3.6M-row one.
+    """
+    if relation not in adapter.list_all_tables():
+        return {}
+    present = set(adapter.read_table_schema(relation).columns)
+    if not set(_RUN_LOG_COST_COLUMNS).issubset(present):
+        # A log from before a column existed is history the plan cannot read,
+        # not a reason to fail one.
+        return {}
+    runs: dict[str, list[tuple[str, float, int]]] = {}
+    with adapter.table_snapshot(
+        relation,
+        columns=list(_RUN_LOG_COST_COLUMNS),
+        predicate=ReadPredicate("model_name", ReadPredicateOperator.IN, models),
+    ) as snapshot:
+        for batch in snapshot:
+            frame = pl.from_arrow(batch)
+            assert isinstance(frame, pl.DataFrame)
+            for row in frame.iter_rows(named=True):
+                priced = _priced_run(row)
+                if priced is not None:
+                    runs.setdefault(row["model_name"], []).append(priced)
+    rates: dict[str, float] = {}
+    for name, history in runs.items():
+        recent = sorted(history, reverse=True)[:_PRICED_RUNS]
+        rates[name] = sum(cost for _, cost, _ in recent) / sum(
+            rows for _, _, rows in recent
+        )
+    return rates
+
+
+def _priced_run(row: dict[str, Any]) -> tuple[str, float, int] | None:
+    cost = row["estimated_cost_usd"]
+    processed = row["rows_processed"] or 0
+    provider_rows = processed - (row["cache_hits"] or 0)
+    if cost is None or cost <= 0 or provider_rows <= 0:
+        return None
+    return (row["completed_at"] or "", float(cost), provider_rows)
 
 
 def _descriptor_identity(
@@ -456,7 +608,7 @@ def format_plan_table(plan: ProjectPlan) -> list[str]:
     name_width = max([len("model"), *(len(model.name) for model in plan.models)]) + 2
     header = (
         f"{'model':<{name_width}}{'kind':<12}{'mater.':<13}{'status':<11}"
-        f"{'state_rows':>11}{'reprocess':>11}{'est_calls':>11}"
+        f"{'state_rows':>11}{'reprocess':>11}{'est_calls':>11}{'est_cost':>12}"
     )
     lines = [header, "-" * len(header)]
     for model in plan.models:
@@ -474,9 +626,15 @@ def format_plan_table(plan: ProjectPlan) -> list[str]:
                 else str(model.estimated_provider_calls)
             )
         )
+        cost = (
+            "-"
+            if model.estimated_cost_usd is None
+            else f"~{format_usd(model.estimated_cost_usd)}"
+        )
         lines.append(
             f"{model.name:<{name_width}}{model.kind:<12}{model.materialization:<13}"
             f"{model.status:<11}{model.state_rows:>11}{reprocess:>11}{calls:>11}"
+            f"{cost:>12}"
         )
         if model.status != "unchanged":
             lines.append(f"  {model.reason}")
@@ -507,9 +665,54 @@ def _summary_line(plan: ProjectPlan) -> str:
             f"Rows to reprocess: {exact} from code changes, "
             f"up to {bounded} more downstream."
         )
+        if cost := _cost_sentence(plan):
+            parts.append(cost)
     parts.append(
         "No source was discovered and no provider was called; "
         "changed inputs are found by the run itself."
     )
     return " ".join(parts)
+
+
+def _cost_sentence(plan: ProjectPlan) -> str:
+    priced = [m for m in plan.models if m.estimated_cost_usd is not None]
+    # A paid model with rows to reprocess and no price is the case the reader
+    # most needs told about: a blank would read as free.
+    unpriced = [
+        m.name
+        for m in plan.models
+        if m.estimated_cost_usd is None
+        and m.provider is not None
+        and m.rows_to_reprocess > 0
+    ]
+    if plan.cost_source is None:
+        if not unpriced:
+            return ""
+        return (
+            "Provider cost is not estimated: a plan prices rows from the run "
+            "log's history, and this target has no run-log enabled."
+        )
+    sentence = ""
+    if priced:
+        total = sum(m.estimated_cost_usd or 0.0 for m in priced)
+        sentence = (
+            f"Provider cost: about {format_usd(total)}, priced at each "
+            f"model's cost per provider row over its last {_PRICED_RUNS} "
+            f"priced runs in {plan.cost_source}. An estimate, not a cap: reuse "
+            "and caches lower it, longer text or a costlier model raise it."
+        )
+    if unpriced:
+        sentence += (
+            f"{' ' if sentence else ''}No priced history in {plan.cost_source} "
+            f"for {', '.join(unpriced)}."
+        )
+    return sentence
+
+
+def format_usd(value: float) -> str:
+    if value == 0:
+        return "$0"
+    if value < 0.01:
+        return "$<0.01"
+    return f"${value:,.2f}"
 

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### An embed pays once per text, and `stel plan` says what a reprocess costs (issue #665)
+
+- **Three ways a corpus still paid twice for the same text.** #671 made
+  reuse follow text rather than row ids, but it can only find vectors the
+  target still holds. A vector embedded after the last flush of a run that
+  then crashed, text that repeats in a later window of the same run, and a
+  target rebuilt by `--full-refresh` were all paid for again. astrolabe's SEC
+  backfill was relaunched through repeated ~1.3h failures that way.
+- **`embedding.cache_path`** in profiles.yml is the embed-side twin of
+  `llm.cache_path`: every vector is written to a local, owner-only DuckDB
+  file as soon as its provider batch returns, keyed on
+  `embedding_input_hash` plus `embedding_config_hash`, and each window looks
+  there before the target. It holds hashes and vectors, no text, and stays
+  outside `code_version`. With it set, `--full-refresh` reuses cached
+  vectors; delete the file to force a re-embed.
+- **Identical text within a flush window is embedded once** whether or not a
+  cache is configured. Run metrics add `response_cache_hits` and
+  `duplicate_text_hits` (both within `cache_hits`) and `input_characters`.
+- **`embedding.pricing`** (`input_usd_per_mchar`, `input_usd_per_mtok`)
+  gives embeds an `estimated_cost_usd` in run results and the run log, and
+  lets a run budget's `max_cost_usd` stop an embed. Before this, embeddings
+  had no price and the cost cap could not see them.
+- **`stel plan` has an `est_cost` column.** With `run-log:` enabled, each
+  reprocessing model is priced at its recent cost per provider row (its last
+  five priced runs) times the rows to reprocess. The figure is an
+  estimate, not a cap, written `~$N`; a refusal under
+  `on_code_change: fail` names it. Without a run log the footer says the cost
+  is not estimated instead of leaving it blank. `plan.json` moves to schema
+  version 2: `estimated_cost_usd` per model, `metadata.cost_source`.
+- ADR-0033 records why the cache is a local file written per batch, and why
+  a plan is priced from history rather than from the upstream text.
+
 ### A demo you can run from PyPI: `stel init --template demo` (issue #688)
 
 - **Every demo lived in the repository**, and each showed one primitive, so

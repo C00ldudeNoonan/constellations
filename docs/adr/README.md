@@ -42,6 +42,7 @@ history (issue #311).
 | [0030](0030-a-store-mirror-is-a-byte-copy-synced-by-a-reader.md) | A store mirror is a byte copy of each Lance table, synced after activation by a query-lease reader; a failed sync fails the model, not the publication | accepted |
 | [0031](0031-a-concept-cloud-reaches-the-source-through-a-loopback-server.md) | A concept cloud reaches the source through a loopback server serving the artifact same-origin, not a token baked into it | accepted |
 | [0032](0032-a-served-indexs-age-is-the-activation-it-serves.md) | A served index is dated by the activation of the generation it serves, read from the ledger per request, not by the latest run artifact | accepted |
+| [0033](0033-an-embedding-is-cached-locally-by-text-and-a-plan-is-priced-from-history.md) | Every embedding a provider returns is cached locally by text and configuration before its window publishes; `stel plan` prices rows from the run log's cost per provider row | accepted |
 
 ## When to write one
 

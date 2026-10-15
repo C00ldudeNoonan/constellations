@@ -56,6 +56,7 @@ def _plan(
     upper: bool = False,
     policy: str | None = "fail",
     limit: int | None = 0,
+    cost: float | None = None,
 ) -> ModelPlan:
     return ModelPlan(
         name=name,
@@ -72,6 +73,7 @@ def _plan(
         provider="deterministic",
         provider_model="deterministic-v1",
         reason="because",
+        estimated_cost_usd=cost,
         reprocess_policy=policy,
         reprocess_limit=limit,
     )
@@ -88,6 +90,12 @@ def test_cascade_upper_bound_is_refused() -> None:
     refusals = guard_reprocess([_plan(status="cascade", upper=True)])
     assert len(refusals) == 1
     assert "up to 10" in refusals[0].describe()
+
+
+def test_a_refusal_names_the_priced_cost_when_the_plan_has_one() -> None:
+    """The refusal is where an operator decides whether to pay (issue #665)."""
+    (refusal,) = guard_reprocess([_plan(status="changed", cost=1234.5)])
+    assert "at most $1,234.50" in refusal.describe()
 
 
 def test_within_limit_new_unchanged_and_full_pass() -> None:

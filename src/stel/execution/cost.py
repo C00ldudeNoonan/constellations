@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from ..config.profile import PricingConfig
+from ..config.profile import EmbeddingPricingConfig, PricingConfig
 from ..profile import ResolvedProfile
 from ..providers import InferenceProvider
 
@@ -16,6 +16,26 @@ def estimate_cost(totals: dict[str, Any], pricing: PricingConfig) -> float:
         ("output_tokens", pricing.output_usd_per_mtok),
         ("cache_read_input_tokens", pricing.cache_read_usd_per_mtok),
         ("cache_creation_input_tokens", pricing.cache_write_usd_per_mtok),
+    ]
+    cost = sum(
+        float(totals.get(key, 0)) * rate for key, rate in rates if rate is not None
+    )
+    return round(cost / 1_000_000, 6)
+
+
+def estimate_embedding_cost(
+    totals: Mapping[str, Any], pricing: EmbeddingPricingConfig
+) -> float:
+    """Input tokens and characters x the operator's embedding rates (issue #665).
+
+    Characters are counted by stel over the texts it actually sent, not
+    reported by the provider, so a character-billed estimate is as close as
+    `len()` is to the provider's own count -- Vertex, for one, documents that
+    it does not bill whitespace, which makes this a slight overestimate.
+    """
+    rates = [
+        ("input_tokens", pricing.input_usd_per_mtok),
+        ("input_characters", pricing.input_usd_per_mchar),
     ]
     cost = sum(
         float(totals.get(key, 0)) * rate for key, rate in rates if rate is not None

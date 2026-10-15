@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .plan import ModelPlan
+from .plan import ModelPlan, format_usd
 
 # The two statuses under which published rows are paid for again. `new` is a
 # first build and `full` rebuilds every run by declaration; neither is a
@@ -47,9 +47,14 @@ class Refusal:
             if plan.estimated_provider_calls
             else ""
         )
+        cost = (
+            f", at most {format_usd(plan.estimated_cost_usd)}"
+            if plan.estimated_cost_usd is not None
+            else ""
+        )
         return (
             f"{plan.name} ({plan.kind}, {provider}): {rows} of {plan.state_rows:,} "
-            f"published rows would reprocess{calls}; reprocess_limit is "
+            f"published rows would reprocess{calls}{cost}; reprocess_limit is "
             f"{plan.reprocess_limit}. {plan.reason}."
         )
 

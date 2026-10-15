@@ -1276,3 +1276,36 @@ def test_falsy_profile_document_is_not_treated_as_empty_mapping(
     message = str(exc_info.value)
     assert "profiles.yml:1:1 [<root>]" in message
     assert "top-level must be a mapping of profile names" in message
+
+
+def _write_embedding_profile(tmp_path: Path, embedding_block: str) -> None:
+    _write_project(tmp_path, profile="test_proj")
+    (tmp_path / "profiles.yml").write_text(
+        "test_proj:\n  target: dev\n  outputs:\n    dev:\n      warehouse:\n"
+        "        type: duckdb\n        path: ./d.duckdb\n        schema: d\n"
+        "      embedding:\n        provider: deterministic\n" + embedding_block,
+        encoding="utf-8",
+    )
+
+
+def test_embedding_cache_path_resolves_against_the_project(tmp_path: Path) -> None:
+    """Like llm.cache_path: a relative path means the project, not the cwd
+    the run happened to start in (issue #665)."""
+    _write_embedding_profile(
+        tmp_path, "        cache_path: ./target/embedding_cache.duckdb\n"
+    )
+    project, _, _ = load_project(tmp_path)
+    resolved = resolve_profile(project, tmp_path)
+    assert resolved.embedding is not None
+    assert resolved.embedding.cache_path == (
+        tmp_path / "target" / "embedding_cache.duckdb"
+    ).resolve()
+
+
+def test_embedding_pricing_without_a_rate_is_rejected(tmp_path: Path) -> None:
+    """An empty pricing block would price every run at $0 -- a number an
+    operator would trust. It fails at profile resolution instead."""
+    _write_embedding_profile(tmp_path, "        pricing: {}\n")
+    project, _, _ = load_project(tmp_path)
+    with pytest.raises(ProfileError, match="input_usd_per_mchar"):
+        resolve_profile(project, tmp_path)

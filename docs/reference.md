@@ -341,7 +341,9 @@ llm:
 
 Available caps: `max_documents`, `max_file_bytes`, `max_total_bytes`,
 `max_input_tokens`, `max_output_tokens`, `max_api_calls`, and `max_cost_usd`
-(provider-reported spend wins over the pricing-table estimate). A tripped
+(provider-reported spend wins over the pricing-table estimate). An `embed:`
+model charges the run budget too, and `max_cost_usd` reaches it once the
+profile sets `embedding.pricing`. A tripped
 budget stops the model with the distinct `budget_exceeded` status: `full`
 materializations publish nothing, and incremental runs keep only chunks that
 already committed with their state. Token and spend caps are measured from
@@ -623,28 +625,29 @@ manifest written by a previous `compile` or `run`. The CI recipe: store
 `state:modified` says *which* models a change touched. `stel plan` says what
 that costs: for every selected model, whether its `code_version` still matches
 the rows its published state records, how many rows the next run would
-reprocess, which downstream models the change reaches, and roughly how many
-provider requests that implies. It reads stel's own state table and nothing
+reprocess, which downstream models the change reaches, roughly how many
+provider requests that implies, and — when the target keeps a run log — what
+those rows cost. It reads stel's own state table and run log and nothing
 else — no source discovery, no provider call, no model table — so it is safe
 to run against production before a change is.
 
 ```
 $ stel plan --select 'document_registry+'   # the rag_chunks_pipeline example, after changing chunk_size
-model              kind        mater.       status      state_rows  reprocess  est_calls
-----------------------------------------------------------------------------------------
-document_registry  extraction  incremental  unchanged            2          0          -
-document_chunks    chunk       incremental  changed              2          2          -
+model              kind        mater.       status      state_rows  reprocess  est_calls    est_cost
+----------------------------------------------------------------------------------------------------
+document_registry  extraction  incremental  unchanged            2          0          -           -
+document_chunks    chunk       incremental  changed              2          2          -           -
   code_version differs for 2 of 2 published rows
-chunk_embeddings   embed       incremental  cascade              2        <=2        <=1
+chunk_embeddings   embed       incremental  cascade              2        <=2        <=1           -
   upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
-chunk_entities     llm         incremental  cascade              2        <=2        <=2
+chunk_entities     llm         incremental  cascade              2        <=2        <=2           -
   upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
-chunk_facts        llm         incremental  cascade              2        <=2        <=2
+chunk_facts        llm         incremental  cascade              2        <=2        <=2           -
   upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
-chunk_search       search      incremental  cascade              2        <=2          -
+chunk_search       search      incremental  cascade              2        <=2          -           -
   upstream document_chunks changed: this model's input re-keys or re-fingerprints, up to every published row
 
-6 model(s) planned: 1 unchanged, 1 changed, 4 downstream of a change, 0 new, 0 rebuilt every run. Rows to reprocess: 2 from code changes, up to 8 more downstream. No source was discovered and no provider was called; changed inputs are found by the run itself.
+6 model(s) planned: 1 unchanged, 1 changed, 4 downstream of a change, 0 new, 0 rebuilt every run. Rows to reprocess: 2 from code changes, up to 8 more downstream. Provider cost is not estimated: a plan prices rows from the run log's history, and this target has no run-log enabled. No source was discovered and no provider was called; changed inputs are found by the run itself.
 ```
 
 The statuses:
@@ -672,6 +675,23 @@ split, and one request per row for an `llm:` model or per document for
 `uses_llm` transform, whose fan-out per parent is the transform's own code.
 Batch submission is not modeled; a provider whose extra is not installed on
 the planning host leaves the count unknown rather than failing the plan.
+
+`est_cost` is what those rows would cost (issue #665). A plan cannot know what
+a row costs before reading it — an embed bills by the characters in its text,
+an llm call by its tokens — so it prices each reprocessing model from history:
+its last five priced runs in the [run log](#append-only-logs), pooled as
+`estimated_cost_usd` over the rows that reached the provider
+(`rows_processed - cache_hits`), times the rows to reprocess. It needs
+`run-log:` enabled and a `pricing:` block (`llm.pricing` or
+`embedding.pricing`) the model's earlier runs were priced under; without
+either the column is `-` and the footer says why, so a blank never reads as
+free. The figure is written `<=$N` because it is always a ceiling: it prices
+every row as though it reaches the provider, and vector reuse, the response
+caches, and duplicate text only lower it. It uses the rates those earlier runs
+were priced at, so a price change shows up after the next run, not before it.
+`plan.json` carries it per model as `estimated_cost_usd`, and the run log it
+was read from as `metadata.cost_source` (plan schema version 2), and a refusal
+under `on_code_change: fail` names it.
 
 A plan connects to the warehouse the way a run does — the same profile,
 target, and preflight — and writes `target/plan.json`, which `--json` prints
@@ -2798,11 +2818,60 @@ Incremental runs distinguish three cases:
   row, as does a row whose id changed while its text did not;
 - text, model, provider, dimensions, or implementation changes recompute it.
 
+Within one flush window, rows with identical text are sent to the provider
+once and share the vector (`duplicate_text_hits` in the run metrics).
+
 Removed upstream IDs are deleted downstream. Provider results are validated for
 cardinality, dimensions, and finite numbers before any rows or state are
 published. `stel.embedding.embed_query()` accepts the identity recorded in
 the manifest so query-time vectors cannot silently use a different provider
 implementation or configuration.
+
+### Paying once: the embedding response cache
+
+Reuse from the target only finds vectors the target still holds. Three cases
+paid for the same text twice anyway (issue #665): a run that crashed after
+embedding but before its next flush, text that repeats in later windows of
+the same run, and a target that was rebuilt (`--full-refresh` turns target
+reuse off) or lost the row. The profile's `embedding.cache_path` closes all
+three:
+
+```yaml
+embedding:
+  provider: vertex
+  cache_path: ./target/embedding_cache.duckdb   # relative to the project
+  pricing:                                      # optional
+    input_usd_per_mchar: 0.025    # Vertex text embeddings bill characters
+    # input_usd_per_mtok: 0.15    # a token-billed provider; both may be set
+  provider_options: { ... }
+```
+
+- Every vector is written to the cache as soon as its provider batch returns,
+  before its window publishes, keyed on `embedding_input_hash` plus
+  `embedding_config_hash`. The next run, retry or rebuild looks the window up
+  there first and sends only texts the cache has never seen under this
+  configuration. A changed model, dimension or provider option is a different
+  key, so it re-embeds.
+- The cache is a local DuckDB file holding hashes, vectors and timestamps — no
+  text, ids or credentials — kept owner-only like the `llm:` cache. It is
+  operator-owned and outside `code_version`: deleting it costs provider calls,
+  never correctness, and is how you force a re-embed, since `--full-refresh`
+  alone now reuses cached vectors. Budget roughly 8 bytes per dimension per
+  distinct text (about 6 KB at 768 dimensions, so ~22 GB for 3.67M chunks).
+- A path that cannot hold a cache fails the run before the first provider
+  call. A write that fails partway through (a full disk) logs one warning and
+  turns the cache off for the rest of that model's run instead of failing it,
+  because the vectors in hand are already paid for and about to publish.
+- Run metrics split `cache_hits` by source: `response_cache_hits` from the
+  file, `duplicate_text_hits` from the window, and the rest from the target.
+
+`embedding.pricing` gives an embed the same `estimated_cost_usd` an `llm:`
+model gets from `llm.pricing`: input tokens and input characters times
+whichever rates are set, in USD per million. Characters are counted by stel
+over the texts actually sent (`input_characters` in the metrics), so for a
+provider that does not bill whitespace the estimate runs slightly high. With
+it set, a run budget's `max_cost_usd` applies to embeds, the run log records
+their cost, and `stel plan` can price them.
 
 ## LLM transformation models
 
@@ -5515,7 +5584,9 @@ invocation: `invocation_id`, `model_name`, `kind`, `status`, resolved
 `provider`/`provider_model`/`provider_implementation`,
 `rows_processed`/`rows_skipped`/`rows_written`, `api_calls`, `cache_hits`,
 `input_tokens`, `output_tokens`, `estimated_cost_usd` (when the profile sets
-`pricing:`), `duration_seconds`, `started_at`, `completed_at`. This is a
+`llm.pricing` or `embedding.pricing`), `duration_seconds`, `started_at`,
+`completed_at`. `stel plan` reads `estimated_cost_usd`, `rows_processed` and
+`cache_hits` back to price a reprocess before it runs. This is a
 durable sink for numbers stel already meters, not a second meter.
 `started_at`/`completed_at` are the model's own span; a `skipped` row, which
 the runner never started, carries the invocation's. A model that failed is

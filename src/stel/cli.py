@@ -1058,8 +1058,9 @@ def plan(
 
     Compares each selected model's code_version against the rows its
     published state records, names the downstream models a change reaches,
-    and estimates the provider requests those rows imply. Reads only stel's
-    own state table: no source discovery, no provider call, no model table.
+    and estimates the provider requests those rows imply -- and, when the
+    target keeps a run log, what they cost. Reads only stel's own state table
+    and run log: no source discovery, no provider call, no model table.
     """
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]

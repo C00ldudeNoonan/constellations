@@ -12,6 +12,7 @@ from pydantic import (
     GetJsonSchemaHandler,
     PrivateAttr,
     field_validator,
+    model_validator,
 )
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema, PydanticCustomError, core_schema
@@ -214,6 +215,33 @@ class LLMConfig(BaseModel):
     budget: LLMBudgetConfig | None = None
 
 
+class EmbeddingPricingConfig(BaseModel):
+    """User-supplied embedding prices for cost estimates (issue #665).
+
+    Two units because providers bill embeddings in two: Vertex's text
+    embedding models charge per input character, token-metered providers per
+    token. Set the one your provider bills; setting both adds them. Like
+    `llm.pricing`, no prices ship with stel.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    input_usd_per_mtok: float | None = Field(
+        default=None, ge=0.0, allow_inf_nan=False
+    )
+    input_usd_per_mchar: float | None = Field(
+        default=None, ge=0.0, allow_inf_nan=False
+    )
+
+    @model_validator(mode="after")
+    def _require_a_rate(self) -> EmbeddingPricingConfig:
+        if self.input_usd_per_mtok is None and self.input_usd_per_mchar is None:
+            raise ValueError(
+                "embedding pricing needs input_usd_per_mtok or input_usd_per_mchar"
+            )
+        return self
+
+
 class EmbeddingProfileConfig(BaseModel):
     """Operator-owned defaults for embedding-provider execution."""
 
@@ -239,6 +267,12 @@ class EmbeddingProfileConfig(BaseModel):
         le=3600.0,
         allow_inf_nan=False,
     )
+    # The embed-side twin of `llm.cache_path` (issue #665): every vector a
+    # provider returns is written here before its window publishes, so a
+    # crash, a duplicate text, or a rebuilt target never pays for it twice.
+    # Operator-owned and outside code_version, like the llm cache.
+    cache_path: Path | None = None
+    pricing: EmbeddingPricingConfig | None = None
 
 
 class _RedactedWarehouseInput:

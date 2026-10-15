@@ -2,6 +2,13 @@
 
 ## v0.23.0 - 2026-10-15
 
+### The `mcp` extra requires `mcp>=1.30.0` (CVE-2026-59951)
+
+- `mcp` 1.28.1, the version the lock carried, has a known vulnerability fixed
+  in 1.30.0. The `mcp` extra and the dev group now require `>=1.30.0,<2`, so
+  an install that resolves the extra can no longer land on an affected
+  version.
+
 ### The star map gets built-in lenses, and its caption counts what it left out (issue #345)
 
 - **Four lenses on every export**: `mentions`, `documents`, `link status`

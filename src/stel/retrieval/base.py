@@ -570,6 +570,11 @@ class CollectionMetadata:
     source_generation: str | None = None
     source_rows: int | None = None
     source_progress: str | None = None
+    # What the approximate vector index was trained on, and how many vectors
+    # extension has placed into it since (issue #683). None where the store
+    # does not train an index, or has not recorded one yet.
+    vector_index_trained_rows: int | None = None
+    vector_index_extended_rows: int | None = None
 
 
 class StoreRole(StrEnum):

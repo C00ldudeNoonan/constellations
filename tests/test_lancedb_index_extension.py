@@ -13,6 +13,10 @@ declared type, or an ANN index under `exact`, which is implemented by its
 absence (issue #461) -- must still reach the build path. And the extension is
 an optimization, so a failure falls back to the rebuild rather than taking the
 publish with it, without leaking native text on the way (issue #490).
+
+The cost of extending is drift, so the store also records what the vector
+index was trained on and how many vectors extension has placed since, and the
+publish says so once that passes the largest extension measured (issue #683).
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from stel.retrieval import (
     RetrievalError,
     StoreRole,
 )
+from stel.retrieval.servability import index_extension_advisory
 
 SENTINEL = "gs://distinctive-bucket/prefix?token=distinctive-native-secret"
 POOL_REFUSAL = (
@@ -345,3 +350,153 @@ def test_a_failed_extension_rebuilds_instead_and_leaks_no_native_text(
     # The native text is reachable only through the DEBUG record's exc_info.
     debug = [r for r in caplog.records if r.levelno == logging.DEBUG and r.exc_info]
     assert any(SENTINEL in str(record.exc_info[1]) for record in debug if record.exc_info)
+
+
+# ─── the training record (issue #683) ───────────────────────────────────────
+
+
+def _training(store: LanceDBStore) -> tuple[int | None, int | None]:
+    metadata = store.inspect_collection(PHYSICAL)
+    assert metadata is not None
+    return metadata.vector_index_trained_rows, metadata.vector_index_extended_rows
+
+
+def test_a_build_records_its_training_and_each_extension_adds_to_it(
+    tmp_path: Path,
+) -> None:
+    """An updated vector counts as well as a new one: an upsert rewrites the
+    row, and extension assigns it to centroids the index already had."""
+    spec = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    with _store(tmp_path) as store:
+        store.create_collection(spec)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(spec)
+        assert _training(store) == (4, 0)
+
+        store.upsert(PHYSICAL, _rows(0, 2), id_field="chunk_id", mutation_digest="d1")
+        store.append(PHYSICAL, _rows(4, 2), id_field="chunk_id", mutation_digest="d2")
+        store.ensure_indexes(spec)
+        assert _training(store) == (4, 4)
+
+        store.append(PHYSICAL, _rows(6, 3), id_field="chunk_id", mutation_digest="d3")
+        store.ensure_indexes(spec)
+        assert _training(store) == (4, 7)
+
+
+def test_a_rebuild_starts_the_record_over(tmp_path: Path) -> None:
+    built = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    with _store(tmp_path) as store:
+        store.create_collection(built)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(built)
+        store.append(PHYSICAL, _rows(4, 4), id_field="chunk_id", mutation_digest="d1")
+        store.ensure_indexes(built)
+        assert _training(store) == (4, 4)
+
+        store.append(PHYSICAL, _rows(8, 2), id_field="chunk_id", mutation_digest="d2")
+        store.ensure_indexes(_spec(vector_search="approximate", vector_index="ivf_hnsw_sq"))
+
+        assert _training(store) == (10, 0)
+
+
+def test_an_index_trained_before_the_record_counts_from_its_first_extension(
+    tmp_path: Path,
+) -> None:
+    """A collection published before #683 carries no stamp. Waiting for its
+    next full build would leave exactly the collections that only ever extend
+    unmeasured, so the baseline is what the index held before this extension."""
+    spec = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    with _store(tmp_path) as store:
+        store.create_collection(spec)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(spec)
+        store._open_owned_table(PHYSICAL).update_field_metadata(
+            {
+                "path": "chunk_id",
+                "metadata": {
+                    "stel.vector_index_trained_rows": "",
+                    "stel.vector_index_extended_rows": "",
+                },
+            }
+        )
+        assert _training(store) == (None, None)
+
+        store.append(PHYSICAL, _rows(4, 2), id_field="chunk_id", mutation_digest="d1")
+        store.ensure_indexes(spec)
+
+        assert _training(store) == (4, 2)
+
+
+def test_a_restamp_keeps_the_record(tmp_path: Path) -> None:
+    """Every publish that completes its rows re-stamps the id field (#508).
+    Lance merges field metadata rather than replacing it; if that ever
+    changed, the record would vanish on the publish after the build."""
+    spec = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    with _store(tmp_path) as store:
+        store.create_collection(spec)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(spec)
+
+        store.restamp_collection(spec)
+
+        assert _training(store) == (4, 0)
+
+
+def test_exact_search_carries_no_record(tmp_path: Path) -> None:
+    """`exact` is the absence of an ANN index (#461); a record left behind
+    would describe an index that no longer exists."""
+    approximate = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    exact = _spec(vector_search="exact")
+    with _store(tmp_path) as store:
+        store.create_collection(approximate)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(approximate)
+        store.append(PHYSICAL, _rows(4, 4), id_field="chunk_id", mutation_digest="d1")
+        store.ensure_indexes(exact)
+        assert _training(store) == (None, None)
+
+        # The BTree alone is extended from here on, which is no vector's training.
+        store.append(PHYSICAL, _rows(8, 2), id_field="chunk_id", mutation_digest="d2")
+        store.ensure_indexes(exact)
+        assert _training(store) == (None, None)
+
+
+# ─── the advisory (issue #683) ──────────────────────────────────────────────
+
+
+def test_extension_within_the_measured_range_says_nothing() -> None:
+    """30% is the largest extension measured on the prod corpus, and recall
+    held there. The line is inclusive of what was measured."""
+    assert (
+        index_extension_advisory(
+            model="m", collection="c", trained_rows=1_000, extended_rows=300
+        )
+        is None
+    )
+
+
+def test_extension_past_the_measured_range_names_the_retrain() -> None:
+    advisory = index_extension_advisory(
+        model="sec_chunk_search",
+        collection="sec_chunks",
+        trained_rows=3_667_730,
+        extended_rows=1_200_000,
+    )
+    assert advisory is not None
+    assert "trained on 3,667,730 rows" in advisory
+    assert "1,200,000 more vectors" in advisory
+    assert "(33% of that sample)" in advisory
+    assert "issue #683" in advisory
+    assert "`stel run --select sec_chunk_search --full-refresh`" in advisory
+
+
+@pytest.mark.parametrize(
+    ("trained", "extended"), [(None, None), (None, 10), (10, None), (0, 10)]
+)
+def test_no_record_means_no_advisory(trained: int | None, extended: int | None) -> None:
+    assert (
+        index_extension_advisory(
+            model="m", collection="c", trained_rows=trained, extended_rows=extended
+        )
+        is None
+    )

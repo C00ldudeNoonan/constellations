@@ -70,6 +70,7 @@ from ..retrieval.servability import (
     index_build_advisory,
     index_build_advisory_row_threshold,
     index_build_is_estimated,
+    index_extension_advisory,
 )
 from ..state_reconciliation import BoundedReconciler, UpstreamRecord
 from ..timing import PhaseTimings
@@ -163,6 +164,7 @@ def _run_search_model(
     coordinator = ServingCoordinator(adapter, ensure_schema=True)
     publish_lease: PublishLease | None = None
     active_generation: str | None = None
+    published: CollectionMetadata | None = None
     state_swapped = False
     superseded_collection: str | None = None
 
@@ -937,6 +939,7 @@ def _run_search_model(
                     metadata = store.ensure_indexes(spec)
                 if not warned_exact:
                     _warn_on_exact_vector_scan(model, spec, metadata.row_count)
+                published = metadata
                 if metadata.config_fingerprint != spec.config_fingerprint:
                     raise RunError(
                         "Retrieval collection failed post-publication configuration validation"
@@ -1090,7 +1093,16 @@ def _run_search_model(
             },
         )
     assert spec is not None
+    assert published is not None
     safe_target = store.safe_descriptor()
+    trained = published.vector_index_trained_rows
+    extended = published.vector_index_extended_rows
+    advisory = index_extension_advisory(
+        model=model.name,
+        collection=spec.logical_name,
+        trained_rows=trained,
+        extended_rows=extended,
+    )
     return ModelRunResult(
         model_name=model.name,
         materialization=model.materialization,
@@ -1105,6 +1117,11 @@ def _run_search_model(
         # Where the wall clock went, so a slow publish can be attributed
         # rather than guessed at (#432, #454).
         metrics=timings.as_metrics(),
+        # A warning rather than a log line so it reaches the run summary and
+        # run_results.json, where an operator looks after a monthly publish
+        # (issue #683). Never a retrain: that is the whole-corpus cost #619
+        # removed, and the operator's call.
+        warnings={advisory: 1} if advisory is not None else {},
         serving_resource={
             "type": "retrieval_index",
             "store_type": store_config.type,
@@ -1115,6 +1132,12 @@ def _run_search_model(
             "status": "ready",
             "active_generation": active_generation,
             "fencing_token": publish_lease.fencing_token if publish_lease else None,
+            # What the vector index was trained on and how far extension has
+            # taken it since, so drift exposure is visible without a probe
+            # (issue #683). Null where the store trains nothing or has not
+            # recorded it.
+            "vector_index_trained_rows": trained,
+            "vector_index_extended_rows": extended,
         },
     )
 

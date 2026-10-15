@@ -82,6 +82,11 @@ collects them.
   from that sample, recall degrades without anything reporting it.
   `--full-refresh` is the only retrain, and nothing yet measures the drift or
   prompts for one. That is the sharp edge of this decision.
+  *Follow-up (#683):* measured on prod's 3.67M vectors, extending by 5%, 15%
+  and 30% left recall@20 inside the spread between two fresh builds. The store
+  now records the rows an index was trained on and the vectors extension has
+  placed since, and a publish past 30% warns and names the retrain. It still
+  never retrains on its own.
 - **The in-place build advisory is gone**, because the build it predicted no
   longer happens. It survives for the two cases that do build from scratch: a
   private generation, and a first publish.

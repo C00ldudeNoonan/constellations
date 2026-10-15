@@ -427,6 +427,72 @@ def test_an_index_trained_before_the_record_counts_from_its_first_extension(
         assert _training(store) == (4, 2)
 
 
+def test_an_extension_that_committed_before_its_count_is_counted_next_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that dies after Lance commits the `optimize()` but before
+    stel counts it leaves nothing unindexed, so the next publish has nothing
+    to extend and would never count those vectors -- an advisory suppressed
+    for good (Codex review, #691). The pending stamp settles it."""
+    spec = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    with _store(tmp_path) as store:
+        store.create_collection(spec)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(spec)
+        store.append(PHYSICAL, _rows(4, 2), id_field="chunk_id", mutation_digest="d1")
+
+        settle = LanceDBStore._settle_extension
+        calls: list[int] = []
+
+        def dies_after_commit(self: LanceDBStore, *args: Any) -> None:
+            calls.append(1)
+            if len(calls) == 2:  # the settle right after `optimize()`
+                raise RuntimeError("process died")
+            settle(self, *args)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(LanceDBStore, "_settle_extension", dies_after_commit)
+            with pytest.raises(RetrievalError):
+                store.ensure_indexes(spec)
+        assert _unindexed(store) == 0  # Lance did commit
+        assert _training(store) == (4, 0)
+
+        store.ensure_indexes(spec)
+
+        assert _training(store) == (4, 2)
+
+
+def test_an_extension_that_never_committed_is_counted_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other side: the rows are still unindexed, so the next extension
+    counts them itself, and folding the pending count as well would count
+    them twice."""
+    spec = _spec(vector_search="approximate", vector_index="ivf_hnsw_flat")
+    with _store(tmp_path) as store:
+        store.create_collection(spec)
+        store.append(PHYSICAL, _rows(0, 4), id_field="chunk_id", mutation_digest="d0")
+        store.ensure_indexes(spec)
+        store.append(PHYSICAL, _rows(4, 2), id_field="chunk_id", mutation_digest="d1")
+
+        with monkeypatch.context() as patched:
+            original = LanceDBStore._open_owned_table
+            patched.setattr(
+                LanceDBStore,
+                "_open_owned_table",
+                lambda self, name: _SpyTable(
+                    original(self, name), optimize_raises=RuntimeError(POOL_REFUSAL)
+                ),
+            )
+            with pytest.raises(RetrievalError):
+                store.ensure_indexes(spec)
+        assert _training(store) == (4, 0)
+
+        store.ensure_indexes(spec)
+
+        assert _training(store) == (4, 2)
+
+
 def test_a_restamp_keeps_the_record(tmp_path: Path) -> None:
     """Every publish that completes its rows re-stamps the id field (#508).
     Lance merges field metadata rather than replacing it; if that ever

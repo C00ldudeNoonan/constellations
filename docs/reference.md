@@ -818,7 +818,8 @@ per-run rebuild are not in it, so a large new ingest passes under the
 threshold. The run budget's `max_cost_usd` is the cap that sees everything;
 this is a question asked before starting. A paid model with no priced history
 is named in a warning and left out of the total rather than blocking every
-run. The threshold needs `run_log` enabled on the target and is rejected at
+run. A run log that cannot be read is different: it refuses the run, because
+pricing nothing would project $0, and `--accept-cost` runs without the check. The threshold needs `run_log` enabled on the target and is rejected at
 profile resolution without it. Inside the threshold, the projection is logged
 at `-v`. `stel plan` says when a run would ask.
 ADR [0034](adr/0034-a-run-over-its-cost-threshold-asks-and-refuses-without-a-terminal.md)

@@ -211,12 +211,22 @@ def plan_project(
         # shows is not worth a warehouse read per invocation.
         cost_source = run_log_relation(resolved)
         if cost_source is not None:
-            plans = price_plans(
-                plans,
-                adapter=adapter,
-                relation=cost_source,
-                reprocess_all=reprocess_all,
-            )
+            try:
+                plans = price_plans(
+                    plans,
+                    adapter=adapter,
+                    relation=cost_source,
+                    reprocess_all=reprocess_all,
+                )
+            except AdapterError as error:
+                # The run log is best-effort when written, so reading it is
+                # too: a plan that cannot price is still a plan. The cost
+                # guard does not get this leniency (Codex review on #695).
+                log.warning(
+                    "Could not read run log '%s' to price this plan [%s]",
+                    cost_source,
+                    type(error).__name__,
+                )
     warehouse = resolved.warehouse
     return ProjectPlan(
         models=tuple(plans),
@@ -484,6 +494,10 @@ def price_plans(
     Rows only, never calls: a request's cost depends on how many texts it
     carries, which is the provider's batch split rather than anything the
     log records.
+
+    Raises `AdapterError` when the run log cannot be read. Each caller
+    decides what that means: `stel plan` still reports, but the cost guard
+    must not read an unreadable history as a free run.
     """
     wanted = tuple(
         plan.name
@@ -492,17 +506,7 @@ def price_plans(
     )
     if not wanted:
         return plans
-    try:
-        rates = _cost_per_provider_row(adapter, relation=relation, models=wanted)
-    except AdapterError as error:
-        # The run log is best-effort when written, so reading it is too: a
-        # plan that cannot price is still a plan.
-        log.warning(
-            "Could not read run log '%s' to price this plan [%s]",
-            relation,
-            type(error).__name__,
-        )
-        return plans
+    rates = _cost_per_provider_row(adapter, relation=relation, models=wanted)
     code_changed = {plan.name for plan in plans if plan.stale_rows > 0}
     return [
         replace(

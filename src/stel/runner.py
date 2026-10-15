@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .adapters import (
+    AdapterError,
     ReadPredicate,
     ReadPredicateOperator,
     StateScope,
@@ -1009,13 +1010,21 @@ def _enforce_cost_guard(
         )
     if full_refresh:
         plans = full_refresh_rows(plans)
-    projection = project_cost(
-        price_plans(
+    try:
+        priced = price_plans(
             plans, adapter=adapter, relation=source, reprocess_all=reprocess_all
-        ),
-        threshold_usd=threshold,
-        source=source,
-    )
+        )
+    except AdapterError as error:
+        # Unreadable history is not absent history: pricing nothing would
+        # project $0 and start a run configured to stop above its threshold
+        # (Codex review on #695). The type name only -- adapter text can
+        # carry warehouse detail.
+        raise RunError(
+            f"Refusing to start: the run log {source} could not be read to "
+            f"price this run [{type(error).__name__}], so confirm_cost_above_usd "
+            "cannot be checked. Pass `--accept-cost` to run without the check."
+        ) from error
+    projection = project_cost(priced, threshold_usd=threshold, source=source)
     if projection.unpriced:
         log.warning(
             "cost guard: no priced history in %s for %s; the projection leaves "

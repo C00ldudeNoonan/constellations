@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from stel.adapters import AdapterError
 from stel.cli import cli
 from stel.cost_guard import CostProjection
 from stel.execution.contracts import RunError
@@ -245,6 +246,36 @@ def test_an_unpriced_model_is_named_and_does_not_stop_the_run(
         "cost guard: no priced history in stel_run_log for document_embeddings"
         in caplog.text
     )
+
+
+def test_an_unreadable_run_log_refuses_rather_than_projecting_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable history is not absent history. Pricing nothing would project
+    $0 and start a run configured to stop above its threshold (Codex review
+    on #695); `stel plan` keeps reporting, since it spends nothing."""
+    project = _project(tmp_path)
+    _change_embedding_model(project)
+    provider = _Provider(monkeypatch)
+
+    def unreadable(*args: Any, **kwargs: Any) -> dict[str, float]:
+        raise AdapterError("permission denied on dataset docs")
+
+    monkeypatch.setattr("stel.plan._cost_per_provider_row", unreadable)
+
+    with pytest.raises(RunError) as refused:
+        run_project(project)
+    assert provider.texts == []
+    message = str(refused.value)
+    assert "run log stel_run_log could not be read" in message
+    assert "[AdapterError]" in message
+    assert "permission denied" not in message
+
+    (embed,) = plan_project(project, select="document_embeddings").models
+    assert embed.estimated_cost_usd is None
+
+    results = run_project(project, accept_cost=True)
+    assert all(not result.errors for result in results)
 
 
 def test_a_threshold_without_a_run_log_is_rejected_before_the_warehouse(

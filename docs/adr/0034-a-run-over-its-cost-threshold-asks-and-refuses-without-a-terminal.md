@@ -64,6 +64,10 @@ It lost because a target that never set `pricing:` would then refuse every
 reprocess forever. That forces `pricing:` as a side effect of a threshold,
 and the threshold has no way to say so. The warning names the unpriced
 models, and the run budget's `max_cost_usd` is the cap that covers them.
+A run log that cannot be read is not the same case and does refuse. Pricing
+nothing would project $0 and start the run the threshold exists to stop
+(Codex review on #695). `stel plan` still reports in that case, since it
+spends nothing.
 
 ### Bound the run instead: lower `max_cost_usd`
 

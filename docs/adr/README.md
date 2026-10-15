@@ -43,6 +43,7 @@ history (issue #311).
 | [0031](0031-a-concept-cloud-reaches-the-source-through-a-loopback-server.md) | A concept cloud reaches the source through a loopback server serving the artifact same-origin, not a token baked into it | accepted |
 | [0032](0032-a-served-indexs-age-is-the-activation-it-serves.md) | A served index is dated by the activation of the generation it serves, read from the ledger per request, not by the latest run artifact | accepted |
 | [0033](0033-an-embedding-is-cached-locally-by-text-and-a-plan-is-priced-from-history.md) | Every embedding a provider returns is cached locally by text and configuration before its window publishes; `stel plan` prices rows from the run log's cost per provider row | accepted |
+| [0034](0034-a-run-over-its-cost-threshold-asks-and-refuses-without-a-terminal.md) | A run whose projected provider cost is over the target's `confirm_cost_above_usd` asks at a terminal and refuses without one; `--full-refresh` and `--accept-reprocess` do not release it | accepted |
 
 ## When to write one
 

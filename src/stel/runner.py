@@ -40,6 +40,12 @@ from .config.model import (
 from .config.profile import WarehouseConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
+from .cost_guard import (
+    CostConfirmation,
+    format_cost_refusal,
+    full_refresh_rows,
+    project_cost,
+)
 from .dag import NodeKind, ProjectDAG, is_dbt_ref
 from .execution import ModelRunResult as ModelRunResult
 from .execution import RunError as RunError
@@ -57,7 +63,7 @@ from .execution import usage as _usage_execution
 from .logging_setup import REPORTER_ECHO_EXTRA
 from .manifest import compute_modified_models
 from .paths import resolve_within_project
-from .plan import plan_models
+from .plan import ModelPlan, plan_models, price_plans, run_log_relation
 from .profile import (
     ResolvedProfile,
     apply_source_path_overrides,
@@ -142,6 +148,8 @@ def run_project(
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
     accept_reprocess: bool = False,
+    accept_cost: bool = False,
+    confirm_cost: CostConfirmation | None = None,
 ) -> list[ModelRunResult]:
     _reject_conflicting_reprocess_flags(
         full_refresh=full_refresh, reprocess_all=reprocess_all
@@ -282,7 +290,7 @@ def run_project(
     started_at = datetime.now(UTC).isoformat()
     with adapter:
         log.info("connected to %s warehouse", resolved.warehouse.type)
-        _enforce_reprocess_guard(
+        _enforce_spend_guards(
             selected,
             models_by_name=models_by_name,
             dag=dag,
@@ -293,6 +301,8 @@ def run_project(
             full_refresh=full_refresh,
             reprocess_all=reprocess_all,
             accept_reprocess=accept_reprocess,
+            accept_cost=accept_cost,
+            confirm_cost=confirm_cost,
         )
         if threads > 1 and len(selected) > 1:
             results_by_name = _run_in_batches(dag, selected, adapter, _run, threads)
@@ -339,6 +349,8 @@ def build_project(
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
     accept_reprocess: bool = False,
+    accept_cost: bool = False,
+    confirm_cost: CostConfirmation | None = None,
 ) -> BuildResult:
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
@@ -469,7 +481,7 @@ def build_project(
     started_at = datetime.now(UTC).isoformat()
     with adapter:
         log.info("connected to %s warehouse", resolved.warehouse.type)
-        _enforce_reprocess_guard(
+        _enforce_spend_guards(
             selected,
             models_by_name=models_by_name,
             dag=dag,
@@ -480,6 +492,8 @@ def build_project(
             full_refresh=full_refresh,
             reprocess_all=reprocess_all,
             accept_reprocess=accept_reprocess,
+            accept_cost=accept_cost,
+            confirm_cost=confirm_cost,
         )
         for name in selected:
             model = models_by_name[name]
@@ -836,6 +850,52 @@ def _run_budget_ledger(resolved: ResolvedProfile) -> BudgetLedger | None:
     return BudgetLedger(resolved.llm.budget, scope="run")
 
 
+def _enforce_spend_guards(
+    selected: list[str],
+    *,
+    models_by_name: Mapping[str, ModelConfig],
+    dag: ProjectDAG,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool,
+    reprocess_all: bool,
+    accept_reprocess: bool,
+    accept_cost: bool,
+    confirm_cost: CostConfirmation | None,
+) -> None:
+    """Both pre-run guards, in order: rows (issue #530), then dollars (issue
+    #586). The cost guard reuses the reprocess guard's plan when it made one,
+    so a selection under both guards pays for one plan."""
+    plans = _enforce_reprocess_guard(
+        selected,
+        models_by_name=models_by_name,
+        dag=dag,
+        project=project,
+        project_dir=project_dir,
+        adapter=adapter,
+        resolved=resolved,
+        full_refresh=full_refresh,
+        reprocess_all=reprocess_all,
+        accept_reprocess=accept_reprocess,
+    )
+    _enforce_cost_guard(
+        selected,
+        plans=plans,
+        models_by_name=models_by_name,
+        dag=dag,
+        project=project,
+        project_dir=project_dir,
+        adapter=adapter,
+        resolved=resolved,
+        full_refresh=full_refresh,
+        reprocess_all=reprocess_all,
+        accept_cost=accept_cost,
+        confirm_cost=confirm_cost,
+    )
+
+
 def _enforce_reprocess_guard(
     selected: list[str],
     *,
@@ -848,9 +908,10 @@ def _enforce_reprocess_guard(
     full_refresh: bool,
     reprocess_all: bool,
     accept_reprocess: bool,
-) -> None:
+) -> list[ModelPlan] | None:
     """Stop before the first model runs if a paid model would reprocess
-    published rows it was not told to (issue #530).
+    published rows it was not told to (issue #530). Returns the plan when it
+    made one.
 
     `--full-refresh` and `--accept-reprocess` are the operator saying so.
     Otherwise the whole selection is planned -- every model, because the
@@ -870,7 +931,7 @@ def _enforce_reprocess_guard(
     announcing the reprocess does not make it free, and it stays guarded.
     `--accept-reprocess` remains the way to say yes to that one."""
     if full_refresh or accept_reprocess:
-        return
+        return None
     planned = [models_by_name[name] for name in selected]
     guarded = [
         model
@@ -883,7 +944,7 @@ def _enforce_reprocess_guard(
         or (model.llm is not None and model.llm.on_code_change == "fail")
     ]
     if not guarded:
-        return
+        return None
     plans = plan_models(
         planned,
         dag=dag,
@@ -900,6 +961,76 @@ def _enforce_reprocess_guard(
         "reprocess guard: %d guarded model(s) within their reprocess_limit",
         len(guarded),
     )
+    return plans
+
+
+def _enforce_cost_guard(
+    selected: list[str],
+    *,
+    plans: list[ModelPlan] | None,
+    models_by_name: Mapping[str, ModelConfig],
+    dag: ProjectDAG,
+    project: ProjectConfig,
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    resolved: ResolvedProfile,
+    full_refresh: bool,
+    reprocess_all: bool,
+    accept_cost: bool,
+    confirm_cost: CostConfirmation | None,
+) -> None:
+    """Stop before the first model runs if the projected provider cost is over
+    the target's `confirm_cost_above_usd` and nobody said yes (issue #586).
+
+    `--accept-cost` is yes in advance. Otherwise `confirm_cost` asks, and a
+    run with no one to ask refuses. `--full-refresh` and `--accept-reprocess`
+    release the reprocess guard but not this one: they accept a reprocess,
+    and this is the question of what that reprocess costs."""
+    threshold = resolved.confirm_cost_above_usd
+    if threshold is None or accept_cost:
+        return
+    source = run_log_relation(resolved)
+    if source is None:
+        # Profile validation requires an enabled run log beside a threshold;
+        # a profile built some other way still must not skip the question.
+        raise RunError(
+            "confirm_cost_above_usd is set but this target has no enabled "
+            "run_log to price the run from"
+        )
+    if plans is None:
+        plans = plan_models(
+            [models_by_name[name] for name in selected],
+            dag=dag,
+            project=project,
+            project_dir=project_dir,
+            adapter=adapter,
+            resolved=resolved,
+            reprocess_all=reprocess_all,
+        )
+    if full_refresh:
+        plans = full_refresh_rows(plans)
+    projection = project_cost(
+        price_plans(
+            plans, adapter=adapter, relation=source, reprocess_all=reprocess_all
+        ),
+        threshold_usd=threshold,
+        source=source,
+    )
+    if projection.unpriced:
+        log.warning(
+            "cost guard: no priced history in %s for %s; the projection leaves "
+            "them out",
+            source,
+            ", ".join(projection.unpriced),
+        )
+    if not projection.exceeds_threshold:
+        log.info("cost guard: %s", projection.describe()[0])
+        return
+    if confirm_cost is None:
+        raise RunError(format_cost_refusal(projection, declined=False))
+    if not confirm_cost(projection):
+        raise RunError(format_cost_refusal(projection, declined=True))
+    log.info("cost guard: confirmed. %s", projection.describe()[0])
 
 
 def _single_data_parent(model_name: str, dag: ProjectDAG) -> str | None:

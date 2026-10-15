@@ -568,8 +568,12 @@ def parse_concept_cloud_export(data: dict[str, Any]) -> ConceptCloudExport:
 def placeholder_export() -> ConceptCloudExport:
     """A small, valid bundle for artifact development and tests. It mirrors the
     invoice example: a two-node dbt plane, three vendor concepts, one
-    co-occurrence edge, and one cross-layer link."""
-    return ConceptCloudExport(
+    co-occurrence edge, and one cross-layer link, with the built-in lenses
+    every exported bundle carries (issue #345)."""
+    # Imported here because `lenses` builds on this module's models.
+    from .lenses import with_built_in_lenses
+
+    bare = ConceptCloudExport(
         generated_at="2026-08-04T00:00:00Z",
         project="invoice_pipeline",
         dag_plane=DagPlane(
@@ -645,3 +649,9 @@ def placeholder_export() -> ConceptCloudExport:
             ),
         ),
     )
+    concepts, dimensions, unavailable = with_built_in_lenses(bare.concepts, bare.dimensions)
+    return bare.model_copy(update={
+        "concepts": concepts,
+        "dimensions": dimensions,
+        "unavailable_dimensions": unavailable,
+    })

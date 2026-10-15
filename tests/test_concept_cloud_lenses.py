@@ -7,15 +7,20 @@ counts that let the caption say what the export left out.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import polars as pl
 import pytest
 
 from stel.concept_cloud import (
     Concept,
+    ConceptCloudExport,
     ConceptCloudExportError,
     DagPlane,
     Provenance,
     build_concept_cloud,
+    demo_export,
+    placeholder_export,
 )
 from stel.concept_cloud.lenses import (
     DOCUMENTS,
@@ -167,6 +172,19 @@ def test_an_export_carries_the_lenses_after_its_declared_dimensions() -> None:
         "tone": "positive", MENTIONS: "2–9", DOCUMENTS: "2–9",
         LINK_STATUS: "matched",
     }
+
+
+@pytest.mark.parametrize("bundle", [demo_export, placeholder_export])
+def test_the_built_in_bundles_carry_the_lenses(bundle: Callable[[], ConceptCloudExport]) -> None:
+    """`--demo` and `--placeholder` are how the docs say to try the viewer, so
+    a lens every export carries has to be on them too (Codex on #692)."""
+    export = bundle()
+    names = {d.name for d in export.dimensions} | {
+        u.name for u in export.unavailable_dimensions
+    }
+
+    assert {MENTIONS, DOCUMENTS, LINK_STATUS, LINK_SCORE} <= names
+    assert all(MENTIONS in c.dimensions for c in export.concepts)
 
 
 def test_a_declared_dimension_may_not_take_a_lens_name() -> None:

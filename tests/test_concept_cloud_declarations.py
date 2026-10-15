@@ -160,7 +160,7 @@ def test_bundle_round_trips_through_the_versioned_contract() -> None:
 
     parsed = parse_concept_cloud_export(bundle)
 
-    assert parsed.schema_version == CONCEPT_CLOUD_SCHEMA_VERSION == "6"
+    assert parsed.schema_version == CONCEPT_CLOUD_SCHEMA_VERSION == "7"
     assert _concept(parsed, "Federal Reserve").entity_class == "institution"
 
 

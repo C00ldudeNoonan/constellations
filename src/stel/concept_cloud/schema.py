@@ -34,7 +34,10 @@ from pydantic import (
 # v6 (issue #555 item 7): `source_access` names the governed context model a
 # concept's sentences are fetched from at view time. The bundle carries the
 # model's *name* and never a sentence — see `SourceAccess`.
-CONCEPT_CLOUD_SCHEMA_VERSION = "6"
+# v7 (issue #345): built-in lenses as `derived` dimensions, `ordinal` on a
+# dimension, `unavailable_dimensions` naming a lens the corpus cannot fill and
+# why, and `coverage` counting what the export left out.
+CONCEPT_CLOUD_SCHEMA_VERSION = "7"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -152,12 +155,18 @@ class DimensionDef(_Frozen):
     `source` records where the values came from: `query_log` dimensions are
     aggregates derived from the MCP query log (retrieval heat — never query
     text or principals); `column` dimensions are concept-keyed categorical
-    columns from the pipeline, e.g. an `llm:` enum field."""
+    columns from the pipeline, e.g. an `llm:` enum field; `derived` dimensions
+    are the built-in lenses, banded from fields every concept already carries.
+
+    `ordinal` says the values are ordered low to high, so the viewer colors
+    them along one ramp by position in `values` rather than as unrelated
+    categories."""
 
     name: str
     values: tuple[str, ...]
-    source: Literal["query_log", "column"]
+    source: Literal["query_log", "column", "derived"]
     description: str | None = None
+    ordinal: bool = False
 
     @field_validator("name")
     @classmethod
@@ -202,6 +211,36 @@ class BreakdownDef(_Frozen):
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("breakdown values must be unique")
         return cleaned
+
+
+class UnavailableDimension(_Frozen):
+    """A built-in lens this corpus cannot fill, and why (issue #345).
+
+    Offered rather than drawn: a lens with no data would paint every concept
+    the same band, which reads as "these are all equal" when the truth is
+    "this was never measured" -- `match_score` on an alias-table corpus, say,
+    where it is null by design."""
+
+    name: str
+    reason: str
+
+    @field_validator("name", "reason")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        return _require_non_empty(value)
+
+
+class Coverage(_Frozen):
+    """What the export left out, counted so a caption can say so (issue #345).
+
+    "200 concepts" and "200 of 4,318 concepts" are different claims about a
+    corpus, and only the second is true of a capped export."""
+
+    # Distinct canonical ids the linking rows produced, before any top-N cap.
+    concepts_total: int = Field(ge=0)
+    # Mentions entity linking left unmatched: they have no canonical id, so
+    # there is no node to draw them as.
+    unmatched_mentions: int = Field(ge=0)
 
 
 class SourceAccess(_Frozen):
@@ -362,7 +401,7 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["6"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["7"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane
@@ -384,6 +423,12 @@ class ConceptCloudExport(_Frozen):
     # view time (issue #555 item 7). None means the artifact has no
     # reach-the-source affordance at all, which is the default.
     source_access: SourceAccess | None = None
+    # Built-in lenses the corpus cannot fill (issue #345); the picker lists
+    # them as unavailable, with the reason, instead of drawing them.
+    unavailable_dimensions: tuple[UnavailableDimension, ...] = ()
+    # None when the bundle was not built from linking rows (a fixture, the
+    # demo), so there is nothing it could honestly count.
+    coverage: Coverage | None = None
 
     @field_validator("generated_at", "project")
     @classmethod
@@ -398,6 +443,17 @@ class ConceptCloudExport(_Frozen):
         dimension_defs = {dim.name: set(dim.values) for dim in self.dimensions}
         if len(dimension_defs) != len(self.dimensions):
             raise ValueError("dimension names must be unique")
+        unavailable = [u.name for u in self.unavailable_dimensions]
+        if len(set(unavailable)) != len(unavailable):
+            raise ValueError("unavailable dimension names must be unique")
+        both = sorted(set(unavailable) & set(dimension_defs))
+        if both:
+            raise ValueError(f"dimension(s) {both} are both declared and unavailable")
+        if self.coverage is not None and self.coverage.concepts_total < len(self.concepts):
+            raise ValueError(
+                f"coverage counts {self.coverage.concepts_total} concepts in total, "
+                f"fewer than the {len(self.concepts)} the bundle carries"
+            )
         for concept in self.concepts:
             for name, value in concept.dimensions.items():
                 allowed = dimension_defs.get(name)

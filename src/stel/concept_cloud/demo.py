@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import cast
 
+from .lenses import with_built_in_lenses
 from .schema import (
     BreakdownDef,
     Concept,
@@ -241,7 +242,13 @@ def demo_export() -> ConceptCloudExport:
     id_by_display = {d: _canonical_id(d, lbl) for d, lbl, _, _ in _CONCEPTS}
     documents_of = {d: max(1, freq // 3) for d, _, freq, _ in _CONCEPTS}
 
-    concepts = tuple(
+    retrieval = DimensionDef(
+        name="retrieval",
+        values=("hot", "warm", "cold", "never"),
+        source="query_log",
+        description="How often agents' queries returned this concept's chunks",
+    )
+    declared = tuple(
         Concept(
             canonical_id=id_by_display[display],
             display=display,
@@ -260,6 +267,7 @@ def demo_export() -> ConceptCloudExport:
         )
         for display, label, freq, status in _CONCEPTS
     )
+    concepts, dimensions, unavailable = with_built_in_lenses(declared, (retrieval,))
 
     edges = [
         ConceptEdge(
@@ -298,13 +306,7 @@ def demo_export() -> ConceptCloudExport:
         concepts=concepts,
         concept_edges=tuple(edges),
         cross_layer_edges=cross_layer_edges,
-        dimensions=(
-            DimensionDef(
-                name="retrieval",
-                values=("hot", "warm", "cold", "never"),
-                source="query_log",
-                description="How often agents' queries returned this concept's chunks",
-            ),
-        ),
+        dimensions=dimensions,
         breakdowns=(BreakdownDef(name="section", values=_DEMO_SECTIONS),),
+        unavailable_dimensions=unavailable,
     )

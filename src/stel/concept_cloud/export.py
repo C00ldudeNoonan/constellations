@@ -28,12 +28,14 @@ import polars as pl
 from ..config import load_project
 from ..config.vocabulary import Vocabulary, declared_terms
 from ..manifest import MANIFEST_FILENAME, write_manifest
+from .lenses import LENS_NAMES, with_built_in_lenses
 from .schema import (
     BreakdownDef,
     Concept,
     ConceptCloudExport,
     ConceptEdge,
     ConceptEdgeMethod,
+    Coverage,
     CrossLayerEdge,
     DagEdge,
     DagNode,
@@ -171,7 +173,13 @@ def build_concept_cloud(
     `context_model` names the governed context model a reader's "show me a
     sentence" click searches (issue #555 item 7). Only the name is carried;
     see `SourceAccess` for why it is not verified here.
+
+    Every bundle also carries the built-in lenses (issue #345; see `lenses`)
+    after the declared dimensions, and a `Coverage` count of the concepts the
+    top-N cap left out and the mentions linking left unmatched.
     """
+    for name in dimension_columns or {}:
+        _check_dimension_name(name)
     generated_at = generated_at or datetime.now(UTC).isoformat()
     node_ids = {node.id for node in dag_plane.nodes}
 
@@ -222,6 +230,8 @@ def build_concept_cloud(
             c.model_copy(update={"dimensions": values_by_concept.get(c.canonical_id, {})})
             for c in concepts
         ]
+    lensed, all_dimensions, unavailable = with_built_in_lenses(concepts, dimension_defs)
+    concepts = list(lensed)
     breakdown_defs: list[BreakdownDef] = []
     counts_by_concept: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
     linked = _linked_rows(links, statuses) if breakdown_columns else links
@@ -253,12 +263,25 @@ def build_concept_cloud(
         concepts=tuple(concepts),
         concept_edges=concept_edges,
         cross_layer_edges=cross_layer_edges,
-        dimensions=tuple(dimension_defs),
+        dimensions=all_dimensions,
         periods=periods,
         breakdowns=tuple(breakdown_defs),
         source_access=(
             SourceAccess(model=context_model) if context_model else None
         ),
+        unavailable_dimensions=unavailable,
+        coverage=_coverage(links, statuses),
+    )
+
+
+def _coverage(links: pl.DataFrame, statuses: tuple[str, ...]) -> Coverage:
+    """Count what the cloud cannot show: concepts beyond the top-N cap, and
+    mentions with no canonical id. An unmatched mention is one row with a null
+    canonical id, so distinct mention ids count it once."""
+    unmatched = links.filter(pl.col("canonical_id").is_null())
+    return Coverage(
+        concepts_total=_linked_rows(links, statuses)["canonical_id"].n_unique(),
+        unmatched_mentions=unmatched["mention_id"].n_unique(),
     )
 
 
@@ -1101,8 +1124,20 @@ def export_concept_cloud(
     )
 
 
+def _check_dimension_name(name: str) -> None:
+    if name in LENS_NAMES:
+        raise ConceptCloudExportError(
+            f"dimension '{name}' is the name of a built-in lens; every bundle "
+            f"already carries {', '.join(repr(n) for n in LENS_NAMES)}, so "
+            "declare it under another name"
+        )
+
+
 def _model_column(kind: str, name: str, spec: str) -> tuple[str, str]:
-    """Split a `model.column` spec, refusing one with either half missing."""
+    """Split a `model.column` spec, refusing one with either half missing, and
+    a dimension named like a built-in lens."""
+    if kind == "dimension":
+        _check_dimension_name(name)
     model_name, _, value_column = spec.partition(".")
     if not model_name or not value_column:
         raise ConceptCloudExportError(

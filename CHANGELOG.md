@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### The star map gets built-in lenses, and its caption counts what it left out (issue #345)
+
+- **Four lenses on every export**: `mentions`, `documents`, `link status`
+  and `link score`, after the declared dimensions in the color-by picker.
+  They come from fields every concept already carries, so they need no flag
+  and add no warehouse read. What they show is where they disagree: a concept
+  named in a thousand documents and never linked confidently.
+- **Fixed bands, never per-corpus quantiles**, so a color means the same
+  count on every corpus and every export. Ordered lenses share one blue
+  ramp that gets lighter as the value rises.
+- **A lens the corpus cannot fill is unavailable, with the reason**, rather
+  than drawn as one band: `link score` on an alias-table corpus, `documents`
+  when the linking rows have no `document_id`.
+- **The caption counts truncation**: "200 of 4,318 concepts" under a
+  `--top-n` cap, and how many unmatched mentions have no node.
+- Bundle schema v7: `derived` dimension source, `ordinal` on a dimension,
+  `unavailable_dimensions`, and `coverage`. A v6 bundle is refused. The lens
+  names are reserved: `--dimension mentions=...` is refused before anything
+  is read.
+- **Fix: a legend value is text, not markup.** The legend put each
+  dimension value into its HTML unescaped, and a `--dimension` value is
+  warehouse text, so a value like `<img onerror=...>` ran in every copy of a
+  shared artifact.
+
 ### A publish says how far its vector index has been extended past its training (issue #683)
 
 - **Drift exposure is recorded, not guessed.** Since #651 an incremental

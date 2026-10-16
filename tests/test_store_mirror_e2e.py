@@ -128,7 +128,12 @@ def test_a_fresh_host_restores_and_carries_on_without_re_embedding(tmp_path: Pat
         assert metadata is not None
         assert metadata.physical_generation == served
         hits = store.vector_search(
-            _COLLECTION, [1.0, 0.0], vector_field="embedding", limit=1, columns=["chunk_id"]
+            _COLLECTION,
+            [1.0, 0.0],
+            vector_field="embedding",
+            metric="cosine",
+            limit=1,
+            columns=["chunk_id"],
         )
         assert hits.column("chunk_id").to_pylist() == ["c1"]
 

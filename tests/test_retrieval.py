@@ -185,6 +185,7 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
             metadata.physical_name,
             [1.0, 0.0],
             vector_field="embedding",
+            metric="cosine",
             limit=1,
             columns=["chunk_id", "text", "_distance"],
             predicates=[RetrievalPredicate("category", RetrievalPredicateOperator.EQUAL, "prices")],
@@ -223,6 +224,7 @@ def test_lancedb_incremental_publication_and_queries(tmp_path: Path) -> None:
             updated.physical_name,
             [0.5, 0.5],
             vector_field="embedding",
+            metric="cosine",
             limit=10,
             columns=["chunk_id"],
         )
@@ -1123,6 +1125,7 @@ def test_every_declared_attribute_type_round_trips_a_filter(tmp_path: Path) -> N
                 metadata.physical_name,
                 [1.0, 0.0],
                 vector_field="embedding",
+                metric="cosine",
                 limit=10,
                 columns=["chunk_id"],
                 predicates=[RetrievalPredicate(field, operator, value)],

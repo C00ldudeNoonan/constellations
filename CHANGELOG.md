@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Vector search ranks by the metric the model declares (issue #700)
+
+- **`search.vector.metric` now reaches every query.** Under `search: exact`,
+  the default, it never did. **LanceDB ranked by L2** for every metric,
+  because the query named no distance and only an index carries one.
+  **DuckDB ranked by cosine** for every metric, because it read the metric
+  from a descriptor key the stored descriptor never had. The reported
+  `_distance` was computed under the same wrong metric. On DuckDB under
+  `approximate`, a `euclidean` or `dot` HNSW index also could not serve a
+  query that asked for cosine.
+- **Upgrading:** rankings change only where they were wrong, for vectors
+  that are not unit-norm or a declared `dot`/`euclidean`. On unit-norm
+  vectors cosine and L2 rank identically, so a cosine model over a
+  normalizing embedder (Vertex, OpenAI) is unaffected. No republish is
+  needed; the fix is in the query, not the collection.
+- `RetrievalStore.vector_search` takes a required `metric`. A third-party
+  store must rank by it.
+
 ### A misnamed grants relation is a configuration error, not "no grants" (issue #698)
 
 - **A schema-qualified `--grants-relation` is refused at startup.** The

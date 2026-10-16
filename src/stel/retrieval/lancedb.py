@@ -26,6 +26,7 @@ from ..optional_dependencies import (
 from .base import (
     CollectionMetadata,
     CollectionSpec,
+    DistanceMetric,
     IndexedRow,
     MirrorCopy,
     MutationOutcome,
@@ -1513,11 +1514,7 @@ class LanceDBStore(RetrievalStore):
                                 "or ivf_hnsw_flat until the collection is larger "
                                 "(code=lancedb_pq_corpus_too_small)"
                             )
-                        metric = (
-                            "l2"
-                            if spec.distance_metric == "euclidean"
-                            else spec.distance_metric
-                        )
+                        metric = _lance_distance_type(spec.distance_metric)
                         config_class = getattr(index_module, _VECTOR_INDEX_CONFIGS[chosen])
                         step = f"{wanted} vector index for '{spec.vector_field}'"
                         self._build_index(
@@ -1596,6 +1593,7 @@ class LanceDBStore(RetrievalStore):
         vector: Sequence[float],
         *,
         vector_field: str,
+        metric: DistanceMetric,
         limit: int,
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
@@ -1616,7 +1614,13 @@ class LanceDBStore(RetrievalStore):
                 or any(not isfinite(float(item)) for item in vector)
             ):
                 raise RetrievalError("LanceDB vector query is invalid")
-            query = table.search(list(vector), vector_column_name=vector_field)
+            # Named on every query, not left to the index: under `exact` there
+            # is no index, and LanceDB's default is L2 (issue #700). With an
+            # index built under the same metric, naming it still uses the
+            # index -- verified against ivf_pq and ivf_hnsw_sq on 0.34.
+            query = table.search(
+                list(vector), vector_column_name=vector_field
+            ).distance_type(_lance_distance_type(metric))
             where = _compile_predicates(predicates)
             if where is not None:
                 # Prefilter, so the scan is restricted *before* the search
@@ -1815,6 +1819,15 @@ def _validate_query_projection(columns: Sequence[str] | None) -> None:
         not columns or any(not _COLLECTION_RE.fullmatch(column) for column in columns)
     ):
         raise RetrievalError("LanceDB query projection is invalid")
+
+
+def _lance_distance_type(metric: str | None) -> str | None:
+    """A declared `search.vector.metric` in LanceDB's vocabulary.
+
+    One mapping for the index build and the query, so the two cannot name
+    different distances for the same collection (issue #700).
+    """
+    return "l2" if metric == "euclidean" else metric
 
 
 def _include_score_column(columns: Sequence[str], score_column: str) -> list[str]:

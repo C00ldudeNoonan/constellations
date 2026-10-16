@@ -151,6 +151,7 @@ def _search(store: Any, *, predicates: tuple[RetrievalPredicate, ...] = (), **ex
         COLLECTION,
         _query_vector(),
         vector_field="embedding",
+        metric="cosine",
         limit=10,
         columns=["id", "symbol"],
         predicates=predicates,
@@ -246,6 +247,9 @@ class _RecordingQuery:
         self.calls.append((name, value))
         return self
 
+    def distance_type(self, distance_type: str) -> _RecordingQuery:
+        return self._record("distance_type", distance_type)
+
     def where(self, where: str, prefilter: bool = False) -> _RecordingQuery:
         return self._record("where", (where, prefilter))
 
@@ -275,7 +279,15 @@ def test_nprobes_and_refine_factor_reach_the_query(store: Any, monkeypatch: Any)
     measured at."""
     from lancedb.query import LanceVectorQueryBuilder
 
-    for name in ("where", "refine_factor", "nprobes", "select", "limit", "to_arrow"):
+    for name in (
+        "distance_type",
+        "where",
+        "refine_factor",
+        "nprobes",
+        "select",
+        "limit",
+        "to_arrow",
+    ):
         assert callable(getattr(LanceVectorQueryBuilder, name)), name
 
     real_table = store._open_owned_table(COLLECTION)
@@ -300,4 +312,8 @@ def test_nprobes_and_refine_factor_reach_the_query(store: Any, monkeypatch: Any)
     assert ("nprobes", 100) in tuned.calls
     assert ("refine_factor", 30) in tuned.calls
     assert tuned.calls[-1] == ("limit", 10)
-    assert [name for name, _ in plain.calls] == ["select", "limit"]
+    assert [name for name, _ in plain.calls] == ["distance_type", "select", "limit"]
+    # The declared metric is named on every query, tuned or not: under
+    # `exact` there is no index to supply it, and LanceDB's default is L2
+    # (issue #700).
+    assert tuned.calls[0] == plain.calls[0] == ("distance_type", "cosine")

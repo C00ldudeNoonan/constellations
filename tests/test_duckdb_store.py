@@ -188,7 +188,7 @@ def test_vector_search_ranks_by_distance(store: DuckDBStore) -> None:
         name = _populate(store)
 
         table = store.vector_search(
-            name, [1.0, 0.0, 0.0], vector_field="embedding", limit=2
+            name, [1.0, 0.0, 0.0], vector_field="embedding", metric="cosine", limit=2
         )
 
         assert table.column("id").to_pylist()[0] == "a"
@@ -232,6 +232,7 @@ def test_scalar_policy_predicate_filters_both_legs(store: DuckDBStore) -> None:
             name,
             [1.0, 0.0, 0.0],
             vector_field="embedding",
+            metric="cosine",
             limit=5,
             predicates=[predicate],
         )
@@ -253,6 +254,7 @@ def test_array_containment_predicate_filters_by_overlap(store: DuckDBStore) -> N
             name,
             [0.0, 0.0, 1.0],
             vector_field="embedding",
+            metric="cosine",
             limit=5,
             predicates=[predicate],
         )
@@ -304,7 +306,7 @@ def test_exact_vector_search_needs_no_index_and_still_ranks(
         name = _populate(store, vector_search="exact")
 
         table = store.vector_search(
-            name, [0.0, 1.0, 0.0], vector_field="embedding", limit=1
+            name, [0.0, 1.0, 0.0], vector_field="embedding", metric="cosine", limit=1
         )
 
         assert table.column("id").to_pylist() == ["b"]
@@ -469,6 +471,7 @@ def test_error_text_never_carries_the_database_path(tmp_path: Path) -> None:
                 name,
                 [1.0, 0.0, 0.0],
                 vector_field="embedding",
+                metric="cosine",
                 limit=1,
                 predicates=[
                     RetrievalPredicate(

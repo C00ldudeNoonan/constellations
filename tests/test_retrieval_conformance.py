@@ -28,6 +28,7 @@ import pytest
 from stel.retrieval import StoreRole
 from stel.retrieval.base import (
     CollectionSpec,
+    DistanceMetric,
     IndexedRow,
     RetrievalError,
     RetrievalFeature,
@@ -36,7 +37,9 @@ from stel.retrieval.base import (
     RetrievalStore,
 )
 from stel.retrieval.duckdb import DuckDBConfig, DuckDBStore
+from stel.retrieval.evolution import descriptor_json
 from stel.retrieval.lancedb import LanceDBConfig, LanceDBStore
+from stel.retrieval.registry import collection_descriptor
 
 SCHEMA = pa.schema(
     [
@@ -311,17 +314,82 @@ def test_vector_search_orders_by_similarity(store: RetrievalStore) -> None:
     name = _populate(store)
 
     table = store.vector_search(
-        name, [1.0, 0.0, 0.0], vector_field="embedding", limit=3
+        name, [1.0, 0.0, 0.0], vector_field="embedding", metric="cosine", limit=3
     )
 
     assert _ids(table)[0] == "a"
+
+
+# Unnormalized on purpose: on unit vectors cosine and L2 rank identically, and
+# every other vector in this suite is a unit vector, which is how a store
+# ranking by the wrong metric went unnoticed (issue #700). Against [1, 0, 0]
+# the three metrics give three different full orders.
+_METRIC_ROWS = (
+    ("y", [0.2, 0.0, 0.0]),  # cosine 1.000   L2 0.80   dot  0.2
+    ("w", [1.0, 0.6, 0.0]),  # cosine 0.857   L2 0.60   dot  1.0
+    ("x", [10.0, 3.0, 0.0]),  # cosine 0.958   L2 9.49   dot 10.0
+)
+_METRIC_ORDER: dict[DistanceMetric, list[str]] = {
+    "cosine": ["y", "x", "w"],
+    "euclidean": ["w", "y", "x"],
+    "dot": ["x", "w", "y"],
+}
+
+
+@pytest.mark.parametrize("metric", sorted(_METRIC_ORDER))
+def test_exact_vector_search_ranks_by_the_declared_metric(
+    store: RetrievalStore, metric: DistanceMetric
+) -> None:
+    """`search: exact` is the absence of an index, so nothing but the query can
+    carry the metric (issue #700). LanceDB fell back to L2 for every metric,
+    and DuckDB read a descriptor key the real descriptor never had and fell
+    back to cosine. The descriptor here is built by the real builder for
+    that reason: the hand-written one the fixtures used had the key."""
+    name = store.physical_collection("metric")
+    descriptor = descriptor_json(
+        collection_descriptor(
+            {"vector": {"field": "embedding", "dimensions": 3, "metric": metric}},
+            store_type=store.store_type(),
+        )
+    )
+    spec = replace(
+        _spec(store, name), distance_metric=metric, descriptor=descriptor
+    )
+    store.create_collection(spec)
+    store.upsert(
+        name,
+        [
+            IndexedRow(
+                row_id,
+                {
+                    "id": row_id,
+                    "body": row_id,
+                    "tenant_id": "acme",
+                    "rank": 1,
+                    "access_groups": [],
+                    "embedding": vector,
+                },
+                f"fp-{row_id}",
+            )
+            for row_id, vector in _METRIC_ROWS
+        ],
+        id_field="id",
+        mutation_digest="metric",
+    )
+    store.ensure_indexes(spec)
+
+    table = store.vector_search(
+        name, [1.0, 0.0, 0.0], vector_field="embedding", metric=metric, limit=3
+    )
+
+    assert _ids(table) == _METRIC_ORDER[metric]
 
 
 def test_vector_search_honors_the_limit(store: RetrievalStore) -> None:
     name = _populate(store)
 
     table = store.vector_search(
-        name, [1.0, 0.0, 0.0], vector_field="embedding", limit=1
+        name, [1.0, 0.0, 0.0], vector_field="embedding", metric="cosine", limit=1
     )
 
     assert table.num_rows == 1
@@ -331,7 +399,9 @@ def test_vector_search_rejects_a_nonpositive_limit(store: RetrievalStore) -> Non
     name = _populate(store)
 
     with pytest.raises(RetrievalError):
-        store.vector_search(name, [1.0, 0.0, 0.0], vector_field="embedding", limit=0)
+        store.vector_search(
+            name, [1.0, 0.0, 0.0], vector_field="embedding", metric="cosine", limit=0
+        )
 
 
 def test_text_search_matches_terms(store: RetrievalStore) -> None:
@@ -365,6 +435,7 @@ def test_equality_predicate_filters(store: RetrievalStore) -> None:
         name,
         [1.0, 0.0, 0.0],
         vector_field="embedding",
+        metric="cosine",
         limit=5,
         predicates=[
             RetrievalPredicate("tenant_id", RetrievalPredicateOperator.EQUAL, "globex")
@@ -382,6 +453,7 @@ def test_in_predicate_filters(store: RetrievalStore) -> None:
         name,
         [1.0, 0.0, 0.0],
         vector_field="embedding",
+        metric="cosine",
         limit=5,
         predicates=[
             RetrievalPredicate(
@@ -401,6 +473,7 @@ def test_numeric_comparison_predicate_filters(store: RetrievalStore) -> None:
         name,
         [1.0, 0.0, 0.0],
         vector_field="embedding",
+        metric="cosine",
         limit=5,
         predicates=[
             RetrievalPredicate(
@@ -423,6 +496,7 @@ def test_several_predicates_compose_as_conjunction(store: RetrievalStore) -> Non
         name,
         [1.0, 0.0, 0.0],
         vector_field="embedding",
+        metric="cosine",
         limit=5,
         predicates=[
             RetrievalPredicate("tenant_id", RetrievalPredicateOperator.EQUAL, "acme"),
@@ -441,6 +515,7 @@ def test_array_overlap_predicate_filters(store: RetrievalStore) -> None:
         name,
         [0.0, 0.0, 1.0],
         vector_field="embedding",
+        metric="cosine",
         limit=5,
         predicates=[
             RetrievalPredicate(

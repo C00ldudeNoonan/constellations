@@ -48,6 +48,7 @@ from ..optional_dependencies import optional_dependency_version
 from .base import (
     CollectionMetadata,
     CollectionSpec,
+    DistanceMetric,
     IndexedRow,
     MutationOutcome,
     MutationReceipt,
@@ -807,6 +808,7 @@ class DuckDBStore(RetrievalStore):
         vector: Sequence[float],
         *,
         vector_field: str,
+        metric: DistanceMetric,
         limit: int,
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
@@ -824,7 +826,9 @@ class DuckDBStore(RetrievalStore):
         if not _IDENTIFIER_RE.fullmatch(vector_field):
             raise RetrievalError("DuckDB vector field name is invalid")
         conn = self._connection()
-        metric = self._collection_metric(conn, collection)
+        # The declared metric, from the query: the stored-descriptor lookup
+        # this replaces read a key the real descriptor never had, so every
+        # collection ranked by cosine (issue #700).
         function = _DISTANCE_FUNCTIONS[metric]
         literal = _vector_literal(vector)
         projection = _projection(columns, "_distance")
@@ -899,24 +903,6 @@ class DuckDBStore(RetrievalStore):
             f"DuckDB collection '{collection}' has no primary key "
             "(code=duckdb_missing_primary_key)"
         )
-
-    def _collection_metric(self, conn: Any, collection: str) -> str:
-        rows = self._query(
-            conn,
-            "SELECT comment FROM duckdb_tables() "
-            "WHERE schema_name = 'main' AND table_name = ?",
-            parameters=[collection],
-            operation="inspect",
-        )
-        if not rows:
-            raise RetrievalError(f"DuckDB collection '{collection}' does not exist")
-        descriptor = _stamp(rows[0][0]).get(_DESCRIPTOR_KEY)
-        if descriptor:
-            parsed = json.loads(descriptor)
-            metric = parsed.get("distance_metric") if isinstance(parsed, dict) else None
-            if isinstance(metric, str) and metric in _DISTANCE_FUNCTIONS:
-                return metric
-        return "cosine"
 
     def _arrow_schema(self, conn: Any, collection: str) -> pa.Schema:
         try:

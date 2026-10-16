@@ -10,7 +10,7 @@ from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType, TracebackType
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -102,6 +102,12 @@ class RetrievalStoreConfig(BaseModel):
         same question asked of the other config family.
         """
         return "-"
+
+
+# The distances a `search.vector.metric` can name. A query passes the one its
+# model declares; see `RetrievalStore.vector_search` for why the store cannot
+# be left to remember it (issue #700).
+DistanceMetric = Literal["cosine", "euclidean", "dot"]
 
 
 class RetrievalFeature(StrEnum):
@@ -925,13 +931,22 @@ class RetrievalStore(ABC):
         vector: Sequence[float],
         *,
         vector_field: str,
+        metric: DistanceMetric,
         limit: int,
         columns: Sequence[str] | None = None,
         predicates: Sequence[RetrievalPredicate] = (),
         refine_factor: int | None = None,
         nprobes: int | None = None,
     ) -> pa.Table:
-        """Rank rows by distance to `vector`.
+        """Rank rows by distance to `vector`, under `metric`.
+
+        `metric` is required and the store must rank by it. Under
+        `search: exact` there is no index to remember a metric, so the query
+        is the only thing that can carry the one the model declared; left to
+        their own defaults, LanceDB ranked by L2 and DuckDB by cosine
+        whatever the config said (issue #700). The caller has already checked
+        that the collection was published under the same configuration
+        fingerprint, so the declared metric is the collection's metric.
 
         `refine_factor` asks a store that answers from a *compressed* index to
         re-rank its candidates against the stored vectors before returning

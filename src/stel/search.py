@@ -1242,6 +1242,7 @@ def _execute_query(
                 collection,
                 vector,
                 vector_field=search_config.vector.field,
+                metric=search_config.vector.metric,
                 limit=candidate_limit,
                 columns=included_fields,
                 predicates=predicates,

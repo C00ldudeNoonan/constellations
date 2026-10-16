@@ -207,6 +207,21 @@ class WarehouseContextRepository:
         if buffer is not None:
             buffer.close()
 
+    def has_relation(self, relation: str) -> bool:
+        """Whether `relation` is a table in the model namespace, as the operator.
+
+        The same lookup `read_rows` makes before reading, asked on its own: a
+        caller that must tell "no rows" from "no table" cannot get that from
+        `read_rows`, which answers both with nothing (issue #698).
+        """
+        try:
+            with self._session.warehouse(None, identity=OPERATOR_IDENTITY) as adapter:
+                return relation in adapter.list_tables()
+        except AdapterError:
+            raise ContextRepositoryError(
+                "The governed context relation could not be read"
+            ) from None
+
     def read_rows(
         self,
         relation: str,

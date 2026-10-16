@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### A misnamed grants relation is a configuration error, not "no grants" (issue #698)
+
+- **A schema-qualified `--grants-relation` is refused at startup.** The
+  relation is read from the schema the active profile's warehouse names, so a
+  name like `ops.context_grants` (the example `docs/mcp.md` used to show)
+  matched no table there. Every subject then read as having no grants, and
+  every governed model was denied with nothing logged. `mcp serve` now exits 2
+  and says to name the table alone; `stel grants` gives the same message.
+- **A grants relation that does not exist fails as a configuration error**
+  naming the relation, where it used to read as a subject with no grants. A
+  subject with no rows in an existing relation is still denied. Public models
+  do not read grants and are unaffected, except under
+  `--enforce-warehouse-identity`, which looks every caller's identity up in
+  the relation and now refuses rather than falling back to the operator's
+  connection.
+
 ### A run over its cost threshold asks first (issue #586)
 
 - **`confirm_cost_above_usd` on a profile target.** Before the first model

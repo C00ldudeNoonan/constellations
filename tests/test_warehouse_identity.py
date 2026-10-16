@@ -233,7 +233,7 @@ def test_the_grants_relation_itself_is_read_as_the_operator() -> None:
     """Reading grants is what resolves an identity, so it cannot be read under
     one. This is the ordering the whole seam rests on (ADR-0010)."""
     reader = _RecordingReader()
-    WarehouseGrantStore(reader, relation="ops.grants").grants_for("alice")
+    WarehouseGrantStore(reader, relation="stel_grants").grants_for("alice")
     assert reader.identities == [OPERATOR_IDENTITY]
 
 
@@ -275,7 +275,7 @@ def test_enforcement_on_an_adapter_that_cannot_do_it_fails_at_startup(
     with pytest.raises(ValueError, match="cannot execute reads as a named"):
         ContextService.from_project(
             tmp_path,
-            grants_relation="ops.grants",
+            grants_relation="stel_grants",
             enforce_warehouse_identity=True,
         )
 
@@ -323,12 +323,12 @@ def test_the_cli_flag_reaches_the_service(
     _write_project(tmp_path, "        type: duckdb\n        path: w.duckdb\n")
 
     result = _serve(
-        tmp_path, "--grants-relation", "ops.grants", "--enforce-warehouse-identity"
+        tmp_path, "--grants-relation", "stel_grants", "--enforce-warehouse-identity"
     )
 
     assert result.exit_code == 0, result.output
     assert seen["enforce_warehouse_identity"] is True
-    assert seen["grants_relation"] == "ops.grants"
+    assert seen["grants_relation"] == "stel_grants"
 
 
 def test_enforcement_without_a_grants_relation_is_refused_at_the_cli(
@@ -357,7 +357,7 @@ def test_the_cli_refuses_a_warehouse_that_cannot_scope_its_identity(
     )
 
     result = _serve(
-        tmp_path, "--grants-relation", "ops.grants", "--enforce-warehouse-identity"
+        tmp_path, "--grants-relation", "stel_grants", "--enforce-warehouse-identity"
     )
 
     assert result.exit_code == 2
@@ -381,7 +381,7 @@ def test_the_cli_lets_a_bigquery_target_past_the_identity_gate(
     )
 
     result = _serve(
-        tmp_path, "--grants-relation", "ops.grants", "--enforce-warehouse-identity"
+        tmp_path, "--grants-relation", "stel_grants", "--enforce-warehouse-identity"
     )
 
     assert "cannot execute reads as a named principal" not in result.output
@@ -408,6 +408,9 @@ class _RecordingReader:
     ) -> tuple[Mapping[str, Any], ...]:
         self.identities.append(identity)
         return ()
+
+    def has_relation(self, relation: str) -> bool:
+        return True
 
 
 class _StubAdapter:

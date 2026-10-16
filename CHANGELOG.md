@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### A run over its cost threshold asks first (issue #586)
+
+- **`confirm_cost_above_usd` on a profile target.** Before the first model
+  runs, `stel run` and `stel build` price the selection from the run log,
+  the way `stel plan` does. If the total is over the threshold, a run at a
+  terminal asks `Proceed? [y/N]` and any other run refuses, before any
+  provider call. `--accept-cost` is yes in advance. The threshold needs
+  `run_log` enabled, and a profile that sets one without it is rejected.
+- **It is not released by `--full-refresh` or `--accept-reprocess`**,
+  which accept a reprocess, not its price. A full refresh is priced at every
+  published row of each paid model.
+- **It covers reprocessing only.** New input and first builds are not in the
+  projection, and a model with no priced history is named in a warning
+  rather than counted. `max_cost_usd` remains the cap.
+- **`stel plan --reprocess-all` prices an embed model at what it pays**:
+  only rows whose `code_version` moved, or every row when an upstream model's
+  code changed. It used to price every row at full rate, though the flag
+  reads unchanged vectors back for free (#655). `plan.json` records the
+  rows each estimate was priced at as `priced_rows`.
+- `stel plan` says when a run would ask. The plan artifact moves to schema
+  version 3 with `metadata.confirm_cost_above_usd`.
+- ADR-0034 records the design.
+
 ## v0.23.0 - 2026-10-15
 
 ### The `mcp` extra requires `mcp>=1.30.0` (CVE-2026-59951)

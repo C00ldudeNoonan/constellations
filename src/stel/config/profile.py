@@ -440,6 +440,26 @@ class TargetConfig(BaseModel):
     # Operator-owned source roots for this target. Keys are source names from
     # project YAML; values replace SourceConfig.path after target resolution.
     source_paths: dict[str, str] = Field(default_factory=dict, alias="source-paths")
+    # The cost guard (issue #586): a run whose projected provider cost exceeds
+    # this asks before the first model runs. Per target, because what is
+    # worth a question on dev is routine on prod.
+    confirm_cost_above_usd: float | None = Field(
+        default=None, gt=0.0, allow_inf_nan=False, alias="confirm-cost-above-usd"
+    )
+
+    @model_validator(mode="after")
+    def _cost_guard_needs_a_run_log(self) -> TargetConfig:
+        # The projection is priced from run-log history, so a threshold over a
+        # target with no log would never be able to trip. Saying so here beats
+        # a guard that silently never asks.
+        if self.confirm_cost_above_usd is not None and (
+            self.run_log is None or not self.run_log.enabled
+        ):
+            raise ValueError(
+                "confirm_cost_above_usd prices a run from the run log's history; "
+                "enable run_log on this target (run_log: {enabled: true})"
+            )
+        return self
 
 
 class ProfileConfig(BaseModel):

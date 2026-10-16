@@ -58,7 +58,8 @@ log = logging.getLogger(__name__)
 
 PLAN_FILENAME = "plan.json"
 # 2: `estimated_cost_usd` per model and `cost_source` in metadata (issue #665).
-PLAN_SCHEMA_VERSION = 2
+# 3: `confirm_cost_above_usd` in metadata, the target's cost guard (issue #586).
+PLAN_SCHEMA_VERSION = 3
 
 PlanStatus = Literal["new", "unchanged", "changed", "cascade", "full"]
 
@@ -71,7 +72,7 @@ _PLACEHOLDER_TEXT = "x"
 # Runs a model's cost per provider row is pooled over. Recent enough that a
 # changed price or prompt shows up within a few runs, wide enough that one
 # small run does not set the rate.
-_PRICED_RUNS = 5
+PRICED_RUNS = 5
 
 
 class PlanError(RuntimeError):
@@ -115,6 +116,10 @@ class ModelPlan:
     #: None for a kind that carries no guard.
     reprocess_policy: str | None = None
     reprocess_limit: int | None = None
+    #: Of `rows_to_reprocess`, the rows `estimated_cost_usd` was priced at:
+    #: fewer for an embed model under `--reprocess-all`, whose flag-only rows
+    #: reuse their vectors (issue #655). None when the model is unpriced.
+    priced_rows: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +140,7 @@ class ModelPlan:
             "reason": self.reason,
             "reprocess_policy": self.reprocess_policy,
             "reprocess_limit": self.reprocess_limit,
+            "priced_rows": self.priced_rows,
         }
 
 
@@ -146,6 +152,8 @@ class ProjectPlan:
     #: The run-log relation costs were priced from, or None when the target
     #: has no run log enabled and no model could be priced.
     cost_source: str | None
+    #: The target's cost-guard threshold (issue #586), or None when unset.
+    confirm_cost_above_usd: float | None
 
     def counts(self) -> dict[str, int]:
         counts = {status: 0 for status in ("new", "unchanged", "changed", "cascade", "full")}
@@ -163,6 +171,7 @@ class ProjectPlan:
                 "target": self.target,
                 "counts": self.counts(),
                 "cost_source": self.cost_source,
+                "confirm_cost_above_usd": self.confirm_cost_above_usd,
             },
             "models": [model.to_dict() for model in self.models],
         }
@@ -205,13 +214,29 @@ def plan_project(
         # Priced here rather than in `plan_models`: the runner's reprocess
         # guard reads that function before every run, and a cost it never
         # shows is not worth a warehouse read per invocation.
-        cost_source = _run_log_relation(resolved)
+        cost_source = run_log_relation(resolved)
         if cost_source is not None:
-            plans = _price_plans(plans, adapter=adapter, relation=cost_source)
+            try:
+                plans = price_plans(
+                    plans,
+                    adapter=adapter,
+                    relation=cost_source,
+                    reprocess_all=reprocess_all,
+                )
+            except AdapterError as error:
+                # The run log is best-effort when written, so reading it is
+                # too: a plan that cannot price is still a plan. The cost
+                # guard does not get this leniency (Codex review on #695).
+                log.warning(
+                    "Could not read run log '%s' to price this plan [%s]",
+                    cost_source,
+                    type(error).__name__,
+                )
     warehouse = resolved.warehouse
     return ProjectPlan(
         models=tuple(plans),
         cost_source=cost_source,
+        confirm_cost_above_usd=resolved.confirm_cost_above_usd,
         target={
             "profile": resolved.profile_name,
             "name": resolved.target_name,
@@ -448,15 +473,19 @@ def _estimate_provider_calls(
     return (None, *_descriptor_identity(descriptor))
 
 
-def _run_log_relation(resolved: ResolvedProfile) -> str | None:
+def run_log_relation(resolved: ResolvedProfile) -> str | None:
     run_log = resolved.run_log
     if run_log is None or not run_log.enabled:
         return None
     return run_log.relation
 
 
-def _price_plans(
-    plans: list[ModelPlan], *, adapter: WarehouseAdapter, relation: str
+def price_plans(
+    plans: list[ModelPlan],
+    *,
+    adapter: WarehouseAdapter,
+    relation: str,
+    reprocess_all: bool,
 ) -> list[ModelPlan]:
     """Price each reprocessing model at its recent cost per provider row.
 
@@ -470,6 +499,10 @@ def _price_plans(
     Rows only, never calls: a request's cost depends on how many texts it
     carries, which is the provider's batch split rather than anything the
     log records.
+
+    Raises `AdapterError` when the run log cannot be read. Each caller
+    decides what that means: `stel plan` still reports, but the cost guard
+    must not read an unreadable history as a free run.
     """
     wanted = tuple(
         plan.name
@@ -478,26 +511,52 @@ def _price_plans(
     )
     if not wanted:
         return plans
-    try:
-        rates = _cost_per_provider_row(adapter, relation=relation, models=wanted)
-    except AdapterError as error:
-        # The run log is best-effort when written, so reading it is too: a
-        # plan that cannot price is still a plan.
-        log.warning(
-            "Could not read run log '%s' to price this plan [%s]",
-            relation,
-            type(error).__name__,
-        )
-        return plans
+    rates = _cost_per_provider_row(adapter, relation=relation, models=wanted)
+    code_changed = {plan.name for plan in plans if plan.stale_rows > 0}
     return [
-        replace(
+        _priced(
             plan,
-            estimated_cost_usd=round(plan.rows_to_reprocess * rates[plan.name], 6),
+            rows=_provider_rows(
+                plan, reprocess_all=reprocess_all, code_changed=code_changed
+            ),
+            rate=rates[plan.name],
         )
         if plan.name in rates
         else plan
         for plan in plans
     ]
+
+
+def _priced(plan: ModelPlan, *, rows: int, rate: float) -> ModelPlan:
+    return replace(
+        plan, priced_rows=rows, estimated_cost_usd=round(rows * rate, 6)
+    )
+
+
+def _provider_rows(
+    plan: ModelPlan, *, reprocess_all: bool, code_changed: set[str]
+) -> int:
+    """How many of the rows a plan reprocesses would reach the provider.
+
+    All of them, except for an embed model under `--reprocess-all` (issue
+    #655): it reads its own vectors back by input hash, so the rows the flag
+    alone puts back through the stage cost nothing. Only rows whose
+    code_version moved are paid for then, or every row when an upstream
+    model's code changed and may have changed their text. Pricing the flag's
+    rows anyway would make the cost guard ask before the one recovery run
+    that is free (#586).
+
+    `caused_by` alone cannot say which: under the flag every upstream model
+    with state plans as `changed`, so it names those too. `code_changed`
+    -- the planned models with a stale row -- is the upstream change that
+    can move text."""
+    if (
+        reprocess_all
+        and plan.kind == "embed"
+        and code_changed.isdisjoint(plan.caused_by)
+    ):
+        return plan.stale_rows
+    return plan.rows_to_reprocess
 
 
 _RUN_LOG_COST_COLUMNS = (
@@ -541,7 +600,7 @@ def _cost_per_provider_row(
                     runs.setdefault(row["model_name"], []).append(priced)
     rates: dict[str, float] = {}
     for name, history in runs.items():
-        recent = sorted(history, reverse=True)[:_PRICED_RUNS]
+        recent = sorted(history, reverse=True)[:PRICED_RUNS]
         rates[name] = sum(cost for _, cost, _ in recent) / sum(
             rows for _, _, rows in recent
         )
@@ -697,7 +756,7 @@ def _cost_sentence(plan: ProjectPlan) -> str:
         total = sum(m.estimated_cost_usd or 0.0 for m in priced)
         sentence = (
             f"Provider cost: about {format_usd(total)}, priced at each "
-            f"model's cost per provider row over its last {_PRICED_RUNS} "
+            f"model's cost per provider row over its last {PRICED_RUNS} "
             f"priced runs in {plan.cost_source}. An estimate, not a cap: reuse "
             "and caches lower it, longer text or a costlier model raise it."
         )

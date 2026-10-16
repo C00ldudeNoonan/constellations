@@ -94,6 +94,8 @@ class ResolvedProfile:
     # Opt-in append-only histories for this target (issues #306, #329).
     run_log: RunLogConfig | None = None
     mcp_query_log: QueryLogConfig | None = None
+    # The cost guard's threshold (issue #586); requires an enabled run log.
+    confirm_cost_above_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +229,7 @@ def resolve_profile(
         retrieval=retrieval,
         run_log=selected.run_log,
         mcp_query_log=selected.mcp_query_log,
+        confirm_cost_above_usd=selected.confirm_cost_above_usd,
         source_paths=selected.source_paths,
         profiles_path=profiles_path,
     )

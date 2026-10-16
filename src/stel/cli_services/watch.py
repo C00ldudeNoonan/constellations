@@ -15,6 +15,7 @@ import click
 from ..adapters import create_adapter
 from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import ConfigError
+from ..cost_guard import CostConfirmation
 from ..manifest import write_manifest, write_run_results
 from ..paths import resolve_within_project
 from ..profile import apply_source_path_overrides, resolve_profile
@@ -34,6 +35,8 @@ def run_watch(
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
     accept_reprocess: bool = False,
+    accept_cost: bool = False,
+    confirm_cost: CostConfirmation | None = None,
 ) -> None:
     """Watch source paths and re-run on changes. Blocking; Ctrl-C to exit."""
     from watchfiles import watch
@@ -95,6 +98,8 @@ def run_watch(
                 source_filter=source_filter,
                 read_filter=read_filter,
                 accept_reprocess=accept_reprocess,
+                accept_cost=accept_cost,
+                confirm_cost=confirm_cost,
             )
         except (*CONFIG_ERRORS, RunError) as e:
             click.echo(f"error: {e}", err=True)

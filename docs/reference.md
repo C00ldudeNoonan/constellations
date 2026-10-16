@@ -403,11 +403,11 @@ stel init <name> [--template {json,pdf,markdown,html,demo}]  # scaffold a fresh 
 stel seed [--count N] [--type {invoices,posts,...,tickets,emails}]
 stel compile                                             # parse YAML, validate DAG, write manifest.json
 stel graph                                               # Mermaid DAG to stdout
-stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
+stel run [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--accept-cost] [--threads N] [--watch] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel test [--select EXPR] [--exclude EXPR] [--store-failures] [--state DIR]
 stel eval [--select EXPR] [--exclude EXPR] [--json]      # golden-set retrieval evaluation (recall/precision/MRR/NDCG@k)
 stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one golden set: deltas, and the queries that moved
-stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
+stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--accept-cost] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
 stel show <model> [--limit N]                            # peek at a materialized table
@@ -691,10 +691,15 @@ provider, so vector reuse, the response caches and duplicate text make the run
 cheaper; rows longer than the history's, a costlier prompt or model, or a
 price rise since those runs make it dearer. It uses the rates those earlier
 runs were priced at, so a price change shows up after the next run, not
-before it. Set a run budget's `max_cost_usd` when you need a cap.
-`plan.json` carries it per model as `estimated_cost_usd`, and the run log it
-was read from as `metadata.cost_source` (plan schema version 2), and a refusal
-under `on_code_change: fail` names it.
+before it. Under `--reprocess-all`, an embed model is priced only at the rows
+whose `code_version` moved, or at every row when an upstream model's code
+changed. The rows the flag alone puts back through the stage reuse their
+vectors and cost nothing (see below). Set a run budget's `max_cost_usd` when
+you need a cap. `plan.json` carries the estimate per model as
+`estimated_cost_usd`, the rows it was priced at as `priced_rows`, the run log it was read from as `metadata.cost_source`,
+and the target's [cost threshold](#asking-before-a-costly-run-confirm_cost_above_usd)
+as `metadata.confirm_cost_above_usd` (plan schema version 3). A refusal under
+`on_code_change: fail` names the estimate.
 
 A plan connects to the warehouse the way a run does — the same profile,
 target, and preflight — and writes `target/plan.json`, which `--json` prints
@@ -763,6 +768,62 @@ The policy fields are not part of `code_version`, for the same reason
 `on_index_change` is not: relaxing a guard must never itself be a reprocess.
 ADR [0008](adr/0008-reprocess-guard-defaults-to-fail.md) records why `fail` is
 the default rather than a warning.
+
+### Asking before a costly run: `confirm_cost_above_usd`
+
+The reprocess guard counts rows, and it is out of the way once you have said
+yes: under `on_code_change: reprocess`, `--accept-reprocess` or
+`--full-refresh`. A target can also set a dollar threshold, so that a run
+that would cost more than it asks first:
+
+```yaml
+my_project:
+  outputs:
+    prod:
+      warehouse: { type: bigquery, ... }
+      embedding: { provider: vertex, pricing: { input_usd_per_mchar: 0.025 } }
+      run_log: { enabled: true }        # required: the projection is priced from it
+      confirm_cost_above_usd: 25
+```
+
+Before the first model runs, `stel run` and `stel build` plan the selection,
+price it the way [`stel plan`](#planning-a-change-stel-plan) does (each
+model's cost per provider row in the run log, times the rows it would
+reprocess), and add it up. If the total is over the threshold, the run stops:
+
+```
+Projected provider cost: about $91.80, over confirm_cost_above_usd ($25.00).
+  chunk_embeddings (embed): ~$91.80 for 3,613,979 row(s). --full-refresh reprocesses every published row.
+Priced at each model's cost per provider row over its last 5 priced runs in stel_run_log; an estimate, not a cap. New input since the last run is not in it.
+Proceed? [y/N]:
+```
+
+- **At a terminal it asks.** `y` runs; anything else, Enter included, stops
+  before any provider call.
+- **Anywhere else it refuses**: piped, scheduled, `--json`, or `run_project`
+  called as a library. The error carries the same projection. No answer is
+  never taken as yes.
+- **`--accept-cost`** is yes in advance, for a run you have already priced
+  with `stel plan`. Raising the threshold is the other way forward.
+- **`--full-refresh` and `--accept-reprocess` do not release it.** They say
+  yes to a reprocess, not to its price, and a full refresh is priced at every
+  published row of each paid model.
+- **An embed model under `--reprocess-all` is priced at what it pays.** That
+  is nothing when only the flag reprocesses its rows, so the recovery run is
+  never questioned.
+
+What it projects is what a plan can see without reading a source: published
+rows that would reprocess. New input, a first build and a `full` model's
+per-run rebuild are not in it, so a large new ingest passes under the
+threshold. The run budget's `max_cost_usd` is the cap that sees everything;
+this is a question asked before starting. A paid model with no priced history
+is named in a warning and left out of the total rather than blocking every
+run. A run log that cannot be read is different: it refuses the run, because
+pricing nothing would project $0, and `--accept-cost` runs without the check. The threshold needs `run_log` enabled on the target and is rejected at
+profile resolution without it. Inside the threshold, the projection is logged
+at `-v`. `stel plan` says when a run would ask.
+ADR [0034](adr/0034-a-run-over-its-cost-threshold-asks-and-refuses-without-a-terminal.md)
+records why it refuses rather than warns without a terminal.
 
 ### Reprocessing without re-paying: `--reprocess-all`
 

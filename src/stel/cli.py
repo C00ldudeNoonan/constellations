@@ -37,6 +37,7 @@ from .config import ConfigError
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
+from .cost_guard import CostConfirmation, CostProjection, project_cost
 from .credentials import CredentialReference, CredentialReferenceError
 from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
@@ -1101,6 +1102,43 @@ def plan(
             "Pass --accept-reprocess or --full-refresh, or set on_code_change: "
             "reprocess on the model."
         )
+    if result.confirm_cost_above_usd is not None and result.cost_source is not None:
+        projection = project_cost(
+            result.models,
+            threshold_usd=result.confirm_cost_above_usd,
+            source=result.cost_source,
+        )
+        if projection.exceeds_threshold:
+            click.echo("")
+            click.echo(
+                "`stel run` would ask before starting (and refuse without a "
+                "terminal), unless passed --accept-cost:"
+            )
+            for line in projection.describe():
+                click.echo(line)
+
+
+def _stdin_is_interactive() -> bool:
+    return click.get_text_stream("stdin").isatty()
+
+
+def _cost_confirmation(json_output: bool) -> CostConfirmation | None:
+    """The cost guard's question (issue #586), when someone can answer it.
+
+    None is "no one to ask", which the guard turns into a refusal: a
+    scheduled or piped run must not wait on a prompt, and must not take a
+    missing answer as yes. `--json` counts as no one -- its stdout belongs
+    to a program."""
+    if json_output or not _stdin_is_interactive():
+        return None
+    return _confirm_cost
+
+
+def _confirm_cost(projection: CostProjection) -> bool:
+    # stderr, beside the run ledger: stdout carries the results table.
+    for line in projection.describe():
+        click.echo(line, err=True)
+    return click.confirm("Proceed?", default=False, err=True)
 
 
 @cli.command()
@@ -1123,6 +1161,15 @@ def plan(
     help=(
         "Proceed when an embed or llm model would reprocess published rows at "
         "provider cost (on_code_change: fail). `stel plan` shows what that is."
+    ),
+)
+@click.option(
+    "--accept-cost",
+    is_flag=True,
+    help=(
+        "Proceed without asking when the projected provider cost is over the "
+        "target's confirm_cost_above_usd. Without it, such a run asks at a "
+        "terminal and refuses anywhere else."
     ),
 )
 @click.option(
@@ -1190,6 +1237,7 @@ def run(
     full_refresh: bool,
     reprocess_all: bool,
     accept_reprocess: bool,
+    accept_cost: bool,
     select: str | None,
     exclude: str | None,
     watch: bool,
@@ -1232,6 +1280,8 @@ def run(
             source_filter=source_filter,
             read_filter=read_filter,
             accept_reprocess=accept_reprocess,
+            accept_cost=accept_cost,
+            confirm_cost=_cost_confirmation(json_output),
         )
         return
 
@@ -1250,6 +1300,8 @@ def run(
             source_filter=source_filter,
             read_filter=read_filter,
             accept_reprocess=accept_reprocess,
+            accept_cost=accept_cost,
+            confirm_cost=_cost_confirmation(json_output),
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1391,6 +1443,15 @@ def _usage_summary(
         "provider cost (on_code_change: fail). `stel plan` shows what that is."
     ),
 )
+@click.option(
+    "--accept-cost",
+    is_flag=True,
+    help=(
+        "Proceed without asking when the projected provider cost is over the "
+        "target's confirm_cost_above_usd. Without it, such a run asks at a "
+        "terminal and refuses anywhere else."
+    ),
+)
 @click.option("--select", "select", default=None, help="Selector expression.")
 @click.option("--exclude", default=None, help="Selector expression for nodes to exclude.")
 @click.option(
@@ -1446,6 +1507,7 @@ def build(
     full_refresh: bool,
     reprocess_all: bool,
     accept_reprocess: bool,
+    accept_cost: bool,
     select: str | None,
     exclude: str | None,
     threads: int,
@@ -1479,6 +1541,8 @@ def build(
             source_filter=source_filter,
             read_filter=read_filter,
             accept_reprocess=accept_reprocess,
+            accept_cost=accept_cost,
+            confirm_cost=_cost_confirmation(json_output),
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e

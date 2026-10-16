@@ -33,10 +33,13 @@ from stel.mcp_server.authorization import AuthorizationError, PolicyAttribute, P
 from stel.mcp_server.grants import (
     WAREHOUSE_IDENTITY_ATTRIBUTE,
     GrantAuthorizationProvider,
+    GrantConfigurationError,
     GrantWarehouseIdentityResolver,
     WarehouseGrantStore,
 )
+from stel.mcp_server.repository import WarehouseContextRepository
 from stel.profile import resolve_profile
+from stel.search import SearchSession
 
 TARGET = "dev"
 
@@ -95,6 +98,9 @@ class _AdapterRowReader:
                 [subject],
             )
         return tuple(dict(zip(names, row, strict=True)) for row in rows)
+
+    def has_relation(self, relation: str) -> bool:
+        return True
 
 
 def _store(project_dir: Path) -> WarehouseGrantStore:
@@ -413,6 +419,141 @@ def test_a_value_containing_sql_is_stored_verbatim(project: Path) -> None:
         value=hostile,
     )
     assert _values(project, "analyst@example.com", "tenant_id") == (hostile,)
+
+
+# ─── the relation the server reads ──────────────────────────────────────────
+
+
+def _served_store(project_dir: Path, relation: str) -> WarehouseGrantStore:
+    """The store exactly as `stel mcp serve --grants-relation` builds it.
+
+    `_AdapterRowReader` above reads the table straight from the adapter, so it
+    cannot see what the served repository does to a relation name before
+    reading: it looks the name up among the schema's tables, and a name that
+    is not there reads as no rows at all (issue #698).
+    """
+    session = SearchSession(project_dir, target=TARGET, profiles_dir=None)
+    return WarehouseGrantStore(WarehouseContextRepository(session), relation=relation)
+
+
+def test_a_grant_reaches_the_served_repository(project: Path) -> None:
+    """The control for the two below: the same path, correctly configured,
+    does find the grant."""
+    grant(
+        project,
+        profiles_dir=None,
+        target=TARGET,
+        subject="analyst@example.com",
+        attribute="tenant_id",
+        value="acme",
+    )
+    grants = _served_store(project, DEFAULT_GRANTS_RELATION).grants_for(
+        "analyst@example.com"
+    )
+    assert [(g.attribute, g.value) for g in grants] == [("tenant_id", "acme")]
+
+
+def test_a_schema_qualified_grants_relation_is_refused(project: Path) -> None:
+    """`docs/mcp.md` showed `--grants-relation ops.context_grants`.
+
+    The served repository reads bare table names from the profile's schema, so
+    a qualified name never matched one: every subject read as having no
+    grants, every governed model was denied, and nothing said why (issue
+    #698). `stel grants` already refused the name, so the relation could not
+    even be administered under it.
+    """
+    grant(
+        project,
+        profiles_dir=None,
+        target=TARGET,
+        subject="analyst@example.com",
+        attribute="tenant_id",
+        value="acme",
+    )
+    with create_adapter(
+        resolve_profile(
+            load_project(project)[0], project, target=TARGET, profiles_dir=None
+        ).warehouse,
+        project_dir=project,
+    ) as adapter:
+        schema = adapter.config.schema_name
+
+    with pytest.raises(ValueError, match="schema-qualified"):
+        _served_store(project, f"{schema}.{DEFAULT_GRANTS_RELATION}")
+
+
+def test_a_missing_grants_relation_is_a_configuration_error(project: Path) -> None:
+    """A relation that does not exist is not a subject with no grants.
+
+    Reported as a denial, a typo in `--grants-relation` -- or a server started
+    before anything was granted -- presents as an empty catalog with no
+    reason, which is what `GrantConfigurationError` exists to prevent (issue
+    #698).
+    """
+    store = _served_store(project, "stel_grants_typo")
+    with pytest.raises(GrantConfigurationError, match="stel_grants_typo"):
+        store.grants_for("analyst@example.com")
+
+
+def test_a_subject_without_grants_is_still_denied_not_an_error(project: Path) -> None:
+    """The existence check must not turn an ordinary "no grants" into an error:
+    the relation exists, this subject simply has nothing in it."""
+    grant(
+        project,
+        profiles_dir=None,
+        target=TARGET,
+        subject="someone-else@example.com",
+        attribute="tenant_id",
+        value="acme",
+    )
+    store = _served_store(project, DEFAULT_GRANTS_RELATION)
+    assert store.grants_for("analyst@example.com") == ()
+    with pytest.raises(AuthorizationError):
+        GrantAuthorizationProvider(store).search_policy_filters(
+            Principal(subject_id="analyst@example.com"),
+            access="governed",
+            attributes=[PolicyAttribute("tenant_id", "string")],
+        )
+
+
+def test_a_missing_grants_relation_leaves_public_models_readable(project: Path) -> None:
+    """A public model reads no grants, so a missing relation cannot refuse it."""
+    provider = GrantAuthorizationProvider(_served_store(project, "stel_grants_typo"))
+    filters = provider.search_policy_filters(
+        Principal(subject_id="analyst@example.com"),
+        access="public",
+        attributes=[PolicyAttribute("tenant_id", "string")],
+    )
+    assert filters == ()
+
+
+def test_a_missing_grants_relation_refuses_identity_resolution(project: Path) -> None:
+    """Under `--enforce-warehouse-identity` every read, public included, looks
+    the caller's identity up in the relation. A missing relation is then a
+    configuration error rather than a quiet fall back to the operator's
+    connection (issue #698)."""
+    resolver = GrantWarehouseIdentityResolver(_served_store(project, "stel_grants_typo"))
+    with pytest.raises(GrantConfigurationError, match="stel_grants_typo"):
+        resolver.identity_for(Principal(subject_id="analyst@example.com"))
+
+
+def test_serve_refuses_a_schema_qualified_grants_relation(project: Path) -> None:
+    """At startup, with the config-error exit code, before anything listens."""
+    from click.testing import CliRunner
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "--project-dir",
+            str(project),
+            "mcp",
+            "serve",
+            "--grants-relation",
+            "ops.context_grants",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "schema-qualified" in result.output
 
 
 # ─── the constants the CLI duplicates ───────────────────────────────────────

@@ -46,7 +46,6 @@ from ..adapters import create_adapter
 from ..adapters.base import WarehouseCapability
 from ..append_log import audit_relation_for, write_audit_rows
 from ..config import load_project
-from ..config.identifiers import validate_node_name
 from ..env import GRANTS_ACTOR_ENV, read_env
 from ..mcp_server.grants import (
     ATTRIBUTE_COLUMN,
@@ -58,6 +57,7 @@ from ..mcp_server.grants import (
     WAREHOUSE_IDENTITY_ATTRIBUTE,
     GrantConfigurationError,
     parse_interval,
+    validate_grants_relation,
 )
 from ..profile import resolve_profile
 from .context import ConfigClickError
@@ -120,7 +120,7 @@ def _resolve(
     """
     project_config, _sources, _models = load_project(project_dir)
     try:
-        checked = validate_node_name(relation, kind="Grants relation")
+        checked = validate_grants_relation(relation)
     except ValueError as error:
         raise ConfigClickError(str(error)) from error
     resolved = resolve_profile(

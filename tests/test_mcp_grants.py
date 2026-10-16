@@ -172,6 +172,9 @@ class _FakeRepository:
         subject = predicates[0].value
         return tuple(row for row in self._rows if row["subject_id"] == subject)
 
+    def has_relation(self, relation: str) -> bool:
+        return True
+
 
 def _rows() -> list[dict[str, str]]:
     return [
@@ -182,7 +185,7 @@ def _rows() -> list[dict[str, str]]:
 
 def test_grants_are_read_per_subject_and_scoped_to_that_subject() -> None:
     repository = _FakeRepository(_rows())
-    store = WarehouseGrantStore(repository, relation="ops.grants")
+    store = WarehouseGrantStore(repository, relation="stel_grants")
 
     assert store.grants_for("alice") == (Grant("alice", "tenant_id", "acme"),)
     assert store.grants_for("bob") == (Grant("bob", "tenant_id", "globex"),)
@@ -196,7 +199,7 @@ def test_grants_are_cached_and_the_ttl_bounds_revocation() -> None:
     now = {"t": 0.0}
     repository = _FakeRepository(_rows())
     store = WarehouseGrantStore(
-        repository, relation="ops.grants", ttl_seconds=60.0, clock=lambda: now["t"]
+        repository, relation="stel_grants", ttl_seconds=60.0, clock=lambda: now["t"]
     )
 
     assert store.grants_for("alice")
@@ -219,7 +222,7 @@ def test_expired_subjects_are_swept_and_do_not_grow_the_cache_forever() -> None:
     now = {"t": 0.0}
     repository = _FakeRepository(_rows())
     store = WarehouseGrantStore(
-        repository, relation="ops.grants", ttl_seconds=60.0, clock=lambda: now["t"]
+        repository, relation="stel_grants", ttl_seconds=60.0, clock=lambda: now["t"]
     )
 
     for subject in ("alice", "bob", "carol", "dave"):
@@ -239,7 +242,7 @@ def test_a_blank_grant_value_is_refused_rather_than_guessed() -> None:
     repository = _FakeRepository(
         [{"subject_id": "alice", "attribute": "tenant_id", "value": "  "}]
     )
-    store = WarehouseGrantStore(repository, relation="ops.grants")
+    store = WarehouseGrantStore(repository, relation="stel_grants")
 
     with pytest.raises(GrantConfigurationError, match="no usable"):
         store.grants_for("alice")
@@ -251,7 +254,7 @@ def test_a_grant_relation_missing_a_column_fails_loudly() -> None:
     repository = _FakeRepository(
         [{"subject_id": "alice", "attribute": "tenant_id"}]
     )
-    store = WarehouseGrantStore(repository, relation="ops.grants")
+    store = WarehouseGrantStore(repository, relation="stel_grants")
 
     with pytest.raises(GrantConfigurationError, match="no usable 'value'"):
         store.grants_for("alice")
@@ -269,7 +272,7 @@ def test_from_project_refuses_both_authorization_and_grants_relation(
         ContextService.from_project(
             tmp_path / "no-such-project",
             authorization=ClaimAuthorizationProvider(),
-            grants_relation="ops.grants",
+            grants_relation="stel_grants",
         )
 
 
@@ -295,7 +298,10 @@ def test_malformed_grant_row_is_a_configuration_error_not_a_denial() -> None:
         ) -> tuple[Mapping[str, Any], ...]:
             return ({"subject_id": "alice", "attribute": "tenant_id", "value": "  "},)
 
-    store = WarehouseGrantStore(_BlankValueRepository(), relation="ops.grants")
+        def has_relation(self, relation: str) -> bool:
+            return True
+
+    store = WarehouseGrantStore(_BlankValueRepository(), relation="stel_grants")
 
     with pytest.raises(GrantConfigurationError):
         store.grants_for("alice")

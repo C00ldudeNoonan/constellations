@@ -304,8 +304,14 @@ tenant from another.
 `--grants-relation` moves that decision to a relation you own:
 
 ```bash
-stel mcp serve --grants-relation ops.context_grants
+stel mcp serve --grants-relation stel_grants
 ```
+
+The relation is a table in the schema the active profile's warehouse names —
+the same schema `stel grants` creates and writes it in — so it is named alone,
+without a schema. A schema-qualified name such as `ops.context_grants` is
+refused at startup: it matches no table in that schema, and would otherwise
+deny every governed model.
 
 The relation supplies four string columns:
 
@@ -360,7 +366,12 @@ grants, so a retrieval store that ignored a filter still cannot leak a row.
 
 A grants relation that is malformed — a null, blank, or missing column — fails
 as a configuration error rather than as a denial, so schema drift does not
-present as "this subject has no grants".
+present as "this subject has no grants". So does a relation that does not
+exist at all, such as a typo in `--grants-relation` or a server started before
+anything was granted: the error names the relation and how to create it.
+Public models do not read grants, so they stay available — unless
+`--enforce-warehouse-identity` is set, where every read looks up the caller's
+identity in the relation, and a missing relation refuses public reads too.
 
 Policy attributes declared as `array[string]` — including the `access_groups`
 shape in the agent-context contract — are filtered by set overlap: the row's
@@ -479,7 +490,7 @@ Turn it on with `--enforce-warehouse-identity`, which requires
 `--grants-relation` because the identity *is* a grant:
 
 ```bash
-stel mcp serve --transport streamable-http --trust-proxy-principal-headers   --grants-relation ops.grants --enforce-warehouse-identity
+stel mcp serve --transport streamable-http --trust-proxy-principal-headers   --grants-relation stel_grants --enforce-warehouse-identity
 ```
 
 The flag is off by default. Left off, the grants above still govern what each

@@ -32,6 +32,7 @@ from ..adapters.base import (
     ReadPredicateOperator,
     WarehouseIdentity,
 )
+from ..config.identifiers import validate_node_name
 from ..search import SearchFilter, SearchFilterOperator
 from .authorization import (
     AuthorizationError,
@@ -173,13 +174,43 @@ class GrantStore(Protocol):
     def grants_for(self, subject_id: str) -> tuple[Grant, ...]: ...
 
 
+def validate_grants_relation(relation: str) -> str:
+    """The one naming rule for the grants relation, served and administered.
+
+    The relation is a table in the schema the active profile's warehouse
+    names: `stel grants` creates and writes it there, and the server reads it
+    from there. A schema-qualified name never matched a table in that list, so
+    it read as "no grants" for every subject and denied every governed model
+    without a word (issue #698). Refused here, by name, so the operator sees
+    why instead of an empty catalog.
+    """
+    if "." in relation:
+        raise ValueError(
+            f"Grants relation {relation!r} is schema-qualified. The grants relation "
+            "is a table in the schema the active profile's warehouse names, where "
+            "`stel grants` creates it and the server reads it; a qualified name "
+            "matches no table there and would deny every governed model. Name the "
+            f"table alone (for example {relation.rsplit('.', 1)[-1]!r})."
+        )
+    return validate_node_name(relation, kind="Grants relation")
+
+
 class GrantRowReader(Protocol):
-    """The one repository capability a grant store needs.
+    """The repository capabilities a grant store needs.
 
     Narrower than `ContextRepository` on purpose: reading grants is a plain
     row read, and depending on the full repository protocol would make every
     unrelated method a prerequisite for supplying grants from somewhere else.
     """
+
+    def has_relation(self, relation: str) -> bool:
+        """Whether `relation` exists, read as the operator.
+
+        Separate from `read_rows` because an absent relation and a subject
+        with no rows in it read identically there, and only one of them is a
+        denial (issue #698).
+        """
+        ...
 
     def read_rows(
         self,
@@ -233,8 +264,7 @@ class WarehouseGrantStore:
         ttl_seconds: float = DEFAULT_GRANT_TTL_SECONDS,
         clock: Any = time.monotonic,
     ) -> None:
-        if not relation:
-            raise ValueError("grant relation must not be empty")
+        validate_grants_relation(relation)
         if ttl_seconds <= 0:
             raise ValueError("grant ttl_seconds must be positive")
         self._repository = repository
@@ -293,6 +323,17 @@ class WarehouseGrantStore:
             # `_grant_from_row` rather than by the projection.
             columns=None,
         )
+        # Only an empty answer pays for the check: a subject with grants has
+        # proven the relation exists, and the existence check is what tells a
+        # subject with none apart from a relation that is not there (#698).
+        if not rows and not self._repository.has_relation(self._relation):
+            raise GrantConfigurationError(
+                f"The grants relation '{self._relation}' does not exist in the "
+                "schema the active profile's warehouse names, so no subject can "
+                "be authorized. Create it with `stel grants grant ... --relation "
+                f"{self._relation} --target <target>`, or point --grants-relation "
+                "at the relation that holds the grants."
+            )
         return tuple(_grant_from_row(row, self._relation) for row in rows)
 
 

@@ -74,7 +74,7 @@ CONFIGURATIONS: dict[str, list[str]] = {
     # Warehouse-identity enforcement (#568). A flag the CLI accepts but never
     # boots is the same class of bug this file exists for.
     "stdio-enforced-warehouse-identity": [
-        "--grants-relation", "ops.grants",
+        "--grants-relation", "stel_grants",
         "--enforce-warehouse-identity",
     ],
 }

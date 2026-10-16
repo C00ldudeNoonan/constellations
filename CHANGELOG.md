@@ -19,7 +19,8 @@
 - **`stel plan --reprocess-all` prices an embed model at what it pays**:
   only rows whose `code_version` moved, or every row when an upstream model's
   code changed. It used to price every row at full rate, though the flag
-  reads unchanged vectors back for free (#655).
+  reads unchanged vectors back for free (#655). `plan.json` records the
+  rows each estimate was priced at as `priced_rows`.
 - `stel plan` says when a run would ask. The plan artifact moves to schema
   version 3 with `metadata.confirm_cost_above_usd`.
 - ADR-0034 records the design.

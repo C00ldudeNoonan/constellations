@@ -20,7 +20,7 @@ from click.testing import CliRunner
 
 from stel.adapters import AdapterError
 from stel.cli import cli
-from stel.cost_guard import CostProjection
+from stel.cost_guard import CostProjection, project_cost
 from stel.execution.contracts import RunError
 from stel.plan import plan_project
 from stel.profile import ProfileError
@@ -213,11 +213,17 @@ def test_reprocess_all_prices_an_embed_model_at_what_it_pays(
     project = _project(tmp_path)
     provider = _Provider(monkeypatch)
 
-    (embed,) = plan_project(
-        project, select="document_embeddings", reprocess_all=True
-    ).models
+    plan = plan_project(project, select="document_embeddings", reprocess_all=True)
+    (embed,) = plan.models
     assert embed.rows_to_reprocess == 3
+    assert embed.priced_rows == 0
     assert embed.estimated_cost_usd == 0
+    # The price is for the rows that reach the provider, and the line says
+    # so rather than reading as $0 a row for all three (review on #695).
+    projection = project_cost(plan.models, threshold_usd=20, source="stel_run_log")
+    assert "~$0 for 3 row(s), 0 of them reaching the provider." in "\n".join(
+        projection.describe()
+    )
 
     results = run_project(project, reprocess_all=True)
     assert all(not result.errors for result in results)
@@ -226,6 +232,32 @@ def test_reprocess_all_prices_an_embed_model_at_what_it_pays(
     _change_embedding_model(project)
     with pytest.raises(RunError, match=r"about \$33\.00, over"):
         run_project(project, reprocess_all=True)
+
+
+def test_reprocess_all_prices_every_row_when_an_upstream_model_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chunk model whose code moved may have changed every text below it, so
+    the embed model's rows are priced in full even though its own code did
+    not move. Pricing its stale rows alone would project $0 and start the
+    expensive run unasked (review on #695)."""
+    project = _project(tmp_path)
+    models = project / "models" / "documents.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "chunk_size: 1000", "chunk_size: 900"
+        ),
+        encoding="utf-8",
+    )
+    provider = _Provider(monkeypatch)
+
+    plans = {m.name: m for m in plan_project(project, reprocess_all=True).models}
+    assert plans["document_embeddings"].stale_rows == 0
+    assert plans["document_embeddings"].priced_rows == 3
+
+    with pytest.raises(RunError, match=r"about \$33\.00, over"):
+        run_project(project, reprocess_all=True)
+    assert provider.texts == []
 
 
 def test_an_unpriced_model_is_named_and_does_not_stop_the_run(

@@ -116,6 +116,10 @@ class ModelPlan:
     #: None for a kind that carries no guard.
     reprocess_policy: str | None = None
     reprocess_limit: int | None = None
+    #: Of `rows_to_reprocess`, the rows `estimated_cost_usd` was priced at:
+    #: fewer for an embed model under `--reprocess-all`, whose flag-only rows
+    #: reuse their vectors (issue #655). None when the model is unpriced.
+    priced_rows: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +140,7 @@ class ModelPlan:
             "reason": self.reason,
             "reprocess_policy": self.reprocess_policy,
             "reprocess_limit": self.reprocess_limit,
+            "priced_rows": self.priced_rows,
         }
 
 
@@ -509,20 +514,23 @@ def price_plans(
     rates = _cost_per_provider_row(adapter, relation=relation, models=wanted)
     code_changed = {plan.name for plan in plans if plan.stale_rows > 0}
     return [
-        replace(
+        _priced(
             plan,
-            estimated_cost_usd=round(
-                _provider_rows(
-                    plan, reprocess_all=reprocess_all, code_changed=code_changed
-                )
-                * rates[plan.name],
-                6,
+            rows=_provider_rows(
+                plan, reprocess_all=reprocess_all, code_changed=code_changed
             ),
+            rate=rates[plan.name],
         )
         if plan.name in rates
         else plan
         for plan in plans
     ]
+
+
+def _priced(plan: ModelPlan, *, rows: int, rate: float) -> ModelPlan:
+    return replace(
+        plan, priced_rows=rows, estimated_cost_usd=round(rows * rate, 6)
+    )
 
 
 def _provider_rows(

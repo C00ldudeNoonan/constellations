@@ -53,9 +53,17 @@ class CostProjection:
                 if plan.reprocess_is_upper_bound
                 else f"{plan.rows_to_reprocess:,}"
             )
+            # Under `--reprocess-all` an embed model is priced at fewer rows
+            # than it reprocesses; say which, or the price reads as per row.
+            paid = (
+                f", {plan.priced_rows:,} of them reaching the provider"
+                if plan.priced_rows is not None
+                and plan.priced_rows != plan.rows_to_reprocess
+                else ""
+            )
             lines.append(
                 f"  {plan.name} ({plan.kind}): ~{format_usd(plan.estimated_cost_usd or 0.0)}"
-                f" for {rows} row(s). {plan.reason}."
+                f" for {rows} row(s){paid}. {plan.reason}."
             )
         if self.unpriced:
             lines.append(

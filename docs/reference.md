@@ -696,7 +696,7 @@ whose `code_version` moved, or at every row when an upstream model's code
 changed. The rows the flag alone puts back through the stage reuse their
 vectors and cost nothing (see below). Set a run budget's `max_cost_usd` when
 you need a cap. `plan.json` carries the estimate per model as
-`estimated_cost_usd`, the run log it was read from as `metadata.cost_source`,
+`estimated_cost_usd`, the rows it was priced at as `priced_rows`, the run log it was read from as `metadata.cost_source`,
 and the target's [cost threshold](#asking-before-a-costly-run-confirm_cost_above_usd)
 as `metadata.confirm_cost_above_usd` (plan schema version 3). A refusal under
 `on_code_change: fail` names the estimate.

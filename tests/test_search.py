@@ -840,6 +840,70 @@ def _request() -> SearchRequest:
     )
 
 
+@pytest.mark.parametrize("held", [True, False])
+def test_session_pin_reuse_removes_warm_query_dml(
+    published_project: Path, monkeypatch: pytest.MonkeyPatch, held: bool,
+) -> None:
+    """#541: count actual warehouse statements, including the shutdown DELETE."""
+    from stel.adapters.duckdb import DuckDBAdapter
+
+    if held:
+        _allow_held_connections(monkeypatch)
+    execute = DuckDBAdapter.execute
+    rows = DuckDBAdapter.rows
+    writes: list[str] = []
+    reads: list[str] = []
+
+    def record_execute(self: Any, sql: str, params: Any = None) -> Any:
+        if "stel_serving_leases" in sql and sql.strip().startswith(("INSERT", "DELETE")):
+            writes.append(sql.strip().split()[0])
+        return execute(self, sql, params)
+
+    def record_rows(self: Any, sql: str, params: Any = None) -> Any:
+        if "stel_serving_ledger" in sql:
+            reads.append(sql)
+        return rows(self, sql, params)
+
+    monkeypatch.setattr(DuckDBAdapter, "execute", record_execute)
+    monkeypatch.setattr(DuckDBAdapter, "rows", record_rows)
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    try:
+        assert search(published_project, _request(), session=session)
+        reads.clear()
+        for _ in range(2):
+            assert search(published_project, _request(), session=session)
+        if held:
+            assert writes == ["INSERT"]
+            assert len(reads) == 4  # readmission and final validation per query
+        else:
+            assert writes == ["INSERT", "DELETE"] * 3
+    finally:
+        session.close()
+    assert writes == (["INSERT", "DELETE"] if held else ["INSERT", "DELETE"] * 3)
+
+
+def test_a_drain_refusal_preserves_the_store_other_readers_may_be_using(
+    published_project: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#541: a coordination refusal is not a broken store connection."""
+    from stel.retrieval.coordination import ServingBusyError, ServingCoordinator
+
+    def draining(self: Any, lease: Any) -> Any:
+        raise ServingBusyError("Query readers are draining")
+
+    _allow_held_connections(monkeypatch)
+    session = SearchSession(published_project, target=None, profiles_dir=None)
+    try:
+        assert search(published_project, _request(), session=session)
+        alias, store = next(iter(session._stores.items()))
+        monkeypatch.setattr(ServingCoordinator, "refresh_query", draining)
+        with pytest.raises(SearchError, match="draining"):
+            search(published_project, _request(), session=session)
+        assert session._stores.get(alias) is store
+    finally:
+        session.close()
+
+
 def test_a_session_holds_the_warehouse_open_when_the_adapter_allows(
     published_project: Path,
     monkeypatch: pytest.MonkeyPatch,

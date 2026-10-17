@@ -1626,6 +1626,7 @@ def test_a_ledger_predating_generations_gains_the_activation_column(
 
         columns = adapter.table_column_names(SERVING_LEDGER_TABLE) or frozenset()
         assert "active_collection" in columns
+        assert "query_drain_until_epoch" in columns  # cooperative admission gate, issue #541
         # And the publisher identity columns (issue #621), added the same way.
         assert {
             "publisher_host",

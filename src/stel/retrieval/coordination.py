@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
@@ -73,6 +73,9 @@ STATUS_PUBLISHING_IN_PLACE = "publishing_in_place"
 SERVABLE_STATUSES = (STATUS_READY, STATUS_DEGRADED, STATUS_PUBLISHING)
 
 RECOVERY_ERROR_CODE = "administrative_recovery"
+# An admission gate, never an expiry of a durable pin (issue #541). A
+# publisher that abandons its retry must not leave serving disabled forever.
+QUERY_DRAIN_SECONDS = 60
 
 # `_finish`'s activation argument has three cases, spelled out because the
 # difference between two of them was a bug: an `int` stamps the activation,
@@ -116,6 +119,7 @@ _LEDGER_COLUMNS_ADDED_LATER: tuple[tuple[str, str], ...] = (
     # whole point -- an index that has stopped publishing has to stop looking
     # fresh. Epoch seconds for the reason the publisher columns above are.
     ("activated_epoch", "BIGINT"),
+    ("query_drain_until_epoch", "BIGINT"),
 )
 
 
@@ -294,7 +298,8 @@ class ServingCoordinator:
                 mirror_generation STRING,
                 mirror_target STRING,
                 mirrored_epoch BIGINT,
-                activated_epoch BIGINT
+                activated_epoch BIGINT,
+                query_drain_until_epoch BIGINT
             )
             """
         )
@@ -471,7 +476,7 @@ class ServingCoordinator:
                    publisher_started_epoch, publisher_label,
                    publisher_heartbeat_epoch, publisher_namespace, progress_note,
                    mirror_generation, mirror_target, mirrored_epoch,
-                   activated_epoch
+                   activated_epoch, query_drain_until_epoch
             FROM {self._ref(LEDGER_TABLE)}
             WHERE model_name = ? AND stage = ? AND target_identity = ?
             """,
@@ -506,7 +511,7 @@ class ServingCoordinator:
                    publisher_started_epoch, publisher_label,
                    publisher_heartbeat_epoch, publisher_namespace, progress_note,
                    mirror_generation, mirror_target, mirrored_epoch,
-                   activated_epoch,
+                   activated_epoch, query_drain_until_epoch,
                    (
                        SELECT COUNT(*) FROM {self._ref(LEASE_TABLE)}
                        WHERE model_name = ? AND stage = ? AND target_identity = ?
@@ -699,7 +704,7 @@ class ServingCoordinator:
                 status = ?, expected_code_version = ?,
                 config_fingerprint = {fingerprint_assignment},
                 safe_error_code = NULL, started_at = CURRENT_TIMESTAMP,
-                completed_at = NULL{retain_generation},
+                completed_at = NULL{retain_generation}, query_drain_until_epoch = NULL,
                 publisher_host = ?, publisher_pid = ?,
                 publisher_started_epoch = CAST(? AS INT64), publisher_label = ?,
                 publisher_heartbeat_epoch = ?, publisher_namespace = ?
@@ -742,14 +747,32 @@ class ServingCoordinator:
                 raise ServingBusyError(
                     "Serving generation changed while planning publication; retry the run"
                 )
+            if excludes_readers:
+                self._request_query_drain(scope, fencing_token=int(row[0]))
             raise ServingBusyError(
-                "Active query leases block publication for this serving scope"
+                "Active query leases block publication for this serving scope; "
+                "readers have been asked to drain; retry the run"
             )
         return PublishLease(
             scope=scope,
             publication_id=publication_id,
             fencing_token=int(row[0]),
             config_fingerprint=config_fingerprint,
+        )
+
+    def _request_query_drain(self, scope: StateScope, *, fencing_token: int) -> None:
+        """Stop new admissions briefly without revoking any running reader.
+
+        Condition on the observed fence: a losing publisher must not close
+        admission on a generation another publisher just activated (#541).
+        """
+        self._adapter.execute(
+            f"""
+            UPDATE {self._ref(LEDGER_TABLE)} SET query_drain_until_epoch = ?
+            WHERE model_name = ? AND stage = ? AND target_identity = ?
+              AND fencing_token = ? AND publication_id IS NULL
+            """,
+            [int(time.time()) + QUERY_DRAIN_SECONDS, *self._scope_params(scope), fencing_token],
         )
 
     def verify_publish(self, lease: PublishLease) -> None:
@@ -1070,6 +1093,7 @@ class ServingCoordinator:
                 "This search index has no ready publication; re-run `stel run` "
                 "and resolve any recorded failure first"
             )
+        self._check_query_drain(row)
         fencing_token = int(row[0])
         status = str(row[1])
         pinned_generation = str(row[5])
@@ -1093,6 +1117,7 @@ class ServingCoordinator:
                 WHERE model_name = ? AND stage = ? AND target_identity = ?
                   AND status IN (?, ?, ?)
                   AND fencing_token = ? AND active_generation = ?
+                  AND (query_drain_until_epoch IS NULL OR query_drain_until_epoch <= ?)
             )
             """,
             [
@@ -1105,6 +1130,7 @@ class ServingCoordinator:
                 *SERVABLE_STATUSES,
                 fencing_token,
                 pinned_generation,
+                int(time.time()),
             ],
         )
         held = self._adapter.rows(
@@ -1152,6 +1178,39 @@ class ServingCoordinator:
             raise
         return lease
 
+    @staticmethod
+    def _check_query_drain(row: tuple[Any, ...]) -> None:
+        if row[23] is not None and int(row[23]) > int(time.time()):
+            raise ServingBusyError(
+                "A publisher has requested query readers to drain; retry the query shortly"
+            )
+
+    def refresh_query(self, lease: QueryLease) -> QueryLease:
+        """Readmit a session's pin with one read and current status (#541).
+
+        Reuse never admits a new reader to a superseded generation. Existing
+        holders may finish across cutover, using ordinary validate_query.
+        """
+        row, held = self._read_row_and_lease(lease)
+        self._validate_query_row(lease, row, held, require_active=False)
+        assert row is not None
+        self._check_query_drain(row)
+        if (
+            row[5] != lease.pinned_generation
+            or row[4] != lease.config_fingerprint
+            or row[11] != lease.pinned_collection
+        ):
+            raise StaleServingLeaseError(
+                "The pinned search-index generation is no longer active; retry the query"
+            )
+        status = str(row[1])
+        return replace(
+            lease,
+            status=status,
+            safe_error_code=str(row[6])
+            if status == STATUS_DEGRADED and row[6] is not None else None,
+        )
+
     def validate_query(self, lease: QueryLease, *, require_active: bool = False) -> None:
         """Verify the durable pin, which survives private-generation cutover.
 
@@ -1168,6 +1227,12 @@ class ServingCoordinator:
         than reading them at two.
         """
         row, held = self._read_row_and_lease(lease)
+        self._validate_query_row(lease, row, held, require_active=require_active)
+
+    @staticmethod
+    def _validate_query_row(
+        lease: QueryLease, row: tuple[Any, ...] | None, held: bool, *, require_active: bool
+    ) -> None:
         if (
             row is None
             or not held

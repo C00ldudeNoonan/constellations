@@ -52,7 +52,8 @@ from .retrieval import (
     collection_config_fingerprint,
     create_store,
 )
-from .retrieval.coordination import STATUS_DEGRADED
+from .retrieval.coordination import STATUS_DEGRADED, QueryLease, ServingCoordinationError
+from .retrieval.query_pins import SessionQueryPins
 from .timing import PhaseTimings
 
 log = logging.getLogger(__name__)
@@ -337,9 +338,9 @@ class _HeldWarehouse:
 class SearchSession:
     """Query setup a long-lived server reuses across requests (issue #523).
 
-    A query's warehouse lease, its embedding and its index lookups are per
-    request. Compiling the project, resolving the profile and opening the
-    retrieval store are not: none of them can change under a running server,
+    A query's embedding and index lookups are per request; its durable pin
+    may be shared across requests. Compiling the project, resolving the
+    profile and opening the retrieval store are not: none of them can change under a running server,
     which is why `WarehouseContextRepository` already caches the first two.
     The search path cached none of them, so every MCP request redid all three.
 
@@ -362,8 +363,9 @@ class SearchSession:
     call, because its open handle is an exclusive lock that would block
     `stel run` in another process for as long as the server ran.
 
-    Deliberately not cached: the query lease. It is the generation pin and the
-    concurrency control, so it is re-taken per request even here.
+    Remote operator queries share a durable pin between requests (#541),
+    validating it at each admission. File-backed warehouses keep per-query
+    pins so an idle server does not block the local build loop.
 
     Concurrency: the MCP tools are registered as synchronous functions, so the
     SDK runs them off the event loop and concurrent callers are not
@@ -397,6 +399,31 @@ class SearchSession:
         # Decided on the first open and remembered, so a file-backed warehouse
         # does not construct a throwaway adapter per call to ask again.
         self._warehouse_holdable: bool | None = None
+        self._query_pins: SessionQueryPins | None = None
+
+    @contextmanager
+    def query_lease(
+        self, coordinator: ServingCoordinator, scope: StateScope, *, legacy_scope: StateScope,
+        timings: PhaseTimings,
+    ) -> Iterator[QueryLease]:
+        """Share pins only where a held operator connection is supported."""
+        with self._lock:
+            if self._held is not None and self._query_pins is None:
+                self._query_pins = SessionQueryPins(lambda: self.warehouse(None))
+            pins = self._query_pins
+        if pins is not None:
+            with pins.query(
+                coordinator, scope, legacy_scope=legacy_scope, timings=timings
+            ) as lease:
+                yield lease
+            return
+        with timings.phase("lease"):
+            lease = coordinator.acquire_query(scope, legacy_scope=legacy_scope)
+        try:
+            yield lease
+        finally:
+            with timings.phase("lease"):
+                coordinator.release_query(lease)
 
     def resolve(self, timings: PhaseTimings | None) -> _ResolvedProject:
         """Compile the project and resolve the profile, once per session."""
@@ -625,6 +652,8 @@ class SearchSession:
                 log.debug("Discarding a failed retrieval store raised on close")
 
     def close(self) -> None:
+        if self._query_pins is not None:
+            self._query_pins.close()
         with self._lock:
             aliases = list(self._stores)
         for alias in aliases:
@@ -805,11 +834,9 @@ def _search(
             coordinator = ServingCoordinator(adapter, ensure_schema=ensuring_schema)
             if ensuring_schema:
                 session.mark_schema_ensured()
-            with timings.phase("lease"):
-                lease = coordinator.acquire_query(
-                    state_scope, legacy_scope=legacy_state_scope
-                )
-            try:
+            with session.query_lease(
+                coordinator, state_scope, legacy_scope=legacy_state_scope, timings=timings
+            ) as lease:
                 if lease.config_fingerprint != expected_fingerprint:
                     raise SearchError(
                         f"Search index '{model.name}' was published under a different "
@@ -864,9 +891,6 @@ def _search(
                     )
                 with timings.phase("lease"):
                     coordinator.validate_query(lease)
-            finally:
-                with timings.phase("lease"):
-                    coordinator.release_query(lease)
     except SearchError:
         raise
     except (AdapterError, RetrievalError) as error:
@@ -875,7 +899,9 @@ def _search(
         # reopen (issue #523). AdapterError is a warehouse failure, not a
         # store one, and leaves the store cached; `session.warehouse()` has
         # already retired a held connection on it.
-        if isinstance(error, RetrievalError):
+        # Admission/drain refusals do not mean the store failed. Closing it
+        # here could interrupt another reader that still holds its pin (#541).
+        if isinstance(error, RetrievalError) and not isinstance(error, ServingCoordinationError):
             session.discard_store(alias)
         raise SearchError(str(error)) from None
 

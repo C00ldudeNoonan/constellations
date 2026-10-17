@@ -4128,6 +4128,26 @@ result validation. Private-generation builds allow both existing and new readers
 of the old generation, including across activation. In-place publication still
 excludes queries and is blocked while any query lease is held.
 
+On warehouses that support held operator connections (BigQuery and MotherDuck),
+a serving session shares one durable pin per index across overlapping queries
+and short idle periods. Every query validates the pin against the live ledger
+before reuse and after store I/O, including current ready/degraded status.
+Warm queries need two serving reads and no lease INSERT/DELETE. Initial
+admission keeps its full protocol. File-backed DuckDB keeps per-query pins;
+one-shot CLI sessions release their pins when they close.
+
+An idle pin is released after 30 seconds, checked every 5 seconds. An in-place
+publisher blocked by pins requests a 60-second admission pause and returns a
+busy error: retry the run after readers drain. New and reused queries report a
+retryable error asking them to wait during that pause; running queries finish
+normally. Idle sessions normally release within 35 seconds of their last
+completed query, plus warehouse I/O; active queries may take longer. If the
+publisher abandons its retry, the pause expires automatically. This deadline
+expires only the admission pause, never
+a reader's durable pin. Session shutdown also waits for an in-flight worker
+to release its own pin, including a worker whose caller already timed out.
+See [ADR-0035](adr/0035-session-query-pins-drain-without-expiring-readers.md).
+
 Superseded generations are retired only after query leases drain. If readers
 still hold pins at cutover, cleanup is deferred to a later private build; a
 stale lease is not silently expired. The unsuffixed legacy collection is never

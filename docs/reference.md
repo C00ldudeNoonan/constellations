@@ -3736,6 +3736,33 @@ stel search --model chunk_search --query "labor market" \
   --filter category in '["employment", "wages"]'
 ```
 
+#### How hybrid ranks
+
+Hybrid runs the vector and the text query separately, each returning up to
+`candidate_limit` chunks, and fuses the two rankings with reciprocal rank
+fusion (RRF, rank constant 60). **It fuses documents, not chunks**, when the
+index declares a `document_id_field` (the default, `document_id`):
+
+1. Each ranking collapses to documents, at the rank of their best chunk.
+2. RRF combines the two document rankings.
+3. The result expands back to chunks interleaved: every document's best chunk
+   in document order, then every document's second chunk, and so on. Within
+   a document, chunks keep their chunk-level RRF order.
+
+So the first results span as many documents as the candidates do, and a
+chunk's `score` is its document's fused score: a document's second chunk can
+score above the next document's first. Order by `rank`, not `score`.
+`contributing_ranks` still names where *this chunk* ranked in each leg.
+
+An index with `document_id_field: null` fuses chunks directly, which was the
+only behavior before issue #701. Chunk-level fusion lets a chunk ranked
+middling in both legs outrank a chunk ranked first in only one. Over one
+company's filings that put boilerplate above the filing that both legs ranked
+first, through different chunks. On a 41-question SEC golden set, hybrid
+recall@5 was 0.56, below text alone at 0.62; fusing documents raises it to
+0.62 and nDCG@5 from 0.57 to 0.61. ADR-0036 records the measurement and the
+alternatives.
+
 #### Where a query's time goes
 
 `-v` reports the query's wall clock by phase on stderr, so it composes with

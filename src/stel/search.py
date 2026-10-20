@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
@@ -1309,7 +1309,10 @@ def _execute_query(
     if request.mode == SearchMode.TEXT:
         return text_rows
     with timings.phase("fuse"):
-        return _rrf({"vector": vector_rows, "text": text_rows})
+        legs = {"vector": vector_rows, "text": text_rows}
+        if search_config.document_id_field is None:
+            return _rrf(legs)
+        return _rrf_by_document(legs, document_id_field=search_config.document_id_field)
 
 
 def _rank_table(table: pa.Table, id_field: str) -> list[_RankedRow]:
@@ -1392,6 +1395,63 @@ def _rrf(
         )
         for record_id in ordered
     ]
+
+
+def _rrf_by_document(
+    ranked: Mapping[str, Sequence[_ScoredRow]],
+    *,
+    document_id_field: str,
+    rank_constant: int = 60,
+) -> list[_ScoredRow]:
+    """Hybrid fusion at document grain (ADR-0036, issue #701).
+
+    Chunk-grain RRF lets a chunk that ranks middling in *both* legs outrank
+    the single best chunk of either leg, so a document whose best chunk
+    differs per leg loses to boilerplate from its neighbours. Each leg is
+    therefore collapsed to documents at the rank of their best chunk and the
+    documents are fused. The result expands back to chunks interleaved: every
+    document's best chunk in document order, then every document's second,
+    so a record-grain caller sees one chunk per document before a second from
+    any. Within a document chunks keep their chunk-grain RRF order.
+
+    A chunk's score is its document's fused score, so a document's second
+    chunk scores above the next document's first: rank is the ordering. A row
+    with no document id is its own document, which is chunk-grain RRF.
+    """
+    chunks = _rrf(ranked, rank_constant=rank_constant)
+    if not chunks:
+        return []
+
+    def document_key(values: Mapping[str, Any], record_id: str) -> tuple[str, str]:
+        # Tagged so a record id can never collide with a document id.
+        document_id = values.get(document_id_field)
+        if isinstance(document_id, str) and document_id:
+            return ("document", document_id)
+        return ("record", record_id)
+
+    scores: dict[tuple[str, str], float] = {}
+    for name in sorted(ranked):
+        seen: set[tuple[str, str]] = set()
+        for row in ranked[name]:
+            key = document_key(row.values, row.record_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rank_constant + len(seen))
+    maximum = sum(1 for rows in ranked.values() if rows) / (rank_constant + 1)
+
+    members: dict[tuple[str, str], list[_ScoredRow]] = {}
+    for row in chunks:
+        members.setdefault(document_key(row.values, row.record_id), []).append(row)
+    documents = sorted(members, key=lambda key: (-scores[key], key[1], key[0]))
+    interleaved: list[_ScoredRow] = []
+    for depth in range(max(len(rows) for rows in members.values())):
+        interleaved.extend(
+            replace(members[key][depth], score=scores[key] / maximum)
+            for key in documents
+            if depth < len(members[key])
+        )
+    return interleaved
 
 
 def _to_result(

@@ -4,12 +4,13 @@ What this PR changes, in 1–3 sentences.
 
 ## Tracking
 
-- Closes #<!-- GitHub issue; only when this PR fully satisfies its acceptance criteria -->
-- Theme: ALE-<!-- the Linear theme this sits under -->
+- Closes #<!-- GitHub issue; `Part of #N` unless this PR meets its done-when -->
+- Fixes ALE-<!-- the leaf Linear issue this PR completes; `Part of ALE-nn` if not -->
+- Theme: ALE-<!-- the parent theme, as a bare identifier -->
 
-<!-- Write the Linear theme as a bare identifier. Never "Fixes ALE-nn" or
-     "Closes ALE-nn": a theme spans many issues and PRs, and a closing keyword
-     completes it on merge, hiding whatever is left underneath. -->
+<!-- Never put a closing keyword ("Fixes", "Closes", "Resolves") on the theme:
+     it spans many issues and PRs, and completing it on merge hides whatever
+     is left open under it. AGENTS.md, "Change, GitHub, and Linear hygiene". -->
 
 ## Test plan
 

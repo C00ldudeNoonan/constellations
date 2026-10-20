@@ -1,98 +1,77 @@
 ---
 name: linear-sync
-description: Keep GitHub issues and PRs linked to their Linear theme, in both directions. Use when filing a GitHub issue, opening a PR, or after one merges — and when asked which theme something belongs to, or why a Linear theme looks idle while work is shipping.
+description: File work in Linear and keep a Linear issue, its GitHub twin and its PRs linked. Use when filing an issue, opening a PR, or after one merges — and when asked where an issue belongs, or why Linear and GitHub disagree about what is open.
 ---
 
-# Linking GitHub work to Linear themes
+# Linear and GitHub, kept in step
 
-**Linear tracks themes; GitHub tracks work.** One Linear issue spans many
-GitHub issues and many PRs. Mirroring them one-to-one makes both lists
-worthless — Linear stops being a place to see shape and becomes a slower copy
-of the GitHub tracker.
+**Linear holds the backlog; GitHub holds the work** (AGENTS.md, "Change,
+GitHub, and Linear hygiene"; issue #705, ALE-311). A leaf Linear issue has
+exactly one GitHub twin, made when work starts. A theme is a Linear parent
+issue with leaf children; it never has a twin of its own.
 
-- Team prefix: `ALE`. Projects: **Constellations** (this repo, `stel`) and
+- Team prefix `ALE`. Projects: **Constellations** (this repo, `stel`) and
   **Astrolabe** (the downstream data project).
-- Themes are Linear issues in those projects, e.g. "AI harness feedback loop",
-  "Retrieval quality", "Backend reach".
+- To start work, use the `start-issue` skill. This one covers filing, the PR
+  and the merge.
 
-## Find the theme
+## Filing an issue
 
-Never work from a list of themes written down anywhere — it goes stale. Query:
+1. Find its theme. Query, never a list written down anywhere:
+   `list_issues(project="Constellations", state="Backlog|Todo")`, top-level
+   issues only. Match on what the work is *about*, not which files it touches.
+   If nothing fits, say so and ask: a new theme is a decision about the
+   project's shape.
+2. `save_issue` with `team: "ALE"`, `project`, `parentId` (the theme),
+   `milestone` (the theme's, unless the issue belongs to a different phase),
+   `priority`, and `state` Todo or Backlog. Give it a problem statement and a
+   done-when.
+3. Write GitHub references with their repo in Linear text
+   (`constellations#701`, `astrolabe#1178`): Linear links a bare `#701` to
+   whatever has that number in another repo.
+4. Do not create the GitHub issue. `start-issue` does, when work starts.
 
-```
-list_issues(project="Constellations", state="Backlog|Todo|In Progress")
-```
+An issue that already exists on GitHub (filed from outside, or older) gets its
+Linear issue now: file it as above, append
+`Synced from Linear [ALE-nn](https://linear.app/alex-noonan/issue/ALE-nn)` to
+the GitHub body, and attach the GitHub link in Linear (`save_issue` `links`).
 
-Match on what the work is *about*, not on which files it touches. If nothing
-fits, say so and ask rather than inventing a theme; a new theme is a decision
-about how the project is shaped, not a side effect of filing an issue.
+## Opening a PR
 
-## The three links, and which are reliable
-
-| direction | mechanism | reliable? |
-|---|---|---|
-| GitHub issue → theme | `Theme: ALE-nn` + URL in the issue body | yes, you write it |
-| PR → theme | bare `ALE-nn` in the PR body | best-effort; Linear may or may not surface it |
-| theme → GitHub | a comment on the Linear issue naming the issue/PR | **yes — this is the one that always works** |
-
-Branches here are named `feat/<issue>-<slug>` and carry no `ALE-` identifier,
-so **Linear's automatic branch linking never fires.** That is the whole reason
-the theme looks idle while work ships. Do not rely on the integration noticing;
-post the comment.
-
-## The trap: closing keywords
-
-Write the identifier bare — `ALE-45`, or `Theme: ALE-45`.
-
-**Never** `Fixes ALE-45`, `Closes ALE-45`, or `Resolves ALE-45`. Those are
-Linear's completion keywords: merging one PR would mark the whole theme done
-and bury every GitHub issue still open underneath it. A theme is finished when
-a human decides it is, not when one of its PRs lands.
-
-The same word is correct on the GitHub side — `Closes #380` is right when the
-PR genuinely satisfies that issue. The keyword is safe for a GitHub issue and
-wrong for a Linear theme, which is exactly why it is easy to get wrong.
-
-## What to write
-
-**Filing a GitHub issue** — first line of the body:
+In the Tracking section the template provides:
 
 ```
-Theme: ALE-45 — AI harness feedback loop
-https://linear.app/alex-noonan/issue/ALE-45/ai-harness-feedback-loop
+- Closes #705
+- Fixes ALE-311
+- Theme: ALE-48
 ```
 
-Then comment on the theme:
+- `Closes #N` only when the PR satisfies the GitHub issue's done-when;
+  `Part of #N` otherwise.
+- `Fixes ALE-nn` names the **leaf** issue, so Linear's GitHub app links the PR
+  and moves the issue to Done on merge. `Part of ALE-nn` links without closing.
+- **Never a closing keyword on a theme.** `Fixes`, `Closes` or `Resolves`
+  against a parent would complete it on merge and hide every child still
+  open. Write the parent as `Theme: ALE-nn`.
+- Attach the PR in Linear as well (`save_issue` `links`), so the link exists
+  even if the app misses it.
 
-```
-save_comment(issue="ALE-45", body="GitHub #380 — candidate judgments and
-promotion (#329 phase 3). https://github.com/.../issues/380")
-```
+## After a merge
 
-**Opening a PR** — in the Tracking section the template already provides:
+- Check that the leaf issue went to Done. Done means shipped and verified.
+- If something is still owed (a release, a check against astrolabe's prod),
+  move it to **In Review** with a comment saying what is owed and how it will
+  be checked. Move it to Done once that is recorded. In Review never means
+  "PR open, awaiting review"; that stays In Progress.
+- A theme closes when a human decides it is done, not when its last PR lands.
+  If its children are all closed, say so in a comment on the theme, naming the
+  evidence, and leave the decision to them.
 
-```
-- Closes #380
-- Theme: ALE-45
-```
+## When the trackers disagree
 
-**After a PR merges** — one line on the theme saying what actually shipped:
-
-```
-save_comment(issue="ALE-45", body="Shipped in #387: candidate retrieval
-judgments derived from the transcript corpus. #380 remains open for promotion
-and classification labels.")
-```
-
-## Keep it proportionate
-
-A theme wants a line per GitHub issue and per merged PR — enough to see what
-moved and what remains. It does not want a running log of commits, review
-rounds, or CI results. If a theme's comment history is longer than its
-description, the traffic has stopped being signal.
-
-## When the theme is genuinely done
-
-Say so in a comment naming the evidence, and let a human close it. If several
-GitHub issues under it are still open, it is not done — that is the situation
-the closing-keyword rule exists to prevent.
+- A Linear issue still open after its GitHub issue and every PR closed:
+  suggest Done or Canceled.
+- A GitHub issue with no `Synced from Linear` footer: it has no Linear issue
+  yet. File one.
+- A parent In Progress: move it to Todo or Backlog; its state is its children's.
+- More than five leaf issues In Progress: finish one before starting another.

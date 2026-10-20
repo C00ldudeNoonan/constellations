@@ -750,6 +750,12 @@ Hybrid semantics are reciprocal rank fusion with a default rank constant of
 rrf_score(id) = sum(1 / (rrf_k + rank_in_component))
 ```
 
+When the index declares a `document_id_field`, `id` in that formula is the
+document, not the record: each component collapses to documents at the rank
+of their best record, and the fused documents expand back to records
+interleaved, best record of each document first ([ADR-0036](../adr/0036-hybrid-search-fuses-documents-not-chunks.md),
+issue #701). Without one, `id` is the record.
+
 Core owns candidate deduplication, that formula, and the UTF-8 ID tie-break.
 It calls typed vector and text primitives by default. A store's optional native
 hybrid method is used only when `SERVER_SIDE_HYBRID_RRF` promises identical

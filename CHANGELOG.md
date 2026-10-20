@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Hybrid search fuses documents, not chunks (issue #701)
+
+- **Hybrid no longer ranks below text alone.** Fusing the vector and text legs
+  chunk by chunk let a chunk ranked middling in both legs outrank a filing
+  that both legs ranked first, through a different chunk in each. On a
+  41-question SEC golden set, recall@5 / MRR@5 / nDCG@5 at document grain
+  go from 0.558 / 0.639 / 0.567 to 0.615 / 0.678 / 0.606. Text alone scored
+  0.623 / 0.627 / 0.585.
+- **How it ranks now.** Each leg collapses to documents at the rank of its
+  best chunk, and RRF (still k=60, equal weights) fuses the documents. Chunks
+  come back interleaved: every document's best chunk, then every document's
+  second. So the first results span more documents. A chunk's `score` is its
+  document's fused score; order by `rank`.
+- **Upgrading:** hybrid results on any index with a `document_id_field` (the
+  default) change order, with no republish. A `stel eval` baseline on a
+  hybrid model will move. `document_id_field: null` keeps chunk fusion.
+  ADR-0036 records the alternatives measured.
+
 ### Vector search ranks by the metric the model declares (issue #700)
 
 - **`search.vector.metric` now reaches every query.** Under `search: exact`,

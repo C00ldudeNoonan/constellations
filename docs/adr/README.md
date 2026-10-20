@@ -45,6 +45,7 @@ history (issue #311).
 | [0033](0033-an-embedding-is-cached-locally-by-text-and-a-plan-is-priced-from-history.md) | Every embedding a provider returns is cached locally by text and configuration before its window publishes; `stel plan` prices rows from the run log's cost per provider row | accepted |
 | [0034](0034-a-run-over-its-cost-threshold-asks-and-refuses-without-a-terminal.md) | A run whose projected provider cost is over the target's `confirm_cost_above_usd` asks at a terminal and refuses without one; `--full-refresh` and `--accept-reprocess` do not release it | accepted |
 | [0035](0035-session-query-pins-drain-without-expiring-readers.md) | Remote serving sessions share durable query pins and drain cooperatively; a clock never revokes a running reader | accepted |
+| [0036](0036-hybrid-search-fuses-documents-not-chunks.md) | Hybrid search fuses documents, at the rank of their best chunk, and interleaves their chunks back out; RRF's constant and equal weights stay | accepted |
 
 ## When to write one
 

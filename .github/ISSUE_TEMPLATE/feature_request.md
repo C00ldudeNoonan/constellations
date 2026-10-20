@@ -7,7 +7,9 @@ labels: enhancement
 
 **Theme**
 
-The Linear theme this belongs under (`ALE-nn` and its URL), or say so if none fits yet.
+Work is tracked in Linear. Name the Linear theme this belongs under (`ALE-nn`)
+if you know it; a maintainer files the Linear issue and adds the
+`Synced from Linear` footer here.
 
 **The problem**
 

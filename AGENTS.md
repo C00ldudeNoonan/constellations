@@ -21,8 +21,10 @@ Use these maintained references rather than copying volatile feature lists:
 - `docs/adr/` — decision records: what was ruled out and why. Read the index
   before revisiting a design that looks arbitrary, and add one when a decision
   had a real alternative a contributor would plausibly try.
-- GitHub issues labeled `roadmap` — planning context. Verify every claim against
-  current code, tests, and user docs before describing it as implemented.
+- Linear project `Constellations` — the backlog, its themes and milestones, and
+  what is next (see "Change, GitHub, and Linear hygiene"). Verify every claim
+  against current code, tests, and user docs before describing it as
+  implemented.
 
 ## Architecture and product boundaries
 
@@ -158,26 +160,81 @@ the next test to touch it will not know to.
 
 ## Change, GitHub, and Linear hygiene
 
-Linear tracks **themes**; GitHub tracks **work**. One Linear issue (team prefix
-`ALE`, project `Constellations` for this repo, `Astrolabe` for the downstream
-data project) spans many GitHub issues and many PRs. Never mirror the two
-one-to-one — a Linear issue per GitHub issue makes both lists worthless.
+**Linear holds the backlog; GitHub holds the work.** Linear (team prefix `ALE`,
+project `Constellations` for this repo, `Astrolabe` for the downstream data
+project) is the source of truth for what exists, where it sits and what is
+next. GitHub is where a piece of work gets its branch, PR and review. Decided
+2026-10-20 (issue #705, ALE-311), following astrolabe (astrolabe#1181,
+ALE-228). Before then GitHub `triage:*` labels picked the next issue and Linear
+held only themes, so "next" rested on labels nobody maintained and six themes
+sat In Progress with nothing open under them. Those labels are retired.
 
-- **Every GitHub issue names its theme.** Put `Theme: ALE-nn — <title>` and the
-  Linear URL in the body. Find the theme by listing open Linear issues in the
-  project rather than from a list kept here, which would go stale; if none
-  fits, say so in the issue and ask instead of inventing one.
-- **Every PR names the theme too**, as a bare identifier (`ALE-nn`) in the
-  body. **Never use a Linear closing keyword** — `Fixes ALE-nn`, `Closes
-  ALE-nn`, `Resolves ALE-nn` — because a theme outlives any single PR, and
-  auto-completing it hides every remaining GitHub issue underneath.
-- **Post the back-link.** When a GitHub issue is filed under a theme, or a PR
-  merges under one, add a one-line comment on the Linear theme naming the
-  issue or PR and what it did. Branch names here are `feat/<issue>-<slug>` and
-  carry no `ALE-` identifier, so Linear's automatic branch linking does not
-  fire; the comment is the link that is actually guaranteed to exist.
-- Keep the traffic proportionate: a theme wants a line per GitHub issue and per
-  merged PR, not a running log of every commit.
+**Where an issue goes in Linear.**
+
+| Level | Use it for | Example |
+|---|---|---|
+| Project | A separately shippable product or repo | Constellations, Astrolabe |
+| Milestone | A sequenced phase with a done-when and a real target date | Phase 1 — Dogfood |
+| Parent issue (a *theme*) | One body of work, with what "done" means for it | ALE-48 Retrieval quality |
+| Leaf issue | One piece of work: one GitHub issue, one or a few PRs | ALE-305 Snowflake adapter |
+
+Do not nest more than one level. A group of more than six issues that will
+take longer than a week gets a milestone. In Linear text, write a GitHub
+reference with its repo (`constellations#701`): Linear turns a bare `#701` into
+a link to whatever has that number in another repo.
+
+**Filing an issue.** File it in Linear (`save_issue`), not with `gh issue
+create`: a title, a problem statement and a done-when, placed under its parent
+theme with a priority, in **Todo** (next up) or **Backlog** (not yet). Do not
+create its GitHub issue yet. If no theme fits, say so and ask rather than
+inventing one: a new theme is a decision about the project's shape.
+
+**Picking the next issue** is a Linear query, not a scan of GitHub:
+
+- **State Todo, leaf issues only**, ordered by the target date of the issue's
+  milestone (none sorts last), then by priority. A parent is never picked:
+  take its next child.
+- **Keep In Progress short.** At most five leaf issues In Progress in the
+  project; at the limit, finish one before starting another. In Progress means
+  a branch or an open PR exists.
+- **A parent is never In Progress** and never counts toward that limit. Its
+  state is its children's.
+- **Skip an issue claimed on GitHub** (`scripts/check_issue_claim.py` exit 1).
+
+**Starting work on ALE-nn** (the `start-issue` skill runs all of this):
+
+1. Find or create its GitHub twin: `python scripts/linear_twin.py ALE-nn`.
+   Exit 0 prints it; exit 1 means none, so create it with `--create --title
+   "<title>" --body-file <file>`; exit 2 means it could not check. The body's
+   first line is `Theme: ALE-<parent> — <title>`, which names the parent; the
+   script adds the `Synced from Linear [ALE-nn](url)` footer, which is the only
+   thing that marks a twin. Never search GitHub for the identifier: search
+   matches substrings.
+2. Attach the GitHub issue in Linear (`save_issue` `links`).
+3. Claim it: `python scripts/check_issue_claim.py N`, then `--claim --branch
+   feat/<N>-<slug>`. Every session runs as one GitHub account, and the claim
+   comment naming the branch is what tells sessions apart. Exit 1 means stop
+   and ask; exit 2 is not a pass. Re-check with `--mine <branch>` just before
+   `gh pr create`, and `--release` a claim whose work is dead.
+4. Move the Linear issue to In Progress.
+
+**Opening the PR.** `Closes #N` closes the GitHub issue on merge; `Part of #N`
+does not. Put `Fixes ALE-nn` on the **leaf** issue in the body too, and attach
+the PR in Linear (`save_issue` `links`) so the link exists even if Linear's
+GitHub app misses it. **Never put a closing keyword on a theme** (`Fixes`,
+`Closes`, `Resolves` against a parent): a theme outlives any single PR, and
+completing it on merge hides everything still open under it. Name the theme as
+`Theme: ALE-nn` instead.
+
+**On merge**, check that the leaf issue went to Done. Done means shipped and
+verified. If something is still owed after the merge (a release, a check
+against astrolabe's prod), move it to **In Review** with a comment saying what
+is owed, and to Done once that is recorded. In Review never means "PR open":
+that stays In Progress.
+
+An issue that arrived GitHub-first (from outside, or an older one) gets its
+Linear issue now: file it in Linear, add the footer to the GitHub body, and
+attach the GitHub link.
 
 - Inspect the worktree first. Preserve unrelated user changes, use an isolated
   worktree when branches conflict, and stage explicit files only.
@@ -185,8 +242,9 @@ one-to-one — a Linear issue per GitHub issue makes both lists worthless.
   generated example data, `dist/`, root `docs/research/`, root `docs/private/`,
   or any `_scratch/` directory. Put reusable review findings in issue/PR
   comments instead of committing temporary notes.
-- Search open and closed issues before creating one. Comment on an existing
-  tracker when the scope overlaps; create a new issue only for distinct work.
+- Search Linear, and open and closed GitHub issues, before filing one. Comment
+  on an existing issue when the scope overlaps; file a new one only for
+  distinct work.
 - Link implementation PRs to their related issues. Use `Closes #…` only when
   the PR fully satisfies that issue's acceptance criteria; keep parent/design
   issues open when follow-up work remains.

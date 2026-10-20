@@ -43,6 +43,9 @@ python scripts/linear_twin.py ALE-nn
   GitHub references written bare (`#701`) since it now lives on GitHub. Then
   `python scripts/linear_twin.py ALE-nn --create --title "<title>" --body-file <file>`.
   It adds the footer and refuses to make a second twin.
+  If another session created one at the same moment, the earliest wins: the
+  script closes yours as a duplicate and prints the winner. Use the number it
+  prints.
 - Exit 2 means it could not check. Create nothing.
 - Never search GitHub for `ALE-nn` instead: search matches substrings.
 - Attach the twin in Linear: `save_issue` with

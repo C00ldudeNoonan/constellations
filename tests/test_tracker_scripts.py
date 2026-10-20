@@ -46,6 +46,16 @@ def test_only_the_footer_makes_a_twin() -> None:
     assert twin.twins(issues, "ALE-311") == [3]
 
 
+def test_concurrent_creates_agree_on_the_earliest_twin() -> None:
+    """Two sessions that both saw no twin and both created one must settle on
+    the same number, or each claims its own issue and the claim check cannot
+    arbitrate (Codex review on #706). The just-created twin counts even when
+    the listing does not show it yet."""
+    assert twin.earliest([710, 712], 712) == 710
+    assert twin.earliest([710, 712], 710) == 710
+    assert twin.earliest([], 712) == 712
+
+
 def test_the_footer_is_added_once() -> None:
     body = twin.with_footer("Problem.\n\n", "ALE-311")
 

@@ -19,7 +19,11 @@ Issues are listed (`gh issue list --state all`) and matched here rather than
 searched, because search lags a just-created issue.
 
 `--create` appends the footer when the body lacks it, files the issue, and
-prints its number. It refuses when a twin already exists.
+prints its number. It refuses when a twin already exists. Two sessions can
+both see no twin and both create one, so after creating it lists again: the
+earliest twin wins, and a session whose twin is not the earliest closes its
+own as a duplicate and prints the winner. Both sessions then hold the same
+number, and the claim check arbitrates who works it.
 
 Exit 0: a twin was found, or created with --create. Its number is printed.
 Exit 1: no twin, and --create was not given.
@@ -64,6 +68,12 @@ def twins(issues: list[dict[str, Any]], identifier: str) -> list[int]:
     return sorted(
         int(issue["number"]) for issue in issues if pattern.search(issue.get("body") or "")
     )
+
+
+def earliest(found: list[int], created: int) -> int:
+    """The twin every session agrees on: the lowest number, counting the one
+    just created even if the listing does not show it yet."""
+    return min({*found, created})
 
 
 def with_footer(body: str, identifier: str) -> str:
@@ -114,6 +124,21 @@ def create(title: str, body: str) -> int:
     return int(match.group(1))
 
 
+def close_duplicate(number: int, winner: int, identifier: str) -> None:
+    run(
+        [
+            "gh",
+            "issue",
+            "close",
+            str(number),
+            "--reason",
+            "not planned",
+            "--comment",
+            f"Duplicate of #{winner}: another session created {identifier}'s twin first.",
+        ]
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Find, or create, the GitHub issue for a Linear issue."
@@ -142,13 +167,17 @@ def main(argv: list[str] | None = None) -> int:
                     + ". Close the extras as duplicates.",
                     file=sys.stderr,
                 )
-            print(found[-1])
+            print(found[0])
             return 0
         if not args.create:
             print(f"{identifier} has no GitHub twin.", file=sys.stderr)
             return 1
         body = with_footer(args.body_file.read_text(encoding="utf-8"), identifier)
-        number = create(args.title, body)
+        created = create(args.title, body)
+        number = earliest(twins(list_issues(), identifier), created)
+        if number != created:
+            close_duplicate(created, number, identifier)
+            print(f"{identifier} already had twin #{number}; closed #{created}.", file=sys.stderr)
     except (CheckError, OSError, json.JSONDecodeError) as exc:
         print(f"Could not check {identifier}: {exc}", file=sys.stderr)
         return 2

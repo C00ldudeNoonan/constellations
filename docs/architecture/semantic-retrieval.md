@@ -26,7 +26,9 @@ implements `WarehouseAdapter`, exposes arbitrary SQL, or becomes the only copy
 of a row.
 
 The supported proving implementation is local LanceDB. No additional retrieval
-store is currently on the roadmap. Features are
+store has been accepted; the BigQuery-native design review in
+[bigquery-native-retrieval.md](bigquery-native-retrieval.md) is complete, with
+the adopt-or-defer decision tracked in Linear ALE-257. Features are
 capabilities, not assumptions: a vector-only store can implement this contract
 without pretending to support BM25, hybrid search, online schema evolution, or
 atomic replacement.

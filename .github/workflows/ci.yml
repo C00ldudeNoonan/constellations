@@ -42,3 +42,24 @@ jobs:
           name: junit-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci/junit.xml
           retention-days: 30
+
+  latest-warehouse-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: latest
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync locked project dependencies
+        run: uv sync --all-extras --dev --locked
+      # An isolated overlay exercises the newest allowed drivers without
+      # churning uv.lock or changing the primary reproducible test job.
+      - name: Pytest with latest DuckDB and Polars
+        run: >-
+          uv run --locked --with 'duckdb>=2' --with 'polars>=2'
+          pytest -q -n auto --dist loadfile
+          -W 'error:Arrow output on a DB-API result makes an extra copy:UserWarning'

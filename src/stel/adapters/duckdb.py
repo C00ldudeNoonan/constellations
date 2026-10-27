@@ -181,6 +181,29 @@ def _arrow_reader_digest(schema: pa.Schema) -> Any:
 
 
 def _update_arrow_digest(digest: Any, batch: pa.RecordBatch) -> None:
+    if not any(column.null_count for column in batch.columns):
+        _update_digest_payload(digest, batch)
+        return
+    # Arrow leaves value bytes behind NULLs unspecified, and DuckDB 2 may
+    # return different ones for the same logical row on a second read. Hash
+    # such a column as its validity plus its non-null values, both built by
+    # Arrow kernels: a round trip through Python objects would refuse valid
+    # dates past year 9999 and nanosecond timestamps.
+    digest.update(b"\x01")
+    for field, column in zip(batch.schema, batch.columns, strict=True):
+        if column.null_count:
+            digest.update(b"n")
+            parts = [column.is_valid().cast(pa.int8()), column.drop_null()]
+        else:
+            digest.update(b"v")
+            parts = [column]
+        for part in parts:
+            _update_digest_payload(
+                digest, pa.RecordBatch.from_arrays([part], names=[field.name])
+            )
+
+
+def _update_digest_payload(digest: Any, batch: pa.RecordBatch) -> None:
     payload = batch.serialize().to_pybytes()
     digest.update(len(payload).to_bytes(8, "big"))
     digest.update(payload)
@@ -357,6 +380,7 @@ class DuckDBAdapter(WarehouseAdapter):
         super().__init__(config, project_dir=project_dir)
         self._con: duckdb.DuckDBPyConnection | None = None
         self._catalog: str = ""
+        self._deferred_unregister: set[str] = set()
 
     @classmethod
     def adapter_type(cls) -> str:
@@ -752,20 +776,20 @@ class DuckDBAdapter(WarehouseAdapter):
         self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None
     ) -> int:
         full = self.table_ref(table)
-        self.connection.register("stel_staging", df)
+        self._register_frame("stel_staging", df)
         try:
             self.connection.execute(
                 f"CREATE OR REPLACE TABLE {full} AS SELECT * FROM stel_staging"
             )
         finally:
-            self.connection.unregister("stel_staging")
+            self._unregister_frame("stel_staging")
         return df.height
 
     def append_rows(self, table: str, df: pl.DataFrame) -> int:
         if df.height == 0:
             return 0
         full = self.table_ref(table)
-        self.connection.register("stel_append", df)
+        self._register_frame("stel_append", df)
         try:
             # BY NAME tolerates a log whose column order differs from an
             # older table's; a genuinely new column still fails loudly rather
@@ -779,7 +803,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 f"INSERT INTO {full} BY NAME SELECT * FROM stel_append"
             )
         finally:
-            self.connection.unregister("stel_append")
+            self._unregister_frame("stel_append")
         return df.height
 
     def _evolve_append_target(self, full: str, df: pl.DataFrame) -> None:
@@ -841,6 +865,7 @@ class DuckDBAdapter(WarehouseAdapter):
 
     def dry_run_sql(self, select_sql: str) -> SqlRelationSchema:
         try:
+            self._abort_pending_result(self.connection)
             rel = self.connection.sql(
                 f"SELECT * FROM ({select_sql}) AS _stel_dry_run LIMIT 0"
             )
@@ -1002,7 +1027,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 update_when_changed, df.columns, existing, table
             )
         full = self.table_ref(table)
-        self.connection.register("stel_staging", df)
+        self._register_frame("stel_staging", df)
         try:
             self.connection.execute("BEGIN TRANSACTION")
             try:
@@ -1057,7 +1082,7 @@ class DuckDBAdapter(WarehouseAdapter):
             else:
                 self.connection.execute("COMMIT")
         finally:
-            self.connection.unregister("stel_staging")
+            self._unregister_frame("stel_staging")
         _log_publication(
             "incremental",
             f"{self.schema_ref}.{self.quote_ident(table)}",
@@ -1079,7 +1104,7 @@ class DuckDBAdapter(WarehouseAdapter):
         first = True
         try:
             for df in chunks:
-                self.connection.register("stel_staging", df)
+                self._register_frame("stel_staging", df)
                 try:
                     if first:
                         self.connection.execute(
@@ -1099,7 +1124,7 @@ class DuckDBAdapter(WarehouseAdapter):
                             f"SELECT {col_list} FROM stel_staging"
                         )
                 finally:
-                    self.connection.unregister("stel_staging")
+                    self._unregister_frame("stel_staging")
                 total += df.height
             if first:
                 # Empty corpus: drop the target (BigQuery's materialize_full
@@ -1220,7 +1245,7 @@ class DuckDBAdapter(WarehouseAdapter):
         has_rows = new_rows.height > 0 and new_rows.width > 0
         if has_rows:
             validate_incremental_keys(new_rows, child_key)
-            self.connection.register("stel_staging", new_rows)
+            self._register_frame("stel_staging", new_rows)
         try:
             with self._transaction():
                 full = self.table_ref(table)
@@ -1252,13 +1277,25 @@ class DuckDBAdapter(WarehouseAdapter):
                     self._upsert_state_rows(state_scope, state_records)
         finally:
             if has_rows:
-                self.connection.unregister("stel_staging")
+                self._unregister_frame("stel_staging")
         return new_rows.height
 
     def drop_table(self, table: str) -> None:
         self.connection.execute(f"DROP TABLE IF EXISTS {self.table_ref(table)}")
 
     # ─── querying ────────────────────────────────────────────────────────
+
+    def _arrow_relation_reader(
+        self,
+        cursor: duckdb.DuckDBPyConnection,
+        sql: str,
+        params: list[Any],
+        batch_size: int,
+    ) -> pa.RecordBatchReader:
+        self._abort_pending_result(cursor)
+        relation = cursor.sql(sql, params=params)
+        assert relation is not None
+        return relation.to_arrow_reader(batch_size)
 
     def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
         cursor = self._cursor()
@@ -1273,9 +1310,9 @@ class DuckDBAdapter(WarehouseAdapter):
             cursor.execute("BEGIN TRANSACTION")
             transaction_open = True
             table_ref = self.table_ref(request.table)
-            schema_reader = cursor.execute(
-                f"SELECT * FROM {table_ref} LIMIT 0"
-            ).to_arrow_reader(1)
+            schema_reader = self._arrow_relation_reader(
+                cursor, f"SELECT * FROM {table_ref} LIMIT 0", [], 1
+            )
             try:
                 available_columns = frozenset(schema_reader.schema.names)
             finally:
@@ -1310,13 +1347,12 @@ class DuckDBAdapter(WarehouseAdapter):
                 if request.columns is None
                 else ", ".join(self.quote_ident(column) for column in request.columns)
             )
-            if params:
-                cursor.execute(
-                    f"SELECT {projection} FROM {table_ref}{where_sql}", params
-                )
-            else:
-                cursor.execute(f"SELECT {projection} FROM {table_ref}{where_sql}")
-            reader = cursor.to_arrow_reader(request.batch_size)
+            reader = self._arrow_relation_reader(
+                cursor,
+                f"SELECT {projection} FROM {table_ref}{where_sql}",
+                params,
+                request.batch_size,
+            )
             snapshot_reader = reader
             fingerprint = canonical_fingerprint(
                 {
@@ -1424,13 +1460,12 @@ class DuckDBAdapter(WarehouseAdapter):
                 if request.columns is None
                 else ", ".join(self.quote_ident(column) for column in request.columns)
             )
-            if params:
-                cursor.execute(
-                    f"SELECT {projection} FROM {table_ref}{where_sql}", params
-                )
-            else:
-                cursor.execute(f"SELECT {projection} FROM {table_ref}{where_sql}")
-            reader = cursor.to_arrow_reader(request.batch_size)
+            reader = self._arrow_relation_reader(
+                cursor,
+                f"SELECT {projection} FROM {table_ref}{where_sql}",
+                params,
+                request.batch_size,
+            )
             digest = _arrow_reader_digest(reader.schema)
             for batch in reader:
                 _update_arrow_digest(digest, batch)
@@ -1458,15 +1493,37 @@ class DuckDBAdapter(WarehouseAdapter):
         assert result is not None
         return result
 
+    @staticmethod
+    def _abort_pending_result(connection: duckdb.DuckDBPyConnection) -> None:
+        # DuckDB 2 keeps a partially fetched execute() result open. Its
+        # relation and registration APIs refuse that connection until the
+        # result ends; DuckDB 1 has no abort() and replaced it implicitly.
+        abort = getattr(connection, "abort", None)
+        if abort is not None:
+            abort()
+
+    def _register_frame(self, name: str, frame: pl.DataFrame) -> None:
+        self._abort_pending_result(self.connection)
+        self.connection.register(name, frame)
+
+    def _unregister_frame(self, name: str) -> None:
+        try:
+            self.connection.unregister(name)
+        except duckdb.TransactionException:
+            # DuckDB 2 blocks unregister after a statement aborts its
+            # transaction. The transaction owner will roll back and retry.
+            self._deferred_unregister.add(name)
+
     def execute(self, sql: str, params: list[Any] | None = None) -> Any:
         if params is None:
             return self.connection.execute(sql)
         return self.connection.execute(sql, params)
 
     def query_df(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame:
-        if params is None:
-            return self.connection.execute(sql).pl()
-        return self.connection.execute(sql, params).pl()
+        self._abort_pending_result(self.connection)
+        relation = self.connection.sql(sql, params=params)
+        assert relation is not None
+        return relation.pl()
 
     def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
         row = self.execute(sql, params).fetchone()
@@ -1583,7 +1640,7 @@ class DuckDBAdapter(WarehouseAdapter):
         """
         if not records:
             return
-        self.connection.register("stel_state_rows", self._state_frame(scope, records))
+        self._register_frame("stel_state_rows", self._state_frame(scope, records))
         try:
             self.connection.execute(
                 f"""
@@ -1599,7 +1656,7 @@ class DuckDBAdapter(WarehouseAdapter):
                 """
             )
         finally:
-            self.connection.unregister("stel_state_rows")
+            self._unregister_frame("stel_state_rows")
 
     _STATE_ON_CONFLICT = """
             ON CONFLICT (
@@ -1848,7 +1905,16 @@ class DuckDBAdapter(WarehouseAdapter):
                 error.add_note(
                     f"Failed to roll back DuckDB transaction: {rollback_error}"
                 )
+            self._cleanup_deferred_unregister(error)
             raise
+
+    def _cleanup_deferred_unregister(self, error: BaseException) -> None:
+        for name in self._deferred_unregister:
+            try:
+                self.connection.unregister(name)
+            except Exception:
+                error.add_note("Failed to unregister a DuckDB temporary frame")
+        self._deferred_unregister.clear()
 
     def _resolved_path(self) -> Path:
         config = self.config

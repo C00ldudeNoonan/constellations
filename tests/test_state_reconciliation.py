@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
+import duckdb
 import polars as pl
 import pytest
 
@@ -452,6 +453,7 @@ def test_replace_state_scope_with_no_batches_clears_the_scope(tmp_path: Path) ->
 
 
 def test_replace_state_scope_rolls_back_cross_batch_duplicates(tmp_path: Path) -> None:
+    """Issue #715: a failed DuckDB 2 insert defers frame cleanup until rollback."""
     with _open_adapter(tmp_path) as adapter:
         _seed(adapter, ["survivor"])
         with pytest.raises(AdapterError, match="duplicate record keys"):
@@ -465,6 +467,8 @@ def test_replace_state_scope_rolls_back_cross_batch_duplicates(tmp_path: Path) -
                 ),
             )
         assert sorted(adapter.fetch_state(SCOPE)) == ["survivor"]
+        with pytest.raises(duckdb.CatalogException):
+            adapter.raw_connection.execute("SELECT * FROM stel_state_rows").fetchall()
 
 
 def test_replace_state_scope_preserves_other_scopes(tmp_path: Path) -> None:

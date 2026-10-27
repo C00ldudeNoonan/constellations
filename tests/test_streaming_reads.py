@@ -26,7 +26,12 @@ from stel.adapters import (
     parse_warehouse_config,
 )
 from stel.adapters.bigquery import BigQueryAdapter
-from stel.adapters.duckdb import DuckDBAdapter, _duckdb_arrow_batches
+from stel.adapters.duckdb import (
+    DuckDBAdapter,
+    _arrow_reader_digest,
+    _duckdb_arrow_batches,
+    _update_arrow_digest,
+)
 
 
 def _duckdb_config(path: Path) -> Any:
@@ -55,6 +60,49 @@ def _sanitized_native_cause(error: BaseException, sentinel: str) -> AdapterError
     assert cause.__traceback__ is None
     assert cause.__context__ is None
     return cause
+
+
+def test_duckdb_snapshot_digest_ignores_uninitialized_null_bytes() -> None:
+    """Issue #715: DuckDB 2 can vary unused Arrow value bytes behind a NULL."""
+    schema = pa.schema([pa.field("value", pa.int64())])
+    validity = pa.py_buffer(b"\x00")
+    digests = []
+    for raw in (b"\x00" * 8, b"\xff" * 8):
+        column = pa.Array.from_buffers(pa.int64(), 1, [validity, pa.py_buffer(raw)])
+        batch = pa.RecordBatch.from_arrays([column], schema=schema)
+        digest = _arrow_reader_digest(schema)
+        _update_arrow_digest(digest, batch)
+        digests.append(digest.hexdigest())
+    assert digests[0] == digests[1]
+
+    non_null = pa.RecordBatch.from_arrays([pa.array([1], type=pa.int64())], schema=schema)
+    digest = _arrow_reader_digest(schema)
+    _update_arrow_digest(digest, non_null)
+    assert digest.hexdigest() != digests[0]
+
+
+def test_duckdb_snapshot_digest_hashes_values_python_cannot_hold() -> None:
+    """PR #719 review: NULL normalization must not convert values to Python.
+
+    A date past year 9999 and a nanosecond timestamp are valid DuckDB values
+    that ``to_pylist`` refuses, which aborted the snapshot read; nanoseconds
+    that differ must still change the digest.
+    """
+    con = duckdb.connect()
+    try:
+        digests = []
+        for nanos in ("001", "002"):
+            batch = con.sql(
+                f"SELECT DATE '10000-01-01' AS day, "
+                f"TIMESTAMP_NS '2024-01-01 00:00:00.000000{nanos}' AS at "
+                "UNION ALL SELECT NULL, NULL"
+            ).to_arrow_table().combine_chunks().to_batches()[0]
+            digest = _arrow_reader_digest(batch.schema)
+            _update_arrow_digest(digest, batch)
+            digests.append(digest.hexdigest())
+    finally:
+        con.close()
+    assert digests[0] != digests[1]
 
 
 def test_duckdb_streams_projected_filtered_batches_from_one_snapshot(

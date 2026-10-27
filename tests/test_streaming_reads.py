@@ -81,6 +81,30 @@ def test_duckdb_snapshot_digest_ignores_uninitialized_null_bytes() -> None:
     assert digest.hexdigest() != digests[0]
 
 
+def test_duckdb_snapshot_digest_hashes_values_python_cannot_hold() -> None:
+    """PR #719 review: NULL normalization must not convert values to Python.
+
+    A date past year 9999 and a nanosecond timestamp are valid DuckDB values
+    that ``to_pylist`` refuses, which aborted the snapshot read; nanoseconds
+    that differ must still change the digest.
+    """
+    con = duckdb.connect()
+    try:
+        digests = []
+        for nanos in ("001", "002"):
+            batch = con.sql(
+                f"SELECT DATE '10000-01-01' AS day, "
+                f"TIMESTAMP_NS '2024-01-01 00:00:00.000000{nanos}' AS at "
+                "UNION ALL SELECT NULL, NULL"
+            ).to_arrow_table().combine_chunks().to_batches()[0]
+            digest = _arrow_reader_digest(batch.schema)
+            _update_arrow_digest(digest, batch)
+            digests.append(digest.hexdigest())
+    finally:
+        con.close()
+    assert digests[0] != digests[1]
+
+
 def test_duckdb_streams_projected_filtered_batches_from_one_snapshot(
     tmp_path: Path,
 ) -> None:

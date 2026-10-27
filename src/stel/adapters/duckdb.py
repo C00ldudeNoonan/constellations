@@ -181,18 +181,29 @@ def _arrow_reader_digest(schema: pa.Schema) -> Any:
 
 
 def _update_arrow_digest(digest: Any, batch: pa.RecordBatch) -> None:
-    if any(column.null_count for column in batch.columns):
-        # Arrow leaves value bytes behind NULLs unspecified. DuckDB 2 may
-        # return different bytes for the same logical row on a second read.
-        batch = pa.RecordBatch.from_arrays(
-            [
-                pa.array(column.to_pylist(), type=column.type)
-                if column.null_count
-                else column
-                for column in batch.columns
-            ],
-            schema=batch.schema,
-        )
+    if not any(column.null_count for column in batch.columns):
+        _update_digest_payload(digest, batch)
+        return
+    # Arrow leaves value bytes behind NULLs unspecified, and DuckDB 2 may
+    # return different ones for the same logical row on a second read. Hash
+    # such a column as its validity plus its non-null values, both built by
+    # Arrow kernels: a round trip through Python objects would refuse valid
+    # dates past year 9999 and nanosecond timestamps.
+    digest.update(b"\x01")
+    for field, column in zip(batch.schema, batch.columns, strict=True):
+        if column.null_count:
+            digest.update(b"n")
+            parts = [column.is_valid().cast(pa.int8()), column.drop_null()]
+        else:
+            digest.update(b"v")
+            parts = [column]
+        for part in parts:
+            _update_digest_payload(
+                digest, pa.RecordBatch.from_arrays([part], names=[field.name])
+            )
+
+
+def _update_digest_payload(digest: Any, batch: pa.RecordBatch) -> None:
     payload = batch.serialize().to_pybytes()
     digest.update(len(payload).to_bytes(8, "big"))
     digest.update(payload)

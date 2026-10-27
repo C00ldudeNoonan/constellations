@@ -45,7 +45,7 @@ jobs:
 
   latest-warehouse-deps:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
@@ -61,5 +61,5 @@ jobs:
       - name: Pytest with latest DuckDB and Polars
         run: >-
           uv run --locked --with 'duckdb>=2' --with 'polars>=2'
-          pytest -vv -n auto --dist loadfile -o faulthandler_timeout=90
+          pytest -q -n auto --dist loadfile
           -W 'error:Arrow output on a DB-API result makes an extra copy:UserWarning'

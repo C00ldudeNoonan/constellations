@@ -149,6 +149,37 @@ def test_a_failure_mid_run_keeps_earlier_flushes(
 
 
 @pytest.mark.parametrize("overlap_publication", [False, True])
+def test_provider_failure_closes_the_streamed_input_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlap_publication: bool
+) -> None:
+    """Issue #432: failure must release the snapshot's warehouse cursor."""
+    project = _project(
+        tmp_path, flush_every=2, overlap_publication=overlap_publication
+    )
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    original_snapshot = DuckDBAdapter.table_snapshot
+    open_snapshots = 0
+
+    @contextmanager
+    def tracked_snapshot(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        nonlocal open_snapshots
+        with original_snapshot(self, *args, **kwargs) as snapshot:
+            open_snapshots += 1
+            try:
+                yield snapshot
+            finally:
+                open_snapshots -= 1
+
+    monkeypatch.setattr(DuckDBAdapter, "table_snapshot", tracked_snapshot)
+    _fail_after(1, monkeypatch)
+    with pytest.raises(RunError):
+        run_project(project, select="document_embeddings")
+
+    assert open_snapshots == 0
+
+
+@pytest.mark.parametrize("overlap_publication", [False, True])
 def test_the_rerun_only_pays_for_what_was_lost(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlap_publication: bool
 ) -> None:

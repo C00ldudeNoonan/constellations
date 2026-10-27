@@ -12,8 +12,8 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import nullcontext
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from functools import partial
@@ -414,7 +414,7 @@ def _run_embed_model(
             cache_hits += 1
             prior_window_hits += 1
 
-    def _iter_windows() -> Iterator[list[_EmbedWork]]:
+    def _iter_windows() -> Generator[list[_EmbedWork], None, None]:
         """Yield at most `flush_every` items at a time.
 
         The whole point of the rewrite (issue #401): the previous shape built
@@ -683,12 +683,24 @@ def _run_embed_model(
             publishing.result()
             _advance_published(prior)
 
+        def _run_serial_windows() -> None:
+            with closing(_iter_windows()) as windows:
+                for window in windows:
+                    _apply_response_cache(window)
+                    _apply_reuse(window)
+                    if not _embed_or_stop(window):
+                        break
+                    _publish(window)
+                    _advance_published(window)
+
         def _run_overlapped_windows() -> None:
             # Prepare reads before submitting a write so the adapter is never
             # used from two threads at once. A failed preparation still owes
             # publication of the already-computed prior window.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                windows = iter(_iter_windows())
+            with (
+                closing(_iter_windows()) as windows,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool,
+            ):
                 prior: list[_EmbedWork] | None = None
                 while True:
                     try:
@@ -714,13 +726,7 @@ def _run_embed_model(
                     _publish_and_advance(prior)
 
         if not config.overlap_publication:
-            for window in _iter_windows():
-                _apply_response_cache(window)
-                _apply_reuse(window)
-                if not _embed_or_stop(window):
-                    break
-                _publish(window)
-                _advance_published(window)
+            _run_serial_windows()
         else:
             _run_overlapped_windows()
         if run_status is None:

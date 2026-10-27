@@ -12,6 +12,7 @@ cadence changes execution, never output.
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date
@@ -24,6 +25,7 @@ import pytest
 
 from stel.adapters import LayoutPruningColumns
 from stel.adapters.base import NO_LAYOUT_PRUNING
+from stel.adapters.duckdb import DuckDBAdapter
 from stel.execution.contracts import RunError
 from stel.providers.deterministic import DeterministicEmbeddingProvider
 from stel.runner import run_project
@@ -36,7 +38,9 @@ pytestmark = pytest.mark.e2e
 DOCUMENTS = 7
 
 
-def _project(tmp_path: Path, *, flush_every: int) -> Path:
+def _project(
+    tmp_path: Path, *, flush_every: int, overlap_publication: bool = False
+) -> Path:
     project = tmp_path / "project"
     project.mkdir(parents=True)
     (project / "stel_project.yml").write_text(
@@ -75,6 +79,7 @@ def _project(tmp_path: Path, *, flush_every: int) -> Path:
         "      id_field: chunk_id\n      vector_field: embedding\n"
         "      dimensions: 4\n      batch_size: 1\n"
         f"      flush_every: {flush_every}\n"
+        f"      overlap_publication: {str(overlap_publication).lower()}\n"
         "    materialization: incremental\n",
         encoding="utf-8",
     )
@@ -120,13 +125,16 @@ def _fail_after(calls: int, monkeypatch: pytest.MonkeyPatch) -> None:
 # ─── the point of the issue: paid work survives a later failure ─────────────
 
 
+@pytest.mark.parametrize("overlap_publication", [False, True])
 def test_a_failure_mid_run_keeps_earlier_flushes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlap_publication: bool
 ) -> None:
     """The incident in #401: 28 hours of paid provider calls thrown away by a
     failure at the end. Rows embedded before the failure must already be in
     the warehouse."""
-    project = _project(tmp_path, flush_every=2)
+    project = _project(
+        tmp_path, flush_every=2, overlap_publication=overlap_publication
+    )
     run_project(project, select="document_registry")
     run_project(project, select="document_chunks")
     _fail_after(5, monkeypatch)
@@ -139,12 +147,15 @@ def test_a_failure_mid_run_keeps_earlier_flushes(
     assert _embedded_count(project) == 4
 
 
+@pytest.mark.parametrize("overlap_publication", [False, True])
 def test_the_rerun_only_pays_for_what_was_lost(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlap_publication: bool
 ) -> None:
     """State advances per flush, so a resumed run must not re-embed rows it
     already paid for — that is the whole economic argument of the issue."""
-    project = _project(tmp_path, flush_every=2)
+    project = _project(
+        tmp_path, flush_every=2, overlap_publication=overlap_publication
+    )
     run_project(project, select="document_registry")
     run_project(project, select="document_chunks")
     _fail_after(5, monkeypatch)
@@ -169,6 +180,80 @@ def test_nothing_is_lost_across_the_whole_corpus(tmp_path: Path) -> None:
         project, 'SELECT embedding FROM "db".docs.document_embeddings'
     )
     assert all(vector[0] is not None for vector in vectors)
+
+
+def test_next_provider_window_runs_during_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #432: publication and the next provider call truly overlap."""
+    project = _project(tmp_path, flush_every=1, overlap_publication=True)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    publishing = threading.Event()
+    next_embedding = threading.Event()
+    original_embed = DeterministicEmbeddingProvider._embed
+    original_publish = DuckDBAdapter.materialize_full
+    calls = 0
+
+    def embed(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            assert publishing.wait(5), "the first publish never started"
+            next_embedding.set()
+        return original_embed(self, *args, **kwargs)
+
+    def publish(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if args[0] == "document_embeddings":
+            publishing.set()
+            assert next_embedding.wait(5), "the next provider call did not overlap"
+        return original_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(DeterministicEmbeddingProvider, "_embed", embed)
+    monkeypatch.setattr(DuckDBAdapter, "materialize_full", publish)
+    run_project(project, select="document_embeddings")
+    assert _embedded_count(project) == DOCUMENTS
+
+
+def test_overlap_reuses_text_from_a_window_still_publishing(tmp_path: Path) -> None:
+    """Issue #432: an unpublished prior window still supplies duplicate text."""
+    project = _project(tmp_path, flush_every=1, overlap_publication=True)
+    (project / "data" / "doc1.json").write_text(
+        json.dumps({"title": "Release 1", "body": "body text 0"}),
+        encoding="utf-8",
+    )
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    [result] = run_project(project, select="document_embeddings")
+
+    assert result.metrics["provider_calls"] == DOCUMENTS - 1
+    assert result.metrics["prior_window_hits"] == 1
+    assert _embedded_count(project) == DOCUMENTS
+
+
+def test_overlap_keeps_state_behind_a_failed_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #432: speculative provider work cannot advance unpublished state."""
+    project = _project(tmp_path, flush_every=2, overlap_publication=True)
+    run_project(project, select="document_registry")
+    run_project(project, select="document_chunks")
+    original = DuckDBAdapter.materialize_incremental
+
+    def fail(self: Any, *args: Any, **kwargs: Any) -> Any:
+        del self, args, kwargs
+        raise ValueError("private row text")
+
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", fail)
+    with pytest.raises(RunError) as caught:
+        run_project(project, select="document_embeddings")
+    assert "private row text" not in str(caught.value)
+    assert _embedded_count(project) == 2
+
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", original)
+    [resumed] = run_project(project, select="document_embeddings")
+    assert resumed.status is None
+    assert _embedded_count(project) == DOCUMENTS
 
 
 # ─── cadence must not change content ────────────────────────────────────────

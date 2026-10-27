@@ -17,6 +17,7 @@ from stel.backends import (
     validate_backend_options,
 )
 from stel.config.model import (
+    EmbedConfig,
     ExtractionConfig,
     FieldConfig,
     ModelConfig,
@@ -205,6 +206,17 @@ def test_code_version_ignores_publish_every(tmp_path: Path) -> None:
     assert compute_code_version(
         extraction=base, transform=None, project_dir=tmp_path
     ) == compute_code_version(extraction=tuned, transform=None, project_dir=tmp_path)
+
+
+def test_embed_overlap_does_not_reprocess_published_vectors(tmp_path: Path) -> None:
+    """Issue #432: scheduling a publish cannot change embedding identity."""
+    base = EmbedConfig(provider="deterministic", model="contract-v1", dimensions=4)
+    tuned = base.model_copy(update={"overlap_publication": True})
+    assert compute_code_version(
+        extraction=None, transform=None, embed=base, project_dir=tmp_path
+    ) == compute_code_version(
+        extraction=None, transform=None, embed=tuned, project_dir=tmp_path
+    )
 
 
 def test_update_when_changed_does_not_change_model_code_version(

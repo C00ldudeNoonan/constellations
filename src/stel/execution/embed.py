@@ -280,6 +280,7 @@ def _run_embed_model(
     # Target reuse is the remainder: the hits the warehouse answered.
     response_cache_hits = 0
     duplicate_text_hits = 0
+    prior_window_hits = 0
     embedded_count = 0
     processed = 0
     usage_totals: dict[str, int | float] = {}
@@ -397,6 +398,21 @@ def _run_embed_model(
             item.embedded_at = hit.embedded_at
             cache_hits += 1
             response_cache_hits += 1
+
+    def _apply_prior_window_reuse(
+        window: list[_EmbedWork], prior: list[_EmbedWork]
+    ) -> None:
+        """Reuse vectors from a computed window whose publish has not landed."""
+        nonlocal cache_hits, prior_window_hits
+        vectors = {item.text_hash: item for item in prior if item.vector is not None}
+        for item in window:
+            if item.vector is not None or item.text_hash not in vectors:
+                continue
+            existing = vectors[item.text_hash]
+            item.vector = existing.vector
+            item.embedded_at = existing.embedded_at or now
+            cache_hits += 1
+            prior_window_hits += 1
 
     def _iter_windows() -> Iterator[list[_EmbedWork]]:
         """Yield at most `flush_every` items at a time.
@@ -606,53 +622,90 @@ def _run_embed_model(
 
     run_status: str | None = None
     errors: list[str] = []
+
+    def _embed_or_stop(window: list[_EmbedWork]) -> bool:
+        nonlocal run_status
+        try:
+            _embed_window(window)
+        except BudgetExceededError as error:
+            run_status = "budget_exceeded"
+            errors.append(f"BudgetExceededError: {error}")
+            return False
+        except Exception as error:
+            # Provider and warehouse exceptions have different safe boundaries.
+            raise RunError(
+                f"Embed model '{model.name}' provider execution failed: "
+                f"{artifact_error_text(error)}"
+            ) from error
+        return True
+
     # Counted in source rows and advanced per flushed window: the operator
     # cares how much of the corpus is through, not how many provider requests
     # it took. The id pass already counted the upstream, so the total is known
     # even though both the windows and the read itself stream (issues #401, #410).
     with get_reporter().model_task(model.name, "embed", upstream_rows) as task:
         advanced = 0
-        for window in _iter_windows():
-            # Provider failures and publication failures are kept apart on
-            # purpose. `artifact_error_text` exists to sanitize *provider* text;
-            # routing a warehouse error through it hands the raw message to its
-            # fallback, and that message can quote the offending row and the
-            # statement that touched it (issue #401 review).
-            _apply_response_cache(window)
-            _apply_reuse(window)
-            try:
-                _embed_window(window)
-            except BudgetExceededError as e:
-                # Exhaustion fires before the next provider call. Windows
-                # already published stay with their state advanced; this
-                # window's partial vectors are discarded and re-embedded next
-                # run, exactly like a crash at the same point -- which is the
-                # entire design.
-                run_status = "budget_exceeded"
-                errors.append(f"BudgetExceededError: {e}")
-                break
-            except Exception as e:
-                raise RunError(
-                    f"Embed model '{model.name}' provider execution failed: "
-                    f"{artifact_error_text(e)}"
-                ) from e
+
+        def _advance_published(window: list[_EmbedWork]) -> None:
+            nonlocal processed, advanced
             processed += len(window)
-            _publish(window)
-            # Advance by *source rows consumed*, not window size: rows the
-            # generator dropped as unchanged never reach a window, so a
-            # mostly-incremental run would otherwise leave the bar near zero
-            # while the model was in fact nearly done.
+            # Skipped source rows never enter a work window.
             consumed = processed + skipped
             task.advance(consumed - advanced)
             advanced = consumed
-            # Drop the window's vectors before the next one is built. Without
-            # this the generator's reference keeps one extra flush alive.
             window.clear()
+
+        if not config.overlap_publication:
+            for window in _iter_windows():
+                _apply_response_cache(window)
+                _apply_reuse(window)
+                if not _embed_or_stop(window):
+                    break
+                _publish(window)
+                _advance_published(window)
+        else:
+            # Only the provider runs beside a warehouse write. Preparing the
+            # next window (including its target-reuse query) happens first, so
+            # the shared adapter is never called concurrently from two threads.
+            # One worker keeps publications strictly ordered.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                windows = iter(_iter_windows())
+                prior: list[_EmbedWork] | None = None
+                while True:
+                    try:
+                        window = next(windows)
+                        _apply_response_cache(window)
+                        if prior is not None:
+                            _apply_prior_window_reuse(window, prior)
+                        _apply_reuse(window)
+                    except StopIteration:
+                        break
+                    except Exception:
+                        # A read/reuse failure must not strand a fully paid
+                        # prior window just because it occurred before submit.
+                        if prior is not None:
+                            _publish(prior)
+                            _advance_published(prior)
+                        raise
+                    publishing = pool.submit(_publish, prior) if prior is not None else None
+                    try:
+                        ready = _embed_or_stop(window)
+                    except Exception:
+                        if publishing is not None and prior is not None:
+                            publishing.result()
+                            _advance_published(prior)
+                        raise
+                    if publishing is not None and prior is not None:
+                        publishing.result()
+                        _advance_published(prior)
+                    if not ready:
+                        break
+                    prior = window
+                if run_status is None and prior is not None:
+                    _publish(prior)
+                    _advance_published(prior)
         if run_status is None:
-            # Rows skipped after the final window are consumed but never
-            # advanced above, so close the bar out on the total it was opened
-            # with. A budget stop leaves the bar where it stopped: filling it
-            # would report a corpus as done that the cap just cut short.
+            # Skipped rows after the final flush still count as consumed.
             task.advance(upstream_rows - advanced)
 
     deleted_count = 0
@@ -712,6 +765,7 @@ def _run_embed_model(
         "metadata_updates": cache_hits,
         "response_cache_hits": response_cache_hits,
         "duplicate_text_hits": duplicate_text_hits,
+        "prior_window_hits": prior_window_hits,
         **usage_totals,
         # Where the wall clock went (#432). Summed across threads, so these
         # can exceed `duration_seconds` once provider batches overlap -- that

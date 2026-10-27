@@ -83,6 +83,7 @@ _EMBED_EXECUTION_FIELDS = frozenset(
         "max_retries",
         "flush_every",
         "max_concurrent",
+        "overlap_publication",
         # The reprocess guard (issue #530) decides whether a run may start;
         # putting it in the identity would make relaxing it a reprocess.
         "on_code_change",

@@ -47,6 +47,7 @@ history (issue #311).
 | [0035](0035-session-query-pins-drain-without-expiring-readers.md) | Remote serving sessions share durable query pins and drain cooperatively; a clock never revokes a running reader | accepted |
 | [0036](0036-hybrid-search-fuses-documents-not-chunks.md) | Hybrid search fuses documents, at the rank of their best chunk, and interleaves their chunks back out; RRF's constant and equal weights stay | accepted |
 | [0037](0037-a-segmented-search-group-declares-its-partitions.md) | A segmented search group declares partition bounds and pins every selected member | proposed |
+| [0038](0038-embedding-publication-overlap-is-opt-in.md) | Embedding can overlap the next provider window with publication when explicitly enabled; chunk stays serial until measured | accepted |
 
 ## When to write one
 

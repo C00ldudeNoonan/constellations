@@ -448,6 +448,10 @@ class EmbedConfig(BaseModel):
     # output content -- including it would re-embed every existing corpus at
     # provider prices on upgrade.
     flush_every: int = Field(default=5000, gt=0)
+    # An operator can overlap the next provider window with publication of
+    # the previous one. Keep the default serial: a failed publish can leave
+    # one already-computed window to recover from the response cache.
+    overlap_publication: bool = False
     # Refuse to start a run that would pay for published rows again (issue
     # #530): a changed embed identity, or an upstream change that re-keys the
     # input, reprocesses the corpus at provider prices with nothing but the

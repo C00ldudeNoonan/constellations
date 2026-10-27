@@ -2366,6 +2366,7 @@ provider bill again. Embedded rows publish and advance state every
     model: text-embedding-005
     dimensions: 768
     flush_every: 2000   # publish and bank 2000 embedded rows at a time
+    overlap_publication: false  # opt in after measuring warehouse write time
   materialization: incremental
 ```
 
@@ -2378,9 +2379,21 @@ compose — a batch is split again by `max_texts_per_request` and
 with nothing to overlap. Neither setting is part of `code_version`, so tuning
 throughput never re-embeds a corpus.
 
-Peak memory is one flush rather than the corpus, and a run that dies at hour
-28 keeps every row it already paid for — the next run resumes at the last
-flush instead of re-embedding everything (issue #401).
+`embed.overlap_publication` defaults to `false`. When enabled, stel computes the
+next embed window while the preceding window publishes. Publication and state
+advancement still occur in window order; the adapter is never used concurrently
+by those two activities. Peak work can reach two flush windows, and a failed
+publication can leave up to one later window computed but unpublished. A
+configured embedding response cache can retain those vectors for a retry;
+without one, the retry may pay for that window again. Compare `seconds_publish`
+with the model's duration before enabling it. `seconds_provider` sums time
+across concurrent provider workers and can exceed the model duration. Switching
+the option never changes `code_version` or re-embeds existing rows.
+`prior_window_hits` counts vectors reused from the preceding in-flight window.
+
+With serial publication, peak memory is one flush rather than the corpus. A
+run that dies at hour 28 keeps every row it already paid for. The next run
+resumes at the last flush instead of re-embedding everything (issue #401).
 
 The input is bounded the same way. An embed run reads its upstream's schema
 from a zero-row probe, streams the id column once to validate it and count the

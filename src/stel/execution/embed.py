@@ -639,6 +639,18 @@ def _run_embed_model(
             ) from error
         return True
 
+    def _next_prepared_window(
+        windows: Iterator[list[_EmbedWork]], prior: list[_EmbedWork] | None
+    ) -> list[_EmbedWork] | None:
+        window = next(windows, None)
+        if window is None:
+            return None
+        _apply_response_cache(window)
+        if prior is not None:
+            _apply_prior_window_reuse(window, prior)
+        _apply_reuse(window)
+        return window
+
     # Counted in source rows and advanced per flushed window: the operator
     # cares how much of the corpus is through, not how many provider requests
     # it took. The id pass already counted the upstream, so the total is known
@@ -655,6 +667,52 @@ def _run_embed_model(
             advanced = consumed
             window.clear()
 
+        def _publish_and_advance(window: list[_EmbedWork] | None) -> None:
+            if window is None:
+                return
+            _publish(window)
+            _advance_published(window)
+
+        def _await_prior(
+            publishing: concurrent.futures.Future[None] | None,
+            prior: list[_EmbedWork] | None,
+        ) -> None:
+            if publishing is None:
+                return
+            assert prior is not None
+            publishing.result()
+            _advance_published(prior)
+
+        def _run_overlapped_windows() -> None:
+            # Prepare reads before submitting a write so the adapter is never
+            # used from two threads at once. A failed preparation still owes
+            # publication of the already-computed prior window.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                windows = iter(_iter_windows())
+                prior: list[_EmbedWork] | None = None
+                while True:
+                    try:
+                        window = _next_prepared_window(windows, prior)
+                    except Exception:
+                        _publish_and_advance(prior)
+                        raise
+                    if window is None:
+                        break
+                    publishing = (
+                        pool.submit(_publish, prior) if prior is not None else None
+                    )
+                    try:
+                        ready = _embed_or_stop(window)
+                    except Exception:
+                        _await_prior(publishing, prior)
+                        raise
+                    _await_prior(publishing, prior)
+                    if not ready:
+                        break
+                    prior = window
+                if run_status is None:
+                    _publish_and_advance(prior)
+
         if not config.overlap_publication:
             for window in _iter_windows():
                 _apply_response_cache(window)
@@ -664,46 +722,7 @@ def _run_embed_model(
                 _publish(window)
                 _advance_published(window)
         else:
-            # Only the provider runs beside a warehouse write. Preparing the
-            # next window (including its target-reuse query) happens first, so
-            # the shared adapter is never called concurrently from two threads.
-            # One worker keeps publications strictly ordered.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                windows = iter(_iter_windows())
-                prior: list[_EmbedWork] | None = None
-                while True:
-                    try:
-                        window = next(windows)
-                        _apply_response_cache(window)
-                        if prior is not None:
-                            _apply_prior_window_reuse(window, prior)
-                        _apply_reuse(window)
-                    except StopIteration:
-                        break
-                    except Exception:
-                        # A read/reuse failure must not strand a fully paid
-                        # prior window just because it occurred before submit.
-                        if prior is not None:
-                            _publish(prior)
-                            _advance_published(prior)
-                        raise
-                    publishing = pool.submit(_publish, prior) if prior is not None else None
-                    try:
-                        ready = _embed_or_stop(window)
-                    except Exception:
-                        if publishing is not None and prior is not None:
-                            publishing.result()
-                            _advance_published(prior)
-                        raise
-                    if publishing is not None and prior is not None:
-                        publishing.result()
-                        _advance_published(prior)
-                    if not ready:
-                        break
-                    prior = window
-                if run_status is None and prior is not None:
-                    _publish(prior)
-                    _advance_published(prior)
+            _run_overlapped_windows()
         if run_status is None:
             # Skipped rows after the final flush still count as consumed.
             task.advance(upstream_rows - advanced)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -27,6 +27,7 @@ from stel.adapters import LayoutPruningColumns
 from stel.adapters.base import NO_LAYOUT_PRUNING
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.execution.contracts import RunError
+from stel.execution.embed import _EmbeddingReuseReader
 from stel.providers.deterministic import DeterministicEmbeddingProvider
 from stel.runner import run_project
 
@@ -254,6 +255,41 @@ def test_overlap_keeps_state_behind_a_failed_publish(
     [resumed] = run_project(project, select="document_embeddings")
     assert resumed.status is None
     assert _embedded_count(project) == DOCUMENTS
+
+
+def test_overlap_publishes_prior_window_when_next_preparation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #432: a reuse failure must not strand the preceding window."""
+    project = _project(tmp_path, flush_every=2, overlap_publication=True)
+    run_project(project)
+    original_rows_for = _EmbeddingReuseReader.rows_for
+    original_publish = DuckDBAdapter.materialize_incremental
+    lookups = 0
+    publications = 0
+
+    def fail_second_reuse(
+        self: _EmbeddingReuseReader, text_hashes: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 2:
+            raise ValueError("reuse failed")
+        return original_rows_for(self, text_hashes)
+
+    def count_publication(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal publications
+        if args[0] == "document_embeddings":
+            publications += 1
+        return original_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(_EmbeddingReuseReader, "rows_for", fail_second_reuse)
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", count_publication)
+    with pytest.raises(ValueError, match="reuse failed"):
+        run_project(project, select="document_embeddings", reprocess_all=True)
+
+    assert lookups == 2
+    assert publications == 1
 
 
 # ─── cadence must not change content ────────────────────────────────────────

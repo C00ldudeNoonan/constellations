@@ -906,10 +906,14 @@ class DuckDBStore(RetrievalStore):
 
     def _arrow_schema(self, conn: Any, collection: str) -> pa.Schema:
         try:
-            result = conn.execute(
+            abort = getattr(conn, "abort", None)
+            if abort is not None:
+                abort()
+            relation = conn.sql(
                 f"SELECT * FROM {_quote_identifier(collection)} LIMIT 0"
             )
-            return result.to_arrow_table().schema
+            assert relation is not None
+            return relation.to_arrow_table().schema
         except Exception:
             raise RetrievalError(
                 "DuckDB operation 'schema' failed (code=duckdb_schema_failed)"
@@ -938,7 +942,12 @@ class DuckDBStore(RetrievalStore):
         operation: str,
     ) -> pa.Table:
         try:
-            return conn.execute(statement, list(parameters or ())).to_arrow_table()
+            abort = getattr(conn, "abort", None)
+            if abort is not None:
+                abort()
+            relation = conn.sql(statement, params=list(parameters or ()))
+            assert relation is not None
+            return relation.to_arrow_table()
         except Exception:
             raise RetrievalError(_failure(operation)) from None
 

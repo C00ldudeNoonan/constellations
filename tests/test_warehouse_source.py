@@ -316,12 +316,12 @@ def _project(tmp_path: Path) -> Path:
 def _registry(project: Path) -> pl.DataFrame:
     con = duckdb.connect(str(project / "target" / "db.duckdb"), read_only=True)
     try:
-        return pl.DataFrame(
-            con.execute(
-                "SELECT post_id, subreddit, selftext, source_uri "
-                'FROM "db".main.post_registry ORDER BY post_id'
-            ).pl()
+        relation = con.sql(
+            "SELECT post_id, subreddit, selftext, source_uri "
+            'FROM "db".main.post_registry ORDER BY post_id'
         )
+        assert relation is not None
+        return relation.pl()
     finally:
         con.close()
 

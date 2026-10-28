@@ -5,8 +5,9 @@ Two variants of a step exist side by side (`for_each`, see the reference's
 golden set, one artifact per model. Which one is better was a diff of two
 JSON files by eye. This module runs the same per-model evaluation for every
 model in a selection and emits one comparison: per metric, each variant's
-value and its delta from the baseline; per query, the ones whose score moved,
-so a regression is traceable to examples rather than to a number.
+value, its delta and paired-bootstrap confidence interval from the baseline;
+per query, the ones whose score moved, so a regression is traceable to examples
+rather than to a number.
 
 No second scorer. The numbers are `retrieval_eval.py`'s, computed once per
 model; this module only lines them up. Comparability is checked before any
@@ -16,7 +17,9 @@ and refused with both models named.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +42,9 @@ from .versioning import compute_model_code_version
 # floating-point sums over queries, so exact equality would report a
 # "movement" that is only summation order.
 _UNCHANGED = 1e-9
+DEFAULT_BOOTSTRAP_SEED = 0
+DEFAULT_BOOTSTRAP_SAMPLES = 1000
+DEFAULT_CONFIDENCE_LEVEL = 0.95
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,16 @@ class VariantComparison:
     side: Side
     #: metric -> cutoff -> variant minus baseline, for every scored cutoff.
     deltas: Mapping[str, Mapping[int, float]]
+    #: Percentile paired-bootstrap intervals for variant minus baseline.
+    delta_intervals: Mapping[str, Mapping[int, BootstrapInterval | None]]
     moved: tuple[QueryMovement, ...]
+
+
+@dataclass(frozen=True)
+class BootstrapInterval:
+    lower: float
+    upper: float
+    queries: int
 
 
 @dataclass(frozen=True)
@@ -92,6 +107,9 @@ class RetrievalComparison:
     #: Every per-model result the comparison was built from, in evaluation
     #: order, so the ordinary eval artifact can be written alongside.
     results: tuple[RetrievalTestResult, ...]
+    bootstrap_seed: int
+    bootstrap_samples: int
+    confidence_level: float
 
     def status(self) -> str:
         """Worst status over every side: a variant that leaks an excluded id
@@ -110,6 +128,9 @@ def compare_retrieval_variants(
     baseline: str | None,
     target: str | None,
     profiles_dir: Path | None,
+    bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
+    bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+    confidence_level: float = DEFAULT_CONFIDENCE_LEVEL,
 ) -> RetrievalComparison:
     """Evaluate every search model `compare` selects and line the results up
     against `baseline` (the first selected model when None).
@@ -117,6 +138,7 @@ def compare_retrieval_variants(
     Selection order is the order the models were named when every token of
     `compare` is a plain model name, and name order otherwise (a tag or a
     graph operator has no order of its own)."""
+    _validate_bootstrap_options(bootstrap_seed, bootstrap_samples, confidence_level)
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     resolved = resolve_profile(project, project_dir, target=target, profiles_dir=profiles_dir)
@@ -165,10 +187,18 @@ def compare_retrieval_variants(
         for name in ordered[1:]:
             result = by_key[(name, test.name)]
             deltas, moved = compare_results(base_result, result)
+            delta_intervals = paired_bootstrap_intervals(
+                base_result,
+                result,
+                seed=bootstrap_seed,
+                samples=bootstrap_samples,
+                confidence_level=confidence_level,
+            )
             variants.append(
                 VariantComparison(
                     side=Side(name, code_versions[name], result),
                     deltas=deltas,
+                    delta_intervals=delta_intervals,
                     moved=moved,
                 )
             )
@@ -189,6 +219,90 @@ def compare_retrieval_variants(
         models=tuple(ordered),
         tests=tuple(tests),
         results=tuple(results),
+        bootstrap_seed=bootstrap_seed,
+        bootstrap_samples=bootstrap_samples,
+        confidence_level=confidence_level,
+    )
+
+
+def _validate_bootstrap_options(seed: int, samples: int, confidence_level: float) -> None:
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise RetrievalEvalError("--bootstrap-seed must be an integer")
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+        raise RetrievalEvalError("bootstrap samples must be a positive integer")
+    if not 0.0 < confidence_level < 1.0:
+        raise RetrievalEvalError("bootstrap confidence level must be between 0 and 1")
+
+
+def paired_bootstrap_intervals(
+    baseline: RetrievalTestResult,
+    variant: RetrievalTestResult,
+    *,
+    seed: int,
+    samples: int,
+    confidence_level: float,
+) -> dict[str, dict[int, BootstrapInterval | None]]:
+    """Percentile CIs over resampled per-query metric deltas, paired by ID."""
+    baseline_queries = {query.query_id: query for query in baseline.per_query}
+    variant_queries = {query.query_id: query for query in variant.per_query}
+    intervals: dict[str, dict[int, BootstrapInterval | None]] = {}
+    keys = sorted(
+        {
+            (metric, cutoff)
+            for query in baseline.per_query
+            for metric, values in query.values.items()
+            for cutoff in values
+        }
+        | {
+            (metric, cutoff)
+            for query in variant.per_query
+            for metric, values in query.values.items()
+            for cutoff in values
+        }
+    )
+    paired_ids = sorted(baseline_queries.keys() & variant_queries.keys())
+    for metric, cutoff in keys:
+        paired_deltas = [
+            variant_queries[query_id].values[metric][cutoff]
+            - baseline_queries[query_id].values[metric][cutoff]
+            for query_id in paired_ids
+            if metric in baseline_queries[query_id].values
+            and metric in variant_queries[query_id].values
+            and cutoff in baseline_queries[query_id].values.get(metric, {})
+            and cutoff in variant_queries[query_id].values.get(metric, {})
+        ]
+        if not paired_deltas:
+            intervals.setdefault(metric, {})[cutoff] = None
+            continue
+        rng = random.Random(_metric_seed(seed, metric, cutoff))
+        means = sorted(
+            sum(paired_deltas[rng.randrange(len(paired_deltas))] for _ in paired_deltas)
+            / len(paired_deltas)
+            for _ in range(samples)
+        )
+        tail = (1.0 - confidence_level) / 2.0
+        intervals.setdefault(metric, {})[cutoff] = BootstrapInterval(
+            lower=_percentile(means, tail),
+            upper=_percentile(means, 1.0 - tail),
+            queries=len(paired_deltas),
+        )
+    return intervals
+
+
+def _metric_seed(seed: int, metric: str, cutoff: int) -> int:
+    """Derive a stable independent RNG stream without process-randomized hash()."""
+    payload = f"{seed}:{metric}:{cutoff}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _percentile(sorted_values: Sequence[float], percentile: float) -> float:
+    """Linear interpolation using the common (n - 1) percentile convention."""
+    position = percentile * (len(sorted_values) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    fraction = position - lower_index
+    return sorted_values[lower_index] + fraction * (
+        sorted_values[upper_index] - sorted_values[lower_index]
     )
 
 
@@ -299,7 +413,7 @@ def _query_deltas(
 
 
 RETRIEVAL_COMPARE_FILENAME = "retrieval_compare.json"
-RETRIEVAL_COMPARE_ARTIFACT_VERSION = 1
+RETRIEVAL_COMPARE_ARTIFACT_VERSION = 2
 
 
 def _side_dict(side: Side) -> dict[str, Any]:
@@ -327,6 +441,12 @@ def build_retrieval_compare_artifact(comparison: RetrievalComparison) -> dict[st
         "baseline": comparison.baseline,
         "models": list(comparison.models),
         "status": comparison.status(),
+        "bootstrap": {
+            "method": "paired_percentile",
+            "confidence_level": comparison.confidence_level,
+            "samples": comparison.bootstrap_samples,
+            "seed": comparison.bootstrap_seed,
+        },
         "tests": [
             {
                 "test": test.test_name,
@@ -339,6 +459,21 @@ def build_retrieval_compare_artifact(comparison: RetrievalComparison) -> dict[st
                     {
                         **_side_dict(variant.side),
                         "deltas": variant.deltas,
+                        "delta_confidence_intervals": {
+                            metric: {
+                                cutoff: (
+                                    {
+                                        "lower": interval.lower,
+                                        "upper": interval.upper,
+                                        "queries": interval.queries,
+                                    }
+                                    if interval is not None
+                                    else None
+                                )
+                                for cutoff, interval in by_cutoff.items()
+                            }
+                            for metric, by_cutoff in variant.delta_intervals.items()
+                        },
                         "moved_queries": [
                             {
                                 "query_id": movement.query_id,
@@ -394,7 +529,13 @@ def format_comparison(comparison: RetrievalComparison) -> list[str]:
                 for variant in test.variants:
                     value = variant.side.result.aggregate.get(metric, {}).get(cutoff, 0.0)
                     delta = variant.deltas.get(metric, {}).get(cutoff, 0.0)
-                    row += f"{f'{value:.3f} ({delta:+.3f})':<{cell + 2}}"
+                    interval = variant.delta_intervals.get(metric, {}).get(cutoff)
+                    interval_text = (
+                        f" [{interval.lower:+.3f}, {interval.upper:+.3f}]"
+                        if interval is not None
+                        else " [n/a]"
+                    )
+                    row += f"{f'{value:.3f} ({delta:+.3f}){interval_text}':<{cell + 2}}"
                 lines.append(row.rstrip())
         lines.extend(_format_status_row(test, cell))
         for variant in test.variants:

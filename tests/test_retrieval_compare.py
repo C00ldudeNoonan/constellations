@@ -21,6 +21,7 @@ from stel.retrieval_compare import (
     compare_results,
     compare_retrieval_variants,
     format_comparison,
+    paired_bootstrap_intervals,
 )
 from stel.retrieval_compare import TestComparison as _TestComparison
 from stel.retrieval_eval import RetrievalEvalError, RetrievalTestResult
@@ -264,6 +265,11 @@ def test_chunk_size_variants_produce_a_delta_and_the_query_that_moved(
     # Two queries; the labor one drops from hit to miss at the small size.
     assert variant.deltas["recall"][1] == pytest.approx(-0.5)
     assert variant.deltas["mrr"][1] == pytest.approx(-0.5)
+    interval = variant.delta_intervals["recall"][1]
+    assert interval is not None
+    assert interval.lower == pytest.approx(-1.0)
+    assert interval.upper == pytest.approx(0.0)
+    assert interval.queries == 2
     [moved] = variant.moved
     assert moved.query_id == "q_labor"
     assert moved.deltas["recall"][1] == pytest.approx(-1.0)
@@ -450,7 +456,13 @@ def test_cli_table_and_json_forms(chunk_size_project: Path) -> None:
     result = runner.invoke(cli, [*base, *compare, "--json"])
     assert result.exit_code == 1, result.output
     payload = json.loads(result.output)
-    assert payload["version"] == 1
+    assert payload["version"] == 2
+    assert payload["bootstrap"] == {
+        "method": "paired_percentile",
+        "confidence_level": 0.95,
+        "samples": 1000,
+        "seed": 0,
+    }
     assert payload["models"] == [_variant(BIG), _variant(SMALL)]
     assert (chunk_size_project / "target" / "retrieval_compare.json").exists()
     # The per-model artifact is written too, one entry per side.
@@ -490,6 +502,11 @@ def test_artifact_carries_identity_and_no_text(chunk_size_project: Path) -> None
     [variant] = test["variants"]
     assert variant["code_version"] != test["baseline"]["code_version"]
     assert {q["query_id"] for q in variant["moved_queries"]} == {"q_labor"}
+    assert variant["delta_confidence_intervals"]["recall"]["1"] == {
+        "lower": -1.0,
+        "upper": 0.0,
+        "queries": 2,
+    }
     assert test["golden_set_hash"]
     serialized = json.dumps(artifact)
     for text in ("Payroll employment", "consumer price growth", "data.duckdb", "lancedb"):
@@ -524,14 +541,60 @@ def test_a_rank_change_that_moves_no_metric_is_not_a_movement() -> None:
     # Same score, different order among results: noise, not a regression.
     variant = _result("b", {"recall": {2: 1.0 + 1e-12}}, ("y", "x"))
     deltas, moved = compare_results(baseline, variant)
+    intervals = paired_bootstrap_intervals(
+        baseline, variant, seed=19, samples=200, confidence_level=0.95
+    )
+    assert intervals == paired_bootstrap_intervals(
+        baseline, variant, seed=19, samples=200, confidence_level=0.95
+    )
     assert deltas == {"recall": {2: pytest.approx(0.0, abs=1e-9)}}
     assert moved == ()
+
+
+def test_bootstrap_pairs_by_query_id_and_ignores_unmatched_queries() -> None:
+    def query(query_id: str, value: float) -> QueryMetrics:
+        return QueryMetrics(
+            query_id=query_id,
+            diagnosis=QueryDiagnosis.OK,
+            values={"recall": {1: value}},
+            ranked_ids=(),
+            missing_ids=(),
+        )
+
+    baseline = RetrievalTestResult(
+        model_name="base",
+        test_name="quality",
+        golden_set="golden",
+        mode="text",
+        per_query=[query("q1", 0.0), query("q2", 0.0), query("q3", 0.0)],
+    )
+    variant = RetrievalTestResult(
+        model_name="variant",
+        test_name="quality",
+        golden_set="golden",
+        mode="text",
+        per_query=[
+            query("q3", 1.0),
+            query("extra", 1.0),
+            query("q1", 1.0),
+            query("q2", 0.0),
+        ],
+    )
+    intervals = paired_bootstrap_intervals(
+        baseline, variant, seed=11, samples=500, confidence_level=0.95
+    )
+    interval = intervals["recall"][1]
+    assert interval is not None
+    assert interval.queries == 3
 
 
 def test_format_lists_every_model_as_a_column() -> None:
     baseline = _result("a", {"recall": {1: 1.0}}, ("x",))
     variant = _result("b", {"recall": {1: 0.0}}, ("y",))
     deltas, moved = compare_results(baseline, variant)
+    intervals = paired_bootstrap_intervals(
+        baseline, variant, seed=19, samples=200, confidence_level=0.95
+    )
     comparison = RetrievalComparison(
         project="p",
         baseline="a",
@@ -544,14 +607,22 @@ def test_format_lists_every_model_as_a_column() -> None:
                 granularity="record",
                 cutoffs=(1,),
                 baseline=Side("a", "v1", baseline),
-                variants=(VariantComparison(Side("b", "v2", variant), deltas, moved),),
+                variants=(
+                    VariantComparison(
+                        Side("b", "v2", variant), deltas, intervals, moved
+                    ),
+                ),
             ),
         ),
         results=(baseline, variant),
+        bootstrap_seed=19,
+        bootstrap_samples=200,
+        confidence_level=0.95,
     )
     lines = format_comparison(comparison)
     header = lines[1]
     assert "a" in header and "b" in header
     assert any(line.startswith("recall@1") and "(-1.000)" in line for line in lines)
+    assert any("[-1.000, -1.000]" in line for line in lines)
     assert any("q: recall@1 -1.000" in line for line in lines)
     assert any("ranked [x] -> [y]" in line for line in lines)

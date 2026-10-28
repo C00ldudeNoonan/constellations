@@ -1683,17 +1683,26 @@ values, or raw embedding vectors. Artifact version 2 added each result's
 evaluation for every search model `EXPR` selects and emits one comparison
 against the baseline (the first-named model, or name order under a tag or
 graph selector): per test, each side's aggregate and status, each variant's
-delta from the baseline for every metric at every cutoff, and the queries
-whose per-query score moved, with the ids each side ranked. A rank change
+delta from the baseline for every metric at every cutoff with a paired
+bootstrap confidence interval, and the queries whose per-query score moved,
+with the ids each side ranked. A rank change
 that moves no metric is not reported — two irrelevant results swapping
 places is noise. There is no second scorer; `retrieval_compare.py` only lines
 up `retrieval_eval.py`'s numbers.
+
+Intervals resample per-query metric deltas with replacement, pairing baseline
+and variant values by query ID. The default is a 95% percentile interval from
+1,000 draws with seed 0; `--bootstrap-seed` changes and records the seed. Each
+metric/cutoff uses a deterministic independent random stream. Intervals are
+descriptive uncertainty estimates over the judged queries, not a guarantee
+about future queries or an authorization-policy result.
 
 Comparability is checked before any query runs: every compared model must
 declare the same test names, each on the same golden set, at the same `at`
 cutoffs and `granularity`, or the comparison is refused naming both models
 and the field that differs. The artifact is `target-path/retrieval_compare.json`
-(version 1): metrics, model names, each side's `code_version`, and query ids
+(version 2): metrics, bootstrap settings, each variant's delta intervals,
+model names, each side's `code_version`, and query ids
 with ranked ids; never chunk text, prompt text, or profile values. The
 per-model `retrieval_eval.json` is written alongside. The exit code follows
 the plain form: 1 when any side's status is `fail`.

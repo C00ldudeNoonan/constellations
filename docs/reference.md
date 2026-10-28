@@ -1133,12 +1133,12 @@ traceable to examples rather than to a number.
 $ stel eval --compare 'release_search__chunk_size_1000 release_search__chunk_size_60'
 quality: golden_set=search_golden (2 queries, granularity=document); baseline release_search__chunk_size_1000
 metric        release_search__chunk_size_1000  release_search__chunk_size_60
-----------------------------------------------------------------------------
-recall@1      1.000                            0.500 (-0.500)
-precision@1   1.000                            0.500 (-0.500)
-hit_rate@1    1.000                            0.500 (-0.500)
-mrr@1         1.000                            0.500 (-0.500)
-ndcg@1        1.000                            0.500 (-0.500)
+-----------------------------------------------------------------------------
+recall@1      1.000                            0.500 (-0.500) [-1.000, +0.000]
+precision@1   1.000                            0.500 (-0.500) [-1.000, +0.000]
+hit_rate@1    1.000                            0.500 (-0.500) [-1.000, +0.000]
+mrr@1         1.000                            0.500 (-0.500) [-1.000, +0.000]
+ndcg@1        1.000                            0.500 (-0.500) [-1.000, +0.000]
 status        pass                             fail
   release_search__chunk_size_60: 1 query(ies) moved
     q_labor: hit_rate@1 -1.000, mrr@1 -1.000, ndcg@1 -1.000, precision@1 -1.000, recall@1 -1.000
@@ -1148,13 +1148,17 @@ status        pass                             fail
 Wrote target/retrieval_compare.json
 ```
 
-The first-named model is the baseline; with a tag or graph selector the
+The interval is a paired percentile bootstrap over per-query metric deltas
+(variant minus baseline), resampled by query ID. It defaults to 1,000 draws,
+95% confidence, and seed 0; pass `--bootstrap-seed N` to choose and record a
+different seed. The first-named model is the baseline; with a tag or graph selector the
 models sort by name, so pass `--baseline` to choose. Every compared model
 must carry the same tests on the same golden set, at the same cutoffs and
 granularity, or the comparison is refused naming both models before a query
 runs. The exit code is the plain form's: 1 if any side's status is `fail`.
-`--json` prints `target/retrieval_compare.json`, which carries the metrics,
-each side's `code_version`, and query ids with the ids each side ranked, and
+`--json` prints `target/retrieval_compare.json` (artifact version 2), which
+carries the bootstrap settings, each variant's metric/cutoff confidence
+intervals, each side's `code_version`, and query ids with the ids each side ranked, and
 never chunk text or anything from a profile; the per-model
 `retrieval_eval.json` is written alongside.
 

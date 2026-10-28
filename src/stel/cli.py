@@ -1713,6 +1713,13 @@ def test(
     metavar="MODEL",
     help="With --compare: the model deltas are measured from (default: the first selected).",
 )
+@click.option(
+    "--bootstrap-seed",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Seed for paired-bootstrap confidence intervals with --compare.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Print the eval artifact to stdout.")
 @_verbose_option
 @_project_context_options
@@ -1723,6 +1730,7 @@ def eval_(
     exclude: str | None,
     compare: str | None,
     baseline: str | None,
+    bootstrap_seed: int,
     as_json: bool,
     verbose: int,
     diagnostics_file: Path | None,
@@ -1745,6 +1753,7 @@ def eval_(
             project_dir,
             compare=compare,
             baseline=baseline,
+            bootstrap_seed=bootstrap_seed,
             target=target,
             profiles_dir=profiles_dir,
             as_json=as_json,
@@ -1752,6 +1761,8 @@ def eval_(
         return
     if baseline is not None:
         raise click.UsageError("--baseline only applies with --compare.")
+    if bootstrap_seed != 0:
+        raise click.UsageError("--bootstrap-seed only applies with --compare.")
     try:
         results = run_retrieval_evaluation(
             project_dir,
@@ -1812,6 +1823,7 @@ def _eval_compare(
     *,
     compare: str,
     baseline: str | None,
+    bootstrap_seed: int,
     target: str | None,
     profiles_dir: Path | None,
     as_json: bool,
@@ -1826,6 +1838,7 @@ def _eval_compare(
             baseline=baseline,
             target=target,
             profiles_dir=profiles_dir,
+            bootstrap_seed=bootstrap_seed,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e

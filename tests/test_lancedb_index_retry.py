@@ -280,6 +280,34 @@ def test_store_refusals_inside_a_build_are_not_retried(
     assert sleeps == []
 
 
+@pytest.mark.parametrize("error_type", [ValueError, TypeError])
+def test_invalid_index_arguments_are_not_retried_or_exposed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+) -> None:
+    """Native schema/argument refusals cannot succeed on retry (issue #722)."""
+    sleeps = _record_sleeps(monkeypatch)
+    spec = _spec()
+    with _store(tmp_path) as store:
+        _publish(store, spec)
+        seen = _flaky(monkeypatch, failures=5, raise_=error_type)
+        with pytest.raises(RetrievalError) as exc_info:
+            store.ensure_indexes(spec)
+
+    assert len(seen["table"].calls) == 1
+    assert sleeps == []
+    assert str(exc_info.value) == (
+        "LanceDB operation 'index creation' failed on BTree index for 'category' "
+        f"[{error_type.__name__}] (code=lancedb_index_failed)"
+    )
+    assert SENTINEL not in repr(exc_info.value)
+    assert exc_info.value.__context__ is None
+    assert str(exc_info.value.__cause__) == f"Native retrieval error type: {error_type.__name__}"
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
 def test_failures_outside_the_build_are_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -783,6 +783,15 @@ class SearchAttributeConfig(BaseModel):
     sortable: bool = False
     returned: bool = False
 
+    @model_validator(mode="after")
+    def _reject_array_sort(self) -> SearchAttributeConfig:
+        if self.data_type == "array[string]" and self.sortable:
+            raise ValueError(
+                f"Search attribute '{self.name}' with data_type array[string] "
+                "cannot be sortable; remove sortable or use a scalar attribute"
+            )
+        return self
+
 
 class SearchQueryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)

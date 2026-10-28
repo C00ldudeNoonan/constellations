@@ -881,6 +881,29 @@ def test_an_id_field_that_is_also_an_attribute_is_indexed_once() -> None:
     assert fields == ("chunk_id",)
 
 
+@pytest.mark.parametrize("role", ["none", "user", "policy", "user_and_policy"])
+def test_array_attributes_do_not_request_scalar_indexes(role: str) -> None:
+    """List columns cannot carry a BTree, including policy arrays (issue #722)."""
+    config = _search_config(
+        access="governed" if role in {"policy", "user_and_policy"} else "public",
+        attributes=(
+            {"name": "groups", "data_type": "array[string]", "filter_role": role},
+            {"name": "category", "data_type": "string", "filter_role": "user"},
+        ),
+    )
+    assert _scalar_index_fields(config) == ("chunk_id", "category")
+
+
+def test_sortable_array_is_rejected_during_config_validation() -> None:
+    """An unsupported array sort must fail before publication (issue #722)."""
+    with pytest.raises(ValidationError, match=r"Search attribute 'groups'.*sortable"):
+        _search_config(
+            attributes=(
+                {"name": "groups", "data_type": "array[string]", "sortable": True},
+            ),
+        )
+
+
 # ─── refine_factor and nprobes are query knobs, not index properties ────────
 # (issues #520 and #684)
 

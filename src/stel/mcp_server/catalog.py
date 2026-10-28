@@ -455,11 +455,14 @@ def _schema_fields(descriptor: Mapping[str, Any]) -> tuple[ContextField, ...]:
 
 def _filter_capability(attribute: Mapping[str, Any]) -> FilterCapability:
     data_type = str(attribute.get("data_type", "string"))
-    operators = (
-        (FilterOperator.EQUAL, FilterOperator.NOT_EQUAL, FilterOperator.IN)
-        if data_type in {"boolean", "array[string]"}
-        else tuple(FilterOperator)
-    )
+    if data_type == "array[string]":
+        operators = (FilterOperator.ARRAY_CONTAINS_ANY,)
+    elif data_type == "boolean":
+        operators = (FilterOperator.EQUAL, FilterOperator.NOT_EQUAL, FilterOperator.IN)
+    else:
+        operators = tuple(
+            item for item in FilterOperator if item is not FilterOperator.ARRAY_CONTAINS_ANY
+        )
     return FilterCapability(
         field=str(attribute.get("name", "")),
         data_type=data_type,

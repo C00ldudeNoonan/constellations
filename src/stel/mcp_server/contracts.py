@@ -44,6 +44,7 @@ class FilterOperator(StrEnum):
     GREATER_THAN = "gt"
     GREATER_THAN_OR_EQUAL = "ge"
     IN = "in"
+    ARRAY_CONTAINS_ANY = "array_contains_any"
 
 
 class BusinessFilter(BaseModel):
@@ -55,9 +56,9 @@ class BusinessFilter(BaseModel):
 
     @model_validator(mode="after")
     def _validate_value_shape(self) -> BusinessFilter:
-        if self.operator is FilterOperator.IN:
+        if self.operator in {FilterOperator.IN, FilterOperator.ARRAY_CONTAINS_ANY}:
             if not isinstance(self.value, tuple) or not self.value:
-                raise ValueError("in filters require one or more values")
+                raise ValueError(f"{self.operator.value} filters require one or more values")
         elif isinstance(self.value, tuple):
             raise ValueError("scalar filters accept exactly one value")
         return self

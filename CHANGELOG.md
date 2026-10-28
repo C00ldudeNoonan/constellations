@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fix MCP array membership filters (issue #723): `list_context_models`
+  advertises `array_contains_any` for `array[string]` user attributes, and
+  `search_context` accepts a nonempty JSON array of values for that operator.
+  Scalar operators and server-controlled policy filters keep their existing behavior.
+
 ## v0.24.0 - 2026-10-23
 
 ### Hybrid search fuses documents, not chunks (issue #701)

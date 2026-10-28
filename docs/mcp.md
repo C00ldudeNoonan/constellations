@@ -633,6 +633,24 @@ avoid starving the result page. stel applies declared attribute filters as
 satisfy them and none are discarded after retrieval; a selective filter
 returns a full page rather than a short one.
 
+Use the operators advertised for each field under `retrieval.filter_fields`
+by `list_context_models`. An `array[string]` user attribute accepts only
+`array_contains_any`, with a nonempty JSON array as its value. A row matches
+when its list contains at least one of those values:
+
+```json
+{
+  "model": "context_search",
+  "query": "growth",
+  "filters": [
+    {"field": "topics", "operator": "array_contains_any", "value": ["labor", "housing"]}
+  ]
+}
+```
+
+Scalar fields do not accept `array_contains_any`. Policy attributes remain
+server-controlled and cannot be supplied as business filters.
+
 A search hit carries the attributes the model declares `returned: true`, in
 an `attributes` object beside `citation` and `lineage`:
 

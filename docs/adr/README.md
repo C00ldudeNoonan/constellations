@@ -49,6 +49,7 @@ history (issue #311).
 | [0037](0037-a-segmented-search-group-declares-its-partitions.md) | A segmented search group declares partition bounds and pins every selected member | proposed |
 | [0038](0038-embedding-publication-overlap-is-opt-in.md) | Embedding can overlap the next provider window with publication when explicitly enabled; chunk stays serial until measured | accepted |
 | [0039](0039-array-filters-publish-without-a-scalar-index.md) | Array filters publish without a scalar index; array sorting and deterministic index argument failures are refused early | accepted |
+| [0040](0040-mcp-array-filters-use-explicit-overlap.md) | MCP array filters expose the search core's explicit overlap operator rather than translating scalar `in` | accepted |
 
 ## When to write one
 

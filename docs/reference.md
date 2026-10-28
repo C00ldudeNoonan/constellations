@@ -3863,6 +3863,12 @@ The retrieval store must advertise the `array_containment_filters` capability;
 one that cannot express overlap refuses the query rather than dropping the
 filter.
 
+The MCP `search_context` tool accepts the same overlap operator for user
+attributes, with a nonempty JSON array in the filter's `value`.
+`list_context_models` advertises only `array_contains_any` for an
+`array[string]` field; scalar fields retain their scalar operators. See
+[MCP filtering](mcp.md#limits-and-errors) for a request example.
+
 Every declared `data_type` is filterable, temporal types included:
 
 ```bash

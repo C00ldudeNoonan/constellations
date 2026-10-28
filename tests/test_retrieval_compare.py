@@ -502,7 +502,7 @@ def test_artifact_carries_identity_and_no_text(chunk_size_project: Path) -> None
     [variant] = test["variants"]
     assert variant["code_version"] != test["baseline"]["code_version"]
     assert {q["query_id"] for q in variant["moved_queries"]} == {"q_labor"}
-    assert variant["delta_confidence_intervals"]["recall"]["1"] == {
+    assert variant["delta_confidence_intervals"]["recall"][1] == {
         "lower": -1.0,
         "upper": 0.0,
         "queries": 2,
@@ -626,3 +626,52 @@ def test_format_lists_every_model_as_a_column() -> None:
     assert any("[-1.000, -1.000]" in line for line in lines)
     assert any("q: recall@1 -1.000" in line for line in lines)
     assert any("ranked [x] -> [y]" in line for line in lines)
+
+
+def test_format_widens_columns_for_intervals_across_three_models() -> None:
+    baseline = _result("a", {"recall": {1: 1.0}}, ("x",))
+    variant_b = _result("b", {"recall": {1: 0.0}}, ("y",))
+    variant_c = _result("c", {"recall": {1: 0.5}}, ("z",))
+    deltas_b, moved_b = compare_results(baseline, variant_b)
+    deltas_c, moved_c = compare_results(baseline, variant_c)
+    intervals_b = paired_bootstrap_intervals(
+        baseline, variant_b, seed=7, samples=100, confidence_level=0.95
+    )
+    intervals_c = paired_bootstrap_intervals(
+        baseline, variant_c, seed=7, samples=100, confidence_level=0.95
+    )
+    comparison = RetrievalComparison(
+        project="p",
+        baseline="a",
+        models=("a", "b", "c"),
+        tests=(
+            _TestComparison(
+                test_name="t",
+                golden_set="g",
+                golden_set_hash="h",
+                granularity="record",
+                cutoffs=(1,),
+                baseline=Side("a", "v1", baseline),
+                variants=(
+                    VariantComparison(
+                        Side("b", "v2", variant_b), deltas_b, intervals_b, moved_b
+                    ),
+                    VariantComparison(
+                        Side("c", "v3", variant_c), deltas_c, intervals_c, moved_c
+                    ),
+                ),
+            ),
+        ),
+        results=(baseline, variant_b, variant_c),
+        bootstrap_seed=7,
+        bootstrap_samples=100,
+        confidence_level=0.95,
+    )
+    lines = format_comparison(comparison)
+    header = lines[1]
+    metric_row = next(line for line in lines if line.startswith("recall@1"))
+    status_row = next(line for line in lines if line.startswith("status"))
+    c_column = header.index("c", header.index("b") + 1)
+    expected_cell = "0.500 (-0.500) [-0.500, -0.500]"
+    assert metric_row[c_column:c_column + len(expected_cell)] == expected_cell
+    assert status_row[c_column:c_column + 4] == "pass"

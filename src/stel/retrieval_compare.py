@@ -512,8 +512,7 @@ def format_comparison(comparison: RetrievalComparison) -> list[str]:
     variants' cells carrying their delta from the baseline. Then the moved
     queries per variant, each with the ranking on both sides."""
     lines: list[str] = []
-    width = max(len(name) for name in comparison.models)
-    cell = max(width, 18)
+    cell = _comparison_cell_width(comparison)
     for test in comparison.tests:
         queries = len(test.baseline.result.per_query)
         lines.append(
@@ -525,23 +524,41 @@ def format_comparison(comparison: RetrievalComparison) -> list[str]:
         lines.append("-" * len(header.rstrip()))
         for metric, by_cutoff in test.baseline.result.aggregate.items():
             for cutoff in test.cutoffs:
-                row = f"{f'{metric}@{cutoff}':<14}{by_cutoff.get(cutoff, 0.0):<{cell + 2}.3f}"
+                baseline_value = f"{by_cutoff.get(cutoff, 0.0):.3f}"
+                row = f"{f'{metric}@{cutoff}':<14}{baseline_value:<{cell + 2}}"
                 for variant in test.variants:
-                    value = variant.side.result.aggregate.get(metric, {}).get(cutoff, 0.0)
-                    delta = variant.deltas.get(metric, {}).get(cutoff, 0.0)
-                    interval = variant.delta_intervals.get(metric, {}).get(cutoff)
-                    interval_text = (
-                        f" [{interval.lower:+.3f}, {interval.upper:+.3f}]"
-                        if interval is not None
-                        else " [n/a]"
-                    )
-                    row += f"{f'{value:.3f} ({delta:+.3f}){interval_text}':<{cell + 2}}"
+                    row += f"{_variant_cell(variant, metric, cutoff):<{cell + 2}}"
                 lines.append(row.rstrip())
         lines.extend(_format_status_row(test, cell))
         for variant in test.variants:
             lines.extend(_format_movements(variant))
         lines.append("")
     return lines
+
+
+def _comparison_cell_width(comparison: RetrievalComparison) -> int:
+    width = max(18, *(len(name) for name in comparison.models))
+    for test in comparison.tests:
+        for metric, by_cutoff in test.baseline.result.aggregate.items():
+            for cutoff, value in by_cutoff.items():
+                width = max(width, len(f"{value:.3f}"))
+                for variant in test.variants:
+                    width = max(width, len(_variant_cell(variant, metric, cutoff)))
+        for side in (test.baseline, *(variant.side for variant in test.variants)):
+            width = max(width, len(side.result.status))
+    return width
+
+
+def _variant_cell(variant: VariantComparison, metric: str, cutoff: int) -> str:
+    value = variant.side.result.aggregate.get(metric, {}).get(cutoff, 0.0)
+    delta = variant.deltas.get(metric, {}).get(cutoff, 0.0)
+    interval = variant.delta_intervals.get(metric, {}).get(cutoff)
+    interval_text = (
+        f" [{interval.lower:+.3f}, {interval.upper:+.3f}]"
+        if interval is not None
+        else " [n/a]"
+    )
+    return f"{value:.3f} ({delta:+.3f}){interval_text}"
 
 
 def _format_status_row(test: TestComparison, cell: int) -> list[str]:

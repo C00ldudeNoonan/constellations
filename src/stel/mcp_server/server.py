@@ -147,6 +147,10 @@ def create_mcp_server(
         before fusion, not how many results come back — that stays `limit`.
         Unset, it scales with `limit`.
 
+        `filters` use the operators advertised by `list_context_models`.
+        An `array[string]` field accepts only `array_contains_any`, with a
+        nonempty array of values; a row matches if it shares any value.
+
         `entity_scope` restricts results to chunks linked to declared
         vocabulary terms: `{"class": "central_bank"}` for every term of a
         class, or `{"term": "Federal Reserve", "expand": "narrower"}` for one

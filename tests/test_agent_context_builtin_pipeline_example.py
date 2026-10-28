@@ -10,12 +10,18 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import yaml
+from mcp import ClientSession
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from stel.agent_context import FreshnessStatus
 from stel.checks import run_project_tests
 from stel.manifest import write_manifest
+from stel.mcp_server.authorization import Principal, StaticPrincipalResolver
 from stel.mcp_server.catalog import ArtifactCatalog
 from stel.mcp_server.repository import WarehouseContextRepository
+from stel.mcp_server.server import create_mcp_server
+from stel.mcp_server.service import ContextService
 from stel.mcp_server.serving_state import freshness, read_activations
 from stel.runner import run_project
 from stel.search import SearchSession
@@ -85,6 +91,110 @@ def test_builtin_pipeline_example_is_mcp_discoverable(tmp_path: Path) -> None:
     assert summary.contract == "agent_context/v1"
     assert summary.grain == "document_chunks"
     assert summary.access == "governed"
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_mcp_array_membership_filters_the_published_index(tmp_path: Path) -> None:
+    """Issue #723: discover, validate and execute overlap through real MCP.
+
+    The search input tags each chunk with its document's title. A filter
+    must select that document and exclude other searchable documents, in
+    every retrieval mode, while policy fields remain caller-inaccessible.
+    """
+    project = _project(tmp_path)
+    config_path = project / "models" / "context_search.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["models"][0]["search"]["attributes"].append(
+        {
+            "name": "topics",
+            "data_type": "array[string]",
+            "filter_role": "user",
+            "returned": True,
+        }
+    )
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    run_project(project, exclude="context_search")
+    # Prepare the search input directly: embed currently scalarizes list
+    # passthrough values, a separate issue from the MCP filter contract.
+    connection = duckdb.connect(str(project / "target" / "context.duckdb"))
+    try:
+        connection.execute(
+            'ALTER TABLE "context".context.chunk_embeddings ADD COLUMN topics VARCHAR[]'
+        )
+        connection.execute('UPDATE "context".context.chunk_embeddings SET topics = [title]')
+    finally:
+        connection.close()
+    run_project(project, select="context_search")
+    write_manifest(project)
+    service = ContextService.from_project(
+        project,
+        principal_resolver=StaticPrincipalResolver(
+            Principal(
+                "test-reader",
+                tenant_id="economic-data",
+                access_groups=("research-desk",),
+            )
+        ),
+    )
+    wanted = "Labor market cooling continues into the second quarter"
+    try:
+        async with create_connected_server_and_client_session(
+            create_mcp_server(service),
+            raise_exceptions=True,
+        ) as session:
+            catalog = await session.call_tool("list_context_models", {})
+            assert not catalog.isError
+            assert catalog.structuredContent is not None
+            fields = catalog.structuredContent["models"][0]["retrieval"]["filter_fields"]
+            assert next(field for field in fields if field["field"] == "topics") == {
+                "field": "topics",
+                "data_type": "array[string]",
+                "operators": ["array_contains_any"],
+            }
+            for mode in ("text", "vector", "hybrid"):
+                await _assert_array_membership_search(session, mode, wanted)
+            for field, operator, value in (
+                ("topics", "eq", wanted),
+                ("tenant_id", "array_contains_any", ["economic-data"]),
+            ):
+                refused = await session.call_tool(
+                    "search_context",
+                    {
+                        "model": "context_search",
+                        "query": "growth",
+                        "mode": "text",
+                        "filters": [{"field": field, "operator": operator, "value": value}],
+                    },
+                )
+                assert refused.structuredContent is not None
+                assert refused.structuredContent["results"] == []
+                assert refused.structuredContent["error"]["code"] == "capability_unavailable"
+    finally:
+        service.close()
+
+
+async def _assert_array_membership_search(session: ClientSession, mode: str, wanted: str) -> None:
+    arguments = {"model": "context_search", "query": "growth", "mode": mode}
+    baseline = await session.call_tool("search_context", arguments)
+    assert baseline.structuredContent is not None
+    assert baseline.structuredContent["error"] is None
+    assert len({hit["document_id"] for hit in baseline.structuredContent["results"]}) > 1
+    for values, expected in ((["absent", wanted], True), (["absent"], False)):
+        response = await session.call_tool("search_context", {
+            **arguments,
+            "filters": [{"field": "topics", "operator": "array_contains_any", "value": values}],
+        })
+        assert not response.isError
+        assert response.structuredContent is not None
+        assert response.structuredContent["error"] is None
+        hits = response.structuredContent["results"]
+        assert bool(hits) is expected
+        assert all(hit["attributes"]["topics"] == [wanted] for hit in hits)
 
 
 def test_a_published_index_reports_its_activation_through_a_real_warehouse(

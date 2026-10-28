@@ -1546,12 +1546,15 @@ def _scalar_index_fields(search: SearchConfig) -> tuple[str, ...]:
 
     Ordered with the merge key first and de-duplicated: an id field that is
     also a filterable attribute must not ask for the same index twice.
+    Array membership predicates work without an index; list columns cannot
+    carry a BTree (issue #722).
     """
     fields = [search.id_field]
     fields.extend(
         attribute.name
         for attribute in search.attributes
-        if attribute.filter_role != "none" or attribute.sortable
+        if attribute.data_type != "array[string]"
+        and (attribute.filter_role != "none" or attribute.sortable)
     )
     return tuple(dict.fromkeys(fields))
 

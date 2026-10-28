@@ -254,6 +254,53 @@ def test_search_filters_are_typed_and_authorized(published_project: Path) -> Non
         )
 
 
+def test_array_user_filter_survives_publication_and_incremental_rerun(tmp_path: Path) -> None:
+    """Build real indexes before querying array membership (issue #722)."""
+    project = _write_project(tmp_path)
+    model_file = project / "models" / "search.yml"
+    model_file.write_text(
+        "version: 2\nmodels:\n"
+        "  - name: release_documents\n"
+        "    source: ref('releases')\n"
+        "    extraction:\n      backend: json\n"
+        "      options:\n        fields: [body, category]\n"
+        "  - name: release_arrays\n"
+        "    transform:\n      type: sql\n      path: models/release_arrays.sql\n"
+        "  - name: release_search\n"
+        "    depends_on: [ref('release_arrays')]\n"
+        "    materialization: incremental\n"
+        "    search:\n"
+        "      id_field: chunk_id\n      document_id_field: null\n"
+        "      text_fields: [text]\n      return_text_fields: [text]\n"
+        "      full_text:\n        fields: [text]\n"
+        "      attributes:\n"
+        "        - name: category\n          data_type: array[string]\n"
+        "          filter_role: user\n          returned: true\n"
+        "      query:\n        modes: [text]\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "release_arrays.sql").write_text(
+        "SELECT document_id AS chunk_id, 'economic ' || body AS text, "
+        "[category, 'economic'] AS category FROM {{ ref('release_documents') }}",
+        encoding="utf-8",
+    )
+
+    request = SearchRequest(
+        model="release_search",
+        query="economic",
+        mode=SearchMode.TEXT,
+        filters=(
+            SearchFilter("category", SearchFilterOperator.ARRAY_CONTAINS_ANY, ("prices",)),
+        ),
+    )
+    for _ in range(2):
+        results = run_project(project)
+        assert results[-1].serving_resource is not None
+        hits = search(project, request).results
+        assert len(hits) == 1
+        assert hits[0].metadata["category"] == ["prices", "economic"]
+
+
 def test_search_cli_emits_stable_json_and_human_provenance(
     published_project: Path,
 ) -> None:

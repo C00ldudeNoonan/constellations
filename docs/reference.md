@@ -3335,10 +3335,12 @@ native exception's type; when every attempt fails, the error says so
 Retrying is safe because `create_index(replace=True)` is idempotent and a
 partially built index is re-entered on the next publish anyway. A refusal
 stel raises itself (an `ivf_pq` corpus below the training floor, an unowned
-collection) is never retried. Like the cache budgets, these are execution
-settings and do not enter the store's identity.
+collection) is never retried. Native schema or argument failures reported as
+`ValueError` or `TypeError` also fail on the first attempt; repeating an
+invalid index definition cannot fix it. Like the cache budgets, these are
+execution settings and do not enter the store's identity.
 
-One native failure is also never retried, because retrying it cannot work.
+Memory-pool exhaustion is also never retried, because retrying it cannot work.
 Lance sorts the whole key column through a DataFusion memory pool when it
 builds a scalar index, and that pool is neither of the caches above: a BTree
 over 3.64 million keys exhausted it in under three seconds, and the same
@@ -3852,6 +3854,11 @@ stel search --model chunk_search --query "inflation"   --filter access_groups ar
 ```
 
 The row matches when its list shares at least one value with the array given.
+LanceDB publishes array attributes without a BTree index and evaluates their
+membership predicates without one. This applies to user and policy filters;
+scalar filter and sort attributes still get BTree indexes. Array attributes
+cannot declare `sortable: true`; configuration validation names the attribute
+and rejects it before source access or publication.
 The retrieval store must advertise the `array_containment_filters` capability;
 one that cannot express overlap refuses the query rather than dropping the
 filter.

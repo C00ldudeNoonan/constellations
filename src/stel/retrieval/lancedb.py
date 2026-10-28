@@ -1163,9 +1163,10 @@ class LanceDBStore(RetrievalStore):
     ) -> None:
         """Run one index build, retrying native failures with backoff (#491).
 
-        Only native errors are retried; a `RetrievalError` is a deliberate
-        refusal. Every retry passes `replace=True`: a first attempt that failed
-        after LanceDB had already committed the index would otherwise be
+        Native schema/argument errors (`ValueError`/`TypeError`) and deliberate
+        `RetrievalError` refusals are not retried. Every retry passes
+        `replace=True`: a first attempt that failed after LanceDB had already
+        committed the index would otherwise be
         refused as a duplicate. The retry warning carries only the step and the
         native exception's type (issue #490); the native text goes to DEBUG.
         """
@@ -1176,6 +1177,10 @@ class LanceDBStore(RetrievalStore):
                 build(replace=existing or attempt > 1)
                 return
             except RetrievalError:
+                raise
+            except (ValueError, TypeError):
+                # An invalid index definition cannot improve on another
+                # attempt. The caller still sanitizes the native error (#722).
                 raise
             except Exception as error:
                 if _is_pool_exhausted(error):

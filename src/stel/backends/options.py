@@ -76,6 +76,8 @@ def validate_llm_numeric_options(options: Mapping[str, Any]) -> None:
         if number_name not in options:
             continue
         number_value = options[number_name]
+        if number_name == "temperature" and number_value is None:
+            continue
         if isinstance(number_value, bool) or not isinstance(number_value, int | float):
             raise ValueError(
                 f"llm option '{number_name}' must be a number between "
@@ -326,7 +328,7 @@ class LLMBackendOptions(_BackendOptions):
         "If a field is genuinely missing from the document, use null."
     )
     cache_path: str | Path | None = None
-    temperature: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    temperature: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     max_tokens: int = Field(default=2048, ge=1, le=65_536)
     max_retries: int = Field(default=4, ge=0, le=20)
     max_concurrent: int = Field(default=4, ge=1, le=100)

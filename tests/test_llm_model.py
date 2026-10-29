@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
 import pytest
+from anthropic import Omit
 
 from stel.manifest import build_manifest
 from stel.runner import RunError, run_project
@@ -115,6 +117,51 @@ def test_llm_model_materializes_typed_rows_and_metadata(tmp_path: Path) -> None:
     assert "INT" in dtypes["score"].upper()
     provider = _rows(project, f"SELECT DISTINCT llm_provider FROM {_FACTS}")
     assert provider == [("deterministic",)]
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-haiku-4-5"])
+def test_anthropic_map_publishes_and_reruns_incrementally_with_current_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str,
+) -> None:
+    """#714: run the real provider and installed SDK through a warehouse llm: model."""
+    captured: list[dict[str, Any]] = []
+
+    def post(client: Any, path: str, **kwargs: Any) -> SimpleNamespace:
+        del client, path
+        captured.append({
+            key: value for key, value in kwargs["body"].items() if not isinstance(value, Omit)
+        })
+        return SimpleNamespace(
+            id="msg_offline", stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+            content=[SimpleNamespace(type="text", text='{"sentiment": "positive", "score": 7}')],
+        )
+
+    monkeypatch.setattr("anthropic.Anthropic.post", post)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    project = _project(tmp_path, docs={"a": "employment rose"})
+    models_path = project / "models" / "models.yml"
+    models_path.write_text(
+        models_path.read_text(encoding="utf-8")
+        .replace("provider: deterministic", "provider: anthropic")
+        .replace("model: deterministic-v1", f"model: {model}"),
+        encoding="utf-8",
+    )
+    results = run_project(project)
+    result = next(item for item in results if item.model_name == "document_facts")
+    assert result.rows_written == 1
+    assert result.metrics["input_tokens"] == 7
+    assert _rows(project, f"SELECT sentiment, score, llm_model FROM {_FACTS}") == [
+        ("positive", 7, model),
+    ]
+    assert len(captured) == 1
+    assert "temperature" not in captured[0]
+    assert "tool_choice" not in captured[0]
+    assert captured[0]["output_config"]["format"]["type"] == "json_schema"
+    second = run_project(project)
+    repeated = next(item for item in second if item.model_name == "document_facts")
+    assert repeated.documents_skipped == 1
+    assert len(captured) == 1
 
 
 def test_llm_model_is_deterministic_and_incremental(tmp_path: Path) -> None:

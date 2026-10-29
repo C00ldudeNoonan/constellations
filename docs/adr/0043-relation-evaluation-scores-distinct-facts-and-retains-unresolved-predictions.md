@@ -1,4 +1,4 @@
-# ADR-0042: Relation evaluation scores distinct facts and retains unresolved predictions
+# ADR-0043: Relation evaluation scores distinct facts and retains unresolved predictions
 
 - **Status:** accepted
 - **Date:** 2026-10-29

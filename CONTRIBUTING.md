@@ -269,7 +269,9 @@ The current implementation boundaries are:
 - DuckDB and BigQuery are the implemented warehouse adapters. State follows the
   active adapter; do not introduce new DuckDB assumptions into orchestration.
 - Local filesystem and GCS are the implemented document-source types.
-- Anthropic is the only implemented LLM provider.
+- Anthropic, vllm, Vertex, and the offline deterministic provider implement
+  inference through the provider registry. Anthropic uses native JSON output;
+  single and batch requests share a schema and sampling contract.
 - stel is dbt-shaped but standalone. Its artifacts and test semantics must be
   documented explicitly rather than assumed to be dbt-core contracts.
 

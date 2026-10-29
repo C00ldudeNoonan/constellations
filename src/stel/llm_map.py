@@ -70,7 +70,7 @@ class LLMMapRuntime:
     implementation: str
     output_cardinality: Literal["one", "many"]
     system_prompt: str
-    temperature: float
+    temperature: float | None
     max_tokens: int
     max_retries: int
     max_concurrent: int
@@ -229,7 +229,7 @@ def resolve_llm_runtime(
                 else {}
             ),
             "output_cardinality": config.output_cardinality,
-            "temperature": config.temperature,
+            "temperature": provider.resolve_temperature(config.temperature),
             "max_tokens": config.max_tokens,
             "fields": fields_spec,
             # Endpoint and semantic provider options resolve from the profile and
@@ -250,7 +250,7 @@ def resolve_llm_runtime(
         implementation=implementation,
         output_cardinality=config.output_cardinality,
         system_prompt=prompt.text,
-        temperature=config.temperature,
+        temperature=provider.resolve_temperature(config.temperature),
         max_tokens=config.max_tokens,
         max_retries=config.max_retries,
         max_concurrent=config.max_concurrent,

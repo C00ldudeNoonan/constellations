@@ -101,10 +101,10 @@ def _append_declaration(project_dir: Path, declaration_yaml: str) -> None:
     project_file.write_text(existing + declaration_yaml, encoding="utf-8")
 
 
-# `document_typed_relations` (the `rule` extractor) declares exactly these two
-# rules against `examples/economic_nlp/models/document_typed_relations.yml`.
+# All rule extractors in the example, including the offline eval fixture,
+# must be covered when a project opts into a closed relation declaration.
 _MATCHING_DECLARATION = (
-    "\nclasses: [ORG, GPE, MONEY]\n"
+    "\nclasses: [ORG, GPE, MONEY, TOPIC]\n"
     "relations:\n"
     "  - name: references_geography\n"
     "    subject_class: ORG\n"
@@ -112,6 +112,9 @@ _MATCHING_DECLARATION = (
     "  - name: references_amount\n"
     "    subject_class: ORG\n"
     "    object_class: MONEY\n"
+    "  - name: references_topic\n"
+    "    subject_class: ORG\n"
+    "    object_class: TOPIC\n"
 )
 
 
@@ -185,17 +188,7 @@ def test_co_occurrence_models_are_unaffected_by_a_declaration(tmp_path: Path) ->
     # classes:/relations: declaration constrains rule/model_assertion
     # extractors only.
     project_dir = _copy_example(tmp_path)
-    _append_declaration(
-        project_dir,
-        "\nclasses: [ORG, GPE, MONEY]\n"
-        "relations:\n"
-        "  - name: references_geography\n"
-        "    subject_class: ORG\n"
-        "    object_class: GPE\n"
-        "  - name: references_amount\n"
-        "    subject_class: ORG\n"
-        "    object_class: MONEY\n",
-    )
+    _append_declaration(project_dir, _MATCHING_DECLARATION)
 
     project, sources, models = load_project(project_dir)
     validate_project_contract(project, sources, models, project_dir)

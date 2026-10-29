@@ -84,6 +84,17 @@ def test_execute_map_item_cardinality_one() -> None:
     assert usage["input_tokens"] == 3
 
 
+def test_temperature_defaults_preserve_plugin_contract_and_anthropic_identity() -> None:
+    """#714: omission differs from explicit zero only for providers opting into it."""
+    assert _runtime().temperature == 0.0
+    assert _runtime().config_hash == _runtime(temperature=0.0).config_hash
+    implicit = _runtime(provider="anthropic", model="claude-haiku-4-5")
+    explicit = _runtime(provider="anthropic", model="claude-haiku-4-5", temperature=0.0)
+    assert implicit.temperature is None
+    assert explicit.temperature == 0.0
+    assert implicit.config_hash != explicit.config_hash
+
+
 def test_execute_map_item_cardinality_many_fans_out() -> None:
     runtime = _runtime(output_cardinality="many")
     rows, _usage = execute_map_item("doc1", runtime, budget=None)

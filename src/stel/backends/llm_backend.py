@@ -56,8 +56,8 @@ _DEFAULT_SYSTEM = (
     "Return structured fields that match the requested output schema. "
     "If a field is genuinely missing from the document, use null."
 )
-# Extraction wants reproducibility, not creativity.
-_DEFAULT_TEMPERATURE = 0.0
+# None lets the provider select its supported sampling default.
+_DEFAULT_TEMPERATURE = None
 _DEFAULT_MAX_TOKENS = 2048
 _DEFAULT_MAX_RETRIES = 4
 _DEFAULT_MAX_CONCURRENT = 4
@@ -158,7 +158,7 @@ class LLMBackend(BaseBackend):
         system_prompt:  Override system prompt
         cache_path:     Path to cache file (recommended: ./target/llm_cache.duckdb)
         fields:         [{name, type, description?}] — structured output schema
-        temperature:    Sampling temperature (default 0 — deterministic extraction;
+        temperature:    Sampling temperature (default provider-selected;
                         part of the cache key)
         max_tokens:     Response budget (default 2048); a truncated response is
                         an error, never partial data
@@ -227,7 +227,7 @@ class LLMBackend(BaseBackend):
             timeout_seconds=float(
                 options.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
             ),
-            temperature=float(options.get("temperature", _DEFAULT_TEMPERATURE)),
+            temperature=options.get("temperature", _DEFAULT_TEMPERATURE),
             max_tokens=int(options.get("max_tokens", _DEFAULT_MAX_TOKENS)),
             max_retries=int(options.get("max_retries", _DEFAULT_MAX_RETRIES)),
             max_concurrent=int(options.get("max_concurrent", _DEFAULT_MAX_CONCURRENT)),
@@ -288,7 +288,7 @@ class LLMBackend(BaseBackend):
         fields_spec = _fields_spec(options)
         system = options.get("system_prompt", _DEFAULT_SYSTEM)
         fields_spec, system = _apply_enum_portability(provider, fields_spec, system)
-        temperature = float(options.get("temperature", _DEFAULT_TEMPERATURE))
+        temperature = provider.resolve_temperature(options.get("temperature", _DEFAULT_TEMPERATURE))
         max_tokens = int(options.get("max_tokens", _DEFAULT_MAX_TOKENS))
         poll_seconds = float(
             options.get("batch_poll_seconds", _DEFAULT_BATCH_POLL_SECONDS)
@@ -525,7 +525,7 @@ def extract_fields_from_text(
     system: str = _DEFAULT_SYSTEM,
     cache_path: str | Path | None = None,
     call_api: Any = None,
-    temperature: float = _DEFAULT_TEMPERATURE,
+    temperature: float | None = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
@@ -576,7 +576,7 @@ def extract_fields_with_usage(
     system: str = _DEFAULT_SYSTEM,
     cache_path: str | Path | None = None,
     call_api: Any = None,
-    temperature: float = _DEFAULT_TEMPERATURE,
+    temperature: float | None = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
@@ -628,6 +628,7 @@ def extract_fields_with_usage(
         if provider_options
         else get_inference_provider(provider)
     )
+    temperature = provider_instance.resolve_temperature(temperature)
     resolved_model = resolve_provider_model(provider_instance, model)
     resolved_base_url = provider_instance.resolve_base_url(base_url)
     fields_spec, system = _apply_enum_portability(
@@ -720,7 +721,7 @@ def _default_call_api(
     fields_spec: list[dict[str, Any]],
     *,
     provider: str = DEFAULT_LLM_PROVIDER,
-    temperature: float = _DEFAULT_TEMPERATURE,
+    temperature: float | None = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     api_key_env: CredentialSelector = None,
@@ -743,6 +744,7 @@ def _default_call_api(
             "credential resolution",
             code="invalid_credential_reference",
         )
+    temperature = provider_instance.resolve_temperature(temperature)
     credential = _resolve_provider_credential(provider_instance, api_key_env)
     request = _inference_request(
         content=content,
@@ -962,7 +964,7 @@ def _inference_request(
     model: str,
     system: str,
     fields_spec: list[dict[str, Any]],
-    temperature: float,
+    temperature: float | None,
     max_tokens: int,
     output_cardinality: str = "one",
 ) -> InferenceRequest:
@@ -1128,7 +1130,7 @@ def _enum_portability_line(spec: dict[str, Any]) -> str:
 def _hash_schema(
     system: str,
     fields_spec: list[dict[str, Any]],
-    temperature: float,
+    temperature: float | None,
     output_cardinality: str = "one",
 ) -> str:
     payload: dict[str, Any] = {

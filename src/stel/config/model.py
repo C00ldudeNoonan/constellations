@@ -529,7 +529,7 @@ class LLMTransformConfig(BaseModel):
     prompt: str | PromptRef = Field(union_mode="left_to_right")
     provider: str = Field(default="default", min_length=1)
     model: str = Field(default="default", min_length=1)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
     max_tokens: int = Field(default=2048, gt=0, le=1_000_000)
     max_concurrent: int = Field(default=8, gt=0, le=1_000)
     max_retries: int = Field(default=4, ge=0)

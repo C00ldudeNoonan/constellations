@@ -464,7 +464,7 @@ class InferenceRequest:
     output_schema: Mapping[str, Any] = field(repr=False)
     output_name: str = "extract"
     output_description: str = "Return the extracted structured fields."
-    temperature: float = 0.0
+    temperature: float | None = 0.0
     max_tokens: int = 2048
 
     def __post_init__(self) -> None:
@@ -478,7 +478,7 @@ class InferenceRequest:
             raise ValueError("inference output_schema must be a mapping")
         if not isinstance(self.output_name, str) or not self.output_name:
             raise ValueError("output_name must not be empty")
-        if (
+        if self.temperature is not None and (
             isinstance(self.temperature, bool)
             or not isinstance(self.temperature, (int, float))
             or not math.isfinite(self.temperature)
@@ -930,6 +930,10 @@ class BaseProvider(ABC):
 
 
 class InferenceProvider(BaseProvider):
+    # Existing v3 plugins keep receiving numeric temperatures unless they
+    # explicitly opt into delegating the default to their service.
+    default_temperature: ClassVar[float | None] = 0.0
+
     default_model: ClassVar[str | None] = None
     supports_custom_base_url: ClassVar[bool] = False
     requires_base_url: ClassVar[bool] = False
@@ -954,6 +958,9 @@ class InferenceProvider(BaseProvider):
         credential: ProviderCredential | None,
         runtime: ProviderRuntimeOptions,
     ) -> InferenceResult: ...
+
+    def resolve_temperature(self, temperature: float | None) -> float | None:
+        return self.default_temperature if temperature is None else temperature
 
     def resolve_model(self, model: str | None) -> str:
         if model is not None and (not isinstance(model, str) or not model):

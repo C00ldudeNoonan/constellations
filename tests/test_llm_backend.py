@@ -261,10 +261,10 @@ def test_custom_api_key_env_wins_for_sync_and_reusable_clients(
     class _FakeMessages:
         def create(self, **kwargs: Any) -> SimpleNamespace:
             return SimpleNamespace(
-                stop_reason="tool_use",
+                stop_reason="end_turn",
                 content=[
                     SimpleNamespace(
-                        type="tool_use", name="extract", input={"vendor": "Acme"}
+                        type="text", text='{"vendor": "Acme"}'
                     )
                 ],
                 usage=SimpleNamespace(input_tokens=0, output_tokens=0),
@@ -329,7 +329,7 @@ def test_generation_params_default_and_override(
     assert "ANTHROPIC_API_KEY" not in repr(first_reference)
     assert counter.kwargs == {
         "provider": "anthropic",
-        "temperature": 0.0,
+        "temperature": None,
         "max_tokens": 2048,
         "max_retries": 4,
     }
@@ -638,7 +638,7 @@ def test_truncated_response_is_an_error(
     monkeypatch: pytest.MonkeyPatch, doc: Path, schema: list[dict[str, Any]]
 ) -> None:
     """A max_tokens-truncated response raises instead of yielding partial data;
-    the client is constructed with the retry budget and called with temperature 0
+    the client is constructed with the retry budget and called without a temperature override
     and a plain-string system prompt."""
     init_kwargs: dict[str, Any] = {}
     create_kwargs: dict[str, Any] = {}
@@ -670,7 +670,8 @@ def test_truncated_response_is_an_error(
         "max_retries": 4,
         "timeout": 60.0,
     }
-    assert create_kwargs["temperature"] == 0.0
+    assert "temperature" not in create_kwargs
+    assert "extra_body" not in create_kwargs
     assert create_kwargs["max_tokens"] == 2048
     assert isinstance(create_kwargs["system"], str)
 

@@ -459,7 +459,9 @@ def test_type_identity_is_qualified_by_module() -> None:
 # the one identity a package rename must not move. Digests captured before the
 # #313 rename; `_identity_qualname` is what keeps them.
 _PROVIDER_IDENTITIES: tuple[tuple[str, str], ...] = (
-    ("anthropic-inference", "provider-v3/5c08808d1ce2631b38df9019744a80fe"),
+    # #714 deliberately moves Anthropic to native JSON output (implementation
+    # v2); cached tool responses must not hide the changed request semantics.
+    ("anthropic-inference", "provider-v3/62e48e086881ad33aa32e41af535e0a0"),
     ("deterministic-embedding", "provider-v3/525af5c1b28b0dd4e9fd2038b89315d2"),
     ("deterministic-inference", "provider-v3/5ebfdb5a1ba32560062b0d962c86f057"),
     ("vertex-embedding", "provider-v3/da9e3b794607ec572d78ce1954240d90"),

@@ -3049,6 +3049,35 @@ identity and aggregate usage — prompts, input text, and credentials are never
 copied into artifacts. Native provider batch execution for `llm:` models is
 deferred (issue #149 covers the batch machinery `backend: llm` already uses).
 
+### Anthropic compatibility and sampling
+
+The Anthropic provider requires `anthropic>=0.103.1` and supports the current
+SDK, including 2.x. Single requests and document-extraction batches use native
+JSON output (`output_config.format`) with the declared schema; stel parses the
+text response and preserves enum constraints. The SDK transforms closed schemas
+for the API, including `additionalProperties: false`. Schemas containing
+free-form objects instead retain automatic, non-strict tool selection so their
+undeclared nested keys are preserved. If the model returns no matching tool
+result, the request fails safely. Forced tool selection is never sent.
+Refusals and truncated or malformed JSON fail without publishing partial output;
+reported usage still counts toward billing and budgets. Refusal text is never
+included in the error.
+
+For both `llm:` models and `backend: llm` options, omitted or `null`
+`temperature` uses the provider default. Anthropic sends no sampling parameter;
+the other built-in providers and existing v3 plugins retain `0.0`. An explicit
+number, including `0.0`, remains a distinct cache and incremental identity for
+Anthropic. Legacy sampling overrides are sent through the SDK's `extra_body`
+for single requests and in each batch item's parameters. Use them only with
+a model/API version that supports sampling; current models can reject them.
+
+Anthropic's implementation identity advances to v2 for this request change.
+Existing cached tool responses are not reused, and incremental `llm:` models
+see a configuration change. Inspect `stel plan` and use the documented
+reprocess guard before accepting paid reprocessing. Provider contract v3 stays
+compatible: providers opt into a service-selected sampling default by setting
+`default_temperature = None`; existing plugins continue to receive a number.
+
 ### Versioned prompts
 
 A prompt is a program input that changes the output, exactly like the SQL in a

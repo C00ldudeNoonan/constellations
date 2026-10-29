@@ -1,11 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from anthropic.types import ToolParam
+from typing import Any
 
 from ..logging_setup import PROVIDER_DIAGNOSTICS_EXTRA
 from .base import (
@@ -39,14 +37,15 @@ log = logging.getLogger(__name__)
 @register_inference_provider
 class AnthropicInferenceProvider(InferenceProvider):
     provider_name = "anthropic"
-    implementation_version = "1"
+    implementation_version = "2"
     implementation_packages = ("anthropic",)
     default_model = "claude-haiku-4-5"
+    default_temperature = None
     default_credential_env = "ANTHROPIC_API_KEY"
     supports_native_batch = True
     max_batch_requests = 100_000
     batch_cost_multiplier = 0.5
-    # Tool `input_schema` is JSON Schema; `enum` rides through unchanged.
+    # Native JSON output preserves enum constraints in the supplied schema.
     supports_schema_enum = True
 
     def complete(
@@ -217,15 +216,13 @@ def _complete_with_sdk(
         max_retries=runtime.max_retries,
         timeout=runtime.timeout_seconds,
     )
-    response = client.messages.create(
-        model=request.model,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        system=request.system_prompt,
-        tools=[_structured_output_tool(request)],
-        tool_choice={"type": "tool", "name": request.output_name},
-        messages=[{"role": "user", "content": request.content}],
-    )
+    params = _message_params(request)
+    # SDK >=1 removed sampling keywords. extra_body preserves an explicit
+    # legacy-model override without putting a removed keyword in the call.
+    if request.temperature is not None:
+        params.pop("temperature")
+        params["extra_body"] = {"temperature": request.temperature}
+    response = client.messages.create(**params)
     try:
         return _parse_response_safely(response, request)
     except ProviderResponseError as error:
@@ -255,18 +252,7 @@ def _submit_batch_with_sdk(
     payload = [
         {
             "custom_id": item.request_id,
-            "params": {
-                "model": item.request.model,
-                "max_tokens": item.request.max_tokens,
-                "temperature": item.request.temperature,
-                "system": item.request.system_prompt,
-                "tools": [_structured_output_tool(item.request)],
-                "tool_choice": {
-                    "type": "tool",
-                    "name": item.request.output_name,
-                },
-                "messages": [{"role": "user", "content": item.request.content}],
-            },
+            "params": _message_params(item.request),
         }
         for item in requests
     ]
@@ -423,15 +409,59 @@ def _credential_value(credential: ProviderCredential | None) -> str:
     return credential.reveal()
 
 
-def _structured_output_tool(request: InferenceRequest) -> ToolParam:
-    return {
-        "name": request.output_name,
-        "description": request.output_description,
-        "input_schema": dict(request.output_schema),
+def _message_params(request: InferenceRequest) -> dict[str, Any]:
+    from anthropic import transform_schema
+
+    params: dict[str, Any] = {
+        "model": request.model,
+        "max_tokens": request.max_tokens,
+        "system": request.system_prompt,
+        "messages": [{"role": "user", "content": request.content}],
     }
+    if _needs_flexible_objects(request.output_schema):
+        # Native JSON closes objects, which would turn an existing free-form
+        # object field into {}. Automatic, non-strict tool use preserves those
+        # schemas without the forced tool choice current models reject.
+        params["tools"] = [{
+            "name": request.output_name,
+            "description": request.output_description,
+            "input_schema": dict(request.output_schema),
+        }]
+        params["tool_choice"] = {"type": "auto"}
+    else:
+        params["output_config"] = {
+            "format": {
+                "type": "json_schema",
+                "schema": transform_schema(dict(request.output_schema)),
+            },
+        }
+    if request.temperature is not None:
+        params["temperature"] = request.temperature
+    return params
+
+
+def _needs_flexible_objects(schema: Mapping[str, Any]) -> bool:
+    kind = schema.get("type")
+    has_object = kind == "object" or (isinstance(kind, list) and "object" in kind)
+    if has_object and (
+        (not schema.get("properties") and schema.get("additionalProperties") is not False)
+        or ("additionalProperties" in schema and schema["additionalProperties"] is not False)
+    ):
+        return True
+    return any(
+        _needs_flexible_objects(child)
+        for value in schema.values()
+        for child in (value if isinstance(value, list) else [value])
+        if isinstance(child, Mapping)
+    )
 
 
 def _parse_response(response: Any, request: InferenceRequest) -> InferenceResult:
+    if getattr(response, "stop_reason", None) == "refusal":
+        raise ProviderResponseError(
+            "anthropic refused the inference request",
+            safe_for_display=True,
+        )
     if getattr(response, "stop_reason", None) == "max_tokens":
         raise ProviderResponseError(
             f"LLM response truncated at max_tokens={request.max_tokens}; partial "
@@ -460,28 +490,48 @@ def _parse_response(response: Any, request: InferenceRequest) -> InferenceResult
             "provider response content is malformed",
             safe_for_display=True,
         )
+    tool_output = _needs_flexible_objects(request.output_schema)
     for block in content:
         if (
             getattr(block, "type", None) == "tool_use"
             and getattr(block, "name", None) == request.output_name
+            and tool_output
         ):
             output = getattr(block, "input", None)
-            if not isinstance(output, Mapping):
+        elif getattr(block, "type", None) == "text":
+            if tool_output:
+                continue
+            text = getattr(block, "text", None)
+            if not isinstance(text, str):
                 raise ProviderResponseError(
-                    "provider structured output must be a mapping",
+                    "anthropic structured output text is malformed",
                     safe_for_display=True,
                 )
-            raw_request_id = getattr(response, "id", None)
-            request_id = (
-                raw_request_id
-                if isinstance(raw_request_id, str) and raw_request_id
-                else None
+            try:
+                output = json.loads(text)
+            except (ValueError, RecursionError):
+                raise ProviderResponseError(
+                    "anthropic returned invalid structured JSON",
+                    safe_for_display=True,
+                ) from None
+        else:
+            continue
+        if not isinstance(output, Mapping):
+            raise ProviderResponseError(
+                "provider structured output must be a mapping",
+                safe_for_display=True,
             )
-            return InferenceResult(
-                dict(output),
-                usage=usage,
-                provider_request_id=request_id,
-            )
+        raw_request_id = getattr(response, "id", None)
+        request_id = (
+            raw_request_id
+            if isinstance(raw_request_id, str) and raw_request_id
+            else None
+        )
+        return InferenceResult(
+            dict(output),
+            usage=usage,
+            provider_request_id=request_id,
+        )
     raise ProviderResponseError(
         "anthropic did not return the requested structured output",
         safe_for_display=True,

@@ -43,6 +43,24 @@ jobs:
           path: target/ci/junit.xml
           retention-days: 30
 
+  latest-anthropic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync locked project dependencies
+        run: uv sync --all-extras --dev --locked
+      # Overlay the current SDK without replacing the reproducible lock.
+      - name: Provider contracts with latest Anthropic
+        run: >-
+          uv run --locked --with 'anthropic>=2'
+          pytest -q tests/test_anthropic_provider.py tests/test_provider_contracts.py
+          tests/test_llm_backend.py tests/test_backend_options.py tests/test_llm_map.py
+          tests/test_llm_model.py
+
   latest-warehouse-deps:
     runs-on: ubuntu-latest
     timeout-minutes: 10

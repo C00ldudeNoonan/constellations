@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from anthropic import Omit
 
 from stel.providers import (
     BatchInferenceRequest,
@@ -39,6 +42,7 @@ def _request(content: str = "document") -> InferenceRequest:
             "properties": {"value": {"type": "string"}},
             "required": ["value"],
         },
+        temperature=None,
         max_tokens=321,
     )
 
@@ -46,7 +50,7 @@ def _request(content: str = "document") -> InferenceRequest:
 def _message(value: str, *, request_id: str = "msg_1") -> SimpleNamespace:
     return SimpleNamespace(
         id=request_id,
-        stop_reason="tool_use",
+        stop_reason="end_turn",
         usage=SimpleNamespace(
             input_tokens=7,
             output_tokens=3,
@@ -54,7 +58,7 @@ def _message(value: str, *, request_id: str = "msg_1") -> SimpleNamespace:
             cache_creation_input_tokens=1,
         ),
         content=[
-            SimpleNamespace(type="tool_use", name="extract", input={"value": value})
+            SimpleNamespace(type="text", text=json.dumps({"value": value}))
         ],
     )
 
@@ -91,8 +95,12 @@ def test_anthropic_complete_maps_request_and_normalizes_response(
     request = captured["request"]
     assert request["model"] == "claude-test"
     assert request["max_tokens"] == 321
-    assert request["tool_choice"] == {"type": "tool", "name": "extract"}
-    assert request["tools"][0]["input_schema"]["required"] == ["value"]
+    assert "temperature" not in request
+    assert "tools" not in request
+    assert "tool_choice" not in request
+    schema = request["output_config"]["format"]["schema"]
+    assert schema["required"] == ["value"]
+    assert schema["additionalProperties"] is False
     assert result.output == {"value": "ok"}
     assert result.usage.to_metrics() == {
         "input_tokens": 7,
@@ -101,6 +109,177 @@ def test_anthropic_complete_maps_request_and_normalizes_response(
         "cache_creation_input_tokens": 1,
     }
     assert result.provider_request_id == "msg_1"
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-haiku-4-5"])
+@pytest.mark.parametrize("temperature", [None, 0.0])
+def test_current_sdk_accepts_single_and_batch_requests(
+    monkeypatch: pytest.MonkeyPatch, model: str, temperature: float | None,
+) -> None:
+    """#714: execute the installed SDK's signatures and body transformation offline."""
+    captured: list[dict[str, Any]] = []
+
+    def post(client: Any, path: str, **kwargs: Any) -> SimpleNamespace:
+        del client
+        body = {key: value for key, value in kwargs["body"].items() if not isinstance(value, Omit)}
+        body.update(kwargs["options"].get("extra_json") or {})
+        captured.append(body)
+        if path.endswith("batches"):
+            return SimpleNamespace(id="batch_1")
+        response = _message("ok")
+        response.content = [SimpleNamespace(type="text", text='{"items": [{"label": "yes"}]}')]
+        return response
+
+    # The real generated Messages methods still execute. Only the native
+    # client's final HTTP boundary is replaced; no credential or network needed.
+    monkeypatch.setattr("anthropic.Anthropic.post", post)
+    request = replace(
+        _request(), model=model, temperature=temperature,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string", "enum": ["yes", "no"]}},
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    )
+    original_schema = json.dumps(request.output_schema, sort_keys=True)
+    provider = AnthropicInferenceProvider()
+    credential = ProviderCredential("offline-test-key")
+    runtime = ProviderRuntimeOptions()
+    result = provider.complete(request, credential=credential, runtime=runtime)
+    assert result.output == {"items": [{"label": "yes"}]}
+    provider.submit_batch(
+        [BatchInferenceRequest("a", request)], credential=credential, runtime=runtime,
+    )
+    single = captured[0]
+    batch = captured[1]["requests"][0]["params"]
+    assert single == batch
+    assert single["model"] == model
+    assert "tool_choice" not in single
+    assert "tools" not in single
+    if temperature is None:
+        assert "temperature" not in single
+    else:
+        assert single["temperature"] == temperature
+    schema = single["output_config"]["format"]["schema"]
+    nested = schema["properties"]["items"]["items"]
+    assert schema["additionalProperties"] is False
+    assert nested["additionalProperties"] is False
+    assert nested["properties"]["label"]["enum"] == ["yes", "no"]
+    assert json.dumps(request.output_schema, sort_keys=True) == original_schema
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize(
+    ("stop_reason", "text", "expected"),
+    [
+        ("refusal", "private-refusal-body", "refused"),
+        ("end_turn", "private-invalid-json", "invalid structured JSON"),
+        ("end_turn", "[]", "must be a mapping"),
+        ("max_tokens", '{"value":', "truncated"),
+    ],
+)
+def test_rejected_json_retains_billing_without_sensitive_response(
+    monkeypatch: pytest.MonkeyPatch, batch: bool,
+    stop_reason: str, text: str, expected: str,
+) -> None:
+    """#714: refusal precedes JSON parsing; both paths retain rejected-call usage."""
+    response = _message("ok")
+    response.stop_reason = stop_reason
+    response.content = [SimpleNamespace(type="text", text=text)]
+    request = _request("private-input-sentinel")
+    if batch:
+        result = anthropic_module._normalize_batch_results(
+            [BatchInferenceRequest("a", request)],
+            [SimpleNamespace(
+                custom_id="a", result=SimpleNamespace(type="succeeded", message=response),
+            )],
+        )
+        error = result.items[0].error
+    else:
+        class Messages:
+            def create(self, **kwargs: Any) -> SimpleNamespace:
+                del kwargs
+                return response
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs: Any) -> None:
+                del kwargs
+                self.messages = Messages()
+
+        monkeypatch.setattr("anthropic.Anthropic", FakeAnthropic)
+        with pytest.raises(ProviderResponseError) as exc_info:
+            AnthropicInferenceProvider().complete(
+                request, credential=ProviderCredential("private-key-sentinel"),
+                runtime=ProviderRuntimeOptions(),
+            )
+        error = exc_info.value
+    assert isinstance(error, ProviderResponseError)
+    assert expected in str(error)
+    assert error.failure is not None
+    assert error.failure.billed_requests == 1
+    assert error.failure.usage.input_tokens == 7
+    assert error.failure.usage.output_tokens == 3
+    rendered = str(error) + _provider_traceback_locals(error)
+    assert "private-" not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("field_schema", "value"),
+    [
+        ({"type": "object"}, {"unknown_key": "kept"}),
+        ({"type": "array", "items": {"type": "object"}}, [{"unknown_key": "kept"}]),
+        ({"type": ["object", "null"]}, {"unknown_key": "kept"}),
+    ],
+)
+def test_free_form_objects_use_automatic_tools_without_losing_values(
+    monkeypatch: pytest.MonkeyPatch, field_schema: dict[str, Any], value: Any,
+) -> None:
+    """#714: native JSON must not silently close a previously free-form object."""
+    captured: list[dict[str, Any]] = []
+    response = _message("ok")
+    response.content = [
+        SimpleNamespace(type="text", text="private-preamble"),
+        SimpleNamespace(type="tool_use", name="extract", input={"value": value}),
+    ]
+
+    def post(client: Any, path: str, **kwargs: Any) -> SimpleNamespace:
+        del client
+        captured.append({
+            key: item for key, item in kwargs["body"].items() if not isinstance(item, Omit)
+        })
+        return SimpleNamespace(id="batch_1") if path.endswith("batches") else response
+
+    monkeypatch.setattr("anthropic.Anthropic.post", post)
+    request = replace(_request(), output_schema={
+        "type": "object", "properties": {"value": field_schema},
+    })
+    provider = AnthropicInferenceProvider()
+    credential = ProviderCredential("offline-test-key")
+    runtime = ProviderRuntimeOptions()
+    result = provider.complete(request, credential=credential, runtime=runtime)
+    provider.submit_batch(
+        [BatchInferenceRequest("a", request)], credential=credential, runtime=runtime,
+    )
+    assert result.output == {"value": value}
+    assert captured[0] == captured[1]["requests"][0]["params"]
+    assert captured[0]["tool_choice"] == {"type": "auto"}
+    assert "output_config" not in captured[0]
+    assert captured[0]["tools"][0]["input_schema"] == request.output_schema
+    response.content = [SimpleNamespace(type="text", text="private-no-tool-body")]
+    with pytest.raises(
+        ProviderResponseError, match="did not return the requested structured output",
+    ):
+        provider.complete(request, credential=credential, runtime=runtime)
 
 
 def test_anthropic_request_failure_is_sanitized(
@@ -146,9 +325,9 @@ def test_anthropic_rejects_truncated_and_malformed_structured_output(
             content=[],
         ),
         SimpleNamespace(
-            stop_reason="tool_use",
+            stop_reason="end_turn",
             usage=SimpleNamespace(input_tokens=1, output_tokens=1),
-            content=[SimpleNamespace(type="tool_use", name="extract", input=[])],
+            content=[SimpleNamespace(type="text", text="[]")],
         ),
     ]
 
@@ -251,7 +430,7 @@ def test_anthropic_batch_detaches_malformed_item_error_from_raw_response(
     sentinel = "malformed-batch-message-that-must-not-survive"
     malformed_message = SimpleNamespace(
         provider_body=sentinel,
-        stop_reason="tool_use",
+        stop_reason="end_turn",
         usage=None,
         content=[],
     )

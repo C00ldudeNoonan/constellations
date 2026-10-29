@@ -45,6 +45,27 @@ from economic_nlp.document_features
 order by document_id;
 ```
 
+The `relation_quality` subgraph runs without spaCy, a downloaded model, network
+access, or inference cost:
+
+```bash
+uv run stel --project-dir examples/economic_nlp build --select +relation_quality
+```
+
+It reads six hand-authored synthetic mentions with canonical IDs from
+`eval_fixtures/mentions/`, runs the real rule extractor, then joins its mention
+endpoints back to canonical IDs. The join retains unresolved endpoints rather
+than hiding linking failures. Four independently authored gold facts in
+`eval_fixtures/gold/` cover `references_geography` and `references_topic` across
+two documents. This fixture tests the evaluator; it does not estimate NLP
+quality on the main corpus.
+
+`relation_quality` publishes overall and per-type precision, recall, F1,
+support, true/false positive and false negative counts, and unresolved-endpoint
+counts. All three `min_metric` gates pass with F1 and per-type recall of 1.0.
+CI changes the geography rule to a label that never matches and verifies that
+overall F1 falls to 2/3, geography recall becomes zero, and two gates fail.
+
 `document_tone` scores each document against the operator-owned `tone_lexicon`
 (term, category, weight). It is deterministic and reads the token table, so it
 needs no language model. General polarity (`positive`/`negative`) and domain

@@ -51,6 +51,7 @@ history (issue #311).
 | [0039](0039-array-filters-publish-without-a-scalar-index.md) | Array filters publish without a scalar index; array sorting and deterministic index argument failures are refused early | accepted |
 | [0040](0040-mcp-array-filters-use-explicit-overlap.md) | MCP array filters expose the search core's explicit overlap operator rather than translating scalar `in` | accepted |
 | [0041](0041-a-token-packing-rejection-reports-tuning-rather-than-retrying.md) | A recognized Vertex aggregate token-limit rejection reports safe tuning guidance without issuing unreserved split retries | accepted |
+| [0042](0042-relation-evaluation-scores-distinct-facts-and-retains-unresolved-predictions.md) | Relation evaluation scores distinct canonical facts and keeps unresolved predictions in precision | accepted |
 
 ## When to write one
 

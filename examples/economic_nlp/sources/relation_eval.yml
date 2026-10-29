@@ -1,0 +1,8 @@
+version: 2
+sources:
+  - name: relation_eval_mention_fixtures
+    path: eval_fixtures/mentions
+    file_pattern: "*.json"
+  - name: relation_eval_gold_fixtures
+    path: eval_fixtures/gold
+    file_pattern: "*.json"

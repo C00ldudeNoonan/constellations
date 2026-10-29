@@ -18,6 +18,7 @@ from .config.model import (
     LLMTransformConfig,
     MLConfig,
     ModelConfig,
+    RelationEvalConfig,
     SearchConfig,
     TransformConfig,
 )
@@ -104,7 +105,7 @@ def compute_code_version(
     embed: EmbedConfig | None = None,
     llm: LLMTransformConfig | None = None,
     search: SearchConfig | None = None,
-    eval_config: EvalConfig | None = None,
+    eval_config: EvalConfig | RelationEvalConfig | None = None,
     depends_on: list[str] | None = None,
     fields: list[FieldConfig] | None = None,
     effective_extraction: Mapping[str, Any] | None = None,

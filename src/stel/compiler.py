@@ -17,6 +17,7 @@ from .config.model import (
     DEFAULT_VECTOR_INDEX,
     ModelConfig,
     ModelKind,
+    RelationEvalConfig,
     protect_model_llm_credential_option,
 )
 from .config.project import ProjectConfig
@@ -336,6 +337,7 @@ def validate_warehouse_capabilities(
             or model.chunk is not None
             or model.embed is not None
             or model.llm is not None
+            or model.eval is not None
         ):
             required[WarehouseCapability.TABULAR_READS] = (
                 f"{_kind_label(model).lower()} input reads"
@@ -354,6 +356,10 @@ def validate_warehouse_capabilities(
             # dependency before runtime resolution can touch provider config.
             required[WarehouseCapability.STREAMING_TABULAR_READS] = (
                 "bounded llm input reads"
+            )
+        if isinstance(model.eval, RelationEvalConfig):
+            required[WarehouseCapability.STREAMING_TABULAR_READS] = (
+                "projected relation eval input reads"
             )
         # Derived enum checks count: they are schema tests the adapter must
         # support, and finding that out after materialization would move a

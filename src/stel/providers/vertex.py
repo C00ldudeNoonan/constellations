@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import isfinite
@@ -27,9 +28,11 @@ from .base import (
     ProviderConfigurationError,
     ProviderCredential,
     ProviderError,
+    ProviderRequestError,
     ProviderResponseError,
     ProviderRuntimeOptions,
     ProviderUsage,
+    http_status_of,
     provider_error_debug_enabled,
     provider_option,
     provider_request_error,
@@ -170,8 +173,8 @@ class VertexEmbeddingOptions(BaseModel):
         ge=1,
         le=250,
     )
-    # Under the ~20k-token per-request ceiling, with headroom for the estimate
-    # below being wrong in the unsafe direction.
+    # A local estimate, not a tokenizer: numeric/unusual text can exceed the
+    # service ceiling even below this budget (issue #728).
     max_tokens_per_request: int = provider_option(
         "execution",
         default=18_000,
@@ -262,19 +265,7 @@ class VertexEmbeddingProvider(EmbeddingProvider):
         provider_requests = _split_requests(request, options)
 
         def _issue(provider_request: EmbeddingRequest) -> Any:
-            return client.models.embed_content(
-                model=provider_request.model,
-                contents=list(provider_request.texts),
-                config={
-                    "task_type": (
-                        options.query_task_type
-                        if provider_request.input_type == "query"
-                        else options.task_type
-                    ),
-                    "output_dimensionality": provider_request.dimensions,
-                    "auto_truncate": options.auto_truncate,
-                },
-            )
+            return _issue_embedding(client, provider_request, options)
 
         # The calls go out concurrently; the responses are parsed in request
         # order below. Keeping parsing sequential preserves the usage
@@ -690,16 +681,78 @@ def _import_google_genai(feature: str) -> Any:
     )
 
 
-# Characters per token used to size a request. Deliberately below the ~3.9
-# English average so the estimate runs high and packs fewer texts than the
-# true limit allows: overshooting the per-request token ceiling fails the
-# whole call, while undershooting only costs a little throughput (issue #350).
-#
-# Measured against Vertex on representative filing prose, the real ratio was
-# ~5.7 chars/token, so this uses roughly half the declared token budget in
-# practice. That headroom is the point — an operator who has measured their
-# own corpus can raise `max_tokens_per_request` toward the true ~20k ceiling.
+# This estimate packs ordinary prose efficiently (issue #350), but cannot
+# bound an unknown tokenizer. A numeric SEC dev batch estimated at 17,531
+# tokens contained 22,454 and was rejected (issue #728). Preserve packing and
+# reservation counts; classify that rejection and let the operator tune it.
 _CHARS_PER_TOKEN = 3.0
+
+_REQUEST_TOKEN_LIMIT = re.compile(
+    r"\binput token count is ([0-9]{1,9}) but the model supports up to ([0-9]{1,9})\b"
+)
+
+
+def _issue_embedding(
+    client: Any, request: EmbeddingRequest, options: VertexEmbeddingOptions
+) -> Any:
+    failure: ProviderRequestError | None = None
+    try:
+        return client.models.embed_content(
+            model=request.model,
+            contents=list(request.texts),
+            config={
+                "task_type": (
+                    options.query_task_type
+                    if request.input_type == "query"
+                    else options.task_type
+                ),
+                "output_dimensionality": request.dimensions,
+                "auto_truncate": options.auto_truncate,
+            },
+        )
+    except Exception as error:
+        failure = _request_token_limit_error(error, request, options)
+        if failure is None:
+            # Unknown errors retain the ordinary provider sanitizer and retry
+            # classification. Never reinterpret every HTTP 400 as overflow.
+            raise
+    # Leave the native handler before raising, so neither its message nor its
+    # response survives as an exception chain in the concurrent failure slot.
+    raise failure
+
+
+def _request_token_limit_error(
+    error: Exception, request: EmbeddingRequest, options: VertexEmbeddingOptions
+) -> ProviderRequestError | None:
+    if http_status_of(error) != 400:
+        return None
+    message = getattr(error, "message", None)
+    if not isinstance(message, str):
+        return None
+    match = _REQUEST_TOKEN_LIMIT.search(message)
+    if match is None:
+        return None
+    actual, limit = (int(value) for value in match.groups())
+    if not 0 < limit < actual:
+        return None
+    estimated = sum(_estimated_tokens(text) for text in request.texts)
+    # Only authored text and numeric counts enter logs. The ordinary run-error
+    # formatter retains request codes, but deliberately drops config messages.
+    log.warning(
+        "Vertex AI embedding request exceeds the aggregate token limit "
+        "(texts=%d, estimated_tokens=%d, actual_tokens=%d, limit=%d). "
+        "Reduce embedding.provider_options.max_tokens_per_request "
+        "(currently %d) or "
+        "max_texts_per_request; a single oversized input needs smaller upstream chunks. "
+        "The character estimate is not a token count; "
+        "no automatic split retry was issued.",
+        len(request.texts),
+        estimated,
+        actual,
+        limit,
+        options.max_tokens_per_request,
+    )
+    return ProviderRequestError("vertex", "embedding", code="request_token_limit")
 
 
 def _estimated_tokens(text: str) -> int:

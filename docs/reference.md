@@ -1385,6 +1385,7 @@ my_project:
           task_type: RETRIEVAL_DOCUMENT
           query_task_type: RETRIEVAL_QUERY
           auto_truncate: false
+          max_tokens_per_request: 18000  # estimated tokens; tune for your corpus
 ```
 
 **Prefer a regional location to `global` for embeddings that serve queries.**
@@ -1430,14 +1431,44 @@ The model ID and output dimensionality remain reviewable model semantics:
   materialization: incremental
 ```
 
-stel passes `dimensions` as Vertex `output_dimensionality`, sends each runner
-batch as one SDK request, and configures the SDK with the model's retry count
-and the profile timeout. Document and query task types are separate so an
-inherited search identity uses `RETRIEVAL_QUERY` at query time. Vertex model
+stel passes `dimensions` as Vertex `output_dimensionality`, splits each runner
+batch by the profile's request budgets, and configures the SDK with the model's
+retry count and the profile timeout. Document and query task types are separate
+so an inherited search identity uses `RETRIEVAL_QUERY` at query time. Vertex model
 availability, input limits, supported dimensions, and locations can change;
 check the current
 [Vertex text embeddings documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings)
 before choosing production settings.
+
+**A request token budget is an estimate, not a tokenizer.** `gemini-embedding*`
+models carry one text per request. For other text embedding models,
+`max_tokens_per_request` defaults to 18000, `max_texts_per_request` to
+250, and `max_concurrent_requests` to 8. The local estimate uses three characters
+per token. Numeric tables and unusual text can contain more tokens than this
+estimate predicts, even when each individual text fits its model's input limit.
+Vertex's aggregate input token limit is separate from the per-text limit.
+
+When Vertex reports the recognized aggregate token-limit rejection (HTTP 400),
+stel raises a non-retryable `ProviderRequestError` with code `request_token_limit`
+and emits a warning with the request's text count, estimated tokens, actual tokens
+and limit, plus the packing settings to reduce.
+The native message, response body and input text are omitted. Other HTTP 400
+errors retain the usual sanitized HTTP classification; they are not assumed to
+be packing failures. This diagnostic is local to Vertex embeddings.
+
+Reduce `embedding.provider_options.max_tokens_per_request` in the active target's
+profile and rerun. **6000 is a measured starting point for numeric SEC chunks,
+not a universal safe limit.** If that still fails, reduce it further or lower
+`max_texts_per_request`. An individual text over its own model limit needs a
+smaller upstream chunk; changing the request budget cannot repair that case.
+stel does not automatically truncate text or split and retry a rejected request.
+Hidden extra calls would exceed the request count reserved before execution.
+The SDK's configured retries still apply to transient statuses, not this HTTP 400.
+
+Packing settings are execution-only: tuning them preserves embedding/config
+identity and permits an incremental rerun using the existing response cache and
+completed publication checkpoints. No full refresh is needed. Model, dimensions,
+task types and `auto_truncate` still affect embedding identity.
 
 ### BigQuery
 

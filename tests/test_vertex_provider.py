@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +15,7 @@ from stel.cli import cli
 from stel.config import load_project
 from stel.config.model import EmbedConfig
 from stel.embedding import EmbeddingIdentity
+from stel.execution.errors import artifact_error_text
 from stel.optional_dependencies import OptionalDependencyError
 from stel.profile import ProfileError, resolve_profile
 from stel.providers import (
@@ -387,6 +390,139 @@ def test_vertex_sdk_error_text_does_not_cross_provider_boundary(
     assert excinfo.value.code == "RuntimeError"
     assert secret not in str(excinfo.value)
     assert "/private/path" not in str(excinfo.value)
+
+
+class _EmbeddingSDKError(RuntimeError):
+    def __init__(self, code: int, message: Any) -> None:
+        super().__init__("private-response-body")
+        self.code = code
+        self.message = message
+
+
+class _TokenLimitedModels(_FakeModels):
+    """Synthetic tokenizer that needs two characters per token (ALE-456/#728)."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.request_sizes: list[int] = []
+
+    def embed_content(
+        self, *, model: str, contents: list[str], config: dict[str, Any]
+    ) -> Any:
+        self.request_sizes.append(len(contents))
+        tokens = sum(len(text) // 2 for text in contents)
+        if tokens > 20_000:
+            # Generated SDK-shaped failure, never a captured provider body.
+            raise _EmbeddingSDKError(
+                400,
+                f"Unable to submit request because the input token count is {tokens} "
+                "but the model supports up to 20000. private-response-body",
+            )
+        return super().embed_content(model=model, contents=contents, config=config)
+
+
+def test_vertex_token_underestimate_has_safe_tuning_guidance_without_hidden_calls(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ALE-456/#728: numeric text can exceed the request limit below the estimate."""
+    models = _TokenLimitedModels()
+    client_options: list[dict[str, Any]] = []
+
+    def client(**options: Any) -> Any:
+        client_options.append(options)
+        return SimpleNamespace(models=models)
+
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: SimpleNamespace(Client=client))
+    monkeypatch.delenv("STEL_DEBUG_PROVIDER_ERRORS", raising=False)
+    request = EmbeddingRequest(
+        model="text-embedding-005",
+        texts=("1234567890" * 150,) * 35,
+        dimensions=3,
+        input_ids=tuple(f"chunk-{index}" for index in range(35)),
+    )
+    runtime = ProviderRuntimeOptions(max_retries=0)
+    provider = _provider(max_concurrent_requests=1)
+    assert provider.estimate_provider_requests(request) == 1
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(ProviderRequestError) as excinfo:
+        provider.embed(request, credential=None, runtime=runtime)
+
+    assert str(excinfo.value) == "vertex embedding failed [request_token_limit]"
+    assert excinfo.value.retryable is False
+    assert artifact_error_text(excinfo.value) == (
+        "ProviderRequestError: vertex embedding failed [request_token_limit]"
+    )
+    assert caplog.records[-1].getMessage() == (
+        "Vertex AI embedding request exceeds the aggregate token limit "
+        "(texts=35, estimated_tokens=17535, actual_tokens=26250, limit=20000). "
+        "Reduce embedding.provider_options.max_tokens_per_request "
+        "(currently 18000) or max_texts_per_request; "
+        "a single oversized input needs smaller upstream chunks. "
+        "The character estimate is not a token count; no automatic split retry was issued."
+    )
+    assert models.request_sizes == [35]
+    assert client_options[0]["http_options"]["retry_options"]["attempts"] == 1
+    assert "private-response-body" not in caplog.text + "".join(
+        traceback.format_exception(excinfo.value)
+    )
+    assert request.texts[0] not in caplog.text
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+
+    # Tuning execution changes splits, never vectors' identity, order or IDs.
+    tuned = _provider(max_tokens_per_request=6000, max_concurrent_requests=1)
+    assert profile_options_fingerprint(tuned.profile_options) == profile_options_fingerprint(
+        provider.profile_options
+    )
+    assert tuned.estimate_provider_requests(request) == 4
+    result = tuned.embed(request, credential=None, runtime=runtime)
+    assert models.request_sizes == [35, 11, 11, 11, 2]
+    assert result.provider_requests == 4
+    assert result.input_ids == request.input_ids
+    assert len(result.vectors) == 35
+    assert all(call["config"]["auto_truncate"] is False for call in models.calls)
+
+    # The worker slot itself must not retain the SDK error before the outer
+    # provider sanitizer runs (the concurrent issuer holds failed exceptions).
+    with pytest.raises(ProviderRequestError) as inner:
+        vertex_module._issue_embedding(
+            SimpleNamespace(models=models), request, VertexEmbeddingOptions()
+        )
+    assert inner.value.__cause__ is None
+    assert inner.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (400, "invalid output dimensionality private-response-body"),
+        (400, "input exceeds the individual limit of 2048 tokens private-response-body"),
+        (429, "input token count is 26250 but the model supports up to 20000"),
+        (400, "input token count is 20 but the model supports up to 20000"),
+        (400, {"message": "private-response-body"}),
+    ],
+)
+def test_vertex_unknown_rejections_keep_http_classification(
+    status: int, message: Any, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ALE-456/#728: a generic 400 is not evidence of aggregate token overflow."""
+    class Models:
+        def embed_content(self, **kwargs: Any) -> Any:
+            raise _EmbeddingSDKError(status, message)
+
+    fake = SimpleNamespace(Client=lambda **kwargs: SimpleNamespace(models=Models()))
+    monkeypatch.setattr(vertex_module, "_load_google_genai", lambda: fake)
+    with pytest.raises(ProviderRequestError) as excinfo:
+        _provider().embed(
+            EmbeddingRequest(model="text-embedding-005", texts=("synthetic",), dimensions=3),
+            credential=None,
+            runtime=ProviderRuntimeOptions(),
+        )
+    assert excinfo.value.code == f"http_{status}"
+    assert excinfo.value.retryable is (status == 429)
+    assert "aggregate token limit" not in caplog.text
+    assert "private-response-body" not in "".join(traceback.format_exception(excinfo.value))
 
 
 def test_vertex_semantic_options_are_part_of_embedding_identity() -> None:

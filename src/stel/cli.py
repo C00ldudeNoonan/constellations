@@ -1302,6 +1302,7 @@ def run(
             accept_reprocess=accept_reprocess,
             accept_cost=accept_cost,
             confirm_cost=_cost_confirmation(json_output),
+            persist_manifest=True,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1310,7 +1311,6 @@ def run(
     elapsed = round(time.monotonic() - start, 3)
     _note_diagnostics()
 
-    write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
     results_path = write_run_results(
         project_dir,
         results,
@@ -1543,6 +1543,7 @@ def build(
             accept_reprocess=accept_reprocess,
             accept_cost=accept_cost,
             confirm_cost=_cost_confirmation(json_output),
+            persist_manifest=True,
         )
     except _CONFIG_ERRORS as e:
         raise ConfigClickError(str(e)) from e
@@ -1558,7 +1559,6 @@ def build(
         if t.is_hard_failure:
             test_failures.setdefault(t.model_name, []).append(_test_failure_label(t))
 
-    write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
     results_path = write_run_results(
         project_dir,
         result.run_results,

@@ -16,7 +16,7 @@ from ..adapters import create_adapter
 from ..compiler import validate_project_contract, validate_warehouse_capabilities
 from ..config import ConfigError
 from ..cost_guard import CostConfirmation
-from ..manifest import write_manifest, write_run_results
+from ..manifest import write_run_results
 from ..paths import resolve_within_project
 from ..profile import apply_source_path_overrides, resolve_profile
 from ..runner import RunError, run_project
@@ -100,11 +100,11 @@ def run_watch(
                 accept_reprocess=accept_reprocess,
                 accept_cost=accept_cost,
                 confirm_cost=confirm_cost,
+                persist_manifest=True,
             )
         except (*CONFIG_ERRORS, RunError) as e:
             click.echo(f"error: {e}", err=True)
             return
-        write_manifest(project_dir, target=target, profiles_dir=profiles_dir)
         write_run_results(
             project_dir, results, target=target, profiles_dir=profiles_dir
         )

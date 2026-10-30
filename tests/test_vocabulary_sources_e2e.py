@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
 import duckdb
 import pytest
+import yaml
 from click.testing import CliRunner
 
+from stel import runner as runner_module
+from stel.adapters import StateScope, create_adapter, parse_warehouse_config
+from stel.adapters.duckdb import DuckDBAdapter
 from stel.cli import cli
 from stel.config.loader import ConfigError
+from stel.manifest import build_manifest
 from stel.plan import plan_project
 from stel.runner import build_project, run_project
 
@@ -155,3 +161,97 @@ def test_documented_csv_example_builds_offline_and_invalidates_on_seed_change(
     with seed.open("a", encoding="utf-8") as handle:
         handle.write("0001652044,Alphabet\n")
     assert plan_project(project).models[0].status == "changed"
+
+
+def _add_catalog_model(tmp_path: Path) -> None:
+    """An unselected context model makes the artifact carry serving declarations."""
+    path = tmp_path / "models" / "m.yml"
+    model_file = yaml.safe_load(path.read_text(encoding="utf-8"))
+    model_file["models"].append(
+        {
+            "name": "context",
+            "depends_on": ["ref('classified')"],
+            "transform": {"type": "python", "module": "transforms.context"},
+            "agent_context": {"contract": "agent_context/v1", "grain": "document_chunks"},
+        }
+    )
+    path.write_text(yaml.safe_dump(model_file), encoding="utf-8")
+    (tmp_path / "transforms").mkdir()
+    (tmp_path / "transforms" / "context.py").write_text(
+        "def run(inputs):\n    return inputs['classified']\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("invocation", ["run", "build", "watch"])
+@pytest.mark.parametrize("change", ["add_label", "drop_relation"])
+def test_cli_manifest_keeps_the_published_vocabulary_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invocation: str,
+    change: str,
+) -> None:
+    """PR #733: post-publication artifacts must not re-read a moving vocabulary."""
+    warehouse = _project(tmp_path)
+    _add_catalog_model(tmp_path)
+    with duckdb.connect(str(warehouse)) as con:
+        con.execute("CREATE TABLE sectors AS SELECT 'a' AS id")
+    baseline = build_manifest(tmp_path)
+    expected_version = baseline["models"][0]["code_version"]
+    published = []
+    read_limits = []
+    original_publish = runner_module._run_extraction_model
+    original_read = DuckDBAdapter.read_relation
+
+    def read_relation(self, qualified, *, limit=None):
+        read_limits.append(limit)
+        return original_read(self, qualified, limit=limit)
+
+    def publish_then_change(**kwargs):
+        result = original_publish(**kwargs)
+        assert result.rows_written == 1
+        assert not (tmp_path / "target" / "manifest.json").exists()
+        sql = (
+            "INSERT INTO main.sectors VALUES ('b')"
+            if change == "add_label"
+            else "DROP TABLE main.sectors"
+        )
+        kwargs["adapter"].execute(sql)
+        published.append(result)
+        return result
+
+    monkeypatch.setattr(DuckDBAdapter, "read_relation", read_relation)
+    monkeypatch.setattr("stel.runner._run_extraction_model", publish_then_change)
+    if invocation == "watch":
+        monkeypatch.setattr("watchfiles.watch", lambda *args, **kwargs: iter(()))
+    command = "run" if invocation == "watch" else invocation
+    args = [command, "--project-dir", str(tmp_path), "--select", "classified"]
+    if invocation == "watch":
+        args.append("--watch")
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert len(published) == 1
+    assert read_limits == [10_001]
+    manifest_path = tmp_path / "target" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    classified = next(model for model in manifest["models"] if model["name"] == "classified")
+    assert classified["fields"][0]["values"] == ["a"]
+    assert classified["extraction"]["options"]["fields"][0]["values"] == ["a"]
+    assert classified["code_version"] == expected_version
+    assert [
+        term["label"] for term in manifest["declarations"]["vocabularies"]["sector"]["terms"]
+    ] == ["a"]
+    config = parse_warehouse_config({"type": "duckdb", "path": str(warehouse)})
+    with create_adapter(config, project_dir=tmp_path) as adapter:
+        assert adapter.state_code_version_counts(StateScope("classified")) == {expected_version: 1}
+    # Standalone compilation still resolves a fresh snapshot, including failures.
+    compiled = CliRunner().invoke(cli, ["compile", "--project-dir", str(tmp_path)])
+    if change == "add_label":
+        assert compiled.exit_code == 0, compiled.output
+        refreshed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert refreshed["models"][0]["fields"][0]["values"] == ["a", "b"]
+        assert refreshed["models"][0]["code_version"] != expected_version
+    else:
+        assert compiled.exit_code == 2, compiled.output
+        assert "cannot read source relation" in compiled.output
+        assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest

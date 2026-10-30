@@ -62,7 +62,7 @@ from .execution import search as _search_execution
 from .execution import transform as _transform_execution
 from .execution import usage as _usage_execution
 from .logging_setup import REPORTER_ECHO_EXTRA
-from .manifest import compute_modified_models
+from .manifest import capture_manifest, compute_modified_models
 from .paths import resolve_within_project
 from .plan import ModelPlan, plan_models, price_plans, run_log_relation
 from .profile import (
@@ -152,7 +152,9 @@ def run_project(
     accept_reprocess: bool = False,
     accept_cost: bool = False,
     confirm_cost: CostConfirmation | None = None,
+    persist_manifest: bool = False,
 ) -> list[ModelRunResult]:
+    """Execute selected models; CLI callers also persist the captured manifest."""
     _reject_conflicting_reprocess_flags(
         full_refresh=full_refresh, reprocess_all=reprocess_all
     )
@@ -246,6 +248,13 @@ def run_project(
             "`stel run`/`build`."
         )
 
+    manifest = (
+        capture_manifest(
+            project_dir, project=project, sources=sources, models=models, resolved=resolved
+        )
+        if persist_manifest
+        else None
+    )
     reporter = get_reporter()
     reporter.run_started(
         len(selected),
@@ -334,6 +343,8 @@ def run_project(
 
     errored = sum(1 for r in results if r.errors)
     reporter.run_finished(ok=len(results) - errored, errored=errored, skipped=0)
+    if manifest is not None:
+        manifest.write()
     return results
 
 
@@ -354,10 +365,12 @@ def build_project(
     accept_reprocess: bool = False,
     accept_cost: bool = False,
     confirm_cost: CostConfirmation | None = None,
+    persist_manifest: bool = False,
 ) -> BuildResult:
     """Run + test each model in dependency order. A model whose run errors or
     whose tests hard-fail blocks all its descendants, which are reported as
-    skipped (dbt `build` semantics)."""
+    skipped (dbt `build` semantics). `persist_manifest` writes the configuration
+    captured before execution rather than reloading it after publication."""
     _reject_conflicting_reprocess_flags(
         full_refresh=full_refresh, reprocess_all=reprocess_all
     )
@@ -451,6 +464,13 @@ def build_project(
             "`stel run`/`build`."
         )
 
+    manifest = (
+        capture_manifest(
+            project_dir, project=project, sources=sources, models=models, resolved=resolved
+        )
+        if persist_manifest
+        else None
+    )
     reporter = get_reporter()
     reporter.run_started(
         len(selected),
@@ -617,6 +637,8 @@ def build_project(
         errored=errored,
         skipped=len(out.skipped),
     )
+    if manifest is not None:
+        manifest.write()
     return out
 
 

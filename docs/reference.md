@@ -2218,8 +2218,12 @@ CSV seeds resolve when the project loads. Warehouse vocabularies resolve during
 document discovery, provider calls, or stel schema/state initialization.
 These commands require access to the active warehouse for a warehouse-backed
 vocabulary, including `compile`. Each invocation uses its resolved snapshot;
-a new invocation reads the relation again. Reads do not build the source
-relation or update it. Source rows sort by label so a row reorder alone does
+a new invocation reads the relation again. `run`, `build`, and each watch
+iteration capture the manifest from this resolved configuration before
+execution and write that same snapshot afterward; changes to the vocabulary
+during execution cannot change the artifact describing the published rows.
+Standalone `compile` always resolves a fresh snapshot. Reads do not build the
+source relation or update it. Source rows sort by label so a row reorder alone does
 not change identity; extra terms retain their authored order. Adding, changing,
 or removing enum labels changes dependent LLM models' code identity, appears in
 `stel plan`, and follows the existing incremental/reprocess policy.

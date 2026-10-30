@@ -263,6 +263,13 @@ updating the table.
 
 ## Scope discipline
 
+External vocabulary resolution belongs to `vocabulary_sources.py`. CSV paths
+use the project path/config-file boundary. Warehouse reads use the active
+adapter's bounded `read_relation()` and `preflight_reads()` lifecycle before
+discovery or schema/state initialization. Keep unresolved references out of
+provider schemas and code identities; compiled declarations contain resolved
+terms, preserving the existing artifact contract (ADR-0044).
+
 The current implementation boundaries are:
 
 - Python 3.12+ only; no Rust or PyO3.

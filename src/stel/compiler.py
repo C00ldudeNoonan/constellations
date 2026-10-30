@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 from .adapters import (
     AdapterError,
@@ -150,7 +152,7 @@ def validate_project_contract(
                 )
             try:
                 canonical_options = validate_backend_options(
-                    backend, model.extraction.options
+                    backend, _backend_validation_options(model.extraction.options)
                 )
             except BackendOptionsError as e:
                 error_path = getattr(e, "path", ("options",))
@@ -264,6 +266,26 @@ def validate_project_contract(
                 ("depends_on",),
             )
     return dag
+
+
+def _backend_validation_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Validate unresolved vocabulary enums structurally, without resolving I/O.
+
+    A private copy substitutes a non-empty set only for backend option
+    validation. The original reference stays unresolved and cannot supply a
+    provider schema or a code version until warehouse preflight replaces it.
+    """
+    fields = options.get("fields")
+    if not isinstance(fields, list) or not any(
+        isinstance(field, dict) and "values_from" in field for field in fields
+    ):
+        return options
+    validated = deepcopy(options)
+    for field in validated["fields"]:
+        if isinstance(field, dict) and "values_from" in field:
+            del field["values_from"]
+            field["values"] = ["unresolved_vocabulary"]
+    return validated
 
 
 def validate_warehouse_capabilities(
@@ -657,7 +679,10 @@ def _warn_on_enum_test_drift(model: ModelConfig) -> None:
     one of the two lists has drifted. Which one is right is the author's call,
     so this reports rather than decides.
     """
-    drift = enum_test_drift(model.fields, declared_accepted_values(model.tests))
+    drift = enum_test_drift(
+        [field for field in model.fields if field.values_from is None],
+        declared_accepted_values(model.tests),
+    )
     for name, values, explicit in drift:
         log.warning(
             "Model '%s' field '%s' declares `values: %s` but an "

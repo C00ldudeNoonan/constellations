@@ -42,6 +42,7 @@ from .providers import (
 from .retrieval.evolution import search_code_identity
 from .sql_models import SQL_COMPILER_CONTRACT_VERSION
 from .transforms import transform_code_version_identity
+from .vocabulary_sources import require_resolved_vocabularies
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _NON_SEMANTIC_EXTRACTION_OPTIONS = frozenset(
@@ -256,6 +257,7 @@ def compute_model_code_version(
     resolved: ResolvedProfile | None = None,
 ) -> str:
     effective_extraction: dict[str, Any] | None = None
+    require_resolved_vocabularies(project)
     effective_transform: dict[str, Any] | None = None
     resolved_extraction = _resolve_extraction_options(model, project, resolved)
     if resolved_extraction is not None:

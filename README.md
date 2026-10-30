@@ -9,6 +9,10 @@ dbt users will recognize the workflow: declare sources and models in YAML,
 build a DAG, materialize incrementally, test the results, and emit artifacts.
 `stel` is a standalone CLI rather than a dbt package or dbt adapter.
 
+Shared enum vocabularies can use inline terms, CSV seeds, or existing warehouse
+relations. The [vocabulary sources example](examples/vocabulary_sources/README.md)
+runs offline and shows how label changes reach provider schemas and incremental plans.
+
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
 > and BigQuery warehouses, local, GCS, and Google Drive sources, metadata-aware deterministic
 > chunk models, record-scoped incremental state, bounded projected warehouse

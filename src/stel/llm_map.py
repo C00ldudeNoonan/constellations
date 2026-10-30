@@ -111,6 +111,11 @@ class LLMMapRuntime:
 
 
 def _build_field_spec(field: FieldConfig) -> dict[str, Any]:
+    if field.values_from is not None:
+        raise LLMMapError(
+            f"Field '{field.name}' has an unresolved vocabulary; "
+            "resolve the active warehouse before inference"
+        )
     data_type = field.data_type or "string"
     schema_type = _JSON_SCHEMA_TYPES.get(data_type, "string")
     spec: dict[str, Any] = {"name": field.name, "type": schema_type}

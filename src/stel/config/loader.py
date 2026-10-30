@@ -517,6 +517,10 @@ def load_project(
     # the concrete variants, which is correct when transform.path itself
     # contains a ${matrix.KEY} placeholder.
     _populate_sql_depends_on(models, project_dir)
+    # Local import: vocabulary_sources uses ConfigError and file validation.
+    from ..vocabulary_sources import resolve_csv_vocabularies
+
+    resolve_csv_vocabularies(project, project_dir)
     _resolve_declared_vocabularies(project, models)
 
     return project, sources, models
@@ -525,10 +529,10 @@ def load_project(
 def _resolve_declared_vocabularies(project: ProjectConfig, models: list[ModelConfig]) -> None:
     """Replace every `values_from: vocab.<name>` with its vocabulary's labels.
 
-    Runs here, before `load_project` returns, so every caller — the compiler's
-    preflight, `stel run`, docs, manifest, dbt export — sees an ordinary
-    resolved `values:` list and needs no awareness of vocabularies at all
-    (issue #625). An unknown vocabulary name fails here: before source
+    Inline and CSV vocabularies resolve before `load_project` returns, so
+    consumers see an ordinary `values:` list (issue #625). Warehouse-backed
+    references remain explicit until runtime preflight resolves their snapshot
+    and calls this function again (#718). An unknown vocabulary name fails here: before source
     discovery, credentials, or any provider call, which matches every other
     structural check in this function.
 
@@ -558,6 +562,8 @@ def _resolve_field_values_from(
     if field.values_from is None:
         return field
     vocabulary = _vocabulary_for(project, model.name, field.name, field.values_from)
+    if vocabulary.source is not None:
+        return field
     return field.model_copy(
         update={
             "values": vocabulary.labels(),
@@ -585,6 +591,21 @@ def _resolve_extraction_options_values_from(project: ProjectConfig, model: Model
                 )
             )
         vocabulary = _vocabulary_for(project, model.name, field_name, values_from)
+        if entry.get("values"):
+            raise ConfigError(
+                f"Model '{model.name}' field '{field_name}' declares both "
+                "`values:` and `values_from:`"
+            )
+        field_type = next(
+            (entry[key] for key in ("type", "data_type", "data-type", "dtype") if key in entry),
+            "string",
+        )
+        if field_type != "enum":
+            raise ConfigError(
+                f"Model '{model.name}' field '{field_name}' uses `values_from:`; use `type: enum`"
+            )
+        if vocabulary.source is not None:
+            continue
         # `LLMFieldSpec` (backends/options.py) has no `values_from` field and
         # forbids unknown keys, so this must be fully resolved to a plain
         # `values:` list before that validation ever sees it — the same

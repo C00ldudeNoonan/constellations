@@ -18,6 +18,7 @@ from ..config import load_project
 from ..dag import ProjectDAG
 from ..profile import apply_source_path_overrides, resolve_profile
 from ..runner import _discover_sources, _run_model
+from ..vocabulary_sources import require_resolved_vocabularies
 from .adapter import CaptureAdapter
 
 
@@ -42,6 +43,7 @@ def materialize(
     """
     project_path = Path(project_dir)
     project, sources, models = load_project(project_path)
+    require_resolved_vocabularies(project)
     dag: ProjectDAG = validate_project_contract(project, sources, models, project_path)
 
     models_by_name = {m.name: m for m in models}

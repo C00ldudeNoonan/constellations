@@ -74,6 +74,7 @@ from .progress import get_reporter
 from .reprocess_guard import format_refusals, guard_reprocess
 from .sources import SourceError, get_document_source
 from .versioning import compute_model_code_version
+from .vocabulary_sources import resolve_warehouse_vocabularies
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +189,7 @@ def run_project(
         resolved.warehouse.type,
     )
     adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+    resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select,
@@ -392,6 +394,7 @@ def build_project(
         resolved.warehouse.type,
     )
     adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+    resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select,

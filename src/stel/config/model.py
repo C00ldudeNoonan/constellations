@@ -1108,7 +1108,8 @@ class FieldConfig(BaseModel):
     # #625), so two fields classifying into the same set share one
     # declaration instead of repeating it: `vocab.<name>`, resolved against
     # `stel_project.yml`'s `vocabularies:` by `load_project` before any model
-    # sees this field. Resolution populates `values` (and `value_descriptions`
+    # sees this field. Warehouse-backed references stay explicit until runtime
+    # preflight (#718). Resolution populates `values` (and `value_descriptions`
     # below) and clears this back to `None` — everything downstream of
     # `load_project` reads only `values`. Excluded from serialization: it is
     # always `None` by the time any artifact is built, and a project that

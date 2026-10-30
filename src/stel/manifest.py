@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ._distribution import distribution_version
-from .adapters import StateScope
+from .adapters import StateScope, create_adapter
 from .adapters.base import RETRIEVAL_PUBLISH_STAGE
 from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
@@ -40,6 +40,7 @@ from .versioning import (
     describe_model_inference,
     describe_model_llm,
 )
+from .vocabulary_sources import has_warehouse_vocabularies, resolve_warehouse_vocabularies
 
 MANIFEST_VERSION = 1
 # The serving manifest: written for a project with a search or agent-context
@@ -63,6 +64,9 @@ def build_manifest(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    if has_warehouse_vocabularies(project):
+        adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+        resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     sources = apply_source_path_overrides(sources, resolved)
     has_search = any(model.search is not None for model in models)
     has_agent_context = any(model.agent_context is not None for model in models)

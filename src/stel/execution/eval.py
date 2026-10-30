@@ -1,4 +1,4 @@
-"""Classification eval models (issue #309).
+"""Classification and relation eval models (issues #309, #731).
 
 Reads two already-materialized relations — predictions and labelled ground
 truth — and publishes long-format metric rows. No inference, no provider, no
@@ -20,16 +20,19 @@ import polars as pl
 
 from ..adapters import WarehouseAdapter
 from ..classification_metrics import (
+    ClassificationReport,
     as_rows,
     declared_labels_for,
     join_pairs,
     score,
 )
-from ..config.model import ModelConfig
+from ..config.model import EvalConfig, ModelConfig, RelationEvalConfig
 from ..dag import parse_ref
 from ..hashing import canonical_fingerprint
+from ..relation_metrics import relation_metric_rows
 from ..versioning import compute_code_version
 from .contracts import ModelRunResult, RunError
+from .relation_eval import read_relation_scores
 from .warehouse import warehouse_options
 
 # Identity of one metric row, so an incremental eval upserts rather than
@@ -110,22 +113,15 @@ def _predictions_version(frame: pl.DataFrame) -> str | None:
     return str(next(iter(versions)))
 
 
-def run_eval_model(
-    *,
+def _classification_report(
     model: ModelConfig,
+    config: EvalConfig,
     models_by_name: Mapping[str, ModelConfig],
-    project_dir: Path,
-    adapter: WarehouseAdapter,
-    full_refresh: bool,
-) -> ModelRunResult:
-    assert model.eval is not None
-    config = model.eval
-
-    predictions_name = parse_ref(config.predictions)
-    expected_name = parse_ref(config.expected)
-    predictions = adapter.read_table(predictions_name)
-    expected = adapter.read_table(expected_name)
-
+    predictions: pl.DataFrame,
+    expected: pl.DataFrame,
+    predictions_name: str,
+    expected_name: str,
+) -> ClassificationReport:
     _column(predictions, config.key, model.name, predictions_name)
     _column(predictions, config.predicted_field, model.name, predictions_name)
     _column(expected, config.key, model.name, expected_name)
@@ -167,12 +163,43 @@ def run_eval_model(
                 declared_labels_for(config.predicted_field, upstream.fields)
             )
 
-    report = score(
+    return score(
         pairs,
         declared_labels=declared,
         unmatched_rows=unmatched,
         unusable_expected_rows=unusable_expected,
     )
+
+
+def run_eval_model(
+    *,
+    model: ModelConfig,
+    models_by_name: Mapping[str, ModelConfig],
+    project_dir: Path,
+    adapter: WarehouseAdapter,
+    full_refresh: bool,
+) -> ModelRunResult:
+    assert model.eval is not None
+    config = model.eval
+
+    predictions_name = parse_ref(config.predictions)
+    expected_name = parse_ref(config.expected)
+    if isinstance(config, RelationEvalConfig):
+        scores, predictions_version = read_relation_scores(adapter, config)
+        metric_rows = relation_metric_rows(scores)
+        evaluated_rows = scores[0].expected_triples
+        unmatched_rows = scores[0].false_negatives
+    else:
+        predictions = adapter.read_table(predictions_name)
+        expected = adapter.read_table(expected_name)
+        report = _classification_report(
+            model, config, models_by_name, predictions, expected,
+            predictions_name, expected_name,
+        )
+        metric_rows = as_rows(report)
+        predictions_version = _predictions_version(predictions)
+        evaluated_rows = report.evaluated_rows
+        unmatched_rows = report.unmatched_rows
 
     code_version = compute_code_version(
         extraction=None,
@@ -182,10 +209,8 @@ def run_eval_model(
         project_dir=project_dir,
     )
     evaluated_at = datetime.now(UTC).isoformat()
-    predictions_version = _predictions_version(predictions)
-
     rows: list[dict[str, Any]] = []
-    for row in as_rows(report):
+    for row in metric_rows:
         rows.append(
             {
                 "metric_id": canonical_fingerprint(
@@ -249,7 +274,7 @@ def run_eval_model(
         model_name=model.name,
         materialization=model.materialization,
         kind="eval",
-        documents_processed=report.evaluated_rows,
-        documents_skipped=report.unmatched_rows,
+        documents_processed=evaluated_rows,
+        documents_skipped=unmatched_rows,
         rows_written=rows_written,
     )

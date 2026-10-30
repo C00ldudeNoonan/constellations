@@ -139,6 +139,8 @@ fitting the workflow analytics engineers already use.**
   and Slides as source documents.
 - **RAG and classic ML primitives** — deterministic recursive/token chunking;
   count, TF-IDF, and hashing features; and naive Bayes text classification.
+- **Offline model evaluation** — classification and canonical relation-triple
+  metrics against gold relations, with per-label thresholds in `stel build`.
 - **dbt-shaped everything** — `ref()`, `--select` / `--exclude` selectors with
   `tag:` support, structural and deterministic quality tests, custom-Python
   tests, warn/error severities, source freshness, and profiles with `--target`.

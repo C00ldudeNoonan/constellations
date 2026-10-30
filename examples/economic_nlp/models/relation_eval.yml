@@ -1,0 +1,76 @@
+version: 2
+
+models:
+  - name: relation_eval_mentions
+    description: "Synthetic hand-authored mentions with reviewed canonical IDs; no NLP inference"
+    source: ref('relation_eval_mention_fixtures')
+    extraction:
+      backend: json
+      options:
+        fields: [evaluation_document, entity_id, canonical_id, label, sentence_index, start, end]
+    fields:
+      - {name: evaluation_document, data_type: string}
+      - {name: entity_id, data_type: string}
+      - {name: canonical_id, data_type: string}
+      - {name: label, data_type: string}
+      - {name: sentence_index, data_type: int}
+      - {name: start, data_type: int}
+      - {name: end, data_type: int}
+    tags: [relation_eval]
+
+  - name: relation_eval_assertions
+    description: "Exercise the real rule extractor over the offline fixture"
+    depends_on: [ref('relation_eval_mentions')]
+    transform:
+      type: python
+      module: stel.text.transforms.extract_relations
+      options:
+        mentions: relation_eval_mentions
+        document_id_field: evaluation_document
+        extractor: rule
+        scope: sentence
+        rules:
+          - subject_label: ORG
+            object_label: GPE
+            relation_type: references_geography
+          - subject_label: ORG
+            object_label: TOPIC
+            relation_type: references_topic
+    tags: [relation_eval]
+
+  - name: relation_eval_predictions
+    description: "Resolve assertion endpoints to canonical IDs, retaining unresolved endpoints"
+    transform:
+      type: sql
+      path: sql/relation_eval_predictions.sql
+    tags: [relation_eval]
+
+  - name: relation_eval_gold
+    description: "Independent synthetic gold triples; never derived from the extractor"
+    source: ref('relation_eval_gold_fixtures')
+    extraction:
+      backend: json
+      options:
+        fields: [evaluation_document, subject_canonical_id, relation_type, object_canonical_id]
+    fields:
+      - {name: evaluation_document, data_type: string}
+      - {name: subject_canonical_id, data_type: string}
+      - {name: relation_type, data_type: string}
+      - {name: object_canonical_id, data_type: string}
+    tags: [relation_eval]
+
+  - name: relation_quality
+    eval:
+      kind: relations
+      predictions: ref('relation_eval_predictions')
+      expected: ref('relation_eval_gold')
+      subject_field: subject_canonical_id
+      relation_field: relation_type
+      object_field: object_canonical_id
+      document_field: evaluation_document
+      labels: [references_geography, references_topic]
+    tags: [relation_eval]
+    tests:
+      - min_metric: {metric: f1, min: 1.0}
+      - min_metric: {metric: recall, label: references_geography, min: 1.0}
+      - min_metric: {metric: recall, label: references_topic, min: 1.0}

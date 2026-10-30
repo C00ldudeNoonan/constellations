@@ -866,6 +866,47 @@ class EvalConfig(BaseModel):
         return v
 
 
+class RelationEvalConfig(BaseModel):
+    """Score canonical relation triples against reviewed gold facts (issue #731)."""
+
+    model_config = _STRICT_CONFIG
+
+    kind: Literal["relations"]
+    predictions: str
+    expected: str
+    subject_field: str
+    relation_field: str
+    object_field: str
+    # None deliberately scores corpus-level facts, collapsing repeated evidence.
+    document_field: str | None = None
+    labels: list[str] = Field(default_factory=list)
+
+    @field_validator("subject_field", "relation_field", "object_field", "document_field")
+    @classmethod
+    def _validate_column(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("eval column names must not be empty")
+        return value
+
+    @field_validator("labels")
+    @classmethod
+    def _validate_labels(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("eval labels must not be empty")
+        if len(values) != len(set(values)):
+            raise ValueError("eval labels must not repeat")
+        return values
+
+    @model_validator(mode="after")
+    def _distinct_columns(self) -> RelationEvalConfig:
+        columns = [self.subject_field, self.relation_field, self.object_field]
+        if self.document_field is not None:
+            columns.append(self.document_field)
+        if len(columns) != len(set(columns)):
+            raise ValueError("relation eval fields must name distinct columns")
+        return self
+
+
 class SearchFreshnessConfig(BaseModel):
     """How long this index's contents stay current enough to call fresh.
 
@@ -1202,7 +1243,7 @@ class ModelConfig(BaseModel):
     embed: EmbedConfig | None = None
     llm: LLMTransformConfig | None = None
     search: SearchConfig | None = None
-    eval: EvalConfig | None = None
+    eval: EvalConfig | RelationEvalConfig | None = None
     # Golden-set retrieval evaluations over this search index (issue #137);
     # only meaningful — and only allowed — when `search` is set.
     retrieval_tests: list[RetrievalTestConfig] = Field(default_factory=list)

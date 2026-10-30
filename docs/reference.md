@@ -5156,6 +5156,90 @@ yourself is rejected — the edges have one source of truth.
 Single-label classification only. Multi-label and regression are different
 metric families and would get their own `kind:`.
 
+## Relation extraction eval models
+
+`eval: {kind: relations}` compares directed canonical triples against an
+independent gold relation. It reads existing tables and makes no inference
+calls. Both inputs use the configured column names; project a different schema
+in an upstream transform when necessary.
+
+```yaml
+- name: relation_quality
+  eval:
+    kind: relations
+    predictions: ref('linked_assertions')
+    expected: ref('reviewed_relations')
+    subject_field: subject_canonical_id
+    relation_field: relation_type
+    object_field: object_canonical_id
+    document_field: document_id  # omit for corpus-level facts
+    labels: [located_in, owns]   # optional; retains types absent from both inputs
+  tests:
+    - min_metric: {metric: f1, min: 0.85}
+    - min_metric: {metric: recall, label: owns, min: 0.70}
+```
+
+`subject_field`, `relation_field`, and `object_field` are required and must name
+distinct columns. `document_field` is optional and must name a fourth column
+when set. All configured columns must exist even in empty input tables.
+`predictions` and `expected` derive the DAG edges; do not set `depends_on`.
+Classification-only options such as `key` and `predicted_field` are rejected.
+
+Matching is exact and case-sensitive. Use namespaced canonical IDs when IDs
+from different entity namespaces could collide. Direction matters: `(a, owns,
+b)` differs from `(b, owns, a)`. With `document_field`, the same triple in two
+documents is two facts; without it, repeated evidence anywhere in the corpus
+collapses to one fact. Duplicate complete triples in either input count once.
+Per-type output covers the union of observed types and explicit `labels`.
+Relation characteristics, including inverse declarations, are not supported
+yet; inverse assertions do not match automatically.
+
+Output uses the same long metric schema and version/history behavior as
+classification evals above. A null `label` identifies the overall **micro**
+scores; each relation type also has its own rows:
+
+| metric | meaning |
+|---|---|
+| precision | true positives / predicted triples |
+| recall | true positives / gold triples |
+| f1 | 2 × true positives / (2 × true positives + false positives + false negatives) |
+| support, expected_triples | distinct gold triples |
+| predicted_triples | distinct complete predictions plus unresolved prediction rows |
+| true_positives | exact matches |
+| false_positives | extra complete predictions plus unresolved prediction rows |
+| false_negatives | gold triples without an exact prediction |
+| unmatched_subject_rows | prediction rows with null or blank subject canonical IDs |
+| unmatched_object_rows | prediction rows with null or blank object canonical IDs |
+| unmatched_entity_rows | prediction rows with either endpoint unresolved, counted once per row |
+
+Zero denominators produce 0.0. An empty predictions table therefore reports
+zero recall against every gold type. An empty gold table is an error, as are
+null/blank gold endpoints, null/blank relation types, non-string IDs/types,
+and null/blank document IDs when document scope is configured. These errors
+fail before metric publication and never include row values in diagnostics.
+
+Unresolved prediction endpoints cannot match gold. Each such row counts as a
+false positive, including repeated rows: unknown endpoints cannot safely be
+assumed to denote the same entity. A wrong but nonempty canonical ID is an
+ordinary mismatch; these diagnostics identify missing links, not every linking
+error. Filter `status = 'asserted'` upstream when the extractor also emits
+`ambiguous` or `no_relation` candidates. Retain unresolved asserted rows with
+left joins so linking failures remain visible in precision.
+
+Reads project only scoring columns and an optional predictions `code_version`,
+in adapter snapshot batches. Exact deduplication retains O(distinct triples)
+memory; this is an in-process benchmark evaluator, not a warehouse-scale join.
+Run the credential-free fixture with the real rule extractor:
+
+```bash
+uv run stel --project-dir examples/economic_nlp build --select +relation_quality
+```
+
+The fixture contains four independently authored synthetic gold facts across
+two types. Its perfect score checks mechanics, not real-world extraction
+quality. A CI test deliberately breaks a rule and verifies that F1 drops and
+the build gates fail.
+
 ## Tests
 
 **Structural:**

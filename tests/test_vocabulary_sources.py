@@ -20,7 +20,8 @@ from stel.dbt_embed.api import materialize
 from stel.dbt_embed.codegen import generate_dbt_models
 from stel.dbt_export import build_dbt_sources
 from stel.llm_map import LLMMapError, build_fields_spec
-from stel.manifest import build_manifest
+from stel.manifest import SERVING_MANIFEST_VERSION, build_manifest
+from stel.mcp_server.catalog import ArtifactCatalog, ArtifactCatalogError
 from stel.profile import resolve_profile
 from stel.versioning import compute_model_code_version
 from stel.vocabulary_sources import resolve_warehouse_vocabularies
@@ -292,3 +293,50 @@ def test_warehouse_vocabulary_uses_the_selected_profile_target(tmp_path: Path) -
     )
     manifest = build_manifest(tmp_path, target="other")
     assert manifest["models"][0]["fields"][0]["values"] == ["other"]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        {"from": {"relation": "warehouse://terms", "label_column": "id"}},
+        {"terms": [{"label": "a"}], "extra_terms": []},
+    ],
+)
+def test_serving_artifact_contract_rejects_source_instructions(declaration: dict[str, Any]) -> None:
+    manifest = {
+        "manifest_version": SERVING_MANIFEST_VERSION,
+        "declarations": {"classes": [], "vocabularies": {"v": declaration}},
+        "target": {"name": "dev"},
+        "models": [],
+        "dag": {},
+    }
+    with pytest.raises(ArtifactCatalogError, match="resolved compiled vocabulary"):
+        ArtifactCatalog.from_payloads(manifest)
+
+
+def test_serving_uses_the_compiled_warehouse_snapshot_without_reads_or_false_drift(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _project(tmp_path, {"relation": "warehouse://main.sectors", "label_column": "id"})
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "manifest_version": SERVING_MANIFEST_VERSION,
+                "declarations": {
+                    "classes": [],
+                    "vocabularies": {"sector": {"terms": [{"label": "a"}]}},
+                },
+                "target": {"name": "dev"},
+                "models": [],
+                "dag": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    catalog = ArtifactCatalog.load(tmp_path)
+    assert catalog.vocabularies["sector"].labels() == ["a"]
+    assert not caplog.records
+    assert not (tmp_path / "warehouse.duckdb").exists()

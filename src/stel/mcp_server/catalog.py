@@ -132,8 +132,16 @@ class ArtifactCatalog:
         # entity links were published under (issue #669). A difference is not
         # an error -- the served answer is right for the published rows -- but
         # it is the one state an operator cannot otherwise see.
-        if _declaration_payload(project.vocabularies) != _declaration_payload(
-            catalog.vocabularies
+        # A warehouse-backed live declaration has no values until preflight.
+        # Serving must not query it or warn that its unresolved empty set
+        # differs from the compiled snapshot (#718).
+        live = _declaration_payload({
+            name: vocabulary for name, vocabulary in project.vocabularies.items()
+            if vocabulary.source is None
+        })
+        compiled = _declaration_payload(catalog.vocabularies)
+        if set(project.vocabularies) != set(compiled) or any(
+            compiled[name] != value for name, value in live.items()
         ):
             log.warning(
                 "stel_project.yml declares a `vocabularies:` block that differs "
@@ -314,6 +322,11 @@ def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]
         )
     vocabularies: dict[str, Vocabulary] = {}
     for name, value in payload.items():
+        if not isinstance(value, Mapping) or set(value) != {"terms"}:
+            raise ArtifactCatalogError(
+                f"The manifest's declaration of vocabulary '{name}' is not a "
+                "resolved compiled vocabulary; run `stel compile`"
+            )
         try:
             vocabularies[str(name)] = Vocabulary.model_validate(value)
         except ValidationError:

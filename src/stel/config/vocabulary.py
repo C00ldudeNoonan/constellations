@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .identifiers import validate_node_name
+from .source import WAREHOUSE_SOURCE_SCHEME, validate_relation_name
 
 # `values_from: vocab.<name>` — the only source kind today. Prefixed rather
 # than a bare name so a later `values_from:` source (e.g. a warehouse column)
@@ -78,6 +79,33 @@ class VocabularyTerm(BaseModel):
         return v
 
 
+class VocabularySource(BaseModel):
+    """A bounded CSV seed or relation read through the active warehouse (#718)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str | None = None
+    relation: str | None = None
+    label_column: str
+    description_column: str | None = None
+    max_terms: int = Field(default=10_000, gt=0, strict=True)
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> VocabularySource:
+        if (self.path is None) == (self.relation is None):
+            raise ValueError("vocabulary `from:` requires exactly one of `path:` or `relation:`")
+        if self.path is not None and (not self.path or not self.path.lower().endswith(".csv")):
+            raise ValueError("vocabulary seed `path:` must name a CSV file")
+        if self.relation is not None:
+            if not self.relation.startswith(WAREHOUSE_SOURCE_SCHEME):
+                raise ValueError("vocabulary `relation:` must start with 'warehouse://'")
+            validate_relation_name(self.relation[len(WAREHOUSE_SOURCE_SCHEME) :])
+        for column in (self.label_column, self.description_column):
+            if column is not None and not column.strip():
+                raise ValueError("vocabulary source column names must not be empty")
+        return self
+
+
 class Vocabulary(BaseModel):
     """One closed, ordered label set, declared once under `vocabularies:`.
 
@@ -85,12 +113,29 @@ class Vocabulary(BaseModel):
     schema, `accepted_values` test, and prompt fallback all see as `values`.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    terms: list[VocabularyTerm] = Field(min_length=1)
+    terms: list[VocabularyTerm] = Field(default_factory=list)
+    # Sources are authoring inputs. Artifacts retain the resolved declaration,
+    # in the existing shape, rather than instructions to query a live table.
+    source: VocabularySource | None = Field(default=None, alias="from", exclude=True)
+    extra_terms: list[VocabularyTerm] = Field(default_factory=list, exclude=True)
 
     @model_validator(mode="after")
     def _validate_terms(self) -> Vocabulary:
+        if self.source is not None:
+            if "terms" in self.model_fields_set:
+                raise ValueError("vocabulary declares both `terms:` and `from:`; use exactly one")
+            labels = [term.label for term in self.extra_terms]
+            if len(labels) != len(set(labels)):
+                raise ValueError("vocabulary `extra_terms:` labels must be unique")
+            if len(labels) > self.source.max_terms:
+                raise ValueError("vocabulary `extra_terms:` exceeds source `max_terms`")
+            return self
+        if not self.terms:
+            raise ValueError("vocabulary must declare non-empty `terms:` or a `from:` source")
+        if self.extra_terms:
+            raise ValueError("vocabulary `extra_terms:` requires a `from:` source")
         seen: set[str] = set()
         for term in self.terms:
             if term.label in seen:
@@ -211,7 +256,7 @@ def check_declaration(
     declared_classes = set(classes)
     for vocab_name, vocabulary in vocabularies.items():
         validate_node_name(vocab_name, kind="Vocabulary")
-        for term in vocabulary.terms:
+        for term in (*vocabulary.terms, *vocabulary.extra_terms):
             if term.entity_class is None or term.entity_class in declared_classes:
                 continue
             raise ValueError(

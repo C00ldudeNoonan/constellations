@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: classified_mentions
+    source: ref('mentions')
+    materialization: incremental
+    extraction:
+      backend: llm
+      options:
+        fields:
+          - {name: competitor_id, type: enum, values_from: vocab.competitor_id}
+    fields:
+      - {name: competitor_id, type: enum, values_from: vocab.competitor_id}

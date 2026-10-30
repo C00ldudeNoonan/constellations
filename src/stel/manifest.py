@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from ._distribution import distribution_version
-from .adapters import StateScope
+from .adapters import StateScope, create_adapter
 from .adapters.base import RETRIEVAL_PUBLISH_STAGE
 from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
 from .config.model import LLMTransformConfig, ModelConfig
 from .config.project import ProjectConfig
+from .config.source import SourceConfig
 from .dag import NodeKind, ProjectDAG, parse_ref
 from .embedding import (
     effective_search_config,
@@ -40,6 +41,7 @@ from .versioning import (
     describe_model_inference,
     describe_model_llm,
 )
+from .vocabulary_sources import has_warehouse_vocabularies, resolve_warehouse_vocabularies
 
 MANIFEST_VERSION = 1
 # The serving manifest: written for a project with a search or agent-context
@@ -53,6 +55,35 @@ MANIFEST_FILENAME = "manifest.json"
 RUN_RESULTS_FILENAME = "run_results.json"
 
 
+@dataclass(frozen=True)
+class ManifestSnapshot:
+    """An immutable artifact captured from the configuration used to execute."""
+
+    path: Path
+    content: str = field(repr=False)
+
+    def write(self) -> Path:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(self.content, encoding="utf-8")
+        return self.path
+
+
+def capture_manifest(
+    project_dir: Path,
+    *,
+    project: ProjectConfig,
+    sources: list[SourceConfig],
+    models: list[ModelConfig],
+    resolved: ResolvedProfile,
+) -> ManifestSnapshot:
+    """Freeze values and code identities before execution, without writing yet."""
+    payload = _build_manifest_from_project(project, sources, models, project_dir, resolved)
+    return ManifestSnapshot(
+        path=project_dir / project.target_path / MANIFEST_FILENAME,
+        content=json.dumps(payload, indent=2),
+    )
+
+
 def build_manifest(
     project_dir: Path,
     *,
@@ -63,7 +94,20 @@ def build_manifest(
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )
+    if has_warehouse_vocabularies(project):
+        adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
+        resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     sources = apply_source_path_overrides(sources, resolved)
+    return _build_manifest_from_project(project, sources, models, project_dir, resolved)
+
+
+def _build_manifest_from_project(
+    project: ProjectConfig,
+    sources: list[SourceConfig],
+    models: list[ModelConfig],
+    project_dir: Path,
+    resolved: ResolvedProfile,
+) -> dict[str, Any]:
     has_search = any(model.search is not None for model in models)
     has_agent_context = any(model.agent_context is not None for model in models)
     dag = (

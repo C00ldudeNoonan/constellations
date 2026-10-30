@@ -53,6 +53,7 @@ from .versioning import (
     describe_model_inference,
     describe_model_llm,
 )
+from .vocabulary_sources import resolve_warehouse_vocabularies
 
 log = logging.getLogger(__name__)
 
@@ -201,6 +202,7 @@ def plan_project(
     models_by_name = {model.name: model for model in models}
     planned = [models_by_name[name] for name in selected]
     validate_warehouse_capabilities(planned, adapter)
+    resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
     with adapter:
         plans = plan_models(
             planned,

@@ -1,0 +1,5 @@
+version: 2
+sources:
+  - name: mentions
+    path: documents
+    file_pattern: "*.json"

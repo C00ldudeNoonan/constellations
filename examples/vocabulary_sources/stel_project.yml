@@ -1,0 +1,12 @@
+name: vocabulary_sources
+version: "0.1.0"
+profile: vocabulary_sources
+
+vocabularies:
+  competitor_id:
+    from:
+      path: seeds/competitors.csv
+      label_column: competitor_id
+      description_column: name
+    extra_terms:
+      - {label: none, description: No listed company}

@@ -1343,6 +1343,19 @@ class WarehouseAdapter(ABC):
     #: to rename the old ones into.
     migration_mode: bool = False
 
+    @contextmanager
+    def preflight_reads(self) -> Iterator[Self]:
+        """Connect for input validation without creating stel schema/state (#718).
+
+        This is a connection lifecycle, not a read-only SQL sandbox. Callers
+        use only adapter read methods and close it before normal execution.
+        """
+        self._connect()
+        try:
+            yield self
+        finally:
+            self._close()
+
     def __enter__(self) -> Self:
         self._connect()
         try:

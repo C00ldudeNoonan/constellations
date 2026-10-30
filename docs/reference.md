@@ -2179,6 +2179,63 @@ enum field and needs no awareness of vocabularies. `values:` and
 `values_from:` are mutually exclusive; an unknown vocabulary name fails to
 load.
 
+### Sourcing vocabulary terms
+
+A vocabulary can read a UTF-8 CSV seed instead of repeating labels in YAML:
+
+```yaml
+vocabularies:
+  competitor_id:
+    from:
+      path: seeds/competitors.csv
+      label_column: competitor_id
+      description_column: name
+      max_terms: 10000
+    extra_terms:
+      - {label: none, description: No listed company}
+```
+
+Use `from.relation: warehouse://main.dim_competitors` **instead of** `from.path`
+to read an existing relation through the active target's warehouse adapter.
+One-part names address the target schema; two- and three-part names address
+the named schema/dataset and catalog/project, as with warehouse document sources.
+The relation must already exist before the invocation; it cannot be a model
+built later in the same run. Both forms feed `values_from: vocab.competitor_id`
+on top-level `fields:` and on `backend: llm` extraction option fields.
+
+`terms:` and `from:` are mutually exclusive. `extra_terms:` is available only
+with `from:` and appends ordinary authored terms after the sourced terms.
+`description_column` is optional. CSV paths stay inside the project and must
+be regular, non-symlink files with no symlink directory components. CSV headers
+must be unique and rows must match the header. Labels must be non-empty strings
+(CSV preserves identifiers' leading zeros); descriptions must be strings or
+null. Empty sets and duplicate labels, including collisions with `extra_terms`,
+fail. A source is bounded by `max_terms` (default 10,000, including extra terms);
+warehouse reads request at most that limit plus one row to detect overflow.
+
+CSV seeds resolve when the project loads. Warehouse vocabularies resolve during
+`compile`, `plan`, `run`, and `build`, after structural validation and before
+document discovery, provider calls, or stel schema/state initialization.
+These commands require access to the active warehouse for a warehouse-backed
+vocabulary, including `compile`. Each invocation uses its resolved snapshot;
+a new invocation reads the relation again. `run`, `build`, and each watch
+iteration capture the manifest from this resolved configuration before
+execution and write that same snapshot afterward; changes to the vocabulary
+during execution cannot change the artifact describing the published rows.
+Standalone `compile` always resolves a fresh snapshot. Reads do not build the
+source relation or update it. Source rows sort by label so a row reorder alone does
+not change identity; extra terms retain their authored order. Adding, changing,
+or removing enum labels changes dependent LLM models' code identity, appears in
+`stel plan`, and follows the existing incremental/reprocess policy.
+
+Compiled artifacts carry resolved values in the existing schema, with no
+live source instructions or unrelated source columns. Treat label sets as
+artifact-visible configuration, just like inline enum values. An unresolved
+warehouse vocabulary cannot supply a provider schema or a code version.
+Offline dbt export, code generation, and embedded execution support CSV and
+inline vocabularies; they reject unresolved warehouse vocabularies. See the
+runnable [`vocabulary_sources` example](../examples/vocabulary_sources/README.md).
+
 A term's `description:` reaches the prompt fallback too, as a line of its
 own, so a provider without schema-level enum support sees what a label means,
 not only its name. A term may also declare `aliases:` (alternative names) and

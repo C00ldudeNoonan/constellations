@@ -109,6 +109,11 @@ def _fields_spec(options: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "llm backend requires `options.fields: [{name, type, ...}]`"
             )
         spec = {key: value for key, value in field.items() if isinstance(key, str)}
+        if "values_from" in spec:
+            raise ValueError(
+                "llm field has an unresolved vocabulary; resolve the active warehouse "
+                "before constructing a provider schema"
+            )
         # `type: enum` is stel's declaration, not a JSON Schema type: normalize
         # it to the string it constrains, carrying the closed set as `enum` so
         # it reaches the provider schema on this path too (issue #304).

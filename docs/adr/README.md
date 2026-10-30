@@ -53,6 +53,7 @@ history (issue #311).
 | [0041](0041-a-token-packing-rejection-reports-tuning-rather-than-retrying.md) | A recognized Vertex aggregate token-limit rejection reports safe tuning guidance without issuing unreserved split retries | accepted |
 | [0042](0042-anthropic-structured-output-is-native-json.md) | Anthropic single and batch requests use native JSON output and opt into a service-selected sampling default | accepted |
 | [0043](0043-relation-evaluation-scores-distinct-facts-and-retains-unresolved-predictions.md) | Relation evaluation scores distinct canonical facts and keeps unresolved predictions in precision | accepted |
+| [0044](0044-vocabulary-sources-resolve-before-execution.md) | Vocabulary sources resolve to bounded snapshots before code identity or execution; warehouse-backed compile requires access | accepted |
 
 ## When to write one
 

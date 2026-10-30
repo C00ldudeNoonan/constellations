@@ -1,0 +1,10 @@
+vocabulary_sources:
+  target: dev
+  outputs:
+    dev:
+      warehouse:
+        type: duckdb
+        path: target/vocabulary_sources.duckdb
+      llm:
+        provider: deterministic
+        cache_path: target/llm_cache.sqlite

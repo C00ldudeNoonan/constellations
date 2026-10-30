@@ -17,6 +17,7 @@ from .config.model import ModelConfig
 from .config.profile import WarehouseConfig
 from .dag import ProjectDAG, parse_ref
 from .profile import resolve_profile
+from .vocabulary_sources import require_resolved_vocabularies
 
 DEFAULT_OUTPUT_FILENAME = "sources.yml"
 
@@ -57,6 +58,7 @@ def build_dbt_sources(
     dagster_meta: bool = False,
 ) -> dict[str, Any]:
     project, sources_cfg, models = load_project(project_dir)
+    require_resolved_vocabularies(project)
     resolved = resolve_profile(
         project, project_dir, target=target, profiles_dir=profiles_dir
     )

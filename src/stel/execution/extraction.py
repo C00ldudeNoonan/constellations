@@ -310,6 +310,28 @@ class DiscoveredSource:
     refs: list[DocumentRef]
 
 
+def _extract_in_memory(
+    source: DocumentSource,
+    backend: BaseBackend,
+    doc: DocumentRef,
+    options: dict[str, Any],
+    budget: BudgetGuard | None,
+) -> ExtractionResult:
+    fetch_bytes = getattr(source, "fetch_bytes", None)
+    extract_bytes = getattr(backend, "extract_bytes", None)
+    if not callable(fetch_bytes) or not callable(extract_bytes):
+        raise RunError("In-memory extraction requires an in-memory source")
+    payload = fetch_bytes(doc)
+    if budget is not None:
+        budget.check_file_bytes(len(payload))
+        budget.charge_bytes(len(payload))
+        budget.ensure_headroom()
+    result: ExtractionResult = extract_bytes(payload, options)
+    if budget is not None:
+        budget.charge_metrics(result.metrics)
+    return result
+
+
 def run_extraction_model(
     *,
     model: ModelConfig,
@@ -538,18 +560,9 @@ def run_extraction_model(
                 local_path: Path | None = None
                 try:
                     if getattr(backend, "memory_only", False):
-                        fetch_bytes = getattr(source_backend, "fetch_bytes", None)
-                        extract_bytes = getattr(backend, "extract_bytes", None)
-                        if not callable(fetch_bytes) or not callable(extract_bytes):
-                            raise RunError("In-memory extraction requires an in-memory source")
-                        payload = fetch_bytes(doc)
-                        if budget_guard is not None:
-                            budget_guard.check_file_bytes(len(payload))
-                            budget_guard.charge_bytes(len(payload))
-                            budget_guard.ensure_headroom()
-                        result = extract_bytes(payload, options)
-                        if budget_guard is not None:
-                            budget_guard.charge_metrics(result.metrics)
+                        result = _extract_in_memory(
+                            source_backend, backend, doc, options, budget_guard
+                        )
                         return doc, result, None
                     local_path = source_backend.fetch(doc, work_dir)
                     if budget_guard is not None:

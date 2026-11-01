@@ -23,6 +23,7 @@ from stel.config.loader import ConfigError
 from stel.config.profile import WarehouseConfig
 from stel.config.source import SourceConfig, validate_relation_name
 from stel.profile import ProfileError
+from stel.runner import run_project
 from stel.sources import DocumentRef, SourceError, get_document_source
 from stel.sources.warehouse import WarehouseDocumentSource
 
@@ -331,8 +332,6 @@ def _registry(project: Path) -> pl.DataFrame:
 
 
 def test_table_rows_flow_through_extraction(tmp_path: Path) -> None:
-    from stel.runner import run_project
-
     project = _project(tmp_path)
 
     results = {r.model_name: r for r in run_project(project)}
@@ -349,8 +348,6 @@ def test_memory_backend_never_stages_warehouse_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """#734: warehouse prose never crosses the local document-file boundary."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
     sentinel = "warehouse-private-payload-734"
     con = duckdb.connect(str(project / "target" / "db.duckdb"))
@@ -390,8 +387,6 @@ def test_memory_backend_malformed_input_is_sanitized_and_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """#734: a failed snapshot never leaks or advances its state."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
     models = project / "models" / "models.yml"
     models.write_text(
@@ -421,8 +416,6 @@ def test_memory_backend_interrupted_run_retries_and_empty_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#734: interruption does not record unpublished rows; an empty source prunes."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
     models = project / "models" / "models.yml"
     models.write_text(
@@ -452,8 +445,6 @@ def test_memory_backend_invalid_configuration_precedes_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
 ) -> None:
     """#734: invalid memory extraction cannot start warehouse work."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
     models = project / "models" / "models.yml"
     text = models.read_text(encoding="utf-8").replace("backend: json", "backend: json_memory")
@@ -485,8 +476,6 @@ def test_memory_backend_invalid_configuration_precedes_adapter(
 @pytest.mark.parametrize("backend", ["json", "json_memory"])
 def test_incremental_contract_over_rows(tmp_path: Path, backend: str) -> None:
     """The design's promise: skip, re-extract, prune — machinery unchanged."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
     models = project / "models" / "models.yml"
     models.write_text(
@@ -518,8 +507,6 @@ def test_incremental_contract_over_rows(tmp_path: Path, backend: str) -> None:
 
 def test_switching_to_memory_preserves_source_identity_and_reprocesses(tmp_path: Path) -> None:
     """#734: opting in changes extraction code, not warehouse row identity."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
     run_project(project)
     db = project / "target" / "db.duckdb"
@@ -546,8 +533,6 @@ def test_source_filter_scopes_rows_by_path_columns(tmp_path: Path) -> None:
     """`--source-filter 'wallstreetbets/*'` addresses a row subset the same
     way it addresses an object prefix — the partition seam for orchestrators
     (astrolabe #167 shape) with no new concept."""
-    from stel.runner import run_project
-
     project = _project(tmp_path)
 
     results = {

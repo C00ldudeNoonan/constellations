@@ -37,7 +37,8 @@ from pydantic import (
 # v7 (issue #345): built-in lenses as `derived` dimensions, `ordinal` on a
 # dimension, `unavailable_dimensions` naming a lens the corpus cannot fill and
 # why, and `coverage` counting what the export left out.
-CONCEPT_CLOUD_SCHEMA_VERSION = "7"
+# v8 (issue #738): a concept's declared class ancestry.
+CONCEPT_CLOUD_SCHEMA_VERSION = "8"
 
 # Mirrors stel.text.relations.RelationMethod (proximity vs. asserted edges).
 ConceptEdgeMethod = Literal["co_occurrence", "rule", "model_assertion"]
@@ -288,6 +289,7 @@ class Concept(_Frozen):
     # term a project's vocabulary states for this concept. Definitions come
     # only from the declaration's term description, never from document text.
     entity_class: str | None = Field(default=None, alias="class")
+    class_ancestors: tuple[str, ...] = ()
     definition: str | None = None
     broader: str | None = None
     label: str | None = None
@@ -338,6 +340,8 @@ class Concept(_Frozen):
         for key in ("class", "class_", "definition", "broader"):
             if key in data and data[key] is None:
                 del data[key]
+        if not data.get("class_ancestors"):
+            data.pop("class_ancestors", None)
         return data
 
     @field_validator("match_score")
@@ -401,7 +405,7 @@ class CrossLayerEdge(_Frozen):
 class ConceptCloudExport(_Frozen):
     """The complete, self-contained input for the concept-cloud artifact."""
 
-    schema_version: Literal["7"] = CONCEPT_CLOUD_SCHEMA_VERSION
+    schema_version: Literal["8"] = CONCEPT_CLOUD_SCHEMA_VERSION
     generated_at: str
     project: str
     dag_plane: DagPlane

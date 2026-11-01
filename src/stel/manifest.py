@@ -13,6 +13,7 @@ from .adapters.base import RETRIEVAL_PUBLISH_STAGE
 from .agent_context import contract_descriptor
 from .compiler import validate_project_contract, validate_retrieval_capabilities
 from .config import load_project
+from .config.class_hierarchy import ClassDef
 from .config.model import LLMTransformConfig, ModelConfig
 from .config.project import ProjectConfig
 from .config.source import SourceConfig
@@ -49,8 +50,8 @@ MANIFEST_VERSION = 1
 # project's `classes:` and `vocabularies:` as compiled (issue #669), so the
 # catalog interprets published entity links under the declaration that was
 # in force when the artifact was written rather than whatever the project
-# file says when the server starts.
-SERVING_MANIFEST_VERSION = 3
+# file says when the server starts. v4 carries class hierarchy declarations.
+SERVING_MANIFEST_VERSION = 4
 MANIFEST_FILENAME = "manifest.json"
 RUN_RESULTS_FILENAME = "run_results.json"
 
@@ -764,7 +765,10 @@ def _declarations(project: ProjectConfig) -> dict[str, Any]:
     reads like the project file it came from.
     """
     return {
-        "classes": list(project.classes),
+        "classes": [
+            value.model_dump(mode="json") if isinstance(value, ClassDef) else value
+            for value in project.classes
+        ],
         "vocabularies": {
             name: vocabulary.model_dump(mode="json", by_alias=True)
             for name, vocabulary in project.vocabularies.items()

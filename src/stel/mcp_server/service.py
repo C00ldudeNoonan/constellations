@@ -29,6 +29,7 @@ from ..agent_context import (
     freshness_status,
 )
 from ..append_log import query_fingerprint
+from ..config.class_hierarchy import class_ancestors
 from ..retrieval.servability import (
     DEFAULT_CONTEXT_TIMEOUT_SECONDS,
     MAX_CONTEXT_TIMEOUT_SECONDS,
@@ -1705,9 +1706,14 @@ class ContextService:
             )
         if scope.entity_class is not None:
             accepted = {
-                (name, label)
+                (name, term.label)
                 for name, vocabulary in vocabularies.items()
-                for label in vocabulary.labels_in_class(scope.entity_class)
+                for term in vocabulary.terms
+                if term.entity_class is not None
+                and scope.entity_class in (
+                    term.entity_class,
+                    *class_ancestors(term.entity_class, self._catalog.class_hierarchy),
+                )
             }
             if not accepted:
                 declared = sorted(

@@ -34,6 +34,20 @@ def test_class_names_follow_the_identifier_charset() -> None:
         ProjectConfig(name="p", classes=("not-an-identifier",))
 
 
+@pytest.mark.parametrize(
+    ("classes", "message"),
+    [
+        (["org", {"name": "bank", "subclass_of": "missing"}], "undeclared parent 'missing'"),
+        ([{"name": "bank", "subclass_of": "bank"}], "bank -> bank"),
+        ([{"name": "a", "subclass_of": "b"}, {"name": "b", "subclass_of": "a"}], "a -> b -> a"),
+        (["bank", {"name": "bank", "subclass_of": "bank"}], "classes must be unique"),
+    ],
+)
+def test_invalid_class_hierarchies_fail_preflight(classes: list[object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        ProjectConfig.model_validate({"name": "p", "classes": classes})
+
+
 def test_relation_subject_class_must_be_declared() -> None:
     with pytest.raises(ValueError, match=r"subject_class: org.*not declared"):
         ProjectConfig(
@@ -133,6 +147,41 @@ def test_matching_declaration_compiles(tmp_path: Path) -> None:
 
     project, sources, models = load_project(project_dir)
     validate_project_contract(project, sources, models, project_dir)
+
+
+def test_subclasses_are_accepted_for_both_relation_endpoints(tmp_path: Path) -> None:
+    """#738: each endpoint can inherit through more than one level."""
+    project_dir = _copy_example(tmp_path)
+    _append_declaration(
+        project_dir,
+        "\nclasses:\n"
+        "  - COMPANY\n  - REGION\n  - MONEY\n  - TOPIC\n"
+        "  - {name: INSTITUTION, subclass_of: COMPANY}\n"
+        "  - {name: ORG, subclass_of: INSTITUTION}\n"
+        "  - {name: GPE, subclass_of: REGION}\n"
+        "relations:\n"
+        "  - {name: references_geography, subject_class: COMPANY, object_class: REGION}\n"
+        "  - {name: references_amount, subject_class: COMPANY, object_class: MONEY}\n"
+        "  - {name: references_topic, subject_class: COMPANY, object_class: TOPIC}\n",
+    )
+    project, sources, models = load_project(project_dir)
+    validate_project_contract(project, sources, models, project_dir)
+
+
+def test_a_parent_does_not_satisfy_a_subclass_pairing(tmp_path: Path) -> None:
+    """#738: inheritance is directional, not an equivalence relation."""
+    project_dir = _copy_example(tmp_path)
+    _append_declaration(
+        project_dir,
+        "\nclasses: [ORG, GPE, MONEY, TOPIC, {name: CITY, subclass_of: GPE}]\n"
+        "relations:\n"
+        "  - {name: references_geography, subject_class: ORG, object_class: CITY}\n"
+        "  - {name: references_amount, subject_class: ORG, object_class: MONEY}\n"
+        "  - {name: references_topic, subject_class: ORG, object_class: TOPIC}\n",
+    )
+    project, sources, models = load_project(project_dir)
+    with pytest.raises(ConfigError, match="ORG -> CITY"):
+        validate_project_contract(project, sources, models, project_dir)
 
 
 def test_undeclared_relation_type_fails_at_compile(tmp_path: Path) -> None:

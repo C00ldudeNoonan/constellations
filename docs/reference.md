@@ -2310,7 +2310,8 @@ strings a project happened to write:
  "entity_scope": {"term": "Central bank", "expand": "narrower"}}
 ```
 
-A scope names exactly one of `class` (every term declaring that `class:`) or
+A scope names exactly one of `class` (every term declaring that class or a
+subclass) or
 `term` (one term). `expand` applies to a term scope only, and is `none`
 unless asked for: `narrower` adds every term beneath it in the declared
 `broader` hierarchy, transitively; `broader` adds the chain above it.
@@ -2360,7 +2361,7 @@ qualify. So `stel compile`, `run` and `build` write the declaration into
 and an edit to the project file does nothing to a running or restarted server
 until you recompile and republish. A server started beside a project file that
 differs from its manifest logs a warning saying so. A manifest from before
-`manifest_version: 3` is refused with "run `stel compile`" rather than read as
+`manifest_version: 4` is refused with "run `stel compile`" rather than read as
 declaring nothing, since an empty declaration would downgrade `entity_types` to
 the scan and refuse every scope for the wrong reason.
 
@@ -4864,7 +4865,10 @@ declared domain/range:
 
 ```yaml
 # stel_project.yml
-classes: [company, country]
+classes:
+  - company
+  - country
+  - {name: bank, subclass_of: company}
 relations:
   - name: located_in
     subject_class: company
@@ -4872,12 +4876,22 @@ relations:
 ```
 
 At compile time, a `rule` extractor's `relation_type` and
-`subject_label`/`object_label` pairing must match a declared relation exactly;
+`subject_label`/`object_label` must match a declared pairing, or be subclasses
+of its corresponding domain and range;
 a `model_assertion` model's `relation_types` must each be a declared relation
 name. Either failure names the model and the declared alternatives. The same
 `name` may repeat with a different pairing — `located_in` can hold for both
 `company -> country` and `person -> country` — so a relation type is not
 required to be monomorphic.
+
+A class can declare one `subclass_of` parent, which must be another declared
+class. Ancestry is transitive: a bank subclass of company is accepted anywhere
+a company is allowed. Unknown parents, repeated names and cycles fail project
+validation before discovery or warehouse access. Bare names retain their flat
+behavior. Class ancestry is separate from a vocabulary term's `broader` chain;
+the latter does not imply class inheritance. MCP class scopes include terms
+declared in descendant classes, and concept-cloud nodes show the declared class
+followed by its ancestors.
 
 A project that declares neither `classes:` nor `relations:` is unaffected:
 this adds a constraint only where one exists, never a new requirement, and
@@ -6337,7 +6351,7 @@ run results under `target-path`:
 - **`manifest.json`** — project, sources, models, refs, tags, `code_version` per
   model, DAG nodes+edges+execution order. Re-generated each run. A project
   with a search or agent-context model writes the serving manifest
-  (`manifest_version: 3`), which also carries `declarations`: the project's
+  (`manifest_version: 4`), which also carries `declarations`: the project's
   `classes:` and `vocabularies:` as compiled, because the MCP server reads the
   declaration from here rather than from the project file (issue #669).
 - **`run_results.json`** — run-level metadata (warehouse target, status, counts,

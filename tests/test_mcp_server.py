@@ -238,6 +238,7 @@ def _artifact_catalog(
     with_public_model: bool = False,
     vocabularies: Mapping[str, Vocabulary] | None = None,
     stale_after_seconds: int | None = None,
+    class_declarations: list[str | dict[str, str]] | None = None,
 ) -> ArtifactCatalog:
     registry_id = "model.context_demo.document_registry"
     chunks_id = "model.context_demo.document_chunks"
@@ -358,6 +359,8 @@ def _artifact_catalog(
         )
         manifest["dag"]["execution_order"].append(public_id)
         manifest["dag"]["edges"].append([embed_id, public_id])
+    if class_declarations is not None:
+        manifest["declarations"]["classes"] = class_declarations
     return ArtifactCatalog.from_payloads(manifest)
 
 
@@ -648,6 +651,7 @@ def _service(
     with_public_model: bool = False,
     vocabularies: Mapping[str, Vocabulary] | None = None,
     stale_after_seconds: int | None = None,
+    class_declarations: list[str | dict[str, str]] | None = None,
 ) -> tuple[ContextService, FakeSearch]:
     fake_search = search if search is not None else FakeSearch(hit_metadata)
     service = ContextService(
@@ -655,6 +659,7 @@ def _service(
             with_public_model=with_public_model,
             vocabularies=vocabularies,
             stale_after_seconds=stale_after_seconds,
+            class_declarations=class_declarations,
         ),
         repository=repository or FakeRepository(_fixture_rows()),
         context_search=fake_search,
@@ -1030,6 +1035,30 @@ def _scoped_search(
             limit=limit,
             entity_scope=scope,
         )
+    )
+
+
+def test_parent_class_scope_includes_subclasses_but_not_unrelated_classes() -> None:
+    """#738: use the compiled ancestry when resolving a class scope."""
+    service, _ = _service(
+        repository=FakeRepository(_scope_rows()),
+        search=_TwoAllowedSearch(),
+        vocabularies=_scope_vocabularies(),
+        class_declarations=[
+            "entity", "indicator",
+            {"name": "institution", "subclass_of": "organization"},
+            {"name": "organization", "subclass_of": "entity"},
+        ],
+    )
+    try:
+        response = _scoped_search(service, EntityScope(entity_class="entity"))
+    finally:
+        service.close()
+    assert response.error is None
+    assert len(response.results) == 2
+    assert response.entity_scope_applied is not None
+    assert response.entity_scope_applied.accepted_terms == (
+        "Bank of England", "Central bank", "Federal Reserve"
     )
 
 

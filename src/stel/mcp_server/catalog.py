@@ -13,6 +13,8 @@ from pydantic import ValidationError
 
 from ..agent_context import FreshnessStatus
 from ..config import load_project
+from ..config.class_hierarchy import class_names, class_parents
+from ..config.project import ProjectConfig
 from ..config.vocabulary import Vocabulary, check_declaration
 from ..manifest import SERVING_MANIFEST_VERSION
 from .authorization import PolicyAttribute
@@ -105,6 +107,7 @@ class ArtifactCatalog:
         resources: Sequence[ContextResource],
         *,
         vocabularies: Mapping[str, Vocabulary],
+        class_hierarchy: Mapping[str, str],
     ) -> None:
         self._resources = {resource.name: resource for resource in resources}
         # The declared vocabularies (issue #625) as the manifest carries them,
@@ -112,6 +115,7 @@ class ArtifactCatalog:
         # derived `entity_types` fall back to scanning rather than reporting
         # nothing (issue #628).
         self._vocabularies: Mapping[str, Vocabulary] = dict(vocabularies)
+        self._class_hierarchy = dict(class_hierarchy)
 
     @classmethod
     def load(
@@ -148,6 +152,12 @@ class ArtifactCatalog:
                 "from the one in manifest.json; the server serves the compiled "
                 "declaration. Recompile and republish for the edit to take effect."
             )
+        if class_parents(project.classes) != catalog.class_hierarchy:
+            log.warning(
+                "stel_project.yml declares a class hierarchy that differs from "
+                "manifest.json; the server serves the compiled declaration. "
+                "Recompile and republish for the edit to take effect."
+            )
         return catalog
 
     @classmethod
@@ -163,7 +173,7 @@ class ArtifactCatalog:
                 f"stel MCP requires a manifest v{SERVING_MANIFEST_VERSION} "
                 f"artifact and this one is v{version}; run `stel compile`"
             )
-        vocabularies = _declared_vocabularies(manifest)
+        vocabularies, class_hierarchy = _declared_vocabularies(manifest)
         target = manifest.get("target")
         if not isinstance(target, Mapping):
             raise ArtifactCatalogError("The manifest has no safe target descriptor")
@@ -282,13 +292,17 @@ class ArtifactCatalog:
                     stale_after_seconds=_stale_after_seconds(serving),
                 )
             )
-        return cls(resources, vocabularies=vocabularies)
+        return cls(resources, vocabularies=vocabularies, class_hierarchy=class_hierarchy)
 
     @property
     def vocabularies(self) -> Mapping[str, Vocabulary]:
         """The declared vocabularies as compiled into the manifest; empty when
         the project declared none."""
         return self._vocabularies
+
+    @property
+    def class_hierarchy(self) -> Mapping[str, str]:
+        return self._class_hierarchy
 
     def all(self) -> tuple[ContextResource, ...]:
         return tuple(sorted(self._resources.values(), key=lambda item: item.name))
@@ -297,7 +311,9 @@ class ArtifactCatalog:
         return self._resources.get(name)
 
 
-def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]:
+def _declared_vocabularies(
+    manifest: Mapping[str, Any],
+) -> tuple[dict[str, Vocabulary], dict[str, str]]:
     """The `declarations` block, validated back into models as a whole.
 
     Validation is what project load runs: each `Vocabulary` validates itself,
@@ -335,12 +351,13 @@ def _declared_vocabularies(manifest: Mapping[str, Any]) -> dict[str, Vocabulary]
                 "validate; run `stel compile`"
             ) from None
     try:
-        check_declaration(vocabularies, [str(value) for value in classes])
+        declaration = ProjectConfig.model_validate({"name": "manifest", "classes": classes})
+        check_declaration(vocabularies, class_names(declaration.classes))
     except ValueError as exc:
         raise ArtifactCatalogError(
             f"The manifest's declaration does not validate: {exc}; run `stel compile`"
         ) from None
-    return vocabularies
+    return vocabularies, class_parents(declaration.classes)
 
 
 def _declaration_payload(

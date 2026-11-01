@@ -12,11 +12,13 @@ build a DAG, materialize incrementally, test the results, and emit artifacts.
 Shared enum vocabularies can use inline terms, CSV seeds, or existing warehouse
 relations. The [vocabulary sources example](examples/vocabulary_sources/README.md)
 runs offline and shows how label changes reach provider schemas and incremental plans.
+Declared entity classes can also form a single-parent hierarchy used by
+relation validation, MCP class scopes, and concept-cloud descriptions.
 
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
 > and BigQuery warehouses, local, GCS, and Google Drive sources, metadata-aware deterministic
 > chunk models, record-scoped incremental state, bounded projected warehouse
-> snapshots, an incremental local LanceDB search sink, classic text ML, and six
+> snapshots, an incremental local LanceDB search sink, classic text ML, and
 > extraction backends. See
 > [`docs/reference.md`](docs/reference.md) for the full reference.
 

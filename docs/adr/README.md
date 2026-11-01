@@ -55,6 +55,7 @@ history (issue #311).
 | [0043](0043-relation-evaluation-scores-distinct-facts-and-retains-unresolved-predictions.md) | Relation evaluation scores distinct canonical facts and keeps unresolved predictions in precision | accepted |
 | [0044](0044-vocabulary-sources-resolve-before-execution.md) | Vocabulary sources resolve to bounded snapshots before code identity or execution; warehouse-backed compile requires access | accepted |
 | [0045](0045-warehouse-rows-can-stay-in-memory.md) | Warehouse rows can be extracted in memory with an explicit backend | accepted |
+| [0046](0046-class-ancestry-is-a-compiled-declaration.md) | Class ancestry is a compiled declaration shared by relation checks, MCP and concept clouds | accepted |
 
 ## When to write one
 

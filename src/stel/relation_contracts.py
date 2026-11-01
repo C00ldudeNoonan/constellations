@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .config.class_hierarchy import class_ancestors, class_parents
 from .config.model import ModelConfig
 from .config.project import ProjectConfig
 from .paths import resolve_module_file
@@ -63,6 +64,7 @@ def validate_relation_project_contracts(
         allowed_pairs.setdefault(relation.name, set()).add(
             (relation.subject_class, relation.object_class)
         )
+    parents = class_parents(project.classes)
 
     for model in models:
         if (
@@ -82,7 +84,7 @@ def validate_relation_project_contracts(
         options = parse_relation_options(model.transform.options)
         if isinstance(options, RuleExtractorOptions):
             for index, rule in enumerate(options.rules):
-                _validate_rule(model, index, rule, allowed_pairs)
+                _validate_rule(model, index, rule, allowed_pairs, parents)
         elif isinstance(options, ModelAssertionExtractorOptions):
             _validate_model_assertion_types(model, options, allowed_pairs)
 
@@ -92,6 +94,7 @@ def _validate_rule(
     index: int,
     rule: RelationRule,
     allowed_pairs: _AllowedPairs,
+    parents: dict[str, str],
 ) -> None:
     pairs = allowed_pairs.get(rule.relation_type)
     if pairs is None:
@@ -103,7 +106,9 @@ def _validate_rule(
             path=("transform", "options", "rules", index, "relation_type"),
         )
     pair = (rule.subject_label, rule.object_label)
-    if pair not in pairs:
+    subjects = (pair[0], *class_ancestors(pair[0], parents))
+    objects = (pair[1], *class_ancestors(pair[1], parents))
+    if not any((subject, obj) in pairs for subject in subjects for obj in objects):
         allowed = sorted(f"{subject} -> {obj}" for subject, obj in pairs)
         raise RelationContractError(
             f"Model '{model.name}' rule {index} asserts '{rule.relation_type}' "

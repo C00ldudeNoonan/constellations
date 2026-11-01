@@ -10,6 +10,8 @@ prune) over a table instead of a directory.
 from __future__ import annotations
 
 import json
+import logging
+import tempfile
 from pathlib import Path
 
 import duckdb
@@ -17,8 +19,10 @@ import polars as pl
 import pytest
 
 from stel.adapters import create_adapter, parse_warehouse_config
+from stel.config.loader import ConfigError
 from stel.config.profile import WarehouseConfig
 from stel.config.source import SourceConfig, validate_relation_name
+from stel.profile import ProfileError
 from stel.sources import DocumentRef, SourceError, get_document_source
 from stel.sources.warehouse import WarehouseDocumentSource
 
@@ -341,11 +345,154 @@ def test_table_rows_flow_through_extraction(tmp_path: Path) -> None:
     )
 
 
-def test_incremental_contract_over_rows(tmp_path: Path) -> None:
+def test_memory_backend_never_stages_warehouse_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#734: warehouse prose never crosses the local document-file boundary."""
+    from stel.runner import run_project
+
+    project = _project(tmp_path)
+    sentinel = "warehouse-private-payload-734"
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("UPDATE rawdata.reddit_posts SET selftext = ? WHERE post_id = 'p1'", [sentinel])
+    con.close()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    caplog.set_level(logging.DEBUG)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace("backend: json", "backend: json_memory"),
+        encoding="utf-8",
+    )
+
+    def forbidden_fetch(*args: object, **kwargs: object) -> None:
+        raise AssertionError("warehouse rows must not be staged")
+
+    monkeypatch.setattr(WarehouseDocumentSource, "fetch", forbidden_fetch)
+    first = {r.model_name: r for r in run_project(project)}
+    assert first["post_registry"].documents_processed == 3
+    assert _registry(project)["selftext"].to_list() == [
+        sentinel, "second post text", "third post text"
+    ]
+    second = {r.model_name: r for r in run_project(project)}
+    assert second["post_registry"].documents_skipped == 3
+    assert sentinel not in caplog.text
+    for path in scratch.rglob("*"):
+        if path.is_file():
+            assert sentinel.encode() not in path.read_bytes()
+    for path in (project / "target").rglob("*"):
+        if path.is_file() and path.suffix != ".duckdb":
+            assert sentinel.encode() not in path.read_bytes()
+
+
+def test_memory_backend_malformed_input_is_sanitized_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#734: a failed snapshot never leaks or advances its state."""
+    from stel.runner import run_project
+
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace("backend: json", "backend: json_memory"),
+        encoding="utf-8",
+    )
+    original = WarehouseDocumentSource.fetch_bytes
+
+    def malformed(self: WarehouseDocumentSource, ref: DocumentRef) -> bytes:
+        if ref.relative_path.endswith("p1"):
+            return b"private-malformed-sentinel {"
+        return original(self, ref)
+
+    caplog.set_level(logging.DEBUG)
+    with monkeypatch.context() as patch:
+        patch.setattr(WarehouseDocumentSource, "fetch_bytes", malformed)
+        failed = {r.model_name: r for r in run_project(project)}["post_registry"]
+    assert failed.rows_written == 2
+    assert "private-malformed-sentinel" not in caplog.text
+    assert "private-malformed-sentinel" not in str(failed)
+    retry = {r.model_name: r for r in run_project(project)}["post_registry"]
+    assert retry.documents_processed == 1
+    assert retry.documents_skipped == 2
+
+
+def test_memory_backend_interrupted_run_retries_and_empty_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#734: interruption does not record unpublished rows; an empty source prunes."""
+    from stel.runner import run_project
+
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace("backend: json", "backend: json_memory"),
+        encoding="utf-8",
+    )
+
+    def interrupted(self: WarehouseDocumentSource, ref: DocumentRef) -> bytes:
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(WarehouseDocumentSource, "fetch_bytes", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            run_project(project)
+    retry = {r.model_name: r for r in run_project(project)}["post_registry"]
+    assert retry.documents_processed == 3
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("DELETE FROM rawdata.reddit_posts")
+    con.close()
+    empty = {r.model_name: r for r in run_project(project)}["post_registry"]
+    assert empty.documents_deleted == 3
+    assert _registry(project).is_empty()
+
+
+@pytest.mark.parametrize("invalid", ["local_source", "post_extract", "source_override"])
+def test_memory_backend_invalid_configuration_precedes_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    """#734: invalid memory extraction cannot start warehouse work."""
+    from stel.runner import run_project
+
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    text = models.read_text(encoding="utf-8").replace("backend: json", "backend: json_memory")
+    if invalid == "post_extract":
+        text = text.replace("      options:", "      post_extract: hooks.process\n      options:")
+    elif invalid == "local_source":
+        source = project / "sources" / "src.yml"
+        source.write_text(
+            "version: 2\nsources:\n  - name: reddit_rows\n    path: data\n",
+            encoding="utf-8",
+        )
+    else:
+        profile = project / "profiles.yml"
+        profile.write_text(
+            profile.read_text(encoding="utf-8")
+            + "      source_paths:\n        reddit_rows: data\n",
+            encoding="utf-8",
+        )
+    models.write_text(text, encoding="utf-8")
+
+    def forbidden_adapter(*args: object, **kwargs: object) -> None:
+        raise AssertionError("adapter opened before validation")
+
+    monkeypatch.setattr("stel.runner.create_adapter", forbidden_adapter)
+    with pytest.raises((ConfigError, ProfileError), match=r"source_paths|json_memory"):
+        run_project(project)
+
+
+@pytest.mark.parametrize("backend", ["json", "json_memory"])
+def test_incremental_contract_over_rows(tmp_path: Path, backend: str) -> None:
     """The design's promise: skip, re-extract, prune — machinery unchanged."""
     from stel.runner import run_project
 
     project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace("backend: json", f"backend: {backend}"),
+        encoding="utf-8",
+    )
     run_project(project)
 
     # Unchanged table: everything skips.
@@ -367,6 +514,32 @@ def test_incremental_contract_over_rows(tmp_path: Path) -> None:
     assert third["post_registry"].documents_skipped == 1
     assert third["post_registry"].documents_deleted == 1
     assert _registry(project).height == 2
+
+
+def test_switching_to_memory_preserves_source_identity_and_reprocesses(tmp_path: Path) -> None:
+    """#734: opting in changes extraction code, not warehouse row identity."""
+    from stel.runner import run_project
+
+    project = _project(tmp_path)
+    run_project(project)
+    db = project / "target" / "db.duckdb"
+    with duckdb.connect(str(db), read_only=True) as con:
+        before = con.execute(
+            "SELECT post_id, document_id, content_hash FROM main.post_registry ORDER BY post_id"
+        ).fetchall()
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace("backend: json", "backend: json_memory"),
+        encoding="utf-8",
+    )
+    result = {r.model_name: r for r in run_project(project)}["post_registry"]
+    with duckdb.connect(str(db), read_only=True) as con:
+        after = con.execute(
+            "SELECT post_id, document_id, content_hash FROM main.post_registry ORDER BY post_id"
+        ).fetchall()
+    assert result.documents_processed == 3
+    assert result.documents_skipped == 0
+    assert after == before
 
 
 def test_source_filter_scopes_rows_by_path_columns(tmp_path: Path) -> None:

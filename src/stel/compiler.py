@@ -142,6 +142,19 @@ def validate_project_contract(
                     f"'{backend}'. Available: {sorted(available_backends)}",
                     ("extraction", "backend"),
                 )
+            if backend == "json_memory":
+                source_name = parse_ref(model.source or "")
+                source = next(s for s in sources if s.name == source_name)
+                if not source.path.startswith("warehouse://"):
+                    raise _model_error(
+                        model, "json_memory requires a warehouse:// source",
+                        ("extraction", "backend"),
+                    )
+                if model.extraction.post_extract is not None:
+                    raise _model_error(
+                        model, "json_memory does not support path-based post_extract hooks",
+                        ("extraction", "post_extract"),
+                    )
             if backend == "llm" and "api_key_env" in model.extraction.options:
                 raise _model_error(
                     model,

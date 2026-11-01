@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Warehouse sources can use `backend: json_memory` to project the discovered
+  row snapshot without staging document payload files (issue #734). Document
+  IDs and row fingerprints remain stable; changing backends reprocesses the
+  model. Path-based post-extraction hooks are unavailable on this backend.
 - Fix MCP array membership filters (issue #723): `list_context_models`
   advertises `array_contains_any` for `array[string]` user attributes, and
   `search_context` accepts a nonempty JSON array of values for that operator.

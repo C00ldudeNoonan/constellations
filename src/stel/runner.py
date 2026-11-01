@@ -190,9 +190,9 @@ def run_project(
         resolved.target_name,
         resolved.warehouse.type,
     )
+    sources = apply_source_path_overrides(sources, resolved)
     adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
     resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
-    sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select,
         exclude=exclude,
@@ -406,9 +406,9 @@ def build_project(
         resolved.target_name,
         resolved.warehouse.type,
     )
+    sources = apply_source_path_overrides(sources, resolved)
     adapter = create_adapter(resolved.warehouse, project_dir=project_dir)
     resolve_warehouse_vocabularies(project, sources, models, project_dir, adapter)
-    sources = apply_source_path_overrides(sources, resolved)
     selected = dag.select_models(
         select=select,
         exclude=exclude,

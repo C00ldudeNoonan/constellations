@@ -1914,6 +1914,20 @@ the row-grain analogue of the object sources' verified-snapshot rule.
 `max_objects` (default 5000) bounds the read and refuses rather than
 truncates; narrow with a view or raise it deliberately.
 
+For sensitive warehouse rows, choose `backend: json_memory` with the same
+`options.fields` as `json`. It reads the discovered snapshot in memory without
+writing a local document payload file. It requires a `warehouse://` source and
+does not support path-based `post_extract` hooks. Existing `json` models keep
+their file-backed behavior; switching backends reprocesses the model while
+preserving document IDs and row fingerprints. Source filters and incremental
+deletion rules are unchanged.
+
+This boundary covers stel's document staging, not the warehouse, operating
+system memory or swap, or downstream outputs and caches. The active warehouse
+may itself be local, and extracted fields are written to the target warehouse.
+Keys and path columns become document paths and metadata, so do not put raw
+sensitive content in them. Configure downstream models and caches accordingly.
+
 **Not `dbt_ref()`.** The two answer different questions: `dbt_ref('model')`
 lets a *transform* consume a dbt-built table, resolved by dbt in embedded
 (dbt-duckdb) mode. A `warehouse://` source starts a *document pipeline* from

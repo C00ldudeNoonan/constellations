@@ -537,6 +537,20 @@ def run_extraction_model(
             ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
                 local_path: Path | None = None
                 try:
+                    if getattr(backend, "memory_only", False):
+                        fetch_bytes = getattr(source_backend, "fetch_bytes", None)
+                        extract_bytes = getattr(backend, "extract_bytes", None)
+                        if not callable(fetch_bytes) or not callable(extract_bytes):
+                            raise RunError("In-memory extraction requires an in-memory source")
+                        payload = fetch_bytes(doc)
+                        if budget_guard is not None:
+                            budget_guard.check_file_bytes(len(payload))
+                            budget_guard.charge_bytes(len(payload))
+                            budget_guard.ensure_headroom()
+                        result = extract_bytes(payload, options)
+                        if budget_guard is not None:
+                            budget_guard.charge_metrics(result.metrics)
+                        return doc, result, None
                     local_path = source_backend.fetch(doc, work_dir)
                     if budget_guard is not None:
                         size = local_path.stat().st_size
@@ -558,6 +572,9 @@ def run_extraction_model(
                     # Provider errors reach here already sanitized with their
                     # chains severed; redacted SDK diagnostics were logged at the
                     # provider boundary. Safe to log in full.
+                    if getattr(backend, "memory_only", False):
+                        log.debug("in-memory extraction failed for %s", doc.relative_path)
+                        return doc, None, "in-memory extraction failed"
                     log.debug(
                         "extraction failed for %s", doc.relative_path, exc_info=True
                     )

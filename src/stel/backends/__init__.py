@@ -2,6 +2,7 @@ from . import (
     email_backend,  # noqa: F401  # side-effect: registers EmailBackend
     html_backend,  # noqa: F401  # side-effect: registers HtmlBackend
     json_backend,  # noqa: F401  # side-effect: registers JsonBackend
+    json_memory_backend,  # noqa: F401  # side-effect: registers JsonMemoryBackend
     llm_backend,  # noqa: F401  # side-effect: registers LLMBackend
     markdown_backend,  # noqa: F401  # side-effect: registers MarkdownBackend
     pdf_backend,  # noqa: F401  # side-effect: registers PdfBackend

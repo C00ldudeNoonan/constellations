@@ -310,6 +310,28 @@ class DiscoveredSource:
     refs: list[DocumentRef]
 
 
+def _extract_in_memory(
+    source: DocumentSource,
+    backend: BaseBackend,
+    doc: DocumentRef,
+    options: dict[str, Any],
+    budget: BudgetGuard | None,
+) -> ExtractionResult:
+    fetch_bytes = getattr(source, "fetch_bytes", None)
+    extract_bytes = getattr(backend, "extract_bytes", None)
+    if not callable(fetch_bytes) or not callable(extract_bytes):
+        raise RunError("In-memory extraction requires an in-memory source")
+    payload = fetch_bytes(doc)
+    if budget is not None:
+        budget.check_file_bytes(len(payload))
+        budget.charge_bytes(len(payload))
+        budget.ensure_headroom()
+    result: ExtractionResult = extract_bytes(payload, options)
+    if budget is not None:
+        budget.charge_metrics(result.metrics)
+    return result
+
+
 def run_extraction_model(
     *,
     model: ModelConfig,
@@ -537,6 +559,11 @@ def run_extraction_model(
             ) -> tuple[DocumentRef, ExtractionResult | None, str | None]:
                 local_path: Path | None = None
                 try:
+                    if getattr(backend, "memory_only", False):
+                        result = _extract_in_memory(
+                            source_backend, backend, doc, options, budget_guard
+                        )
+                        return doc, result, None
                     local_path = source_backend.fetch(doc, work_dir)
                     if budget_guard is not None:
                         size = local_path.stat().st_size
@@ -558,6 +585,9 @@ def run_extraction_model(
                     # Provider errors reach here already sanitized with their
                     # chains severed; redacted SDK diagnostics were logged at the
                     # provider boundary. Safe to log in full.
+                    if getattr(backend, "memory_only", False):
+                        log.debug("in-memory extraction failed for %s", doc.relative_path)
+                        return doc, None, "in-memory extraction failed"
                     log.debug(
                         "extraction failed for %s", doc.relative_path, exc_info=True
                     )

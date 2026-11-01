@@ -217,6 +217,15 @@ class WarehouseDocumentSource(DocumentSource):
         destination.write_text(payload, encoding="utf-8")
         return destination
 
+    def fetch_bytes(self, ref: DocumentRef) -> bytes:
+        """Return the same discovered snapshot without staging a local document."""
+        payload = self._rows.get(ref.document_id)
+        if payload is None:
+            raise SourceError(
+                f"Source '{ref.source_name}': row was not part of this run's discovery"
+            )
+        return payload.encode("utf-8")
+
     def scan(self, source: SourceConfig, project_dir: Path) -> SourceScan:
         relation = _relation(source)
         try:

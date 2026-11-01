@@ -130,7 +130,7 @@ fitting the workflow analytics engineers already use.**
 
 ## What's in the box
 
-- **Six extraction backends** — `json`, `markdown`, `pdf`, `html`, `email`,
+- **Extraction backends** — `json`, `json_memory`, `markdown`, `pdf`, `html`, `email`,
   and `llm` (Claude tool-use with response caching).
 - **Built-in text/ML preprocessing** — token counting, encoding repair,
   normalized spaCy token/entity child tables,

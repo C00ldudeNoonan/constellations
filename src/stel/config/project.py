@@ -11,7 +11,8 @@ from pydantic import (
     model_validator,
 )
 
-from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME, validate_node_name
+from .class_hierarchy import ClassDeclaration, class_names, validate_classes
+from .identifiers import DEFAULT_DUCKDB_FILENAME, DEFAULT_SCHEMA_NAME
 from .vocabulary import RelationTypeDef, Vocabulary, check_declaration
 from .yaml_diagnostics import ConfigPath, YamlProvenance
 
@@ -64,17 +65,14 @@ class ProjectConfig(BaseModel):
     # #626), checked against `RelationRule`/`ModelAssertionExtractorOptions`
     # at compile time. Declaring neither adds no constraint — only a project
     # that opts in gets one.
-    classes: tuple[str, ...] = Field(default_factory=tuple)
+    classes: tuple[ClassDeclaration, ...] = Field(default_factory=tuple)
     relations: tuple[RelationTypeDef, ...] = Field(default_factory=tuple)
 
     @field_validator("classes")
     @classmethod
-    def _validate_classes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        normalized = tuple(value.strip() for value in v)
-        for name in normalized:
-            validate_node_name(name, kind="Class")
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("classes must be unique")
+    def _validate_classes(cls, v: tuple[ClassDeclaration, ...]) -> tuple[ClassDeclaration, ...]:
+        normalized = tuple(value.strip() if isinstance(value, str) else value for value in v)
+        validate_classes(normalized)
         return normalized
 
     @model_validator(mode="after")
@@ -82,14 +80,14 @@ class ProjectConfig(BaseModel):
         # Vocabulary names and term classes are checked against the project
         # around them, in the function the serving catalog also applies to a
         # compiled declaration (issue #669), so the two cannot disagree.
-        check_declaration(self.vocabularies, self.classes)
+        check_declaration(self.vocabularies, class_names(self.classes))
         return self
 
     @model_validator(mode="after")
     def _validate_relations(self) -> ProjectConfig:
         if not self.relations:
             return self
-        declared_classes = set(self.classes)
+        declared_classes = set(class_names(self.classes))
         seen: set[tuple[str, str, str]] = set()
         for relation in self.relations:
             for class_name, role in (

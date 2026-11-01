@@ -80,7 +80,7 @@ class EntityExpansion(StrEnum):
 class EntityScope(BaseModel):
     """Restrict a search to chunks linked to declared vocabulary terms.
 
-    Exactly one of `entity_class` (every term declaring that `class:`) or
+    Exactly one of `entity_class` (terms in that class or its subclasses) or
     `term` (one term, optionally expanded through `broader`). Both name
     *declared* things: a scope naming something the project does not declare
     is refused rather than quietly matching nothing, because an empty result

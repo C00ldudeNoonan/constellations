@@ -1722,7 +1722,7 @@ source or relation key.
 
 ## Artifact contract and migration
 
-### The serving manifest (v2, now v3)
+### The serving manifest (v2 through v4)
 
 Adding a non-relation resource required `manifest_version: 2`. The existing
 `models` list remains the ordered list of model-file DAG resources for a small
@@ -1736,10 +1736,11 @@ project's `classes:` and `vocabularies:` as compiled, each term with its
 authored fields (`label`, `description`, `aliases`, `broader`, `class`). The
 MCP catalog reads the declaration from here and not from `stel_project.yml`,
 so published `context_entity_links` rows are interpreted under the declaration
-that produced them. The catalog refuses a manifest at any other version: an
-older artifact has no declaration, and reading it as an empty one would be a
-silent downgrade rather than a visible "run `stel compile`". Everything below
-is unchanged from v2:
+that produced them. v4 (issue #738) permits class declarations with a
+`subclass_of` parent in that block. The catalog refuses a manifest at any
+other version: an older artifact cannot carry class ancestry, and reading it
+as a flat hierarchy would be a silent downgrade rather than a visible "run
+`stel compile`". Everything below is unchanged from v2:
 
 ```json
 {

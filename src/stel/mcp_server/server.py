@@ -153,7 +153,7 @@ def create_mcp_server(
 
         `entity_scope` restricts results to chunks linked to declared
         vocabulary terms: `{"class": "central_bank"}` for every term of a
-        class, or `{"term": "Federal Reserve", "expand": "narrower"}` for one
+        class or its subclasses, or `{"term": "Federal Reserve", "expand": "narrower"}` for one
         term and the terms beneath it. A model's declared terms are published
         as its `entity_types`. Expansion is off unless asked for, and every
         scoped response reports what the scope resolved to in

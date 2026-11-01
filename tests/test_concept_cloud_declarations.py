@@ -22,6 +22,7 @@ from stel.concept_cloud import (
     parse_concept_cloud_export,
 )
 from stel.concept_cloud.schema import CONCEPT_CLOUD_SCHEMA_VERSION
+from stel.config.class_hierarchy import ClassDef
 from stel.config.project import ProjectConfig
 from stel.config.vocabulary import Vocabulary, VocabularyTerm
 
@@ -77,6 +78,21 @@ def test_a_declared_concept_carries_its_class_definition_and_broader_term() -> N
     assert fed.entity_class == "institution"
     assert fed.definition == "The United States central bank"
     assert fed.broader == "Central bank system"
+
+
+def test_a_concept_carries_its_class_ancestors_in_order() -> None:
+    export = build_concept_cloud(
+        project="p", links=_links(), dag_plane=DagPlane(nodes=()),
+        vocabularies={"central_banks": _central_banks()},
+        classes=("entity", ClassDef(name="organization", subclass_of="entity"),
+                 ClassDef(name="institution", subclass_of="organization")),
+    )
+    fed = _concept(export, "Federal Reserve")
+    assert fed.class_ancestors == ("organization", "entity")
+    payload = json.loads(export.to_json())
+    assert next(c for c in payload["concepts"] if c["canonical_id"] == "Federal Reserve")[
+        "class_ancestors"
+    ] == ["organization", "entity"]
 
 
 def test_a_definition_is_the_declared_text_never_document_text() -> None:
@@ -160,7 +176,7 @@ def test_bundle_round_trips_through_the_versioned_contract() -> None:
 
     parsed = parse_concept_cloud_export(bundle)
 
-    assert parsed.schema_version == CONCEPT_CLOUD_SCHEMA_VERSION == "7"
+    assert parsed.schema_version == CONCEPT_CLOUD_SCHEMA_VERSION == "8"
     assert _concept(parsed, "Federal Reserve").entity_class == "institution"
 
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -26,6 +26,7 @@ from typing import Any, Literal, NamedTuple, cast
 import polars as pl
 
 from ..config import load_project
+from ..config.class_hierarchy import ClassDeclaration, class_ancestors, class_parents
 from ..config.vocabulary import Vocabulary, declared_terms
 from ..manifest import MANIFEST_FILENAME, write_manifest
 from .lenses import LENS_NAMES, with_built_in_lenses
@@ -154,6 +155,7 @@ def build_concept_cloud(
     vocabularies: Mapping[str, Vocabulary] | None = None,
     breakdown_columns: dict[str, tuple[pl.DataFrame, str]] | None = None,
     context_model: str | None = None,
+    classes: Sequence[ClassDeclaration] = (),
 ) -> ConceptCloudExport:
     """Assemble a bundle from entity-linking (+optional entities/relations) frames.
 
@@ -190,7 +192,7 @@ def build_concept_cloud(
         names=concept_names(names) if names is not None else {},
         time_field=time_field, time_grain=time_grain,
         top_n_per_period=top_n_per_period,
-        declared=_declared_by_term(vocabularies or {}),
+        declared=_declared_by_term(vocabularies or {}, class_parents(classes)),
     )
     kept = {c.canonical_id for c in concepts}
     concept_edges = _aggregate_edges(relations, canonical_of, kept, period_of)
@@ -337,12 +339,14 @@ class _Declared:
     """What a vocabulary term declares about a concept (issue #629)."""
 
     entity_class: str | None = None
+    class_ancestors: tuple[str, ...] = ()
     definition: str | None = None
     broader: str | None = None
 
 
 def _declared_by_term(
     vocabularies: Mapping[str, Vocabulary],
+    parents: Mapping[str, str],
 ) -> dict[tuple[str, str], _Declared]:
     """Declared fields keyed by (vocabulary name, term label). A vocabulary's
     name is the `entity_namespace` its alias rows carry (issue #627), and a
@@ -355,6 +359,9 @@ def _declared_by_term(
     return {
         key: _Declared(
             entity_class=term.entity_class,
+            class_ancestors=(
+                class_ancestors(term.entity_class, parents) if term.entity_class else ()
+            ),
             definition=term.description,
             broader=term.broader,
         )
@@ -481,6 +488,7 @@ def _aggregate_concepts(
             display=str(display),
             description=name.description if name else None,
             entity_class=declared_here.entity_class,
+            class_ancestors=declared_here.class_ancestors,
             definition=declared_here.definition,
             broader=declared_here.broader,
             label=str(label) if label is not None else None,
@@ -1119,6 +1127,7 @@ def export_concept_cloud(
         time_grain=time_grain,
         top_n_per_period=top_n_per_period,
         vocabularies=project.vocabularies,
+        classes=project.classes,
         breakdown_columns=breakdown_columns or None,
         context_model=context_model,
     )

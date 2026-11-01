@@ -134,6 +134,42 @@ def test_a_live_file_that_matches_the_manifest_is_not_warned_about(
     assert not caplog.records
 
 
+def test_compiled_class_hierarchy_survives_live_edits(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#738: a changed parent must not silently change published scopes."""
+    _write_project(tmp_path, fed_class="institution")
+    project_file = tmp_path / "stel_project.yml"
+    original = project_file.read_text(encoding="utf-8")
+    hierarchical = original.replace(
+        "classes: [institution, indicator]",
+        "classes: [organization, indicator, {name: institution, subclass_of: organization}]",
+    )
+    project_file.write_text(hierarchical, encoding="utf-8")
+    manifest = json.loads(write_manifest(tmp_path).read_text(encoding="utf-8"))
+    assert manifest["declarations"]["classes"][-1] == {
+        "name": "institution", "subclass_of": "organization"
+    }
+    project_file.write_text(original, encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="stel.mcp_server.catalog"):
+        catalog = ArtifactCatalog.load(tmp_path)
+    assert catalog.class_hierarchy == {"institution": "organization"}
+    assert "class hierarchy" in caplog.text
+
+
+def test_invalid_compiled_class_hierarchy_is_refused() -> None:
+    manifest = {
+        "manifest_version": SERVING_MANIFEST_VERSION,
+        "declarations": {
+            "classes": [{"name": "bank", "subclass_of": "bank"}],
+            "vocabularies": {},
+        },
+        "target": {"name": "dev"}, "models": [], "dag": {},
+    }
+    with pytest.raises(ArtifactCatalogError, match="class hierarchy cycle"):
+        ArtifactCatalog.from_payloads(manifest)
+
+
 def test_a_manifest_that_cannot_carry_the_declaration_is_refused() -> None:
     """An older artifact is refused, never read as declaring nothing.
 
@@ -141,8 +177,8 @@ def test_a_manifest_that_cannot_carry_the_declaration_is_refused() -> None:
     declaration would downgrade a project with a vocabulary to the scanned
     `entity_types` and refuse every `entity_scope` with the wrong reason.
     """
-    with pytest.raises(ArtifactCatalogError, match=r"v3 artifact and this one is v2"):
-        ArtifactCatalog.from_payloads({"manifest_version": 2, "target": {"name": "dev"}})
+    with pytest.raises(ArtifactCatalogError, match=r"v4 artifact and this one is v3"):
+        ArtifactCatalog.from_payloads({"manifest_version": 3, "target": {"name": "dev"}})
 
 
 def test_a_declaration_that_does_not_validate_is_refused() -> None:

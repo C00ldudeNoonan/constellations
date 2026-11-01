@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Declared classes can name a `subclass_of` parent (issue #738). Relation
+  checks accept descendants; MCP class scopes and concept-cloud displays use
+  the same ancestry. Recompile serving manifests and regenerate concept-cloud
+  bundles on upgrade (manifest v4, concept-cloud v8).
 - Warehouse sources can use `backend: json_memory` to project the discovered
   row snapshot without staging document payload files (issue #734). Document
   IDs and row fingerprints remain stable; changing backends reprocesses the

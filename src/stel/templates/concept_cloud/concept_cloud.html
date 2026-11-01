@@ -670,6 +670,9 @@
                             : "<br>") +
           `<span class="k">id</span> ${esc(node.id)}<br>` +
           `<span class="k">type</span> ${esc(node.label)} · ` +
+          (node.entityClass
+            ? `<span class="k">class</span> ${esc([node.entityClass, ...node.classAncestors].join(" → "))} · `
+            : "") +
           `<span class="k">freq</span> ${node.frequency}` +
           (period !== null
             ? ` <span class="k">in ${esc(period)}</span> ${node.by_period?.[period] || 0}`
@@ -819,6 +822,7 @@
       DATA.concepts.forEach(c => {
         const node = {
           id: c.canonical_id, name: c.display, kind: "concept", label: c.label || "—",
+          entityClass: c.class || "", classAncestors: c.class_ancestors || [],
           description: c.description || "", val: c.frequency,
           link_status: c.link_status, frequency: c.frequency,
           dimensions: c.dimensions || {}, labelled: labelled.has(c.canonical_id),

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from .adapters import AdapterError, WarehouseCapability
+from .config.class_hierarchy import class_names
 from .config.loader import (
     ConfigError,
     _reject_symlink_directory_components,
@@ -96,7 +97,7 @@ def resolve_csv_vocabularies(project: ProjectConfig, project_dir: Path) -> None:
             description=f"Vocabulary '{name}' seed",
         )
         project.vocabularies[name] = _resolve_rows(name, vocabulary, _read_csv(name, source, path))
-    check_declaration(project.vocabularies, project.classes)
+    check_declaration(project.vocabularies, class_names(project.classes))
 
 
 def _read_csv(name: str, source: VocabularySource, path: Path) -> list[Mapping[str, Any]]:

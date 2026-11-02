@@ -2,20 +2,59 @@
 
 ## Unreleased
 
+## v0.24.0 - 2026-11-01
+
+### Entity classes, vocabularies, and relation evaluation
+
 - Declared classes can name a `subclass_of` parent (issue #738). Relation
   checks accept descendants; MCP class scopes and concept-cloud displays use
   the same ancestry. Recompile serving manifests and regenerate concept-cloud
   bundles on upgrade (manifest v4, concept-cloud v8).
+- Vocabulary terms can come from a UTF-8 CSV seed or warehouse relation,
+  with bounded reads and optional appended terms (issue #718). Resolved labels
+  reach enum schemas, model identity, incremental plans, and the compiled
+  serving declaration. Warehouse-backed compilation requires warehouse access.
+- `eval.kind: relations` scores canonical relation triples with precision,
+  recall, and F1 overall and per type, with optional document scope and
+  unresolved-endpoint diagnostics (issue #731). An offline economic NLP example
+  demonstrates the evaluation and its quality gates.
+
+### Warehouse input and long-running operations
+
 - Warehouse sources can use `backend: json_memory` to project the discovered
   row snapshot without staging document payload files (issue #734). Document
   IDs and row fingerprints remain stable; changing backends reprocesses the
   model. Path-based post-extraction hooks are unavailable on this backend.
+- `embed.overlap_publication` optionally computes the next provider window
+  while publishing the preceding one; serial execution remains the default
+  (PR #720). The reference documents its memory and speculative-spend costs.
+- Vertex aggregate token-limit rejections report a safe diagnostic and tuning
+  guidance without replaying native response content (issue #728).
+- Serving sessions reuse durable query pins where the adapter supports them,
+  reducing warm-query lease writes while preserving reader and publisher
+  coordination (issue #541). The serving ledger adds a drain deadline column.
+
+### Retrieval, providers, and dependencies
+
+- Variant comparisons include seeded paired-bootstrap confidence intervals;
+  comparison artifacts move to version 2 (issue #724).
+- Filterable `array[string]` attributes publish without unsupported scalar
+  BTree indexes, and array sorting is rejected during validation (issue #722).
 - Fix MCP array membership filters (issue #723): `list_context_models`
   advertises `array_contains_any` for `array[string]` user attributes, and
   `search_context` accepts a nonempty JSON array of values for that operator.
   Scalar operators and server-controlled policy filters keep their existing behavior.
-
-## v0.24.0 - 2026-10-23
+- Anthropic single and batch inference use native structured JSON on current
+  SDKs, omit temperature by default, and preserve refusals and billed usage
+  safely (issue #714). The provider implementation identity changes, so
+  existing Anthropic caches and incremental plans may require reprocessing.
+- DuckDB reads support both 1.x and 2.x, including parameterized and Arrow
+  reads, while preserving publication and state guarantees (issue #715).
+- Dependency updates address the fpdf2 and msgpack advisories and update
+  filelock, pypdf, and pyasn1 (PRs #712, #721, and #735).
+- Contributor changes document the Linear-first backlog workflow, test
+  incremental/retry equivalence, and record segmented-search and BigQuery
+  retrieval design decisions (PRs #706, #708, #709, and #711).
 
 ### Hybrid search fuses documents, not chunks (issue #701)
 

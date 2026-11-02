@@ -173,6 +173,7 @@ class ExtractionConfig(BaseModel):
     backend: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     post_extract: PostExtractConfig | None = None
+    on_source_deletion: Literal["delete", "guard"] = "delete"
     # Rows flush to the warehouse every N documents (issue #77) — bounds
     # memory and gives incremental runs per-flush crash recovery. Excluded
     # from code_version: it changes execution, never output content.
@@ -1326,6 +1327,15 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_single_kind(self) -> ModelConfig:
+        if (
+            self.extraction is not None
+            and self.extraction.on_source_deletion == "guard"
+            and self.materialization != "incremental"
+        ):
+            raise ValueError(
+                f"Model '{self.name}': on_source_deletion: guard requires "
+                "`materialization: incremental`"
+            )
         kinds = self.declared_kinds()
         if len(kinds) > 1:
             raise ValueError(

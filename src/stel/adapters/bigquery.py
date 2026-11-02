@@ -3951,6 +3951,83 @@ class BigQueryAdapter(WarehouseAdapter):
             reuse_state_from_target=state_record_keys is None,
         )
 
+    def delete_guarded_extraction_rows(
+        self,
+        table: str,
+        *,
+        keys: Sequence[str],
+        state_scope: StateScope,
+        expected_state: Mapping[str, StateValue],
+    ) -> int:
+        """Compare the complete reviewed baseline and delete in one transaction."""
+        validate_state_keys(keys)
+        if not keys or not set(keys).issubset(expected_state):
+            raise AdapterError("Invalid guarded extraction deletion set")
+        records = [
+            StateRecord(key, value.input_fingerprint, value.code_version)
+            for key, value in expected_state.items()
+        ]
+        validate_state_records(records)
+        bigquery = _bigquery()
+        load = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        baseline = staging_table_name("guard_baseline")
+        deleted_keys = staging_table_name("guard_deleted")
+        try:
+            self._load_state_records(baseline, records, load)
+            self._load_keys(deleted_keys, keys, load)
+            state = self._state_ref
+            target = self.table_ref(table)
+            prior = self.table_ref(baseline)
+            removals = self.table_ref(deleted_keys)
+            scope = (
+                "model_name = guard_model AND state_scope = guard_stage "
+                "AND target_identity = guard_target"
+            )
+            columns = "record_key, input_fingerprint, code_version"
+            sql = f"""
+DECLARE guard_model STRING DEFAULT ?;
+DECLARE guard_stage STRING DEFAULT ?;
+DECLARE guard_target STRING DEFAULT ?;
+DECLARE deleted_count INT64 DEFAULT 0;
+DECLARE guard_valid BOOL DEFAULT FALSE;
+BEGIN TRANSACTION;
+-- Acquire the mutation locks before checking the snapshot. Both updates roll
+-- back if either check fails; on success these same rows are deleted below.
+UPDATE {state} SET input_fingerprint = input_fingerprint
+  WHERE {scope} AND record_key IN (SELECT k FROM {removals});
+UPDATE {target} SET document_id = document_id WHERE document_id IN (SELECT k FROM {removals});
+SET guard_valid = IF(
+  (SELECT COUNT(*) = COUNT(DISTINCT record_key) FROM {state} WHERE {scope})
+  AND NOT EXISTS (SELECT {columns} FROM {state} WHERE {scope}
+                  EXCEPT DISTINCT SELECT {columns} FROM {prior})
+  AND NOT EXISTS (SELECT {columns} FROM {prior}
+                  EXCEPT DISTINCT SELECT {columns} FROM {state} WHERE {scope}),
+  TRUE, ERROR('Guarded extraction state changed; retry and review again'));
+SET guard_valid = IF(
+  NOT EXISTS (SELECT DISTINCT document_id, content_hash, code_version FROM {target}
+              EXCEPT DISTINCT SELECT {columns} FROM {prior})
+  AND NOT EXISTS (SELECT {columns} FROM {prior}
+                  EXCEPT DISTINCT
+                  SELECT DISTINCT document_id, content_hash, code_version FROM {target}),
+  TRUE, ERROR('Guarded extraction target and state disagree'));
+DELETE FROM {target} WHERE document_id IN (SELECT k FROM {removals});
+SET deleted_count = @@row_count;
+DELETE FROM {state} WHERE {scope} AND record_key IN (SELECT k FROM {removals});
+COMMIT TRANSACTION;
+SELECT deleted_count;
+"""
+            result = self.scalar(
+                sql, [state_scope.model_name, state_scope.stage, state_scope.target_identity]
+            )
+            return int(result or 0)
+        finally:
+            for staging in (baseline, deleted_keys):
+                self.client.delete_table(self._table_id(staging), not_found_ok=True)
+
+
     def _delete_rows_and_state_inline(
         self,
         table: str,

@@ -128,7 +128,9 @@ def compute_code_version(
         "extraction": (
             dict(effective_extraction)
             if effective_extraction is not None
-            else extraction.model_dump(exclude={"flush_every", "publish_every"})
+            else extraction.model_dump(
+                exclude={"flush_every", "publish_every", "on_source_deletion"}
+            )
             if extraction
             else None
         ),
@@ -141,9 +143,7 @@ def compute_code_version(
         ),
         # artifact.external is boundary policy, not code identity (see
         # flush_every above).
-        "ml": ml.model_dump(mode="json", exclude={"artifact": {"external"}})
-        if ml
-        else None,
+        "ml": ml.model_dump(mode="json", exclude={"artifact": {"external"}}) if ml else None,
         "chunk": chunk.model_dump(exclude={"flush_every"}) if chunk else None,
         # Scoring configuration changes what the metric rows mean, so it
         # invalidates them like any other row-content change (issue #309).
@@ -176,16 +176,10 @@ def compute_code_version(
         # not re-key the model: a 3.6M-row corpus
         # was rewritten in full for a `batch_size` change that had to be made
         # to recover from a failing publish (issue #587).
-        "search": (
-            search_code_identity(search.model_dump(mode="python")) if search else None
-        ),
-        "agent_context": (
-            agent_context.model_dump(mode="json") if agent_context else None
-        ),
+        "search": (search_code_identity(search.model_dump(mode="python")) if search else None),
+        "agent_context": (agent_context.model_dump(mode="json") if agent_context else None),
         "depends_on": depends_on or None,
-        "fields": [
-            {"name": field.name, "data_type": field.data_type} for field in fields
-        ]
+        "fields": [{"name": field.name, "data_type": field.data_type} for field in fields]
         if fields
         else None,
     }
@@ -216,9 +210,7 @@ def compute_code_version(
         assert isinstance(extraction_identity, dict)
         extraction_identity["post_extract"] = {
             **hook.model_dump(),
-            "code_hash": (
-                _hash_file(module_file) if module_file.is_file() else "missing"
-            ),
+            "code_hash": (_hash_file(module_file) if module_file.is_file() else "missing"),
         }
 
     if transform and transform.type == "sql" and transform.path:
@@ -233,20 +225,14 @@ def compute_code_version(
             payload["sql_unique_key"] = unique_key
             payload["sql_on_schema_change"] = on_schema_change
         try:
-            sql_file = resolve_within_project(
-                transform.path, project_dir, surface="transform.path"
-            )
+            sql_file = resolve_within_project(transform.path, project_dir, surface="transform.path")
         except ConfigError:
             payload["transform_sql_hash"] = "missing"
         else:
-            payload["transform_sql_hash"] = (
-                _hash_file(sql_file) if sql_file.exists() else "missing"
-            )
+            payload["transform_sql_hash"] = _hash_file(sql_file) if sql_file.exists() else "missing"
 
     canonical = canonical_json(payload)
-    return hashlib.blake2b(
-        canonical.encode(), digest_size=HASH_DIGEST_SIZE
-    ).hexdigest()
+    return hashlib.blake2b(canonical.encode(), digest_size=HASH_DIGEST_SIZE).hexdigest()
 
 
 def compute_model_code_version(

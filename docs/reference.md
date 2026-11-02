@@ -454,6 +454,48 @@ file, one-based line and column, and full configuration path without echoing
 the rejected input value; duplicate mapping keys are rejected at their second
 declaration. Configuration failures exit 2.
 
+### Guarding source deletions
+
+Incremental extraction normally removes previously published documents absent
+from the next source listing. An incomplete listing can therefore remove valid
+data. To require an explicit review before those removals, opt in on the model:
+
+```yaml
+source: ref('my_documents')
+extraction:
+  backend: json
+  on_source_deletion: guard
+materialization: incremental
+```
+
+The default is `delete`, preserving existing behavior. With `guard`, an
+unfiltered run refuses when previously published documents are absent, before
+deleting or extracting any documents for that model. The error gives the count
+and a fingerprint, not the document identifiers. Compare the source listing
+and the model's published state independently, using the access controls
+appropriate for those records. Once the exact removals are confirmed, rerun:
+
+```bash
+stel build --approve-source-deletions my_model=FINGERPRINT
+```
+
+`stel run` accepts the same option. The fingerprint binds the project, target,
+model, previous state and complete discovered source snapshot. If either state
+or listing changes, the approval no longer matches and the run refuses again.
+The fingerprint is a snapshot identifier, not authentication; warehouse and
+source access must still be restricted. The target and state must agree before
+the run and again within the guarded deletion transaction. A mismatch requires
+investigation and repair before retrying; the guard does not repair state.
+
+Guarded models cannot be full-refreshed: use an approved incremental run for
+intentional source removals. An approval cannot be combined with a source or
+read filter, a state selector, full refresh, or watch mode. Filtered runs retain
+their additive behavior and do not reconcile removals, including downstream
+removals. Do not rely on a filtered run to remove obsolete sensitive content;
+run an unfiltered build after reviewing the source instead. The guard protects
+the extraction deletion decision; it does not verify source completeness or
+guarantee later models complete successfully.
+
 ### Useful flags
 
 - `--watch` on `run` listens to source paths and re-runs on file changes
@@ -461,6 +503,9 @@ declaration. Configuration failures exit 2.
 - `--threads N` parallelizes per-document extraction within an extraction
   model. Most useful for PDF / LLM / HTML (I/O- or API-bound). The LLM cache
   is lock-serialized so threading is safe.
+- `--approve-source-deletions MODEL=FINGERPRINT` approves one reviewed source
+  snapshot for a guarded incremental extraction model. It can be repeated for
+  distinct models; see [guarding source deletions](#guarding-source-deletions).
 - `--select` / `--exclude` limit source discovery as well as model execution;
   an unrelated GCS branch is never listed or authenticated.
 - `--source-filter GLOB` (repeatable) on `run`/`build` scopes a run to the

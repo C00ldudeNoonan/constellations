@@ -1674,6 +1674,24 @@ to see the plan first."""
     ) -> int:
         """Atomically delete target rows and their scoped state when supported."""
 
+    def delete_guarded_extraction_rows(
+        self,
+        table: str,
+        *,
+        keys: Sequence[str],
+        state_scope: StateScope,
+        expected_state: Mapping[str, StateValue],
+    ) -> int:
+        """Delete only while the target and scoped state match the reviewed baseline.
+
+        Implementations must compare and delete within the same transaction,
+        and refuse when they cannot provide the guarantee.
+        """
+        raise AdapterCapabilityError(
+            f"Warehouse adapter '{self.adapter_type()}' cannot atomically guard extraction deletion"
+        )
+
+
     @abstractmethod
     def replace_children(
         self,

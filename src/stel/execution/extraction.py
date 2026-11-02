@@ -60,6 +60,7 @@ from .contracts import (
     update_filter_for_publish,
 )
 from .cost import budget_cost_estimator, estimate_cost
+from .deletion_guard import approval_matches, deletion_approval_token
 from .errors import artifact_error_text
 from .values import scalarize
 from .warehouse import warehouse_options
@@ -332,6 +333,41 @@ def _extract_in_memory(
     return result
 
 
+def _guard_extraction_baseline(
+    adapter: WarehouseAdapter,
+    model_name: str,
+    state: dict[str, StateValue],
+    existing_tables: set[str],
+) -> None:
+    """Refuse a guarded run when target and state do not name the same documents."""
+    if model_name not in existing_tables:
+        if state:
+            raise RunError(
+                f"Extraction model '{model_name}' has state but no target; "
+                "source deletion cannot be checked safely."
+            )
+        return
+    target_rows: set[tuple[str, str, str]] = set()
+    with adapter.table_snapshot(
+        model_name, columns=["document_id", "content_hash", "code_version"]
+    ) as snapshot:
+        for batch in snapshot:
+            for row in zip(*(column.to_pylist() for column in batch.columns), strict=True):
+                if any(not isinstance(value, str) or not value for value in row):
+                    raise RunError(
+                        f"Extraction model '{model_name}' has invalid target identities; "
+                        "source deletion cannot be checked safely."
+                    )
+                target_rows.add(row)
+        snapshot.validate_unchanged()
+    expected = {(key, value.input_fingerprint, value.code_version) for key, value in state.items()}
+    if target_rows != expected:
+        raise RunError(
+            f"Extraction model '{model_name}' target and state disagree; "
+            "source deletion cannot be checked safely."
+        )
+
+
 def run_extraction_model(
     *,
     model: ModelConfig,
@@ -345,6 +381,7 @@ def run_extraction_model(
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
+    deletion_approval: str | None = None,
 ) -> ModelRunResult:
     _sweep_stale_fetch_dirs_once()
     assert model.extraction is not None
@@ -430,9 +467,7 @@ def run_extraction_model(
     source_name = parse_ref(model.source)
     discovered = source_docs.get(source_name)
     if discovered is None:
-        raise RunError(
-            f"Model '{model.name}' references unknown source '{source_name}'"
-        )
+        raise RunError(f"Model '{model.name}' references unknown source '{source_name}'")
     docs = discovered.refs
     source_backend = discovered.backend
 
@@ -445,10 +480,18 @@ def run_extraction_model(
     warehouse_opts = warehouse_options(adapter, model)
     state_scope = StateScope(model.name)
 
+    if model.extraction.on_source_deletion == "guard" and full_refresh:
+        raise RunError(
+            f"Extraction model '{model.name}' guards source deletion; "
+            "a full refresh is refused because it can remove published documents."
+        )
+
     is_incremental = model.materialization == "incremental" and not full_refresh
     processed_state = adapter.fetch_state(state_scope) if is_incremental else {}
     skip_state = state_for_skipping(processed_state, reprocess_all=reprocess_all)
     existing_tables = set(adapter.list_tables()) if is_incremental else set()
+    if is_incremental and model.extraction.on_source_deletion == "guard":
+        _guard_extraction_baseline(adapter, model.name, processed_state, existing_tables)
     empty_incremental_target = (
         is_incremental
         and not processed_state
@@ -474,13 +517,44 @@ def run_extraction_model(
         current_ids = {doc.document_id for doc in docs}
         removed = [doc_id for doc_id in processed_state if doc_id not in current_ids]
         if removed:
-            adapter.delete_rows_and_state(
-                model.name,
-                key_col="document_id",
-                keys=removed,
-                state_scope=state_scope,
-            )
+            if model.extraction.on_source_deletion == "guard":
+                token = deletion_approval_token(
+                    project=project.name,
+                    target=resolved.target_name,
+                    model=model.name,
+                    state=processed_state,
+                    documents=docs,
+                )
+                if not approval_matches(token, deletion_approval):
+                    raise RunError(
+                        f"Extraction model '{model.name}' refused source deletion: "
+                        f"{len(removed)} previously published document(s) are absent. "
+                        f"Review the deletion set, then approve snapshot {token}."
+                    )
+            if model.extraction.on_source_deletion == "guard":
+                try:
+                    adapter.delete_guarded_extraction_rows(
+                        model.name,
+                        keys=removed,
+                        state_scope=state_scope,
+                        expected_state=processed_state,
+                    )
+                except Exception:
+                    # Native adapter errors may contain SQL or source values.
+                    raise RunError(
+                        f"Extraction model '{model.name}' could not verify the "
+                        "approved deletion; inspect the target and state before retrying."
+                    ) from None
+            else:
+                adapter.delete_rows_and_state(
+                    model.name,
+                    key_col="document_id",
+                    keys=removed,
+                    state_scope=state_scope,
+                )
             deleted = len(removed)
+        elif deletion_approval is not None:
+            raise RunError(f"Extraction model '{model.name}' has no source deletions to approve.")
 
     skipped = len(docs) - len(docs_to_process)
     total_docs = len(docs_to_process)
@@ -497,8 +571,7 @@ def run_extraction_model(
     warning_counts: Counter[str] = Counter()
     if not docs:
         warning_counts[
-            f"Source '{source_name}' matched zero documents; verify its path and "
-            "file_pattern."
+            f"Source '{source_name}' matched zero documents; verify its path and file_pattern."
         ] += 1
     usage_totals: dict[str, Any] = {}
     full_state_records: list[StateRecord] = []
@@ -533,15 +606,11 @@ def run_extraction_model(
                     extracted_at=extracted_at,
                 )
             )
-            chunk_records.append(
-                StateRecord(doc.document_id, doc.content_hash, code_version)
-            )
+            chunk_records.append(StateRecord(doc.document_id, doc.content_hash, code_version))
         return chunk_rows, chunk_records
 
     run_status: str | None = None
-    progress_task = get_reporter().model_task(
-        model.name, "extraction", total_docs
-    )
+    progress_task = get_reporter().model_task(model.name, "extraction", total_docs)
     progress_task.__enter__()
     try:
         if budget_guard is not None and docs_to_process:
@@ -575,9 +644,7 @@ def run_extraction_model(
                         budget=budget_guard,
                     )
                     if post_extract is not None:
-                        result = post_extract.apply(
-                            result, document=doc, local_path=local_path
-                        )
+                        result = post_extract.apply(result, document=doc, local_path=local_path)
                     return doc, result, None
                 except BudgetExceededError:
                     raise
@@ -588,9 +655,7 @@ def run_extraction_model(
                     if getattr(backend, "memory_only", False):
                         log.debug("in-memory extraction failed for %s", doc.relative_path)
                         return doc, None, "in-memory extraction failed"
-                    log.debug(
-                        "extraction failed for %s", doc.relative_path, exc_info=True
-                    )
+                    log.debug("extraction failed for %s", doc.relative_path, exc_info=True)
                     return doc, None, artifact_error_text(e)
                 finally:
                     # Delete this document's staged bytes now rather than at the
@@ -599,9 +664,9 @@ def run_extraction_model(
                     if local_path is not None:
                         _cleanup_fetched(local_path, work_dir)
 
-            def _iter_extracted() -> (
-                Iterator[list[tuple[DocumentRef, ExtractionResult | None, str | None]]]
-            ):
+            def _iter_extracted() -> Iterator[
+                list[tuple[DocumentRef, ExtractionResult | None, str | None]]
+            ]:
                 if options.get("batch") and docs_to_process:
                     # Deterministic windows bound fetch, text, and result memory
                     # (issue #149); each window is one or more resumable native
@@ -625,9 +690,7 @@ def run_extraction_model(
                                 usage_totals[key] = usage_totals.get(key, 0) + value
                         if on_partial == "fail":
                             failed = [
-                                (doc, err)
-                                for doc, _res, err in extracted_window
-                                if err is not None
+                                (doc, err) for doc, _res, err in extracted_window if err is not None
                             ]
                             if failed:
                                 for doc, err in failed:
@@ -646,9 +709,7 @@ def run_extraction_model(
                 for i in range(0, total_docs, flush_every):
                     chunk = docs_to_process[i : i + flush_every]
                     if threads > 1 and len(chunk) > 1:
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=threads
-                        ) as ex:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
                             yield list(ex.map(_one, chunk))
                     else:
                         yield [_one(d) for d in chunk]
@@ -673,9 +734,7 @@ def run_extraction_model(
                                 model.name,
                             )
                             yielded = True
-                            yield _apply_extraction_contract(
-                                pl.DataFrame(chunk_rows), model
-                            )
+                            yield _apply_extraction_contract(pl.DataFrame(chunk_rows), model)
                     if errors:
                         raise _FullExtractionFailed
                     if not yielded:

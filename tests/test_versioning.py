@@ -196,6 +196,25 @@ def test_code_version_ignores_flush_every(tmp_path: Path) -> None:
     ) == compute_code_version(extraction=tuned, transform=None, project_dir=tmp_path)
 
 
+def test_code_version_ignores_extraction_deletion_guard(tmp_path: Path) -> None:
+    """#741: enabling the safety guard must not reprocess existing documents."""
+    base = ExtractionConfig(backend="json", options={"fields": ["a"]})
+    guarded = ExtractionConfig(
+        backend="json", options={"fields": ["a"]}, on_source_deletion="guard"
+    )
+    assert compute_code_version(
+        extraction=base, transform=None, project_dir=tmp_path
+    ) == compute_code_version(extraction=guarded, transform=None, project_dir=tmp_path)
+    project = ProjectConfig(name="p", extraction=ExtractionDefaults(default_backend="json"))
+    before = ModelConfig(
+        name="raw", source="ref('docs')", extraction=base, materialization="incremental"
+    )
+    after = before.model_copy(update={"extraction": guarded})
+    assert compute_model_code_version(before, project, tmp_path) == compute_model_code_version(
+        after, project, tmp_path
+    )
+
+
 def test_code_version_ignores_publish_every(tmp_path: Path) -> None:
     """publish_every shapes publication cadence, not output — changing it must
     not invalidate incremental state (issue #293)."""

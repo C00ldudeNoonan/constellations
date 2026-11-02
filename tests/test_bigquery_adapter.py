@@ -1077,6 +1077,43 @@ def test_delete_rows_and_state_uses_one_scoped_transaction() -> None:
     assert params[4].values == ["chunk-1", "chunk-2"]
 
 
+def test_guarded_extraction_delete_checks_baseline_inside_one_transaction() -> None:
+    """#741: baseline, target and removals are checked before any committed delete."""
+    client = _FakeClient()
+    client.query_results = [_FakeJob(rows=[(1,)])]
+    adapter = _adapter(client)
+    state = {"a": StateValue("hash-a", "v1"), "b": StateValue("hash-b", "v1")}
+    scope = StateScope("m")
+    deleted = adapter.delete_guarded_extraction_rows(
+        "docs", keys=["b"], state_scope=scope, expected_state=state
+    )
+    assert deleted == 1
+    assert len(client.loads) == 2
+    assert len(client.dropped) == 2
+    sql, config = client.queries[-1]
+    assert sql.index("BEGIN TRANSACTION") < sql.index("UPDATE ") < sql.index("SET guard_valid")
+    assert sql.index("SET guard_valid") < sql.index("DELETE FROM") < sql.index("COMMIT TRANSACTION")
+    assert "EXCEPT DISTINCT" in sql and "ERROR(" in sql
+    assert [param.value for param in config.query_parameters] == [
+        scope.model_name,
+        scope.stage,
+        scope.target_identity,
+    ]
+
+
+def test_guarded_extraction_delete_rejects_unknown_keys_before_staging() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match="Invalid guarded"):
+        adapter.delete_guarded_extraction_rows(
+            "docs",
+            keys=["missing"],
+            state_scope=StateScope("m"),
+            expected_state={"a": StateValue("hash-a", "v1")},
+        )
+    assert not client.loads and not client.queries
+
+
 def test_list_tables_filters_internal() -> None:
     client = _FakeClient()
     client.listing = ["docs", "stel_state", "stel_test_failures__docs__not_null"]

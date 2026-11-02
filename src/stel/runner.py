@@ -61,6 +61,7 @@ from .execution import ml as _ml_execution
 from .execution import search as _search_execution
 from .execution import transform as _transform_execution
 from .execution import usage as _usage_execution
+from .execution.deletion_guard import is_valid_approval
 from .logging_setup import REPORTER_ECHO_EXTRA
 from .manifest import capture_manifest, compute_modified_models
 from .paths import resolve_within_project
@@ -136,6 +137,68 @@ class BuildResult:
     skipped: list[str] = field(default_factory=list)
 
 
+def _validate_deletion_approvals(
+    approvals: Mapping[str, str] | None,
+    models: list[ModelConfig],
+    full_refresh: bool,
+    source_filter: Sequence[str],
+    read_filter: Sequence[tuple[str, str, str]],
+) -> None:
+    if not approvals:
+        return
+    if full_refresh or source_filter or read_filter:
+        raise RunError("Source deletion approval requires an unfiltered incremental run.")
+    guarded = {
+        model.name
+        for model in models
+        if model.extraction is not None and model.extraction.on_source_deletion == "guard"
+    }
+    if not isinstance(approvals, Mapping) or any(
+        not isinstance(name, str) or name not in guarded or not is_valid_approval(token)
+        for name, token in approvals.items()
+    ):
+        raise RunError(
+            "Invalid source deletion approval; expected a guarded model and SHA-256 token."
+        )
+
+
+def _validate_guarded_full_refresh(
+    *,
+    full_refresh: bool,
+    models: list[ModelConfig],
+    dag: ProjectDAG,
+    select: str | None,
+    exclude: str | None,
+) -> None:
+    if not full_refresh:
+        return
+    guarded = {
+        model.name
+        for model in models
+        if model.extraction is not None and model.extraction.on_source_deletion == "guard"
+    }
+    if not guarded:
+        return
+    if "state:" in (select or "") or "state:" in (exclude or ""):
+        raise RunError("A guarded project cannot combine --full-refresh with state selectors.")
+    if guarded.intersection(dag.select_models(select=select, exclude=exclude)):
+        raise RunError("A guarded extraction model cannot run with --full-refresh.")
+
+
+def _validate_deletion_approval_selection(
+    approvals: Mapping[str, str] | None,
+    dag: ProjectDAG,
+    select: str | None,
+    exclude: str | None,
+) -> None:
+    if not approvals:
+        return
+    if "state:" in (select or "") or "state:" in (exclude or ""):
+        raise RunError("Source deletion approval cannot use state selectors.")
+    if not set(approvals).issubset(dag.select_models(select=select, exclude=exclude)):
+        raise RunError("Source deletion approval names a model outside the selection.")
+
+
 def run_project(
     project_dir: Path,
     *,
@@ -149,17 +212,23 @@ def run_project(
     state: Path | None = None,
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
+    deletion_approvals: Mapping[str, str] | None = None,
     accept_reprocess: bool = False,
     accept_cost: bool = False,
     confirm_cost: CostConfirmation | None = None,
     persist_manifest: bool = False,
 ) -> list[ModelRunResult]:
     """Execute selected models; CLI callers also persist the captured manifest."""
-    _reject_conflicting_reprocess_flags(
-        full_refresh=full_refresh, reprocess_all=reprocess_all
-    )
+    _reject_conflicting_reprocess_flags(full_refresh=full_refresh, reprocess_all=reprocess_all)
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
+    _validate_deletion_approvals(
+        deletion_approvals, models, full_refresh, source_filter, read_filter
+    )
+    _validate_guarded_full_refresh(
+        full_refresh=full_refresh, models=models, dag=dag, select=select, exclude=exclude
+    )
+    _validate_deletion_approval_selection(deletion_approvals, dag, select, exclude)
     # Validate --source-filter before resolving the profile: it is a deterministic
     # option error that a missing credential / bad profile must not mask, and a
     # rejected filter should not resolve credentials first (#266 review). The
@@ -181,9 +250,7 @@ def run_project(
     # caller who supplied --state (issue #417 review). Validation happens once
     # the real selection exists.
     read_predicates: tuple[ReadPredicate, ...] = ()
-    resolved = resolve_profile(
-        project, project_dir, target=target, profiles_dir=profiles_dir
-    )
+    resolved = resolve_profile(project, project_dir, target=target, profiles_dir=profiles_dir)
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -204,6 +271,8 @@ def run_project(
             resolved=resolved,
         ),
     )
+    if deletion_approvals and not set(deletion_approvals).issubset(selected):
+        raise RunError("Source deletion approval names a model outside the selection.")
     validate_warehouse_capabilities(
         [model for model in models if model.name in set(selected)],
         adapter,
@@ -232,9 +301,7 @@ def run_project(
     dbt_ref_models = sorted(
         model.name
         for model in models
-        if model.name in set(selected)
-        and model.source is not None
-        and is_dbt_ref(model.source)
+        if model.name in set(selected) and model.source is not None and is_dbt_ref(model.source)
     )
     if dbt_ref_models:
         # A dbt_ref('...') source reads a dbt-built table, which only dbt can
@@ -296,6 +363,7 @@ def run_project(
             threads=threads,
             run_budget=run_budget,
             subset_run=subset_run,
+            deletion_approval=(deletion_approvals or {}).get(name),
             read_predicates=read_predicates,
         )
 
@@ -362,6 +430,7 @@ def build_project(
     state: Path | None = None,
     source_filter: Sequence[str] = (),
     read_filter: Sequence[tuple[str, str, str]] = (),
+    deletion_approvals: Mapping[str, str] | None = None,
     accept_reprocess: bool = False,
     accept_cost: bool = False,
     confirm_cost: CostConfirmation | None = None,
@@ -371,11 +440,16 @@ def build_project(
     whose tests hard-fail blocks all its descendants, which are reported as
     skipped (dbt `build` semantics). `persist_manifest` writes the configuration
     captured before execution rather than reloading it after publication."""
-    _reject_conflicting_reprocess_flags(
-        full_refresh=full_refresh, reprocess_all=reprocess_all
-    )
+    _reject_conflicting_reprocess_flags(full_refresh=full_refresh, reprocess_all=reprocess_all)
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
+    _validate_deletion_approvals(
+        deletion_approvals, models, full_refresh, source_filter, read_filter
+    )
+    _validate_guarded_full_refresh(
+        full_refresh=full_refresh, models=models, dag=dag, select=select, exclude=exclude
+    )
+    _validate_deletion_approval_selection(deletion_approvals, dag, select, exclude)
     # Validate --source-filter before resolving the profile: it is a deterministic
     # option error that a missing credential / bad profile must not mask, and a
     # rejected filter should not resolve credentials first (#266 review). The
@@ -397,9 +471,7 @@ def build_project(
     # caller who supplied --state (issue #417 review). Validation happens once
     # the real selection exists.
     read_predicates: tuple[ReadPredicate, ...] = ()
-    resolved = resolve_profile(
-        project, project_dir, target=target, profiles_dir=profiles_dir
-    )
+    resolved = resolve_profile(project, project_dir, target=target, profiles_dir=profiles_dir)
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -420,6 +492,8 @@ def build_project(
             resolved=resolved,
         ),
     )
+    if deletion_approvals and not set(deletion_approvals).issubset(selected):
+        raise RunError("Source deletion approval names a model outside the selection.")
     validate_warehouse_capabilities(
         [model for model in models if model.name in set(selected)],
         adapter,
@@ -448,9 +522,7 @@ def build_project(
     dbt_ref_models = sorted(
         model.name
         for model in models
-        if model.name in set(selected)
-        and model.source is not None
-        and is_dbt_ref(model.source)
+        if model.name in set(selected) and model.source is not None and is_dbt_ref(model.source)
     )
     if dbt_ref_models:
         # A dbt_ref('...') source reads a dbt-built table, which only dbt can
@@ -494,9 +566,7 @@ def build_project(
     )
     models_by_name = {m.name: m for m in models}
 
-    validate_test_requirements(
-        [model for model in models if model.name in set(selected)], resolved
-    )
+    validate_test_requirements([model for model in models if model.name in set(selected)], resolved)
     run_budget = _run_budget_ledger(resolved)
     out = BuildResult()
     blocked: set[str] = set()
@@ -556,6 +626,7 @@ def build_project(
                     threads=threads,
                     run_budget=run_budget,
                     subset_run=subset_run,
+                    deletion_approval=(deletion_approvals or {}).get(name),
                     read_predicates=read_predicates,
                 )
             except RunError as e:
@@ -1194,6 +1265,7 @@ def _run_model(
     threads: int = 1,
     run_budget: BudgetLedger | None = None,
     subset_run: bool = False,
+    deletion_approval: str | None = None,
     read_predicates: Sequence[ReadPredicate] = (),
 ) -> ModelRunResult:
     kind = _model_kind_label(model)
@@ -1308,6 +1380,7 @@ def _run_model(
             threads=threads,
             run_budget=run_budget,
             subset_run=subset_run,
+            deletion_approval=deletion_approval,
         )
     elif model.ml is not None:
         result = _run_ml_model(
@@ -1409,9 +1482,7 @@ def _run_model(
         _watermark_safely(
             model.name,
             "record its sync watermark",
-            lambda: adapter.write_sync_watermark(
-                StateScope(model.name), parent_scope, watermark
-            ),
+            lambda: adapter.write_sync_watermark(StateScope(model.name), parent_scope, watermark),
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     result.started_at = started_at

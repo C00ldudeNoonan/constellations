@@ -1093,7 +1093,12 @@ def test_guarded_extraction_delete_checks_baseline_inside_one_transaction() -> N
     sql, config = client.queries[-1]
     assert sql.index("BEGIN TRANSACTION") < sql.index("UPDATE ") < sql.index("SET guard_valid")
     assert sql.index("SET guard_valid") < sql.index("DELETE FROM") < sql.index("COMMIT TRANSACTION")
-    assert "EXCEPT DISTINCT" in sql and "ERROR(" in sql
+    first_check = sql.index("SET guard_valid")
+    assert sql.index("UPDATE `proj`.`ds`.`stel_state`") < first_check
+    assert sql.index("UPDATE `proj`.`ds`.`docs`") < first_check
+    assert sql.count("SET guard_valid") == 2
+    assert "Guarded extraction state changed" in sql
+    assert "Guarded extraction target and state disagree" in sql
     assert [param.value for param in config.query_parameters] == [
         scope.model_name,
         scope.stage,
@@ -4413,6 +4418,69 @@ def test_a_defaulted_dataset_beside_a_populated_legacy_one_refuses() -> None:
     adapter._client = client
     with pytest.raises(LegacyWarehouseNamesError, match=f"schema: {LEGACY_SCHEMA_NAME}"):
         adapter._guard_legacy_names()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_guarded_extraction_delete_is_atomic() -> None:
+    """#741: actual BigQuery checks both baselines and rolls back on disagreement."""
+    dataset = "stel_it_" + os.urandom(3).hex()
+    cfg = parse_warehouse_config({"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset})
+    adapter = create_adapter(cfg)
+    scope = StateScope("docs")
+    baseline = {"a": StateValue("hash-a", "v1"), "b": StateValue("hash-b", "v1")}
+    try:
+        with adapter:
+            adapter.materialize_full(
+                "docs",
+                pl.DataFrame({"document_id": ["a", "b"], "content_hash": ["hash-a", "hash-b"],
+                              "code_version": ["v1", "v1"]}),
+            )
+            adapter.upsert_state(scope, [StateRecord(k, v.input_fingerprint, v.code_version)
+                                         for k, v in baseline.items()])
+            adapter.upsert_state(scope, [StateRecord("a", "changed", "v1")])
+            changed_state = adapter.fetch_state(scope)
+            with pytest.raises(AdapterError):
+                adapter.delete_guarded_extraction_rows(
+                    "docs", keys=["b"], state_scope=scope, expected_state=baseline
+                )
+            assert adapter.fetch_state(scope) == changed_state
+            assert adapter.relation_row_count(f"{dataset}.docs") == 2
+            adapter.upsert_state(scope, [StateRecord("a", "hash-a", "v1")])
+            adapter.execute(f"UPDATE {adapter.table_ref('docs')} SET content_hash = 'wrong' "
+                            "WHERE document_id = 'a'")
+            with pytest.raises(AdapterError):
+                adapter.delete_guarded_extraction_rows(
+                    "docs", keys=["b"], state_scope=scope, expected_state=baseline
+                )
+            assert adapter.fetch_state(scope) == baseline
+            assert adapter.relation_row_count(f"{dataset}.docs") == 2
+            adapter.execute(f"UPDATE {adapter.table_ref('docs')} SET content_hash = 'hash-a' "
+                            "WHERE document_id = 'a'")
+            adapter.execute(
+                f"INSERT INTO {adapter.table_ref('docs')} "
+                f"SELECT * FROM {adapter.table_ref('docs')} WHERE document_id = 'b'"
+            )
+            with pytest.raises(AdapterError):
+                adapter.delete_guarded_extraction_rows(
+                    "docs", keys=["b"], state_scope=scope, expected_state=baseline
+                )
+            assert adapter.fetch_state(scope) == baseline
+            assert adapter.relation_row_count(f"{dataset}.docs") == 3
+            adapter.execute(f"DELETE FROM {adapter.table_ref('docs')} WHERE document_id = 'b'")
+            adapter.execute(
+                f"INSERT INTO {adapter.table_ref('docs')} "
+                "(document_id, content_hash, code_version) VALUES ('b', 'hash-b', 'v1')"
+            )
+            assert adapter.delete_guarded_extraction_rows(
+                "docs", keys=["b"], state_scope=scope, expected_state=baseline
+            ) == 1
+            assert adapter.fetch_state(scope) == {"a": baseline["a"]}
+            assert adapter.rows(f"SELECT document_id FROM {adapter.table_ref('docs')}") == [("a",)]
+    finally:
+        assert isinstance(adapter, BigQueryAdapter)
+        adapter._reset_storage_for_test()
 
 
 @pytest.mark.skipif(

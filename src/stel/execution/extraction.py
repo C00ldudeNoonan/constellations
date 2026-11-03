@@ -358,6 +358,11 @@ def _guard_extraction_baseline(
                         f"Extraction model '{model_name}' has invalid target identities; "
                         "source deletion cannot be checked safely."
                     )
+                if row in target_rows:
+                    raise RunError(
+                        f"Extraction model '{model_name}' has duplicate target identities; "
+                        "source deletion cannot be checked safely."
+                    )
                 target_rows.add(row)
         snapshot.validate_unchanged()
     expected = {(key, value.input_fingerprint, value.code_version) for key, value in state.items()}

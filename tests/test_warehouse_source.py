@@ -590,6 +590,60 @@ def test_guarded_source_refuses_inconsistent_target_and_state(tmp_path: Path) ->
     assert _registry(project).equals(before)
 
 
+def test_guarded_source_refuses_duplicate_target_rows(tmp_path: Path) -> None:
+    """#741: identical duplicate rows must not collapse into a valid baseline."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("INSERT INTO main.post_registry SELECT * FROM main.post_registry LIMIT 1")
+    con.close()
+    before = _registry(project)
+    with pytest.raises(RunError, match="duplicate target identities"):
+        run_project(project)
+    assert _registry(project).equals(before)
+
+
+def test_guarded_delete_rechecks_duplicate_target_in_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#741: a duplicate introduced after the first baseline check blocks deletion."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.close()
+    with pytest.raises(RunError) as refusal:
+        run_project(project)
+    token = re.search(r"snapshot ([0-9a-f]{64})", str(refusal.value))
+    assert token is not None
+    original = DuckDBAdapter.delete_guarded_extraction_rows
+
+    def duplicate_target(self: DuckDBAdapter, table: str, **kwargs: Any) -> int:
+        self.connection.execute(
+            "INSERT INTO main.post_registry SELECT * FROM main.post_registry LIMIT 1"
+        )
+        return original(self, table, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "delete_guarded_extraction_rows", duplicate_target)
+    with pytest.raises(RunError, match="could not verify"):
+        run_project(project, deletion_approvals={"post_registry": token.group(1)})
+    assert _registry(project).height == 4
+
+
 def test_guarded_full_refresh_is_rejected_before_source_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

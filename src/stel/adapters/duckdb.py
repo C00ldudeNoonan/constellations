@@ -1243,14 +1243,14 @@ class DuckDBAdapter(WarehouseAdapter):
             if self._table_columns(table) is None:
                 raise AdapterError("Guarded extraction target is missing; refusing deletion")
             ids = self.connection.execute(
-                "SELECT DISTINCT document_id, content_hash, code_version "
+                "SELECT document_id, content_hash, code_version "
                 f"FROM {self.table_ref(table)}"
             ).fetchall()
             expected = {
                 (key, value.input_fingerprint, value.code_version)
                 for key, value in expected_state.items()
             }
-            if set(ids) != expected:
+            if len(ids) != len(expected) or set(ids) != expected:
                 raise AdapterError(
                     "Guarded extraction target and state disagree; refusing deletion"
                 )

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Incremental extraction can opt into `on_source_deletion: guard`, requiring
+  snapshot-bound approval with `--approve-source-deletions` before removing
+  documents missing from source discovery (issue #741).
+
 ## v0.24.0 - 2026-11-01
 
 ### Entity classes, vocabularies, and relation evaluation

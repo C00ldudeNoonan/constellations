@@ -4007,7 +4007,8 @@ SET guard_valid = IF(
                   EXCEPT DISTINCT SELECT {columns} FROM {state} WHERE {scope}),
   TRUE, ERROR('Guarded extraction state changed; retry and review again'));
 SET guard_valid = IF(
-  NOT EXISTS (SELECT DISTINCT document_id, content_hash, code_version FROM {target}
+  (SELECT COUNT(*) = COUNT(DISTINCT document_id) FROM {target})
+  AND NOT EXISTS (SELECT DISTINCT document_id, content_hash, code_version FROM {target}
               EXCEPT DISTINCT SELECT {columns} FROM {prior})
   AND NOT EXISTS (SELECT {columns} FROM {prior}
                   EXCEPT DISTINCT

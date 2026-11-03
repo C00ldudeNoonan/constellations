@@ -482,6 +482,8 @@ stel build --approve-source-deletions my_model=FINGERPRINT
 `stel run` accepts the same option. The fingerprint binds the project, target,
 model, previous state and complete discovered source snapshot. If either state
 or listing changes, the approval no longer matches and the run refuses again.
+On a continuously changing source, even an added or updated document changes
+the fingerprint, so review and approval may require a quiet source window.
 The fingerprint is a snapshot identifier, not authentication; warehouse and
 source access must still be restricted. The target and state must agree before
 the run and again within the guarded deletion transaction. A mismatch requires

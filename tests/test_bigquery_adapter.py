@@ -4425,12 +4425,21 @@ def test_a_defaulted_dataset_beside_a_populated_legacy_one_refuses() -> None:
 )
 def test_integration_guarded_extraction_delete_is_atomic() -> None:
     """#741: actual BigQuery checks both baselines and rolls back on disagreement."""
-    dataset = "stel_it_" + os.urandom(3).hex()
+    from google.api_core.exceptions import BadRequest
+    from google.cloud import bigquery
+
+    dataset = "stel_it_" + os.urandom(16).hex()
+    dataset_id = f"{_BQ_PROJECT}.{dataset}"
     cfg = parse_warehouse_config({"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset})
     adapter = create_adapter(cfg)
     scope = StateScope("docs")
     baseline = {"a": StateValue("hash-a", "v1"), "b": StateValue("hash-b", "v1")}
+    client = bigquery.Client(project=_BQ_PROJECT)
+    created = False
     try:
+        # A collision must fail before cleanup can remove another dataset.
+        client.create_dataset(dataset_id, exists_ok=False)
+        created = True
         with adapter:
             adapter.materialize_full(
                 "docs",
@@ -4441,7 +4450,7 @@ def test_integration_guarded_extraction_delete_is_atomic() -> None:
                                          for k, v in baseline.items()])
             adapter.upsert_state(scope, [StateRecord("a", "changed", "v1")])
             changed_state = adapter.fetch_state(scope)
-            with pytest.raises(AdapterError):
+            with pytest.raises(BadRequest, match="Guarded extraction state changed"):
                 adapter.delete_guarded_extraction_rows(
                     "docs", keys=["b"], state_scope=scope, expected_state=baseline
                 )
@@ -4450,7 +4459,7 @@ def test_integration_guarded_extraction_delete_is_atomic() -> None:
             adapter.upsert_state(scope, [StateRecord("a", "hash-a", "v1")])
             adapter.execute(f"UPDATE {adapter.table_ref('docs')} SET content_hash = 'wrong' "
                             "WHERE document_id = 'a'")
-            with pytest.raises(AdapterError):
+            with pytest.raises(BadRequest, match="Guarded extraction target and state disagree"):
                 adapter.delete_guarded_extraction_rows(
                     "docs", keys=["b"], state_scope=scope, expected_state=baseline
                 )
@@ -4462,7 +4471,7 @@ def test_integration_guarded_extraction_delete_is_atomic() -> None:
                 f"INSERT INTO {adapter.table_ref('docs')} "
                 f"SELECT * FROM {adapter.table_ref('docs')} WHERE document_id = 'b'"
             )
-            with pytest.raises(AdapterError):
+            with pytest.raises(BadRequest, match="Guarded extraction target and state disagree"):
                 adapter.delete_guarded_extraction_rows(
                     "docs", keys=["b"], state_scope=scope, expected_state=baseline
                 )
@@ -4479,8 +4488,11 @@ def test_integration_guarded_extraction_delete_is_atomic() -> None:
             assert adapter.fetch_state(scope) == {"a": baseline["a"]}
             assert adapter.rows(f"SELECT document_id FROM {adapter.table_ref('docs')}") == [("a",)]
     finally:
-        assert isinstance(adapter, BigQueryAdapter)
-        adapter._reset_storage_for_test()
+        try:
+            if created:
+                client.delete_dataset(dataset_id, delete_contents=True, not_found_ok=True)
+        finally:
+            client.close()
 
 
 @pytest.mark.skipif(

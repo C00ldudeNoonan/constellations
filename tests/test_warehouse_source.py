@@ -13,6 +13,8 @@ import json
 import logging
 import re
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,8 @@ import duckdb
 import polars as pl
 import pytest
 from click.testing import CliRunner
+
+from stel import runner as runner_module
 
 from stel.adapters import create_adapter, parse_warehouse_config
 from stel.adapters.duckdb import DuckDBAdapter
@@ -476,6 +480,48 @@ def test_memory_backend_invalid_configuration_precedes_adapter(
     monkeypatch.setattr("stel.runner.create_adapter", forbidden_adapter)
     with pytest.raises((ConfigError, ProfileError), match=r"source_paths|json_memory"):
         run_project(project)
+
+
+@pytest.mark.parametrize("command", ["run", "build"])
+def test_writer_claim_spans_discovery_and_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """#741: both runner entrypoints hold the writer before discovering any source."""
+    active = False
+    events: list[str] = []
+    discover = runner_module._discover_sources
+    publish = DuckDBAdapter.materialize_incremental
+
+    @contextmanager
+    def claim(self: DuckDBAdapter) -> Iterator[None]:
+        nonlocal active
+        assert not active
+        active = True
+        events.append("claim")
+        try:
+            yield
+        finally:
+            active = False
+            events.append("release")
+
+    def discover_claimed(*args: Any, **kwargs: Any) -> Any:
+        assert active
+        events.append("discover")
+        return discover(*args, **kwargs)
+
+    def publish_claimed(self: DuckDBAdapter, *args: Any, **kwargs: Any) -> int:
+        assert active
+        events.append("publish")
+        return publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "writer_claim", claim)
+    monkeypatch.setattr(runner_module, "_discover_sources", discover_claimed)
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", publish_claimed)
+    result = CliRunner().invoke(cli, ["--project-dir", str(_project(tmp_path)), command])
+    assert result.exit_code == 0, result.output
+    assert events[0] == "claim" and events[-1] == "release"
+    assert events.index("claim") < events.index("discover") < events.index("publish")
+    assert not active
 
 
 @pytest.mark.parametrize("backend", ["json", "json_memory"])

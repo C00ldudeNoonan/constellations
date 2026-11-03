@@ -56,7 +56,8 @@ history (issue #311).
 | [0044](0044-vocabulary-sources-resolve-before-execution.md) | Vocabulary sources resolve to bounded snapshots before code identity or execution; warehouse-backed compile requires access | accepted |
 | [0045](0045-warehouse-rows-can-stay-in-memory.md) | Warehouse rows can be extracted in memory with an explicit backend | accepted |
 | [0046](0046-class-ancestry-is-a-compiled-declaration.md) | Class ancestry is a compiled declaration shared by relation checks, MCP and concept clouds | accepted |
-| [0047](0047-source-deletion-approval-binds-the-discovered-snapshot.md) | Approval for source deletion binds the discovered snapshot and prior state | proposed |
+| [0047](0047-source-deletion-approval-binds-the-discovered-snapshot.md) | Approval for source deletion binds the discovered snapshot and prior state | accepted; amended by 0048 |
+| [0048](0048-bigquery-writers-hold-a-non-expiring-claim.md) | BigQuery writers hold a non-expiring claim across discovery and publication | accepted; amends 0047 |
 
 ## When to write one
 

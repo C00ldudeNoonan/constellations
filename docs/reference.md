@@ -489,6 +489,55 @@ source access must still be restricted. The target and state must agree before
 the run and again within the guarded deletion transaction. A mismatch requires
 investigation and repair before retrying; the guard does not repair state.
 
+On BigQuery, every `run` and `build` (including unguarded models) holds the
+dataset's `stel_writer_claim` table from before discovery until publication
+finishes. Model publication and state mutation APIs also acquire this claim
+when called independently. Acquisition uses the table-creation API, so two
+writers cannot both acquire an empty dataset. The claim uses the physical data
+project and dataset; profile aliases, billing projects and service accounts do
+not create separate locks. Different datasets can run concurrently. Read-only
+source discovery uses a connection that does not initialize schema or state.
+
+This is a cooperative boundary. Stop old writers and upgrade every stel writer
+before enabling the guard. Restrict writes to model targets and `stel_state` to
+participating writers. Older stel versions, direct SDK clients, and trusted raw
+SQL executed outside a claimed run can bypass the protocol; the transaction
+alone cannot exclude BigQuery append loads or insert-only writes. Do not run
+such writers concurrently with guarded extraction. A claim is not an IAM fence.
+
+The claim never expires or gets stolen automatically. Every query and load
+submitted while it is held carries a `stel_writer` job label matching the claim
+table's label. Transparent query-job retries are disabled while claimed. A
+normal return or confirmed terminal job failure permits release. A lost
+submission response, unfinished job or failed ownership check retains the
+claim and refuses further publication. A failed run may therefore require
+operator recovery even if the warehouse job later finishes successfully.
+Ambiguous table metadata API mutations also retain the claim. These are not
+jobs; use warehouse audit records to establish that their requests completed.
+
+To recover a stranded BigQuery writer claim:
+
+1. Stop the old writer and prevent it from resuming. Pause competing writers
+   while investigating; the claim's age does not establish that it is safe.
+2. Read the `stel_writer` label on `PROJECT.DATASET.stel_writer_claim`. Inspect
+   all matching jobs in every execution/billing project and location used by
+   the writer, with access to jobs submitted by its service account. Wait for
+   completion or cancel and then **confirm terminal status**. A cancellation
+   request or process exit alone is insufficient. If submission was ambiguous,
+   do not recover until outstanding submissions and jobs are accounted for.
+   Account for ambiguous metadata API requests as well; if completion cannot be
+   established, leave the claim in place.
+3. Inspect and repair target/state consistency as needed. Only after the old
+   writer cannot submit and all its jobs are terminal, manually delete that
+   dataset's `stel_writer_claim` table through the BigQuery console or API.
+4. Start a fresh process and rerun without approval first. Review the newly
+   discovered deletion fingerprint before authorizing removals.
+
+stel deliberately provides no timed or force-unlock command. Never delete a
+live claim or configure expiration on it; doing so invalidates this guarantee.
+ADR [0048](adr/0048-bigquery-writers-hold-a-non-expiring-claim.md) records the
+protocol and its recovery boundary.
+
 Guarded models cannot be full-refreshed: use an approved incremental run for
 intentional source removals. An approval cannot be combined with a source or
 read filter, a state selector, full refresh, or watch mode. Filtered runs retain

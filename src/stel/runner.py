@@ -219,7 +219,9 @@ def run_project(
     persist_manifest: bool = False,
 ) -> list[ModelRunResult]:
     """Execute selected models; CLI callers also persist the captured manifest."""
-    _reject_conflicting_reprocess_flags(full_refresh=full_refresh, reprocess_all=reprocess_all)
+    _reject_conflicting_reprocess_flags(
+        full_refresh=full_refresh, reprocess_all=reprocess_all
+    )
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     _validate_deletion_approvals(
@@ -250,7 +252,9 @@ def run_project(
     # caller who supplied --state (issue #417 review). Validation happens once
     # the real selection exists.
     read_predicates: tuple[ReadPredicate, ...] = ()
-    resolved = resolve_profile(project, project_dir, target=target, profiles_dir=profiles_dir)
+    resolved = resolve_profile(
+        project, project_dir, target=target, profiles_dir=profiles_dir
+    )
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -301,7 +305,9 @@ def run_project(
     dbt_ref_models = sorted(
         model.name
         for model in models
-        if model.name in set(selected) and model.source is not None and is_dbt_ref(model.source)
+        if model.name in set(selected)
+        and model.source is not None
+        and is_dbt_ref(model.source)
     )
     if dbt_ref_models:
         # A dbt_ref('...') source reads a dbt-built table, which only dbt can
@@ -337,12 +343,6 @@ def run_project(
     )
 
     required_sources = set(dag.required_sources(selected))
-    source_docs = _discover_sources(
-        [source for source in sources if source.name in required_sources],
-        project_dir,
-        source_filter=source_filter,
-        warehouse=resolved.warehouse,
-    )
 
     models_by_name = {m.name: m for m in models}
 
@@ -368,7 +368,13 @@ def run_project(
         )
 
     started_at = datetime.now(UTC).isoformat()
-    with adapter:
+    with adapter.writer_claim(), adapter:
+        source_docs = _discover_sources(
+            [source for source in sources if source.name in required_sources],
+            project_dir,
+            source_filter=source_filter,
+            warehouse=resolved.warehouse,
+        )
         log.info("connected to %s warehouse", resolved.warehouse.type)
         _enforce_spend_guards(
             selected,
@@ -440,7 +446,9 @@ def build_project(
     whose tests hard-fail blocks all its descendants, which are reported as
     skipped (dbt `build` semantics). `persist_manifest` writes the configuration
     captured before execution rather than reloading it after publication."""
-    _reject_conflicting_reprocess_flags(full_refresh=full_refresh, reprocess_all=reprocess_all)
+    _reject_conflicting_reprocess_flags(
+        full_refresh=full_refresh, reprocess_all=reprocess_all
+    )
     project, sources, models = load_project(project_dir)
     dag = validate_project_contract(project, sources, models, project_dir)
     _validate_deletion_approvals(
@@ -471,7 +479,9 @@ def build_project(
     # caller who supplied --state (issue #417 review). Validation happens once
     # the real selection exists.
     read_predicates: tuple[ReadPredicate, ...] = ()
-    resolved = resolve_profile(project, project_dir, target=target, profiles_dir=profiles_dir)
+    resolved = resolve_profile(
+        project, project_dir, target=target, profiles_dir=profiles_dir
+    )
     log.info(
         "resolved profile '%s' target '%s' -> %s warehouse",
         project.profile,
@@ -522,7 +532,9 @@ def build_project(
     dbt_ref_models = sorted(
         model.name
         for model in models
-        if model.name in set(selected) and model.source is not None and is_dbt_ref(model.source)
+        if model.name in set(selected)
+        and model.source is not None
+        and is_dbt_ref(model.source)
     )
     if dbt_ref_models:
         # A dbt_ref('...') source reads a dbt-built table, which only dbt can
@@ -558,22 +570,24 @@ def build_project(
     )
 
     required_sources = set(dag.required_sources(selected))
-    source_docs = _discover_sources(
-        [source for source in sources if source.name in required_sources],
-        project_dir,
-        source_filter=source_filter,
-        warehouse=resolved.warehouse,
-    )
     models_by_name = {m.name: m for m in models}
 
-    validate_test_requirements([model for model in models if model.name in set(selected)], resolved)
+    validate_test_requirements(
+        [model for model in models if model.name in set(selected)], resolved
+    )
     run_budget = _run_budget_ledger(resolved)
     out = BuildResult()
     blocked: set[str] = set()
     skipped_results: list[ModelRunResult] = []
 
     started_at = datetime.now(UTC).isoformat()
-    with adapter:
+    with adapter.writer_claim(), adapter:
+        source_docs = _discover_sources(
+            [source for source in sources if source.name in required_sources],
+            project_dir,
+            source_filter=source_filter,
+            warehouse=resolved.warehouse,
+        )
         log.info("connected to %s warehouse", resolved.warehouse.type)
         _enforce_spend_guards(
             selected,
@@ -1482,7 +1496,9 @@ def _run_model(
         _watermark_safely(
             model.name,
             "record its sync watermark",
-            lambda: adapter.write_sync_watermark(StateScope(model.name), parent_scope, watermark),
+            lambda: adapter.write_sync_watermark(
+                StateScope(model.name), parent_scope, watermark
+            ),
         )
     result.duration_seconds = round(time.monotonic() - start, 3)
     result.started_at = started_at

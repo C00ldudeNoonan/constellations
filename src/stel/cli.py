@@ -1194,7 +1194,9 @@ def _confirm_cost(projection: CostProjection) -> bool:
         "'+name+', 'tag:raw', 'kind:embed')."
     ),
 )
-@click.option("--exclude", default=None, help="Selector expression for nodes to exclude.")
+@click.option(
+    "--exclude", default=None, help="Selector expression for nodes to exclude."
+)
 @click.option(
     "--watch",
     is_flag=True,

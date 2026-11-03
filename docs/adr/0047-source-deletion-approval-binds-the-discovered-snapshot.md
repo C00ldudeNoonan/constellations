@@ -1,6 +1,6 @@
 # ADR-0047: source deletion approval binds the discovered snapshot
 
-- **Status:** proposed
+- **Status:** accepted; amended by [0048](0048-bigquery-writers-hold-a-non-expiring-claim.md)
 - **Date:** 2026-11-02
 - **Prompted by:** #741
 
@@ -36,7 +36,7 @@ projects' behavior. The guard cannot establish that the listing is complete,
 and later pipeline failures still require operational recovery. Baseline
 comparison and transactional deletion add warehouse reads and mutation cost.
 
-## Open concurrency blocker
+## Concurrency blocker (resolved by ADR-0048)
 
 The proposed BigQuery transaction alone does not enforce the reviewed baseline
 against concurrent writers: insert-only MERGEs and append loads can run while

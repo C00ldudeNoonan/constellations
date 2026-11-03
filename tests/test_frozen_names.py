@@ -57,6 +57,7 @@ from stel.adapters.base import (
     STATE_TABLE,
     SYNC_WATERMARK_TABLE,
     TEST_FAILURES_TABLE_PREFIX,
+    WRITER_CLAIM_TABLE,
     staging_table_name,
 )
 from stel.checks.schema import _failures_table_name
@@ -99,6 +100,12 @@ SRC_ROOT = pathlib.Path(stel.__file__).parent
 
 # (label, actual, expected, why_frozen)
 _FROZEN_LITERALS: tuple[tuple[str, object, object, str], ...] = (
+    (
+        "adapters.base.WRITER_CLAIM_TABLE",
+        WRITER_CLAIM_TABLE,
+        "stel_writer_claim",
+        "arbitrates BigQuery dataset writers; another name bypasses a live or stranded claim",
+    ),
     (
         "adapters.base.STATE_TABLE",
         STATE_TABLE,

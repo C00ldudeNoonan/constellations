@@ -210,6 +210,9 @@ def validate_state_keys(record_keys: Sequence[str]) -> None:
 STATE_TABLE = "stel_state"
 LEGACY_STATE_TABLE = "dbt_ml_state"
 
+# A non-expiring BigQuery dataset writer claim, never a sweepable staging table.
+WRITER_CLAIM_TABLE = "stel_writer_claim"
+
 # One row per (child model, parent model) pair: the parent generation
 # (`state_max_last_run_at`) a child was caught up with as of its own last
 # *successful* publish (issue #611). Lazily created on first write, like the
@@ -275,6 +278,7 @@ INTERNAL_TABLE_PREFIXES = (
 # prefixes above. The ledger and lease tables were never filtered before #313
 # and showed up in `stel ls`/`stel show` as if a user had modeled them.
 INTERNAL_TABLE_NAMES = (
+    WRITER_CLAIM_TABLE,
     STATE_TABLE,
     SERVING_LEDGER_TABLE,
     SERVING_LEASE_TABLE,
@@ -1342,6 +1346,15 @@ class WarehouseAdapter(ABC):
     #: pre-#313 names — and must not create the new empty objects it is about
     #: to rename the old ones into.
     migration_mode: bool = False
+
+    @contextmanager
+    def writer_claim(self) -> Iterator[None]:
+        """Hold cooperating writers out from discovery through publication.
+
+        File-backed adapters already exclude other processes while connected.
+        Remote adapters override this when writes can outlive the caller.
+        """
+        yield
 
     @contextmanager
     def preflight_reads(self) -> Iterator[Self]:

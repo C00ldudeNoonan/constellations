@@ -472,7 +472,9 @@ def run_extraction_model(
     source_name = parse_ref(model.source)
     discovered = source_docs.get(source_name)
     if discovered is None:
-        raise RunError(f"Model '{model.name}' references unknown source '{source_name}'")
+        raise RunError(
+            f"Model '{model.name}' references unknown source '{source_name}'"
+        )
     docs = discovered.refs
     source_backend = discovered.backend
 
@@ -611,11 +613,15 @@ def run_extraction_model(
                     extracted_at=extracted_at,
                 )
             )
-            chunk_records.append(StateRecord(doc.document_id, doc.content_hash, code_version))
+            chunk_records.append(
+                StateRecord(doc.document_id, doc.content_hash, code_version)
+            )
         return chunk_rows, chunk_records
 
     run_status: str | None = None
-    progress_task = get_reporter().model_task(model.name, "extraction", total_docs)
+    progress_task = get_reporter().model_task(
+        model.name, "extraction", total_docs
+    )
     progress_task.__enter__()
     try:
         if budget_guard is not None and docs_to_process:
@@ -649,7 +655,9 @@ def run_extraction_model(
                         budget=budget_guard,
                     )
                     if post_extract is not None:
-                        result = post_extract.apply(result, document=doc, local_path=local_path)
+                        result = post_extract.apply(
+                            result, document=doc, local_path=local_path
+                        )
                     return doc, result, None
                 except BudgetExceededError:
                     raise
@@ -660,7 +668,9 @@ def run_extraction_model(
                     if getattr(backend, "memory_only", False):
                         log.debug("in-memory extraction failed for %s", doc.relative_path)
                         return doc, None, "in-memory extraction failed"
-                    log.debug("extraction failed for %s", doc.relative_path, exc_info=True)
+                    log.debug(
+                        "extraction failed for %s", doc.relative_path, exc_info=True
+                    )
                     return doc, None, artifact_error_text(e)
                 finally:
                     # Delete this document's staged bytes now rather than at the
@@ -695,7 +705,9 @@ def run_extraction_model(
                                 usage_totals[key] = usage_totals.get(key, 0) + value
                         if on_partial == "fail":
                             failed = [
-                                (doc, err) for doc, _res, err in extracted_window if err is not None
+                                (doc, err)
+                                for doc, _res, err in extracted_window
+                                if err is not None
                             ]
                             if failed:
                                 for doc, err in failed:
@@ -714,7 +726,9 @@ def run_extraction_model(
                 for i in range(0, total_docs, flush_every):
                     chunk = docs_to_process[i : i + flush_every]
                     if threads > 1 and len(chunk) > 1:
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=threads
+                        ) as ex:
                             yield list(ex.map(_one, chunk))
                     else:
                         yield [_one(d) for d in chunk]
@@ -739,7 +753,9 @@ def run_extraction_model(
                                 model.name,
                             )
                             yielded = True
-                            yield _apply_extraction_contract(pl.DataFrame(chunk_rows), model)
+                            yield _apply_extraction_contract(
+                                pl.DataFrame(chunk_rows), model
+                            )
                     if errors:
                         raise _FullExtractionFailed
                     if not yielded:

@@ -20,13 +20,16 @@ import io
 import logging
 import os
 import re
+import threading
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from functools import wraps
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Concatenate, Literal, cast
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -105,6 +108,7 @@ from .base import (
 )
 from .base import STATE_TABLE as _STATE_TABLE
 from .base import SYNC_WATERMARK_TABLE as _SYNC_WATERMARK_TABLE
+from .bigquery_writer import BigQueryWriterClaim
 from .registry import register
 
 log = logging.getLogger(__name__)
@@ -1257,6 +1261,17 @@ def _bigquery_table_generation(table: Any) -> str:
     )
 
 
+def _serialized_write[**P, T](
+    method: Callable[Concatenate[BigQueryAdapter, P], T],
+) -> Callable[Concatenate[BigQueryAdapter, P], T]:
+    @wraps(method)
+    def claimed(self: BigQueryAdapter, *args: P.args, **kwargs: P.kwargs) -> T:
+        with self.writer_claim():
+            return method(self, *args, **kwargs)
+
+    return claimed
+
+
 @register
 class BigQueryAdapter(WarehouseAdapter):
     def __init__(
@@ -1265,6 +1280,93 @@ class BigQueryAdapter(WarehouseAdapter):
         super().__init__(config, project_dir=project_dir)
         self._client: Any = None
         self._bqstorage_client: Any = None
+        self._writer_claim: BigQueryWriterClaim | None = None
+        self._writer_depth = 0
+        self._writer_lock = threading.RLock()
+        self._writer_poisoned = False
+        self._writer_owns_client = False
+
+    @contextmanager
+    def writer_claim(self) -> Iterator[None]:
+        """Serialize participating writers to this physical dataset, without expiry.
+
+        run/build hold this across discovery and every publication. Individual
+        mutation APIs also participate, including first creation and append.
+        Read-only source discovery uses preflight_reads and does not claim.
+        """
+        with self._writer_lock:
+            self._enter_writer_claim()
+        try:
+            yield
+        finally:
+            with self._writer_lock:
+                self._leave_writer_claim()
+
+    def _enter_writer_claim(self) -> None:
+        if self._writer_poisoned:
+            raise AdapterError("BigQuery writer claim requires operator recovery")
+        if self._writer_claim is None:
+            self._acquire_writer_claim()
+        else:
+            self._writer_claim.verify()
+        self._writer_depth += 1
+
+    def _acquire_writer_claim(self) -> None:
+        owns_client = self._client is None
+        client = self._make_client() if owns_client else self.client
+        claim = BigQueryWriterClaim(
+            client, _bigquery(), self._cfg.project, self._cfg.schema_name, self._cfg.location
+        )
+        try:
+            claim.acquire()
+        except BaseException:
+            if owns_client:
+                client.close()
+            raise
+        self._writer_claim = claim
+        self._writer_owns_client = owns_client
+
+    def _leave_writer_claim(self) -> None:
+        self._writer_depth -= 1
+        if self._writer_depth:
+            return
+        claim = self._writer_claim
+        assert claim is not None
+        try:
+            claim.release()
+        except BaseException:
+            self._writer_poisoned = True
+            raise
+        finally:
+            self._writer_claim = None
+            if self._writer_owns_client:
+                claim.client.close()
+            self._writer_owns_client = False
+
+    def _submit_claimed_job(self, operation: Callable[[], Any]) -> Any:
+        claim = self._writer_claim
+        return operation() if claim is None else claim.submit(operation)
+
+    def _claimed_job_completed(self, job: Any) -> None:
+        if self._writer_claim is not None:
+            self._writer_claim.completed(job)
+
+    def _delete_table_claimed(self, table_id: str, *, not_found_ok: bool) -> None:
+        def operation() -> None:
+            self.client.delete_table(table_id, not_found_ok=not_found_ok)
+
+        if self._writer_claim is None:
+            operation()
+        else:
+            self._writer_claim.mutate_metadata(operation)
+
+    def _update_table_claimed(self, table: Any, fields: list[str]) -> Any:
+        def operation() -> Any:
+            return self.client.update_table(table, fields)
+
+        if self._writer_claim is None:
+            return operation()
+        return self._writer_claim.mutate_metadata(operation)
 
     @classmethod
     def adapter_type(cls) -> str:
@@ -2043,6 +2145,7 @@ class BigQueryAdapter(WarehouseAdapter):
             content=TableContentFingerprint(rows=int(content_rows), fingerprint=str(fingerprint)),
         )
 
+    @_serialized_write
     def write_sync_watermark(
         self, child: StateScope, parent: StateScope, synced_parent_generation: SyncWatermark
     ) -> None:
@@ -2154,6 +2257,7 @@ class BigQueryAdapter(WarehouseAdapter):
         # after any state-shape change.
         self.execute(f"DROP TABLE IF EXISTS {self.table_ref(_SYNC_WATERMARK_TABLE)}")
 
+    @_serialized_write
     def _recluster_state_table(self) -> None:
         """Set stel_state's clustering columns via an in-place metadata patch.
 
@@ -2169,8 +2273,9 @@ class BigQueryAdapter(WarehouseAdapter):
         """
         bq_table = self.client.get_table(self._table_id(_STATE_TABLE))
         bq_table.clustering_fields = list(_STATE_CLUSTER_FIELDS)
-        self.client.update_table(bq_table, ["clustering_fields"])
+        self._update_table_claimed(bq_table, ["clustering_fields"])
 
+    @_serialized_write
     def _replace_state_table(self, source_select: str) -> None:
         """CREATE the rebuilt table under a staging name, verify its row
         count against the table it will replace, then swap it in via COPY --
@@ -2206,7 +2311,7 @@ class BigQueryAdapter(WarehouseAdapter):
         except BaseException as error:
             if migration_created:
                 try:
-                    self.client.delete_table(
+                    self._delete_table_claimed(
                         self._table_id(migration_table), not_found_ok=True
                     )
                 except Exception as cleanup_error:
@@ -2216,7 +2321,7 @@ class BigQueryAdapter(WarehouseAdapter):
                     )
             raise
         else:
-            self.client.delete_table(
+            self._delete_table_claimed(
                 self._table_id(migration_table), not_found_ok=True
             )
 
@@ -2299,18 +2404,22 @@ class BigQueryAdapter(WarehouseAdapter):
         bigquery = _bigquery()
         cfg = self._cfg
         kwargs: dict[str, Any] = {}
-        if params or job_labels or use_query_cache is not None:
+        if params or job_labels or use_query_cache is not None or self._writer_claim is not None:
             job_config = bigquery.QueryJobConfig()
             if params:
                 job_config.query_parameters = to_query_parameters(params)
             if job_labels:
                 job_config.labels = dict(job_labels)
+            if self._writer_claim is not None:
+                job_config.labels = {
+                    **(job_config.labels or {}), "stel_writer": self._writer_claim.owner
+                }
             if use_query_cache is not None:
                 job_config.use_query_cache = use_query_cache
             kwargs["job_config"] = job_config
         if cfg.job_creation_timeout_seconds is not None:
             kwargs["timeout"] = cfg.job_creation_timeout_seconds
-        if cfg.job_retries == 0:
+        if cfg.job_retries == 0 or self._writer_claim is not None:
             kwargs["job_retry"] = None
         elif cfg.job_retry_deadline_seconds is not None:
             from google.cloud.bigquery.retry import DEFAULT_JOB_RETRY
@@ -2318,7 +2427,7 @@ class BigQueryAdapter(WarehouseAdapter):
             kwargs["job_retry"] = DEFAULT_JOB_RETRY.with_deadline(
                 cfg.job_retry_deadline_seconds
             )
-        return self.client.query(sql, **kwargs)
+        return self._submit_claimed_job(lambda: self.client.query(sql, **kwargs))
 
     def _run_query(
         self,
@@ -2336,6 +2445,7 @@ class BigQueryAdapter(WarehouseAdapter):
             sql, params, job_labels=job_labels, use_query_cache=use_query_cache
         )
         job.result(timeout=cfg.job_execution_timeout_seconds)
+        self._claimed_job_completed(job)
         return job
 
     def _open_table_snapshot(self, request: TableReadRequest) -> TableReadSnapshot:
@@ -2636,6 +2746,7 @@ class BigQueryAdapter(WarehouseAdapter):
             return []
         return sorted(str(t.table_id) for t in tables)
 
+    @_serialized_write
     def rename_table(self, old: str, new: str) -> None:
         # BigQuery has no ALTER TABLE ... RENAME across all editions, so this
         # mirrors the v1 state migration below: copy under the new name, then
@@ -2645,7 +2756,7 @@ class BigQueryAdapter(WarehouseAdapter):
             self.execute(
                 f"CREATE TABLE {self.table_ref(new)} COPY {self.table_ref(old)}"
             )
-            self.client.delete_table(self._table_id(old), not_found_ok=True)
+            self._delete_table_claimed(self._table_id(old), not_found_ok=True)
         except Exception as error:
             raise AdapterError(
                 f"BigQuery could not rename '{old}' to '{new}'"
@@ -3181,11 +3292,19 @@ class BigQueryAdapter(WarehouseAdapter):
         buffer = io.BytesIO()
         df.write_parquet(buffer)
         buffer.seek(0)
-        job = self.client.load_table_from_file(
-            buffer, self._table_id(table), job_config=job_config
+        if self._writer_claim is not None:
+            job_config.labels = {
+                **(job_config.labels or {}), "stel_writer": self._writer_claim.owner
+            }
+        job = self._submit_claimed_job(
+            lambda: self.client.load_table_from_file(
+                buffer, self._table_id(table), job_config=job_config
+            )
         )
         job.result()
+        self._claimed_job_completed(job)
 
+    @_serialized_write
     def materialize_sql_full(
         self,
         table: str,
@@ -3292,6 +3411,7 @@ class BigQueryAdapter(WarehouseAdapter):
     def relation_exists(self, table: str) -> bool:
         return self._table_columns(table) is not None
 
+    @_serialized_write
     def materialize_sql_incremental(
         self,
         table: str,
@@ -3464,6 +3584,7 @@ class BigQueryAdapter(WarehouseAdapter):
                 )
         return plan.columns_to_load
 
+    @_serialized_write
     def materialize_full(
         self, table: str, df: pl.DataFrame, *, options: BaseModel | None = None
     ) -> int:
@@ -3570,6 +3691,7 @@ class BigQueryAdapter(WarehouseAdapter):
             job_labels=job_labels,
         )
 
+    @_serialized_write
     def materialize_incremental(
         self,
         table: str,
@@ -3737,6 +3859,7 @@ class BigQueryAdapter(WarehouseAdapter):
             self.drop_table(staging)
         return df.height
 
+    @_serialized_write
     def append_rows(self, table: str, df: pl.DataFrame) -> int:
         if df.height == 0:
             return 0
@@ -3759,6 +3882,7 @@ class BigQueryAdapter(WarehouseAdapter):
         self._load_parquet(table, df, job_config)
         return df.height
 
+    @_serialized_write
     def materialize_full_chunks(
         self,
         table: str,
@@ -3904,6 +4028,7 @@ class BigQueryAdapter(WarehouseAdapter):
             "`table_format: iceberg` to keep it as Iceberg."
         )
 
+    @_serialized_write
     def delete_rows(self, table: str, *, key_col: str, keys: list[str]) -> int:
         if not keys or self._table_columns(table) is None:
             return 0
@@ -3918,6 +4043,7 @@ class BigQueryAdapter(WarehouseAdapter):
             affected += int(job.num_dml_affected_rows or 0)
         return affected
 
+    @_serialized_write
     def delete_rows_and_state(
         self,
         table: str,
@@ -3951,6 +4077,7 @@ class BigQueryAdapter(WarehouseAdapter):
             reuse_state_from_target=state_record_keys is None,
         )
 
+    @_serialized_write
     def delete_guarded_extraction_rows(
         self,
         table: str,
@@ -4026,7 +4153,7 @@ SELECT deleted_count;
             return int(result or 0)
         finally:
             for staging in (baseline, deleted_keys):
-                self.client.delete_table(self._table_id(staging), not_found_ok=True)
+                self._delete_table_claimed(self._table_id(staging), not_found_ok=True)
 
 
     def _delete_rows_and_state_inline(
@@ -4128,7 +4255,7 @@ SELECT deleted_count;
         finally:
             for staging in (target_staging, state_staging):
                 if staging is not None:
-                    self.client.delete_table(self._table_id(staging), not_found_ok=True)
+                    self._delete_table_claimed(self._table_id(staging), not_found_ok=True)
 
     def _load_keys(self, table: str, keys: Sequence[Any], job_config: Any) -> None:
         """Stream a key set into a single-column (`k`) staging table via bounded
@@ -4160,6 +4287,7 @@ SELECT deleted_count;
             )
             self._load_parquet(table, df, job_config)
 
+    @_serialized_write
     def replace_children(
         self,
         table: str,
@@ -4378,8 +4506,9 @@ SELECT deleted_count;
                 self.drop_table(staging_table)
         return new_rows.height
 
+    @_serialized_write
     def drop_table(self, table: str) -> None:
-        self.client.delete_table(self._table_id(table), not_found_ok=True)
+        self._delete_table_claimed(self._table_id(table), not_found_ok=True)
 
     def _reset_storage_for_test(self) -> str:
         """Drop the isolated test dataset used by live adapter integration tests."""
@@ -4412,12 +4541,14 @@ SELECT deleted_count;
             state[record_key] = StateValue(str(row[1]), str(row[2]))
         return state
 
+    @_serialized_write
     def upsert_state(self, scope: StateScope, records: Sequence[StateRecord]) -> None:
         validate_state_records(records)
         if not records:
             return
         self._merge_state(scope, records, replace=False)
 
+    @_serialized_write
     def replace_state(self, scope: StateScope, records: Sequence[StateRecord]) -> None:
         validate_state_records(records)
         self._merge_state(scope, records, replace=True)
@@ -4568,8 +4699,9 @@ SELECT deleted_count;
                 params,
             )
         finally:
-            self.client.delete_table(self._table_id(staging), not_found_ok=True)
+            self._delete_table_claimed(self._table_id(staging), not_found_ok=True)
 
+    @_serialized_write
     def clear_state(self, scope: StateScope) -> None:
         self._run_query(
             f"DELETE FROM {self._state_ref} "
@@ -4577,6 +4709,7 @@ SELECT deleted_count;
             [scope.model_name, scope.stage, scope.target_identity],
         )
 
+    @_serialized_write
     def delete_state(self, scope: StateScope, record_keys: Sequence[str]) -> None:
         validate_state_keys(record_keys)
         if not record_keys:
@@ -4753,6 +4886,7 @@ SELECT deleted_count;
             page_size=request.page_size, fetch=fetch, close=lambda: None
         )
 
+    @_serialized_write
     def _replace_state_scope(
         self,
         scope: StateScope,
@@ -4789,7 +4923,7 @@ SELECT deleted_count;
                 )
             self._run_state_replace_merge(scope, staging, fence)
         finally:
-            self.client.delete_table(self._table_id(staging), not_found_ok=True)
+            self._delete_table_claimed(self._table_id(staging), not_found_ok=True)
         return total
 
     def _run_state_replace_merge(

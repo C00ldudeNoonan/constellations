@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Incremental extraction can opt into `on_source_deletion: guard`, requiring
+  snapshot-bound approval with `--approve-source-deletions` before removing
+  documents missing from source discovery (issue #741).
+- BigQuery runs and builds now hold a non-expiring dataset writer claim from
+  source discovery through publication. Competing stel writers refuse; uncertain
+  job completion retains the claim for manual recovery. Upgrade all writers
+  together and stop older versions before relying on source deletion approval.
+
 ## v0.24.0 - 2026-11-01
 
 ### Entity classes, vocabularies, and relation evaluation

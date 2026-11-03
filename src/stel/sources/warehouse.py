@@ -100,7 +100,7 @@ class WarehouseDocumentSource(DocumentSource):
         try:
             with create_adapter(
                 self._warehouse, project_dir=self._project_dir
-            ) as adapter:
+            ).preflight_reads() as adapter:
                 # cap+1 bounds the query itself: an oversized relation is
                 # refused after transferring one row past the cap, not after
                 # materializing millions (Codex review, #330).
@@ -231,7 +231,7 @@ class WarehouseDocumentSource(DocumentSource):
         try:
             with create_adapter(
                 self._warehouse, project_dir=self._project_dir
-            ) as adapter:
+            ).preflight_reads() as adapter:
                 count = adapter.relation_row_count(relation)
         except AdapterError as error:
             raise SourceError(

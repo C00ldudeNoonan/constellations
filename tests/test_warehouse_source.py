@@ -11,19 +11,27 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
 import pytest
+from click.testing import CliRunner
 
+from stel import runner as runner_module
 from stel.adapters import create_adapter, parse_warehouse_config
+from stel.adapters.duckdb import DuckDBAdapter
+from stel.cli import cli
 from stel.config.loader import ConfigError
 from stel.config.profile import WarehouseConfig
 from stel.config.source import SourceConfig, validate_relation_name
 from stel.profile import ProfileError
-from stel.runner import run_project
+from stel.runner import RunError, run_project
 from stel.sources import DocumentRef, SourceError, get_document_source
 from stel.sources.warehouse import WarehouseDocumentSource
 
@@ -471,6 +479,323 @@ def test_memory_backend_invalid_configuration_precedes_adapter(
     monkeypatch.setattr("stel.runner.create_adapter", forbidden_adapter)
     with pytest.raises((ConfigError, ProfileError), match=r"source_paths|json_memory"):
         run_project(project)
+
+
+@pytest.mark.parametrize("command", ["run", "build"])
+def test_writer_claim_spans_discovery_and_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """#741: both runner entrypoints hold the writer before discovering any source."""
+    active = False
+    events: list[str] = []
+    discover = runner_module._discover_sources
+    publish = DuckDBAdapter.materialize_incremental
+
+    @contextmanager
+    def claim(self: DuckDBAdapter) -> Iterator[None]:
+        nonlocal active
+        assert not active
+        active = True
+        events.append("claim")
+        try:
+            yield
+        finally:
+            active = False
+            events.append("release")
+
+    def discover_claimed(*args: Any, **kwargs: Any) -> Any:
+        assert active
+        events.append("discover")
+        return discover(*args, **kwargs)
+
+    def publish_claimed(self: DuckDBAdapter, *args: Any, **kwargs: Any) -> int:
+        assert active
+        events.append("publish")
+        return publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "writer_claim", claim)
+    monkeypatch.setattr(runner_module, "_discover_sources", discover_claimed)
+    monkeypatch.setattr(DuckDBAdapter, "materialize_incremental", publish_claimed)
+    result = CliRunner().invoke(cli, ["--project-dir", str(_project(tmp_path)), command])
+    assert result.exit_code == 0, result.output
+    assert events[0] == "claim" and events[-1] == "release"
+    assert events.index("claim") < events.index("discover") < events.index("publish")
+    assert not active
+
+
+@pytest.mark.parametrize("backend", ["json", "json_memory"])
+def test_guarded_source_deletion_refuses_before_rows_or_state_change(
+    tmp_path: Path, backend: str
+) -> None:
+    """#741: a partial source must not silently prune a published corpus."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", f"backend: {backend}\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    before = _registry(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    state_before = con.execute("SELECT * FROM main.stel_state ORDER BY record_key").fetchall()
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.execute("UPDATE rawdata.reddit_posts SET selftext = 'changed' WHERE post_id = 'p1'")
+    con.close()
+    with pytest.raises(RunError, match="deletion") as error:
+        run_project(project)
+    assert "p2" not in str(error.value)
+    assert _registry(project).equals(before)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    assert (
+        con.execute("SELECT * FROM main.stel_state ORDER BY record_key").fetchall() == state_before
+    )
+    con.close()
+    # The same source change under the legacy policy really does delete: the
+    # test above would catch the incident rather than only checking the setup.
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "on_source_deletion: guard", "on_source_deletion: delete"
+        ),
+        encoding="utf-8",
+    )
+    result = run_project(project)[0]
+    assert result.documents_deleted == 1
+    assert _registry(project)["post_id"].to_list() == ["p1", "p3"]
+
+
+def test_guarded_deletion_approval_is_bound_to_discovered_snapshot(tmp_path: Path) -> None:
+    """#741: approval for one snapshot cannot authorize a changed snapshot."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.close()
+    with pytest.raises(RunError, match="source deletion") as refusal:
+        run_project(project)
+    token = re.search(r"snapshot ([0-9a-f]{64})", str(refusal.value))
+    assert token is not None
+
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("INSERT INTO rawdata.reddit_posts VALUES ('p2', 'economics', 'second post text')")
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p3'")
+    con.close()
+    with pytest.raises(RunError, match="source deletion"):
+        run_project(project, deletion_approvals={"post_registry": token.group(1)})
+    assert _registry(project).height == 3
+
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute(
+        "INSERT INTO rawdata.reddit_posts VALUES ('p3', 'wallstreetbets', 'third post text')"
+    )
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.execute("UPDATE rawdata.reddit_posts SET selftext = 'edited' WHERE post_id = 'p1'")
+    con.close()
+    with pytest.raises(RunError, match="source deletion") as stale:
+        run_project(project, deletion_approvals={"post_registry": token.group(1)})
+    assert _registry(project).height == 3
+    revised = re.search(r"snapshot ([0-9a-f]{64})", str(stale.value))
+    assert revised is not None and revised.group(1) != token.group(1)
+    result = run_project(project, deletion_approvals={"post_registry": revised.group(1)})[0]
+    assert result.documents_deleted == 1
+    assert _registry(project)["post_id"].to_list() == ["p1", "p3"]
+
+
+def test_guarded_source_refuses_inconsistent_target_and_state(tmp_path: Path) -> None:
+    """#741: an existing target with an incomplete baseline is not a first run."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    before = _registry(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    row = con.execute("SELECT record_key FROM main.stel_state LIMIT 1").fetchone()
+    assert row is not None
+    key = row[0]
+    con.execute("DELETE FROM main.stel_state WHERE record_key = ?", [key])
+    con.close()
+    with pytest.raises(RunError, match="target and state disagree"):
+        run_project(project)
+    assert _registry(project).equals(before)
+    with pytest.raises(RunError, match="cannot run with --full-refresh"):
+        run_project(project, full_refresh=True)
+    assert _registry(project).equals(before)
+
+
+def test_guarded_source_refuses_duplicate_target_rows(tmp_path: Path) -> None:
+    """#741: identical duplicate rows must not collapse into a valid baseline."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("INSERT INTO main.post_registry SELECT * FROM main.post_registry LIMIT 1")
+    con.close()
+    before = _registry(project)
+    with pytest.raises(RunError, match="duplicate target identities"):
+        run_project(project)
+    assert _registry(project).equals(before)
+
+
+def test_guarded_delete_rechecks_duplicate_target_in_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#741: a duplicate introduced after the first baseline check blocks deletion."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.close()
+    with pytest.raises(RunError) as refusal:
+        run_project(project)
+    token = re.search(r"snapshot ([0-9a-f]{64})", str(refusal.value))
+    assert token is not None
+    original = DuckDBAdapter.delete_guarded_extraction_rows
+
+    def duplicate_target(self: DuckDBAdapter, table: str, **kwargs: Any) -> int:
+        self.connection.execute(
+            "INSERT INTO main.post_registry SELECT * FROM main.post_registry LIMIT 1"
+        )
+        return original(self, table, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "delete_guarded_extraction_rows", duplicate_target)
+    with pytest.raises(RunError, match="could not verify"):
+        run_project(project, deletion_approvals={"post_registry": token.group(1)})
+    assert _registry(project).height == 4
+
+
+def test_guarded_full_refresh_is_rejected_before_source_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+
+    def forbidden_discovery(*args: object, **kwargs: object) -> None:
+        raise AssertionError("source discovery ran before rejecting full refresh")
+
+    monkeypatch.setattr(WarehouseDocumentSource, "discover", forbidden_discovery)
+    with pytest.raises(RunError, match="cannot run with --full-refresh"):
+        run_project(project, full_refresh=True)
+
+
+def test_invalid_deletion_approvals_fail_before_opening_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+
+    def forbidden_adapter(*args: object, **kwargs: object) -> None:
+        raise AssertionError("adapter opened before validating the approval")
+
+    monkeypatch.setattr("stel.runner.create_adapter", forbidden_adapter)
+    with pytest.raises(RunError, match="Invalid source deletion approval"):
+        run_project(project, deletion_approvals={"post_registry": "not-a-sha"})
+    with pytest.raises(RunError, match="outside the selection"):
+        run_project(project, select="reddit_rows", deletion_approvals={"post_registry": "0" * 64})
+
+
+def test_guarded_approval_refuses_state_changed_before_atomic_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#741: a state change after approval must not delete the newer record."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    before = _registry(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.close()
+    with pytest.raises(RunError) as refusal:
+        run_project(project)
+    token = re.search(r"snapshot ([0-9a-f]{64})", str(refusal.value))
+    assert token is not None
+    original = DuckDBAdapter.delete_guarded_extraction_rows
+
+    def concurrent_change(self: DuckDBAdapter, table: str, **kwargs: Any) -> int:
+        key = kwargs["keys"][0]
+        self.connection.execute(
+            "UPDATE main.stel_state SET input_fingerprint = 'newer' WHERE record_key = ?",
+            [key],
+        )
+        return original(self, table, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "delete_guarded_extraction_rows", concurrent_change)
+    with pytest.raises(RunError, match="could not verify"):
+        run_project(project, deletion_approvals={"post_registry": token.group(1)})
+    assert _registry(project).equals(before)
+
+
+@pytest.mark.parametrize("command", ["run", "build"])
+def test_guarded_deletion_requires_explicit_snapshot_approval(tmp_path: Path, command: str) -> None:
+    """#741: the CLI must approve exactly the snapshot it will reconcile."""
+    project = _project(tmp_path)
+    models = project / "models" / "models.yml"
+    models.write_text(
+        models.read_text(encoding="utf-8").replace(
+            "backend: json\n", "backend: json\n      on_source_deletion: guard\n"
+        ),
+        encoding="utf-8",
+    )
+    run_project(project)
+    con = duckdb.connect(str(project / "target" / "db.duckdb"))
+    con.execute("DELETE FROM rawdata.reddit_posts WHERE post_id = 'p2'")
+    con.close()
+    runner = CliRunner()
+    args = ["--project-dir", str(project), command]
+    refused = runner.invoke(cli, args)
+    assert refused.exit_code != 0
+    match = re.search(r"snapshot ([0-9a-f]{64})", refused.output)
+    assert match is not None
+    assert "p2" not in refused.output
+    assert _registry(project).height == 3
+    approved = runner.invoke(
+        cli, [*args, "--approve-source-deletions", f"post_registry={match.group(1)}"]
+    )
+    assert approved.exit_code == 0, approved.output
+    assert _registry(project)["post_id"].to_list() == ["p1", "p3"]
 
 
 @pytest.mark.parametrize("backend", ["json", "json_memory"])

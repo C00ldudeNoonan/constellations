@@ -267,6 +267,9 @@ class _FakeJob:
         self.result_timeout = timeout
         return list(self._rows)
 
+    def done(self) -> bool:
+        return True
+
 
 class _FailingJob(_FakeJob):
     def result(self, timeout: Any = None) -> list[_FakeRow]:
@@ -311,6 +314,21 @@ class _FakeClient:
         # Arrow batches rather than rows (issue #418).
         self.query_results: list[Any] = []
         self.updated_tables: list[tuple[Any, list[str]]] = []
+        self.claims: dict[str, Any] = {}
+
+    def create_dataset(self, dataset: Any, exists_ok: bool = False) -> Any:
+        return dataset
+
+    def create_table(self, table: Any, exists_ok: bool = False) -> Any:
+        from google.api_core.exceptions import Conflict
+
+        key = f"{table.project}.{table.dataset_id}.{table.table_id}"
+        if key in self.claims:
+            if exists_ok:
+                return self.claims[key]
+            raise Conflict("already claimed")
+        self.claims[key] = table
+        return table
 
     def query(self, sql: str, job_config: Any = None, **kwargs: Any) -> _FakeJob:
         self.queries.append((sql, job_config))
@@ -326,6 +344,8 @@ class _FakeClient:
     def get_table(self, table_id: str) -> Any:
         from google.api_core.exceptions import NotFound
 
+        if table_id in self.claims:
+            return self.claims[table_id]
         if table_id not in self.tables:
             raise NotFound(table_id)
         schema = [
@@ -354,9 +374,14 @@ class _FakeClient:
         raise NotFound(dataset_id)
 
     def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
+        if table_id in self.claims:
+            del self.claims[table_id]
+            return
         self.dropped.append(table_id)
 
     def update_table(self, table: Any, fields: list[str]) -> Any:
+        if getattr(table, "table_id", None) == "stel_writer_claim":
+            return table
         self.updated_tables.append((table, list(fields)))
         meta = self.table_meta.setdefault(table._fake_table_id, {})
         for field in fields:
@@ -426,7 +451,7 @@ def test_incremental_upsert_uses_staging_merge() -> None:
     assert "WHEN MATCHED THEN UPDATE SET" in sql
     assert "WHEN NOT MATCHED THEN INSERT" in sql
     assert "DELETE FROM" not in sql
-    assert query_config is None
+    assert set(query_config.labels) == {"stel_writer"}
     assert len(client.loads) == 1
     assert client.dropped == [staging_id]
 
@@ -1077,6 +1102,186 @@ def test_delete_rows_and_state_uses_one_scoped_transaction() -> None:
     assert params[4].values == ["chunk-1", "chunk-2"]
 
 
+def test_guarded_extraction_delete_checks_baseline_inside_one_transaction() -> None:
+    """#741: baseline, target and removals are checked before any committed delete."""
+    client = _FakeClient()
+    client.query_results = [_FakeJob(rows=[(1,)])]
+    adapter = _adapter(client)
+    state = {"a": StateValue("hash-a", "v1"), "b": StateValue("hash-b", "v1")}
+    scope = StateScope("m")
+    deleted = adapter.delete_guarded_extraction_rows(
+        "docs", keys=["b"], state_scope=scope, expected_state=state
+    )
+    assert deleted == 1
+    assert len(client.loads) == 2
+    assert len(client.dropped) == 2
+    sql, config = client.queries[-1]
+    assert sql.index("BEGIN TRANSACTION") < sql.index("UPDATE ") < sql.index("SET guard_valid")
+    assert sql.index("SET guard_valid") < sql.index("DELETE FROM") < sql.index("COMMIT TRANSACTION")
+    first_check = sql.index("SET guard_valid")
+    assert sql.index("UPDATE `proj`.`ds`.`stel_state`") < first_check
+    assert sql.index("UPDATE `proj`.`ds`.`docs`") < first_check
+    assert sql.count("SET guard_valid") == 2
+    assert "Guarded extraction state changed" in sql
+    assert "Guarded extraction target and state disagree" in sql
+    assert [param.value for param in config.query_parameters] == [
+        scope.model_name,
+        scope.stage,
+        scope.target_identity,
+    ]
+
+
+def test_guarded_extraction_delete_rejects_unknown_keys_before_staging() -> None:
+    client = _FakeClient()
+    adapter = _adapter(client)
+    with pytest.raises(AdapterError, match="Invalid guarded"):
+        adapter.delete_guarded_extraction_rows(
+            "docs",
+            keys=["missing"],
+            state_scope=StateScope("m"),
+            expected_state={"a": StateValue("hash-a", "v1")},
+        )
+    assert not client.loads and not client.queries
+
+
+@pytest.mark.parametrize("operation", ["create", "upsert", "append", "state", "delete"])
+def test_writer_claim_excludes_competing_mutations_and_profile_aliases(operation: str) -> None:
+    """#741: every publication path must contend on the physical dataset, even on first use."""
+    client = _FakeClient()
+    owner = _adapter(client)
+    contender = _adapter(client, execution_project="another-billing-project")
+    frame = pl.DataFrame({"document_id": ["new"], "content_hash": ["h"], "code_version": ["v"]})
+    with owner.writer_claim():
+        claim = next(iter(client.claims.values()))
+        assert claim.expires is None
+        calls = {
+            "create": lambda: contender.materialize_full("docs", frame),
+            "upsert": lambda: contender.materialize_incremental(
+                "docs", frame, key_col="document_id"
+            ),
+            "append": lambda: contender.append_rows("docs", frame),
+            "state": lambda: contender.upsert_state(
+                StateScope("docs"), [StateRecord("new", "h", "v")]
+            ),
+            "delete": lambda: contender.delete_guarded_extraction_rows(
+                "docs", keys=["old"], state_scope=StateScope("docs"),
+                expected_state={"old": StateValue("h", "v")},
+            ),
+        }
+        with pytest.raises(AdapterError, match="writer claim unavailable"):
+            calls[operation]()
+        assert not client.loads and not client.queries
+        owner.materialize_full("docs", frame)
+        assert len(client.claims) == 1
+    assert not client.claims
+    contender.append_rows("docs", frame)
+    assert not client.claims
+
+
+@pytest.mark.parametrize("failure", ["pending", "lost_response"])
+def test_writer_claim_retains_uncertain_jobs_and_requires_quiescent_recovery(failure: str) -> None:
+    """#741: neither a process timeout nor a lost submission response releases authority."""
+    class PendingJob(_FakeJob):
+        terminal = False
+
+        def result(self, timeout: Any = None) -> list[_FakeRow]:
+            raise TimeoutError("sensitive-provider-response")
+
+        def done(self) -> bool:
+            return self.terminal
+
+    class UncertainClient(_FakeClient):
+        def load_table_from_file(
+            self, fobj: io.BytesIO, table_id: str, job_config: Any = None
+        ) -> _FakeJob:
+            super().load_table_from_file(fobj, table_id, job_config)
+            if failure == "lost_response":
+                raise TimeoutError("sensitive-provider-response")
+            return pending
+
+    pending = PendingJob()
+    client = UncertainClient()
+    owner = _adapter(client)
+    frame = pl.DataFrame({"document_id": ["a"]})
+    with pytest.raises(AdapterError, match="claim retained") as error:
+        owner.materialize_full("docs", frame)
+    assert "sensitive-provider-response" not in str(error.value)
+    assert error.value.__suppress_context__
+    assert len(client.claims) == 1
+    contender = _adapter(client)
+    with pytest.raises(AdapterError, match="claim unavailable"):
+        contender.append_rows("docs", frame)
+    assert len(client.loads) == 1
+    # An operator must stop the owner AND establish terminal jobs before
+    # manually removing the claim. There is deliberately no timed steal API.
+    pending.terminal = True
+    client.delete_table(next(iter(client.claims)))
+    with pytest.raises(AdapterError, match="operator recovery"):
+        owner.append_rows("docs", frame)
+    with contender.writer_claim():
+        pass
+
+
+def test_writer_claim_never_deletes_another_owner_or_accepts_a_lost_acquisition() -> None:
+    """#741: failed acquisition and changed ownership both fail closed without clearing a claim."""
+    class LostAcquisitionClient(_FakeClient):
+        def create_table(self, table: Any, exists_ok: bool = False) -> Any:
+            super().create_table(table, exists_ok)
+            raise TimeoutError("sensitive-acquisition-response")
+
+    client = LostAcquisitionClient()
+    with pytest.raises(AdapterError, match="unavailable") as error:
+        with _adapter(client).writer_claim():
+            pytest.fail("an ambiguous acquisition authorized work")
+    assert "sensitive-acquisition-response" not in str(error.value)
+    assert len(client.claims) == 1
+    client = _FakeClient()
+    owner = _adapter(client)
+    with pytest.raises(AdapterError, match="claim retained"):
+        with owner.writer_claim():
+            table = next(iter(client.claims.values()))
+            table.labels = {"stel_writer": "replacement-owner"}
+            with pytest.raises(AdapterError, match="could not be verified"):
+                owner.append_rows("docs", pl.DataFrame({"document_id": ["a"]}))
+            assert not client.loads
+    assert next(iter(client.claims.values())).labels["stel_writer"] == "replacement-owner"
+
+
+def test_writer_claim_tracks_jobs_without_transparent_retries_or_completed_job_growth() -> None:
+    """#741: label jobs for recovery, disable retries and forget confirmed completions."""
+    client = _FakeClient()
+    owner = _adapter(client)
+    with owner.writer_claim():
+        owner.append_rows("docs", pl.DataFrame({"document_id": ["a"]}))
+        owner.scalar("SELECT 1")
+        claim = owner._writer_claim
+        assert claim is not None
+        assert not claim._jobs
+        assert client.loads[0][2].labels["stel_writer"] == claim.owner
+        assert client.queries[0][1].labels["stel_writer"] == claim.owner
+        assert client.query_kwargs[0]["job_retry"] is None
+
+
+def test_writer_claim_retains_ambiguous_table_metadata_mutation() -> None:
+    """#741: a timed-out table deletion must not land after authority moves to another writer."""
+    class LostDeleteClient(_FakeClient):
+        def delete_table(self, table_id: str, not_found_ok: bool = False) -> None:
+            is_claim = table_id in self.claims
+            super().delete_table(table_id, not_found_ok)
+            if not is_claim:
+                raise TimeoutError("sensitive-metadata-response")
+
+    client = LostDeleteClient()
+    owner = _adapter(client)
+    with pytest.raises(AdapterError, match="claim retained") as error:
+        owner.drop_table("docs")
+    assert "sensitive-metadata-response" not in str(error.value)
+    assert len(client.claims) == 1
+    with pytest.raises(AdapterError, match="claim unavailable"):
+        _adapter(client).append_rows("docs", pl.DataFrame({"document_id": ["a"]}))
+    assert not client.loads
+
+
 def test_list_tables_filters_internal() -> None:
     client = _FakeClient()
     client.listing = ["docs", "stel_state", "stel_test_failures__docs__not_null"]
@@ -1366,7 +1571,7 @@ def test_materialize_full_bad_layout_keeps_target() -> None:
     client = _FailingLoadClient()
     adapter = _adapter(client)
     opts = _parse_options({"partition_by": {"field": "no_such_column"}})
-    with pytest.raises(RuntimeError, match="mismatch"):
+    with pytest.raises(AdapterError, match="claim retained"):
         adapter.materialize_full(
             "docs", pl.DataFrame({"document_id": ["a"]}), options=opts
         )
@@ -1514,7 +1719,9 @@ def test_materialize_full_applies_table_options_and_kms() -> None:
     assert job_config.destination_encryption_configuration.kms_key_name == (
         "projects/p/locations/us/keyRings/r/cryptoKeys/k"
     )
-    assert job_config.labels == {"team": "econ", "env": "prod"}
+    assert job_config.labels == {
+        "team": "econ", "env": "prod", "stel_writer": job_config.labels["stel_writer"]
+    }
 
     swap_sql, swap_config = client.queries[0]
     # every table option — kms included — rides the atomic CREATE OR REPLACE
@@ -1531,7 +1738,7 @@ def test_materialize_full_applies_table_options_and_kms() -> None:
         "kms_key_name = 'projects/p/locations/us/keyRings/r/cryptoKeys/k'"
         in swap_sql
     )
-    assert swap_config.labels == {"team": "econ", "env": "prod"}
+    assert swap_config.labels == job_config.labels
 
 
 def test_partition_migration_configures_staging_before_swap() -> None:
@@ -1594,8 +1801,10 @@ def test_full_chunks_ctas_carries_options_clause() -> None:
         in swap_sql
     )
     # labels also ride the load + swap jobs
-    assert client.loads[0][2].labels == {"team": "econ"}
-    assert client.queries[0][1].labels == {"team": "econ"}
+    assert client.loads[0][2].labels == {
+        "team": "econ", "stel_writer": client.loads[0][2].labels["stel_writer"]
+    }
+    assert client.queries[0][1].labels == client.loads[0][2].labels
 
 
 # ─── the incremental MERGE is pruned to the batch's layout (issue #664) ──────
@@ -1721,7 +1930,7 @@ def test_merge_pruning_keeps_the_fingerprint_and_labels() -> None:
     )
     script, config = client.queries[0]
     assert script.count("WHEN MATCHED AND (") == 2
-    assert config.labels == {"team": "econ"}
+    assert config.labels == {"team": "econ", "stel_writer": config.labels["stel_writer"]}
 
 
 def test_merge_pruning_skips_a_layout_column_with_a_null_in_the_batch() -> None:
@@ -1982,7 +2191,9 @@ def test_merge_stays_default_with_table_options() -> None:
     sql, query_config = client.queries[0]
     assert sql.startswith("MERGE")
     assert "WHEN MATCHED THEN UPDATE SET" in sql
-    assert query_config.labels == {"team": "econ"}
+    assert query_config.labels == {
+        "team": "econ", "stel_writer": query_config.labels["stel_writer"]
+    }
 
 
 def test_duckdb_ignores_warehouse_options(tmp_path: Path) -> None:
@@ -4376,6 +4587,152 @@ def test_a_defaulted_dataset_beside_a_populated_legacy_one_refuses() -> None:
     adapter._client = client
     with pytest.raises(LegacyWarehouseNamesError, match=f"schema: {LEGACY_SCHEMA_NAME}"):
         adapter._guard_legacy_names()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_guarded_extraction_delete_is_atomic() -> None:
+    """#741: actual BigQuery checks both baselines and rolls back on disagreement."""
+    from google.api_core.exceptions import BadRequest
+    from google.cloud import bigquery
+
+    dataset = "stel_it_" + os.urandom(16).hex()
+    dataset_id = f"{_BQ_PROJECT}.{dataset}"
+    cfg = parse_warehouse_config({"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset})
+    adapter = create_adapter(cfg)
+    scope = StateScope("docs")
+    baseline = {"a": StateValue("hash-a", "v1"), "b": StateValue("hash-b", "v1")}
+    client = bigquery.Client(project=_BQ_PROJECT)
+    created = False
+    try:
+        # A collision must fail before cleanup can remove another dataset.
+        client.create_dataset(dataset_id, exists_ok=False)
+        created = True
+        with adapter:
+            adapter.materialize_full(
+                "docs",
+                pl.DataFrame({"document_id": ["a", "b"], "content_hash": ["hash-a", "hash-b"],
+                              "code_version": ["v1", "v1"]}),
+            )
+            adapter.upsert_state(scope, [StateRecord(k, v.input_fingerprint, v.code_version)
+                                         for k, v in baseline.items()])
+            adapter.upsert_state(scope, [StateRecord("a", "changed", "v1")])
+            changed_state = adapter.fetch_state(scope)
+            with pytest.raises(BadRequest, match="Guarded extraction state changed"):
+                adapter.delete_guarded_extraction_rows(
+                    "docs", keys=["b"], state_scope=scope, expected_state=baseline
+                )
+            assert adapter.fetch_state(scope) == changed_state
+            assert adapter.relation_row_count(f"{dataset}.docs") == 2
+            adapter.upsert_state(scope, [StateRecord("a", "hash-a", "v1")])
+            adapter.execute(f"UPDATE {adapter.table_ref('docs')} SET content_hash = 'wrong' "
+                            "WHERE document_id = 'a'")
+            with pytest.raises(BadRequest, match="Guarded extraction target and state disagree"):
+                adapter.delete_guarded_extraction_rows(
+                    "docs", keys=["b"], state_scope=scope, expected_state=baseline
+                )
+            assert adapter.fetch_state(scope) == baseline
+            assert adapter.relation_row_count(f"{dataset}.docs") == 2
+            adapter.execute(f"UPDATE {adapter.table_ref('docs')} SET content_hash = 'hash-a' "
+                            "WHERE document_id = 'a'")
+            adapter.execute(
+                f"INSERT INTO {adapter.table_ref('docs')} "
+                f"SELECT * FROM {adapter.table_ref('docs')} WHERE document_id = 'b'"
+            )
+            with pytest.raises(BadRequest, match="Guarded extraction target and state disagree"):
+                adapter.delete_guarded_extraction_rows(
+                    "docs", keys=["b"], state_scope=scope, expected_state=baseline
+                )
+            assert adapter.fetch_state(scope) == baseline
+            assert adapter.relation_row_count(f"{dataset}.docs") == 3
+            adapter.execute(f"DELETE FROM {adapter.table_ref('docs')} WHERE document_id = 'b'")
+            adapter.execute(
+                f"INSERT INTO {adapter.table_ref('docs')} "
+                "(document_id, content_hash, code_version) VALUES ('b', 'hash-b', 'v1')"
+            )
+            assert adapter.delete_guarded_extraction_rows(
+                "docs", keys=["b"], state_scope=scope, expected_state=baseline
+            ) == 1
+            assert adapter.fetch_state(scope) == {"a": baseline["a"]}
+            assert adapter.rows(f"SELECT document_id FROM {adapter.table_ref('docs')}") == [("a",)]
+    finally:
+        try:
+            if created:
+                client.delete_dataset(dataset_id, delete_contents=True, not_found_ok=True)
+        finally:
+            client.close()
+
+
+@pytest.mark.skipif(
+    not _BQ_PROJECT, reason="set STEL_BQ_TEST_PROJECT to run BigQuery integration"
+)
+def test_integration_writer_claim_excludes_writers_and_retains_lost_job_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#741: real tables.insert exclusion covers first publication, append and job recovery."""
+    from google.cloud import bigquery
+
+    dataset_id = f"{_BQ_PROJECT}.stel_it_{os.urandom(16).hex()}"
+    cfg = parse_warehouse_config(
+        {"type": "bigquery", "project": _BQ_PROJECT, "dataset": dataset_id.split(".")[1]}
+    )
+    owner = create_adapter(cfg)
+    contender = create_adapter(cfg)
+    assert isinstance(owner, BigQueryAdapter)
+    assert isinstance(contender, BigQueryAdapter)
+    client = bigquery.Client(project=_BQ_PROJECT)
+    created = False
+    jobs: list[Any] = []
+    try:
+        dataset = bigquery.Dataset(dataset_id)
+        dataset.default_table_expiration_ms = 3600000
+        client.create_dataset(dataset, exists_ok=False)
+        created = True
+        frame = pl.DataFrame({"document_id": ["a"], "content_hash": ["h"], "code_version": ["v"]})
+        # Hold before initialization/discovery, including on an empty dataset.
+        with owner.writer_claim(), owner:
+            claim_id = f"{dataset_id}.stel_writer_claim"
+            assert client.get_table(claim_id).expires is None
+            with pytest.raises(AdapterError, match="claim unavailable"):
+                with contender.writer_claim():
+                    pytest.fail("a competing writer acquired the same dataset")
+            with contender.preflight_reads():
+                with pytest.raises(AdapterError, match="claim unavailable"):
+                    contender.materialize_incremental("docs", frame, key_col="document_id")
+                with pytest.raises(AdapterError, match="claim unavailable"):
+                    contender.append_rows("docs", frame)
+            owner.materialize_full("docs", frame)
+        with owner:
+            original = owner.client.load_table_from_file
+
+            def lose_response(*args: Any, **kwargs: Any) -> Any:
+                jobs.append(original(*args, **kwargs))
+                raise TimeoutError("synthetic lost response")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(owner.client, "load_table_from_file", lose_response)
+                with pytest.raises(AdapterError, match="claim retained"):
+                    owner.append_rows("docs", frame)
+        with pytest.raises(AdapterError, match="claim unavailable"):
+            with contender.writer_claim():
+                pytest.fail("a stranded claim was stolen")
+        # Stop the old writer, confirm the actual submitted job is terminal,
+        # then perform the documented manual recovery on synthetic data only.
+        for job in jobs:
+            job.result()
+        client.delete_table(claim_id, not_found_ok=False)
+        with contender.writer_claim(), contender:
+            contender.append_rows("docs", frame)
+            assert contender.row_count("docs") == 3
+    finally:
+        try:
+            for job in jobs:
+                job.result()
+            if created:
+                client.delete_dataset(dataset_id, delete_contents=True, not_found_ok=True)
+        finally:
+            client.close()
 
 
 @pytest.mark.skipif(

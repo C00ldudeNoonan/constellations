@@ -42,6 +42,7 @@ from .credentials import CredentialReference, CredentialReferenceError
 from .dag import SelectionError, parse_ref
 from .dbt_export import write_dbt_sources
 from .docs import DocsError, generate_docs, serve_docs
+from .execution.deletion_guard import is_valid_approval
 from .freshness import check_freshness
 from .logging_setup import (
     configure_diagnostics_file,
@@ -1118,6 +1119,18 @@ def plan(
                 click.echo(line)
 
 
+def _parse_deletion_approvals(values: Sequence[str]) -> dict[str, str]:
+    approvals: dict[str, str] = {}
+    for value in values:
+        name, separator, token = value.partition("=")
+        if not separator or not name or name in approvals or not is_valid_approval(token):
+            raise click.UsageError(
+                "Invalid source deletion approval; expected distinct MODEL=SHA256 values."
+            )
+        approvals[name] = token
+    return approvals
+
+
 def _stdin_is_interactive() -> bool:
     return click.get_text_stream("stdin").isatty()
 
@@ -1212,6 +1225,13 @@ def _confirm_cost(projection: CostProjection) -> bool:
     "filtered run never deletes and cannot be combined with --full-refresh.",
 )
 @click.option(
+    "--approve-source-deletions",
+    "deletion_approval_args",
+    multiple=True,
+    metavar="MODEL=TOKEN",
+    help="Approve a reviewed guarded source-deletion snapshot (repeatable).",
+)
+@click.option(
     "--read-filter",
     "read_filter",
     multiple=True,
@@ -1244,6 +1264,7 @@ def run(
     threads: int,
     state: Path | None,
     source_filter: tuple[str, ...],
+    deletion_approval_args: tuple[str, ...],
     read_filter: tuple[tuple[str, str, str], ...],
     json_output: bool,
     verbose: int,
@@ -1253,6 +1274,9 @@ def run(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    deletion_approvals = _parse_deletion_approvals(deletion_approval_args)
+    if watch and deletion_approvals:
+        raise click.UsageError("Source deletion approval cannot be used with --watch.")
     # `run --threads N` executes independent models concurrently, each with its
     # own progress bar on one stderr — fall back to interleave-safe log lines.
     _configure_output(
@@ -1299,6 +1323,7 @@ def run(
             state=state,
             source_filter=source_filter,
             read_filter=read_filter,
+            deletion_approvals=deletion_approvals,
             accept_reprocess=accept_reprocess,
             accept_cost=accept_cost,
             confirm_cost=_cost_confirmation(json_output),
@@ -1482,6 +1507,13 @@ def _usage_summary(
     "filtered run never deletes and cannot be combined with --full-refresh.",
 )
 @click.option(
+    "--approve-source-deletions",
+    "deletion_approval_args",
+    multiple=True,
+    metavar="MODEL=TOKEN",
+    help="Approve a reviewed guarded source-deletion snapshot (repeatable).",
+)
+@click.option(
     "--read-filter",
     "read_filter",
     multiple=True,
@@ -1514,6 +1546,7 @@ def build(
     store_failures: bool,
     state: Path | None,
     source_filter: tuple[str, ...],
+    deletion_approval_args: tuple[str, ...],
     read_filter: tuple[tuple[str, str, str], ...],
     json_output: bool,
     verbose: int,
@@ -1524,6 +1557,7 @@ def build(
     project_dir: Path = ctx.obj["project_dir"]
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
+    deletion_approvals = _parse_deletion_approvals(deletion_approval_args)
     _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=json_output)
     start = time.monotonic()
     try:
@@ -1540,6 +1574,7 @@ def build(
             state=state,
             source_filter=source_filter,
             read_filter=read_filter,
+            deletion_approvals=deletion_approvals,
             accept_reprocess=accept_reprocess,
             accept_cost=accept_cost,
             confirm_cost=_cost_confirmation(json_output),

@@ -1228,6 +1228,45 @@ class DuckDBAdapter(WarehouseAdapter):
             self._delete_state_rows(state_scope, scoped_keys)
         return deleted_count
 
+    def delete_guarded_extraction_rows(
+        self,
+        table: str,
+        *,
+        keys: Sequence[str],
+        state_scope: StateScope,
+        expected_state: Mapping[str, StateValue],
+    ) -> int:
+        validate_state_keys(keys)
+        with self._transaction():
+            if self.fetch_state(state_scope) != dict(expected_state):
+                raise AdapterError("Guarded extraction state changed; retry and review again")
+            if self._table_columns(table) is None:
+                raise AdapterError("Guarded extraction target is missing; refusing deletion")
+            ids = self.connection.execute(
+                "SELECT document_id, content_hash, code_version "
+                f"FROM {self.table_ref(table)}"
+            ).fetchall()
+            expected = {
+                (key, value.input_fingerprint, value.code_version)
+                for key, value in expected_state.items()
+            }
+            if len(ids) != len(expected) or set(ids) != expected:
+                raise AdapterError(
+                    "Guarded extraction target and state disagree; refusing deletion"
+                )
+            if not keys:
+                return 0
+            placeholders = ", ".join("?" for _ in keys)
+            cursor = self.connection.execute(
+                f"DELETE FROM {self.table_ref(table)} "
+                f"WHERE {self.quote_ident('document_id')} IN ({placeholders})",
+                list(keys),
+            )
+            deleted = cursor.fetchone()
+            self._delete_state_rows(state_scope, keys)
+            return int(deleted[0]) if deleted else 0
+
+
     def replace_children(
         self,
         table: str,

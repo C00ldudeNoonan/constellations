@@ -24,7 +24,6 @@ import pytest
 from click.testing import CliRunner
 
 from stel import runner as runner_module
-
 from stel.adapters import create_adapter, parse_warehouse_config
 from stel.adapters.duckdb import DuckDBAdapter
 from stel.cli import cli

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.24.1 - 2026-11-03
 
 - Incremental extraction can opt into `on_source_deletion: guard`, requiring
   snapshot-bound approval with `--approve-source-deletions` before removing

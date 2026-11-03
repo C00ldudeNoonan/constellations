@@ -522,6 +522,10 @@ _PROBE = {
 # (domain, version, digest of _PROBE). Every `canonical_fingerprint` call site
 # in src/ is represented; test_every_fingerprint_domain_is_pinned enforces that.
 _FINGERPRINT_GOLDENS: tuple[tuple[str, int, str], ...] = (
+    ("stel-context-assembly-policy", 1, "c0a9a0a74e8ece3f281430b7794512bd"),
+    ("stel-context-assembly-snapshot", 1, "2a6fcfc460581147146fae1086c7f03e"),
+    ("stel-context-assembly-prompt", 1, "fc38c297359e6c1afec708d5dd7226df"),
+    ("stel-context-assembly-answer", 1, "0d42690d91105c8959d16fac6af19cfa"),
     ("chunk-input", 2, "94c9f5e4a79220f0d0db180a36783470"),
     ("dbt-ml-agent-context-document", 1, "9a7d138624cf31cbd52ea165510dca30"),
     ("dbt-ml-agent-context-document-version", 1, "f14d8f4b9acb0001224fbbd22286c57c"),

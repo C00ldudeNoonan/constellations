@@ -58,6 +58,7 @@ history (issue #311).
 | [0046](0046-class-ancestry-is-a-compiled-declaration.md) | Class ancestry is a compiled declaration shared by relation checks, MCP and concept clouds | accepted |
 | [0047](0047-source-deletion-approval-binds-the-discovered-snapshot.md) | Approval for source deletion binds the discovered snapshot and prior state | accepted; amended by 0048 |
 | [0048](0048-bigquery-writers-hold-a-non-expiring-claim.md) | BigQuery writers hold a non-expiring claim across discovery and publication | accepted; amends 0047 |
+| [0049](0049-context-assembly-is-an-offline-experiment-before-serving-policy.md) | Context assembly is evaluated on frozen governed evidence before changing serving policy | accepted |
 
 ## When to write one
 

@@ -35,3 +35,21 @@ operator action, not authentication. This is opt-in to preserve existing
 projects' behavior. The guard cannot establish that the listing is complete,
 and later pipeline failures still require operational recovery. Baseline
 comparison and transactional deletion add warehouse reads and mutation cost.
+
+## Open concurrency blocker
+
+The proposed BigQuery transaction alone does not enforce the reviewed baseline
+against concurrent writers: insert-only MERGEs and append loads can run while
+it mutates the target and state, and its snapshot does not see those writes.
+This must be fixed before the guard is released. A viable cooperative design
+needs one canonical claim for each physical extraction target, acquired before
+discovery and held across deletion and every publication. Each target and
+state mutation must enforce the same fence atomically; first creation and
+append paths cannot bypass it. Recovery must account for warehouse jobs that
+outlive the process rather than stealing a claim on a timer.
+
+Such a claim controls participating writers only. Older stel versions, direct
+warehouse writes, and other clients can bypass it unless warehouse permissions
+enforce the writer boundary. The operator-facing contract must state this
+limit, and concurrency tests must cover new keys, existing keys, first creation,
+recovery and delayed jobs before the issue can be closed.

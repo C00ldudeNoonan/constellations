@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- A backend's incremental identity now covers only the option definitions it reaches,
+  not all of `backends/options.py`. An edit to one backend's options, such as the LLM
+  `temperature` default in 0.24.0, no longer re-keys the JSON, HTML, PDF, Markdown or
+  email backends (issue #572, ADR-0050). The first run after upgrading re-keys every
+  `extraction:` model once, because the identity algorithm changed; if 0.24.0 already
+  made your rows stale, upgrade before rebuilding so the corpus is rewritten once.
+
 ## v0.24.1 - 2026-11-03
 
 - Incremental extraction can opt into `on_source_deletion: guard`, requiring

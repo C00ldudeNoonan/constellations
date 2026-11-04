@@ -17,6 +17,13 @@ from typing import Any
 from .._distribution import distribution_version
 from ..budget import BudgetGuard
 from ..hashing import HASH_DIGEST_SIZE
+from .options_identity import (
+    CLOSURE_KEY,
+    OPTIONS_MODULE,
+    SHARED_VALIDATION_PATH,
+    options_closure,
+    options_imports,
+)
 
 
 @dataclass
@@ -129,7 +136,12 @@ class BaseBackend(ABC):
             "backend_class_source": _source_digest(backend_type),
             "backend_module_source": _source_digest(backend_module),
             "dependency_sources": (
-                dict(_dependency_source_digests(backend_module.__name__))
+                dict(
+                    _dependency_source_digests(
+                        backend_module.__name__,
+                        option_roots=self._option_model_roots(),
+                    )
+                )
                 if backend_module is not None
                 else None
             ),
@@ -139,6 +151,18 @@ class BaseBackend(ABC):
             canonical.encode(), digest_size=HASH_DIGEST_SIZE
         ).hexdigest()
         return f"stel/backend/{digest}"
+
+    def _option_model_roots(self) -> tuple[str, ...]:
+        """This backend's own option model, when the options module defines it,
+        as the root its identity follows into that module (issue #572)."""
+        from .options import get_backend_option_contract, list_backend_option_contracts
+
+        if self.name() not in list_backend_option_contracts():
+            return ()
+        model = get_backend_option_contract(self.name()).options_model
+        if model.__module__ != OPTIONS_MODULE:
+            return ()
+        return (model.__name__,)
 
     def parser_identity(self) -> str | None:
         """Third-party parser identity for incremental invalidation.
@@ -155,12 +179,18 @@ class BaseBackend(ABC):
         return None
 
 
-def _source_digest(obj: Any) -> str | None:
+def _source_text(obj: Any) -> str | None:
     if obj is None:
         return None
     try:
-        source = inspect.getsource(obj)
+        return inspect.getsource(obj)
     except (OSError, TypeError):
+        return None
+
+
+def _source_digest(obj: Any) -> str | None:
+    source = _source_text(obj)
+    if source is None:
         return None
     return hashlib.blake2b(
         source.encode(), digest_size=HASH_DIGEST_SIZE
@@ -172,7 +202,9 @@ _OWN_PACKAGE = __name__.partition(".")[0]
 
 @functools.cache
 def _dependency_source_digests(
-    module_name: str, package: str = _OWN_PACKAGE
+    module_name: str,
+    package: str = _OWN_PACKAGE,
+    option_roots: tuple[str, ...] = (),
 ) -> tuple[tuple[str, str | None], ...]:
     """Source digests of every `package` module `module_name` transitively
     imports, sorted by module name; the origin module itself is excluded
@@ -180,26 +212,77 @@ def _dependency_source_digests(
     source fails to resolve digests as None rather than being dropped, so
     the failure still perturbs identity instead of hiding it.
 
+    The options module is the exception to "every module, whole": it holds
+    every backend's option model, so it enters as one entry covering only the
+    definitions reachable from what the visited modules take from it and from
+    `option_roots` (the backend's own model), issue #572.
+
     Cached per process: source cannot change under a running interpreter,
     and identity is recomputed on every run over every configured model.
     """
     digests: dict[str, str | None] = {}
     seen: set[str] = {module_name}
     queue: list[str] = [module_name]
-    while queue:
-        name = queue.pop()
-        try:
-            module = importlib.import_module(name)
-        except Exception:
-            digests[name] = None
-            continue
-        if name != module_name:
-            digests[name] = _source_digest(module)
-        for dep in _imported_package_modules(module, package):
-            if dep not in seen:
-                seen.add(dep)
-                queue.append(dep)
+    partitioned = OPTIONS_MODULE if _within_package(OPTIONS_MODULE, package) else None
+    if module_name == partitioned:
+        partitioned = None
+    deep: set[str] = set(option_roots)
+    shallow: set[str] = set()
+    while True:
+        while queue:
+            name = queue.pop()
+            try:
+                module = importlib.import_module(name)
+            except Exception:
+                digests[name] = None
+                continue
+            if name != module_name:
+                digests[name] = _source_digest(module)
+            imported = _imported_package_modules(module, package)
+            if partitioned is not None and partitioned in imported:
+                imports = options_imports(
+                    _source_text(module) or "", module_package=module.__package__ or ""
+                )
+                for taken in imports.names:
+                    (shallow if taken in SHARED_VALIDATION_PATH else deep).add(taken)
+                if not imports.whole:
+                    imported.discard(partitioned)
+            for dep in imported:
+                if dep not in seen:
+                    seen.add(dep)
+                    queue.append(dep)
+        if partitioned is None or partitioned in seen:
+            break
+        # The definitions followed in the options module import further stel
+        # modules; hash those like any dependency, which may name more of the
+        # options module in turn.
+        options_source = _source_text(importlib.import_module(partitioned))
+        if options_source is None:
+            # No source to read: digest it as None, like any unreadable module.
+            digests[partitioned] = None
+            break
+        closure = options_closure(
+            options_source,
+            module_package=_parent_package(partitioned),
+            package=package,
+            deep=frozenset(deep),
+            shallow=frozenset(shallow),
+        )
+        digests[CLOSURE_KEY] = closure.digest
+        new = closure.modules - seen
+        if not new:
+            break
+        seen.update(new)
+        queue.extend(new)
     return tuple(sorted(digests.items()))
+
+
+def _within_package(name: str, package: str) -> bool:
+    return name == package or name.startswith(package + ".")
+
+
+def _parent_package(module_name: str) -> str:
+    return module_name.rpartition(".")[0]
 
 
 def _imported_package_modules(module: ModuleType, package: str) -> set[str]:

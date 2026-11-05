@@ -1267,6 +1267,15 @@ best chunk, and the golden set's ids are document ids. Variants that keep
 the record ids (embedding model, index type, search mode, `refine_factor`,
 `nprobes`) compare fine at the default `granularity: record`.
 
+**Context assembly experiments.** The experimental Python library can compare
+relevance/document order, exact-offset overlap removal and bounded neighbors
+on frozen governed evidence under one complete prompt token budget. It is
+separate from `stel eval` and does not change MCP serving. See the runnable
+[offline example](../examples/context_assembly/README.md) and
+[experiment/review contract](architecture/context-assembly.md). Missing answer
+reviews remain null; synthetic packing results do not establish a model-quality
+winner or select a production policy.
+
 **When the experiment ends.** Keep the winner by dropping the axis and
 writing its value into the base model. That is a `code_version` change, so
 run `stel plan` first: the base model's own state is stale and reprocesses,

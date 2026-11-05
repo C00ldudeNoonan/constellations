@@ -15,6 +15,11 @@ runs offline and shows how label changes reach provider schemas and incremental 
 Declared entity classes can also form a single-parent hierarchy used by
 relation validation, MCP class scopes, and concept-cloud descriptions.
 
+The [context assembly experiment](examples/context_assembly/README.md) compares
+deterministic evidence packing under a fixed token budget, offline. It keeps
+production serving unchanged and separates packing measurements from reviewed
+answer quality.
+
 > **Status: active pure-Python preview.** Shipped capabilities include DuckDB
 > and BigQuery warehouses, local, GCS, and Google Drive sources, metadata-aware deterministic
 > chunk models, record-scoped incremental state, bounded projected warehouse

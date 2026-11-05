@@ -296,7 +296,7 @@ def test_reviews_bind_exact_prompt_answer_inventory_and_cited_evidence():
     key = (_case().case_id, row["policy_id"])
     report = _compare(generator=generator, reviews={key: review}).artifact()
     assert report["aggregate"]["baseline"]["holdout"]["reviewed_cases"] == 1
-    for field in ("prompt_id", "answer_id", "fact_inventory_id"):
+    for field in ("prompt_id", "fact_inventory_id"):
         stale = review.model_copy(update={field: "stale"})
         with pytest.raises(AssemblyError, match="does not match"):
             _compare(generator=generator, reviews={key: stale})
@@ -359,6 +359,28 @@ def test_known_review_mismatch_fails_before_paid_generation():
     with pytest.raises(AssemblyError, match="does not match"):
         _compare(generator=generator, reviews={(_case().case_id, row["policy_id"]): stale})
     assert generator.calls == []
+
+
+def test_drifted_answer_marks_review_stale_and_keeps_every_generated_row():
+    """The review applies to the answer its reviewer saw, not to a re-generation.
+
+    A driver that is not strictly cached can return different text on the scoring
+    run; that must not discard the answers already paid for (PR 745 review, P2).
+    """
+    generator = FixedGenerator()
+    row = _compare(generator=generator).artifact()["rows"][0]
+    key = (_case().case_id, row["policy_id"])
+    drifted = _review(prompt_id=row["prompt_id"], answer_id="answer-the-reviewer-saw")
+    report = _compare(generator=generator, reviews={key: drifted}).artifact()
+    by_policy = {r["policy_id"]: r for r in report["rows"]}
+    assert by_policy[row["policy_id"]]["answer_review"] == "stale"
+    assert by_policy[row["policy_id"]]["answer_scores"] is None
+    assert by_policy[row["policy_id"]]["reviewer"] is None
+    assert all(r["answer_id"] is not None for r in report["rows"])
+    assert all(r["answer_review"] is None for pid, r in by_policy.items()
+               if pid != row["policy_id"])
+    assert report["aggregate"]["baseline"]["holdout"]["stale_reviews"] == 1
+    assert report["aggregate"]["baseline"]["holdout"]["reviewed_cases"] == 0
 
 
 def test_non_json_citation_is_rejected_at_the_input_boundary():

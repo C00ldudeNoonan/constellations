@@ -103,7 +103,11 @@ A reviewer inspects the exact answer and cited immutable passages, then
 creates an `AnswerReview` keyed by `(case_id, policy_id)`. It must match the
 prompt hash, `answer_identity(answer.text)` and frozen fact inventory ID.
 The trusted driver can replay cached observations to score those reviews
-without paying for a second generation. Preserve answers privately under
+without paying for a second generation. If the driver instead returns different
+text, the review does not apply: that row is marked `answer_review: "stale"`
+with null scores and reviewer, the other rows are kept, and the aggregate counts
+`stale_reviews`. A review that mismatches the prompt or fact inventory is known
+before any call and still raises first. Preserve answers privately under
 operator-controlled storage if asynchronous review requires them; this API
 never writes payloads, caches, or files.
 

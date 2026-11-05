@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental `stel.context_assembly` and `stel.context_assembly_eval` Python
+  APIs compare relevance/document order, exact-offset overlap removal, and bounded
+  neighbor expansion on frozen governed evidence under one rendered-input token
+  budget. Authorization runs before packing, reports hold identities and counts
+  only, and generation needs an explicit driver and live opt-in. A human review
+  whose answer no longer matches the generated text is marked stale rather than
+  failing the comparison (issue #744, ADR-0049).
+
 - A backend's incremental identity now covers only the option definitions it reaches,
   not all of `backends/options.py`. An edit to one backend's options, such as the LLM
   `temperature` default in 0.24.0, no longer re-keys the JSON, HTML, PDF, Markdown or

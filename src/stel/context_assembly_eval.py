@@ -199,7 +199,8 @@ def compare_context_policies(
                "retrieved_context_ids": [item.rows()[1]["context_id"] for item in case.candidates],
                **context.artifact(), "answer_id": None, "answer_scores": None,
                "generation_seconds": None, "input_tokens": None,
-               "output_tokens": None, "cost_usd": None, "reviewer": None}
+               "output_tokens": None, "cost_usd": None, "reviewer": None,
+               "answer_review": None}
         if generator is not None:
             answer, seconds = _generate(generator, context.render())
             answer_id = answer_identity(answer.text)
@@ -207,7 +208,12 @@ def compare_context_policies(
                        input_tokens=answer.input_tokens, output_tokens=answer.output_tokens,
                        cost_usd=answer.cost_usd)
             review = reviews.get((case.case_id, context.policy_id))
-            if review is not None:
+            if review is not None and review.answer_id != answer_id:
+                # The generator returned different text than the reviewer saw.
+                # Keep every generated row; the review simply does not apply.
+                row["answer_review"] = "stale"
+            elif review is not None:
+                row["answer_review"] = "applied"
                 row["answer_scores"] = score_answer(
                     case, review, prompt_id=context.prompt_id, answer_id=answer_id,
                     context_ids={item.context_id for item in context.evidence},
@@ -282,7 +288,9 @@ def _aggregate_group(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "mean": math.fsum(values) / len(values) if values else None,
             "measured_cases": len(values),
         }
-    return {"cases": len(rows), "reviewed_cases": len(reviewed), "answer_scores": scores,
+    stale = sum(row["answer_review"] == "stale" for row in rows)
+    return {"cases": len(rows), "reviewed_cases": len(reviewed), "stale_reviews": stale,
+            "answer_scores": scores,
             "measurements": measurements,
             "mean_context_tokens": sum(row["token_count"] for row in rows) / len(rows),
             "mean_metadata_tokens": sum(row["metadata_tokens"] for row in rows) / len(rows)}

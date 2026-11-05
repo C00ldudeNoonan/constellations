@@ -59,6 +59,7 @@ history (issue #311).
 | [0047](0047-source-deletion-approval-binds-the-discovered-snapshot.md) | Approval for source deletion binds the discovered snapshot and prior state | accepted; amended by 0048 |
 | [0048](0048-bigquery-writers-hold-a-non-expiring-claim.md) | BigQuery writers hold a non-expiring claim across discovery and publication | accepted; amends 0047 |
 | [0050](0050-a-backend-identity-covers-the-options-it-reaches.md) | A backend's identity covers the options definitions it reaches, not the whole options module | accepted |
+| [0051](0051-warehouse-native-vector-search-is-a-query-time-read-not-a-retrieval-store.md) | Warehouse-native vector search is a query-time read over the embeddings table, not a `RetrievalStore`; a `bigquery` store is deferred | accepted |
 
 ## When to write one
 

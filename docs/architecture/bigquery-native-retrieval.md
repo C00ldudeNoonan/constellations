@@ -1,7 +1,11 @@
 # BigQuery-native retrieval design review
 
-Status: design review complete for issue #618; implementation is deferred
-pending the adopt-or-defer comparison in [Linear ALE-257](https://linear.app/alex-noonan/issue/ALE-257/decide-whether-a-warehouse-native-search-store-bigquery-vector-search).
+Status: design review complete for issue #618. A `store: bigquery` retrieval
+store is deferred, and warehouse-native vector search proceeds as a query-time
+read over the embeddings table instead, per
+[ADR-0051](../adr/0051-warehouse-native-vector-search-is-a-query-time-read-not-a-retrieval-store.md)
+(#747). The findings and the validation gate below stand; they are what a
+later store would be built against.
 This review builds on the [semantic retrieval architecture](semantic-retrieval.md)
 and checks the issue's proposal against the current serving and publication
 contracts.
@@ -16,12 +20,14 @@ full-scan fallback and billed the full synthetic table after four minutes.
 That is not enough evidence to choose BigQuery over the current LanceDB path
 for the 3.6-million-row corpus.
 
-Keep BigQuery-native retrieval as a candidate. Linear ALE-257 now owns the
-comparison and final adopt-or-defer decision; its text-versus-hybrid replay
-prerequisite, ALE-227, is complete. If ALE-257 recommends adoption, file a
-separate implementation issue with a concrete publication, filtering,
-generation-retention, and cost contract. The existing stel MCP retrieval
-surface remains the governed product interface either way.
+Keep BigQuery-native retrieval as a candidate. Linear ALE-257 owned the
+comparison and is closed; its text-versus-hybrid replay prerequisite, ALE-227,
+is complete. The outcome was not a store: ADR-0051 takes warehouse-native
+vector search as a query-time read over the embeddings table and defers
+`store: bigquery`. A store would still need a separate implementation issue
+with a concrete publication, filtering, generation-retention, and cost
+contract. The existing stel MCP retrieval surface remains the governed product
+interface for stel-served search.
 
 ## Goal
 

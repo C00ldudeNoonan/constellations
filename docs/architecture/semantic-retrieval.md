@@ -27,8 +27,9 @@ of a row.
 
 The supported proving implementation is local LanceDB. No additional retrieval
 store has been accepted; the BigQuery-native design review in
-[bigquery-native-retrieval.md](bigquery-native-retrieval.md) is complete, with
-the adopt-or-defer decision tracked in Linear ALE-257. Features are
+[bigquery-native-retrieval.md](bigquery-native-retrieval.md) is complete, and
+[ADR-0051](../adr/0051-warehouse-native-vector-search-is-a-query-time-read-not-a-retrieval-store.md)
+defers a `bigquery` store in favor of a query-time read. Features are
 capabilities, not assumptions: a vector-only store can implement this contract
 without pretending to support BM25, hybrid search, online schema evolution, or
 atomic replacement.

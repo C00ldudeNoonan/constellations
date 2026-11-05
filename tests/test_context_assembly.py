@@ -139,6 +139,12 @@ def test_dedup_does_not_infer_overlap_from_similarity_or_adjacency(other):
                         policy=AssemblyPolicy(token_budget=10000, remove_overlap=True))
     assert len(context.evidence) == 2
     assert not context.omissions
+    # Packing a block untrimmed is not enough: a trimmed block is still packed,
+    # so check that neither block's text or start offset moved.
+    for block, item in zip(context.evidence, (_evidence(), other), strict=True):
+        row = item.rows()[1]
+        assert block.text == row["text"]
+        assert block.citation.get("char_start") == row["citation_char_start"]
 
 
 def test_bounded_neighbors_stay_within_document_version_and_keep_citation_ids():

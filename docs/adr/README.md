@@ -59,6 +59,7 @@ history (issue #311).
 | [0047](0047-source-deletion-approval-binds-the-discovered-snapshot.md) | Approval for source deletion binds the discovered snapshot and prior state | accepted; amended by 0048 |
 | [0048](0048-bigquery-writers-hold-a-non-expiring-claim.md) | BigQuery writers hold a non-expiring claim across discovery and publication | accepted; amends 0047 |
 | [0049](0049-context-assembly-is-an-offline-experiment-before-serving-policy.md) | Context assembly is evaluated on frozen governed evidence before changing serving policy | accepted |
+| [0050](0050-a-backend-identity-covers-the-options-it-reaches.md) | A backend's identity covers the options definitions it reaches, not the whole options module | accepted |
 
 ## When to write one
 

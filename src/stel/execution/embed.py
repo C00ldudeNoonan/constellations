@@ -318,11 +318,7 @@ def _run_embed_model(
         nonlocal skipped, cache_hits
         text_value = record[config.text_field]
         text = "" if text_value is None else str(text_value)
-        input_fingerprint = canonical_fingerprint(
-            record,
-            domain="embedding-input-row",
-            version=1,
-        )
+        input_fingerprint = embed_input_fingerprint(record)
         if skip_state.get(record_id) == StateValue(
             input_fingerprint,
             code_version,
@@ -860,6 +856,12 @@ def _open_response_cache(
             f"Embed model '{model_name}': embedding.cache_path could not be "
             f"opened [{type(error).__name__}]"
         ) from None
+
+
+def embed_input_fingerprint(record: dict[str, Any]) -> str:
+    """The fingerprint state records for one upstream row. `stel plan --pending`
+    compares against it too (issue #751), so it is defined once."""
+    return canonical_fingerprint(record, domain="embedding-input-row", version=1)
 
 
 def _layout_read_order(

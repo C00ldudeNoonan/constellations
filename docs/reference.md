@@ -410,7 +410,7 @@ stel eval --compare EXPR [--baseline MODEL] [--json]     # score variants on one
 stel build [--select EXPR] [--exclude EXPR] [--full-refresh] [--reprocess-all] [--accept-reprocess] [--accept-cost] [--threads N] [--store-failures] [--state DIR] [--source-filter GLOB] [-v] [--diagnostics-file PATH]
 stel ls [--select EXPR] [--resource-type {model,source,search_index,all}] [--output {name,json}] [--orphans]
 stel plan [--select EXPR] [--exclude EXPR] [--reprocess-all] [--json]  # what the next run would reprocess, before it spends anything
-stel plan --pending [--select EXPR] [--json] [--dry-run]  # upstream rows waiting for a run; exit 3 when any, 0 when none
+stel plan --pending [--select EXPR] [--json] [--dry-run] [--include-changed]  # upstream rows waiting for a run; exit 3 when any, 0 when none
 stel show <model> [--limit N]                            # peek at a materialized table
 stel search --model NAME --query TEXT [--mode {vector,text,hybrid}] [--filter FIELD OP VALUE] [--output {table,json}] [-v]
 stel serving status <search-index>                       # publication ledger: status, fence, counts, leases
@@ -821,10 +821,17 @@ embed, chunk or incremental transform model it reports, from the data and
   columns that the upstream also carries; otherwise they are null.
 - **`deleted_rows`**: state rows whose upstream row is gone, counted
   separately, since a subset run never deletes them.
-- **`changed_rows`** is always null, and `changed_reason` says why: a changed
-  row has a state row, and telling it from an unchanged one needs the row's
-  content fingerprint, which reads every column. This report reads the key,
-  partition and cluster columns only, so it can run at sensor frequency.
+- **`changed_rows`** is null unless you pass `--include-changed`, and
+  `changed_reason` says why. A changed row has a state row, and telling it from
+  an unchanged one needs the row's content fingerprint, which reads every
+  column of the upstream. The default report reads the key, partition and
+  cluster columns only, so it can run at sensor frequency; `--include-changed`
+  streams the whole upstream for embed and chunk models and counts rows whose
+  input fingerprint differs from the one state recorded (the runners' own
+  fingerprint, so it cannot drift). Price it first with `--dry-run`. A
+  transform's fingerprint also covers its reference tables, so it stays null.
+  A row whose only change is the model's `code_version` is `stel plan`'s
+  business, not this count.
 
 Any other kind reports `unsupported`; an upstream that does not exist yet
 reports `upstream_missing`. The exit code is **3** when any model has pending
@@ -6578,7 +6585,7 @@ run results under `target-path`:
   status (`pending`, `none`, `unsupported`, `upstream_missing`, `dry_run`),
   `new_rows`, `deleted_rows`, the partition span and oldest pending value,
   the first cluster column's distinct count, and the bytes estimate.
-  `changed_rows` is always null. `schema_version: 1`. `--json` prints it.
+  `changed_rows` is null unless `--include-changed`. `schema_version: 1`. `--json` prints it.
 - **`sources.yml`** — only when you call `emit-dbt-sources`. dbt-shaped.
 - **`docs/`** — static HTML site (`stel docs generate`) with project overview,
   Mermaid DAG, per-model pages. Serve locally with `stel docs serve`.

@@ -1065,6 +1065,16 @@ def _model_kind(model: ModelConfig) -> str:
     is_flag=True,
     help="With --pending: print the bytes estimate and read nothing.",
 )
+@click.option(
+    "--include-changed",
+    "include_changed",
+    is_flag=True,
+    help=(
+        "With --pending: also count rows whose input changed since they were "
+        "published. Reads every column of the upstream, so price it first "
+        "with --dry-run."
+    ),
+)
 @_verbose_option
 @_project_context_options
 @click.pass_context
@@ -1076,6 +1086,7 @@ def plan(
     json_output: bool,
     pending: bool,
     dry_run: bool,
+    include_changed: bool,
     verbose: int,
     diagnostics_file: Path | None,
 ) -> None:
@@ -1091,8 +1102,8 @@ def plan(
     profiles_dir = ctx.obj["profiles_dir"]
     target = ctx.obj["target"]
     _configure_output(verbose, diagnostics_file=diagnostics_file, json_output=json_output)
-    if dry_run and not pending:
-        raise click.UsageError("--dry-run applies to --pending only.")
+    if (dry_run or include_changed) and not pending:
+        raise click.UsageError("--dry-run and --include-changed apply to --pending only.")
     if pending:
         if reprocess_all:
             raise click.UsageError("--reprocess-all does not apply to --pending.")
@@ -1104,6 +1115,7 @@ def plan(
                 target=target,
                 profiles_dir=profiles_dir,
                 dry_run=dry_run,
+                include_changed=include_changed,
             )
         except _CONFIG_ERRORS as e:
             raise ConfigClickError(str(e)) from e

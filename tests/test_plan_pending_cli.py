@@ -86,3 +86,69 @@ def test_dry_run_requires_pending(rag_project: Path) -> None:
     )
     assert result.exit_code == 2
     assert "--pending" in result.output
+
+
+def test_include_changed_counts_rows_whose_input_fingerprint_moved(
+    rag_project: Path,
+) -> None:
+    """Issue #751: `changed` needs the row fingerprint, so it is opt-in, and it
+    uses the runner's own fingerprint so a settled project reports zero."""
+    run_project(rag_project)
+
+    code, report = _pending(
+        rag_project, "--select", "chunk_embeddings", "--include-changed"
+    )
+    assert code == 0
+    assert report["models"][0]["changed_rows"] == 0
+
+    project, _, _ = load_project(rag_project)
+    resolved = resolve_profile(project, rag_project, target=None, profiles_dir=None)
+    with create_adapter(resolved.warehouse, project_dir=rag_project) as adapter:
+        state = f"{adapter.schema_ref}.{adapter.quote_ident('stel_state')}"
+        adapter.execute(
+            f"UPDATE {state} SET input_fingerprint = 'stale' "
+            "WHERE model_name = 'chunk_embeddings' AND record_key = "
+            f"(SELECT MIN(record_key) FROM {state} WHERE model_name = 'chunk_embeddings')"
+        )
+
+    code, report = _pending(
+        rag_project, "--select", "chunk_embeddings", "--include-changed"
+    )
+    assert code == 3
+    (changed,) = report["models"]
+    assert (changed["status"], changed["new_rows"], changed["changed_rows"]) == (
+        "pending",
+        0,
+        1,
+    )
+    assert changed["changed_reason"] is None
+
+    # Without the flag the same state is invisible, and says why.
+    code, report = _pending(rag_project, "--select", "chunk_embeddings")
+    assert code == 0
+    assert report["models"][0]["changed_rows"] is None
+    assert "--include-changed" in report["models"][0]["changed_reason"]
+
+
+def test_include_changed_agrees_with_the_chunk_runner_fingerprint(
+    rag_project: Path,
+) -> None:
+    """A fingerprint that drifted from `chunk_input_hash` would report every
+    settled document as changed."""
+    run_project(rag_project)
+
+    code, report = _pending(
+        rag_project, "--select", "document_chunks", "--include-changed"
+    )
+
+    assert code == 0
+    (model,) = report["models"]
+    assert (model["status"], model["changed_rows"]) == ("none", 0)
+
+
+def test_include_changed_requires_pending(rag_project: Path) -> None:
+    result = CliRunner().invoke(
+        cli, ["--project-dir", str(rag_project), "plan", "--include-changed"]
+    )
+    assert result.exit_code == 2
+    assert "--pending" in result.output

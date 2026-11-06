@@ -1,0 +1,97 @@
+"""The adapter read behind `stel plan --pending` (issue #751)."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from stel.adapters import StateRecord, StateScope, create_adapter, parse_warehouse_config
+from stel.adapters.base import PendingUpstreamRequest
+
+
+def _adapter(tmp_path: Path):
+    config = parse_warehouse_config({"type": "duckdb", "path": str(tmp_path / "w.duckdb")})
+    return create_adapter(config, project_dir=tmp_path)
+
+
+def _seed_upstream(adapter, rows: list[tuple[int, str, str]]) -> None:
+    table = adapter.table_ref("chunks")
+    adapter.execute(
+        f"CREATE TABLE {table} (context_id BIGINT, filing_date DATE, symbol VARCHAR)"
+    )
+    for key, day, symbol in rows:
+        adapter.execute(f"INSERT INTO {table} VALUES ({key}, DATE '{day}', '{symbol}')")
+
+
+def _request(**overrides: object) -> PendingUpstreamRequest:
+    fields: dict[str, object] = {
+        "scope": StateScope("embeddings"),
+        "upstream": "chunks",
+        "key_column": "context_id",
+        "partition_column": "filing_date",
+        "cluster_column": "symbol",
+    }
+    fields.update(overrides)
+    return PendingUpstreamRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_new_rows_are_upstream_keys_with_no_state_row(tmp_path: Path) -> None:
+    with _adapter(tmp_path) as adapter:
+        _seed_upstream(
+            adapter,
+            [
+                (1, "2026-01-05", "AAA"),
+                (2, "2026-02-10", "BBB"),
+                (3, "2026-03-15", "BBB"),
+                (4, "2026-03-20", "CCC"),
+            ],
+        )
+        # A numeric key is stored as its string, which is the cast under test.
+        adapter.upsert_state(
+            StateScope("embeddings"), [StateRecord("1", "fp", "v1"), StateRecord("2", "fp", "v1")]
+        )
+
+        summary = adapter.pending_upstream(_request(), dry_run=False)
+
+    assert summary.new_rows == 2
+    assert str(summary.partition_min) == "2026-03-15"
+    assert str(summary.partition_max) == "2026-03-20"
+    assert summary.cluster_distinct == 2
+    assert summary.deleted_rows == 0
+
+
+def test_deleted_rows_are_state_keys_with_no_upstream_row(tmp_path: Path) -> None:
+    with _adapter(tmp_path) as adapter:
+        _seed_upstream(adapter, [(1, "2026-01-05", "AAA")])
+        adapter.upsert_state(
+            StateScope("embeddings"),
+            [StateRecord("1", "fp", "v1"), StateRecord("gone", "fp", "v1")],
+        )
+        # Another model's state must not count as this one's.
+        adapter.upsert_state(StateScope("other"), [StateRecord("zzz", "fp", "v1")])
+
+        summary = adapter.pending_upstream(_request(), dry_run=False)
+
+    assert (summary.new_rows, summary.deleted_rows) == (0, 1)
+    assert summary.partition_min is None
+
+
+def test_never_run_model_has_every_upstream_row_pending(tmp_path: Path) -> None:
+    with _adapter(tmp_path) as adapter:
+        _seed_upstream(adapter, [(1, "2026-01-05", "AAA"), (2, "2026-01-06", "AAA")])
+
+        summary = adapter.pending_upstream(
+            _request(partition_column=None, cluster_column=None), dry_run=False
+        )
+
+    assert summary.new_rows == 2
+    assert summary.partition_min is None
+    assert summary.cluster_distinct is None
+
+
+def test_dry_run_reads_nothing(tmp_path: Path) -> None:
+    with _adapter(tmp_path) as adapter:
+        _seed_upstream(adapter, [(1, "2026-01-05", "AAA")])
+
+        summary = adapter.pending_upstream(_request(), dry_run=True)
+
+    assert summary.new_rows == 0
+    assert summary.estimated_bytes is None  # DuckDB does not bill by bytes
